@@ -7,6 +7,7 @@ use commonware_parallel::{Rayon, Sequential, Strategy};
 use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
 use commonware_storage::{
     journal::contiguous::fixed::Config as JournalConfig,
+    mmr,
     mmr::journaled::Config as MmrConfig,
     qmdb::any::{FixedConfig, unordered::fixed},
     translator::EightCap,
@@ -38,7 +39,8 @@ type TestContext = deterministic::Context;
 type TestHasher = blake3::Blake3;
 type TestPublicKey = recoverable::PublicKey;
 type TestSigned = VerifiedTransaction<TestPublicKey, TestHasher>;
-type TestDb = Arc<AsyncRwLock<fixed::Db<TestContext, Slot, StateValue, TestHasher, EightCap>>>;
+type TestDb =
+    Arc<AsyncRwLock<fixed::Db<mmr::Family, TestContext, Slot, StateValue, TestHasher, EightCap>>>;
 
 const NAMESPACE: &[u8] = b"processor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
@@ -386,10 +388,10 @@ async fn write_accounts(db: &TestDb, accounts: &[(Address, Account)]) {
 async fn open_state_db(
     context: TestContext,
     suffix: &str,
-) -> fixed::Db<TestContext, Slot, StateValue, TestHasher, EightCap> {
+) -> fixed::Db<mmr::Family, TestContext, Slot, StateValue, TestHasher, EightCap> {
     let page_cache = CacheRef::from_pooler(&context, NZU16!(101), NZUsize!(11));
     let config = FixedConfig {
-        mmr_config: MmrConfig {
+        merkle_config: MmrConfig {
             journal_partition: format!("bench-journal-{suffix}"),
             metadata_partition: format!("bench-metadata-{suffix}"),
             items_per_blob: NZU64!(11),

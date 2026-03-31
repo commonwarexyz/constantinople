@@ -612,7 +612,7 @@ where
 
 fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig<EightCap> {
     FixedConfig {
-        mmr_config: MmrConfig {
+        merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
@@ -635,7 +635,7 @@ fn transaction_db_config(
     page_cache: &CacheRef,
 ) -> ImmutableConfig<EightCap, ()> {
     ImmutableConfig {
-        mmr: MmrConfig {
+        merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-transactions-journal"),
             metadata_partition: format!("{partition_prefix}-transactions-metadata"),
             items_per_blob: ITEMS_PER_BLOB,

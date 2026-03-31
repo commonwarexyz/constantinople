@@ -17,6 +17,7 @@ use commonware_consensus::{
 use commonware_cryptography::{Hasher, certificate::ConstantProvider};
 use commonware_glue::stateful::Stateful;
 use commonware_storage::{
+    mmr,
     qmdb::{any::unordered::fixed, sync::resolver::Resolver as SyncResolver},
     translator::EightCap,
 };
@@ -40,6 +41,7 @@ pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitme
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
 pub(crate) type StateDb<E, H> = fixed::Db<
+    mmr::Family,
     E,
     constantinople_primitives::Slot,
     constantinople_primitives::StateValue,
@@ -47,8 +49,14 @@ pub(crate) type StateDb<E, H> = fixed::Db<
     EightCap,
 >;
 
-pub(crate) type TransactionDb<E, H> =
-    commonware_storage::qmdb::immutable::Immutable<E, <H as Hasher>::Digest, (), H, EightCap>;
+pub(crate) type TransactionDb<E, H> = commonware_storage::qmdb::immutable::Immutable<
+    mmr::Family,
+    E,
+    <H as Hasher>::Digest,
+    (),
+    H,
+    EightCap,
+>;
 
 pub(crate) type StateSyncDb<E, H> = Arc<AsyncRwLock<StateDb<E, H>>>;
 pub(crate) type TransactionSyncDb<E, H> = Arc<AsyncRwLock<TransactionDb<E, H>>>;

@@ -469,7 +469,7 @@ checksum = "1d07550c9036bf2ae0c684c4297d503f838287c83c53686d05370d0e139ae570"
 [[package]]
 name = "commonware-broadcast"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "commonware-codec",
  "commonware-cryptography",
@@ -485,7 +485,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -501,7 +501,7 @@ dependencies = [
 [[package]]
 name = "commonware-coding"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -523,7 +523,7 @@ dependencies = [
 [[package]]
 name = "commonware-conformance"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "commonware-conformance-macros",
  "commonware-macros",
@@ -536,7 +536,7 @@ dependencies = [
 [[package]]
 name = "commonware-conformance-macros"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -546,7 +546,7 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -577,7 +577,7 @@ dependencies = [
 [[package]]
 name = "commonware-cryptography"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -612,7 +612,7 @@ dependencies = [
 [[package]]
 name = "commonware-glue"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "bytes",
  "commonware-codec",
@@ -635,7 +635,7 @@ dependencies = [
 [[package]]
 name = "commonware-invariants"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "commonware-macros",
@@ -648,7 +648,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -657,7 +657,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -669,7 +669,7 @@ dependencies = [
 [[package]]
 name = "commonware-math"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -684,7 +684,7 @@ dependencies = [
 [[package]]
 name = "commonware-p2p"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "commonware-codec",
@@ -711,7 +711,7 @@ dependencies = [
 [[package]]
 name = "commonware-parallel"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -721,7 +721,7 @@ dependencies = [
 [[package]]
 name = "commonware-resolver"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -742,7 +742,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "axum",
@@ -779,7 +779,7 @@ dependencies = [
 [[package]]
 name = "commonware-storage"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "ahash",
  "anyhow",
@@ -804,7 +804,7 @@ dependencies = [
 [[package]]
 name = "commonware-stream"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "chacha20poly1305",
  "commonware-codec",
@@ -823,7 +823,7 @@ dependencies = [
 [[package]]
 name = "commonware-utils"
 version = "2026.3.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#572db71bae2d2f754610280e86fd74e0049fc500"
+source = "git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue#482f768c786faae2d3234cdb38bbb385a734d4f5"
 dependencies = [
  "arbitrary",
  "bytes",

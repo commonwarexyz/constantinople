@@ -40,7 +40,7 @@ use commonware_storage::{
     bmt,
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
-    mmr::Location,
+    mmr,
     qmdb::{
         Error as StorageError,
         any::{
@@ -72,7 +72,8 @@ use thiserror::Error;
 use tracing::warn;
 
 /// Shared QMDB handle for the application state database.
-pub(crate) type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<E, Slot, StateValue, H, T>>>;
+pub(crate) type StateDatabase<E, H, T> =
+    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Slot, StateValue, H, T>>>;
 /// Signed transaction carried by the wire block format.
 type WireTransaction<H, P> = SignedTransaction<P, H>;
 /// Sealed block carried across the wire and through consensus.
@@ -81,7 +82,7 @@ type WireBlock<C, P, H> = Sealed<SignedBlock<C, P, H>, H>;
 type ExecutionBlock<C, P, H> = VerifiedBlock<C, P, H>;
 /// Shared immutable transaction database handle.
 type TransactionDatabase<E, H> =
-    Arc<AsyncRwLock<Immutable<E, <H as Hasher>::Digest, (), H, EightCap>>>;
+    Arc<AsyncRwLock<Immutable<mmr::Family, E, <H as Hasher>::Digest, (), H, EightCap>>>;
 /// The pair of backing databases owned by the application.
 type Databases<E, H, T> = (StateDatabase<E, H, T>, TransactionDatabase<E, H>);
 /// Merkleized state database produced after finalization.
@@ -98,8 +99,8 @@ const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 /// Unmerkleized application state batch used for processor read-through.
 pub type StateBatch<E, H, T> = AnyUnmerkleized<
     E,
-    FixedJournal<E, AnyOperation<UnorderedUpdate<Slot, FixedEncoding<StateValue>>>>,
-    UnorderedIndex<T, Location>,
+    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<Slot, FixedEncoding<StateValue>>>>,
+    UnorderedIndex<T, mmr::Location>,
     H,
     UnorderedUpdate<Slot, FixedEncoding<StateValue>>,
 >;
@@ -114,7 +115,7 @@ pub type ApplicationBatches<E, H, T> = (StateBatch<E, H, T>, TransactionBatch<E,
 #[derive(Debug, Error)]
 pub enum ProcessorError {
     #[error("state database access failed")]
-    Database(#[from] StorageError),
+    Database(#[from] StorageError<mmr::Family>),
     #[error("loaded value has wrong type for its key")]
     MalformedState,
 }
@@ -493,7 +494,7 @@ where
             TransactionsMerkleized<E, H>,
             H::Digest,
         ),
-        StorageError,
+        StorageError<mmr::Family>,
     >
     where
         E: Storage + Clock + Metrics,
@@ -501,7 +502,7 @@ where
         futures::try_join!(
             state_batch.merkleize(),
             transaction_batch.merkleize(),
-            async { Ok::<H::Digest, StorageError>(self.receipts_root(receipts)) },
+            async { Ok::<H::Digest, StorageError<mmr::Family>>(self.receipts_root(receipts)) },
         )
     }
 }
@@ -552,15 +553,15 @@ where
         let state_target = Target {
             root: block.header.state_root,
             range: non_empty_range!(
-                Location::new(block.header.state_range.start()),
-                Location::new(block.header.state_range.end())
+                mmr::Location::new(block.header.state_range.start()),
+                mmr::Location::new(block.header.state_range.end())
             ),
         };
         let transactions_target = Target {
             root: block.header.transactions_root,
             range: non_empty_range!(
-                Location::new(block.header.transactions_range.start()),
-                Location::new(block.header.transactions_range.end())
+                mmr::Location::new(block.header.transactions_range.start()),
+                mmr::Location::new(block.header.transactions_range.end())
             ),
         };
 
@@ -938,6 +939,7 @@ mod tests {
         journal::contiguous::{
             fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
         },
+        mmr,
         mmr::journaled::Config as MmrConfig,
         qmdb::{
             any::{FixedConfig, unordered::fixed},
@@ -959,8 +961,9 @@ mod tests {
     type TestHasher = blake3::Blake3;
     type TestPublicKey = recoverable::PublicKey;
     type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
-    type TestTransactionDb =
-        Arc<AsyncRwLock<Immutable<TestContext, blake3::Digest, (), TestHasher, EightCap>>>;
+    type TestTransactionDb = Arc<
+        AsyncRwLock<Immutable<mmr::Family, TestContext, blake3::Digest, (), TestHasher, EightCap>>,
+    >;
     type TestStateDb = StateDatabase<TestContext, TestHasher, EightCap>;
     type VerifyTestPublicKey = ed25519::PublicKey;
     type VerifyTestSignedTransaction = SignedTransaction<VerifyTestPublicKey, TestHasher>;
@@ -992,7 +995,7 @@ mod tests {
     fn transaction_db_config(suffix: &str, context: &TestContext) -> ImmutableConfig<EightCap, ()> {
         let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
         ImmutableConfig {
-            mmr: MmrConfig {
+            merkle_config: MmrConfig {
                 journal_partition: format!("tx-journal-{suffix}"),
                 metadata_partition: format!("tx-metadata-{suffix}"),
                 items_per_blob: NZU64!(11),
@@ -1015,7 +1018,7 @@ mod tests {
     fn state_db_config(suffix: &str, context: &TestContext) -> FixedConfig<EightCap> {
         let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
         FixedConfig {
-            mmr_config: MmrConfig {
+            merkle_config: MmrConfig {
                 journal_partition: format!("state-journal-{suffix}"),
                 metadata_partition: format!("state-metadata-{suffix}"),
                 items_per_blob: NZU64!(11),
