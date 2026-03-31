@@ -899,6 +899,41 @@ fn verify_accepts_proposed_block_access_list() {
 }
 
 #[test]
+fn verify_rejects_malformed_block_access_list() {
+    let mut harness = ProcessorHarness::default();
+    let sender = harness.signer(58);
+    let precompile = address(0x46);
+    let counter = Arc::new(AtomicUsize::new(0));
+
+    harness.set_account(sender.address, account(1, 0));
+    harness.insert_precompile(
+        precompile,
+        vec![
+            PrecompileStep::Count(counter.clone()),
+            PrecompileStep::Return(Bytes::from_static(b"ok")),
+        ],
+    );
+
+    let proposal = harness.propose_specs(&[TransactionSpec::call(
+        sender,
+        precompile,
+        0,
+        0,
+        Bytes::new(),
+    )]);
+    let mut access_list = proposal.output.access_list.clone();
+    access_list.tx_offsets = vec![1, 1];
+
+    counter.store(0, Ordering::SeqCst);
+    let result = harness.verify_with_strategy(&proposal.valid, &access_list, &Sequential);
+    assert_eq!(
+        result.expect_err("malformed BAL should be rejected before execution"),
+        VerificationError::MalformedBlockAccessList,
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 0);
+}
+
+#[test]
 fn write_access_allows_reads() {
     let mut harness = ProcessorHarness::default();
     let sender = harness.signer(1);
@@ -1221,6 +1256,65 @@ fn precompile_transfer_underflow_reverts() {
     assert_eq!(run.account_change(sender.address), Some(account(10, 1)));
     assert_eq!(run.account_change(precompile), None);
     assert_eq!(run.account_change(beneficiary), None);
+}
+
+#[test]
+fn root_transfer_overflow_reverts() {
+    let mut harness = ProcessorHarness::default();
+    let sender = harness.signer(59);
+    let recipient = address(0x4B);
+
+    harness.set_account(sender.address, account(10, 0));
+    harness.set_account(recipient, account(u64::MAX, 0));
+
+    let run = harness
+        .execute_specs(&[TransactionSpec::transfer(sender.clone(), recipient, 1, 0)])
+        .expect("processing should succeed");
+
+    assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
+    assert_eq!(run.account_change(sender.address), Some(account(10, 1)));
+    assert_eq!(run.account_change(recipient), None);
+    assert!(
+        run.proposed_access_list(0)
+            .contains(&Access::Account(recipient, AccessMode::Write))
+    );
+}
+
+#[test]
+fn precompile_transfer_overflow_reverts() {
+    let mut harness = ProcessorHarness::default();
+    let sender = harness.signer(60);
+    let precompile = address(0x3B);
+    let beneficiary = address(0x4C);
+
+    harness.set_account(sender.address, account(10, 0));
+    harness.set_account(beneficiary, account(u64::MAX, 0));
+    harness.insert_precompile(
+        precompile,
+        vec![
+            PrecompileStep::Transfer(beneficiary, 1),
+            PrecompileStep::Return(Bytes::from_static(b"ok")),
+        ],
+    );
+
+    let run = harness
+        .execute_specs(&[TransactionSpec::call(
+            sender.clone(),
+            precompile,
+            1,
+            0,
+            Bytes::new(),
+        )])
+        .expect("processing should succeed");
+
+    assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
+    assert_eq!(run.account_change(sender.address), Some(account(10, 1)));
+    assert_eq!(run.account_change(precompile), None);
+    assert_eq!(run.account_change(beneficiary), None);
+    assert!(
+        run.proposed_access_list(0)
+            .contains(&Access::Account(beneficiary, AccessMode::Write))
+    );
 }
 
 #[test]
@@ -1909,6 +2003,44 @@ fn precompile_panic_reverts_instead_of_panicking() {
 }
 
 #[test]
+fn precompile_panic_after_mutation_discards_diff_but_keeps_accesses() {
+    let mut harness = ProcessorHarness::default();
+    let sender = harness.signer(61);
+    let precompile = address(0x93);
+    let owner_slot = slot(0x12);
+
+    harness.set_account(sender.address, account(10, 0));
+    harness.set_storage(precompile, owner_slot, slot(0x01));
+    harness.insert_precompile(
+        precompile,
+        vec![
+            PrecompileStep::WriteStorage(owner_slot, slot(0x02)),
+            PrecompileStep::Panic,
+        ],
+    );
+
+    let run = harness
+        .execute_specs(&[TransactionSpec::call(
+            sender.clone(),
+            precompile,
+            0,
+            0,
+            Bytes::new(),
+        )])
+        .expect("processing should succeed");
+
+    assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
+    assert_eq!(run.account_change(sender.address), Some(account(10, 1)));
+    assert_eq!(run.account_change(precompile), None);
+    assert_eq!(run.storage_change(precompile, owner_slot), None);
+    assert!(run.proposed_access_list(0).contains(&Access::Storage(
+        precompile,
+        owner_slot,
+        AccessMode::Write
+    )));
+}
+
+#[test]
 fn validate_rejects_transaction_when_precompile_lookup_panics() {
     let mut harness = ProcessorHarness::default();
     let sender = harness.signer(37);
@@ -1964,6 +2096,40 @@ fn verify_reverts_transaction_when_precompile_lookup_panics_if_validation_is_byp
     assert_eq!(output.receipts.len(), 1);
     assert_eq!(output.receipts[0].status, ReceiptStatus::Revert);
     assert!(output.receipts[0].return_data.is_empty());
+}
+
+#[test]
+fn nested_call_to_non_precompile_target_reverts() {
+    let mut harness = ProcessorHarness::default();
+    let sender = harness.signer(62);
+    let parent = address(0x9B);
+    let child = address(0x9C);
+
+    harness.set_account(sender.address, account(10, 0));
+    harness.insert_precompile(parent, vec![PrecompileStep::Call(child, 0, Bytes::new())]);
+
+    let run = harness
+        .execute_specs(&[TransactionSpec::call(
+            sender.clone(),
+            parent,
+            0,
+            0,
+            Bytes::new(),
+        )])
+        .expect("processing should succeed");
+
+    assert_receipt(&run, 0, ReceiptStatus::Revert, Bytes::new());
+    assert_eq!(run.account_change(sender.address), Some(account(10, 1)));
+    assert_eq!(run.account_change(parent), None);
+    assert_eq!(run.account_change(child), None);
+    assert!(
+        !run.proposed_access_list(0)
+            .contains(&Access::Account(child, AccessMode::Read))
+    );
+    assert!(
+        !run.proposed_access_list(0)
+            .contains(&Access::Account(child, AccessMode::Write))
+    );
 }
 
 #[test]
