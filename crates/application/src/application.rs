@@ -90,6 +90,7 @@ type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Me
 /// Maximum accepted block timestamp in milliseconds since the Unix epoch.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 253_402_300_799_999;
 
+
 /// Unmerkleized application state batch used for processor read-through.
 pub type StateBatch<E, H, T> = AnyUnmerkleized<
     E,
@@ -640,10 +641,11 @@ where
 
     /// Verifies a proposed block against speculative execution.
     ///
-    /// Verification first checks timestamp monotonicity and future skew, waits
-    /// until the block timestamp if needed, rejects any invalid transaction
-    /// signature, rejects any block that contains a static-invalid transaction,
-    /// then re-executes the block and compares all derived roots and ranges.
+    /// Verification rejects invalid transaction signatures and invalid
+    /// timestamps, then waits until the block timestamp has passed to
+    /// account for clock skew. After the wait, it rejects any block that
+    /// contains a static-invalid transaction, re-executes the block, and
+    /// compares all derived roots and ranges.
     async fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
         (runtime, _context): (E, Self::Context),
@@ -661,23 +663,19 @@ where
             return None;
         };
 
-        if block.header.timestamp <= parent.header.timestamp {
+        if block.header.timestamp <= parent.header.timestamp
+            || block.header.timestamp > MAX_BLOCK_TIMESTAMP_MS
+        {
             warn!(
                 height = block.header.height,
                 block_ts = block.header.timestamp,
                 parent_ts = parent.header.timestamp,
-                "verify rejected: timestamp not monotonic"
-            );
-            return None;
-        }
-        if block.header.timestamp > MAX_BLOCK_TIMESTAMP_MS {
-            warn!(
-                height = block.header.height,
-                "verify rejected: timestamp too large"
+                "verify rejected: invalid timestamp"
             );
             return None;
         }
 
+        // Wait until the block timestamp has passed to vote in case of skew.
         let deadline = self.block_deadline(block.header.timestamp);
         runtime.sleep_until(deadline).await;
 
