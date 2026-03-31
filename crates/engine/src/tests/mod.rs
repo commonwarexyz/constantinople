@@ -14,7 +14,13 @@ use common::{
     validator_fixture,
 };
 use commonware_consensus::{Heightable, simplex::elector::RoundRobin, types::coding::Commitment};
-use commonware_cryptography::Signer;
+use commonware_cryptography::{
+    Signer,
+    bls12381::{
+        dkg::Output,
+        primitives::{group::Share, variant::MinSig},
+    },
+};
 use commonware_glue::{
     simulate::{
         action::{Action, Crash, Schedule},
@@ -59,14 +65,8 @@ const fn lossy_link() -> Link {
 #[derive(Clone)]
 struct TestEngineDefinition {
     signers: Vec<TestPrivateKey>,
-    output: commonware_cryptography::bls12381::dkg::Output<
-        commonware_cryptography::bls12381::primitives::variant::MinSig,
-        TestPublicKey,
-    >,
-    shares: BTreeMap<
-        TestPublicKey,
-        Option<commonware_cryptography::bls12381::primitives::group::Share>,
-    >,
+    output: Output<MinSig, TestPublicKey>,
+    shares: BTreeMap<TestPublicKey, Option<Share>>,
     enable_state_sync: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
 }
@@ -219,49 +219,39 @@ impl EngineDefinition for TestEngineDefinition {
                 );
                 let reporter =
                     HeightMonitorReporter::new(public_key.clone(), monitor, NoopReporter);
-                let engine = Engine::<
-                    _,
-                    _,
-                    _,
-                    _,
-                    TestHasher,
-                    commonware_cryptography::bls12381::primitives::variant::MinSig,
-                    RoundRobin<TestHasher>,
-                    _,
-                    _,
-                    _,
-                >::new(
-                    context.with_label("engine"),
-                    Config {
-                        signer,
-                        manager,
-                        blocker,
-                        namespace: ENGINE_NAMESPACE.to_vec(),
-                        output,
-                        share,
-                        input,
-                        precompiles: NoopPrecompiles,
-                        partition_prefix,
-                        freezer_table_initial_size: 1024,
-                        strategy: Sequential,
-                        startup,
-                        sync_config: SyncEngineConfig {
-                            fetch_batch_size: NZU64!(16),
-                            apply_batch_size: 64,
-                            max_outstanding_requests: 8,
-                            update_channel_size: NZUsize!(256),
-                            max_retained_roots: 32,
+                let engine =
+                    Engine::<_, _, _, _, TestHasher, MinSig, RoundRobin<TestHasher>, _, _, _>::new(
+                        context.with_label("engine"),
+                        Config {
+                            signer,
+                            manager,
+                            blocker,
+                            namespace: ENGINE_NAMESPACE.to_vec(),
+                            output,
+                            share,
+                            input,
+                            precompiles: NoopPrecompiles,
+                            partition_prefix,
+                            freezer_table_initial_size: 1024,
+                            strategy: Sequential,
+                            startup,
+                            sync_config: SyncEngineConfig {
+                                fetch_batch_size: NZU64!(16),
+                                apply_batch_size: 64,
+                                max_outstanding_requests: 8,
+                                update_channel_size: NZUsize!(256),
+                                max_retained_roots: 32,
+                            },
+                            genesis_leader,
+                            transaction_namespace: TRANSACTION_NAMESPACE,
+                            block_codec: Default::default(),
+                            genesis_allocations: Vec::new(),
+                            receipt_callback: None,
+                            rejection_callback: None,
+                            bootstrapper: bootstrapper_mailbox.clone(),
                         },
-                        genesis_leader,
-                        transaction_namespace: TRANSACTION_NAMESPACE,
-                        block_codec: Default::default(),
-                        genesis_allocations: Vec::new(),
-                        receipt_callback: None,
-                        rejection_callback: None,
-                        bootstrapper: bootstrapper_mailbox.clone(),
-                    },
-                )
-                .await;
+                    )
+                    .await;
 
                 let marshal = engine.marshal_mailbox();
                 if state_sender

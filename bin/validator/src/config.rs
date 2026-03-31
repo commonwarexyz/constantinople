@@ -5,7 +5,7 @@ use commonware_cryptography::{
     Signer,
     bls12381::{
         dkg,
-        primitives::{group::Share, sharing::ModeVersion},
+        primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
     },
     ed25519,
 };
@@ -68,10 +68,7 @@ pub struct GenesisFile {
 pub struct DecodedConfig {
     pub signer: ed25519::PrivateKey,
     pub public_key: ed25519::PublicKey,
-    pub dkg_output: dkg::Output<
-        commonware_cryptography::bls12381::primitives::variant::MinSig,
-        ed25519::PublicKey,
-    >,
+    pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
     pub share: Share,
     pub genesis_leader: ed25519::PublicKey,
     pub listen: SocketAddr,

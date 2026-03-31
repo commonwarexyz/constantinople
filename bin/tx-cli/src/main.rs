@@ -3,14 +3,14 @@
 use bytes::Bytes;
 use clap::Parser;
 use commonware_codec::{Encode, ReadExt};
-use commonware_cryptography::{Sha256, Signer, ed25519};
+use commonware_cryptography::{Hasher, Sha256, Signer, ed25519};
 use commonware_utils::{from_hex, hex};
 use constantinople_primitives::{Address, Signable, Transaction};
 use std::marker::PhantomData;
 
 const TX_NAMESPACE: &[u8] = b"constantinople-tx";
 
-type Digest = <Sha256 as commonware_cryptography::Hasher>::Digest;
+type Digest = <Sha256 as Hasher>::Digest;
 
 #[derive(Parser)]
 #[command(name = "constantinople-tx")]

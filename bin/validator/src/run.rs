@@ -5,25 +5,35 @@ use crate::{
     config::{ValidatorConfig, decode_public_key},
 };
 use commonware_codec::Encode;
-use commonware_consensus::{Heightable, simplex::elector::RoundRobin};
-use commonware_cryptography::{Sha256, bls12381::primitives::variant::MinSig, ed25519};
+use commonware_consensus::{
+    Heightable, Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
+};
+use commonware_cryptography::{Hasher, Sha256, bls12381::primitives::variant::MinSig, ed25519};
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
-use commonware_parallel::Sequential;
+use commonware_parallel::{Sequential, Strategy};
 use commonware_runtime::{
     Metrics as _, Quota, Runner as _,
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex, union};
-use constantinople_application::processor::{Precompiles, state::StateReader};
+use constantinople_application::{
+    consensus::{ReceiptCallback, RejectionCallback},
+    processor::{
+        Precompiles,
+        executor::Processor,
+        frame::{Frame, FrameError},
+        state::StateReader,
+    },
+};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
-use constantinople_mempool::server::Mempool;
+use constantinople_mempool::server::{InclusionReceipt, Mempool, MempoolConfig, router};
 use constantinople_primitives::Address;
-use std::{path::PathBuf, time::Duration};
+use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
 
 #[derive(Clone, Debug, Default)]
@@ -37,34 +47,30 @@ impl Precompiles for NoopPrecompiles {
     fn execute<S, R>(
         &self,
         _address: Address,
-        _frame: &mut constantinople_application::processor::frame::Frame<'_, R>,
-        _processor: &constantinople_application::processor::executor::Processor<'_, S, Self>,
-    ) -> Result<bytes::Bytes, constantinople_application::processor::frame::FrameError>
+        _frame: &mut Frame<'_, R>,
+        _processor: &Processor<'_, S, Self>,
+    ) -> Result<bytes::Bytes, FrameError>
     where
-        S: commonware_parallel::Strategy,
+        S: Strategy,
         R: StateReader,
     {
-        Err(constantinople_application::processor::frame::FrameError::InvalidTransactionTarget)
+        Err(FrameError::InvalidTransactionTarget)
     }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 struct NoopReporter;
 
-impl commonware_consensus::Reporter for NoopReporter {
-    type Activity = commonware_consensus::marshal::Update<
+impl Reporter for NoopReporter {
+    type Activity = Update<
         constantinople_primitives::Sealed<
-            constantinople_primitives::Block<
-                commonware_consensus::types::coding::Commitment,
-                ed25519::PublicKey,
-                Sha256,
-            >,
+            constantinople_primitives::Block<Commitment, ed25519::PublicKey, Sha256>,
             Sha256,
         >,
     >;
 
     async fn report(&mut self, activity: Self::Activity) {
-        if let commonware_consensus::marshal::Update::Block(_, response) = activity {
+        if let Update::Block(_, response) = activity {
             response.acknowledge();
         }
     }
@@ -183,63 +189,57 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         };
 
         // Build mempool with receipt callback.
-        let mempool = Mempool::<
-            commonware_consensus::types::coding::Commitment,
-            ed25519::PublicKey,
-            Sha256,
-        >::new(
+        let mempool = Mempool::<Commitment, ed25519::PublicKey, Sha256>::new(
             b"constantinople-tx",
-            constantinople_mempool::server::MempoolConfig {
+            MempoolConfig {
                 max_propose_bytes: cfg.max_propose_bytes,
                 max_pool_bytes: cfg.max_pool_bytes,
             },
         );
 
         let mempool_inner = mempool.inner();
-        let receipt_callback: constantinople_application::consensus::ReceiptCallback<
-            <Sha256 as commonware_cryptography::Hasher>::Digest,
-        > = std::sync::Arc::new(move |height, receipts| {
-            let inner = mempool_inner.clone();
-            tokio::spawn(async move {
-                let mut guard = inner.lock().await;
-                for receipt in &receipts {
-                    let hash = receipt.transaction_hash.as_ref().to_vec();
-                    if let Some(sender) = guard.waiters.remove(&hash) {
-                        let _ = sender.send(constantinople_mempool::server::InclusionReceipt {
-                            tx_hash: hex(&hash),
-                            included: true,
-                            height,
-                            status: format!("{:?}", receipt.status),
-                        });
+        let receipt_callback: ReceiptCallback<<Sha256 as Hasher>::Digest> =
+            Arc::new(move |height, receipts| {
+                let inner = mempool_inner.clone();
+                tokio::spawn(async move {
+                    let mut guard = inner.lock().await;
+                    for receipt in &receipts {
+                        let hash = receipt.transaction_hash.as_ref().to_vec();
+                        if let Some(sender) = guard.waiters.remove(&hash) {
+                            let _ = sender.send(InclusionReceipt {
+                                tx_hash: hex(&hash),
+                                included: true,
+                                height,
+                                status: format!("{:?}", receipt.status),
+                            });
+                        }
                     }
-                }
+                });
             });
-        });
 
         let rejection_inner = mempool.inner();
-        let rejection_callback: constantinople_application::consensus::RejectionCallback<
-            <Sha256 as commonware_cryptography::Hasher>::Digest,
-        > = std::sync::Arc::new(move |rejected_hashes| {
-            let inner = rejection_inner.clone();
-            tokio::spawn(async move {
-                let mut guard = inner.lock().await;
-                for hash in &rejected_hashes {
-                    let hash_bytes = hash.as_ref().to_vec();
-                    if let Some(sender) = guard.waiters.remove(&hash_bytes) {
-                        let _ = sender.send(constantinople_mempool::server::InclusionReceipt {
-                            tx_hash: hex(&hash_bytes),
-                            included: false,
-                            height: 0,
-                            status: "Rejected".to_string(),
-                        });
+        let rejection_callback: RejectionCallback<<Sha256 as Hasher>::Digest> =
+            Arc::new(move |rejected_hashes| {
+                let inner = rejection_inner.clone();
+                tokio::spawn(async move {
+                    let mut guard = inner.lock().await;
+                    for hash in &rejected_hashes {
+                        let hash_bytes = hash.as_ref().to_vec();
+                        if let Some(sender) = guard.waiters.remove(&hash_bytes) {
+                            let _ = sender.send(InclusionReceipt {
+                                tx_hash: hex(&hash_bytes),
+                                included: false,
+                                height: 0,
+                                status: "Rejected".to_string(),
+                            });
+                        }
                     }
-                }
+                });
             });
-        });
 
         // Start HTTP server (state_reader filled after DB subscription).
-        let router = constantinople_mempool::server::router(&mempool);
-        let http_addr: std::net::SocketAddr = format!("0.0.0.0:{http_port}").parse().unwrap();
+        let router = router(&mempool);
+        let http_addr: SocketAddr = format!("0.0.0.0:{http_port}").parse().unwrap();
         let http_listener = tokio::net::TcpListener::bind(http_addr)
             .await
             .expect("failed to bind HTTP listener");

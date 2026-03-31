@@ -14,7 +14,7 @@
 use crate::{bootstrapper, types::*};
 use commonware_coding::CodecConfig;
 use commonware_consensus::{
-    Reporters,
+    Reporter, Reporters,
     marshal::{
         self, Update,
         coding::{Marshaled, MarshaledConfig, shards},
@@ -44,14 +44,20 @@ use commonware_runtime::{
 };
 use commonware_storage::{
     archive::immutable,
-    journal::contiguous::variable::Config as VariableJournalConfig,
+    journal::contiguous::{
+        fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
+    },
     mmr::journaled::Config as MmrConfig,
     qmdb::{any::FixedConfig, immutable::Config as ImmutableConfig},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
-use constantinople_application::consensus::Application;
-use constantinople_primitives::BlockCfg;
+use constantinople_application::{
+    consensus::{Application, ReceiptCallback, RejectionCallback},
+    processor::Precompiles,
+};
+use constantinople_mempool::TransactionSource;
+use constantinople_primitives::{Account, Address, BlockCfg};
 use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
@@ -158,13 +164,9 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    pub genesis_allocations: Vec<(
-        constantinople_primitives::Address,
-        constantinople_primitives::Account,
-    )>,
-    pub receipt_callback: Option<constantinople_application::consensus::ReceiptCallback<H::Digest>>,
-    pub rejection_callback:
-        Option<constantinople_application::consensus::RejectionCallback<H::Digest>>,
+    pub genesis_allocations: Vec<(Address, Account)>,
+    pub receipt_callback: Option<ReceiptCallback<H::Digest>>,
+    pub rejection_callback: Option<RejectionCallback<H::Digest>>,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
 
@@ -179,8 +181,8 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     T: Strategy,
-    I: constantinople_mempool::TransactionSource<Commitment, C::PublicKey, H> + Sync,
-    R: constantinople_application::processor::Precompiles + Clone + Send + Sync + 'static,
+    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    R: Precompiles + Clone + Send + Sync + 'static,
 {
     context: ContextCell<E>,
     signer: C,
@@ -221,8 +223,8 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     T: Strategy,
-    I: constantinople_mempool::TransactionSource<Commitment, C::PublicKey, H> + Sync,
-    R: constantinople_application::processor::Precompiles + Clone + Send + Sync + 'static,
+    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    R: Precompiles + Clone + Send + Sync + 'static,
 {
     #[cfg(all(test, feature = "test-utils"))]
     pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
@@ -436,7 +438,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey> + Send + 'static,
         Rx: Receiver<PublicKey = C::PublicKey> + Send + 'static,
-        Rep: commonware_consensus::Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
     {
         spawn_cell!(self.context, self.run(channels, reporter).await)
     }
@@ -445,7 +447,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey>,
         Rx: Receiver<PublicKey = C::PublicKey>,
-        Rep: commonware_consensus::Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
     {
         let marshal_resolver = marshal_resolver::init(
             self.context.as_present(),
@@ -614,7 +616,7 @@ fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig
             thread_pool: None,
             page_cache: page_cache.clone(),
         },
-        journal_config: commonware_storage::journal::contiguous::fixed::Config {
+        journal_config: FixedJournalConfig {
             partition: format!("{partition_prefix}-state-log"),
             items_per_blob: ITEMS_PER_BLOB,
             page_cache: page_cache.clone(),

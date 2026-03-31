@@ -4,6 +4,7 @@ use crate::{
 };
 use bytes::Bytes;
 use commonware_consensus::{
+    Reporter,
     marshal::{self, Identifier},
     types::{Height, View},
 };
@@ -16,14 +17,17 @@ use commonware_cryptography::{
     ed25519,
 };
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
+use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Quota, Storage};
 use commonware_storage::metadata::{Config as MetadataConfig, Metadata};
-use commonware_utils::{N3f1, TryCollect, channel::mpsc, sequence::U64, test_rng};
+use commonware_utils::{Acknowledgement, N3f1, TryCollect, channel::mpsc, sequence::U64, test_rng};
 use constantinople_application::processor::{
     Precompiles,
     executor::Processor,
     frame::{Frame, FrameError},
+    state::StateReader,
 };
+use constantinople_primitives::Address;
 use std::collections::BTreeMap;
 
 pub(crate) type TestHasher = Sha256;
@@ -40,12 +44,12 @@ pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct NoopReporter;
 
-impl commonware_consensus::Reporter for NoopReporter {
+impl Reporter for NoopReporter {
     type Activity = marshal::Update<TestBlock>;
 
     async fn report(&mut self, activity: Self::Activity) {
         if let marshal::Update::Block(_, response) = activity {
-            commonware_utils::Acknowledgement::acknowledge(response);
+            Acknowledgement::acknowledge(response);
         }
     }
 }
@@ -77,9 +81,9 @@ type Fixture = (
     BTreeMap<TestPublicKey, Option<Share>>,
 );
 
-impl<R> commonware_consensus::Reporter for HeightMonitorReporter<R>
+impl<R> Reporter for HeightMonitorReporter<R>
 where
-    R: commonware_consensus::Reporter<Activity = marshal::Update<TestBlock>>,
+    R: Reporter<Activity = marshal::Update<TestBlock>>,
 {
     type Activity = marshal::Update<TestBlock>;
 
@@ -139,19 +143,19 @@ impl ProcessedHeight for ValidatorState {
 pub(crate) struct NoopPrecompiles;
 
 impl Precompiles for NoopPrecompiles {
-    fn is_precompile(&self, _address: constantinople_primitives::Address) -> bool {
+    fn is_precompile(&self, _address: Address) -> bool {
         false
     }
 
     fn execute<S, R>(
         &self,
-        _address: constantinople_primitives::Address,
+        _address: Address,
         _frame: &mut Frame<'_, R>,
         _processor: &Processor<'_, S, Self>,
     ) -> Result<Bytes, FrameError>
     where
-        S: commonware_parallel::Strategy,
-        R: constantinople_application::processor::state::StateReader,
+        S: Strategy,
+        R: StateReader,
     {
         Err(FrameError::InvalidTransactionTarget)
     }

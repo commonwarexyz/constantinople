@@ -13,7 +13,7 @@ use commonware_cryptography::{
 use commonware_runtime::{
     Metrics as _, Runner as _,
     tokio::{
-        Runner,
+        Config as RuntimeConfig, Runner,
         telemetry::{self, Logging},
     },
 };
@@ -22,9 +22,7 @@ use std::collections::BTreeMap;
 use tracing::info;
 
 pub fn setup(args: SetupArgs) {
-    let runner = Runner::new(
-        commonware_runtime::tokio::Config::new().with_worker_threads(args.worker_threads),
-    );
+    let runner = Runner::new(RuntimeConfig::new().with_worker_threads(args.worker_threads));
 
     runner.start(|context| async move {
         telemetry::init(
