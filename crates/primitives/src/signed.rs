@@ -77,10 +77,8 @@ where
 
     /// Creates a new [`Signed`] instance with the given sealed value and signature.
     ///
-    /// # Safety
-    ///
-    /// `signature` must be a valid signature over `inner.seal()`.
-    pub const unsafe fn new_unchecked(inner: Sealed<T, H>, signature: Sig) -> Self {
+    /// The caller must ensure `signature` is a valid signature over `inner.seal()`.
+    pub const fn new_unchecked(inner: Sealed<T, H>, signature: Sig) -> Self {
         Self { inner, signature }
     }
 
@@ -272,7 +270,7 @@ where
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let inner = Sealed::<T, H>::read_cfg(buf, cfg)?;
         let signature = Sig::read(buf)?;
-        Ok(unsafe { Self::new_unchecked(inner, signature) })
+        Ok(Self::new_unchecked(inner, signature))
     }
 }
 
@@ -334,7 +332,7 @@ mod test {
             hasher: &mut H,
         ) -> crate::Sealed<Self, H> {
             hasher.update(&self.0);
-            unsafe { Sealed::new_unchecked(self, hasher.finalize()) }
+            Sealed::new_unchecked(self, hasher.finalize())
         }
     }
 

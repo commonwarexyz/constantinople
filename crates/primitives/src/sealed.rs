@@ -71,10 +71,9 @@ impl<T, H: Hasher> Sealed<T, H> {
     /// Creates a new `Sealed` instance with the given inner value and seal. Does not
     /// require `T` to be [`Sealable`].
     ///
-    /// # Safety
-    /// - Ensure `seal` is the correct seal for `inner`. This function does not check
-    ///   whether the seal matches the inner value's true hash.
-    pub const unsafe fn new_unchecked(inner: T, seal: H::Digest) -> Self {
+    /// The caller must ensure `seal` is the correct seal for `inner`. This function
+    /// does not check whether the seal matches the inner value's true hash.
+    pub const fn new_unchecked(inner: T, seal: H::Digest) -> Self {
         Self { inner, seal }
     }
 
@@ -160,7 +159,7 @@ mod test {
 
         fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
             hasher.update(&self.0);
-            unsafe { Sealed::new_unchecked(self, hasher.finalize()) }
+            Sealed::new_unchecked(self, hasher.finalize())
         }
     }
 

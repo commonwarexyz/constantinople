@@ -135,16 +135,6 @@ pub struct BlockAccessList {
 }
 
 impl BlockAccessList {
-    /// Returns an empty block access list.
-    pub const fn empty() -> Self {
-        Self {
-            tx_offsets: Vec::new(),
-            tx_accesses: Vec::new(),
-            account_writes: Vec::new(),
-            storage_writes: Vec::new(),
-        }
-    }
-
     /// Creates a BAL from per-transaction accesses and final writes.
     ///
     /// Transaction accesses are flattened into `tx_accesses` and partitioned by

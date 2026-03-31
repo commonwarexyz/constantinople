@@ -26,7 +26,6 @@ commonware-parallel.workspace = true
 rand.workspace = true
 bytes.workspace = true
 futures = { workspace = true, features = ["std", "executor"] }
-rand_core.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 commonware-storage.workspace = true

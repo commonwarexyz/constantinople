@@ -252,7 +252,10 @@ where
 
         match loaded {
             Some(StateValue::Account(account)) => account,
-            Some(_) => panic!("proposal account load returned malformed state"),
+            Some(_) => {
+                warn!("proposal account load returned malformed state");
+                Account::default()
+            }
             None => Account::default(),
         }
     }
@@ -264,7 +267,10 @@ where
 
         match loaded {
             Some(StateValue::Storage(value)) => value,
-            Some(_) => panic!("proposal storage load returned malformed state"),
+            Some(_) => {
+                warn!("proposal storage load returned malformed state");
+                Slot::default()
+            }
             None => Slot::default(),
         }
     }

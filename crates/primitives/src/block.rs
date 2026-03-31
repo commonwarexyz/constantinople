@@ -153,14 +153,8 @@ where
 pub struct BlockCfg {
     /// Maximum number of transactions in the block body.
     pub max_transactions: RangeCfg<usize>,
-    /// Maximum number of declared per-transaction offsets in the BAL.
-    pub max_tx_offsets: RangeCfg<usize>,
-    /// Maximum number of declared accesses in the BAL.
-    pub max_tx_accesses: RangeCfg<usize>,
-    /// Maximum number of final account writes in the BAL.
-    pub max_account_writes: RangeCfg<usize>,
-    /// Maximum number of final storage writes in the BAL.
-    pub max_storage_writes: RangeCfg<usize>,
+    /// Codec configuration for the block access list.
+    pub bal: BlockAccessListCfg,
     /// Codec configuration for individual transactions.
     pub transaction: TransactionCfg,
 }
@@ -169,10 +163,7 @@ impl Default for BlockCfg {
     fn default() -> Self {
         Self {
             max_transactions: RangeCfg::new(0..=usize::MAX),
-            max_tx_offsets: RangeCfg::new(0..=usize::MAX),
-            max_tx_accesses: RangeCfg::new(0..=usize::MAX),
-            max_account_writes: RangeCfg::new(0..=usize::MAX),
-            max_storage_writes: RangeCfg::new(0..=usize::MAX),
+            bal: BlockAccessListCfg::default(),
             transaction: TransactionCfg::default(),
         }
     }
@@ -306,15 +297,9 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let tx_vec_cfg = (cfg.max_transactions, cfg.transaction.clone());
-        let bal_cfg = BlockAccessListCfg {
-            max_tx_offsets: cfg.max_tx_offsets,
-            max_tx_accesses: cfg.max_tx_accesses,
-            max_account_writes: cfg.max_account_writes,
-            max_storage_writes: cfg.max_storage_writes,
-        };
         Ok(Self {
             header: Header::read_cfg(buf, &())?,
-            access_list: BlockAccessList::read_cfg(buf, &bal_cfg)?,
+            access_list: BlockAccessList::read_cfg(buf, &cfg.bal)?,
             body: Vec::read_cfg(buf, &tx_vec_cfg)?,
         })
     }
@@ -334,8 +319,7 @@ where
     {
         let digest = self.header.hash_slow(hasher);
 
-        // SAFETY: We computed the seal digest above.
-        unsafe { Sealed::new_unchecked(self, digest) }
+        Sealed::new_unchecked(self, digest)
     }
 }
 

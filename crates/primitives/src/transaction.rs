@@ -151,11 +151,6 @@ impl<D: Digest, P: PublicKey> Transaction<D, P> {
 
         hasher.finalize()
     }
-
-    /// Derives the sender address from the embedded public key.
-    pub fn sender_address<H: Hasher>(&self, hasher: &mut H) -> Address {
-        Address::from_public_key(hasher, &self.sender)
-    }
 }
 
 impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
@@ -199,8 +194,7 @@ impl<D: Digest, P: PublicKey> Sealable for Transaction<D, P> {
     fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
         let seal = self.hash_slow(hasher);
 
-        // SAFETY: We know that `seal` is the correct seal for `self` because we just computed it.
-        unsafe { Sealed::new_unchecked(self, seal) }
+        Sealed::new_unchecked(self, seal)
     }
 }
 
