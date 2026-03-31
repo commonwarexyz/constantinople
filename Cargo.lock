@@ -966,8 +966,6 @@ dependencies = [
  "commonware-utils",
  "constantinople-primitives",
  "reqwest",
- "serde",
- "serde_json",
  "tokio",
 ]
 
@@ -982,7 +980,6 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-glue",
- "commonware-math",
  "commonware-p2p",
  "commonware-parallel",
  "commonware-runtime",
@@ -991,8 +988,6 @@ dependencies = [
  "constantinople-engine",
  "constantinople-mempool",
  "constantinople-primitives",
- "futures",
- "rand 0.8.5",
  "serde",
  "tokio",
  "toml 0.8.23",

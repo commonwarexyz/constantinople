@@ -1,12 +1,17 @@
 //! HTTP mempool server and `TransactionSource` implementation.
 
 use crate::{Finalized, PendingTransaction, SignedTransaction, TransactionSource};
-use axum::{Json, Router, extract::State, http::StatusCode, routing::post};
+use axum::{
+    Json, Router,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    routing::post,
+};
 use commonware_codec::{EncodeSize, Read};
 use commonware_consensus::{Reporter, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::{from_hex, hex};
-use constantinople_primitives::{Header, TransactionCfg};
+use constantinople_primitives::{Header, Receipt, TransactionCfg};
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -38,10 +43,10 @@ pub struct MempoolConfig {
 }
 
 /// Shared mempool state between HTTP handlers and the TransactionSource.
-pub struct MempoolInner<H: Hasher, P: PublicKey> {
-    pub pending: VecDeque<PendingTransaction<P, H>>,
-    pub pending_bytes: usize,
-    pub waiters: HashMap<Vec<u8>, oneshot::Sender<InclusionReceipt>>,
+struct MempoolInner<H: Hasher, P: PublicKey> {
+    pending: VecDeque<PendingTransaction<P, H>>,
+    pending_bytes: usize,
+    waiters: HashMap<Vec<u8>, oneshot::Sender<InclusionReceipt>>,
 }
 
 /// HTTP mempool that implements `TransactionSource`.
@@ -90,16 +95,36 @@ where
         }
     }
 
-    pub fn inner(&self) -> Arc<Mutex<MempoolInner<H, P>>> {
-        self.inner.clone()
+    /// Notifies waiters that their transactions were included in a finalized block.
+    pub async fn notify_included(&self, height: u64, receipts: &[Receipt<H::Digest>]) {
+        let mut inner = self.inner.lock().await;
+        for receipt in receipts {
+            let hash = receipt.transaction_hash.as_ref().to_vec();
+            if let Some(sender) = inner.waiters.remove(&hash) {
+                let _ = sender.send(InclusionReceipt {
+                    tx_hash: hex(&hash),
+                    included: true,
+                    height,
+                    status: format!("{:?}", receipt.status),
+                });
+            }
+        }
     }
 
-    pub const fn config(&self) -> MempoolConfig {
-        self.config
-    }
-
-    pub const fn transaction_namespace(&self) -> &'static [u8] {
-        self.transaction_namespace
+    /// Notifies waiters that their transactions were rejected.
+    pub async fn notify_rejected(&self, rejected_hashes: &[H::Digest]) {
+        let mut inner = self.inner.lock().await;
+        for hash in rejected_hashes {
+            let hash_bytes = hash.as_ref().to_vec();
+            if let Some(sender) = inner.waiters.remove(&hash_bytes) {
+                let _ = sender.send(InclusionReceipt {
+                    tx_hash: hex(&hash_bytes),
+                    included: false,
+                    height: 0,
+                    status: "Rejected".to_string(),
+                });
+            }
+        }
     }
 }
 
@@ -191,7 +216,7 @@ where
             return Err((StatusCode::SERVICE_UNAVAILABLE, "mempool full".to_string()));
         }
         inner.pending_bytes += tx_bytes;
-        inner.waiters.insert(hash, sender);
+        inner.waiters.insert(hash.clone(), sender);
         inner.pending.push_back(tx);
     }
 
@@ -203,7 +228,11 @@ where
             StatusCode::INTERNAL_SERVER_ERROR,
             "waiter dropped".to_string(),
         )),
-        Err(_) => Err((StatusCode::REQUEST_TIMEOUT, "inclusion timeout".to_string())),
+        Err(_) => {
+            let mut inner = state.inner.lock().await;
+            inner.waiters.remove(&hash);
+            Err((StatusCode::REQUEST_TIMEOUT, "inclusion timeout".to_string()))
+        }
     }
 }
 
@@ -226,13 +255,14 @@ where
     H: Hasher + Send + Sync + 'static,
 {
     let state = Arc::new(RouterState {
-        inner: mempool.inner(),
-        namespace: mempool.transaction_namespace(),
-        max_pool_bytes: mempool.config().max_pool_bytes,
+        inner: mempool.inner.clone(),
+        namespace: mempool.transaction_namespace,
+        max_pool_bytes: mempool.config.max_pool_bytes,
         _marker: std::marker::PhantomData::<C>,
     });
 
     Router::new()
         .route("/tx", post(submit_tx::<C, P, H>))
+        .layer(DefaultBodyLimit::max(1024 * 1024))
         .with_state(state)
 }

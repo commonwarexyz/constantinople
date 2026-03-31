@@ -110,8 +110,8 @@ pub const TRANSACTION_RESOLVER_CHANNEL: u64 = 6;
 /// Bootstrapper channel id.
 pub const BOOTSTRAPPER_CHANNEL: u64 = 7;
 
-/// Channel ids expected by [`Channels`] in registration order.
-pub const CHANNELS: [u64; 7] = [
+/// All channel ids used by the engine, including the bootstrapper.
+pub const CHANNELS: [u64; 8] = [
     VOTE_CHANNEL,
     CERTIFICATE_CHANNEL,
     RESOLVER_CHANNEL,
@@ -119,6 +119,7 @@ pub const CHANNELS: [u64; 7] = [
     MARSHAL_RESOLVER_CHANNEL,
     STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL,
+    BOOTSTRAPPER_CHANNEL,
 ];
 
 /// Registered physical channels required by the engine.
@@ -194,7 +195,10 @@ where
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, R, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
-    #[allow(clippy::type_complexity)]
+    #[expect(
+        clippy::type_complexity,
+        reason = "marshal actor type is inherently complex"
+    )]
     marshal: MarshalActor<
         E,
         EngineVariant<H, C::PublicKey>,

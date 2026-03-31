@@ -1,9 +1,6 @@
 //! `run` subcommand — starts a validator from a TOML config.
 
-use crate::{
-    cli::StartupArg,
-    config::{ValidatorConfig, decode_public_key},
-};
+use crate::{cli::StartupArg, config::ValidatorConfig};
 use commonware_codec::Encode;
 use commonware_consensus::{
     Heightable, Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
@@ -31,7 +28,7 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
-use constantinople_mempool::server::{InclusionReceipt, Mempool, MempoolConfig, router};
+use constantinople_mempool::server::{Mempool, MempoolConfig, router};
 use constantinople_primitives::Address;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
@@ -110,6 +107,13 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             "starting validator"
         );
 
+        // Collect all validator public keys before moving bootstrappers.
+        let all_pks = {
+            let mut pks = vec![decoded.public_key.clone()];
+            pks.extend(decoded.bootstrappers.iter().map(|(pk, _)| pk.clone()));
+            pks
+        };
+
         // Build the p2p network.
         let (mut network, mut oracle) = discovery::Network::new(
             context.with_label("p2p"),
@@ -124,13 +128,6 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
         );
 
         // Register all validators as peers.
-        let all_pks = {
-            let mut pks = vec![decoded.public_key.clone()];
-            for b in &cfg.bootstrappers {
-                pks.push(decode_public_key(&b.public_key));
-            }
-            pks
-        };
         oracle
             .track(0, all_pks.into_iter().try_collect().unwrap())
             .await;
@@ -197,49 +194,27 @@ pub fn run(config_path: PathBuf, mode: StartupArg) {
             },
         );
 
-        let mempool_inner = mempool.inner();
+        let receipt_mempool = mempool.clone();
         let receipt_callback: ReceiptCallback<<Sha256 as Hasher>::Digest> =
             Arc::new(move |height, receipts| {
-                let inner = mempool_inner.clone();
+                let mempool = receipt_mempool.clone();
                 tokio::spawn(async move {
-                    let mut guard = inner.lock().await;
-                    for receipt in &receipts {
-                        let hash = receipt.transaction_hash.as_ref().to_vec();
-                        if let Some(sender) = guard.waiters.remove(&hash) {
-                            let _ = sender.send(InclusionReceipt {
-                                tx_hash: hex(&hash),
-                                included: true,
-                                height,
-                                status: format!("{:?}", receipt.status),
-                            });
-                        }
-                    }
+                    mempool.notify_included(height, &receipts).await;
                 });
             });
 
-        let rejection_inner = mempool.inner();
+        let rejection_mempool = mempool.clone();
         let rejection_callback: RejectionCallback<<Sha256 as Hasher>::Digest> =
             Arc::new(move |rejected_hashes| {
-                let inner = rejection_inner.clone();
+                let mempool = rejection_mempool.clone();
                 tokio::spawn(async move {
-                    let mut guard = inner.lock().await;
-                    for hash in &rejected_hashes {
-                        let hash_bytes = hash.as_ref().to_vec();
-                        if let Some(sender) = guard.waiters.remove(&hash_bytes) {
-                            let _ = sender.send(InclusionReceipt {
-                                tx_hash: hex(&hash_bytes),
-                                included: false,
-                                height: 0,
-                                status: "Rejected".to_string(),
-                            });
-                        }
-                    }
+                    mempool.notify_rejected(&rejected_hashes).await;
                 });
             });
 
         // Start HTTP server (state_reader filled after DB subscription).
         let router = router(&mempool);
-        let http_addr: SocketAddr = format!("0.0.0.0:{http_port}").parse().unwrap();
+        let http_addr: SocketAddr = format!("127.0.0.1:{http_port}").parse().unwrap();
         let http_listener = tokio::net::TcpListener::bind(http_addr)
             .await
             .expect("failed to bind HTTP listener");

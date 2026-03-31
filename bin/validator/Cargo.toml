@@ -15,14 +15,13 @@ workspace = true
 [dependencies]
 constantinople-engine.workspace = true
 constantinople-application.workspace = true
-constantinople-mempool = { workspace = true, features = ["mocks"] }
+constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
 
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-glue.workspace = true
-commonware-math = { workspace = true, features = ["std"] }
 commonware-p2p.workspace = true
 commonware-parallel = { workspace = true, features = ["std"] }
 commonware-runtime.workspace = true
@@ -31,8 +30,6 @@ commonware-utils.workspace = true
 axum = "0.8"
 bytes.workspace = true
 clap = { version = "4", features = ["derive"] }
-futures.workspace = true
-rand.workspace = true
 serde = { workspace = true, features = ["derive", "std"] }
 toml = "0.8"
 tracing.workspace = true

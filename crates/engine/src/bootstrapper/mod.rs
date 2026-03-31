@@ -14,7 +14,10 @@
 //! They do not poll the actor aggressively, which keeps outbound fanout low and
 //! avoids peer rate limits.
 //!
-//! Byzantine safety relies on a strict-majority assumption for peer set `0`.
+//! Reliability relies on a strict-majority assumption for peer set `0`:
+//! the finalization certificate is verified independently, so the quorum
+//! only ensures we have a reliable sync target rather than trusting a
+//! single peer.
 //! The actor only counts one response per peer and rejects malformed messages,
 //! invalid certificates, and block/finalization mismatches before they can
 //! influence the vote count.

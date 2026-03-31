@@ -21,7 +21,7 @@ constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
 
 commonware-broadcast.workspace = true
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
+commonware-coding.workspace = true
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true

@@ -2,7 +2,10 @@
 
 use crate::{
     cli::SetupArgs,
-    config::{BootstrapperEntry, GenesisAllocation, GenesisFile, ValidatorConfig},
+    config::{
+        BootstrapperEntry, GenesisAllocation, GenesisFile, ValidatorConfig, default_max_pool_bytes,
+        default_max_propose_bytes,
+    },
 };
 use commonware_codec::Encode;
 use commonware_cryptography::{
@@ -73,7 +76,10 @@ pub fn setup(args: SetupArgs) {
             let signer = &signers[idx];
             let pk = &public_keys[idx];
             let share = shares.get(pk).expect("missing share for validator");
-            let listen = format!("127.0.0.1:{}", args.base_port + i as u16);
+            let listen = format!(
+                "127.0.0.1:{}",
+                args.base_port.checked_add(i as u16).expect("port overflow")
+            );
 
             let bootstrappers: Vec<BootstrapperEntry> = public_keys
                 .iter()
@@ -81,7 +87,10 @@ pub fn setup(args: SetupArgs) {
                 .filter(|(j, _)| *j != idx)
                 .map(|(j, peer_pk)| BootstrapperEntry {
                     public_key: hex(&peer_pk.encode()),
-                    address: format!("127.0.0.1:{}", args.base_port + j as u16),
+                    address: format!(
+                        "127.0.0.1:{}",
+                        args.base_port.checked_add(j as u16).expect("port overflow")
+                    ),
                 })
                 .collect();
 
@@ -95,9 +104,12 @@ pub fn setup(args: SetupArgs) {
                 num_validators: args.validators,
                 log_level: args.log_level.to_string(),
                 worker_threads: args.worker_threads,
-                http_port: args.base_http_port + i as u16,
-                max_propose_bytes: 4 * 1024 * 1024,
-                max_pool_bytes: 64 * 1024 * 1024,
+                http_port: args
+                    .base_http_port
+                    .checked_add(i as u16)
+                    .expect("HTTP port overflow"),
+                max_propose_bytes: default_max_propose_bytes(),
+                max_pool_bytes: default_max_pool_bytes(),
                 bootstrappers,
                 genesis_allocations: genesis_allocations.clone(),
             };

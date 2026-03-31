@@ -14,11 +14,11 @@ use commonware_utils::{NZU32, from_hex};
 use constantinople_primitives::{Account, Address};
 use std::net::SocketAddr;
 
-const fn default_max_propose_bytes() -> usize {
+pub(crate) const fn default_max_propose_bytes() -> usize {
     4 * 1024 * 1024 // 4 MiB
 }
 
-const fn default_max_pool_bytes() -> usize {
+pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024 // 64 MiB
 }
 
@@ -145,9 +145,4 @@ impl ValidatorConfig {
             genesis_allocations,
         }
     }
-}
-
-pub fn decode_public_key(hex_str: &str) -> ed25519::PublicKey {
-    let bytes = decode_hex("public_key", hex_str);
-    ed25519::PublicKey::read(&mut &bytes[..]).expect("failed to decode public key")
 }
