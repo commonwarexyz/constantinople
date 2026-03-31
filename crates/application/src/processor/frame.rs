@@ -328,6 +328,12 @@ impl<'a, R: StateReader> Frame<'a, R> {
             return Err(FrameError::WriteProtection);
         }
 
+        // Record the full write dependency before applying balance math so
+        // proposal-time discovery and verifier-side execution agree even when
+        // the transfer later reverts on underflow or overflow.
+        self.record_account_access(from, AccessMode::Write);
+        self.record_account_access(to, AccessMode::Write);
+
         if from == to {
             // Read + write records Write access without modifying state.
             let account = self.account(from);

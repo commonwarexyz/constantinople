@@ -18,7 +18,7 @@ use bytes::Bytes;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    BlockAccessList, Receipt, ReceiptStatus, Slot, StateValue, VerifiedTransaction,
+    Address, BlockAccessList, Receipt, ReceiptStatus, Slot, StateValue, VerifiedTransaction,
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -93,6 +93,11 @@ where
     S: Strategy,
     P: Precompiles + Sync,
 {
+    fn is_precompile(&self, address: Address) -> Result<bool, FrameError> {
+        catch_unwind(AssertUnwindSafe(|| self.precompiles.is_precompile(address)))
+            .map_err(|_| FrameError::PrecompilePanic)
+    }
+
     /// Creates a processor with the given execution strategy and precompile
     /// registry.
     pub const fn new(strategy: &'a S, precompiles: &'a P) -> Self {
@@ -121,11 +126,12 @@ where
             let tx = transaction.value();
             let base = state.account(sender);
             let nonce = pending_nonces.get(&sender).copied().unwrap_or(base.nonce);
+            let is_precompile = matches!(self.is_precompile(tx.to), Ok(true));
 
             let is_valid = nonce == tx.nonce
                 && nonce != u64::MAX
                 && base.balance >= tx.value
-                && (self.precompiles.is_precompile(tx.to) || tx.input.is_empty());
+                && (is_precompile || tx.input.is_empty());
 
             if !is_valid {
                 invalid.push(transaction);
@@ -310,8 +316,19 @@ where
         }
 
         let tx = transaction.value();
+        let is_precompile = match self.is_precompile(tx.to) {
+            Ok(is_precompile) => is_precompile,
+            Err(_) => {
+                let (diff, observed_accesses) = prelude.into_parts();
+                return Ok(TransactionExecution {
+                    receipt: Receipt::revert(*transaction.message_digest(), Bytes::new()),
+                    diff,
+                    observed_accesses: observed_accesses.into_access_list(),
+                });
+            }
+        };
         let mut root = prelude.child_with_depth(sender, 0, 0, Bytes::new());
-        let result = if self.precompiles.is_precompile(tx.to) {
+        let result = if is_precompile {
             root.call(self, tx.to, tx.value, tx.input.clone())
         } else {
             root.transfer(tx.to, tx.value).map(|()| Bytes::new())
@@ -372,7 +389,7 @@ where
             return Err(FrameError::CallDepthExceeded);
         }
 
-        if !self.precompiles.is_precompile(to) {
+        if !self.is_precompile(to)? {
             return Err(FrameError::InvalidTransactionTarget);
         }
 

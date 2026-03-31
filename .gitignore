@@ -1,1 +1,4 @@
 /target
+/test
+genesis.toml
+mprocs.log

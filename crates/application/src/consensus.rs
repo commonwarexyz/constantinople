@@ -909,31 +909,40 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Application, WireBlock, block_access_list_hash};
+    use super::{
+        Application, ProcessorError, StateDatabase, WireBlock, block_access_list_hash, load_state,
+    };
     use crate::processor::{
         Precompiles,
         executor::Processor,
         frame::{Frame, FrameError},
+        keys::{account_key, storage_key},
     };
     use bytes::Bytes;
-    use commonware_codec::{Decode, Encode};
+    use commonware_codec::{Decode, DecodeExt, Encode, FixedSize};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Round, View},
     };
     use commonware_cryptography::{Digest, Signer, blake3, ed25519, secp256r1::recoverable};
+    use commonware_glue::stateful::db::ManagedDb;
     use commonware_parallel::{Sequential, Strategy};
     use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
-        journal::contiguous::variable::Config as VariableJournalConfig,
+        journal::contiguous::{
+            fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
+        },
         mmr::journaled::Config as MmrConfig,
-        qmdb::immutable::{Config as ImmutableConfig, Immutable},
+        qmdb::{
+            any::{FixedConfig, unordered::fixed},
+            immutable::{Config as ImmutableConfig, Immutable},
+        },
         translator::EightCap,
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, sync::AsyncRwLock};
     use constantinople_primitives::{
-        Address, Block, BlockAccessList, BlockCfg, Header, Sealable, SignedTransaction,
-        Transaction, VerifiedTransaction,
+        Access, AccessMode, Address, Block, BlockAccessList, BlockCfg, Header, Sealable,
+        SignedTransaction, Slot, StateValue, Transaction, VerifiedTransaction,
     };
     use core::marker::PhantomData;
     use std::sync::Arc;
@@ -946,6 +955,7 @@ mod tests {
     type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
     type TestTransactionDb =
         Arc<AsyncRwLock<Immutable<TestContext, blake3::Digest, (), TestHasher, EightCap>>>;
+    type TestStateDb = StateDatabase<TestContext, TestHasher, EightCap>;
     type VerifyTestPublicKey = ed25519::PublicKey;
     type VerifyTestSignedTransaction = SignedTransaction<VerifyTestPublicKey, TestHasher>;
     type VerifyTestTransaction = VerifiedTransaction<VerifyTestPublicKey, TestHasher>;
@@ -996,11 +1006,63 @@ mod tests {
         }
     }
 
+    fn state_db_config(suffix: &str, context: &TestContext) -> FixedConfig<EightCap> {
+        let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
+        FixedConfig {
+            mmr_config: MmrConfig {
+                journal_partition: format!("state-journal-{suffix}"),
+                metadata_partition: format!("state-metadata-{suffix}"),
+                items_per_blob: NZU64!(11),
+                write_buffer: NZUsize!(1024),
+                thread_pool: None,
+                page_cache: page_cache.clone(),
+            },
+            journal_config: FixedJournalConfig {
+                partition: format!("state-log-{suffix}"),
+                items_per_blob: NZU64!(7),
+                page_cache,
+                write_buffer: NZUsize!(1024),
+            },
+            translator: EightCap,
+        }
+    }
+
     async fn open_transaction_db(context: TestContext, suffix: &str) -> TestTransactionDb {
         let db = Immutable::init(context.clone(), transaction_db_config(suffix, &context))
             .await
             .expect("transaction db init should succeed");
         Arc::new(AsyncRwLock::new(db))
+    }
+
+    async fn open_state_db(context: TestContext, suffix: &str) -> TestStateDb {
+        let db = fixed::Db::init(context.clone(), state_db_config(suffix, &context))
+            .await
+            .expect("state db init should succeed");
+        Arc::new(AsyncRwLock::new(db))
+    }
+
+    async fn write_state(db: &TestStateDb, writes: impl IntoIterator<Item = (Slot, StateValue)>) {
+        let mut db = db.write().await;
+        let mut batch = db.new_batch();
+        for (key, value) in writes {
+            batch = batch.write(key, Some(value));
+        }
+        let finalized = batch
+            .merkleize(None, &db)
+            .await
+            .expect("state merkleization should succeed")
+            .finalize();
+        db.apply_batch(finalized)
+            .await
+            .expect("state batch apply should succeed");
+    }
+
+    fn address(byte: u8) -> Address {
+        Address::decode(&[byte; Address::SIZE][..]).expect("address bytes should decode")
+    }
+
+    fn slot(byte: u8) -> Slot {
+        Slot::from([byte; Slot::SIZE])
     }
 
     fn signed_transaction(nonce: u64) -> TestTransaction {
@@ -1146,5 +1208,54 @@ mod tests {
             .expect("tampered block should still decode");
 
         assert!(application.verify_block(&decoded).is_none());
+    }
+
+    #[test]
+    fn malformed_loaded_account_value_returns_error() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let db = open_state_db(context, "malformed-account-value").await;
+            let sender = address(0x90);
+
+            write_state(
+                &db,
+                [(account_key(sender), StateValue::Storage(slot(0x01)))],
+            )
+            .await;
+
+            let batch = ManagedDb::new_batch(&db).await;
+            let access_list = BlockAccessList::from_transactions(
+                [vec![Access::Account(sender, AccessMode::Write)]],
+                Vec::new(),
+                Vec::new(),
+            );
+
+            let result = load_state(&batch, &access_list).await;
+            assert!(matches!(result, Err(ProcessorError::MalformedState)));
+        });
+    }
+
+    #[test]
+    fn malformed_loaded_storage_value_returns_error() {
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let db = open_state_db(context, "malformed-storage-value").await;
+            let owner = address(0x95);
+            let storage_slot = slot(0x96);
+            let mut hasher = TestHasher::default();
+            let key = storage_key(&mut hasher, owner, storage_slot);
+
+            write_state(&db, [(key, StateValue::Account(Default::default()))]).await;
+
+            let batch = ManagedDb::new_batch(&db).await;
+            let access_list = BlockAccessList::from_transactions(
+                [vec![Access::Storage(owner, storage_slot, AccessMode::Read)]],
+                Vec::new(),
+                Vec::new(),
+            );
+
+            let result = load_state(&batch, &access_list).await;
+            assert!(matches!(result, Err(ProcessorError::MalformedState)));
+        });
     }
 }
