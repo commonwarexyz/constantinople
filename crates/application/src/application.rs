@@ -87,9 +87,11 @@ type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleize
 /// Merkleized transaction database produced after finalization.
 type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
 
-/// Maximum accepted block timestamp in milliseconds since the Unix epoch.
-const MAX_BLOCK_TIMESTAMP_MS: u64 = 253_402_300_799_999;
-
+/// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
+///
+/// Different platforms have different `SystemTime` limits, so we use a fixed
+/// timestamp to ensure consistent application of block validity rules.
+const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Unmerkleized application state batch used for processor read-through.
 pub type StateBatch<E, H, T> = AnyUnmerkleized<
@@ -209,8 +211,8 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let mut accounts = HashSet::new();
-    let mut storage = HashSet::new();
+    let mut accounts = HashSet::with_capacity(transactions.len() * 2);
+    let mut storage = HashSet::with_capacity(transactions.len() * 2);
 
     for transaction in transactions {
         let sender = transaction.signer();
@@ -710,7 +712,8 @@ where
             .finalize_execution(sb, tb, &output.receipts)
             .await
             .expect("database merkleization during verification must succeed");
-        let transactions_end = parent.header.transactions_range.end() + block.body.len() as u64 + 1;
+        let transactions_end =
+            parent.header.transactions_range.end() + verified_block.body.len() as u64 + 1;
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),

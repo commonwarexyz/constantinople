@@ -2,7 +2,7 @@
 //!
 //! This module owns the processor entrypoint that executes signed
 //! transactions over a prebuilt in-memory [`State`] snapshot. Processing has
-//! four stages:
+//! five stages:
 //!
 //! - load or otherwise construct the in-memory [`State`] snapshot
 //! - statically validate each transaction against the visible in-memory state
