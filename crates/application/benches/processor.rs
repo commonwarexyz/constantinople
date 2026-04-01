@@ -1,3 +1,4 @@
+use commonware_codec::{DecodeExt, FixedSize};
 use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
 use commonware_math::algebra::Random;
 use commonware_parallel::{Rayon, Sequential, Strategy};
@@ -120,7 +121,7 @@ impl BenchFixture {
         let processor = Processor::new(strategy);
         let validation = processor.validate(&self.state, self.transactions.clone());
         processor
-            .verify(self.state.clone(), &validation.valid)
+            .execute(self.state.clone(), &validation.valid)
             .changeset
             .len()
     }
