@@ -8,12 +8,12 @@
 //! loop on the mailbox themselves because repeated fanout requests will run into
 //! peer rate limits.
 //!
-//! Safety relies on a strict-majority assumption for peer set `0`. Every remote
+//! Safety relies on an `f+1` assumption for peer set `0`. Every remote
 //! response is validated before it can influence target selection:
 //! - the finalization certificate must verify against the configured threshold scheme
 //! - the certificate payload must match the provided block digest
 //! - only one response per peer counts in a round
-//! - the pending fetch resolves only when a strict majority reports the same tip
+//! - the pending fetch resolves only when `f+1` peers report the same tip
 //!
 //! Peers only answer when they have a locally verified finalized tip. Nodes
 //! without a safe tip stay silent for that round.
@@ -34,6 +34,7 @@ use commonware_cryptography::{
 };
 use commonware_macros::select_loop;
 use commonware_p2p::{Blocker, Provider, Receiver, Recipients, Sender};
+use commonware_utils::{Faults, N3f1};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Clock, ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::channel::{fallible::OneshotExt, mpsc, oneshot};
@@ -309,7 +310,8 @@ where
     pub fn new(context: E, config: Config<B, M, P, V>) -> (Self, Mailbox<H, P, V>) {
         let (sender, mailbox) = mpsc::channel(config.mailbox_size);
         let mailbox_handle = Mailbox::new(sender);
-        let quorum = config.scheme.participants().len() / 2 + 1;
+        let n = config.scheme.participants().len();
+        let quorum = N3f1::max_faults(n) as usize + 1;
 
         (
             Self {

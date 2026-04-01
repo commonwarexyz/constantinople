@@ -293,7 +293,7 @@ impl Precompiles for BenchPrecompiles {
         for step in program {
             match step {
                 BenchStep::ReadStorage(slot) => {
-                    let _ = frame.read_storage(*slot)?;
+                    let _ = frame.read_self_storage(*slot)?;
                 }
                 BenchStep::WriteInputValue(slot) => {
                     let value = Slot::decode(frame.input().as_ref())

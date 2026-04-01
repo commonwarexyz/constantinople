@@ -288,10 +288,10 @@ impl Precompiles for TestPrecompiles {
                     assert_eq!(value, expected, "unexpected storage value");
                 }
                 PrecompileStep::ReadStorage(slot) => {
-                    let _ = frame.read_storage(slot)?;
+                    let _ = frame.read_self_storage(slot)?;
                 }
                 PrecompileStep::AssertReadStorage(slot, expected) => {
-                    let value = frame.read_storage(slot)?;
+                    let value = frame.read_self_storage(slot)?;
                     assert_eq!(value, expected, "unexpected owner storage value");
                 }
                 PrecompileStep::WriteStorage(slot, value) => {

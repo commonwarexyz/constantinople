@@ -328,8 +328,7 @@ impl<H: Hasher, C, S, P, I, R, St> Application<H, C, S, P, I, R, St> {
     /// The application keeps the precompile registry, execution strategy,
     /// genesis leader, and transaction signing namespace for all later block
     /// proposal, verification, and application.
-    #[allow(clippy::missing_const_for_fn)]
-    pub fn new(
+    pub const fn new(
         precompiles: R,
         strategy: St,
         genesis_leader: P,

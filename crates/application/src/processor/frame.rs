@@ -134,27 +134,17 @@ impl<'a, R: StateReader> Frame<'a, R> {
         &self.input
     }
 
-    /// Returns the visible account value for the frame owner.
-    pub(super) fn owner_account(&mut self) -> Account {
-        self.account(self.owner)
-    }
-
-    /// Records a new visible account value for the frame owner.
-    pub(super) fn set_owner_account(&mut self, account: Account) {
-        self.set_account(self.owner, account);
-    }
-
     /// Applies the sender nonce bump outside the revertible transaction body.
     ///
     /// The nonce increment is recorded in the prelude frame and committed
     /// immediately so it survives root-frame reverts.
     pub(super) fn bump_sender_nonce(&mut self) -> Result<(), FrameError> {
-        let mut account = self.owner_account();
+        let mut account = self.account(self.owner);
         account.nonce = account
             .nonce
             .checked_add(1)
             .ok_or(FrameError::BadTransactionNonce)?;
-        self.set_owner_account(account);
+        self.set_account(self.owner, account);
         Ok(())
     }
 
@@ -184,7 +174,7 @@ impl<'a, R: StateReader> Frame<'a, R> {
     ///
     /// Returns [`FrameError::AccessViolation`] if the transaction did not
     /// declare storage access for `(address, slot)`.
-    pub fn inspect_storage(&mut self, address: Address, slot: Slot) -> Result<Slot, FrameError> {
+    pub fn read_storage(&mut self, address: Address, slot: Slot) -> Result<Slot, FrameError> {
         if !self.access.can_read_storage(address, slot) {
             return Err(FrameError::AccessViolation);
         }
@@ -193,8 +183,8 @@ impl<'a, R: StateReader> Frame<'a, R> {
     }
 
     /// Returns the visible storage value for the frame owner.
-    pub fn read_storage(&mut self, slot: Slot) -> Result<Slot, FrameError> {
-        self.inspect_storage(self.owner, slot)
+    pub fn read_self_storage(&mut self, slot: Slot) -> Result<Slot, FrameError> {
+        self.read_storage(self.owner, slot)
     }
 
     /// Records a new visible storage value for the frame owner.
@@ -541,7 +531,7 @@ mod tests {
             4
         );
         assert_eq!(
-            root.inspect_storage(child_address, child_slot)
+            root.read_storage(child_address, child_slot)
                 .expect("child storage should be visible"),
             slot(0x66)
         );
@@ -576,12 +566,12 @@ mod tests {
         drop(child);
 
         assert_eq!(
-            root.inspect_storage(root_address, root_slot)
+            root.read_storage(root_address, root_slot)
                 .expect("root storage should be visible"),
             slot(0x77)
         );
         assert_eq!(
-            root.inspect_storage(child_address, child_slot)
+            root.read_storage(child_address, child_slot)
                 .expect("child storage should be visible"),
             Slot::default()
         );
@@ -680,7 +670,7 @@ mod tests {
         );
 
         assert_eq!(
-            frame.inspect_storage(recipient, other_slot),
+            frame.read_storage(recipient, other_slot),
             Err(FrameError::AccessViolation)
         );
         assert_eq!(
