@@ -119,12 +119,12 @@ where
     pub fn into_verified(
         self,
         namespace: &[u8],
-    ) -> Result<VerifiedBy<Transaction<D, P>, H, P>, Self> {
+    ) -> Result<Verified<Transaction<D, P>, H, P::Signature>, Self> {
         if !self.verify(namespace, &self.value().sender) {
             return Err(self);
         }
 
-        Ok(verified_transaction(self))
+        Ok(self.into())
     }
 }
 
@@ -144,7 +144,7 @@ where
         signer: &S,
         namespace: &[u8],
         hasher: &mut H,
-    ) -> VerifiedBy<Self, H, P>
+    ) -> Verified<Self, H, P::Signature>
     where
         H: Hasher<Digest = D>,
         S: Signer<PublicKey = P, Signature = <P as Verifier>::Signature>,
@@ -156,7 +156,7 @@ where
         );
 
         let signed = Signed::new(self.seal(hasher), namespace, signer);
-        verified_transaction(signed)
+        signed.into()
     }
 }
 
@@ -292,22 +292,20 @@ pub trait Signable: Sealable {
 
 impl<T: Sealable> Signable for T {}
 
-type VerifiedBy<T, H, P> = Verified<T, H, <P as Verifier>::Signature>;
-
-/// Converts a [`Signed<Transaction>`] into a [`Verified<Signed<Transaction>>`].
-fn verified_transaction<D, P, H>(
-    signed: Signed<Transaction<D, P>, H, <P as Verifier>::Signature>,
-) -> VerifiedBy<Transaction<D, P>, H, P>
+impl<D, P, H> From<Signed<Transaction<D, P>, H, P::Signature>>
+    for Verified<Transaction<D, P>, H, P::Signature>
 where
     D: Digest,
     P: PublicKey,
     H: Hasher,
 {
-    let mut hasher = H::default();
-    let signer = Address::from_public_key(&mut hasher, &signed.value().sender);
-    Verified {
-        inner: signed,
-        signer,
+    fn from(signed: Signed<Transaction<D, P>, H, P::Signature>) -> Self {
+        let mut hasher = H::default();
+        let signer = Address::from_public_key(&mut hasher, &signed.value().sender);
+        Verified {
+            inner: signed,
+            signer,
+        }
     }
 }
 

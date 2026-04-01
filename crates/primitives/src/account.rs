@@ -14,6 +14,9 @@ use core::ops::Deref;
 use derive_more::{AsRef, Debug, Display};
 use rand_core::CryptoRngCore;
 
+/// Default starting balance for accounts that have not been written yet.
+pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
+
 /// A 20-byte account address, derived by hashing a [`PublicKey`].
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Display, AsRef)]
 #[display("{}", hex(self.0.as_ref()))]
@@ -96,9 +99,6 @@ macro_rules! address {
         const { $crate::Address::new(::commonware_utils::hex!($s)) }
     };
 }
-
-/// Default starting balance for accounts that have not been written yet.
-pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 
 /// An account, as represented in the state of the chain.
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -8,7 +8,7 @@ mod signed;
 pub use signed::{Signable, Signed, Verified};
 
 mod account;
-pub use account::{Account, Address};
+pub use account::{Account, Address, DEFAULT_ACCOUNT_BALANCE};
 
 mod block;
 pub use block::{

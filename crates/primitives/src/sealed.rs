@@ -25,17 +25,6 @@ pub struct Sealed<T, H: Hasher> {
     seal: H::Digest,
 }
 
-#[cfg(any(feature = "arbitrary", test))]
-impl<'a, T, H> arbitrary::Arbitrary<'a> for Sealed<T, H>
-where
-    T: arbitrary::Arbitrary<'a> + Sealable<SealDigest = H::Digest>,
-    H: Hasher,
-{
-    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(u.arbitrary::<T>()?.seal(&mut H::new()))
-    }
-}
-
 impl<T, H> PartialEq for Sealed<T, H>
 where
     T: PartialEq,
@@ -141,6 +130,17 @@ where
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let inner = T::read_cfg(buf, cfg)?;
         Ok(inner.seal(&mut H::new()))
+    }
+}
+
+#[cfg(any(feature = "arbitrary", test))]
+impl<'a, T, H> arbitrary::Arbitrary<'a> for Sealed<T, H>
+where
+    T: arbitrary::Arbitrary<'a> + Sealable<SealDigest = H::Digest>,
+    H: Hasher,
+{
+    fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
+        Ok(u.arbitrary::<T>()?.seal(&mut H::new()))
     }
 }
 
