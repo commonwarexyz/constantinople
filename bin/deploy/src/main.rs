@@ -20,6 +20,7 @@ use std::{
     fs,
     num::{NonZeroU32, NonZeroUsize},
     path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 const STORAGE_CLASS: &str = "gp3";
@@ -79,8 +80,6 @@ pub(crate) struct LocalArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct RemoteArgs {
-    #[arg(long)]
-    tag: String,
     #[arg(long)]
     validator_binary: PathBuf,
     #[arg(long, value_delimiter = ',')]
@@ -255,4 +254,13 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) fn generate_deployer_tag() -> String {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    let process_id = std::process::id();
+    format!("{timestamp:x}-{process_id:x}")
 }

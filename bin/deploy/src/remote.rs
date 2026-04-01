@@ -2,7 +2,8 @@ use crate::{
     ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
     SPAMMER_CONFIG_FILE, SPAMMER_INSTANCE_NAME, STORAGE_CLASS, ValidatorConfig, absolute_path,
     build_spammer_config, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_cluster_material, write_yaml_config,
+    ensure_output_dir_missing, generate_cluster_material, generate_deployer_tag,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws;
@@ -192,7 +193,7 @@ fn build_deployer_config(
     }
 
     aws::Config {
-        tag: remote.tag.clone(),
+        tag: generate_deployer_tag(),
         monitoring: aws::MonitoringConfig {
             instance_type: remote.monitoring_instance_type.clone(),
             storage_size: remote.monitoring_storage_size,
@@ -246,7 +247,6 @@ mod tests {
 
     fn remote_args() -> RemoteArgs {
         RemoteArgs {
-            tag: "testnet".to_string(),
             validator_binary: PathBuf::from("validator"),
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
@@ -313,7 +313,7 @@ mod tests {
             spammer,
         );
 
-        assert_eq!(config.tag, "testnet");
+        assert!(!config.tag.is_empty());
         assert_eq!(config.instances.len(), args.validators as usize + 1);
         assert_eq!(config.instances[0].region, "us-east-1");
         assert_eq!(config.instances[1].region, "us-west-2");
