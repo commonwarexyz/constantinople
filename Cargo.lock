@@ -956,7 +956,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "constantinople-tx-cli"
+name = "constantinople-tx"
 version = "0.0.0"
 dependencies = [
  "bytes",

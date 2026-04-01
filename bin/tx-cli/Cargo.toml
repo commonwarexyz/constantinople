@@ -1,5 +1,5 @@
 [package]
-name = "constantinople-tx-cli"
+name = "constantinople-tx"
 description = "Transaction utility for Constantinople"
 version = "0.0.0"
 edition.workspace = true
@@ -11,10 +11,6 @@ publish = false
 
 [lints]
 workspace = true
-
-[[bin]]
-name = "constantinople-tx"
-path = "src/main.rs"
 
 [dependencies]
 constantinople-primitives.workspace = true
