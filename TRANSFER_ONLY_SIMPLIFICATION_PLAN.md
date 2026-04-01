@@ -16,6 +16,19 @@ The new model should support only simple value transfers:
 Breaking changes are acceptable. This should be treated as a rebuild of the
 execution model, not a compatibility refactor.
 
+## Status
+
+This plan is complete.
+
+The implementation followed the original transfer-only simplification plan and
+also incorporated the later design change that removed transaction receipts.
+That means the final model is slightly simpler than the earlier sections below:
+
+- blocks finalize only `state_root` and `transactions_root`
+- transactions do not emit receipts
+- proposers filter invalid transactions before block construction
+- verifiers reject blocks containing any statically invalid transaction
+
 ## Target Model
 
 ### Transactions
@@ -115,7 +128,6 @@ For each transaction:
 5. increment sender nonce
 6. debit sender balance
 7. credit recipient balance
-8. emit a receipt
 
 There is no nested execution, no calls, and no revertible subframes.
 
@@ -164,7 +176,7 @@ Proposal should:
 1. validate candidate transactions
 2. execute them with the transfer-only processor
 3. write resulting account changes to the speculative state batch
-4. finalize state root, transaction root, and receipt root
+4. finalize state root and transaction root
 5. build a block from `header + body`
 
 ### Verification

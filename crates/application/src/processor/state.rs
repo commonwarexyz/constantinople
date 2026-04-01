@@ -159,9 +159,9 @@ impl StateReader for State {
 /// Proposal-time state with lazy base reads.
 ///
 /// `DiscoveryState` wraps another [`StateReader`] and caches every base read
-/// on demand. The proposer executes sequentially over this state to discover
-/// the canonical BAL and final writes without preloading the entire block's
-/// footprint up front.
+/// on demand. The proposer executes sequentially over this state to build the
+/// final account changeset without preloading the entire block footprint up
+/// front.
 #[derive(Debug)]
 pub struct DiscoveryState<R: StateReader> {
     reader: R,

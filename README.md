@@ -2,7 +2,7 @@
 
 A high-throughput blockchain demo built on [`commonware`](https://github.com/commonwarexyz/monorepo) primitives.
 Constantinople wires together simplex consensus, erasure-coded broadcast, and QMDB storage into a
-simple blockchain that can facilitate transfers and execution of embedded precompiles.
+simple blockchain that supports only account-to-account transfers.
 
 ## Architecture
 
@@ -12,7 +12,7 @@ bin/
   tx-cli/           Transaction builder and submission tool
 
 crates/
-  primitives/       Core types: blocks, transactions, accounts, receipts, access lists
+  primitives/       Core types: blocks, transactions, and accounts
   application/      Consensus integration and transaction processor
   mempool/          HTTP mempool server and transaction source
   engine/           Engine assembly: wires consensus, marshal, QMDB, and p2p together
@@ -30,16 +30,14 @@ crates/
 
 ### Transaction Processor
 
-The processor in `crates/application/src/processor` implements a simple account model with
-balance transfers and pluggable Rust precompiles:
+The processor in `crates/application/src/processor` implements a transfer-only
+account model:
 
-- **Block access lists**: the proposer builds a block-level access list during execution,
-  enabling greedy parallel scheduling of independent transactions during verification.
-- **Precompiles**: implement the `Precompiles` trait to register arbitrary Rust functions at
-  specific addresses. Precompiles execute inside a `Frame` that provides scoped reads, writes,
-  transfers, and nested calls.
-- **Deterministic execution**: the scheduler groups transactions into dependency rounds and
-  executes them in a deterministic order, producing a changeset, receipts, and merkle roots.
+- **Transactions**: every transaction contains only `sender`, `to`, `value`, and `nonce`.
+- **Execution**: the processor validates nonce and balance constraints, then applies direct
+  balance transfers and sender nonce increments.
+- **Deterministic scheduling**: the scheduler groups transactions into dependency rounds using
+  inferred sender/recipient write conflicts and executes them in a deterministic order.
 
 ## Quick Start
 
