@@ -1,7 +1,7 @@
 # `commonware-docker`
 
-This directory contains all of the repositories' dockerfiles as well as the [bake file](https://docs.docker.com/build/bake/)
-used to define this repository's docker build configuration.
+This directory contains the Docker build configuration used to compile Constantinople's deployable
+ARM64 binaries for AWS Graviton.
 
 ## Install Dependencies
 
@@ -10,24 +10,47 @@ used to define this repository's docker build configuration.
 
 ## Building Locally
 
-To build any image in the bake file locally, use `docker buildx bake`:
+To build a compiler image locally, use `docker buildx bake`:
 
 ```sh
 export TARGET="<target_name>"
-
-# Optional: adjust the tag for the image
-# Defaults to `constantinople:local`
-export DEFAULT_TAG="my-image:local"
-
-# Optional: Override the platforms to build the image for.
-# Defaults to `linux/amd64,linux/arm64`
-export PLATFORMS="<platforms>"
 
 docker buildx bake \
   --progress plain \
   -f docker/docker-bake.hcl \
   $TARGET
 ```
+
+Available targets:
+
+* `constantinople-validator`
+* `constantinople-spammer`
+
+By default, these build ARM64 images for AWS Graviton (`linux/arm64`).
+
+#### Build Validator Binary
+
+```sh
+docker buildx bake -f docker/docker-bake.hcl constantinople-validator
+docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
+```
+
+This writes:
+
+* `docker/validator`
+* `docker/validator-debug`
+
+#### Build Spammer Binary
+
+```sh
+docker buildx bake -f docker/docker-bake.hcl constantinople-spammer
+docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
+```
+
+This writes:
+
+* `docker/spammer`
+* `docker/spammer-debug`
 
 #### Troubleshooting
 

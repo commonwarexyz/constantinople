@@ -7,31 +7,33 @@ variable "REPOSITORY" {
 }
 
 variable "DEFAULT_TAG" {
-  default = "constantinople:local"
+  default = "local"
 }
 
 variable "PLATFORMS" {
-  // Only specify a single platform when `--load` ing into docker.
-  // Multi-platform is supported when outputting to disk or pushing to a registry.
-  // Multi-platform builds can be tested locally with:  --set="*.output=type=image,push=false"
-  default = "linux/amd64,linux/arm64"
-}
-
-// Special target: https://github.com/docker/metadata-action#bake-definition
-target "docker-metadata-action" {
-  tags = ["${DEFAULT_TAG}"]
+  default = "linux/arm64"
 }
 
 target "constantinople-validator" {
-  inherits = ["docker-metadata-action"]
   context = "."
-  dockerfile = "docker/validator.dockerfile"
+  dockerfile = "docker/Dockerfile"
   platforms = split(",", PLATFORMS)
+  tags = ["constantinople-validator-builder:${DEFAULT_TAG}"]
+  args = {
+    PACKAGE_NAME = "constantinople-validator"
+    BINARY_NAME = "constantinople"
+    OUTPUT_NAME = "validator"
+  }
 }
 
-target "constantinople-spam-bot" {
-  inherits = ["docker-metadata-action"]
+target "constantinople-spammer" {
   context = "."
-  dockerfile = "docker/validator.dockerfile"
+  dockerfile = "docker/Dockerfile"
   platforms = split(",", PLATFORMS)
+  tags = ["constantinople-spammer-builder:${DEFAULT_TAG}"]
+  args = {
+    PACKAGE_NAME = "constantinople-spammer"
+    BINARY_NAME = "constantinople-spammer"
+    OUTPUT_NAME = "spammer"
+  }
 }

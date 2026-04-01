@@ -84,12 +84,12 @@ To generate a local cluster plus a spammer config:
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./configs \
-  --spammer-count 4096 \
-  --spammer-tps 100000 \
+  --spammer-count 128 \
+  --spammer-tps 1024 \
   local
 ```
 
-Then run the spammer against the local peer topology:
+Then use the printed `mprocs` command, or run the spammer against the local peer topology:
 
 ```sh
 cargo run --bin constantinople-spammer -- \
@@ -109,7 +109,7 @@ cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./deploy \
   --spammer-count 4096 \
-  --spammer-tps 100000 \
+  --spammer-tps 50000 \
   remote \
   --tag constantinople-testnet \
   --validator-binary ./docker/validator \
