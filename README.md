@@ -36,14 +36,13 @@ account model:
 - **Transactions**: every transaction contains only `sender`, `to`, `value`, and `nonce`.
 - **Execution**: the processor validates nonce and balance constraints, then applies direct
   balance transfers and sender nonce increments.
-- **Deterministic scheduling**: the scheduler groups transactions into dependency rounds using
-  inferred sender/recipient write conflicts and executes them in a deterministic order.
+- **Execution model**: blocks execute as a simple sequential in-memory account update pass.
 
 ## Quick Start
 
-### Generate Configs
+`constantinople-deploy` is the entrypoint for generating deployment artifacts.
 
-Generate local deployment configs for a validator cluster:
+### Local Deployment
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -54,23 +53,98 @@ cargo run --bin constantinople-deploy -- generate \
   --base-http-port 8080
 ```
 
-### Run
+This writes:
 
-Start each validator with its config:
+- `validator-0.toml`, `validator-1.toml`, ...
+- `peers.toml`
+- optionally `spammer.toml` if `--spammer-count` and `--spammer-tps` are supplied
+
+It also prints an `mprocs` command that starts the whole local cluster.
+
+To run a single local validator directly:
 
 ```sh
-cargo run --bin constantinople -- --config ./configs/validator-0.toml
+cargo run --bin constantinople -- \
+  --config ./configs/validator-0.toml \
+  --peers ./configs/peers.toml
 ```
 
-Or use the `mprocs` command printed by `constantinople-deploy` to launch all validators at once.
+To run the whole local cluster, use the printed `mprocs` command, or run each validator in a separate terminal:
 
-### Run The Spammer
+```sh
+cargo run --bin constantinople -- --config ./configs/validator-0.toml --peers ./configs/peers.toml
+cargo run --bin constantinople -- --config ./configs/validator-1.toml --peers ./configs/peers.toml
+cargo run --bin constantinople -- --config ./configs/validator-2.toml --peers ./configs/peers.toml
+cargo run --bin constantinople -- --config ./configs/validator-3.toml --peers ./configs/peers.toml
+```
+
+To generate a local cluster plus a spammer config:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --output-dir ./configs \
+  --spammer-count 4096 \
+  --spammer-tps 100000 \
+  local
+```
+
+Then run the spammer against the local peer topology:
 
 ```sh
 cargo run --bin constantinople-spammer -- \
-  --count 1024 \
-  --endpoint http://localhost:8080 \
-  --tps 10000
+  --config ./configs/spammer.toml \
+  --peers ./configs/peers.toml
+```
+
+### Remote Deployment
+
+Remote deployments use the same service TOML configs, but networking is resolved from the deployer
+hosts file at runtime.
+
+Generate a remote deployment bundle:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --output-dir ./deploy \
+  --spammer-count 4096 \
+  --spammer-tps 100000 \
+  remote \
+  --tag constantinople-testnet \
+  --validator-binary ./docker/validator \
+  --regions us-east-1,us-west-2 \
+  --instance-type c8g.large \
+  --storage-size 25 \
+  --monitoring-instance-type c8g.2xlarge \
+  --monitoring-storage-size 100 \
+  --dashboard ./monitoring/dashboard.json \
+  --spammer-binary ./docker/spammer
+```
+
+This writes:
+
+- one validator TOML config per validator
+- optionally `spammer.toml`
+- `config.yaml` for `commonware-deployer`
+- a copied dashboard file for monitoring
+
+The deploy command then prints the `commonware-deployer` command to run.
+
+### Runtime Interfaces
+
+Validator:
+
+```sh
+constantinople --config ./validator.toml --peers ./peers.toml
+constantinople --config ./validator.toml --hosts ./hosts.yaml
+```
+
+Spammer:
+
+```sh
+constantinople-spammer --config ./spammer.toml --peers ./peers.toml
+constantinople-spammer --config ./spammer.toml --hosts ./hosts.yaml
 ```
 
 ## Development
