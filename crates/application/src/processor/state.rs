@@ -26,7 +26,7 @@ impl State {
     /// Creates state from `loaded_addresses` and the known `base_accounts`.
     ///
     /// Any loaded address missing from `base_accounts` is treated as the
-    /// default empty account.
+    /// default account value.
     pub(crate) fn from_loaded(
         base_accounts: HashMap<Address, Account>,
         mut loaded_addresses: Vec<Address>,

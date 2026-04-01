@@ -136,3 +136,29 @@ fn self_transfer_only_bumps_nonce() {
         Some(account(9, 4))
     );
 }
+
+#[test]
+fn missing_recipient_starts_with_default_balance() {
+    let signer = TestSigner::new();
+    let recipient = TestSigner::new();
+    let mut accounts = HashMap::new();
+    accounts.insert(signer.address, account(9, 0));
+    let loaded_addresses = vec![signer.address, recipient.address];
+
+    let processor = processor();
+    let proposal = processor.propose(
+        State::from_loaded(accounts.clone(), loaded_addresses.clone()),
+        vec![signer.sign(recipient.address, 4, 0)],
+    );
+    let output = processor
+        .execute(State::from_loaded(accounts, loaded_addresses), &proposal.valid)
+        .expect("valid proposal transactions should execute");
+
+    assert_eq!(
+        changeset_account(&output.changeset, recipient.address),
+        Some(Account {
+            balance: Account::default().balance + 4,
+            nonce: 0,
+        })
+    );
+}

@@ -97,8 +97,11 @@ macro_rules! address {
     };
 }
 
+/// Default starting balance for accounts that have not been written yet.
+pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
+
 /// An account, as represented in the state of the chain.
-#[derive(Default, Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
 #[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
 pub struct Account {
@@ -108,6 +111,15 @@ pub struct Account {
     /// The nonce of the account, which is incremented every time a
     /// transaction is sent from the account.
     pub nonce: u64,
+}
+
+impl Default for Account {
+    fn default() -> Self {
+        Self {
+            balance: DEFAULT_ACCOUNT_BALANCE,
+            nonce: 0,
+        }
+    }
 }
 
 impl FixedSize for Account {
@@ -191,5 +203,16 @@ mod tests {
 
         let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
         assert_eq!(decoded, account);
+    }
+
+    #[test]
+    fn account_default_starts_funded() {
+        assert_eq!(
+            Account::default(),
+            Account {
+                balance: DEFAULT_ACCOUNT_BALANCE,
+                nonce: 0,
+            }
+        );
     }
 }
