@@ -23,9 +23,9 @@ pub struct Args {
     /// Number of accounts to create.
     #[arg(long)]
     count: NonZeroUsize,
-    /// Validator HTTP endpoint (e.g. http://localhost:8080).
-    #[arg(long)]
-    endpoint: String,
+    /// Validator HTTP endpoints (repeat to target multiple mempools).
+    #[arg(long = "endpoint", required = true, num_args = 1..)]
+    endpoints: Vec<String>,
     /// Starting seed for deterministic key generation.
     #[arg(long, default_value_t = 0)]
     seed_start: u64,
@@ -40,6 +40,7 @@ pub struct Args {
 #[derive(Debug)]
 struct RingTransfer {
     sender_index: usize,
+    endpoint_index: usize,
     from: Address,
     to: Address,
     nonce: u64,
@@ -51,10 +52,37 @@ struct RingAccount {
     key: ed25519::PrivateKey,
     from: Address,
     to: Address,
+    endpoint_index: usize,
     next_nonce: u64,
 }
 
-fn build_ring_accounts(count: NonZeroUsize, seed_start: u64, nonce: u64) -> Vec<RingAccount> {
+#[derive(Debug)]
+struct EndpointState {
+    endpoint: String,
+    ready: VecDeque<usize>,
+    dispatched: u64,
+    completed: usize,
+    failed: usize,
+}
+
+impl EndpointState {
+    fn new(endpoint: String) -> Self {
+        Self {
+            endpoint,
+            ready: VecDeque::new(),
+            dispatched: 0,
+            completed: 0,
+            failed: 0,
+        }
+    }
+}
+
+fn build_ring_accounts(
+    count: NonZeroUsize,
+    seed_start: u64,
+    nonce: u64,
+    endpoint_count: usize,
+) -> Vec<RingAccount> {
     let count = count.get();
 
     let keys = (0..count)
@@ -76,11 +104,33 @@ fn build_ring_accounts(count: NonZeroUsize, seed_start: u64, nonce: u64) -> Vec<
             key: key.clone(),
             from,
             to,
+            endpoint_index: index % endpoint_count,
             next_nonce: nonce,
         });
     }
 
     accounts
+}
+
+fn build_endpoint_states(endpoints: Vec<String>) -> Vec<EndpointState> {
+    endpoints.into_iter().map(EndpointState::new).collect()
+}
+
+fn assign_accounts_to_endpoints(accounts: &[RingAccount], endpoints: &mut [EndpointState]) {
+    for (sender_index, account) in accounts.iter().enumerate() {
+        endpoints[account.endpoint_index].ready.push_back(sender_index);
+    }
+}
+
+fn endpoint_tps(total_tps: u64, endpoint_count: usize, endpoint_index: usize) -> u64 {
+    let endpoint_count = u64::try_from(endpoint_count).expect("endpoint count exceeded u64");
+    let base = total_tps / endpoint_count;
+    let remainder = total_tps % endpoint_count;
+    if u64::try_from(endpoint_index).expect("endpoint index exceeded u64") < remainder {
+        return base + 1;
+    }
+
+    base
 }
 
 fn next_ring_transfer(accounts: &[RingAccount], ready: &mut VecDeque<usize>) -> Option<RingTransfer> {
@@ -89,6 +139,7 @@ fn next_ring_transfer(accounts: &[RingAccount], ready: &mut VecDeque<usize>) -> 
 
     Some(RingTransfer {
         sender_index,
+        endpoint_index: sender.endpoint_index,
         from: sender.from,
         to: sender.to,
         nonce: sender.next_nonce,
@@ -98,17 +149,17 @@ fn next_ring_transfer(accounts: &[RingAccount], ready: &mut VecDeque<usize>) -> 
 
 fn handle_submission_result(
     accounts: &mut [RingAccount],
-    ready: &mut VecDeque<usize>,
+    endpoints: &mut [EndpointState],
     sender_index: usize,
+    endpoint_index: usize,
     submission: Result<(), String>,
-    completed: &mut usize,
-    failed: &mut usize,
     from: Address,
     to: Address,
     nonce: u64,
 ) {
-    *completed += 1;
-    ready.push_back(sender_index);
+    let endpoint = &mut endpoints[endpoint_index];
+    endpoint.completed += 1;
+    endpoint.ready.push_back(sender_index);
 
     if submission.is_ok() {
         accounts[sender_index].next_nonce = nonce
@@ -117,30 +168,30 @@ fn handle_submission_result(
         return;
     }
 
-    *failed += 1;
+    endpoint.failed += 1;
     let from = hex(from.as_ref());
     let to = hex(to.as_ref());
     let err = submission.expect_err("failed submission should carry an error");
-    eprintln!("{from} -> {to} nonce={nonce}: {err}");
+    eprintln!(
+        "{} {from} -> {to} nonce={nonce}: {err}",
+        endpoint.endpoint
+    );
 }
 
 fn drain_completed_submissions(
     accounts: &mut [RingAccount],
-    ready: &mut VecDeque<usize>,
-    tasks: &mut JoinSet<(usize, Address, Address, u64, Result<(), String>)>,
-    completed: &mut usize,
-    failed: &mut usize,
+    endpoints: &mut [EndpointState],
+    tasks: &mut JoinSet<(usize, usize, Address, Address, u64, Result<(), String>)>,
 ) {
     while let Some(result) = tasks.try_join_next() {
-        let (sender_index, from, to, nonce, submission) =
+        let (sender_index, endpoint_index, from, to, nonce, submission) =
             result.expect("spam task panicked");
         handle_submission_result(
             accounts,
-            ready,
+            endpoints,
             sender_index,
+            endpoint_index,
             submission,
-            completed,
-            failed,
             from,
             to,
             nonce,
@@ -149,7 +200,7 @@ fn drain_completed_submissions(
 }
 
 async fn stop_spammer(
-    tasks: &mut JoinSet<(usize, Address, Address, u64, Result<(), String>)>,
+    tasks: &mut JoinSet<(usize, usize, Address, Address, u64, Result<(), String>)>,
 ) {
     println!("stopping spammer...");
     tasks.abort_all();
@@ -165,29 +216,40 @@ where
     Submit: Fn(reqwest::Client, String, Vec<u8>) -> SubmitFuture + Send + Sync + Clone + 'static,
     SubmitFuture: Future<Output = Result<(), String>> + Send + 'static,
 {
-    let mut accounts = build_ring_accounts(args.count, args.seed_start, args.nonce);
-    let mut ready = (0..accounts.len()).collect::<VecDeque<_>>();
+    let endpoint_count = args.endpoints.len();
+    let mut accounts = build_ring_accounts(args.count, args.seed_start, args.nonce, endpoint_count);
+    let mut endpoints = build_endpoint_states(args.endpoints);
+    assign_accounts_to_endpoints(&accounts, &mut endpoints);
     let client = reqwest::Client::new();
-    let url = tx_url(&args.endpoint);
     let mut tasks = JoinSet::new();
-    let mut completed = 0usize;
-    let mut failed = 0usize;
-    let mut dispatched = 0u64;
     let started = time::Instant::now();
     let tps = u64::from(args.tps.get());
 
-    println!(
-        "submitting ring transfers to {url} at {} tx/s. Press Ctrl-C to stop.",
-        args.tps
-    );
+    if endpoint_count == 1 {
+        println!(
+            "submitting ring transfers to {} at {} tx/s. Press Ctrl-C to stop.",
+            tx_url(&endpoints[0].endpoint),
+            args.tps
+        );
+    } else {
+        println!(
+            "submitting ring transfers across {endpoint_count} validators at {} tx/s. Press Ctrl-C to stop.",
+            args.tps
+        );
+        for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+            println!(
+                "endpoint[{endpoint_index}] {} target_tps={}",
+                tx_url(&endpoint.endpoint),
+                endpoint_tps(tps, endpoint_count, endpoint_index)
+            );
+        }
+    }
 
     loop {
         drain_completed_submissions(
             &mut accounts,
-            &mut ready,
+            &mut endpoints,
             &mut tasks,
-            &mut completed,
-            &mut failed,
         );
 
         if should_stop.load(Ordering::Relaxed) {
@@ -195,38 +257,50 @@ where
             break;
         }
 
-        let target = ((started.elapsed().as_nanos() * u128::from(tps)) / 1_000_000_000) as u64;
         let mut submitted = false;
         let mut stop_requested = false;
 
-        while dispatched < target {
-            if should_stop.load(Ordering::Relaxed) {
-                stop_requested = true;
-                break;
+        for endpoint_index in 0..endpoint_count {
+            let target = ((started.elapsed().as_nanos()
+                * u128::from(endpoint_tps(tps, endpoint_count, endpoint_index)))
+                / 1_000_000_000) as u64;
+
+            while endpoints[endpoint_index].dispatched < target {
+                if should_stop.load(Ordering::Relaxed) {
+                    stop_requested = true;
+                    break;
+                }
+
+                let Some(transfer) =
+                    next_ring_transfer(&accounts, &mut endpoints[endpoint_index].ready)
+                else {
+                    break;
+                };
+
+                submitted = true;
+                endpoints[endpoint_index].dispatched += 1;
+
+                let client = client.clone();
+                let endpoint = endpoints[endpoint_index].endpoint.clone();
+                let submit = submit.clone();
+
+                tasks.spawn(async move {
+                    let RingTransfer {
+                        sender_index,
+                        endpoint_index,
+                        from,
+                        to,
+                        nonce,
+                        tx_bytes,
+                    } = transfer;
+                    let result = submit(client, endpoint, tx_bytes).await;
+                    (sender_index, endpoint_index, from, to, nonce, result)
+                });
             }
 
-            let Some(transfer) = next_ring_transfer(&accounts, &mut ready) else {
+            if stop_requested {
                 break;
-            };
-
-            submitted = true;
-            dispatched += 1;
-
-            let client = client.clone();
-            let endpoint = args.endpoint.clone();
-            let submit = submit.clone();
-
-            tasks.spawn(async move {
-                let RingTransfer {
-                    sender_index,
-                    from,
-                    to,
-                    nonce,
-                    tx_bytes,
-                } = transfer;
-                let result = submit(client, endpoint, tx_bytes).await;
-                (sender_index, from, to, nonce, result)
-            });
+            }
         }
 
         if stop_requested {
@@ -254,15 +328,14 @@ where
 
         tokio::select! {
             Some(result) = tasks.join_next() => {
-                let (sender_index, from, to, nonce, submission) =
+                let (sender_index, endpoint_index, from, to, nonce, submission) =
                     result.expect("spam task panicked");
                 handle_submission_result(
                     &mut accounts,
-                    &mut ready,
+                    &mut endpoints,
                     sender_index,
+                    endpoint_index,
                     submission,
-                    &mut completed,
-                    &mut failed,
                     from,
                     to,
                     nonce,
@@ -277,8 +350,18 @@ where
         }
     }
 
+    let completed = endpoints.iter().map(|endpoint| endpoint.completed).sum::<usize>();
+    let failed = endpoints.iter().map(|endpoint| endpoint.failed).sum::<usize>();
     println!("completed: {completed}");
     println!("failed: {failed}");
+    for (endpoint_index, endpoint) in endpoints.iter().enumerate() {
+        println!(
+            "endpoint[{endpoint_index}] {} completed={} failed={}",
+            tx_url(&endpoint.endpoint),
+            endpoint.completed,
+            endpoint.failed
+        );
+    }
 
     if failed == 0 {
         return Ok(());
@@ -329,7 +412,7 @@ fn start_stop_timer(delay: Duration, should_stop: Arc<AtomicBool>) -> tokio::tas
 fn test_args(tps: u32) -> Args {
     Args {
         count: NonZeroUsize::new(1).expect("count should be non-zero"),
-        endpoint: "http://127.0.0.1:8080".to_string(),
+        endpoints: vec!["http://127.0.0.1:8080".to_string()],
         seed_start: 0,
         nonce: 0,
         tps: NonZeroU32::new(tps).expect("tps should be non-zero"),
@@ -339,7 +422,7 @@ fn test_args(tps: u32) -> Args {
 #[cfg(test)]
 mod tests {
     use super::{
-        RingAccount, build_ring_accounts, next_ring_transfer, run_until_stopped,
+        Args, RingAccount, build_ring_accounts, next_ring_transfer, run_until_stopped,
         start_stop_timer, test_args,
     };
     use crate::shared::Digest;
@@ -347,19 +430,16 @@ mod tests {
     use commonware_cryptography::{Sha256, ed25519};
     use constantinople_primitives::{Signed, Transaction, TransactionCfg};
     use std::{
-        collections::VecDeque,
-        num::NonZeroUsize,
-        sync::{
-            Arc,
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-        },
+        collections::{HashSet, VecDeque},
+        num::{NonZeroU32, NonZeroUsize},
+        sync::{Arc, Mutex, atomic::{AtomicBool, AtomicUsize, Ordering}},
         time::Duration,
     };
     use tokio::time;
 
     #[test]
     fn ring_accounts_wrap_back_to_the_first_account() {
-        let accounts = build_ring_accounts(NonZeroUsize::new(3).unwrap(), 11, 7);
+        let accounts = build_ring_accounts(NonZeroUsize::new(3).unwrap(), 11, 7, 2);
 
         assert_eq!(accounts.len(), 3);
         assert_eq!(accounts[0].to, accounts[1].from);
@@ -369,7 +449,7 @@ mod tests {
 
     #[test]
     fn next_ring_transfer_increments_sender_nonce() {
-        let accounts = build_ring_accounts(NonZeroUsize::new(2).unwrap(), 11, 7);
+        let accounts = build_ring_accounts(NonZeroUsize::new(2).unwrap(), 11, 7, 1);
         let mut ready = VecDeque::from(vec![0usize, 1]);
 
         let first = next_ring_transfer(&accounts, &mut ready).expect("first transfer should exist");
@@ -416,7 +496,8 @@ mod tests {
 
     #[test]
     fn next_ring_transfer_skips_busy_senders() {
-        let accounts: Vec<RingAccount> = build_ring_accounts(NonZeroUsize::new(3).unwrap(), 11, 7);
+        let accounts: Vec<RingAccount> =
+            build_ring_accounts(NonZeroUsize::new(3).unwrap(), 11, 7, 1);
         let mut ready = VecDeque::from(vec![1usize, 2]);
 
         let first = next_ring_transfer(&accounts, &mut ready).expect("first transfer should exist");
@@ -426,6 +507,17 @@ mod tests {
         assert_ne!(first.sender_index, 0);
         assert_ne!(second.sender_index, 0);
         assert!(next_ring_transfer(&accounts, &mut ready).is_none());
+    }
+
+    #[test]
+    fn ring_accounts_are_sharded_across_endpoints() {
+        let accounts = build_ring_accounts(NonZeroUsize::new(5).unwrap(), 11, 7, 2);
+
+        assert_eq!(accounts[0].endpoint_index, 0);
+        assert_eq!(accounts[1].endpoint_index, 1);
+        assert_eq!(accounts[2].endpoint_index, 0);
+        assert_eq!(accounts[3].endpoint_index, 1);
+        assert_eq!(accounts[4].endpoint_index, 0);
     }
 
     #[tokio::test]
@@ -480,6 +572,49 @@ mod tests {
         assert!(
             submissions.load(Ordering::Relaxed) > 0,
             "spammer should submit at least one transaction before shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_submits_to_multiple_endpoints() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let stopper = start_stop_timer(Duration::from_millis(10), should_stop.clone());
+        let seen_endpoints = Arc::new(Mutex::new(HashSet::new()));
+        let seen = seen_endpoints.clone();
+        let args = Args {
+            count: NonZeroUsize::new(4).expect("count should be non-zero"),
+            endpoints: vec![
+                "http://127.0.0.1:8080".to_string(),
+                "http://127.0.0.1:8081".to_string(),
+            ],
+            seed_start: 0,
+            nonce: 0,
+            tps: NonZeroU32::new(100_000).expect("tps should be non-zero"),
+        };
+
+        let result = time::timeout(
+            Duration::from_millis(100),
+            run_until_stopped(args, should_stop, move |_client, endpoint, _tx_bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().expect("endpoint set lock should succeed")
+                        .insert(endpoint);
+                    Ok(())
+                }
+            }),
+        )
+        .await;
+
+        stopper.await.expect("shutdown task should finish");
+
+        assert!(result.is_ok(), "spammer should finish before the timeout");
+        assert_eq!(
+            seen_endpoints
+                .lock()
+                .expect("endpoint set lock should succeed")
+                .len(),
+            2,
+            "spammer should use more than one endpoint"
         );
     }
 }
