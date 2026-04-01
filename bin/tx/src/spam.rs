@@ -1,5 +1,4 @@
 use crate::shared::{accept_transaction, build_signed_transaction_bytes, tx_url};
-use clap::Args as ClapArgs;
 use commonware_cryptography::{Sha256, Signer, ed25519};
 use commonware_utils::hex;
 use constantinople_primitives::Address;
@@ -15,23 +14,63 @@ use std::{
 };
 use tokio::{task::JoinSet, time};
 
-#[derive(Debug, ClapArgs)]
+#[derive(Debug)]
 pub struct Args {
-    /// Number of accounts to create.
-    #[arg(long)]
     count: NonZeroUsize,
-    /// Validator HTTP endpoints (repeat to target multiple mempools).
-    #[arg(long = "endpoint", required = true, num_args = 1..)]
     endpoints: Vec<String>,
-    /// Starting seed for deterministic key generation.
-    #[arg(long, default_value_t = 0)]
     seed_start: u64,
-    /// Starting nonce for every sender.
-    #[arg(long, default_value_t = 0)]
     nonce: u64,
-    /// Fixed submission rate in transactions per second.
-    #[arg(long)]
     tps: NonZeroU32,
+}
+
+impl Args {
+    pub(crate) fn new(
+        count: usize,
+        endpoints: Vec<String>,
+        seed_start: u64,
+        nonce: u64,
+        tps: u32,
+    ) -> Result<Self, String> {
+        let count = NonZeroUsize::new(count).ok_or_else(|| "count must be non-zero".to_string())?;
+        let tps = NonZeroU32::new(tps).ok_or_else(|| "tps must be non-zero".to_string())?;
+
+        if endpoints.is_empty() {
+            return Err("at least one endpoint is required".to_string());
+        }
+
+        Ok(Self {
+            count,
+            endpoints,
+            seed_start,
+            nonce,
+            tps,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn count(&self) -> NonZeroUsize {
+        self.count
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn tps(&self) -> NonZeroU32 {
+        self.tps
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn seed_start(&self) -> u64 {
+        self.seed_start
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn nonce(&self) -> u64 {
+        self.nonce
+    }
 }
 
 #[derive(Debug)]
@@ -409,13 +448,8 @@ fn start_stop_timer(delay: Duration, should_stop: Arc<AtomicBool>) -> tokio::tas
 
 #[cfg(test)]
 fn test_args(tps: u32) -> Args {
-    Args {
-        count: NonZeroUsize::new(1).expect("count should be non-zero"),
-        endpoints: vec!["http://127.0.0.1:8080".to_string()],
-        seed_start: 0,
-        nonce: 0,
-        tps: NonZeroU32::new(tps).expect("tps should be non-zero"),
-    }
+    Args::new(1, vec!["http://127.0.0.1:8080".to_string()], 0, 0, tps)
+        .expect("test args should be valid")
 }
 
 #[cfg(test)]

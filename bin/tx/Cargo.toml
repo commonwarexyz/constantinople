@@ -1,6 +1,6 @@
 [package]
 name = "constantinople-tx"
-description = "Transaction utility for Constantinople"
+description = "Transaction spammer for Constantinople"
 version = "0.0.0"
 edition.workspace = true
 authors.workspace = true
@@ -17,9 +17,13 @@ constantinople-primitives.workspace = true
 
 commonware-codec.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-deployer.workspace = true
 commonware-utils.workspace = true
 
 bytes.workspace = true
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["rustls-tls", "json"], default-features = false }
+serde = { workspace = true, features = ["derive", "std"] }
+serde_yaml = "0.9"
 tokio = { version = "1", features = ["full"] }
+toml = "0.8"
