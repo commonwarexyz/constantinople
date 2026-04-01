@@ -41,7 +41,6 @@ use commonware_storage::{
             unordered::{Update as UnorderedUpdate, fixed},
             value::FixedEncoding,
         },
-        immutable::Immutable,
         sync::Target,
     },
     translator::{EightCap, Translator},
@@ -73,9 +72,24 @@ type WireTransaction<H, P> = SignedTransaction<P, H>;
 type WireBlock<C, P, H> = Sealed<SignedBlock<C, P, H>, H>;
 /// In-memory verified block used during execution.
 type ExecutionBlock<C, P, H> = VerifiedBlock<C, P, H>;
+type TransactionJournal<E, H> = FixedJournal<
+    E,
+    commonware_storage::qmdb::immutable::fixed::Operation<<H as Hasher>::Digest, ()>,
+>;
+
 /// Shared immutable transaction database handle.
-type TransactionDatabase<E, H> =
-    Arc<AsyncRwLock<Immutable<mmr::Family, E, <H as Hasher>::Digest, (), H, EightCap>>>;
+type TransactionDatabase<E, H> = Arc<
+    AsyncRwLock<
+        commonware_storage::qmdb::immutable::fixed::Db<
+            mmr::Family,
+            E,
+            <H as Hasher>::Digest,
+            (),
+            H,
+            EightCap,
+        >,
+    >,
+>;
 /// The pair of backing databases owned by the application.
 type Databases<E, H, T> = (StateDatabase<E, H, T>, TransactionDatabase<E, H>);
 /// Merkleized state database produced after finalization.
@@ -99,7 +113,14 @@ pub type StateBatch<E, H, T> = AnyUnmerkleized<
 >;
 
 /// Unmerkleized transaction batch used for append-only transaction storage.
-pub type TransactionBatch<E, H> = ImmutableUnmerkleized<E, <H as Hasher>::Digest, (), H, EightCap>;
+pub type TransactionBatch<E, H> = ImmutableUnmerkleized<
+    E,
+    <H as Hasher>::Digest,
+    FixedEncoding<()>,
+    TransactionJournal<E, H>,
+    H,
+    EightCap,
+>;
 
 /// Unmerkleized batch tuple passed to application execution.
 pub type ApplicationBatches<E, H, T> = (StateBatch<E, H, T>, TransactionBatch<E, H>);
@@ -415,9 +436,10 @@ where
             callback(parent.header.height + 1, rejected, false);
         }
 
-        let transaction_batch = valid.iter().fold(transaction_batch, |batch, transaction| {
-            batch.set(*transaction.message_digest(), ())
-        });
+        let transaction_batch: TransactionBatch<E, H> =
+            valid.iter().fold(transaction_batch, |batch, transaction| {
+                batch.set(*transaction.message_digest(), ())
+            });
         let state_batch = changeset
             .iter()
             .fold(state_batch, |batch, (address, account)| {
@@ -524,9 +546,10 @@ where
             return None;
         };
 
-        let transaction_batch = body.iter().fold(transaction_batch, |batch, transaction| {
-            batch.set(*transaction.message_digest(), ())
-        });
+        let transaction_batch: TransactionBatch<E, H> =
+            body.iter().fold(transaction_batch, |batch, transaction| {
+                batch.set(*transaction.message_digest(), ())
+            });
         let state_batch = output
             .changeset
             .iter()
@@ -618,12 +641,13 @@ where
         let output = processor
             .execute(state, &verified_block.body)
             .expect("certified block contained a statically invalid transaction");
-        let transaction_batch = verified_block
-            .body
-            .iter()
-            .fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
-            });
+        let transaction_batch: TransactionBatch<E, H> =
+            verified_block
+                .body
+                .iter()
+                .fold(transaction_batch, |batch, transaction| {
+                    batch.set(*transaction.message_digest(), ())
+                });
         let state_batch = output
             .changeset
             .iter()
@@ -689,7 +713,7 @@ mod tests {
         mmr::journaled::Config as MmrConfig,
         qmdb::{
             any::{FixedConfig, unordered::fixed},
-            immutable::{Config as ImmutableConfig, Immutable},
+            immutable::fixed as immutable_fixed,
         },
         translator::EightCap,
     };
@@ -714,7 +738,16 @@ mod tests {
     type TestPublicKey = recoverable::PublicKey;
     type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
     type TestTransactionDb = Arc<
-        AsyncRwLock<Immutable<mmr::Family, TestContext, blake3::Digest, (), TestHasher, EightCap>>,
+        AsyncRwLock<
+            immutable_fixed::Db<
+                mmr::Family,
+                TestContext,
+                blake3::Digest,
+                (),
+                TestHasher,
+                EightCap,
+            >,
+        >,
     >;
     type TestStateDb = StateDatabase<TestContext, TestHasher, EightCap>;
     type VerifyTestPublicKey = ed25519::PublicKey;
@@ -784,9 +817,9 @@ mod tests {
         }
     }
 
-    fn transaction_db_config(suffix: &str, context: &TestContext) -> ImmutableConfig<EightCap, ()> {
+    fn transaction_db_config(suffix: &str, context: &TestContext) -> immutable_fixed::Config<EightCap> {
         let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
-        ImmutableConfig {
+        immutable_fixed::Config {
             merkle_config: MmrConfig {
                 journal_partition: format!("tx-journal-{suffix}"),
                 metadata_partition: format!("tx-metadata-{suffix}"),
@@ -829,7 +862,7 @@ mod tests {
     }
 
     async fn open_transaction_db(context: TestContext, suffix: &str) -> TestTransactionDb {
-        let db = Immutable::init(context.clone(), transaction_db_config(suffix, &context))
+        let db = immutable_fixed::Db::init(context.clone(), transaction_db_config(suffix, &context))
             .await
             .expect("transaction db init should succeed");
         Arc::new(AsyncRwLock::new(db))
