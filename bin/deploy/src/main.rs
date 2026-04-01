@@ -56,6 +56,8 @@ pub(crate) struct GenerateArgs {
     log_level: String,
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
+    #[arg(long, default_value_t = 2)]
+    rayon_threads: usize,
     #[arg(long, requires = "spammer_tps")]
     spammer_count: Option<NonZeroUsize>,
     #[arg(long, requires = "spammer_count")]
@@ -133,6 +135,7 @@ pub(crate) struct ValidatorConfig {
     num_validators: u32,
     log_level: String,
     worker_threads: usize,
+    rayon_threads: usize,
     http_port: u16,
     max_propose_bytes: usize,
     max_pool_bytes: usize,

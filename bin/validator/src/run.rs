@@ -8,9 +8,9 @@ use commonware_consensus::{
 use commonware_cryptography::{Hasher, Sha256, bls12381::primitives::variant::MinSig, ed25519};
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
-use commonware_parallel::Sequential;
+use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Metrics as _, Quota, Runner as _,
+    Metrics as _, Quota, Runner as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{Acknowledgement, NZU64, NZUsize, TryCollect, hex, union};
@@ -57,6 +57,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         decoded,
         log_level,
         worker_threads,
+        rayon_threads,
         http_listen,
         json_logs,
         deployer_managed,
@@ -97,6 +98,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             pks.extend(decoded.bootstrappers.iter().map(|(pk, _)| pk.clone()));
             pks
         };
+        let strategy = context
+            .clone()
+            .create_strategy(NZUsize!(rayon_threads))
+            .expect("failed to create parallel strategy");
 
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
@@ -193,7 +198,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
 
         info!("initializing engine");
-        let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, _, _>::new(
+        let engine = Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, Rayon, _>::new(
             context.with_label("engine"),
             EngineConfig {
                 signer: decoded.signer,
@@ -205,7 +210,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 input: mempool,
                 partition_prefix: decoded.partition_prefix,
                 freezer_table_initial_size: 1024,
-                strategy: Sequential,
+                strategy,
                 startup: StartupMode::MarshalSync,
                 sync_config: SyncEngineConfig {
                     fetch_batch_size: NZU64!(16),

@@ -48,6 +48,8 @@ account model:
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./configs \
+  --worker-threads 2 \
+  --rayon-threads 2 \
   local \
   --base-port 3000 \
   --base-http-port 8080
@@ -84,6 +86,8 @@ To generate a local cluster plus a spammer config:
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./configs \
+  --worker-threads 2 \
+  --rayon-threads 2 \
   --spammer-count 128 \
   --spammer-tps 1024 \
   local
@@ -125,6 +129,8 @@ Then generate a remote deployment bundle:
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./deploy \
+  --worker-threads 2 \
+  --rayon-threads 2 \
   --spammer-count 4096 \
   --spammer-tps 50000 \
   remote \

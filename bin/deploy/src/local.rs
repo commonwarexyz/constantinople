@@ -86,6 +86,7 @@ fn build_validators(
             num_validators: args.validators,
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
+            rayon_threads: args.rayon_threads,
             http_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),

@@ -23,6 +23,10 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024 // 64 MiB
 }
 
+pub(crate) const fn default_rayon_threads() -> usize {
+    2
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorConfig {
     pub private_key: String,
@@ -34,6 +38,8 @@ pub struct ValidatorConfig {
     pub num_validators: u32,
     pub log_level: String,
     pub worker_threads: usize,
+    #[serde(default = "default_rayon_threads")]
+    pub rayon_threads: usize,
     pub http_port: u16,
     /// Max bytes of transactions per propose() call.
     #[serde(default = "default_max_propose_bytes")]
@@ -79,6 +85,7 @@ pub struct LoadedConfig {
     pub decoded: DecodedConfig,
     pub log_level: String,
     pub worker_threads: usize,
+    pub rayon_threads: usize,
     pub http_listen: SocketAddr,
     pub json_logs: bool,
     pub deployer_managed: bool,
@@ -160,6 +167,7 @@ fn decode_with_network(
         },
         log_level: config.log_level,
         worker_threads: config.worker_threads,
+        rayon_threads: config.rayon_threads,
         http_listen,
         json_logs,
         deployer_managed: json_logs,
@@ -300,6 +308,7 @@ mod tests {
             num_validators: 2,
             log_level: "info".to_string(),
             worker_threads: 2,
+            rayon_threads: 2,
             http_port: 8080,
             max_propose_bytes: super::default_max_propose_bytes(),
             max_pool_bytes: super::default_max_pool_bytes(),
@@ -383,6 +392,7 @@ mod tests {
             num_validators: 2,
             log_level: "info".to_string(),
             worker_threads: 2,
+            rayon_threads: 2,
             http_port: 8080,
             max_propose_bytes: super::default_max_propose_bytes(),
             max_pool_bytes: super::default_max_pool_bytes(),

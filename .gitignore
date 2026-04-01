@@ -1,4 +1,4 @@
 /target
 /test
-genesis.toml
+/config
 mprocs.log
