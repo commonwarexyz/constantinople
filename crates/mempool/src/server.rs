@@ -18,7 +18,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{Mutex, oneshot};
-use tracing::{info, warn};
+use tracing::warn;
 
 fn decode_body_hex(body: &str) -> Result<Vec<u8>, (StatusCode, String)> {
     from_hex(body.trim()).ok_or((StatusCode::BAD_REQUEST, "bad hex".to_string()))
@@ -278,8 +278,6 @@ where
         }
         inner.pending.push_back(tx);
     }
-
-    info!(tx_hash = %tx_hash_hex, "accepted transaction");
     Ok((hash, tx_hash_hex, receiver))
 }
 
