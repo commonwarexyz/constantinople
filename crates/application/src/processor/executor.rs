@@ -1,7 +1,7 @@
 //! Transaction execution engine for simple transfers.
 
 use super::{
-    schedule::{self, TransactionExecution},
+    schedule,
     state::{AccountDiff, State},
 };
 use commonware_cryptography::{Hasher, PublicKey};
@@ -127,7 +127,7 @@ where
             });
 
         ExecutionOutput {
-            changeset: executed.state.changeset(),
+            changeset: executed.changeset(),
         }
     }
 
@@ -136,7 +136,7 @@ where
         &self,
         state: &State,
         transaction: &VerifiedTransaction<PK, H>,
-    ) -> TransactionExecution
+    ) -> AccountDiff
     where
         H: Hasher,
         PK: PublicKey,
@@ -170,7 +170,7 @@ where
                 },
             );
 
-            return TransactionExecution { diff };
+            return diff;
         }
 
         let recipient_account = state.account(tx.to);
@@ -196,6 +196,6 @@ where
             },
         );
 
-        TransactionExecution { diff }
+        diff
     }
 }

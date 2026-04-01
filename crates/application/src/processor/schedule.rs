@@ -14,20 +14,6 @@ use commonware_parallel::Strategy;
 use constantinople_primitives::{Address, VerifiedTransaction};
 use std::collections::HashMap;
 
-/// The result of executing one transaction batch before changeset export.
-#[derive(Debug)]
-pub(super) struct ExecutedTransactions {
-    /// The final in-memory state after all transaction diffs have been merged.
-    pub state: State,
-}
-
-/// The result of executing one transaction against one state snapshot.
-#[derive(Debug)]
-pub(super) struct TransactionExecution {
-    /// The committed diff that should merge into processor state.
-    pub(super) diff: AccountDiff,
-}
-
 /// Summary information about a greedy schedule.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct ScheduleStats {
@@ -172,12 +158,12 @@ pub(super) fn execute<H, PK, S, F>(
     mut state: State,
     transactions: &[VerifiedTransaction<PK, H>],
     execute_transaction: F,
-) -> ExecutedTransactions
+) -> State
 where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution + Sync,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> AccountDiff + Sync,
 {
     let writes = transactions
         .iter()
@@ -190,7 +176,7 @@ where
 
     if strategy.parallelism_hint().max(1) == 1 {
         execute_transactions_inline(&mut state, &execution);
-        return finish_execution(state);
+        return state;
     }
 
     let (round_for_transaction, stats) = schedule_rounds(&writes);
@@ -207,13 +193,13 @@ where
             let results = execute_round(strategy, &state, &execution, round);
 
             for (transaction_index, result) in round.iter().copied().zip(results) {
-                state.apply(result.diff);
+                state.apply(result);
                 let _ = transaction_index;
             }
         }
     }
 
-    finish_execution(state)
+    state
 }
 
 /// Executes one dependency round either inline or in coarse parallel chunks.
@@ -222,12 +208,12 @@ fn execute_round<H, PK, S, F>(
     state: &State,
     execution: &ExecutionContext<'_, PK, H, F>,
     round: &[usize],
-) -> Vec<TransactionExecution>
+) -> Vec<AccountDiff>
 where
     H: Hasher,
     PK: PublicKey,
     S: Strategy,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution + Sync,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> AccountDiff + Sync,
 {
     if should_execute_round_inline(strategy, round) {
         return execute_round_inline(state, execution, round);
@@ -251,11 +237,11 @@ fn execute_round_inline<H, PK, F>(
     state: &State,
     execution: &ExecutionContext<'_, PK, H, F>,
     round: &[usize],
-) -> Vec<TransactionExecution>
+) -> Vec<AccountDiff>
 where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> AccountDiff,
 {
     let mut results = Vec::with_capacity(round.len());
 
@@ -274,17 +260,12 @@ fn execute_transactions_inline<H, PK, F>(
 ) where
     H: Hasher,
     PK: PublicKey,
-    F: Fn(&State, &VerifiedTransaction<PK, H>) -> TransactionExecution,
+    F: Fn(&State, &VerifiedTransaction<PK, H>) -> AccountDiff,
 {
     for transaction in execution.transactions {
         let result = (execution.execute_transaction)(state, transaction);
-        state.apply(result.diff);
+        state.apply(result);
     }
-}
-
-/// Converts partially collected execution buffers into the final result.
-fn finish_execution(state: State) -> ExecutedTransactions {
-    ExecutedTransactions { state }
 }
 
 /// Builds greedy dependency rounds from inferred sender/recipient writes.
