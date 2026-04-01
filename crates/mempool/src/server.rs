@@ -7,11 +7,11 @@ use axum::{
     http::StatusCode,
     routing::post,
 };
-use commonware_codec::{EncodeSize, Read};
+use commonware_codec::{EncodeSize, ReadExt};
 use commonware_consensus::{Reporter, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::{from_hex, hex};
-use constantinople_primitives::{Header, TransactionCfg};
+use constantinople_primitives::Header;
 use std::{
     collections::{HashMap, VecDeque},
     sync::Arc,
@@ -243,7 +243,7 @@ where
     H: Hasher,
 {
     let bytes = decode_body_hex(body)?;
-    let tx = SignedTransaction::<P, H>::read_cfg(&mut &bytes[..], &TransactionCfg::default())
+    let tx = SignedTransaction::<P, H>::read(&mut &bytes[..])
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("bad transaction: {e}")))?;
 
     tx.into_verified(state.namespace)

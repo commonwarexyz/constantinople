@@ -6,10 +6,6 @@ use commonware_codec::{Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Writ
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use core::num::NonZeroU64;
 
-/// Codec configuration for decoding a [`Transaction`].
-#[derive(Clone, Debug, Default)]
-pub struct TransactionCfg;
-
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Transaction<D: Digest, P: PublicKey> {
@@ -58,7 +54,7 @@ impl<D: Digest, P: PublicKey> EncodeSize for Transaction<D, P> {
 }
 
 impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
-    type Cfg = TransactionCfg;
+    type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let _ = cfg;
@@ -109,7 +105,7 @@ where
 mod test {
     use super::*;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
-    use commonware_codec::Decode;
+    use commonware_codec::DecodeExt;
     use commonware_cryptography::{Signer, blake3, ed25519};
     use commonware_math::algebra::Random;
     use core::num::NonZeroU64;
@@ -128,11 +124,8 @@ mod test {
         let mut encoded = Vec::with_capacity(reference_tx.encode_size());
         reference_tx.write(&mut encoded);
 
-        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode_cfg(
-            &mut &encoded[..],
-            &TransactionCfg::default(),
-        )
-        .expect("decoding should succeed");
+        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &encoded[..])
+            .expect("decoding should succeed");
 
         assert_eq!(
             decoded, reference_tx,
@@ -177,11 +170,8 @@ mod test {
         let mut buf = Vec::with_capacity(tx.encode_size());
         tx.write(&mut buf);
 
-        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode_cfg(
-            &mut &buf[..],
-            &TransactionCfg::default(),
-        )
-        .expect("decoding should succeed");
+        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
+            .expect("decoding should succeed");
         assert_eq!(decoded, tx);
     }
 
@@ -218,10 +208,7 @@ mod test {
         0u64.write(&mut buf);
         tx.nonce.write(&mut buf);
 
-        let result = Transaction::<blake3::Digest, ed25519::PublicKey>::decode_cfg(
-            &mut &buf[..],
-            &TransactionCfg,
-        );
+        let result = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..]);
         assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 }

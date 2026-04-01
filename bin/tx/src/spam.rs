@@ -425,9 +425,9 @@ mod tests {
         start_stop_timer, test_args,
     };
     use crate::shared::Digest;
-    use commonware_codec::Read;
+    use commonware_codec::ReadExt;
     use commonware_cryptography::{Sha256, ed25519};
-    use constantinople_primitives::{Signed, Transaction, TransactionCfg};
+    use constantinople_primitives::{Signed, Transaction};
     use std::{
         collections::{HashSet, VecDeque},
         num::{NonZeroU32, NonZeroUsize},
@@ -458,25 +458,19 @@ mod tests {
         let second =
             next_ring_transfer(&accounts, &mut ready).expect("second transfer should exist");
 
-        let first_decoded = Signed::<
-            Transaction<Digest, ed25519::PublicKey>,
-            Sha256,
-            ed25519::Signature,
-        >::read_cfg(
-            &mut &first.tx_bytes[..], &TransactionCfg::default()
-        )
-        .expect("first ring transfer should decode");
+        let first_decoded =
+            Signed::<Transaction<Digest, ed25519::PublicKey>, Sha256, ed25519::Signature>::read(
+                &mut &first.tx_bytes[..],
+            )
+            .expect("first ring transfer should decode");
         assert_eq!(first_decoded.value().nonce, 7);
         assert_eq!(first_decoded.value().value.get(), 1);
 
-        let second_decoded = Signed::<
-            Transaction<Digest, ed25519::PublicKey>,
-            Sha256,
-            ed25519::Signature,
-        >::read_cfg(
-            &mut &second.tx_bytes[..], &TransactionCfg::default()
-        )
-        .expect("second ring transfer should decode");
+        let second_decoded =
+            Signed::<Transaction<Digest, ed25519::PublicKey>, Sha256, ed25519::Signature>::read(
+                &mut &second.tx_bytes[..],
+            )
+            .expect("second ring transfer should decode");
         assert_eq!(second_decoded.value().nonce, 7);
 
         let mut accounts = accounts;
@@ -484,14 +478,11 @@ mod tests {
         ready.push_back(0);
 
         let third = next_ring_transfer(&accounts, &mut ready).expect("third transfer should exist");
-        let third_decoded = Signed::<
-            Transaction<Digest, ed25519::PublicKey>,
-            Sha256,
-            ed25519::Signature,
-        >::read_cfg(
-            &mut &third.tx_bytes[..], &TransactionCfg::default()
-        )
-        .expect("third ring transfer should decode");
+        let third_decoded =
+            Signed::<Transaction<Digest, ed25519::PublicKey>, Sha256, ed25519::Signature>::read(
+                &mut &third.tx_bytes[..],
+            )
+            .expect("third ring transfer should decode");
         assert_eq!(third.from, first.from);
         assert_eq!(third_decoded.value().nonce, 8);
     }
@@ -535,15 +526,11 @@ mod tests {
         assert_eq!(transfer.from, transfer.to);
         assert_eq!(transfer.endpoint_index, 0);
 
-        let decoded = Signed::<
-            Transaction<Digest, ed25519::PublicKey>,
-            Sha256,
-            ed25519::Signature,
-        >::read_cfg(
-            &mut &transfer.tx_bytes[..],
-            &TransactionCfg::default(),
-        )
-        .expect("self-send transfer should decode");
+        let decoded =
+            Signed::<Transaction<Digest, ed25519::PublicKey>, Sha256, ed25519::Signature>::read(
+                &mut &transfer.tx_bytes[..],
+            )
+            .expect("self-send transfer should decode");
         assert_eq!(decoded.value().to, transfer.from);
         assert_eq!(decoded.value().nonce, 7);
         assert_eq!(decoded.value().value.get(), 1);

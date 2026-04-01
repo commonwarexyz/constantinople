@@ -16,4 +16,4 @@ pub use block::{
 };
 
 mod transaction;
-pub use transaction::{Transaction, TransactionCfg};
+pub use transaction::Transaction;

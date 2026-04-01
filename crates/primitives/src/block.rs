@@ -5,10 +5,7 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{
-    Sealable, Sealed, Signed, Verified,
-    transaction::{Transaction, TransactionCfg},
-};
+use crate::{Sealable, Sealed, Signed, Verified, transaction::Transaction};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
@@ -141,15 +138,12 @@ where
 pub struct BlockCfg {
     /// Maximum number of transactions in the block body.
     pub max_transactions: RangeCfg<usize>,
-    /// Codec configuration for individual transactions.
-    pub transaction: TransactionCfg,
 }
 
 impl Default for BlockCfg {
     fn default() -> Self {
         Self {
             max_transactions: RangeCfg::new(0..=usize::MAX),
-            transaction: TransactionCfg::default(),
         }
     }
 }
@@ -267,7 +261,7 @@ where
     type Cfg = BlockCfg;
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        let tx_vec_cfg = (cfg.max_transactions, cfg.transaction.clone());
+        let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
             header: Header::read_cfg(buf, &())?,
             body: Vec::read_cfg(buf, &tx_vec_cfg)?,

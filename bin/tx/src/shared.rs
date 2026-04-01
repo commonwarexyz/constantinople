@@ -105,9 +105,9 @@ pub async fn accept_transaction(
 #[cfg(test)]
 mod tests {
     use super::{Digest, build_transaction};
-    use commonware_codec::{Decode, Encode};
+    use commonware_codec::{DecodeExt, Encode};
     use commonware_cryptography::{Sha256, Signer, ed25519};
-    use constantinople_primitives::{Address, Signed, Transaction, TransactionCfg};
+    use constantinople_primitives::{Address, Signed, Transaction};
 
     #[test]
     fn simulation_probe_is_unsigned() {
@@ -115,18 +115,15 @@ mod tests {
         let to = Address::from_public_key(&mut Sha256::default(), &key.public_key());
         let probe = build_transaction(&key, to, 10, 3).encode().to_vec();
 
-        let decoded = Transaction::<Digest, ed25519::PublicKey>::decode_cfg(
-            probe.as_slice(),
-            &TransactionCfg::default(),
-        )
-        .expect("probe should decode as an unsigned transaction");
+        let decoded = Transaction::<Digest, ed25519::PublicKey>::decode(probe.as_slice())
+            .expect("probe should decode as an unsigned transaction");
 
         assert_eq!(decoded.sender, key.public_key());
-        assert!(Signed::<
-            Transaction<Digest, ed25519::PublicKey>,
-            Sha256,
-            ed25519::Signature,
-        >::decode_cfg(probe.as_slice(), &TransactionCfg::default())
-        .is_err());
+        assert!(
+            Signed::<Transaction<Digest, ed25519::PublicKey>, Sha256, ed25519::Signature>::decode(
+                probe.as_slice()
+            )
+            .is_err()
+        );
     }
 }
