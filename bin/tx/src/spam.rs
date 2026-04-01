@@ -520,6 +520,33 @@ mod tests {
         assert_eq!(accounts[4].endpoint_index, 0);
     }
 
+    #[test]
+    fn single_account_ring_self_sends_correctly() {
+        let accounts = build_ring_accounts(NonZeroUsize::new(1).unwrap(), 11, 7, 1);
+        let mut ready = VecDeque::from(vec![0usize]);
+
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].from, accounts[0].to);
+
+        let transfer =
+            next_ring_transfer(&accounts, &mut ready).expect("self-send transfer should exist");
+        assert_eq!(transfer.from, transfer.to);
+        assert_eq!(transfer.endpoint_index, 0);
+
+        let decoded = Signed::<
+            Transaction<Digest, ed25519::PublicKey>,
+            Sha256,
+            ed25519::Signature,
+        >::read_cfg(
+            &mut &transfer.tx_bytes[..],
+            &TransactionCfg::default(),
+        )
+        .expect("self-send transfer should decode");
+        assert_eq!(decoded.value().to, transfer.from);
+        assert_eq!(decoded.value().nonce, 7);
+        assert_eq!(decoded.value().value.get(), 1);
+    }
+
     #[tokio::test]
     async fn run_stops_promptly_while_submitting() {
         let should_stop = Arc::new(AtomicBool::new(false));
