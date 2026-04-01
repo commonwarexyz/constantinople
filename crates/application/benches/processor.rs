@@ -1,7 +1,7 @@
 use commonware_codec::{DecodeExt, FixedSize};
 use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
 use commonware_math::algebra::Random;
-use constantinople_application::processor::{executor::Processor, state::State};
+use constantinople_application::processor::{executor, state::State};
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::{marker::PhantomData, num::NonZeroU64};
 use divan::Bencher;
@@ -102,11 +102,8 @@ impl BenchFixture {
     }
 
     fn run(&self) -> usize {
-        let processor = Processor::new();
-        processor
-            .execute(self.state.clone(), &self.transactions)
+        executor::execute(self.state.clone(), &self.transactions)
             .expect("bench proposal transactions should execute")
-            .changeset
             .len()
     }
 }
@@ -171,9 +168,7 @@ fn valid_transactions(
     transactions: Vec<TestTransaction>,
     accounts: &HashMap<Address, Account>,
 ) -> Vec<TestTransaction> {
-    Processor::new()
-        .propose(State::new(accounts.clone()), transactions)
-        .valid
+    executor::propose(State::new(accounts.clone()), transactions).valid
 }
 
 fn address(index: usize, tag: u8) -> Address {

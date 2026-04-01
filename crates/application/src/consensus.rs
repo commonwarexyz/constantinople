@@ -14,7 +14,10 @@
 //! the execution strategy and QMDB integration, while the processor owns the
 //! in-memory state transition logic.
 
-use crate::processor::{executor::Processor, state::State};
+use crate::processor::{
+    executor::{self, ProposalOutput},
+    state::State,
+};
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -418,16 +421,14 @@ where
         if parent.header.height == 0 {
             state_batch = self.apply_genesis_allocations(state_batch);
         }
-        let processor = Processor::new();
         let state = load_state(&state_batch, &all_proposed)
             .await
             .expect("proposal state loading must succeed");
-        let result = processor.propose(state, all_proposed);
-        let crate::processor::executor::ProposalOutput {
+        let ProposalOutput {
             valid,
             invalid,
             changeset,
-        } = result;
+        } = executor::propose(state, all_proposed);
 
         if let Some(ref callback) = self.transaction_callback
             && !invalid.is_empty()
@@ -544,10 +545,9 @@ where
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("block state loading during verification must succeed");
-        let processor = Processor::new();
         let body_len = verified_block.body.len();
         let Block { body, .. } = verified_block;
-        let Some(output) = processor.execute(state, &body) else {
+        let Some(changeset) = executor::execute(state, &body) else {
             warn!(
                 height = block.header.height,
                 "verify rejected: statically invalid transaction"
@@ -559,8 +559,7 @@ where
             body.iter().fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let state_batch = output
-            .changeset
+        let state_batch = changeset
             .iter()
             .fold(state_batch, |batch, (address, account)| {
                 batch.write(*address, Some(*account))
@@ -655,9 +654,7 @@ where
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("state loading must succeed for certified apply");
-        let processor = Processor::new();
-        let output = processor
-            .execute(state, &verified_block.body)
+        let changeset = executor::execute(state, &verified_block.body)
             .expect("certified block contained a statically invalid transaction");
         let transaction_batch: TransactionBatch<E, H> =
             verified_block
@@ -666,16 +663,14 @@ where
                 .fold(transaction_batch, |batch, transaction| {
                     batch.set(*transaction.message_digest(), ())
                 });
-        let state_batch = output
-            .changeset
+        let state_batch = changeset
             .iter()
             .fold(state_batch, |batch, (address, account)| {
                 batch.write(*address, Some(*account))
             });
-        let (state_merkleized, transaction_merkleized) =
-            futures::try_join!(state_batch.merkleize(), transaction_batch.merkleize(),)
-                .expect("database merkleization must succeed");
-        (state_merkleized, transaction_merkleized)
+        self.finalize_execution(state_batch, transaction_batch)
+            .await
+            .expect("database merkleization must succeed")
     }
 }
 

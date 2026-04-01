@@ -1,7 +1,7 @@
 //! End-to-end processor tests for transfer-only execution.
 
 use super::{
-    executor::{Processor, ProposalOutput},
+    executor::{execute, propose, ProposalOutput},
     state::State,
 };
 use commonware_cryptography::{Signer, blake3, ed25519};
@@ -42,10 +42,6 @@ impl TestSigner {
     }
 }
 
-fn processor() -> Processor {
-    Processor::new()
-}
-
 fn account(balance: u64, nonce: u64) -> Account {
     Account { balance, nonce }
 }
@@ -64,7 +60,7 @@ fn validate_tracks_pending_nonce_and_balance() {
     accounts.insert(signer.address, account(10, 0));
     accounts.insert(recipient.address, Account::default());
 
-    let proposal: TestProposal = processor().propose(
+    let proposal: TestProposal = propose(
         State::new(accounts),
         vec![
             signer.sign(recipient.address, 4, 0),
@@ -96,23 +92,21 @@ fn propose_and_verify_match_for_transfer_batch() {
         sender_b.sign(recipient.address, 6, 0),
     ];
 
-    let processor = Processor::new();
-    let proposal = processor.propose(State::new(accounts.clone()), transactions.clone());
-    let verification = processor
-        .execute(State::new(accounts), &proposal.valid)
+    let proposal = propose(State::new(accounts.clone()), transactions.clone());
+    let changeset = execute(State::new(accounts), &proposal.valid)
         .expect("valid proposal transactions should execute");
 
-    assert_eq!(proposal.changeset, verification.changeset);
+    assert_eq!(proposal.changeset, changeset);
     assert_eq!(
-        changeset_account(&verification.changeset, sender_a.address),
+        changeset_account(&changeset, sender_a.address),
         Some(account(7, 1))
     );
     assert_eq!(
-        changeset_account(&verification.changeset, sender_b.address),
+        changeset_account(&changeset, sender_b.address),
         Some(account(7, 1))
     );
     assert_eq!(
-        changeset_account(&verification.changeset, recipient.address),
+        changeset_account(&changeset, recipient.address),
         Some(account(15, 0))
     );
 }
@@ -123,16 +117,14 @@ fn self_transfer_only_bumps_nonce() {
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 3));
 
-    let processor = processor();
-    let proposal = processor.propose(
+    let proposal = propose(
         State::new(accounts.clone()),
         vec![signer.sign(signer.address, 4, 3)],
     );
-    let output = processor
-        .execute(State::new(accounts), &proposal.valid)
+    let changeset = execute(State::new(accounts), &proposal.valid)
         .expect("valid proposal transactions should execute");
     assert_eq!(
-        changeset_account(&output.changeset, signer.address),
+        changeset_account(&changeset, signer.address),
         Some(account(9, 4))
     );
 }
@@ -144,8 +136,7 @@ fn self_transfer_is_included_and_preserves_balance() {
     accounts.insert(signer.address, account(12, 5));
 
     let transaction = signer.sign(signer.address, 7, 5);
-    let processor = processor();
-    let proposal = processor.propose(State::new(accounts.clone()), vec![transaction]);
+    let proposal = propose(State::new(accounts.clone()), vec![transaction]);
 
     assert_eq!(proposal.valid.len(), 1);
     assert!(proposal.invalid.is_empty());
@@ -154,14 +145,13 @@ fn self_transfer_is_included_and_preserves_balance() {
         Some(account(12, 6))
     );
 
-    let output = processor
-        .execute(State::new(accounts), &proposal.valid)
+    let changeset = execute(State::new(accounts), &proposal.valid)
         .expect("self-transfer should execute successfully");
     assert_eq!(
-        changeset_account(&output.changeset, signer.address),
+        changeset_account(&changeset, signer.address),
         Some(account(12, 6))
     );
-    assert_eq!(proposal.changeset, output.changeset);
+    assert_eq!(proposal.changeset, changeset);
 }
 
 #[test]
@@ -172,20 +162,18 @@ fn missing_recipient_starts_with_default_balance() {
     accounts.insert(signer.address, account(9, 0));
     let loaded_addresses = vec![signer.address, recipient.address];
 
-    let processor = processor();
-    let proposal = processor.propose(
+    let proposal = propose(
         State::from_loaded(accounts.clone(), loaded_addresses.clone()),
         vec![signer.sign(recipient.address, 4, 0)],
     );
-    let output = processor
-        .execute(
-            State::from_loaded(accounts, loaded_addresses),
-            &proposal.valid,
-        )
-        .expect("valid proposal transactions should execute");
+    let changeset = execute(
+        State::from_loaded(accounts, loaded_addresses),
+        &proposal.valid,
+    )
+    .expect("valid proposal transactions should execute");
 
     assert_eq!(
-        changeset_account(&output.changeset, recipient.address),
+        changeset_account(&changeset, recipient.address),
         Some(Account {
             balance: Account::default().balance + 4,
             nonce: 0,
