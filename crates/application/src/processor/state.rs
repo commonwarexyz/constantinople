@@ -1,10 +1,8 @@
 //! In-memory processor state for transfer-only execution.
 
+use super::executor::Changeset;
 use constantinople_primitives::{Account, Address};
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::Arc,
-};
+use std::{collections::HashMap, sync::Arc};
 
 /// Fully loaded account state for one execution batch.
 ///
@@ -56,6 +54,11 @@ impl State {
         self.accounts[index]
     }
 
+    /// Returns the dense account index for `address`, if loaded.
+    pub(crate) fn index(&self, address: Address) -> Option<usize> {
+        self.indices.get(&address).copied()
+    }
+
     /// Returns the base account value for `address`.
     ///
     /// Missing accounts read as the default account value.
@@ -83,7 +86,6 @@ impl State {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WorkingState {
     base: State,
-    indices: HashMap<Address, usize>,
     accounts: Vec<Account>,
     changed: Vec<bool>,
 }
@@ -95,7 +97,6 @@ impl WorkingState {
         let accounts = base.accounts.as_ref().clone();
 
         Self {
-            indices: base.indices.as_ref().clone(),
             base,
             accounts,
             changed: vec![false; account_count],
@@ -104,7 +105,7 @@ impl WorkingState {
 
     /// Returns the dense account index for `address`, if loaded.
     pub(crate) fn index(&self, address: Address) -> Option<usize> {
-        self.indices.get(&address).copied()
+        self.base.index(address)
     }
 
     /// Returns the current account snapshot.
@@ -133,15 +134,16 @@ impl WorkingState {
     }
 
     /// Exports the deterministic account changeset.
-    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
-        let mut changeset = BTreeMap::new();
+    pub(crate) fn changeset(&self) -> Changeset {
+        let changed_accounts = self.changed.iter().filter(|changed| **changed).count();
+        let mut changeset = Vec::with_capacity(changed_accounts);
 
         for (index, changed) in self.changed.iter().copied().enumerate() {
             if !changed {
                 continue;
             }
 
-            changeset.insert(self.base.address_at(index), self.accounts[index]);
+            changeset.push((self.base.address_at(index), self.accounts[index]));
         }
 
         changeset

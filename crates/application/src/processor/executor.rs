@@ -3,13 +3,15 @@
 use super::state::{AccountEffect, State, TransferEffect, WorkingState};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_primitives::{Account, Address, VerifiedTransaction};
-use std::collections::BTreeMap;
+
+/// Deterministic account writes produced by execution.
+pub type Changeset = Vec<(Address, Account)>;
 
 /// The final result of verifier-side execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionOutput {
     /// Persistent account writes produced by execution.
-    pub changeset: BTreeMap<Address, Account>,
+    pub changeset: Changeset,
 }
 
 /// The final result of proposal-side filtering and execution.
@@ -20,7 +22,7 @@ pub struct ProposalOutput<PK: PublicKey, H: Hasher> {
     /// Transactions that failed static validation and were excluded.
     pub invalid: Vec<VerifiedTransaction<PK, H>>,
     /// Persistent account writes produced by the included transactions.
-    pub changeset: BTreeMap<Address, Account>,
+    pub changeset: Changeset,
 }
 
 /// Executes transfer-only transactions.

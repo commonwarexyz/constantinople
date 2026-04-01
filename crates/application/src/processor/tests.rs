@@ -50,6 +50,12 @@ fn account(balance: u64, nonce: u64) -> Account {
     Account { balance, nonce }
 }
 
+fn changeset_account(changeset: &[(Address, Account)], address: Address) -> Option<Account> {
+    changeset
+        .iter()
+        .find_map(|(candidate, account)| (*candidate == address).then_some(*account))
+}
+
 #[test]
 fn validate_tracks_pending_nonce_and_balance() {
     let signer = TestSigner::new();
@@ -98,16 +104,16 @@ fn propose_and_verify_match_for_transfer_batch() {
 
     assert_eq!(proposal.changeset, verification.changeset);
     assert_eq!(
-        verification.changeset.get(&sender_a.address),
-        Some(&account(7, 1))
+        changeset_account(&verification.changeset, sender_a.address),
+        Some(account(7, 1))
     );
     assert_eq!(
-        verification.changeset.get(&sender_b.address),
-        Some(&account(7, 1))
+        changeset_account(&verification.changeset, sender_b.address),
+        Some(account(7, 1))
     );
     assert_eq!(
-        verification.changeset.get(&recipient.address),
-        Some(&account(15, 0))
+        changeset_account(&verification.changeset, recipient.address),
+        Some(account(15, 0))
     );
 }
 
@@ -125,5 +131,8 @@ fn self_transfer_only_bumps_nonce() {
     let output = processor
         .execute(State::new(accounts), &proposal.valid)
         .expect("valid proposal transactions should execute");
-    assert_eq!(output.changeset.get(&signer.address), Some(&account(9, 4)));
+    assert_eq!(
+        changeset_account(&output.changeset, signer.address),
+        Some(account(9, 4))
+    );
 }
