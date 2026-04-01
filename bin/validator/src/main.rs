@@ -9,9 +9,12 @@ use clap::Parser;
 fn main() {
     let cli = cli::Cli::parse();
     if let Some(hosts) = cli.hosts {
-        run::run_deployer(hosts, cli.config, cli.mode);
+        run::run_deployer(hosts, cli.config);
         return;
     }
 
-    run::run_local(cli.config, cli.mode);
+    run::run_local(
+        cli.peers.expect("clap should require --peers or --hosts"),
+        cli.config,
+    );
 }

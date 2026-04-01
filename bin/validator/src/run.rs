@@ -1,12 +1,9 @@
-//! `run` subcommand — starts a validator from a TOML config.
+//! Starts a validator from a TOML config.
 
-use crate::{
-    cli::StartupArg,
-    config::{LoadedConfig, load_deployer_config, load_local_config},
-};
+use crate::config::{LoadedConfig, load_deployer_config, load_local_config};
 use commonware_codec::Encode;
 use commonware_consensus::{
-    Heightable, Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
+    Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
 };
 use commonware_cryptography::{Hasher, Sha256, bls12381::primitives::variant::MinSig, ed25519};
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
@@ -45,22 +42,23 @@ impl Reporter for NoopReporter {
     }
 }
 
-pub fn run_local(config_path: PathBuf, mode: StartupArg) {
-    let loaded = load_local_config(&config_path);
-    run_with_config(loaded, config_path, mode);
+pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
+    let loaded = load_local_config(&peers_path, &config_path);
+    run_with_config(loaded, config_path);
 }
 
-pub fn run_deployer(hosts_path: PathBuf, config_path: PathBuf, mode: StartupArg) {
+pub fn run_deployer(hosts_path: PathBuf, config_path: PathBuf) {
     let loaded = load_deployer_config(&hosts_path, &config_path);
-    run_with_config(loaded, config_path, mode);
+    run_with_config(loaded, config_path);
 }
 
-fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg) {
+fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let LoadedConfig {
         decoded,
         log_level,
         worker_threads,
         http_listen,
+        json_logs,
         max_propose_bytes,
         max_pool_bytes,
     } = config;
@@ -79,7 +77,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg)
             context.with_label("telemetry"),
             Logging {
                 level: log_level.parse().expect("bad log_level in config"),
-                json: false,
+                json: json_logs,
             },
             None,
             None,
@@ -87,7 +85,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg)
 
         info!(
             validator = %hex(&decoded.public_key.encode()),
-            listen = %decoded.listen,
+            listen_bind = %decoded.listen_bind,
+            listen_advertise = %decoded.listen_advertise,
             http_listen = %http_listen,
             "starting validator"
         );
@@ -103,8 +102,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg)
             discovery::Config::local(
                 decoded.signer.clone(),
                 b"constantinople",
-                decoded.listen,
-                Ingress::Socket(decoded.listen),
+                decoded.listen_bind,
+                Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
                 12 * 1024 * 1024,
             ),
@@ -147,23 +146,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg)
         );
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
-
-        let startup = match mode {
-            StartupArg::MarshalSync => {
-                info!("starting in marshal-sync mode");
-                StartupMode::MarshalSync
-            }
-            StartupArg::StateSync => {
-                info!("starting in state-sync mode");
-                let block = bootstrapper_mailbox
-                    .fetch_initial_target()
-                    .await
-                    .expect("bootstrapper actor exited before selecting a state-sync target");
-                let height = block.height().get();
-                info!(height, "selected state-sync target");
-                StartupMode::StateSync { block }
-            }
-        };
 
         let mempool = Mempool::<Commitment, ed25519::PublicKey, Sha256>::new(
             b"constantinople-tx",
@@ -212,7 +194,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf, mode: StartupArg)
                 partition_prefix: decoded.partition_prefix,
                 freezer_table_initial_size: 1024,
                 strategy: Sequential,
-                startup,
+                startup: StartupMode::MarshalSync,
                 sync_config: SyncEngineConfig {
                     fetch_batch_size: NZU64!(16),
                     apply_batch_size: 64,
