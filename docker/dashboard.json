@@ -1,0 +1,28 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "tags": [
+    "constantinople"
+  ],
+  "templating": {
+    "list": []
+  },
+  "time": {
+    "from": "now-15m",
+    "to": "now"
+  },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "Constantinople",
+  "uid": "constantinople",
+  "version": 1
+}

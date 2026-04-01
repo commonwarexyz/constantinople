@@ -127,22 +127,22 @@ Then generate a remote deployment bundle:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 \
+  --validators 20 \
   --output-dir ./deploy \
-  --worker-threads 2 \
-  --rayon-threads 2 \
+  --worker-threads 4 \
+  --rayon-threads 4 \
   --spammer-count 4096 \
-  --spammer-tps 50000 \
+  --spammer-tps 32768 \
   remote \
   --validator-binary ./docker/validator \
   --http-cidr 0.0.0.0/0 \
   --spammer-binary ./docker/spammer \
   --regions us-east-1,us-west-2 \
-  --instance-type c8g.large \
-  --storage-size 25 \
+  --instance-type c8g.2xlarge \
+  --storage-size 75 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --dashboard ./monitoring/dashboard.json
+  --dashboard ./docker/dashboard.json
 ```
 
 This writes:
