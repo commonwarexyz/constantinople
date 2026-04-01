@@ -5,6 +5,11 @@ use commonware_utils::hex;
 use constantinople_primitives::Address;
 use std::{
     collections::VecDeque,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     num::{NonZeroU32, NonZeroUsize},
     time::Duration,
 };
@@ -143,7 +148,23 @@ fn drain_completed_submissions(
     }
 }
 
-pub async fn run(args: Args) -> Result<(), String> {
+async fn stop_spammer(
+    tasks: &mut JoinSet<(usize, Address, Address, u64, Result<(), String>)>,
+) {
+    println!("stopping spammer...");
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
+async fn run_with_stop_flag<Submit, SubmitFuture>(
+    args: Args,
+    should_stop: Arc<AtomicBool>,
+    submit: Submit,
+) -> Result<(), String>
+where
+    Submit: Fn(reqwest::Client, String, Vec<u8>) -> SubmitFuture + Send + Sync + Clone + 'static,
+    SubmitFuture: Future<Output = Result<(), String>> + Send + 'static,
+{
     let mut accounts = build_ring_accounts(args.count, args.seed_start, args.nonce);
     let mut ready = (0..accounts.len()).collect::<VecDeque<_>>();
     let client = reqwest::Client::new();
@@ -169,10 +190,21 @@ pub async fn run(args: Args) -> Result<(), String> {
             &mut failed,
         );
 
+        if should_stop.load(Ordering::Relaxed) {
+            stop_spammer(&mut tasks).await;
+            break;
+        }
+
         let target = ((started.elapsed().as_nanos() * u128::from(tps)) / 1_000_000_000) as u64;
         let mut submitted = false;
+        let mut stop_requested = false;
 
         while dispatched < target {
+            if should_stop.load(Ordering::Relaxed) {
+                stop_requested = true;
+                break;
+            }
+
             let Some(transfer) = next_ring_transfer(&accounts, &mut ready) else {
                 break;
             };
@@ -182,6 +214,7 @@ pub async fn run(args: Args) -> Result<(), String> {
 
             let client = client.clone();
             let endpoint = args.endpoint.clone();
+            let submit = submit.clone();
 
             tasks.spawn(async move {
                 let RingTransfer {
@@ -191,34 +224,35 @@ pub async fn run(args: Args) -> Result<(), String> {
                     nonce,
                     tx_bytes,
                 } = transfer;
-                let result = accept_transaction(&client, &endpoint, tx_bytes).await;
+                let result = submit(client, endpoint, tx_bytes).await;
                 (sender_index, from, to, nonce, result)
             });
         }
 
+        if stop_requested {
+            stop_spammer(&mut tasks).await;
+            break;
+        }
+
         if submitted {
             tokio::task::yield_now().await;
+            if should_stop.load(Ordering::Relaxed) {
+                stop_spammer(&mut tasks).await;
+                break;
+            }
             continue;
         }
 
         if tasks.is_empty() {
-            tokio::select! {
-                _ = tokio::signal::ctrl_c() => {
-                    println!("stopping spammer...");
-                    break;
-                }
-                _ = time::sleep(Duration::from_millis(1)) => {}
+            if should_stop.load(Ordering::Relaxed) {
+                stop_spammer(&mut tasks).await;
+                break;
             }
+            time::sleep(Duration::from_millis(1)).await;
             continue;
         }
 
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => {
-                println!("stopping spammer...");
-                tasks.abort_all();
-                while tasks.join_next().await.is_some() {}
-                break;
-            }
             Some(result) = tasks.join_next() => {
                 let (sender_index, from, to, nonce, submission) =
                     result.expect("spam task panicked");
@@ -236,6 +270,11 @@ pub async fn run(args: Args) -> Result<(), String> {
             }
             _ = time::sleep(Duration::from_millis(1)) => {}
         }
+
+        if should_stop.load(Ordering::Relaxed) {
+            stop_spammer(&mut tasks).await;
+            break;
+        }
     }
 
     println!("completed: {completed}");
@@ -248,14 +287,75 @@ pub async fn run(args: Args) -> Result<(), String> {
     Err(format!("failed: {failed}"))
 }
 
+pub async fn run(args: Args) -> Result<(), String> {
+    let should_stop = Arc::new(AtomicBool::new(false));
+    let signal = should_stop.clone();
+    tokio::spawn(async move {
+        loop {
+            let _ = tokio::signal::ctrl_c().await;
+            signal.store(true, Ordering::Relaxed);
+            break;
+        }
+    });
+
+    run_with_stop_flag(args, should_stop, |client, endpoint, tx_bytes| async move {
+        accept_transaction(&client, &endpoint, tx_bytes).await
+    })
+    .await
+}
+
+#[cfg(test)]
+async fn run_until_stopped<Submit, SubmitFuture>(
+    args: Args,
+    should_stop: Arc<AtomicBool>,
+    submit: Submit,
+) -> Result<(), String>
+where
+    Submit: Fn(reqwest::Client, String, Vec<u8>) -> SubmitFuture + Send + Sync + Clone + 'static,
+    SubmitFuture: Future<Output = Result<(), String>> + Send + 'static,
+{
+    run_with_stop_flag(args, should_stop, submit).await
+}
+
+#[cfg(test)]
+fn start_stop_timer(delay: Duration, should_stop: Arc<AtomicBool>) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        time::sleep(delay).await;
+        should_stop.store(true, Ordering::Relaxed);
+    })
+}
+
+#[cfg(test)]
+fn test_args(tps: u32) -> Args {
+    Args {
+        count: NonZeroUsize::new(1).expect("count should be non-zero"),
+        endpoint: "http://127.0.0.1:8080".to_string(),
+        seed_start: 0,
+        nonce: 0,
+        tps: NonZeroU32::new(tps).expect("tps should be non-zero"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{build_ring_accounts, next_ring_transfer, RingAccount};
+    use super::{
+        RingAccount, build_ring_accounts, next_ring_transfer, run_until_stopped,
+        start_stop_timer, test_args,
+    };
     use crate::shared::Digest;
     use commonware_codec::Read;
     use commonware_cryptography::{Sha256, ed25519};
     use constantinople_primitives::{Signed, Transaction, TransactionCfg};
-    use std::{collections::VecDeque, num::NonZeroUsize};
+    use std::{
+        collections::VecDeque,
+        num::NonZeroUsize,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::time;
 
     #[test]
     fn ring_accounts_wrap_back_to_the_first_account() {
@@ -326,5 +426,60 @@ mod tests {
         assert_ne!(first.sender_index, 0);
         assert_ne!(second.sender_index, 0);
         assert!(next_ring_transfer(&accounts, &mut ready).is_none());
+    }
+
+    #[tokio::test]
+    async fn run_stops_promptly_while_submitting() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let stopper = start_stop_timer(Duration::from_millis(10), should_stop.clone());
+        let result = time::timeout(
+            Duration::from_millis(100),
+            run_until_stopped(test_args(100_000), should_stop, |_client, _endpoint, _tx_bytes| async {
+                Ok(())
+            }),
+        )
+        .await;
+
+        stopper.await.expect("shutdown task should finish");
+
+        assert!(result.is_ok(), "spammer should observe shutdown promptly");
+        assert!(
+            result
+                .expect("spammer should finish before the timeout")
+                .is_ok(),
+            "spammer should stop cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_submits_transactions_before_shutdown() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let submissions = Arc::new(AtomicUsize::new(0));
+        let stopper = start_stop_timer(Duration::from_millis(10), should_stop.clone());
+        let submit_count = submissions.clone();
+
+        let result = time::timeout(
+            Duration::from_millis(100),
+            run_until_stopped(
+                test_args(100_000),
+                should_stop,
+                move |_client, _endpoint, _tx_bytes| {
+                    let submissions = submit_count.clone();
+                    async move {
+                        submissions.fetch_add(1, Ordering::Relaxed);
+                        Ok(())
+                    }
+                },
+            ),
+        )
+        .await;
+
+        stopper.await.expect("shutdown task should finish");
+
+        assert!(result.is_ok(), "spammer should finish before the timeout");
+        assert!(
+            submissions.load(Ordering::Relaxed) > 0,
+            "spammer should submit at least one transaction before shutdown"
+        );
     }
 }
