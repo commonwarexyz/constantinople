@@ -6,135 +6,158 @@ use std::{
     sync::Arc,
 };
 
-/// Tracks one value that changed during execution.
+/// Fully loaded account state for one execution batch.
 ///
-/// The processor keeps both the original value and the latest visible value.
-/// This lets execution merge later writes while omitting values that were
-/// changed and then restored back to their original state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Tracked<T> {
-    original: T,
-    current: T,
-}
-
-impl<T> Tracked<T>
-where
-    T: Copy + Eq,
-{
-    /// Creates a tracked entry from the original and current values.
-    const fn new(original: T, current: T) -> Self {
-        Self { original, current }
-    }
-
-    /// Returns the latest visible value.
-    const fn current(&self) -> T {
-        self.current
-    }
-
-    /// Returns whether the value still differs from its original value.
-    fn is_changed(&self) -> bool {
-        self.original != self.current
-    }
-}
-
-/// Stores the account changes produced during execution.
-///
-/// Each entry records both its original and current value. A value disappears
-/// from the diff once it is restored to its original state.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(crate) struct AccountDiff {
-    accounts: HashMap<Address, Tracked<Account>>,
-}
-
-impl AccountDiff {
-    /// Returns the changed account value for `address`, if present.
-    pub(crate) fn account(&self, address: Address) -> Option<Account> {
-        self.accounts.get(&address).map(Tracked::current)
-    }
-
-    /// Records an account change.
-    ///
-    /// If the latest value equals the original value, the tracked entry is
-    /// removed so the diff contains only persistent changes.
-    pub(crate) fn set_account(&mut self, address: Address, original: Account, current: Account) {
-        if let Some(tracked) = self.accounts.get_mut(&address) {
-            tracked.current = current;
-
-            if !tracked.is_changed() {
-                self.accounts.remove(&address);
-            }
-            return;
-        }
-
-        if original == current {
-            return;
-        }
-
-        self.accounts
-            .insert(address, Tracked::new(original, current));
-    }
-
-    /// Merges another diff into this diff.
-    pub(crate) fn merge(&mut self, child: Self) {
-        for (address, tracked) in child.accounts {
-            self.set_account(address, tracked.original, tracked.current);
-        }
-    }
-
-    /// Produces a deterministic changeset for the changed accounts in this diff.
-    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
-        self.accounts
-            .iter()
-            .map(|(address, tracked)| (*address, tracked.current()))
-            .collect()
-    }
-}
-
-/// In-memory processor state.
-///
-/// `State` combines the loaded base state with the committed in-memory diff
-/// accumulated during execution. Reads first consult the committed diff and
-/// then fall back to the loaded base state.
-///
-/// The base maps are `Arc`-wrapped so that `State::clone()` is a cheap
-/// reference-count bump rather than a deep copy. The base maps are read-only
-/// during execution.
+/// The loaded accounts are stored in deterministic address order so later
+/// changeset export can walk a dense array instead of rebuilding order through
+/// a tree or hash map.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct State {
-    base_accounts: Arc<HashMap<Address, Account>>,
-    diff: AccountDiff,
+    addresses: Arc<Vec<Address>>,
+    accounts: Arc<Vec<Account>>,
+    indices: Arc<HashMap<Address, usize>>,
 }
 
 impl State {
     /// Creates in-memory processor state from loaded accounts.
     pub fn new(base_accounts: HashMap<Address, Account>) -> Self {
+        let loaded_addresses = base_accounts.keys().copied().collect::<Vec<_>>();
+        Self::from_loaded(base_accounts, loaded_addresses)
+    }
+
+    /// Creates state from `loaded_addresses` and the known `base_accounts`.
+    ///
+    /// Any loaded address missing from `base_accounts` is treated as the
+    /// default empty account.
+    pub(crate) fn from_loaded(
+        base_accounts: HashMap<Address, Account>,
+        mut loaded_addresses: Vec<Address>,
+    ) -> Self {
+        loaded_addresses.sort_unstable();
+        loaded_addresses.dedup();
+
+        let mut accounts = Vec::with_capacity(loaded_addresses.len());
+        let mut indices = HashMap::with_capacity(loaded_addresses.len());
+
+        for (index, address) in loaded_addresses.iter().copied().enumerate() {
+            indices.insert(address, index);
+            accounts.push(base_accounts.get(&address).copied().unwrap_or_default());
+        }
+
         Self {
-            base_accounts: Arc::new(base_accounts),
-            diff: AccountDiff::default(),
+            addresses: Arc::new(loaded_addresses),
+            accounts: Arc::new(accounts),
+            indices: Arc::new(indices),
         }
     }
 
-    /// Returns the visible account value for `address`.
+    /// Returns the base account at `index`.
+    pub(crate) fn account_at(&self, index: usize) -> Account {
+        self.accounts[index]
+    }
+
+    /// Returns the base account value for `address`.
     ///
     /// Missing accounts read as the default account value.
+    #[cfg(test)]
     pub(crate) fn account(&self, address: Address) -> Account {
-        if let Some(account) = self.diff.account(address) {
-            return account;
-        }
-
-        self.base_accounts
+        self.indices
             .get(&address)
             .copied()
+            .map(|index| self.account_at(index))
             .unwrap_or_default()
     }
 
-    /// Commits an execution diff into the state.
-    pub(crate) fn apply(&mut self, diff: AccountDiff) {
-        self.diff.merge(diff);
+    /// Returns the address at `index`.
+    pub(crate) fn address_at(&self, index: usize) -> Address {
+        self.addresses[index]
     }
 
-    /// Produces a deterministic changeset for the committed state diff.
-    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
-        self.diff.changeset()
+    /// Returns the number of loaded accounts.
+    pub(crate) fn len(&self) -> usize {
+        self.accounts.len()
     }
+}
+
+/// Mutable account state used during one execution pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkingState {
+    base: State,
+    indices: HashMap<Address, usize>,
+    accounts: Vec<Account>,
+    changed: Vec<bool>,
+}
+
+impl WorkingState {
+    /// Creates mutable execution state from a loaded base snapshot.
+    pub(crate) fn new(base: State) -> Self {
+        let account_count = base.len();
+        let accounts = base.accounts.as_ref().clone();
+
+        Self {
+            indices: base.indices.as_ref().clone(),
+            base,
+            accounts,
+            changed: vec![false; account_count],
+        }
+    }
+
+    /// Returns the dense account index for `address`, if loaded.
+    pub(crate) fn index(&self, address: Address) -> Option<usize> {
+        self.indices.get(&address).copied()
+    }
+
+    /// Returns the current account snapshot.
+    pub(crate) fn accounts(&self) -> &[Account] {
+        &self.accounts
+    }
+
+    /// Sets the current account at `index`.
+    pub(crate) fn set_account(&mut self, index: usize, account: Account) {
+        self.accounts[index] = account;
+        self.changed[index] = account != self.base.account_at(index);
+    }
+
+    /// Applies one account update effect.
+    pub(crate) fn apply_effect(&mut self, effect: AccountEffect) {
+        self.set_account(effect.index, effect.account);
+    }
+
+    /// Applies a transfer effect.
+    pub(crate) fn apply_transfer(&mut self, effect: TransferEffect) {
+        self.apply_effect(effect.sender);
+
+        if let Some(recipient) = effect.recipient {
+            self.apply_effect(recipient);
+        }
+    }
+
+    /// Exports the deterministic account changeset.
+    pub(crate) fn changeset(&self) -> BTreeMap<Address, Account> {
+        let mut changeset = BTreeMap::new();
+
+        for (index, changed) in self.changed.iter().copied().enumerate() {
+            if !changed {
+                continue;
+            }
+
+            changeset.insert(self.base.address_at(index), self.accounts[index]);
+        }
+
+        changeset
+    }
+}
+
+/// One account update produced by transaction execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AccountEffect {
+    pub(crate) index: usize,
+    pub(crate) account: Account,
+}
+
+/// The account updates produced by one transfer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct TransferEffect {
+    pub(crate) sender: AccountEffect,
+    pub(crate) recipient: Option<AccountEffect>,
 }

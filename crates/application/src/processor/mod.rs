@@ -7,7 +7,5 @@
 pub mod executor;
 pub mod state;
 
-mod schedule;
-
 #[cfg(test)]
 mod tests;

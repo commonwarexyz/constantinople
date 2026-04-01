@@ -143,7 +143,7 @@ where
         }
     }
 
-    Ok(State::new(base_accounts))
+    Ok(State::from_loaded(base_accounts, account_keys))
 }
 
 /// Collects the accounts that must be loaded for execution.
@@ -415,40 +415,35 @@ where
         if parent.header.height == 0 {
             state_batch = self.apply_genesis_allocations(state_batch);
         }
-        let processor = Processor::new(self.strategy());
+        let processor = Processor::new();
         let state = load_state(&state_batch, &all_proposed)
             .await
             .expect("proposal state loading must succeed");
-        let result = processor.validate(&state, all_proposed);
+        let result = processor.propose(state, all_proposed);
+        let crate::processor::executor::ProposalOutput {
+            valid,
+            invalid,
+            changeset,
+        } = result;
 
         // Notify rejected transaction waiters.
         if let Some(ref callback) = self.rejection_callback
-            && !result.invalid.is_empty()
+            && !invalid.is_empty()
         {
-            let rejected: Vec<_> = result
-                .invalid
-                .iter()
-                .map(|tx| *tx.message_digest())
-                .collect();
+            let rejected: Vec<_> = invalid.iter().map(|tx| *tx.message_digest()).collect();
             callback(rejected);
         }
 
-        let transaction_batch = result
-            .valid
-            .iter()
-            .fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
-            });
-        let output = processor.execute(state, &result.valid);
-        let state_batch = output
-            .changeset
+        let transaction_batch = valid.iter().fold(transaction_batch, |batch, transaction| {
+            batch.set(*transaction.message_digest(), ())
+        });
+        let state_batch = changeset
             .iter()
             .fold(state_batch, |batch, (address, account)| {
                 batch.write(*address, Some(*account))
             });
         if let Some(ref callback) = self.inclusion_callback {
-            let included = result
-                .valid
+            let included = valid
                 .iter()
                 .map(|transaction| *transaction.message_digest())
                 .collect();
@@ -458,8 +453,7 @@ where
             .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed");
-        let transactions_end =
-            parent.header.transactions_range.end() + result.valid.len() as u64 + 1;
+        let transactions_end = parent.header.transactions_range.end() + valid.len() as u64 + 1;
 
         let header = Header {
             context,
@@ -479,8 +473,7 @@ where
         };
         let block = Block::new(
             header,
-            result
-                .valid
+            valid
                 .into_iter()
                 .map(VerifiedTransaction::into_inner)
                 .collect(),
@@ -539,25 +532,20 @@ where
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("block state loading during verification must succeed");
-        let processor = Processor::new(self.strategy());
+        let processor = Processor::new();
         let body_len = verified_block.body.len();
         let Block { body, .. } = verified_block;
-        let validation = processor.validate(&state, body);
-        if !validation.invalid.is_empty() {
+        let Some(output) = processor.execute(state, &body) else {
             warn!(
                 height = block.header.height,
                 "verify rejected: statically invalid transaction"
             );
             return None;
-        }
+        };
 
-        let transaction_batch = validation
-            .valid
-            .iter()
-            .fold(transaction_batch, |batch, transaction| {
-                batch.set(*transaction.message_digest(), ())
-            });
-        let output = processor.execute(state, &validation.valid);
+        let transaction_batch = body.iter().fold(transaction_batch, |batch, transaction| {
+            batch.set(*transaction.message_digest(), ())
+        });
         let state_batch = output
             .changeset
             .iter()
@@ -606,8 +594,7 @@ where
             return None;
         }
         if let Some(ref callback) = self.inclusion_callback {
-            let included = validation
-                .valid
+            let included = body
                 .iter()
                 .map(|transaction| *transaction.message_digest())
                 .collect();
@@ -646,19 +633,16 @@ where
         let state = load_state(&state_batch, &verified_block.body)
             .await
             .expect("state loading must succeed for certified apply");
-        let processor = Processor::new(self.strategy());
-        let validation = processor.validate(&state, verified_block.body.clone());
-        assert!(
-            validation.invalid.is_empty(),
-            "certified block contained a statically invalid transaction"
-        );
+        let processor = Processor::new();
+        let output = processor
+            .execute(state, &verified_block.body)
+            .expect("certified block contained a statically invalid transaction");
         let transaction_batch = verified_block
             .body
             .iter()
             .fold(transaction_batch, |batch, transaction| {
                 batch.set(*transaction.message_digest(), ())
             });
-        let output = processor.execute(state, &validation.valid);
         let state_batch = output
             .changeset
             .iter()

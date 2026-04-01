@@ -1,22 +1,21 @@
 //! End-to-end processor tests for transfer-only execution.
 
 use super::{
-    executor::{Processor, ValidationResult},
+    executor::{Processor, ProposalOutput},
     state::State,
 };
 use commonware_cryptography::{Signer, blake3, ed25519};
 use commonware_math::algebra::Random;
-use commonware_parallel::{Rayon, Sequential};
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::{marker::PhantomData, num::NonZeroU64};
 use rand::rngs::OsRng;
-use std::{collections::HashMap, num::NonZeroUsize};
+use std::collections::HashMap;
 
 const NAMESPACE: &[u8] = b"processor-test";
 
 type TestHasher = blake3::Blake3;
 type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
-type TestValidation = ValidationResult<ed25519::PublicKey, TestHasher>;
+type TestProposal = ProposalOutput<ed25519::PublicKey, TestHasher>;
 
 #[derive(Debug, Clone)]
 struct TestSigner {
@@ -43,8 +42,8 @@ impl TestSigner {
     }
 }
 
-fn processor() -> Processor<'static, Sequential> {
-    Processor::new(&Sequential)
+fn processor() -> Processor {
+    Processor::new()
 }
 
 fn account(balance: u64, nonce: u64) -> Account {
@@ -57,9 +56,10 @@ fn validate_tracks_pending_nonce_and_balance() {
     let recipient = TestSigner::new();
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(10, 0));
+    accounts.insert(recipient.address, Account::default());
 
-    let validation: TestValidation = processor().validate(
-        &State::new(accounts),
+    let proposal: TestProposal = processor().propose(
+        State::new(accounts),
         vec![
             signer.sign(recipient.address, 4, 0),
             signer.sign(recipient.address, 7, 1),
@@ -67,11 +67,11 @@ fn validate_tracks_pending_nonce_and_balance() {
         ],
     );
 
-    assert_eq!(validation.valid.len(), 2);
-    assert_eq!(validation.invalid.len(), 1);
-    assert_eq!(validation.valid[0].value().nonce, 0);
-    assert_eq!(validation.valid[1].value().nonce, 1);
-    assert_eq!(validation.invalid[0].value().value.get(), 7);
+    assert_eq!(proposal.valid.len(), 2);
+    assert_eq!(proposal.invalid.len(), 1);
+    assert_eq!(proposal.valid[0].value().nonce, 0);
+    assert_eq!(proposal.valid[1].value().nonce, 1);
+    assert_eq!(proposal.invalid[0].value().value.get(), 7);
 }
 
 #[test]
@@ -90,11 +90,11 @@ fn propose_and_verify_match_for_transfer_batch() {
         sender_b.sign(recipient.address, 6, 0),
     ];
 
-    let sequential = Sequential;
-    let processor = Processor::new(&sequential);
-    let validation = processor.validate(&State::new(accounts.clone()), transactions.clone());
-    let proposal = processor.execute(State::new(accounts.clone()), &validation.valid);
-    let verification = processor.execute(State::new(accounts), &validation.valid);
+    let processor = Processor::new();
+    let proposal = processor.propose(State::new(accounts.clone()), transactions.clone());
+    let verification = processor
+        .execute(State::new(accounts), &proposal.valid)
+        .expect("valid proposal transactions should execute");
 
     assert_eq!(proposal.changeset, verification.changeset);
     assert_eq!(
@@ -118,41 +118,12 @@ fn self_transfer_only_bumps_nonce() {
     accounts.insert(signer.address, account(9, 3));
 
     let processor = processor();
-    let validation = processor.validate(
-        &State::new(accounts.clone()),
+    let proposal = processor.propose(
+        State::new(accounts.clone()),
         vec![signer.sign(signer.address, 4, 3)],
     );
-    let output = processor.execute(State::new(accounts), &validation.valid);
+    let output = processor
+        .execute(State::new(accounts), &proposal.valid)
+        .expect("valid proposal transactions should execute");
     assert_eq!(output.changeset.get(&signer.address), Some(&account(9, 4)));
-}
-
-#[test]
-fn parallel_verify_matches_sequential_verify() {
-    let sender_a = TestSigner::new();
-    let sender_b = TestSigner::new();
-    let recipient_a = TestSigner::new();
-    let recipient_b = TestSigner::new();
-
-    let mut accounts = HashMap::new();
-    accounts.insert(sender_a.address, account(8, 0));
-    accounts.insert(sender_b.address, account(9, 0));
-
-    let transactions = vec![
-        sender_a.sign(recipient_a.address, 3, 0),
-        sender_b.sign(recipient_b.address, 5, 0),
-    ];
-
-    let sequential = Sequential;
-    let parallel = Rayon::new(NonZeroUsize::new(2).expect("parallelism must be non-zero"))
-        .expect("rayon should build");
-
-    let sequential_processor = Processor::new(&sequential);
-    let parallel_processor = Processor::new(&parallel);
-    let validation = sequential_processor.validate(&State::new(accounts.clone()), transactions);
-
-    let sequential_output =
-        sequential_processor.execute(State::new(accounts.clone()), &validation.valid);
-    let parallel_output = parallel_processor.execute(State::new(accounts), &validation.valid);
-
-    assert_eq!(parallel_output.changeset, sequential_output.changeset);
 }

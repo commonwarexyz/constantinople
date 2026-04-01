@@ -1,13 +1,12 @@
 use commonware_codec::{DecodeExt, FixedSize};
 use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
 use commonware_math::algebra::Random;
-use commonware_parallel::{Rayon, Sequential, Strategy};
 use constantinople_application::processor::{executor::Processor, state::State};
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::{marker::PhantomData, num::NonZeroU64};
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
-use std::{collections::HashMap, hint::black_box, num::NonZeroUsize, sync::OnceLock};
+use std::{collections::HashMap, hint::black_box, sync::OnceLock};
 
 type TestHasher = blake3::Blake3;
 type TestPublicKey = recoverable::PublicKey;
@@ -33,29 +32,15 @@ fn main() {
 }
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
-fn sequential_execution_low_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
+fn execution_low_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
     let fixture = low_contention_fixture(transaction_count);
-    bencher.bench_local(|| black_box(fixture.run(&Sequential)));
+    bencher.bench_local(|| black_box(fixture.run()));
 }
 
 #[divan::bench(args = TRANSACTION_COUNTS)]
-fn parallel_execution_low_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
-    let fixture = low_contention_fixture(transaction_count);
-    let strategy = parallel_strategy();
-    bencher.bench_local(|| black_box(fixture.run(&strategy)));
-}
-
-#[divan::bench(args = TRANSACTION_COUNTS)]
-fn sequential_execution_high_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
+fn execution_high_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
     let fixture = high_contention_fixture(transaction_count);
-    bencher.bench_local(|| black_box(fixture.run(&Sequential)));
-}
-
-#[divan::bench(args = TRANSACTION_COUNTS)]
-fn parallel_execution_high_contention(bencher: Bencher<'_, '_>, transaction_count: usize) {
-    let fixture = high_contention_fixture(transaction_count);
-    let strategy = parallel_strategy();
-    bencher.bench_local(|| black_box(fixture.run(&strategy)));
+    bencher.bench_local(|| black_box(fixture.run()));
 }
 
 #[derive(Debug)]
@@ -83,9 +68,10 @@ impl BenchFixture {
             transactions.push(signer.sign(recipient, 1, 0));
         }
 
+        let valid = valid_transactions(transactions, &accounts);
         Self {
             state: State::new(accounts),
-            transactions,
+            transactions: valid,
         }
     }
 
@@ -108,20 +94,18 @@ impl BenchFixture {
             transactions.push(signer.sign(recipient, 1, 0));
         }
 
+        let valid = valid_transactions(transactions, &accounts);
         Self {
             state: State::new(accounts),
-            transactions,
+            transactions: valid,
         }
     }
 
-    fn run<S>(&self, strategy: &S) -> usize
-    where
-        S: Strategy,
-    {
-        let processor = Processor::new(strategy);
-        let validation = processor.validate(&self.state, self.transactions.clone());
+    fn run(&self) -> usize {
+        let processor = Processor::new();
         processor
-            .execute(self.state.clone(), &validation.valid)
+            .execute(self.state.clone(), &self.transactions)
+            .expect("bench proposal transactions should execute")
             .changeset
             .len()
     }
@@ -183,9 +167,13 @@ fn build_fixture(contention: Contention, transaction_count: usize) -> BenchFixtu
     }
 }
 
-fn parallel_strategy() -> Rayon {
-    Rayon::new(NonZeroUsize::new(4).expect("thread count must be non-zero"))
-        .expect("rayon strategy should build")
+fn valid_transactions(
+    transactions: Vec<TestTransaction>,
+    accounts: &HashMap<Address, Account>,
+) -> Vec<TestTransaction> {
+    Processor::new()
+        .propose(State::new(accounts.clone()), transactions)
+        .valid
 }
 
 fn address(index: usize, tag: u8) -> Address {
