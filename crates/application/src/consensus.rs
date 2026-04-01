@@ -277,13 +277,22 @@ where
     }
 
     /// Verifies signed wire transactions and returns verified execution transactions.
-    fn verify_transactions(
+    fn verify_transactions<Txs>(
         &self,
-        transactions: impl IntoIterator<Item = WireTransaction<H, P>>,
-    ) -> Option<Vec<VerifiedTransaction<P, H>>> {
-        transactions
+        transactions: Txs,
+    ) -> Option<Vec<VerifiedTransaction<P, H>>>
+    where
+        Txs: IntoIterator<Item = WireTransaction<H, P>> + Send,
+        Txs::IntoIter: Send,
+        WireTransaction<H, P>: Send,
+    {
+        let namespace = self.transaction_namespace();
+
+        self.strategy
+            .map_collect_vec(transactions, |transaction: WireTransaction<H, P>| {
+                transaction.into_verified(namespace).ok()
+            })
             .into_iter()
-            .map(|transaction| transaction.into_verified(self.transaction_namespace()).ok())
             .collect()
     }
 
@@ -698,7 +707,7 @@ mod tests {
     };
     use commonware_cryptography::{Digest, Signer, blake3, ed25519, secp256r1::recoverable};
     use commonware_glue::stateful::db::ManagedDb;
-    use commonware_parallel::Sequential;
+    use commonware_parallel::{Sequential, Strategy};
     use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
         journal::contiguous::{
@@ -718,7 +727,13 @@ mod tests {
         VerifiedTransaction,
     };
     use core::{marker::PhantomData, num::NonZeroU64};
-    use std::sync::Arc;
+    use std::{
+        fmt,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+    };
 
     const NAMESPACE: &[u8] = b"application-test";
 
@@ -734,6 +749,68 @@ mod tests {
     type VerifyTestSignedTransaction = SignedTransaction<VerifyTestPublicKey, TestHasher>;
     type VerifyTestTransaction = VerifiedTransaction<VerifyTestPublicKey, TestHasher>;
     type VerifyTestWireBlock = WireBlock<blake3::Digest, VerifyTestPublicKey, TestHasher>;
+
+    #[derive(Clone, Default)]
+    struct CountingStrategy {
+        fold_calls: Arc<AtomicUsize>,
+    }
+
+    impl CountingStrategy {
+        fn fold_calls(&self) -> usize {
+            self.fold_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl fmt::Debug for CountingStrategy {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.debug_struct("CountingStrategy")
+                .field("fold_calls", &self.fold_calls())
+                .finish()
+        }
+    }
+
+    impl Strategy for CountingStrategy {
+        fn fold_init<I, INIT, T, R, ID, F, RD>(
+            &self,
+            iter: I,
+            init: INIT,
+            identity: ID,
+            fold_op: F,
+            _reduce_op: RD,
+        ) -> R
+        where
+            I: IntoIterator<IntoIter: Send, Item: Send> + Send,
+            INIT: Fn() -> T + Send + Sync,
+            T: Send,
+            R: Send,
+            ID: Fn() -> R + Send + Sync,
+            F: Fn(R, &mut T, I::Item) -> R + Send + Sync,
+            RD: Fn(R, R) -> R + Send + Sync,
+        {
+            self.fold_calls.fetch_add(1, Ordering::SeqCst);
+
+            let mut init_value = init();
+            let mut acc = identity();
+            for item in iter {
+                acc = fold_op(acc, &mut init_value, item);
+            }
+            acc
+        }
+
+        fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+        where
+            A: FnOnce() -> RA + Send,
+            B: FnOnce() -> RB + Send,
+            RA: Send,
+            RB: Send,
+        {
+            (a(), b())
+        }
+
+        fn parallelism_hint(&self) -> usize {
+            1
+        }
+    }
 
     fn transaction_db_config(suffix: &str, context: &TestContext) -> ImmutableConfig<EightCap, ()> {
         let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
@@ -831,6 +908,13 @@ mod tests {
         Application::new(Sequential, genesis_leader, NAMESPACE, Vec::new())
     }
 
+    fn counting_test_application(
+        strategy: CountingStrategy,
+    ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), CountingStrategy> {
+        let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
+        Application::new(strategy, genesis_leader, NAMESPACE, Vec::new())
+    }
+
     fn verified_wire_transaction() -> VerifyTestTransaction {
         let private_key = ed25519::PrivateKey::from_seed(11);
         Transaction {
@@ -909,6 +993,20 @@ mod tests {
             *transaction.message_digest()
         );
         assert_eq!(verified.body[0].signer(), transaction.signer());
+    }
+
+    #[test]
+    fn verify_transactions_uses_configured_strategy() {
+        let strategy = CountingStrategy::default();
+        let application = counting_test_application(strategy.clone());
+        let transaction = verified_wire_transaction().into_inner();
+
+        let verified = application
+            .verify_transactions(vec![transaction])
+            .expect("transaction signature should verify");
+
+        assert_eq!(verified.len(), 1);
+        assert_eq!(strategy.fold_calls(), 1);
     }
 
     #[test]
