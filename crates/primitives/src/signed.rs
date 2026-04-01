@@ -317,6 +317,7 @@ mod test {
         Digest, Hasher, Signer, Verifier, blake3, ed25519, secp256r1::recoverable,
     };
     use commonware_math::algebra::Random;
+    use core::num::NonZeroU64;
     use rand::rngs::OsRng;
 
     const NAMESPACE: &[u8] = b"test namespace";
@@ -389,8 +390,7 @@ mod test {
         let verified = Transaction {
             sender: public_key.clone(),
             to: Address::EMPTY,
-            input: bytes::Bytes::new(),
-            value: 0,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce: 0,
             _digest: core::marker::PhantomData::<blake3::Digest>,
         }
@@ -411,8 +411,7 @@ mod test {
         let _ = Transaction {
             sender: wrong_key.public_key(),
             to: Address::EMPTY,
-            input: bytes::Bytes::new(),
-            value: 0,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce: 0,
             _digest: core::marker::PhantomData::<blake3::Digest>,
         }

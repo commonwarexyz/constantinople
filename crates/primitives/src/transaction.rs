@@ -1,123 +1,14 @@
 //! Constantinople transaction type.
 
-use crate::{Address, Sealable, Sealed, Slot};
-use bytes::{Buf, BufMut, Bytes};
-use commonware_codec::{Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write};
+use crate::{Address, Sealable, Sealed};
+use bytes::{Buf, BufMut};
+use commonware_codec::{Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-
-/// Declares whether state will be read or written by a transaction.
-///
-/// This distinction enables finer-grained parallel scheduling: two transactions
-/// that both *read* the same slot can execute concurrently, while any write
-/// to a slot conflicts with all other accesses to that slot.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-#[repr(u8)]
-pub enum AccessMode {
-    /// The transaction will only read state.
-    Read = 0,
-    /// The transaction will write (and possibly read) state.
-    Write = 1,
-}
-
-impl Write for AccessMode {
-    fn write(&self, buf: &mut impl BufMut) {
-        (*self as u8).write(buf);
-    }
-}
-
-impl FixedSize for AccessMode {
-    const SIZE: usize = 1;
-}
-
-impl Read for AccessMode {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
-        match u8::read(buf)? {
-            0 => Ok(Self::Read),
-            1 => Ok(Self::Write),
-            other => Err(Error::InvalidEnum(other)),
-        }
-    }
-}
-
-/// A declared state access.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-#[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-pub enum Access {
-    /// Declares account-level access.
-    Account(Address, AccessMode),
-    /// Declares storage-level access.
-    Storage(Address, Slot, AccessMode),
-}
-
-impl Write for Access {
-    fn write(&self, buf: &mut impl BufMut) {
-        match self {
-            Self::Account(address, access) => {
-                0u8.write(buf);
-                address.write(buf);
-                access.write(buf);
-            }
-            Self::Storage(address, slot, access) => {
-                1u8.write(buf);
-                address.write(buf);
-                slot.write(buf);
-                access.write(buf);
-            }
-        }
-    }
-}
-
-impl EncodeSize for Access {
-    fn encode_size(&self) -> usize {
-        match self {
-            Self::Account(address, access) => {
-                u8::SIZE + address.encode_size() + access.encode_size()
-            }
-            Self::Storage(address, slot, access) => {
-                u8::SIZE + address.encode_size() + slot.encode_size() + access.encode_size()
-            }
-        }
-    }
-}
-
-impl Read for Access {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
-        match u8::read(buf)? {
-            0 => Ok(Self::Account(Address::read(buf)?, AccessMode::read(buf)?)),
-            1 => Ok(Self::Storage(
-                Address::read(buf)?,
-                Slot::read(buf)?,
-                AccessMode::read(buf)?,
-            )),
-            other => Err(Error::InvalidEnum(other)),
-        }
-    }
-}
-
-/// A list of accesses declared by a transaction.
-///
-/// Empty means no explicit accesses were declared.
-pub type AccessList = Vec<Access>;
+use core::num::NonZeroU64;
 
 /// Codec configuration for decoding a [`Transaction`].
-#[derive(Clone, Debug)]
-pub struct TransactionCfg {
-    /// Maximum size of the transaction input bytes.
-    pub max_input_size: RangeCfg<usize>,
-}
-
-impl Default for TransactionCfg {
-    fn default() -> Self {
-        Self {
-            max_input_size: RangeCfg::new(0..=usize::MAX),
-        }
-    }
-}
+#[derive(Clone, Debug, Default)]
+pub struct TransactionCfg;
 
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -126,10 +17,8 @@ pub struct Transaction<D: Digest, P: PublicKey> {
     pub sender: P,
     /// The recipient address.
     pub to: Address,
-    /// The input data for the transaction.
-    pub input: Bytes,
     /// The value to send with the transaction.
-    pub value: u64,
+    pub value: NonZeroU64,
     /// The sender nonce.
     pub nonce: u64,
     /// The digest type.
@@ -157,8 +46,7 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
     fn write(&self, buf: &mut impl BufMut) {
         self.sender.write(buf);
         self.to.write(buf);
-        self.input.write(buf);
-        self.value.write(buf);
+        self.value.get().write(buf);
         self.nonce.write(buf);
     }
 }
@@ -167,8 +55,7 @@ impl<D: Digest, P: PublicKey> EncodeSize for Transaction<D, P> {
     fn encode_size(&self) -> usize {
         self.sender.encode_size()
             + self.to.encode_size()
-            + self.input.encode_size()
-            + self.value.encode_size()
+            + u64::SIZE
             + self.nonce.encode_size()
     }
 }
@@ -177,11 +64,17 @@ impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
     type Cfg = TransactionCfg;
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
+        let _ = cfg;
+        let sender = P::read(buf)?;
+        let to = Address::read(buf)?;
+        let value = u64::read(buf)?;
+        let value = NonZeroU64::new(value)
+            .ok_or(Error::Invalid("Transaction", "value must be non-zero"))?;
+
         Ok(Self {
-            sender: P::read(buf)?,
-            to: Address::read(buf)?,
-            input: Bytes::read_cfg(buf, &cfg.max_input_size)?,
-            value: u64::read(buf)?,
+            sender,
+            to,
+            value,
             nonce: u64::read(buf)?,
             _digest: core::marker::PhantomData,
         })
@@ -207,8 +100,8 @@ where
         Ok(Self {
             sender: u.arbitrary()?,
             to: u.arbitrary()?,
-            input: Bytes::from(<Vec<u8> as arbitrary::Arbitrary>::arbitrary(u)?),
-            value: u.arbitrary()?,
+            value: NonZeroU64::new(u.int_in_range(1..=u64::MAX)?)
+                .expect("arbitrary non-zero value should construct"),
             nonce: u.arbitrary()?,
             _digest: core::marker::PhantomData,
         })
@@ -222,6 +115,7 @@ mod test {
     use commonware_codec::Decode;
     use commonware_cryptography::{Signer, blake3, ed25519};
     use commonware_math::algebra::Random;
+    use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
 
     fn test_sender() -> ed25519::PublicKey {
@@ -274,12 +168,11 @@ mod test {
     }
 
     #[test]
-    fn transaction_with_input_data_roundtrip() {
+    fn transaction_roundtrip() {
         let tx = Transaction::<blake3::Digest, ed25519::PublicKey> {
             sender: test_sender(),
             to: Address::EMPTY,
-            input: Bytes::from_static(b"hello world"),
-            value: 12345,
+            value: NonZeroU64::new(12_345).expect("test value should be non-zero"),
             nonce: 1,
             _digest: core::marker::PhantomData,
         };
@@ -300,8 +193,7 @@ mod test {
         let tx = Transaction::<blake3::Digest, ed25519::PublicKey> {
             sender: test_sender(),
             to: Address::arbitrary(&mut Unstructured::new(&[0xCC; 64])).unwrap(),
-            input: Bytes::from_static(b"some payload"),
-            value: u64::MAX,
+            value: NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
             nonce: u64::MAX,
             _digest: core::marker::PhantomData,
         };
@@ -310,5 +202,27 @@ mod test {
         let mut buf = Vec::new();
         tx.write(&mut buf);
         assert_eq!(buf.len(), expected);
+    }
+
+    #[test]
+    fn transaction_zero_value_decode_is_rejected() {
+        let sender = test_sender();
+        let tx = Transaction::<blake3::Digest, ed25519::PublicKey> {
+            sender: sender.clone(),
+            to: Address::EMPTY,
+            value: NonZeroU64::new(1).expect("test value should be non-zero"),
+            nonce: 7,
+            _digest: core::marker::PhantomData,
+        };
+
+        let mut buf = Vec::new();
+        sender.write(&mut buf);
+        tx.to.write(&mut buf);
+        0u64.write(&mut buf);
+        tx.nonce.write(&mut buf);
+
+        let result =
+            Transaction::<blake3::Digest, ed25519::PublicKey>::decode_cfg(&mut &buf[..], &TransactionCfg);
+        assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 }

@@ -6,11 +6,11 @@
 //! - [`Account`] — The on-chain state of an account, tracking its balance and nonce.
 
 use bytes::{Buf, BufMut};
-use commonware_codec::{DecodeExt, Encode, Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_math::algebra::Random;
 use commonware_utils::{Array, Span, hex};
-use core::{cmp::min, ops::Deref};
+use core::ops::Deref;
 use derive_more::{AsRef, Debug, Display};
 use rand_core::CryptoRngCore;
 
@@ -132,120 +132,6 @@ impl Read for Account {
     }
 }
 
-/// Storage slot key and value type.
-#[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Display, AsRef)]
-#[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-#[as_ref(forward)]
-#[display("{}", hex(&self.0))]
-pub struct Slot([u8; Self::SIZE]);
-
-impl Write for Slot {
-    fn write(&self, buf: &mut impl bytes::BufMut) {
-        buf.put_slice(&self.0);
-    }
-}
-
-impl FixedSize for Slot {
-    const SIZE: usize = 32;
-}
-
-impl Read for Slot {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        if buf.remaining() < Self::SIZE {
-            return Err(CodecError::EndOfBuffer);
-        }
-
-        let mut raw = [0u8; Self::SIZE];
-        buf.copy_to_slice(&mut raw);
-        Ok(Self(raw))
-    }
-}
-
-impl Deref for Slot {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl Span for Slot {}
-impl Array for Slot {}
-
-impl From<[u8; Self::SIZE]> for Slot {
-    fn from(value: [u8; Self::SIZE]) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&[u8]> for Slot {
-    fn from(value: &[u8]) -> Self {
-        let mut raw = [0u8; Self::SIZE];
-        let len = min(value.len(), Self::SIZE);
-        raw[..len].copy_from_slice(&value[..len]);
-        Self(raw)
-    }
-}
-
-/// Macro for converting sequence of string literals containing hex-encoded data
-/// into a [`Slot`] type.
-#[macro_export]
-macro_rules! slot {
-    ($s:tt) => {
-        const {
-            debug_assert_eq!($s.len(), 64, "Slot hex string must be 64 characters long");
-            $crate::Slot::from(::commonware_utils::hex!($s))
-        }
-    };
-}
-
-/// A value within the state database.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-pub enum StateValue {
-    Account(Account),
-    Storage(Slot),
-}
-
-impl Write for StateValue {
-    fn write(&self, buf: &mut impl BufMut) {
-        match self {
-            Self::Account(account) => {
-                0u8.write(buf);
-                let slot: Slot = account.encode().as_ref().into();
-                slot.write(buf)
-            }
-            Self::Storage(slot) => {
-                1u8.write(buf);
-                slot.write(buf)
-            }
-        }
-    }
-}
-
-impl FixedSize for StateValue {
-    const SIZE: usize = u8::SIZE + Slot::SIZE;
-}
-
-impl Read for StateValue {
-    type Cfg = ();
-
-    fn read_cfg(buf: &mut impl bytes::Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
-        let ty = u8::read(buf)?;
-        let slot = Slot::read(buf)?;
-        match ty {
-            0 => {
-                let account = Account::decode(&slot.as_ref()[..Account::SIZE])?;
-                Ok(Self::Account(account))
-            }
-            1 => Ok(Self::Storage(slot)),
-            ty => Err(CodecError::InvalidEnum(ty)),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,40 +179,17 @@ mod tests {
     }
 
     #[test]
-    fn state_value_account_codec_roundtrip() {
+    fn account_codec_roundtrip() {
         let account = Account {
             balance: 42,
             nonce: 7,
         };
-        let value = StateValue::Account(account);
 
-        let mut buf = Vec::with_capacity(StateValue::SIZE);
-        value.write(&mut buf);
-        assert_eq!(buf.len(), StateValue::SIZE);
+        let mut buf = Vec::with_capacity(Account::SIZE);
+        account.write(&mut buf);
+        assert_eq!(buf.len(), Account::SIZE);
 
-        let decoded = StateValue::decode(&mut &buf[..]).expect("decoding should succeed");
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn state_value_storage_codec_roundtrip() {
-        let slot = Slot::from([0xAB; Slot::SIZE]);
-        let value = StateValue::Storage(slot);
-
-        let mut buf = Vec::with_capacity(StateValue::SIZE);
-        value.write(&mut buf);
-        assert_eq!(buf.len(), StateValue::SIZE);
-
-        let decoded = StateValue::decode(&mut &buf[..]).expect("decoding should succeed");
-        assert_eq!(decoded, value);
-    }
-
-    #[test]
-    fn state_value_invalid_discriminant() {
-        let mut buf = vec![2u8]; // invalid discriminant
-        buf.extend_from_slice(&[0u8; Slot::SIZE]);
-
-        let result = StateValue::decode(&mut &buf[..]);
-        assert!(result.is_err(), "should fail with invalid discriminant");
+        let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
+        assert_eq!(decoded, account);
     }
 }
