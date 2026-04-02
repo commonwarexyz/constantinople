@@ -40,17 +40,17 @@ pub fn tx_url(endpoint: &str) -> String {
     format!("{}/tx", endpoint.trim_end_matches('/'))
 }
 
-pub fn accept_tx_url(endpoint: &str) -> String {
-    format!("{}/tx/accept", endpoint.trim_end_matches('/'))
+pub fn accept_batch_url(endpoint: &str) -> String {
+    format!("{}/tx/accept_batch", endpoint.trim_end_matches('/'))
 }
 
-pub fn tx_status_url(endpoint: &str) -> String {
-    format!("{}/tx/status", endpoint.trim_end_matches('/'))
+pub fn wait_batch_url(endpoint: &str) -> String {
+    format!("{}/tx/wait_batch", endpoint.trim_end_matches('/'))
 }
 
 #[derive(Debug, Deserialize)]
-struct SubmissionReceipt {
-    tx_hash: String,
+struct SubmissionBatchReceipt {
+    tx_hashes: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
@@ -70,7 +70,7 @@ pub struct TransactionStatus {
 }
 
 #[derive(Debug, Serialize)]
-struct TransactionStatusRequest<'a> {
+struct WaitBatchRequest<'a> {
     tx_hashes: &'a [String],
 }
 
@@ -88,14 +88,15 @@ pub fn transaction_hash_hex(tx_bytes: &[u8]) -> Result<String, String> {
     Ok(hex(signed.message_digest().as_ref()))
 }
 
-pub async fn accept_transaction(
+pub async fn accept_transaction_batch(
     client: &reqwest::Client,
     endpoint: &str,
-    tx_bytes: Vec<u8>,
-) -> Result<String, String> {
+    body: Vec<u8>,
+) -> Result<Vec<String>, String> {
     let resp = client
-        .post(accept_tx_url(endpoint))
-        .body(hex(&tx_bytes))
+        .post(accept_batch_url(endpoint))
+        .header("content-type", "application/octet-stream")
+        .body(body)
         .send()
         .await
         .map_err(|err| format!("request failed: {err}"))?;
@@ -110,23 +111,19 @@ pub async fn accept_transaction(
         return Err(format!("error ({status}): {body}"));
     }
 
-    let receipt: SubmissionReceipt =
-        serde_json::from_slice(&body).map_err(|err| format!("bad submission receipt: {err}"))?;
-    if receipt.tx_hash.is_empty() {
-        return Err("submission receipt omitted tx_hash".to_string());
-    }
-
-    Ok(receipt.tx_hash)
+    let receipt: SubmissionBatchReceipt = serde_json::from_slice(&body)
+        .map_err(|err| format!("bad submission batch receipt: {err}"))?;
+    Ok(receipt.tx_hashes)
 }
 
-pub async fn fetch_transaction_statuses(
+pub async fn wait_transaction_batch(
     client: &reqwest::Client,
     endpoint: &str,
     tx_hashes: &[String],
 ) -> Result<Vec<TransactionStatus>, String> {
     let resp = client
-        .post(tx_status_url(endpoint))
-        .json(&TransactionStatusRequest { tx_hashes })
+        .post(wait_batch_url(endpoint))
+        .json(&WaitBatchRequest { tx_hashes })
         .send()
         .await
         .map_err(|err| format!("request failed: {err}"))?;
@@ -142,7 +139,7 @@ pub async fn fetch_transaction_statuses(
     }
 
     let response: TransactionStatusResponse =
-        serde_json::from_slice(&body).map_err(|err| format!("bad status response: {err}"))?;
+        serde_json::from_slice(&body).map_err(|err| format!("bad wait response: {err}"))?;
     Ok(response.statuses)
 }
 

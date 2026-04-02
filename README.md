@@ -38,6 +38,18 @@ account model:
   balance transfers and sender nonce increments.
 - **Execution model**: blocks execute as a simple sequential in-memory account update pass.
 
+### Mempool and Spammer
+
+- **Mempool core**: `crates/mempool` uses a FIFO queue with hash-indexed entries, lease batches,
+  direct in-flight retries, lazy tombstones, and recent terminal status caching so proposal and
+  finalize paths stay small and predictable under load.
+- **Hot-path HTTP**: validators keep compatibility routes for single hex transactions, and also
+  expose `POST /tx/accept_batch` plus `POST /tx/wait_batch` for binary batch ingestion and
+  long-poll batch status waits.
+- **Round driver**: `constantinople-spammer` builds a ring of accounts, submits one transfer per
+  account with `nonce = base_nonce + round`, waits for the whole round to be included, and only
+  retries ambiguous outcomes using the exact same signed bytes.
+
 ## Quick Start
 
 `constantinople-deploy` is the entrypoint for generating deployment artifacts.

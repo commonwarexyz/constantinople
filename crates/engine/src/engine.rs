@@ -50,7 +50,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
-use constantinople_application::consensus::{Application, TransactionCallback};
+use constantinople_application::consensus::Application;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::BlockCfg;
 use futures::future::try_join_all;
@@ -158,7 +158,6 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    pub transaction_callback: Option<TransactionCallback<H::Digest>>,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
 
@@ -330,15 +329,12 @@ where
             },
         );
 
-        let mut application = Application::new(
+        let application = Application::new(
             context.with_label("application"),
             config.strategy.clone(),
             config.genesis_leader,
             config.transaction_namespace,
         );
-        if let Some(callback) = config.transaction_callback {
-            application = application.with_transaction_callback(callback);
-        }
         let (stateful, stateful_mailbox) = Stateful::init(
             context.with_label("stateful"),
             StatefulConfig {

@@ -243,7 +243,6 @@ impl EngineDefinition for TestEngineDefinition {
                             genesis_leader,
                             transaction_namespace: TRANSACTION_NAMESPACE,
                             block_codec: Default::default(),
-                            transaction_callback: None,
                             bootstrapper: bootstrapper_mailbox.clone(),
                         },
                     )

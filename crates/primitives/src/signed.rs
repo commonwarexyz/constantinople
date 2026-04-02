@@ -109,6 +109,9 @@ where
     signer: Address,
 }
 
+type VerifiedSignedTransaction<D, P, H> =
+    Verified<Transaction<D, P>, H, <P as Verifier>::Signature>;
+
 impl<D, P, H> Signed<Transaction<D, P>, H, <P as Verifier>::Signature>
 where
     D: Digest,
@@ -119,7 +122,7 @@ where
     pub fn into_verified(
         self,
         namespace: &[u8],
-    ) -> Result<Verified<Transaction<D, P>, H, P::Signature>, Self> {
+    ) -> Result<VerifiedSignedTransaction<D, P, H>, Self> {
         if !self.verify(namespace, &self.value().sender) {
             return Err(self);
         }
@@ -302,7 +305,7 @@ where
     fn from(signed: Signed<Transaction<D, P>, H, P::Signature>) -> Self {
         let mut hasher = H::default();
         let signer = Address::from_public_key(&mut hasher, &signed.value().sender);
-        Verified {
+        Self {
             inner: signed,
             signer,
         }

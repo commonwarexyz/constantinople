@@ -1,23 +1,17 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use commonware_consensus::{Reporter, simplex::types::Context};
+use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_primitives::{Block, Header, Sealed, SignedTransaction, VerifiedTransaction};
-use core::future::Future;
+use std::future::Future;
 
 pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
 pub type PendingTransaction<P, H> = VerifiedTransaction<P, H>;
 
-/// A finalized block ready to report back to the transaction source.
-#[derive(Debug, Clone)]
-pub struct Finalized<C: Digest, P: PublicKey, H: Hasher> {
-    pub block: SealedBlock<C, P, H>,
-}
-
-/// Supplies transactions for block proposals and reacts to finalized blocks.
+/// Supplies transactions for block proposals and finalized block updates.
 pub trait TransactionSource<C, P, H>:
-    Reporter<Activity = Finalized<C, P, H>> + Send + 'static
+    Reporter<Activity = Update<SealedBlock<C, P, H>>> + Send + 'static
 where
     C: Digest,
     H: Hasher,
@@ -34,4 +28,5 @@ where
 #[cfg(feature = "mocks")]
 pub mod mocks;
 
+mod core;
 pub mod server;

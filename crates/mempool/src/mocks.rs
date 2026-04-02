@@ -1,8 +1,9 @@
 //! Mock transaction sources for tests.
 
-use crate::{Finalized, PendingTransaction, TransactionSource};
-use commonware_consensus::{Reporter, simplex::types::Context};
+use crate::{PendingTransaction, TransactionSource};
+use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_utils::Acknowledgement;
 use constantinople_primitives::Header;
 use core::{
     future::{Future, ready},
@@ -59,13 +60,17 @@ where
 
 impl<C, P, H> Reporter for StaticTransactionSource<C, P, H>
 where
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
+    C: Digest + Send + 'static,
+    P: PublicKey + Send + 'static,
+    H: Hasher + Send + 'static,
 {
-    type Activity = Finalized<C, P, H>;
+    type Activity = Update<crate::SealedBlock<C, P, H>>;
 
-    async fn report(&mut self, _item: Self::Activity) {}
+    async fn report(&mut self, activity: Self::Activity) {
+        if let Update::Block(_, acknowledgement) = activity {
+            acknowledgement.acknowledge();
+        }
+    }
 }
 
 #[cfg(test)]

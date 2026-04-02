@@ -92,7 +92,7 @@ fn propose_and_verify_match_for_transfer_batch() {
         sender_b.sign(recipient.address, 6, 0),
     ];
 
-    let proposal = propose(State::new(accounts.clone()), transactions.clone());
+    let proposal = propose(State::new(accounts.clone()), transactions);
     let changeset = execute(State::new(accounts), &proposal.valid)
         .expect("valid proposal transactions should execute");
 

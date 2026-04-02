@@ -208,19 +208,12 @@ where
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-/// Type-erased callback for mempool-visible transaction outcomes.
-///
-/// The callback receives the block height, the transaction hashes, and whether
-/// the transactions were rejected during proposal or included in a certified block.
-pub type TransactionCallback<D> = Arc<dyn Fn(u64, Vec<D>, bool) + Send + Sync>;
-
 pub struct Application<H: Hasher, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
-    transaction_callback: Option<TransactionCallback<H::Digest>>,
     proposed_transactions: Counter,
-    _marker: PhantomData<(C, S, I)>,
+    _marker: PhantomData<(H, C, S, I)>,
 }
 
 impl<H: Hasher, C, S, P, I, St: Clone> Clone for Application<H, C, S, P, I, St>
@@ -232,7 +225,6 @@ where
             strategy: self.strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
-            transaction_callback: self.transaction_callback.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
@@ -268,16 +260,9 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
             strategy,
             genesis_leader,
             transaction_namespace,
-            transaction_callback: None,
             proposed_transactions,
             _marker: PhantomData,
         }
-    }
-
-    /// Sets a callback that receives proposal rejections and certified inclusions.
-    pub fn with_transaction_callback(mut self, callback: TransactionCallback<H::Digest>) -> Self {
-        self.transaction_callback = Some(callback);
-        self
     }
 
     /// Returns the configured execution strategy.
@@ -445,16 +430,9 @@ where
             .expect("proposal state loading must succeed");
         let ProposalOutput {
             valid,
-            invalid,
+            invalid: _,
             changeset,
         } = executor::propose(state, all_proposed);
-
-        if let Some(ref callback) = self.transaction_callback
-            && !invalid.is_empty()
-        {
-            let rejected: Vec<_> = invalid.iter().map(|tx| *tx.message_digest()).collect();
-            callback(parent.header.height + 1, rejected, false);
-        }
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
@@ -643,21 +621,9 @@ where
             .expect("certified block contained a statically invalid transaction");
         let transaction_batch = record_transactions(transaction_batch, &verified_block.body);
         let state_batch = apply_changeset(state_batch, &changeset);
-        let merkleized = self
-            .finalize_execution(state_batch, transaction_batch)
+        self.finalize_execution(state_batch, transaction_batch)
             .await
-            .expect("database merkleization must succeed");
-
-        if let Some(ref callback) = self.transaction_callback {
-            let included = verified_block
-                .body
-                .iter()
-                .map(|transaction| *transaction.message_digest())
-                .collect();
-            callback(block.header.height, included, true);
-        }
-
-        merkleized
+            .expect("database merkleization must succeed")
     }
 }
 

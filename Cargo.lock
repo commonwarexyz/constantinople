@@ -1025,6 +1025,7 @@ dependencies = [
  "serde",
  "serde_yaml",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]

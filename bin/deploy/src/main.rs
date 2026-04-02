@@ -276,7 +276,7 @@ pub(crate) fn default_bootstrappers(
         .collect()
 }
 
-pub(crate) fn spammer_enabled(args: &GenerateArgs) -> bool {
+pub(crate) const fn spammer_enabled(args: &GenerateArgs) -> bool {
     args.spammer_count.is_some()
 }
 
