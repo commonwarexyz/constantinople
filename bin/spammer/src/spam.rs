@@ -426,7 +426,6 @@ async fn poll_pending_statuses(
     client: reqwest::Client,
     fetch_statuses: impl Fn(reqwest::Client, String, Vec<String>) -> FetchStatusesFuture + Clone,
     now: time::Instant,
-    nonce: u64,
 ) -> Result<(), String> {
     let mut retries = Vec::new();
 
@@ -448,7 +447,18 @@ async fn poll_pending_statuses(
                 })
                 .collect::<Vec<_>>();
             let statuses =
-                fetch_statuses(client.clone(), endpoint.endpoint.clone(), tx_hashes).await?;
+                match fetch_statuses(client.clone(), endpoint.endpoint.clone(), tx_hashes).await {
+                    Ok(statuses) => statuses,
+                    Err(err) => match classify_submission_error(&err) {
+                        SubmissionErrorKind::Fatal => {
+                            return Err(format!("{} status poll failed: {err}", endpoint.endpoint));
+                        }
+                        SubmissionErrorKind::RetryRejected
+                        | SubmissionErrorKind::RetryCheckStatus => {
+                            continue;
+                        }
+                    },
+                };
             if statuses.len() != chunk.len() {
                 return Err(format!(
                     "{} returned {} statuses for {} requested hashes",
@@ -477,13 +487,10 @@ async fn poll_pending_statuses(
                         endpoint.completed += 1;
                     }
                     TransactionState::Rejected => {
-                        endpoint.failed += 1;
-                        return Err(format_sender_failure(
-                            &endpoint.endpoint,
-                            &senders[sender_index],
-                            nonce,
-                            "transaction rejected before inclusion",
-                        ));
+                        let retry_backoff =
+                            next_retry_backoff(senders[sender_index].retry_backoff, "rejected");
+                        senders[sender_index].retry_backoff = retry_backoff;
+                        retries.push((sender_index, now + retry_backoff));
                     }
                     TransactionState::Unknown => {
                         let retry_backoff = senders[sender_index].retry_backoff;
@@ -602,7 +609,6 @@ where
                 client.clone(),
                 fetch_statuses.clone(),
                 now,
-                round_nonce,
             )
             .await?;
             next_status_poll = now + STATUS_POLL_INTERVAL;
@@ -1049,6 +1055,105 @@ mod tests {
             *attempts.lock().expect("attempt list lock should succeed"),
             vec![0, 0]
         );
+    }
+
+    #[tokio::test]
+    async fn run_retries_same_nonce_after_mempool_rejection() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let status_polls = Arc::new(AtomicUsize::new(0));
+        let signal = should_stop.clone();
+        let attempts_for_submit = attempts.clone();
+        let status_polls_for_fetch = status_polls.clone();
+
+        let result = time::timeout(
+            Duration::from_secs(4),
+            run_until_stopped_with_statuses(
+                test_args(1),
+                should_stop,
+                move |_client, _endpoint, tx_bytes| {
+                    let attempts = attempts_for_submit.clone();
+                    async move {
+                        let (_sender, nonce) = decode_sender_and_nonce(&tx_bytes);
+                        attempts
+                            .lock()
+                            .expect("attempt list lock should succeed")
+                            .push(nonce);
+                        transaction_hash_hex(&tx_bytes)
+                    }
+                },
+                move |_client, _endpoint, tx_hashes| {
+                    let signal = signal.clone();
+                    let status_polls = status_polls_for_fetch.clone();
+                    Box::pin(async move {
+                        let poll_number = status_polls.fetch_add(1, Ordering::SeqCst);
+                        let state = if poll_number == 0 {
+                            TransactionState::Rejected
+                        } else {
+                            signal.store(true, Ordering::Relaxed);
+                            TransactionState::Included
+                        };
+
+                        Ok(tx_hashes
+                            .into_iter()
+                            .map(|tx_hash| TransactionStatus {
+                                tx_hash,
+                                state: state.clone(),
+                                height: 1,
+                            })
+                            .collect())
+                    })
+                },
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "spammer should finish");
+        assert_eq!(
+            *attempts.lock().expect("attempt list lock should succeed"),
+            vec![0, 0]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_retries_status_poll_failures_without_exiting() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let status_polls = Arc::new(AtomicUsize::new(0));
+        let signal = should_stop.clone();
+        let status_polls_for_fetch = status_polls.clone();
+
+        let result = time::timeout(
+            Duration::from_secs(4),
+            run_until_stopped_with_statuses(
+                test_args(1),
+                should_stop,
+                move |_client, _endpoint, tx_bytes| async move { transaction_hash_hex(&tx_bytes) },
+                move |_client, _endpoint, tx_hashes| {
+                    let signal = signal.clone();
+                    let status_polls = status_polls_for_fetch.clone();
+                    Box::pin(async move {
+                        let poll_number = status_polls.fetch_add(1, Ordering::SeqCst);
+                        if poll_number == 0 {
+                            return Err("request failed: timed out".to_string());
+                        }
+
+                        signal.store(true, Ordering::Relaxed);
+                        Ok(tx_hashes
+                            .into_iter()
+                            .map(|tx_hash| TransactionStatus {
+                                tx_hash,
+                                state: TransactionState::Included,
+                                height: 1,
+                            })
+                            .collect())
+                    })
+                },
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "spammer should finish");
+        assert_eq!(status_polls.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
