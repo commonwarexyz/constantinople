@@ -233,7 +233,8 @@
     },
     {
       "datasource": {
-        "uid": "P8E80F9AEF21F6940"
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
       },
       "description": "Average number of transactions in each validator's proposed blocks",
       "fieldConfig": {
@@ -314,36 +315,20 @@
       "pluginVersion": "11.5.2",
       "targets": [
         {
-          "direction": "backward",
-          "editorMode": "code",
-          "expr": "sum(\n    sum_over_time(\n      {deployer_arch=\"arm64\"} |= \"\\\"message\\\":\\\"proposed block\\\"\"\n      | json txs=\"fields.txs\"\n      | unwrap txs [1m]\n    )\n  )",
-          "hide": true,
-          "legendFormat": "{{deployer_name}}",
-          "queryType": "range",
-          "refId": "A"
-        },
-        {
           "datasource": {
-            "type": "loki",
-            "uid": "P8E80F9AEF21F6940"
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
           },
-          "direction": "backward",
-          "editorMode": "code",
-          "expr": "sum(\n    count_over_time(\n      {deployer_arch=\"arm64\"} |= \"\\\"message\\\":\\\"proposed block\\\"\" [5m]\n    )\n  )",
-          "hide": true,
-          "queryType": "range",
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "name": "Expression",
-            "type": "__expr__",
-            "uid": "__expr__"
-          },
-          "expression": "$A / $B",
-          "hide": false,
-          "refId": "C",
-          "type": "math"
+          "disableTextWrap": false,
+          "editorMode": "builder",
+          "expr": "engine_stateful_transactions_per_second",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "__auto",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
         }
       ],
       "title": "Average Number of Transactions [1m]",
@@ -4788,8 +4773,8 @@
   },
   "timepicker": {},
   "timezone": "browser",
-  "title": "Constantinople2",
-  "uid": "constantinople2",
+  "title": "Constantinople",
+  "uid": "constantinople",
   "version": 1,
   "weekStart": ""
 }

@@ -85,12 +85,18 @@ struct RingAccount {
 }
 
 #[derive(Debug, Clone)]
+enum SenderStatus {
+    Ready,
+    Submitting,
+    Pending(String),
+    Included,
+}
+
+#[derive(Debug, Clone)]
 struct SenderState {
     account: RingAccount,
-    next_nonce: u64,
-    pending_tx_hash: Option<String>,
     retry_backoff: Duration,
-    queued_ready: bool,
+    status: SenderStatus,
 }
 
 #[derive(Debug)]
@@ -133,6 +139,10 @@ enum SubmissionErrorKind {
     Fatal,
 }
 
+type FetchStatusesFuture = std::pin::Pin<
+    Box<dyn Future<Output = Result<Vec<crate::shared::TransactionStatus>, String>> + Send>,
+>;
+
 fn build_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .connect_timeout(HTTP_CONNECT_TIMEOUT)
@@ -148,20 +158,19 @@ fn build_ring_accounts(
     endpoint_count: usize,
 ) -> Vec<RingAccount> {
     let count = count.get();
+    let mut addresses = Vec::with_capacity(count);
 
-    let keys = (0..count)
-        .map(|index| {
-            let seed = seed_start + u64::try_from(index).expect("ring size exceeded u64");
-            ed25519::PrivateKey::from_seed(seed)
-        })
-        .collect::<Vec<_>>();
-    let addresses = keys
-        .iter()
-        .map(|key| Address::from_public_key(&mut Sha256::default(), &key.public_key()))
-        .collect::<Vec<_>>();
+    for index in 0..count {
+        let seed = seed_start + u64::try_from(index).expect("ring size exceeded u64");
+        let key = ed25519::PrivateKey::from_seed(seed);
+        addresses.push(Address::from_public_key(
+            &mut Sha256::default(),
+            &key.public_key(),
+        ));
+    }
 
     let mut accounts = Vec::with_capacity(count);
-    for (index, _key) in keys.iter().enumerate() {
+    for index in 0..count {
         let seed = seed_start + u64::try_from(index).expect("ring size exceeded u64");
         accounts.push(RingAccount {
             seed,
@@ -174,38 +183,32 @@ fn build_ring_accounts(
     accounts
 }
 
-fn build_sender_states(accounts: Vec<RingAccount>, nonce: u64) -> Vec<SenderState> {
+fn build_sender_states(accounts: Vec<RingAccount>) -> Vec<SenderState> {
     accounts
         .into_iter()
         .map(|account| SenderState {
             account,
-            next_nonce: nonce,
-            pending_tx_hash: None,
             retry_backoff: INITIAL_RETRY_BACKOFF,
-            queued_ready: false,
+            status: SenderStatus::Ready,
         })
         .collect()
 }
 
-fn build_sender_transaction_bytes(sender: &SenderState) -> Vec<u8> {
+fn build_round_transaction_bytes(sender: &SenderState, nonce: u64) -> Vec<u8> {
     let key = ed25519::PrivateKey::from_seed(sender.account.seed);
-    build_signed_transaction_bytes(&key, sender.account.to, 1, sender.next_nonce)
+    build_signed_transaction_bytes(&key, sender.account.to, 1, nonce)
 }
 
-fn build_endpoint_states(
-    endpoints: Vec<String>,
-    senders: &mut [SenderState],
-) -> Vec<EndpointState> {
+fn build_endpoint_states(endpoints: Vec<String>, senders: &[SenderState]) -> Vec<EndpointState> {
     let mut endpoint_states = endpoints
         .into_iter()
         .map(EndpointState::new)
         .collect::<Vec<_>>();
 
-    for (sender_index, sender) in senders.iter_mut().enumerate() {
-        let endpoint = &mut endpoint_states[sender.account.endpoint_index];
-        endpoint.sender_indices.push(sender_index);
-        endpoint.ready.push_back(sender_index);
-        sender.queued_ready = true;
+    for (sender_index, sender) in senders.iter().enumerate() {
+        endpoint_states[sender.account.endpoint_index]
+            .sender_indices
+            .push(sender_index);
     }
 
     endpoint_states
@@ -247,8 +250,40 @@ fn format_sender_failure(endpoint: &str, sender: &SenderState, nonce: u64, err: 
     format!("{endpoint} {from} -> {to} nonce={nonce}: {err}")
 }
 
-fn sender_is_ready(sender: &SenderState) -> bool {
-    !sender.queued_ready && sender.pending_tx_hash.is_none()
+fn current_round_nonce(base_nonce: u64, round: u64) -> Result<u64, String> {
+    base_nonce
+        .checked_add(round)
+        .ok_or_else(|| "round nonce overflowed".to_string())
+}
+
+fn sender_pending_hash(sender: &SenderState) -> Option<&str> {
+    match &sender.status {
+        SenderStatus::Pending(tx_hash) => Some(tx_hash),
+        _ => None,
+    }
+}
+
+fn start_round(endpoints: &mut [EndpointState], senders: &mut [SenderState]) {
+    for sender in senders {
+        sender.retry_backoff = INITIAL_RETRY_BACKOFF;
+        sender.status = SenderStatus::Ready;
+    }
+
+    for endpoint in endpoints {
+        endpoint.ready.clear();
+        endpoint.delayed.clear();
+        endpoint.submission_tasks = 0;
+
+        for &sender_index in &endpoint.sender_indices {
+            endpoint.ready.push_back(sender_index);
+        }
+    }
+}
+
+fn round_is_complete(senders: &[SenderState]) -> bool {
+    senders
+        .iter()
+        .all(|sender| matches!(sender.status, SenderStatus::Included))
 }
 
 fn schedule_sender_retry(
@@ -257,8 +292,8 @@ fn schedule_sender_retry(
     sender_index: usize,
     ready_at: time::Instant,
 ) {
+    senders[sender_index].status = SenderStatus::Ready;
     let endpoint_index = senders[sender_index].account.endpoint_index;
-    senders[sender_index].queued_ready = true;
     endpoints[endpoint_index]
         .delayed
         .push(Reverse((ready_at, sender_index)));
@@ -266,7 +301,7 @@ fn schedule_sender_retry(
 
 fn activate_ready_senders(
     endpoints: &mut [EndpointState],
-    senders: &mut [SenderState],
+    senders: &[SenderState],
     now: time::Instant,
 ) {
     for endpoint in endpoints {
@@ -276,8 +311,7 @@ fn activate_ready_senders(
             }
 
             endpoint.delayed.pop();
-            if senders[sender_index].pending_tx_hash.is_some() {
-                senders[sender_index].queued_ready = false;
+            if !matches!(senders[sender_index].status, SenderStatus::Ready) {
                 continue;
             }
 
@@ -289,6 +323,7 @@ fn activate_ready_senders(
 fn spawn_submissions<Submit, SubmitFuture>(
     endpoints: &mut [EndpointState],
     senders: &mut [SenderState],
+    nonce: u64,
     tasks: &mut JoinSet<SubmissionOutcome>,
     client: &reqwest::Client,
     submit: &Submit,
@@ -301,14 +336,12 @@ fn spawn_submissions<Submit, SubmitFuture>(
             let Some(sender_index) = endpoint.ready.pop_front() else {
                 break;
             };
-            senders[sender_index].queued_ready = false;
-            if senders[sender_index].pending_tx_hash.is_some() {
+            if !matches!(senders[sender_index].status, SenderStatus::Ready) {
                 continue;
             }
 
-            let sender = &senders[sender_index];
-            let nonce = sender.next_nonce;
-            let tx_bytes = build_sender_transaction_bytes(sender);
+            senders[sender_index].status = SenderStatus::Submitting;
+            let tx_bytes = build_round_transaction_bytes(&senders[sender_index], nonce);
             let tx_hash =
                 transaction_hash_hex(&tx_bytes).expect("generated tx bytes should decode");
             let endpoint_url = endpoint.endpoint.clone();
@@ -357,8 +390,8 @@ fn handle_submission_completion(
 
     match result {
         Ok(()) => {
-            senders[sender_index].pending_tx_hash = Some(tx_hash);
             senders[sender_index].retry_backoff = INITIAL_RETRY_BACKOFF;
+            senders[sender_index].status = SenderStatus::Pending(tx_hash);
             Ok(())
         }
         Err(err) => match classify_submission_error(&err) {
@@ -380,8 +413,7 @@ fn handle_submission_completion(
             SubmissionErrorKind::RetryCheckStatus => {
                 let retry_backoff = next_retry_backoff(senders[sender_index].retry_backoff, &err);
                 senders[sender_index].retry_backoff = retry_backoff;
-                senders[sender_index].pending_tx_hash = Some(tx_hash);
-                schedule_sender_retry(endpoints, senders, sender_index, now + retry_backoff);
+                senders[sender_index].status = SenderStatus::Pending(tx_hash);
                 Ok(())
             }
         },
@@ -394,6 +426,7 @@ async fn poll_pending_statuses(
     client: reqwest::Client,
     fetch_statuses: impl Fn(reqwest::Client, String, Vec<String>) -> FetchStatusesFuture + Clone,
     now: time::Instant,
+    nonce: u64,
 ) -> Result<(), String> {
     let mut retries = Vec::new();
 
@@ -402,17 +435,16 @@ async fn poll_pending_statuses(
             .sender_indices
             .iter()
             .copied()
-            .filter(|sender_index| senders[*sender_index].pending_tx_hash.is_some())
+            .filter(|sender_index| sender_pending_hash(&senders[*sender_index]).is_some())
             .collect::<Vec<_>>();
 
         for chunk in pending_senders.chunks(STATUS_POLL_BATCH_SIZE) {
             let tx_hashes = chunk
                 .iter()
                 .map(|sender_index| {
-                    senders[*sender_index]
-                        .pending_tx_hash
-                        .clone()
+                    sender_pending_hash(&senders[*sender_index])
                         .expect("pending sender must carry a tx hash")
+                        .to_string()
                 })
                 .collect::<Vec<_>>();
             let statuses =
@@ -427,7 +459,7 @@ async fn poll_pending_statuses(
             }
 
             for (sender_index, status) in chunk.iter().copied().zip(statuses) {
-                let Some(current_hash) = senders[sender_index].pending_tx_hash.clone() else {
+                let Some(current_hash) = sender_pending_hash(&senders[sender_index]) else {
                     continue;
                 };
                 if current_hash != status.tx_hash {
@@ -440,30 +472,21 @@ async fn poll_pending_statuses(
                 match status.state {
                     TransactionState::Pending => {}
                     TransactionState::Included => {
-                        senders[sender_index].pending_tx_hash = None;
-                        senders[sender_index].next_nonce = senders[sender_index]
-                            .next_nonce
-                            .checked_add(1)
-                            .expect("sender nonce overflowed");
                         senders[sender_index].retry_backoff = INITIAL_RETRY_BACKOFF;
+                        senders[sender_index].status = SenderStatus::Included;
                         endpoint.completed += 1;
-                        if sender_is_ready(&senders[sender_index]) {
-                            senders[sender_index].queued_ready = true;
-                            endpoint.ready.push_back(sender_index);
-                        }
                     }
                     TransactionState::Rejected => {
                         endpoint.failed += 1;
                         return Err(format_sender_failure(
                             &endpoint.endpoint,
                             &senders[sender_index],
-                            senders[sender_index].next_nonce,
+                            nonce,
                             "transaction rejected before inclusion",
                         ));
                     }
                     TransactionState::Unknown => {
                         let retry_backoff = senders[sender_index].retry_backoff;
-                        senders[sender_index].pending_tx_hash = None;
                         retries.push((sender_index, now + retry_backoff));
                     }
                 }
@@ -500,7 +523,7 @@ fn print_startup(endpoints: &[EndpointState], sender_count: usize) {
     }
 }
 
-fn print_summary(endpoints: &[EndpointState]) -> Result<(), String> {
+fn print_summary(endpoints: &[EndpointState], completed_rounds: u64) -> Result<(), String> {
     let completed = endpoints
         .iter()
         .map(|endpoint| endpoint.completed)
@@ -510,6 +533,7 @@ fn print_summary(endpoints: &[EndpointState]) -> Result<(), String> {
         .map(|endpoint| endpoint.failed)
         .sum::<usize>();
 
+    println!("rounds completed: {completed_rounds}");
     println!("completed: {completed}");
     println!("failed: {failed}");
     for (index, endpoint) in endpoints.iter().enumerate() {
@@ -550,12 +574,14 @@ where
     SubmitFuture: Future<Output = Result<String, String>> + Send + 'static,
 {
     let accounts = build_ring_accounts(args.count, args.seed_start, args.endpoints.len());
-    let mut senders = build_sender_states(accounts, args.nonce);
-    let mut endpoints = build_endpoint_states(args.endpoints, &mut senders);
+    let mut senders = build_sender_states(accounts);
+    let mut endpoints = build_endpoint_states(args.endpoints, &senders);
     let client = build_http_client();
     let mut tasks = JoinSet::new();
     let mut next_status_poll = time::Instant::now();
+    let mut completed_rounds = 0_u64;
 
+    start_round(&mut endpoints, &mut senders);
     print_startup(&endpoints, args.count.get());
 
     loop {
@@ -565,8 +591,9 @@ where
             handle_submission_completion(&mut endpoints, &mut senders, outcome, now)?;
         }
 
+        let round_nonce = current_round_nonce(args.nonce, completed_rounds)?;
         let now = time::Instant::now();
-        activate_ready_senders(&mut endpoints, &mut senders, now);
+        activate_ready_senders(&mut endpoints, &senders, now);
 
         if now >= next_status_poll {
             poll_pending_statuses(
@@ -575,12 +602,36 @@ where
                 client.clone(),
                 fetch_statuses.clone(),
                 now,
+                round_nonce,
             )
             .await?;
             next_status_poll = now + STATUS_POLL_INTERVAL;
         }
 
-        spawn_submissions(&mut endpoints, &mut senders, &mut tasks, &client, &submit);
+        if round_is_complete(&senders) {
+            completed_rounds = completed_rounds
+                .checked_add(1)
+                .expect("completed round counter overflowed");
+            println!("completed round {completed_rounds}");
+
+            if should_stop.load(Ordering::Relaxed) {
+                stop_spammer(&mut tasks).await;
+                break;
+            }
+
+            start_round(&mut endpoints, &mut senders);
+            next_status_poll = time::Instant::now();
+            continue;
+        }
+
+        spawn_submissions(
+            &mut endpoints,
+            &mut senders,
+            round_nonce,
+            &mut tasks,
+            &client,
+            &submit,
+        );
 
         if should_stop.load(Ordering::Relaxed) {
             stop_spammer(&mut tasks).await;
@@ -597,12 +648,8 @@ where
         }
     }
 
-    print_summary(&endpoints)
+    print_summary(&endpoints, completed_rounds)
 }
-
-type FetchStatusesFuture = std::pin::Pin<
-    Box<dyn Future<Output = Result<Vec<crate::shared::TransactionStatus>, String>> + Send>,
->;
 
 async fn run_with_default_status_fetch<Submit, SubmitFuture>(
     args: Args,
@@ -682,9 +729,10 @@ fn test_args(count: usize) -> Args {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, MAX_SUBMISSION_TASKS_PER_ENDPOINT, build_ring_accounts, build_sender_states,
-        classify_submission_error, next_retry_backoff, run_until_stopped,
-        run_until_stopped_with_statuses, start_stop_timer, test_args,
+        Args, MAX_SUBMISSION_TASKS_PER_ENDPOINT, build_ring_accounts,
+        build_round_transaction_bytes, build_sender_states, classify_submission_error,
+        next_retry_backoff, run_until_stopped, run_until_stopped_with_statuses, start_stop_timer,
+        test_args,
     };
     use crate::shared::{TransactionState, TransactionStatus, transaction_hash_hex};
     use commonware_codec::{Encode, ReadExt};
@@ -692,7 +740,7 @@ mod tests {
     use commonware_utils::hex;
     use constantinople_primitives::{Signed, Transaction};
     use std::{
-        collections::{HashSet, VecDeque},
+        collections::{HashMap, HashSet},
         num::NonZeroUsize,
         sync::{
             Arc, Mutex,
@@ -742,9 +790,9 @@ mod tests {
     #[test]
     fn transaction_hash_matches_generated_bytes() {
         let senders =
-            build_sender_states(build_ring_accounts(NonZeroUsize::new(1).unwrap(), 11, 1), 7);
+            build_sender_states(build_ring_accounts(NonZeroUsize::new(1).unwrap(), 11, 1));
         let sender = &senders[0];
-        let tx_bytes = super::build_sender_transaction_bytes(sender);
+        let tx_bytes = build_round_transaction_bytes(sender, 7);
         let tx_hash = transaction_hash_hex(&tx_bytes).expect("tx hash should decode");
         let (_sender, nonce) = decode_sender_and_nonce(&tx_bytes);
 
@@ -816,11 +864,10 @@ mod tests {
 
         let result = time::timeout(
             Duration::from_millis(500),
-            run_until_stopped(args, should_stop, move |_client, endpoint, tx_bytes| {
+            run_until_stopped(args, should_stop, move |_client, endpoint, _tx_bytes| {
                 let seen = seen.clone();
                 let signal = signal.clone();
                 async move {
-                    let _ = tx_bytes;
                     let count = {
                         let mut seen = seen.lock().expect("endpoint set lock should succeed");
                         seen.insert(endpoint);
@@ -846,47 +893,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_reuses_sender_after_inclusion_status() {
+    async fn run_waits_for_full_round_before_advancing_nonce() {
         let should_stop = Arc::new(AtomicBool::new(false));
-        let submissions = Arc::new(AtomicUsize::new(0));
-        let pending_hashes = Arc::new(Mutex::new(VecDeque::<String>::new()));
-        let pending_for_submit = pending_hashes.clone();
-        let pending_for_status = pending_hashes.clone();
-        let submit_count = submissions.clone();
+        let round_zero_submissions = Arc::new(AtomicUsize::new(0));
+        let round_one_submissions = Arc::new(AtomicUsize::new(0));
+        let round_zero_included = Arc::new(AtomicBool::new(false));
+        let saw_premature_round_one = Arc::new(AtomicBool::new(false));
+        let nonce_by_hash = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
         let signal = should_stop.clone();
+        let round_zero_submissions_for_submit = round_zero_submissions.clone();
+        let round_zero_submissions_for_status = round_zero_submissions.clone();
+        let round_one_submissions_for_submit = round_one_submissions.clone();
+        let round_zero_included_for_submit = round_zero_included.clone();
+        let round_zero_included_for_status = round_zero_included.clone();
+        let saw_premature_round_one_for_submit = saw_premature_round_one.clone();
+        let nonce_by_hash_for_submit = nonce_by_hash.clone();
+        let nonce_by_hash_for_status = nonce_by_hash.clone();
 
         let result = time::timeout(
             Duration::from_secs(2),
             run_until_stopped_with_statuses(
-                test_args(1),
+                test_args(2),
                 should_stop,
                 move |_client, _endpoint, tx_bytes| {
-                    let submit_count = submit_count.clone();
-                    let pending = pending_for_submit.clone();
+                    let round_zero_submissions = round_zero_submissions_for_submit.clone();
+                    let round_one_submissions = round_one_submissions_for_submit.clone();
+                    let round_zero_included = round_zero_included_for_submit.clone();
+                    let saw_premature_round_one = saw_premature_round_one_for_submit.clone();
+                    let nonce_by_hash = nonce_by_hash_for_submit.clone();
                     let signal = signal.clone();
                     async move {
-                        let count = submit_count.fetch_add(1, Ordering::SeqCst) + 1;
+                        let (_sender, nonce) = decode_sender_and_nonce(&tx_bytes);
                         let hash = transaction_hash_hex(&tx_bytes).expect("tx hash should decode");
-                        pending
+                        nonce_by_hash
                             .lock()
-                            .expect("pending hash lock should succeed")
-                            .push_back(hash.clone());
-                        if count >= 2 {
-                            signal.store(true, Ordering::Relaxed);
+                            .expect("nonce map lock should succeed")
+                            .insert(hash.clone(), nonce);
+
+                        match nonce {
+                            0 => {
+                                round_zero_submissions.fetch_add(1, Ordering::SeqCst);
+                            }
+                            1 => {
+                                if !round_zero_included.load(Ordering::SeqCst) {
+                                    saw_premature_round_one.store(true, Ordering::SeqCst);
+                                }
+                                let count =
+                                    round_one_submissions.fetch_add(1, Ordering::SeqCst) + 1;
+                                if count == 2 {
+                                    signal.store(true, Ordering::Relaxed);
+                                }
+                            }
+                            other => panic!("unexpected nonce submitted in test: {other}"),
                         }
+
                         Ok(hash)
                     }
                 },
                 move |_client, _endpoint, tx_hashes| {
-                    let pending = pending_for_status.clone();
+                    let round_zero_submissions = round_zero_submissions_for_status.clone();
+                    let round_zero_included = round_zero_included_for_status.clone();
+                    let nonce_by_hash = nonce_by_hash_for_status.clone();
                     Box::pin(async move {
-                        let mut pending = pending.lock().expect("pending hash lock should succeed");
+                        let nonce_by_hash =
+                            nonce_by_hash.lock().expect("nonce map lock should succeed");
                         let statuses = tx_hashes
                             .into_iter()
                             .map(|tx_hash| {
-                                let state = if pending.front().is_some_and(|next| next == &tx_hash)
-                                {
-                                    pending.pop_front();
+                                let nonce = nonce_by_hash
+                                    .get(&tx_hash)
+                                    .copied()
+                                    .expect("every pending hash should be recorded");
+                                let state = if nonce == 0 {
+                                    if round_zero_submissions.load(Ordering::SeqCst) == 2 {
+                                        round_zero_included.store(true, Ordering::SeqCst);
+                                        TransactionState::Included
+                                    } else {
+                                        TransactionState::Pending
+                                    }
+                                } else if round_zero_included.load(Ordering::SeqCst) {
                                     TransactionState::Included
                                 } else {
                                     TransactionState::Pending
@@ -899,7 +984,6 @@ mod tests {
                                 }
                             })
                             .collect::<Vec<_>>();
-
                         Ok(statuses)
                     })
                 },
@@ -908,7 +992,63 @@ mod tests {
         .await;
 
         assert!(result.is_ok(), "spammer should finish");
-        assert!(submissions.load(Ordering::SeqCst) >= 2);
+        assert!(round_zero_included.load(Ordering::SeqCst));
+        assert!(!saw_premature_round_one.load(Ordering::SeqCst));
+        assert_eq!(round_one_submissions.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn run_retries_same_nonce_until_round_tx_is_accepted() {
+        let should_stop = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(Mutex::new(Vec::<u64>::new()));
+        let signal = should_stop.clone();
+        let attempts_for_submit = attempts.clone();
+
+        let result = time::timeout(
+            Duration::from_secs(4),
+            run_until_stopped_with_statuses(
+                test_args(1),
+                should_stop,
+                move |_client, _endpoint, tx_bytes| {
+                    let attempts = attempts_for_submit.clone();
+                    async move {
+                        let (_sender, nonce) = decode_sender_and_nonce(&tx_bytes);
+                        let attempt_number = {
+                            let mut attempts =
+                                attempts.lock().expect("attempt list lock should succeed");
+                            attempts.push(nonce);
+                            attempts.len()
+                        };
+                        if attempt_number == 1 {
+                            return Err("error (503): mempool full".to_string());
+                        }
+
+                        transaction_hash_hex(&tx_bytes)
+                    }
+                },
+                move |_client, _endpoint, tx_hashes| {
+                    let signal = signal.clone();
+                    Box::pin(async move {
+                        signal.store(true, Ordering::Relaxed);
+                        Ok(tx_hashes
+                            .into_iter()
+                            .map(|tx_hash| TransactionStatus {
+                                tx_hash,
+                                state: TransactionState::Included,
+                                height: 1,
+                            })
+                            .collect())
+                    })
+                },
+            ),
+        )
+        .await;
+
+        assert!(result.is_ok(), "spammer should finish");
+        assert_eq!(
+            *attempts.lock().expect("attempt list lock should succeed"),
+            vec![0, 0]
+        );
     }
 
     #[tokio::test]

@@ -56,15 +56,12 @@ use constantinople_primitives::{
 };
 use core::fmt;
 use futures::StreamExt;
-use prometheus_client::metrics::gauge::Gauge;
+use prometheus_client::metrics::counter::Counter;
 use rand::Rng;
 use std::{
     collections::{HashMap, HashSet},
     marker::PhantomData,
-    sync::{
-        Arc, Once,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -109,7 +106,6 @@ type TransactionsMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Me
 /// Different platforms have different `SystemTime` limits, so we use a fixed
 /// timestamp to ensure consistent application of block validity rules.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
-const UNSET_APPLIED_TIMESTAMP_MS: u64 = u64::MAX;
 
 /// Unmerkleized application state batch used for processor read-through.
 pub type StateBatch<E, H, T> = AnyUnmerkleized<
@@ -218,62 +214,12 @@ where
 /// the transactions were rejected during proposal or included in a certified block.
 pub type TransactionCallback<D> = Arc<dyn Fn(u64, Vec<D>, bool) + Send + Sync>;
 
-#[derive(Debug)]
-struct ApplicationMetrics {
-    register_once: Once,
-    transactions_per_second: Gauge<f64, AtomicU64>,
-    last_applied_timestamp_ms: AtomicU64,
-}
-
-impl ApplicationMetrics {
-    fn new() -> Self {
-        Self {
-            register_once: Once::new(),
-            transactions_per_second: Gauge::default(),
-            last_applied_timestamp_ms: AtomicU64::new(UNSET_APPLIED_TIMESTAMP_MS),
-        }
-    }
-
-    fn register(&self, context: &impl Metrics) {
-        self.register_once.call_once(|| {
-            context.register(
-                "transactions_per_second",
-                "Transactions per second across consecutive applied certified blocks",
-                self.transactions_per_second.clone(),
-            );
-        });
-    }
-
-    fn record_applied_block_tps(
-        &self,
-        context: &impl Metrics,
-        block_timestamp_ms: u64,
-        transactions: usize,
-    ) {
-        self.register(context);
-        let previous_timestamp_ms = self
-            .last_applied_timestamp_ms
-            .swap(block_timestamp_ms, Ordering::SeqCst);
-
-        let tps = if previous_timestamp_ms == UNSET_APPLIED_TIMESTAMP_MS
-            || block_timestamp_ms <= previous_timestamp_ms
-        {
-            0.0
-        } else {
-            let elapsed_seconds = (block_timestamp_ms - previous_timestamp_ms) as f64 / 1_000.0;
-            transactions as f64 / elapsed_seconds
-        };
-
-        self.transactions_per_second.set(tps);
-    }
-}
-
 pub struct Application<H: Hasher, C, S, P, I, St> {
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     transaction_callback: Option<TransactionCallback<H::Digest>>,
-    metrics: Arc<ApplicationMetrics>,
+    proposed_transactions: Counter,
     _marker: PhantomData<(C, S, I)>,
 }
 
@@ -287,7 +233,7 @@ where
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             transaction_callback: self.transaction_callback.clone(),
-            metrics: self.metrics.clone(),
+            proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
     }
@@ -305,13 +251,25 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
     /// The application keeps the execution strategy, genesis leader, and
     /// transaction signing namespace for all later block proposal,
     /// verification, and application.
-    pub fn new(strategy: St, genesis_leader: P, transaction_namespace: &'static [u8]) -> Self {
+    pub fn new(
+        context: impl Metrics,
+        strategy: St,
+        genesis_leader: P,
+        transaction_namespace: &'static [u8],
+    ) -> Self {
+        let proposed_transactions = Counter::default();
+        context.register(
+            "proposed_transactions",
+            "The number of transactions proposed into blocks",
+            proposed_transactions.clone(),
+        );
+
         Self {
             strategy,
             genesis_leader,
             transaction_namespace,
             transaction_callback: None,
-            metrics: Arc::new(ApplicationMetrics::new()),
+            proposed_transactions,
             _marker: PhantomData,
         }
     }
@@ -330,14 +288,6 @@ impl<H: Hasher, C, S, P, I, St> Application<H, C, S, P, I, St> {
     /// Returns the transaction signing namespace.
     pub const fn transaction_namespace(&self) -> &'static [u8] {
         self.transaction_namespace
-    }
-
-    fn record_applied_block_tps<E>(&self, runtime: &E, block_timestamp_ms: u64, transactions: usize)
-    where
-        E: Metrics,
-    {
-        self.metrics
-            .record_applied_block_tps(runtime, block_timestamp_ms, transactions);
     }
 }
 
@@ -505,6 +455,8 @@ where
             let rejected: Vec<_> = invalid.iter().map(|tx| *tx.message_digest()).collect();
             callback(parent.header.height + 1, rejected, false);
         }
+
+        self.proposed_transactions.inc_by(valid.len() as u64);
 
         let transaction_batch = record_transactions(transaction_batch, &valid);
         let state_batch = apply_changeset(state_batch, &changeset);
@@ -682,8 +634,6 @@ where
         let verified_block = self
             .verify_block(block)
             .expect("certified block contained an invalid signature");
-        let transaction_count = verified_block.body.len();
-        self.record_applied_block_tps(&_context.0, block.header.timestamp, transaction_count);
 
         let (state_batch, transaction_batch) = batches;
         let state = load_state(&state_batch, &verified_block.body)
@@ -754,7 +704,7 @@ mod tests {
     use commonware_cryptography::{Digest, Signer, blake3, ed25519, secp256r1::recoverable};
     use commonware_glue::stateful::db::ManagedDb;
     use commonware_parallel::{Sequential, Strategy};
-    use commonware_runtime::{Metrics as _, Runner as _, buffer::paged::CacheRef, deterministic};
+    use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedJournalConfig,
         mmr,
@@ -950,18 +900,20 @@ mod tests {
         .seal_and_sign_verified(&private_key, NAMESPACE, &mut TestHasher::default())
     }
 
-    fn verify_test_application()
-    -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), Sequential> {
+    fn verify_test_application(
+        context: TestContext,
+    ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), Sequential> {
         let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(Sequential, genesis_leader, NAMESPACE)
+        Application::new(context, Sequential, genesis_leader, NAMESPACE)
     }
 
     fn counting_test_application(
+        context: TestContext,
         strategy: CountingStrategy,
     ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), CountingStrategy>
     {
         let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(strategy, genesis_leader, NAMESPACE)
+        Application::new(context, strategy, genesis_leader, NAMESPACE)
     }
 
     fn verified_wire_transaction() -> VerifyTestTransaction {
@@ -1019,87 +971,82 @@ mod tests {
 
     #[test]
     fn decoded_verified_bytes_are_reverified_before_execution() {
-        let application = verify_test_application();
-        let transaction = verified_wire_transaction();
-        let block =
-            Block::<blake3::Digest, VerifyTestPublicKey, TestHasher, VerifyTestTransaction>::new(
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let application = verify_test_application(context);
+            let transaction = verified_wire_transaction();
+            let block = Block::<
+                blake3::Digest,
+                VerifyTestPublicKey,
+                TestHasher,
+                VerifyTestTransaction,
+            >::new(
                 verify_test_header(transaction.value().sender.clone(), 1),
                 vec![transaction.clone()],
             )
             .seal(&mut TestHasher::default());
 
-        let encoded = block.encode();
-        let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
-            .expect("wire block decoding should succeed");
+            let encoded = block.encode();
+            let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
+                .expect("wire block decoding should succeed");
 
-        let verified = application
-            .verify_block(&decoded)
-            .expect("decoded block should be re-verified");
+            let verified = application
+                .verify_block(&decoded)
+                .expect("decoded block should be re-verified");
 
-        assert_eq!(verified.body.len(), 1);
-        assert_eq!(
-            *verified.body[0].message_digest(),
-            *transaction.message_digest()
-        );
-        assert_eq!(verified.body[0].signer(), transaction.signer());
+            assert_eq!(verified.body.len(), 1);
+            assert_eq!(
+                *verified.body[0].message_digest(),
+                *transaction.message_digest()
+            );
+            assert_eq!(verified.body[0].signer(), transaction.signer());
+        });
     }
 
     #[test]
     fn verify_transactions_uses_configured_strategy() {
-        let strategy = CountingStrategy::default();
-        let application = counting_test_application(strategy.clone());
-        let transaction = verified_wire_transaction().into_inner();
+        let executor = deterministic::Runner::default();
+        executor.start(|context| async move {
+            let strategy = CountingStrategy::default();
+            let application = counting_test_application(context, strategy.clone());
+            let transaction = verified_wire_transaction().into_inner();
 
-        let verified = application
-            .verify_transactions(vec![transaction])
-            .expect("transaction signature should verify");
+            let verified = application
+                .verify_transactions(vec![transaction])
+                .expect("transaction signature should verify");
 
-        assert_eq!(verified.len(), 1);
-        assert_eq!(strategy.fold_calls(), 1);
+            assert_eq!(verified.len(), 1);
+            assert_eq!(strategy.fold_calls(), 1);
+        });
     }
 
     #[test]
     fn decoded_block_with_tampered_signature_is_rejected() {
-        let application = verify_test_application();
-        let transaction = verified_wire_transaction();
-        let block = Block::<
-            blake3::Digest,
-            VerifyTestPublicKey,
-            TestHasher,
-            VerifyTestSignedTransaction,
-        >::new(
-            verify_test_header(transaction.value().sender.clone(), 1),
-            vec![transaction.into_inner()],
-        )
-        .seal(&mut TestHasher::default());
-
-        let mut encoded = block.encode().to_vec();
-        let byte = encoded
-            .last_mut()
-            .expect("encoded block should include signature bytes");
-        *byte ^= 0x01;
-
-        let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
-            .expect("tampered block should still decode");
-
-        assert!(application.verify_block(&decoded).is_none());
-    }
-
-    #[test]
-    fn applied_block_tps_metric_uses_consecutive_block_timestamps() {
         let executor = deterministic::Runner::default();
         executor.start(|context| async move {
-            let runtime = context.with_label("application");
-            let application = verify_test_application();
+            let application = verify_test_application(context);
+            let transaction = verified_wire_transaction();
+            let block = Block::<
+                blake3::Digest,
+                VerifyTestPublicKey,
+                TestHasher,
+                VerifyTestSignedTransaction,
+            >::new(
+                verify_test_header(transaction.value().sender.clone(), 1),
+                vec![transaction.into_inner()],
+            )
+            .seal(&mut TestHasher::default());
 
-            application.record_applied_block_tps(&runtime, 1_000, 4);
-            application.record_applied_block_tps(&runtime, 3_000, 10);
+            let mut encoded = block.encode().to_vec();
+            let byte = encoded
+                .last_mut()
+                .expect("encoded block should include signature bytes");
+            *byte ^= 0x01;
 
-            let metrics = runtime.encode();
-            assert!(
-                metrics.contains("application_transactions_per_second 5.0"),
-                "expected encoded metrics to include 5 TPS, got: {metrics}"
-            );
+            let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
+                .expect("tampered block should still decode");
+
+            assert!(application.verify_block(&decoded).is_none());
         });
     }
 

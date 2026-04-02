@@ -331,6 +331,7 @@ where
         );
 
         let mut application = Application::new(
+            context.with_label("application"),
             config.strategy.clone(),
             config.genesis_leader,
             config.transaction_namespace,
