@@ -1,10 +1,18 @@
-//! Constantinople transaction type.
+//! Constantinople transaction type and transaction wrappers.
 
-use crate::{Address, Sealable, Sealed};
+use crate::{Address, Sealable, Sealed, Signed, Verified};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write};
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
 use core::num::NonZeroU64;
+
+/// A signed transaction accepted by the canonical block format.
+pub type SignedTransaction<P, H> =
+    Signed<Transaction<<H as Hasher>::Digest, P>, H, <P as Verifier>::Signature>;
+
+/// A verified transaction paired with its cached sender address.
+pub type VerifiedTransaction<P, H> =
+    Verified<Transaction<<H as Hasher>::Digest, P>, H, <P as Verifier>::Signature>;
 
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

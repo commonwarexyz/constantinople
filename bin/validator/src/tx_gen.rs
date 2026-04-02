@@ -6,8 +6,8 @@ use commonware_utils::{
     Acknowledgement, NZU64,
     channel::fallible::{AsyncFallibleExt, OneshotExt},
 };
-use constantinople_mempool::{SealedBlock, TransactionSource};
-use constantinople_primitives::{Address, Header, Transaction, VerifiedTransaction};
+use constantinople_mempool::TransactionSource;
+use constantinople_primitives::{Address, Header, SealedBlock, Transaction, VerifiedTransaction};
 use rand_core::CryptoRngCore;
 use std::marker::PhantomData;
 use tokio::sync::{mpsc, oneshot};

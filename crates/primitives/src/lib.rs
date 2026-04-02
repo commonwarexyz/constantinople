@@ -11,9 +11,7 @@ mod account;
 pub use account::{Account, Address, DEFAULT_ACCOUNT_BALANCE};
 
 mod block;
-pub use block::{
-    Block, BlockCfg, Header, SignedBlock, SignedTransaction, VerifiedBlock, VerifiedTransaction,
-};
+pub use block::{Block, BlockCfg, Header, SealedBlock};
 
 mod transaction;
-pub use transaction::Transaction;
+pub use transaction::{SignedTransaction, Transaction, VerifiedTransaction};

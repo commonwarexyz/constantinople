@@ -5,12 +5,12 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{Sealable, Sealed, Signed, Verified, transaction::Transaction};
+use crate::{Sealable, Sealed, SignedTransaction};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
-use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
+use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::range::NonEmptyRange;
 
 /// A block header containing metadata, consensus context, and state commitment roots.
@@ -148,23 +148,9 @@ impl Default for BlockCfg {
     }
 }
 
-/// A block containing execution transactions and required epoch-consensus metadata.
-pub type SignedTransaction<P, H> =
-    Signed<Transaction<<H as Hasher>::Digest, P>, H, <P as Verifier>::Signature>;
-
-/// A verified transaction paired with its cached sender address.
-pub type VerifiedTransaction<P, H> =
-    Verified<Transaction<<H as Hasher>::Digest, P>, H, <P as Verifier>::Signature>;
-
-/// The canonical signed block type used for encoding and consensus.
-pub type SignedBlock<C, P, H> = Block<C, P, H, SignedTransaction<P, H>>;
-
-/// The in-memory verified block type used for execution.
-pub type VerifiedBlock<C, P, H> = Block<C, P, H, VerifiedTransaction<P, H>>;
-
-/// A block containing execution transactions and required epoch-consensus metadata.
+/// A block containing signed transactions and required epoch-consensus metadata.
 #[derive(Debug, Clone)]
-pub struct Block<C, P, H, Tx = SignedTransaction<P, H>>
+pub struct Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
@@ -173,17 +159,20 @@ where
     /// The execution header.
     pub header: Header<C, H::Digest, P>,
     /// Ordered transactions included in this execution payload.
-    pub body: Vec<Tx>,
+    pub body: Vec<SignedTransaction<P, H>>,
 }
 
+/// A sealed canonical block.
+pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
+
 #[cfg(any(feature = "arbitrary", test))]
-impl<C, P, H, Tx> arbitrary::Arbitrary<'_> for Block<C, P, H, Tx>
+impl<C, P, H> arbitrary::Arbitrary<'_> for Block<C, P, H>
 where
     C: Digest + for<'a> arbitrary::Arbitrary<'a>,
     P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
     H: Hasher,
     H::Digest: for<'a> arbitrary::Arbitrary<'a>,
-    Tx: for<'a> arbitrary::Arbitrary<'a>,
+    SignedTransaction<P, H>: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self {
@@ -193,58 +182,54 @@ where
     }
 }
 
-impl<C, P, H, Tx> PartialEq for Block<C, P, H, Tx>
+impl<C, P, H> PartialEq for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    Tx: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.header == other.header && self.body == other.body
     }
 }
 
-impl<C, P, H, Tx> Eq for Block<C, P, H, Tx>
+impl<C, P, H> Eq for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey + Eq,
     H: Hasher,
     H::Digest: Eq,
-    Tx: Eq,
 {
 }
 
-impl<C, P, H, Tx> Block<C, P, H, Tx>
+impl<C, P, H> Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
 {
     /// Creates a new block.
-    pub const fn new(header: Header<C, H::Digest, P>, body: Vec<Tx>) -> Self {
+    pub const fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<P, H>>) -> Self {
         Self { header, body }
     }
 }
 
-impl<C, P, H, Tx> EncodeSize for Block<C, P, H, Tx>
+impl<C, P, H> EncodeSize for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    Tx: EncodeSize,
 {
     fn encode_size(&self) -> usize {
         self.header.encode_size() + self.body.encode_size()
     }
 }
 
-impl<C, P, H, Tx> Write for Block<C, P, H, Tx>
+impl<C, P, H> Write for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    Tx: Write,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.header.write(buf);
@@ -252,7 +237,7 @@ where
     }
 }
 
-impl<C, P, H> Read for SignedBlock<C, P, H>
+impl<C, P, H> Read for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
@@ -269,7 +254,7 @@ where
     }
 }
 
-impl<C, P, H, Tx> Sealable for Block<C, P, H, Tx>
+impl<C, P, H> Sealable for Block<C, P, H>
 where
     C: Digest,
     P: PublicKey,
@@ -287,7 +272,7 @@ where
     }
 }
 
-impl<C, P, H, Tx> Heightable for Sealed<Block<C, P, H, Tx>, H>
+impl<C, P, H> Heightable for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
     P: PublicKey,
@@ -298,7 +283,7 @@ where
     }
 }
 
-impl<C, P, H> ConsensusBlock for Sealed<SignedBlock<C, P, H>, H>
+impl<C, P, H> ConsensusBlock for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
     P: PublicKey,
@@ -309,7 +294,7 @@ where
     }
 }
 
-impl<C, P, H> CertifiableBlock for Sealed<SignedBlock<C, P, H>, H>
+impl<C, P, H> CertifiableBlock for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
     P: PublicKey,

@@ -51,10 +51,8 @@ use commonware_storage::{
 use commonware_utils::{non_empty_range, sync::AsyncRwLock};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
-    Account, Address, Block, Header, Sealable, Sealed, SignedBlock, SignedTransaction,
-    VerifiedBlock, VerifiedTransaction,
+    Account, Address, Block, Header, Sealable, SealedBlock, SignedTransaction, VerifiedTransaction,
 };
-use core::fmt;
 use futures::{StreamExt, future::try_join_all};
 use prometheus_client::metrics::counter::Counter;
 use rand::Rng;
@@ -75,12 +73,6 @@ const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Signed transaction carried by the wire block format.
 type WireTransaction<H, P> = SignedTransaction<P, H>;
-
-/// Sealed block carried across the wire and through consensus.
-type WireBlock<C, P, H> = Sealed<SignedBlock<C, P, H>, H>;
-
-/// In-memory verified block used during execution.
-type ExecutionBlock<C, P, H> = VerifiedBlock<C, P, H>;
 
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
@@ -283,18 +275,17 @@ where
             .collect()
     }
 
-    /// Verifies a signed wire block into an in-memory verified execution block.
+    /// Verifies the transactions in a signed wire block for execution.
     ///
     /// Decoding never trusts a prior verification step. Wire bytes always
     /// re-enter the application as [`SignedTransaction`] values, and this
     /// method re-verifies each signature before exposing
     /// [`VerifiedTransaction`] values to execution.
-    fn verify_block(&self, block: &WireBlock<C, P, H>) -> Option<ExecutionBlock<C, P, H>>
+    fn verify_block(&self, block: &SealedBlock<C, P, H>) -> Option<Vec<VerifiedTransaction<P, H>>>
     where
         WireTransaction<H, P>: Clone,
     {
-        let body = self.verify_transactions(block.body.iter().cloned())?;
-        Some(ExecutionBlock::new(block.header.clone(), body))
+        self.verify_transactions(block.body.iter().cloned())
     }
 
     /// Returns the current Unix timestamp in milliseconds.
@@ -360,7 +351,7 @@ where
 {
     type SigningScheme = S;
     type Context = Context<C, P>;
-    type Block = WireBlock<C, P, H>;
+    type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap>;
     type InputProvider = I;
 
@@ -482,7 +473,7 @@ where
         let block = ancestry.next().await?;
         let parent = ancestry.next().await?;
 
-        let Some(verified_block) = self.verify_block(&block) else {
+        let Some(verified_body) = self.verify_block(&block) else {
             warn!(
                 height = block.header.height,
                 "verify rejected: invalid signature"
@@ -507,12 +498,11 @@ where
         runtime.sleep_until(deadline).await;
 
         let (state_batch, transaction_batch) = batches;
-        let state = load_state(&state_batch, &verified_block.body)
+        let state = load_state(&state_batch, &verified_body)
             .await
             .expect("block state loading during verification must succeed");
-        let body_len = verified_block.body.len();
-        let Block { body, .. } = verified_block;
-        let Some(changeset) = executor::execute(state, &body) else {
+        let body_len = verified_body.len();
+        let Some(changeset) = executor::execute(state, &verified_body) else {
             warn!(
                 height = block.header.height,
                 "verify rejected: statically invalid transaction"
@@ -520,7 +510,7 @@ where
             return None;
         };
 
-        let transaction_batch = record_transactions(transaction_batch, &body);
+        let transaction_batch = record_transactions(transaction_batch, &verified_body);
         let state_batch = apply_changeset(state_batch, &changeset);
         let (state_merkleized, transaction_merkleized) = self
             .finalize_execution(state_batch, transaction_batch)
@@ -567,7 +557,7 @@ where
             epoch = block.header.context.round.epoch().get(),
             view = block.header.context.round.view().get(),
             height = block.header.height,
-            txs = body.len(),
+            txs = verified_body.len(),
             timestamp = block.header.timestamp,
             "verified block"
         );
@@ -592,17 +582,17 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let verified_block = self
+        let verified_body = self
             .verify_block(block)
             .expect("certified block contained an invalid signature");
 
         let (state_batch, transaction_batch) = batches;
-        let state = load_state(&state_batch, &verified_block.body)
+        let state = load_state(&state_batch, &verified_body)
             .await
             .expect("state loading must succeed for certified apply");
-        let changeset = executor::execute(state, &verified_block.body)
+        let changeset = executor::execute(state, &verified_body)
             .expect("certified block contained a statically invalid transaction");
-        let transaction_batch = record_transactions(transaction_batch, &verified_block.body);
+        let transaction_batch = record_transactions(transaction_batch, &verified_body);
         let state_batch = apply_changeset(state_batch, &changeset);
         self.finalize_execution(state_batch, transaction_batch)
             .await
@@ -614,11 +604,7 @@ where
 ///
 /// The genesis block starts with empty state, empty transactions, and the
 /// provided leader and timestamp.
-pub fn genesis_block<C, P, H>(
-    hasher: &mut H,
-    leader: P,
-    timestamp: u64,
-) -> Sealed<Block<C, P, H>, H>
+pub fn genesis_block<C, P, H>(hasher: &mut H, leader: P, timestamp: u64) -> SealedBlock<C, P, H>
 where
     C: Digest,
     P: PublicKey,
@@ -644,8 +630,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Application, StateDatabase, WireBlock, load_state};
-    use commonware_codec::{Decode, DecodeExt, Encode, FixedSize};
+    use super::{Application, StateDatabase, load_state};
+    use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, Write};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View},
@@ -666,16 +652,13 @@ mod tests {
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, sync::AsyncRwLock};
     use constantinople_primitives::{
-        Account, Address, Block, BlockCfg, Header, Sealable, SignedTransaction, Transaction,
+        Account, Address, Block, BlockCfg, Header, Sealable, SealedBlock, Transaction,
         VerifiedTransaction,
     };
-    use core::{marker::PhantomData, num::NonZeroU64};
-    use std::{
-        fmt,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+    use core::{fmt, marker::PhantomData, num::NonZeroU64};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
     };
 
     const NAMESPACE: &[u8] = b"application-test";
@@ -691,9 +674,8 @@ mod tests {
     >;
     type TestStateDb = StateDatabase<TestContext, TestHasher, EightCap>;
     type VerifyTestPublicKey = ed25519::PublicKey;
-    type VerifyTestSignedTransaction = SignedTransaction<VerifyTestPublicKey, TestHasher>;
     type VerifyTestTransaction = VerifiedTransaction<VerifyTestPublicKey, TestHasher>;
-    type VerifyTestWireBlock = WireBlock<blake3::Digest, VerifyTestPublicKey, TestHasher>;
+    type VerifyTestWireBlock = SealedBlock<blake3::Digest, VerifyTestPublicKey, TestHasher>;
 
     #[derive(Clone, Default)]
     struct CountingStrategy {
@@ -924,18 +906,12 @@ mod tests {
         executor.start(|context| async move {
             let application = verify_test_application(context);
             let transaction = verified_wire_transaction();
-            let block = Block::<
-                blake3::Digest,
-                VerifyTestPublicKey,
-                TestHasher,
-                VerifyTestTransaction,
-            >::new(
-                verify_test_header(transaction.value().sender.clone(), 1),
-                vec![transaction.clone()],
-            )
-            .seal(&mut TestHasher::default());
+            let header = verify_test_header(transaction.value().sender.clone(), 1);
+            let body = vec![transaction.clone()];
+            let mut encoded = Vec::with_capacity(header.encode_size() + body.encode_size());
+            header.write(&mut encoded);
+            body.write(&mut encoded);
 
-            let encoded = block.encode();
             let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
                 .expect("wire block decoding should succeed");
 
@@ -943,12 +919,9 @@ mod tests {
                 .verify_block(&decoded)
                 .expect("decoded block should be re-verified");
 
-            assert_eq!(verified.body.len(), 1);
-            assert_eq!(
-                *verified.body[0].message_digest(),
-                *transaction.message_digest()
-            );
-            assert_eq!(verified.body[0].signer(), transaction.signer());
+            assert_eq!(verified.len(), 1);
+            assert_eq!(*verified[0].message_digest(), *transaction.message_digest());
+            assert_eq!(verified[0].signer(), transaction.signer());
         });
     }
 
@@ -975,12 +948,7 @@ mod tests {
         executor.start(|context| async move {
             let application = verify_test_application(context);
             let transaction = verified_wire_transaction();
-            let block = Block::<
-                blake3::Digest,
-                VerifyTestPublicKey,
-                TestHasher,
-                VerifyTestSignedTransaction,
-            >::new(
+            let block = Block::<blake3::Digest, VerifyTestPublicKey, TestHasher>::new(
                 verify_test_header(transaction.value().sender.clone(), 1),
                 vec![transaction.into_inner()],
             )

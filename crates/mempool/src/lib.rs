@@ -3,10 +3,8 @@
 
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use constantinople_primitives::{Block, Header, Sealed, VerifiedTransaction};
+use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
 use std::future::Future;
-
-pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
 
 /// Supplies transactions for block proposals and finalized block updates.
 pub trait TransactionSource<C, P, H>:
