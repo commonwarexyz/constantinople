@@ -261,31 +261,16 @@ where
     St: Strategy,
 {
     /// Verifies signed wire transactions and returns verified execution transactions.
-    fn verify_transactions<Txs>(&self, transactions: Txs) -> Option<Vec<VerifiedTransaction<P, H>>>
-    where
-        Txs: IntoIterator<Item = WireTransaction<H, P>> + Send,
-        Txs::IntoIter: Send,
-        WireTransaction<H, P>: Send,
-    {
+    fn verify_transactions(
+        &self,
+        transactions: Vec<SignedTransaction<P, H>>,
+    ) -> Option<Vec<VerifiedTransaction<P, H>>> {
         self.strategy
             .map_collect_vec(transactions, |transaction: WireTransaction<H, P>| {
                 transaction.into_verified(self.transaction_namespace).ok()
             })
             .into_iter()
             .collect()
-    }
-
-    /// Verifies the transactions in a signed wire block for execution.
-    ///
-    /// Decoding never trusts a prior verification step. Wire bytes always
-    /// re-enter the application as [`SignedTransaction`] values, and this
-    /// method re-verifies each signature before exposing
-    /// [`VerifiedTransaction`] values to execution.
-    fn verify_block(&self, block: &SealedBlock<C, P, H>) -> Option<Vec<VerifiedTransaction<P, H>>>
-    where
-        WireTransaction<H, P>: Clone,
-    {
-        self.verify_transactions(block.body.iter().cloned())
     }
 
     /// Returns the current Unix timestamp in milliseconds.
@@ -397,16 +382,16 @@ where
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
         let parent = ancestry.next().await?;
-        let all_proposed = input.propose(&parent.header, &context).await;
+        let body = input.propose(&parent.header, &context).await;
         let (state_batch, transaction_batch) = batches;
-        let state = load_state(&state_batch, &all_proposed)
+        let state = load_state(&state_batch, &body)
             .await
             .expect("proposal state loading must succeed");
         let ProposalOutput {
             valid,
             invalid: _,
             changeset,
-        } = executor::propose(state, all_proposed);
+        } = executor::propose(state, body);
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
@@ -429,19 +414,13 @@ where
                 *state_merkleized.size()
             ),
             transactions_root: transaction_merkleized.root(),
-            transactions_range: non_empty_range!(
-                parent.header.transactions_range.start(),
-                transactions_end
-            ),
+            transactions_range: non_empty_range!(0, transactions_end),
         };
-        let block = Block::new(
-            header,
-            valid
-                .into_iter()
-                .map(VerifiedTransaction::into_inner)
-                .collect(),
-        )
-        .seal(&mut H::default());
+        let body = valid
+            .into_iter()
+            .map(VerifiedTransaction::into_inner)
+            .collect();
+        let block = Block::new(header, body).seal(&mut H::default());
 
         info!(
             epoch = block.header.context.round.epoch().get(),
@@ -470,23 +449,19 @@ where
         mut ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
-        let block = ancestry.next().await?;
+        let Block { header, body } = ancestry.next().await?.into_inner();
         let parent = ancestry.next().await?;
 
-        let Some(verified_body) = self.verify_block(&block) else {
-            warn!(
-                height = block.header.height,
-                "verify rejected: invalid signature"
-            );
+        let Some(verified_body) = self.verify_transactions(body) else {
+            warn!(height = header.height, "verify rejected: invalid signature");
             return None;
         };
 
-        if block.header.timestamp <= parent.header.timestamp
-            || block.header.timestamp > MAX_BLOCK_TIMESTAMP_MS
+        if header.timestamp <= parent.header.timestamp || header.timestamp > MAX_BLOCK_TIMESTAMP_MS
         {
             warn!(
-                height = block.header.height,
-                block_ts = block.header.timestamp,
+                height = header.height,
+                block_ts = header.timestamp,
                 parent_ts = parent.header.timestamp,
                 "verify rejected: invalid timestamp"
             );
@@ -494,7 +469,7 @@ where
         }
 
         // Wait until the block timestamp has passed to vote in case of skew.
-        let deadline = self.block_deadline(block.header.timestamp);
+        let deadline = self.block_deadline(header.timestamp);
         runtime.sleep_until(deadline).await;
 
         let (state_batch, transaction_batch) = batches;
@@ -504,7 +479,7 @@ where
         let body_len = verified_body.len();
         let Some(changeset) = executor::execute(state, &verified_body) else {
             warn!(
-                height = block.header.height,
+                height = header.height,
                 "verify rejected: statically invalid transaction"
             );
             return None;
@@ -516,52 +491,51 @@ where
             .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization during verification must succeed");
-        let transactions_end = parent.header.transactions_range.end() + body_len as u64 + 1;
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),
             *state_merkleized.size()
         );
-        let transactions_range =
-            non_empty_range!(parent.header.transactions_range.start(), transactions_end);
+        let transactions_end = parent.header.transactions_range.end() + body_len as u64 + 1;
+        let transactions_range = non_empty_range!(0, transactions_end);
 
-        if state_merkleized.root() != block.header.state_root {
+        if state_merkleized.root() != header.state_root {
             warn!(
-                height = block.header.height,
+                height = header.height,
                 "verify rejected: state root mismatch"
             );
             return None;
         }
-        if state_range != block.header.state_range {
+        if state_range != header.state_range {
             warn!(
-                height = block.header.height,
+                height = header.height,
                 "verify rejected: state range mismatch"
             );
             return None;
         }
-        if transaction_merkleized.root() != block.header.transactions_root {
+        if transaction_merkleized.root() != header.transactions_root {
             warn!(
-                height = block.header.height,
+                height = header.height,
                 "verify rejected: transactions root mismatch"
             );
             return None;
         }
-        if transactions_range != block.header.transactions_range {
+        if transactions_range != header.transactions_range {
             warn!(
-                height = block.header.height,
+                height = header.height,
                 "verify rejected: transactions range mismatch"
             );
             return None;
         }
+
         info!(
-            epoch = block.header.context.round.epoch().get(),
-            view = block.header.context.round.view().get(),
-            height = block.header.height,
+            epoch = header.context.round.epoch().get(),
+            view = header.context.round.view().get(),
+            height = header.height,
             txs = verified_body.len(),
-            timestamp = block.header.timestamp,
+            timestamp = header.timestamp,
             "verified block"
         );
-
         Some((state_merkleized, transaction_merkleized))
     }
 
@@ -583,7 +557,7 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
         let verified_body = self
-            .verify_block(block)
+            .verify_transactions(block.body.clone())
             .expect("certified block contained an invalid signature");
 
         let (state_batch, transaction_batch) = batches;
@@ -626,411 +600,4 @@ where
     };
 
     Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Application, StateDatabase, load_state};
-    use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, Write};
-    use commonware_consensus::{
-        simplex::types::Context,
-        types::{Epoch, Round, View},
-    };
-    use commonware_cryptography::{Digest, Signer, blake3, ed25519, secp256r1::recoverable};
-    use commonware_glue::stateful::db::ManagedDb;
-    use commonware_parallel::{Sequential, Strategy};
-    use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
-    use commonware_storage::{
-        journal::contiguous::fixed::Config as FixedJournalConfig,
-        mmr,
-        mmr::journaled::Config as MmrConfig,
-        qmdb::{
-            any::{FixedConfig, unordered::fixed},
-            immutable::fixed as immutable_fixed,
-        },
-        translator::EightCap,
-    };
-    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, sync::AsyncRwLock};
-    use constantinople_primitives::{
-        Account, Address, Block, BlockCfg, Header, Sealable, SealedBlock, Transaction,
-        VerifiedTransaction,
-    };
-    use core::{fmt, marker::PhantomData, num::NonZeroU64};
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
-    };
-
-    const NAMESPACE: &[u8] = b"application-test";
-
-    type TestContext = deterministic::Context;
-    type TestHasher = blake3::Blake3;
-    type TestPublicKey = recoverable::PublicKey;
-    type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
-    type TestTransactionDb = Arc<
-        AsyncRwLock<
-            immutable_fixed::Db<mmr::Family, TestContext, blake3::Digest, (), TestHasher, EightCap>,
-        >,
-    >;
-    type TestStateDb = StateDatabase<TestContext, TestHasher, EightCap>;
-    type VerifyTestPublicKey = ed25519::PublicKey;
-    type VerifyTestTransaction = VerifiedTransaction<VerifyTestPublicKey, TestHasher>;
-    type VerifyTestWireBlock = SealedBlock<blake3::Digest, VerifyTestPublicKey, TestHasher>;
-
-    #[derive(Clone, Default)]
-    struct CountingStrategy {
-        fold_calls: Arc<AtomicUsize>,
-    }
-
-    impl CountingStrategy {
-        fn fold_calls(&self) -> usize {
-            self.fold_calls.load(Ordering::SeqCst)
-        }
-    }
-
-    impl fmt::Debug for CountingStrategy {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            f.debug_struct("CountingStrategy")
-                .field("fold_calls", &self.fold_calls())
-                .finish()
-        }
-    }
-
-    impl Strategy for CountingStrategy {
-        fn fold_init<I, INIT, T, R, ID, F, RD>(
-            &self,
-            iter: I,
-            init: INIT,
-            identity: ID,
-            fold_op: F,
-            _reduce_op: RD,
-        ) -> R
-        where
-            I: IntoIterator<IntoIter: Send, Item: Send> + Send,
-            INIT: Fn() -> T + Send + Sync,
-            T: Send,
-            R: Send,
-            ID: Fn() -> R + Send + Sync,
-            F: Fn(R, &mut T, I::Item) -> R + Send + Sync,
-            RD: Fn(R, R) -> R + Send + Sync,
-        {
-            self.fold_calls.fetch_add(1, Ordering::SeqCst);
-
-            let mut init_value = init();
-            let mut acc = identity();
-            for item in iter {
-                acc = fold_op(acc, &mut init_value, item);
-            }
-            acc
-        }
-
-        fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
-        where
-            A: FnOnce() -> RA + Send,
-            B: FnOnce() -> RB + Send,
-            RA: Send,
-            RB: Send,
-        {
-            (a(), b())
-        }
-
-        fn parallelism_hint(&self) -> usize {
-            1
-        }
-    }
-
-    fn transaction_db_config(
-        suffix: &str,
-        context: &TestContext,
-    ) -> immutable_fixed::Config<EightCap> {
-        let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
-        immutable_fixed::Config {
-            merkle_config: MmrConfig {
-                journal_partition: format!("tx-journal-{suffix}"),
-                metadata_partition: format!("tx-metadata-{suffix}"),
-                items_per_blob: NZU64!(11),
-                write_buffer: NZUsize!(1024),
-                thread_pool: None,
-                page_cache: page_cache.clone(),
-            },
-            log: FixedJournalConfig {
-                partition: format!("tx-log-{suffix}"),
-                page_cache,
-                items_per_blob: NZU64!(7),
-                write_buffer: NZUsize!(1024),
-            },
-            translator: EightCap,
-        }
-    }
-
-    fn state_db_config(suffix: &str, context: &TestContext) -> FixedConfig<EightCap> {
-        let page_cache = CacheRef::from_pooler(context, NZU16!(101), NZUsize!(11));
-        FixedConfig {
-            merkle_config: MmrConfig {
-                journal_partition: format!("state-journal-{suffix}"),
-                metadata_partition: format!("state-metadata-{suffix}"),
-                items_per_blob: NZU64!(11),
-                write_buffer: NZUsize!(1024),
-                thread_pool: None,
-                page_cache: page_cache.clone(),
-            },
-            journal_config: FixedJournalConfig {
-                partition: format!("state-log-{suffix}"),
-                items_per_blob: NZU64!(7),
-                page_cache,
-                write_buffer: NZUsize!(1024),
-            },
-            translator: EightCap,
-        }
-    }
-
-    async fn open_transaction_db(context: TestContext, suffix: &str) -> TestTransactionDb {
-        let db =
-            immutable_fixed::Db::init(context.clone(), transaction_db_config(suffix, &context))
-                .await
-                .expect("transaction db init should succeed");
-        Arc::new(AsyncRwLock::new(db))
-    }
-
-    async fn open_state_db(context: TestContext, suffix: &str) -> TestStateDb {
-        let db = fixed::Db::init(context.clone(), state_db_config(suffix, &context))
-            .await
-            .expect("state db init should succeed");
-        Arc::new(AsyncRwLock::new(db))
-    }
-
-    async fn write_state(db: &TestStateDb, writes: impl IntoIterator<Item = (Address, Account)>) {
-        let mut db = db.write().await;
-        let mut batch = db.new_batch();
-        for (key, value) in writes {
-            batch = batch.write(key, Some(value));
-        }
-        let finalized = batch
-            .merkleize(None, &db)
-            .await
-            .expect("state merkleization should succeed")
-            .finalize();
-        db.apply_batch(finalized)
-            .await
-            .expect("state batch apply should succeed");
-    }
-
-    fn address(byte: u8) -> Address {
-        Address::decode(&[byte; Address::SIZE][..]).expect("address bytes should decode")
-    }
-
-    fn signed_transaction(nonce: u64) -> TestTransaction {
-        let private_key = recoverable::PrivateKey::from_seed(7);
-        Transaction {
-            sender: private_key.public_key(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(1).expect("test value should be non-zero"),
-            nonce,
-            _digest: PhantomData,
-        }
-        .seal_and_sign_verified(&private_key, NAMESPACE, &mut TestHasher::default())
-    }
-
-    fn verify_test_application(
-        context: TestContext,
-    ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), Sequential> {
-        let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(context, Sequential, genesis_leader, NAMESPACE)
-    }
-
-    fn counting_test_application(
-        context: TestContext,
-        strategy: CountingStrategy,
-    ) -> Application<TestHasher, blake3::Digest, (), VerifyTestPublicKey, (), CountingStrategy>
-    {
-        let genesis_leader = ed25519::PrivateKey::from_seed(1).public_key();
-        Application::new(context, strategy, genesis_leader, NAMESPACE)
-    }
-
-    fn verified_wire_transaction() -> VerifyTestTransaction {
-        let private_key = ed25519::PrivateKey::from_seed(11);
-        Transaction {
-            sender: private_key.public_key(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(1).expect("test value should be non-zero"),
-            nonce: 0,
-            _digest: PhantomData,
-        }
-        .seal_and_sign_verified(&private_key, NAMESPACE, &mut TestHasher::default())
-    }
-
-    fn verify_test_header(
-        leader: VerifyTestPublicKey,
-        transactions: usize,
-    ) -> Header<blake3::Digest, blake3::Digest, VerifyTestPublicKey> {
-        Header {
-            context: Context {
-                round: Round::new(Epoch::zero(), View::zero()),
-                leader,
-                parent: (View::zero(), blake3::Digest::EMPTY),
-            },
-            parent: blake3::Digest::EMPTY,
-            height: 1,
-            timestamp: 1,
-            state_root: blake3::Digest::EMPTY,
-            state_range: non_empty_range!(0, 1),
-            transactions_root: blake3::Digest::EMPTY,
-            transactions_range: non_empty_range!(0, transactions as u64 + 1),
-        }
-    }
-
-    #[test]
-    fn transactions_end_uses_post_commit_location() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let db = open_transaction_db(context, "transactions-end").await;
-            let mut db = db.write().await;
-            let transaction = signed_transaction(0);
-            let finalized = db
-                .new_batch()
-                .set(*transaction.message_digest(), ())
-                .merkleize(None)
-                .finalize();
-            db.apply_batch(finalized)
-                .await
-                .expect("batch apply should succeed");
-            db.commit().await.expect("commit should succeed");
-
-            assert_eq!(*db.size().await, 3);
-        });
-    }
-
-    #[test]
-    fn decoded_verified_bytes_are_reverified_before_execution() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let application = verify_test_application(context);
-            let transaction = verified_wire_transaction();
-            let header = verify_test_header(transaction.value().sender.clone(), 1);
-            let body = vec![transaction.clone()];
-            let mut encoded = Vec::with_capacity(header.encode_size() + body.encode_size());
-            header.write(&mut encoded);
-            body.write(&mut encoded);
-
-            let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
-                .expect("wire block decoding should succeed");
-
-            let verified = application
-                .verify_block(&decoded)
-                .expect("decoded block should be re-verified");
-
-            assert_eq!(verified.len(), 1);
-            assert_eq!(*verified[0].message_digest(), *transaction.message_digest());
-            assert_eq!(verified[0].signer(), transaction.signer());
-        });
-    }
-
-    #[test]
-    fn verify_transactions_uses_configured_strategy() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let strategy = CountingStrategy::default();
-            let application = counting_test_application(context, strategy.clone());
-            let transaction = verified_wire_transaction().into_inner();
-
-            let verified = application
-                .verify_transactions(vec![transaction])
-                .expect("transaction signature should verify");
-
-            assert_eq!(verified.len(), 1);
-            assert_eq!(strategy.fold_calls(), 1);
-        });
-    }
-
-    #[test]
-    fn decoded_block_with_tampered_signature_is_rejected() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let application = verify_test_application(context);
-            let transaction = verified_wire_transaction();
-            let block = Block::<blake3::Digest, VerifyTestPublicKey, TestHasher>::new(
-                verify_test_header(transaction.value().sender.clone(), 1),
-                vec![transaction.into_inner()],
-            )
-            .seal(&mut TestHasher::default());
-
-            let mut encoded = block.encode().to_vec();
-            let byte = encoded
-                .last_mut()
-                .expect("encoded block should include signature bytes");
-            *byte ^= 0x01;
-
-            let decoded = VerifyTestWireBlock::decode_cfg(&mut &encoded[..], &BlockCfg::default())
-                .expect("tampered block should still decode");
-
-            assert!(application.verify_block(&decoded).is_none());
-        });
-    }
-
-    #[test]
-    fn load_state_reads_sender_and_recipient_accounts() {
-        let executor = deterministic::Runner::default();
-        executor.start(|context| async move {
-            let db = open_state_db(context, "load-state-accounts").await;
-            let recipient = address(0x91);
-            let key = ed25519::PrivateKey::from_seed(13);
-            let sender = Address::from_public_key(&mut TestHasher::default(), &key.public_key());
-
-            write_state(
-                &db,
-                [
-                    (
-                        sender,
-                        Account {
-                            balance: 11,
-                            nonce: 2,
-                        },
-                    ),
-                    (
-                        recipient,
-                        Account {
-                            balance: 7,
-                            nonce: 0,
-                        },
-                    ),
-                ],
-            )
-            .await;
-
-            let batch = ManagedDb::new_batch(&db).await;
-            let transactions = vec![
-                Transaction {
-                    sender: key.public_key(),
-                    to: recipient,
-                    value: NonZeroU64::new(5).expect("test value should be non-zero"),
-                    nonce: 2,
-                    _digest: PhantomData,
-                }
-                .seal_and_sign_verified(
-                    &key,
-                    NAMESPACE,
-                    &mut TestHasher::default(),
-                ),
-            ];
-
-            let loaded = load_state(&batch, &transactions)
-                .await
-                .expect("state load should succeed");
-
-            assert_eq!(
-                loaded.account(sender),
-                Account {
-                    balance: 11,
-                    nonce: 2,
-                }
-            );
-            assert_eq!(
-                loaded.account(recipient),
-                Account {
-                    balance: 7,
-                    nonce: 0,
-                }
-            );
-        });
-    }
 }

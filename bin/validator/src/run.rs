@@ -90,7 +90,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
-                12 * 1024 * 1024,
+                16 * 1024 * 1024,
             )
         } else {
             discovery::Config::local(
@@ -99,7 +99,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
-                12 * 1024 * 1024,
+                16 * 1024 * 1024,
             )
         };
 
@@ -118,6 +118,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             )
             .await;
 
+        // TODO: Add reasonable RL
         let quota = Quota::per_second(std::num::NonZeroU32::MAX);
         let backlog = 1024;
         let channels = Channels {
@@ -152,9 +153,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
 
-        let (tx_gen, tx_gen_mailbox) = TransactionGenerator::<_, _, ed25519::PrivateKey, _>::new(
+        let (tx_gen, tx_gen_mailbox) = TransactionGenerator::<_, _, ed25519::PrivateKey, _, _>::new(
             context.with_label("tx_gen"),
-            32000,
+            8192,
+            strategy.clone(),
         );
         let tx_gen_handle = tx_gen.start();
 

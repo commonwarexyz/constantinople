@@ -77,7 +77,7 @@ const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(8_192);
-const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(65_536);
+const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576);
 const MAX_REPAIR: NonZero<usize> = NZUsize!(50);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: usize = 1024;
@@ -385,10 +385,10 @@ where
                 replay_buffer: NZUsize!(1024 * 1024),
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache,
-                leader_timeout: Duration::from_secs(1),
-                certification_timeout: Duration::from_secs(2),
+                leader_timeout: Duration::from_secs(4),
+                certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
-                fetch_timeout: Duration::from_secs(1),
+                fetch_timeout: Duration::from_secs(4),
                 activity_timeout: ACTIVITY_TIMEOUT,
                 skip_timeout: ViewDelta::new(10),
                 fetch_concurrent: 32,
@@ -493,7 +493,6 @@ where
     V: Variant,
 {
     let participants = output.players().clone();
-
     match share {
         Some(share) => {
             ThresholdScheme::signer(namespace, participants, output.public().clone(), share)

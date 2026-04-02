@@ -1,6 +1,7 @@
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Signer};
 use commonware_macros::select_loop;
+use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Spawner, spawn_cell};
 use commonware_utils::{
     Acknowledgement, NZU64,
@@ -12,27 +13,30 @@ use rand_core::CryptoRngCore;
 use std::marker::PhantomData;
 use tokio::sync::{mpsc, oneshot};
 
-pub struct TransactionGenerator<E, C, P, H>
+pub struct TransactionGenerator<E, C, P, H, S>
 where
     E: Spawner,
     C: Digest,
     P: Signer,
     H: Hasher,
+    S: Strategy,
 {
     context: ContextCell<E>,
     mailbox: mpsc::Receiver<Message<P::PublicKey, H>>,
     keys: Vec<(P, Address)>,
+    strategy: S,
     _marker: PhantomData<C>,
 }
 
-impl<E, C, P, H> TransactionGenerator<E, C, P, H>
+impl<E, C, P, H, S> TransactionGenerator<E, C, P, H, S>
 where
     E: Spawner + CryptoRngCore,
     C: Digest,
     P: Signer,
     H: Hasher,
+    S: Strategy,
 {
-    pub fn new(mut context: E, n_keys: usize) -> (Self, Mailbox<C, P::PublicKey, H>) {
+    pub fn new(mut context: E, n_keys: usize, strategy: S) -> (Self, Mailbox<C, P::PublicKey, H>) {
         let mut hasher = H::default();
         let keys = (0..n_keys)
             .into_iter()
@@ -49,6 +53,7 @@ where
                 context: ContextCell::new(context),
                 mailbox,
                 keys,
+                strategy,
                 _marker: PhantomData,
             },
             Mailbox {
@@ -82,20 +87,23 @@ where
         generation: u64,
         txs: &mut Vec<VerifiedTransaction<P::PublicKey, H>>,
     ) {
-        let mut hasher = H::default();
+        let v = self.strategy.map_init_collect_vec(
+            self.keys.iter().enumerate(),
+            H::default,
+            |hasher, (i, (signer, _))| {
+                let to = self.keys[(i + 1) % self.keys.len()].1;
+                Transaction {
+                    sender: signer.public_key(),
+                    to,
+                    value: NZU64!(1),
+                    nonce: generation,
+                    _digest: PhantomData::<H::Digest>,
+                }
+                .seal_and_sign_verified(signer, b"constantinople-tx", hasher)
+            },
+        );
 
-        for (i, (signer, _)) in self.keys.iter().enumerate() {
-            let to = self.keys[(i + 1) % self.keys.len()].1;
-            let tx = Transaction {
-                sender: signer.public_key(),
-                to,
-                value: NZU64!(1),
-                nonce: generation,
-                _digest: PhantomData::<H::Digest>,
-            }
-            .seal_and_sign_verified(signer, b"constantinople-tx", &mut hasher);
-            txs.push(tx);
-        }
+        *txs = v;
     }
 }
 

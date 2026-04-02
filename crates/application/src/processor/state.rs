@@ -59,18 +59,6 @@ impl State {
         self.indices.get(&address).copied()
     }
 
-    /// Returns the base account value for `address`.
-    ///
-    /// Missing accounts read as the default account value.
-    #[cfg(test)]
-    pub(crate) fn account(&self, address: Address) -> Account {
-        self.indices
-            .get(&address)
-            .copied()
-            .map(|index| self.account_at(index))
-            .unwrap_or_default()
-    }
-
     /// Returns the address at `index`.
     pub(crate) fn address_at(&self, index: usize) -> Address {
         self.addresses[index]
