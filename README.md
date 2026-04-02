@@ -47,7 +47,7 @@ account model:
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
-  --output-dir ./configs \
+  --output-dir ./local \
   --worker-threads 2 \
   --rayon-threads 2 \
   local \
@@ -67,17 +67,17 @@ To run a single local validator directly:
 
 ```sh
 cargo run --bin constantinople -- \
-  --config ./configs/validator-0.yaml \
-  --peers ./configs/peers.yaml
+  --config ./local/validator-0.yaml \
+  --peers ./local/peers.yaml
 ```
 
 To run the whole local cluster, use the printed `mprocs` command, or run each validator in a separate terminal:
 
 ```sh
-cargo run --bin constantinople -- --config ./configs/validator-0.yaml --peers ./configs/peers.yaml
-cargo run --bin constantinople -- --config ./configs/validator-1.yaml --peers ./configs/peers.yaml
-cargo run --bin constantinople -- --config ./configs/validator-2.yaml --peers ./configs/peers.yaml
-cargo run --bin constantinople -- --config ./configs/validator-3.yaml --peers ./configs/peers.yaml
+cargo run --bin constantinople -- --config ./local/validator-0.yaml --peers ./local/peers.yaml
+cargo run --bin constantinople -- --config ./local/validator-1.yaml --peers ./local/peers.yaml
+cargo run --bin constantinople -- --config ./local/validator-2.yaml --peers ./local/peers.yaml
+cargo run --bin constantinople -- --config ./local/validator-3.yaml --peers ./local/peers.yaml
 ```
 
 To generate a local cluster plus a spammer config:
@@ -85,7 +85,7 @@ To generate a local cluster plus a spammer config:
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
-  --output-dir ./configs \
+  --output-dir ./local \
   --worker-threads 2 \
   --rayon-threads 2 \
   --spammer-count 128 \
@@ -97,33 +97,17 @@ Then use the printed `mprocs` command, or run the spammer against the local peer
 
 ```sh
 cargo run --bin constantinople-spammer -- \
-  --config ./configs/spammer.yaml \
-  --peers ./configs/peers.yaml
+  --config ./local/spammer.yaml \
+  --peers ./local/peers.yaml
 ```
 
 ### Remote Deployment
 
 Remote deployments use the same service YAML configs, but networking is resolved from the deployer
-hosts file at runtime.
+hosts file at runtime. `generate remote` does not build binaries. It only writes the deployment
+bundle, and you build `validator` and optional `spammer` into that same directory afterwards.
 
-Build the deployable ARM64 binaries first:
-
-```sh
-docker buildx bake -f docker/docker-bake.hcl constantinople-validator
-docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
-
-docker buildx bake -f docker/docker-bake.hcl constantinople-spammer
-docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
-```
-
-This writes:
-
-- `deploy/validator`
-- `deploy/validator-debug`
-- `deploy/spammer`
-- `deploy/spammer-debug`
-
-Then generate a remote deployment bundle:
+Generate the remote deployment bundle first:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -134,9 +118,7 @@ cargo run --bin constantinople-deploy -- generate \
   --spammer-count 4096 \
   --spammer-tps 32768 \
   remote \
-  --validator-binary ./deploy/validator \
   --http-cidr 0.0.0.0/0 \
-  --spammer-binary ./deploy/spammer \
   --regions us-east-1,us-west-2 \
   --instance-type c8g.2xlarge \
   --storage-size 75 \
@@ -145,15 +127,29 @@ cargo run --bin constantinople-deploy -- generate \
   --dashboard ./docker/dashboard.json
 ```
 
-This writes:
+The generate step writes:
 
-- copied deployable binaries:
-  - `validator`
-  - optionally `spammer`
 - one validator YAML config per validator
 - optionally `spammer.yaml`
 - `config.yaml` for `commonware-deployer`
 - a copied dashboard file for monitoring
+
+Then build the deployable ARM64 binaries into that directory:
+
+```sh
+docker buildx bake -f docker/docker-bake.hcl constantinople-validator
+docker run --rm -v ${PWD}:/constantinople constantinople-validator-builder:local
+
+docker buildx bake -f docker/docker-bake.hcl constantinople-spammer
+docker run --rm -v ${PWD}:/constantinople constantinople-spammer-builder:local
+```
+
+The Docker build step then writes:
+
+- `deploy/validator`
+- `deploy/validator-debug`
+- `deploy/spammer`
+- `deploy/spammer-debug`
 
 The deploy command then prints the exact commands to run:
 

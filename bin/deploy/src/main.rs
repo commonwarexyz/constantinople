@@ -24,6 +24,8 @@ use std::{
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+use tracing::Level;
+use tracing_subscriber::fmt;
 
 const STORAGE_CLASS: &str = "gp3";
 const DASHBOARD_FILE: &str = "dashboard.json";
@@ -183,6 +185,7 @@ pub(crate) struct ClusterMaterial {
 }
 
 fn main() {
+    init_tracing();
     let cli = Cli::parse();
 
     match &cli.command {
@@ -191,6 +194,15 @@ fn main() {
             GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
         },
     }
+}
+
+fn init_tracing() {
+    fmt()
+        .with_max_level(Level::INFO)
+        .with_target(false)
+        .without_time()
+        .compact()
+        .init();
 }
 
 pub(crate) fn absolute_path(path: &Path) -> PathBuf {

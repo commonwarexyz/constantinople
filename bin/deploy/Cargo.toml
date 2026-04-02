@@ -24,6 +24,7 @@ clap = { version = "4", features = ["derive"] }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_yaml = "0.9"
 tracing.workspace = true
+tracing-subscriber = "0.3"
 
 [[bin]]
 name = "constantinople-deploy"

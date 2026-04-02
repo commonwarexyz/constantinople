@@ -12,6 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
 };
+use tracing::info;
 
 struct GeneratedValidator {
     public_key_hex: String,
@@ -70,8 +71,28 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     let raw = serde_yaml::to_string(&deployer_config).expect("failed to serialize deployer config");
     fs::write(&config_path, raw).expect("failed to write deployer config");
 
-    println!("cd {}", output_dir.display());
-    println!("deployer aws create --config {}", DEPLOYER_CONFIG_FILE);
+    info!(
+        output_dir = %output_dir.display(),
+        validators = args.validators,
+        spammer = crate::spammer_enabled(args),
+        "generated remote deployment bundle"
+    );
+    if crate::spammer_enabled(args) {
+        info!(
+            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
+            spammer_binary = %output_dir.join(SPAMMER_INSTANCE_NAME).display(),
+            "build ARM64 binaries into the deployment directory before creating the remote deployment"
+        );
+    } else {
+        info!(
+            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
+            "build the validator ARM64 binary into the deployment directory before creating the remote deployment"
+        );
+    }
+    info!(
+        command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
+        "create remote deployment after building binaries"
+    );
 }
 
 fn build_validators(

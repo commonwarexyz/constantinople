@@ -7,6 +7,7 @@ use crate::{
 use commonware_codec::Encode;
 use commonware_utils::hex;
 use std::{fs, path::PathBuf};
+use tracing::info;
 
 struct GeneratedValidator {
     config_file: PathBuf,
@@ -120,7 +121,9 @@ fn print_local_run_commands(output_dir: &std::path::Path, validators: u32, spamm
         .map(|command| format!("\"{command}\""))
         .collect::<Vec<_>>()
         .join(" ");
-    println!("mprocs {mprocs}");
+
+    info!(output_dir = %output_dir.display(), validators, spammer, "generated local deployment bundle");
+    info!(command = %format!("mprocs {mprocs}"), "start local deployment");
 }
 
 fn local_run_commands(output_dir: &std::path::Path, validators: u32, spammer: bool) -> Vec<String> {
