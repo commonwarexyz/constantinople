@@ -157,6 +157,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
 
+        //   - signature_ms: 40-43
+        // - sleep_ms: 0-3
+        // - load_state_ms: 113-125
+        // - finalize_ms: 107-114
+        // - total_ms: 266-284
         let (tx_gen, tx_gen_mailbox) = TransactionGenerator::<_, _, ed25519::PrivateKey, _, _>::new(
             context.with_label("tx_gen"),
             8192,

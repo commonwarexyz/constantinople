@@ -23,6 +23,25 @@ impl State {
         Self::from_loaded(base_accounts, loaded_addresses)
     }
 
+    /// Creates state from aligned loaded addresses and account values.
+    pub(crate) fn from_loaded_accounts(
+        loaded_addresses: Vec<Address>,
+        accounts: Vec<Account>,
+    ) -> Self {
+        debug_assert_eq!(loaded_addresses.len(), accounts.len());
+
+        let mut indices = HashMap::with_capacity(loaded_addresses.len());
+        for (index, address) in loaded_addresses.iter().copied().enumerate() {
+            indices.insert(address, index);
+        }
+
+        Self {
+            addresses: Arc::new(loaded_addresses),
+            accounts: Arc::new(accounts),
+            indices: Arc::new(indices),
+        }
+    }
+
     /// Creates state from `loaded_addresses` and the known `base_accounts`.
     ///
     /// Any loaded address missing from `base_accounts` is treated as the
@@ -34,19 +53,12 @@ impl State {
         loaded_addresses.sort_unstable();
         loaded_addresses.dedup();
 
-        let mut accounts = Vec::with_capacity(loaded_addresses.len());
-        let mut indices = HashMap::with_capacity(loaded_addresses.len());
+        let accounts = loaded_addresses
+            .iter()
+            .map(|address| base_accounts.get(address).copied().unwrap_or_default())
+            .collect();
 
-        for (index, address) in loaded_addresses.iter().copied().enumerate() {
-            indices.insert(address, index);
-            accounts.push(base_accounts.get(&address).copied().unwrap_or_default());
-        }
-
-        Self {
-            addresses: Arc::new(loaded_addresses),
-            accounts: Arc::new(accounts),
-            indices: Arc::new(indices),
-        }
+        Self::from_loaded_accounts(loaded_addresses, accounts)
     }
 
     /// Returns the base account at `index`.

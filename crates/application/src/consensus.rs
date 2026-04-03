@@ -55,15 +55,14 @@ use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
     Account, Address, Block, Header, Sealable, SealedBlock, SignedTransaction, VerifiedTransaction,
 };
-use futures::{StreamExt, future::try_join_all};
+use futures::{StreamExt, stream::FuturesUnordered};
 use prometheus_client::metrics::counter::Counter;
-use rand::Rng;
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
 use std::{
-    collections::{HashMap, HashSet},
     marker::PhantomData,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
 use tracing::{info, warn};
@@ -146,24 +145,38 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let mut accounts = HashSet::with_capacity(transactions.len().saturating_mul(2));
+    let mut account_keys = Vec::with_capacity(transactions.len().saturating_mul(2));
     for transaction in transactions {
-        accounts.insert(transaction.signer());
-        accounts.insert(transaction.value().to);
+        account_keys.push(transaction.signer());
+        account_keys.push(transaction.value().to);
     }
 
-    let account_keys = accounts.iter().copied().collect::<Vec<_>>();
-    let account_results =
-        try_join_all(account_keys.iter().map(|address| batch.get(address))).await?;
+    account_keys.sort_unstable();
+    account_keys.dedup();
 
-    let mut base_accounts = HashMap::with_capacity(accounts.len());
-    for (address, result) in account_keys.iter().zip(account_results) {
-        if let Some(account) = result {
-            base_accounts.insert(*address, account);
-        }
-    }
+    let db = batch.lock().await;
+    let db = &*db;
+    let state_batch = batch.batch();
+    let pending_reads = account_keys
+        .iter()
+        .enumerate()
+        .map(|(index, address)| async move {
+            let account = state_batch.get(address, db).await?;
+            Ok::<_, ProcessorError>((index, account.unwrap_or_default()))
+        })
+        .collect::<FuturesUnordered<_>>();
+    let mut indexed_accounts = pending_reads
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    indexed_accounts.sort_unstable_by_key(|(index, _)| *index);
+    let accounts = indexed_accounts
+        .into_iter()
+        .map(|(_, account)| account)
+        .collect();
 
-    Ok(State::from_loaded(base_accounts, account_keys))
+    Ok(State::from_loaded_accounts(account_keys, accounts))
 }
 
 /// Writes a changeset of account updates to a state batch.
@@ -193,6 +206,88 @@ where
     transactions.iter().fold(batch, |batch, transaction| {
         batch.set(*transaction.message_digest(), ())
     })
+}
+
+/// Returns elapsed milliseconds for a started instant.
+fn elapsed_ms(started_at: Instant) -> u128 {
+    started_at.elapsed().as_millis()
+}
+
+/// Verifies a batch of signed transactions.
+fn verify_transaction_batch<P, H, B>(
+    namespace: &[u8],
+    rng: &mut impl CryptoRngCore,
+    transactions: &[SignedTransaction<P, H>],
+) -> bool
+where
+    P: PublicKey,
+    H: Hasher,
+    B: BatchVerifier<PublicKey = P>,
+{
+    let mut batch_verifier = B::new();
+    for transaction in transactions {
+        batch_verifier.add(
+            namespace,
+            transaction.message_digest().as_ref(),
+            &transaction.value().sender,
+            transaction.signature(),
+        );
+    }
+
+    batch_verifier.verify(rng)
+}
+
+/// Verifies transactions across strategy partitions and preserves block order.
+fn verify_transaction_chunks<P, H, B, St>(
+    strategy: &St,
+    namespace: &'static [u8],
+    rng: &mut impl CryptoRngCore,
+    transactions: Vec<SignedTransaction<P, H>>,
+) -> Option<Vec<VerifiedTransaction<P, H>>>
+where
+    P: PublicKey,
+    H: Hasher,
+    B: BatchVerifier<PublicKey = P>,
+    St: Strategy,
+{
+    if transactions.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let chunk_count = strategy.parallelism_hint().min(transactions.len());
+    let chunk_size = transactions.len().div_ceil(chunk_count);
+
+    let mut pending = transactions.into_iter();
+    let mut chunks = Vec::with_capacity(chunk_count);
+    loop {
+        let mut chunk = Vec::with_capacity(chunk_size);
+        for _ in 0..chunk_size {
+            let Some(transaction) = pending.next() else {
+                break;
+            };
+            chunk.push(transaction);
+        }
+
+        if chunk.is_empty() {
+            break;
+        }
+
+        let mut rng_seed = [0; 32];
+        rng.fill_bytes(&mut rng_seed);
+        chunks.push((rng_seed, chunk));
+    }
+
+    let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
+        let mut chunk_rng = StdRng::from_seed(rng_seed);
+        verify_transaction_batch::<P, H, B>(namespace, &mut chunk_rng, &chunk)
+            .then(|| chunk.into_iter().map(Into::into).collect::<Vec<_>>())
+    });
+
+    let mut verified = Vec::new();
+    for chunk in verified_chunks {
+        verified.extend(chunk?);
+    }
+    Some(verified)
 }
 
 /// Core constantinople application.
@@ -267,18 +362,22 @@ where
         rng: &mut impl CryptoRngCore,
         transactions: Vec<SignedTransaction<P, H>>,
     ) -> Option<Vec<VerifiedTransaction<P, H>>> {
-        let mut batch_verifier = B::new();
-        for tx in &transactions {
-            batch_verifier.add(
+        let parallelism = self.strategy.parallelism_hint();
+        if parallelism <= 1 || transactions.len() <= parallelism {
+            return verify_transaction_batch::<P, H, B>(
                 self.transaction_namespace,
-                &tx.message_digest(),
-                &tx.value().sender,
-                &tx.signature(),
-            );
+                rng,
+                &transactions,
+            )
+            .then(|| transactions.into_iter().map(Into::into).collect());
         }
-        batch_verifier
-            .verify(rng)
-            .then(|| transactions.into_iter().map(Into::into).collect())
+
+        verify_transaction_chunks::<P, H, B, _>(
+            &self.strategy,
+            self.transaction_namespace,
+            rng,
+            transactions,
+        )
     }
 
     /// Returns the current Unix timestamp in milliseconds.
@@ -390,26 +489,40 @@ where
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
+        let propose_started_at = Instant::now();
         let parent = ancestry.next().await?;
+
+        let input_started_at = Instant::now();
         let body = input.propose(&parent.header, &context).await;
+        let input_ms = elapsed_ms(input_started_at);
+
         let (state_batch, transaction_batch) = batches;
+
+        let load_state_started_at = Instant::now();
         let state = load_state(&state_batch, &body)
             .await
             .expect("proposal state loading must succeed");
+        let load_state_ms = elapsed_ms(load_state_started_at);
+
+        let execute_started_at = Instant::now();
         let ProposalOutput {
             valid,
             invalid: _,
             changeset,
         } = executor::propose(state, body);
+        let execute_ms = elapsed_ms(execute_started_at);
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
         let transaction_batch = record_transactions(transaction_batch, &valid);
         let state_batch = apply_changeset(state_batch, &changeset);
+
+        let finalize_started_at = Instant::now();
         let (state_merkleized, transaction_merkleized) = self
             .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed");
+        let finalize_ms = elapsed_ms(finalize_started_at);
         let transactions_end = parent.header.transactions_range.end() + valid.len() as u64 + 1;
 
         let header = Header {
@@ -437,6 +550,11 @@ where
             height = block.header.height,
             txs = block.body.len(),
             timestamp = block.header.timestamp,
+            input_ms,
+            load_state_ms,
+            execute_ms,
+            finalize_ms,
+            total_ms = elapsed_ms(propose_started_at),
             "proposed block"
         );
 
@@ -458,13 +576,16 @@ where
         mut ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
+        let verify_started_at = Instant::now();
         let Block { header, body } = ancestry.next().await?.into_inner();
         let parent = ancestry.next().await?;
 
+        let signature_started_at = Instant::now();
         let Some(verified_body) = self.verify_transactions(&mut runtime, body) else {
             warn!(height = header.height, "verify rejected: invalid signature");
             return None;
         };
+        let signature_ms = elapsed_ms(signature_started_at);
 
         if header.timestamp <= parent.header.timestamp || header.timestamp > MAX_BLOCK_TIMESTAMP_MS
         {
@@ -479,13 +600,21 @@ where
 
         // Wait until the block timestamp has passed to vote in case of skew.
         let deadline = self.block_deadline(header.timestamp);
+        let sleep_started_at = Instant::now();
         runtime.sleep_until(deadline).await;
+        let sleep_ms = elapsed_ms(sleep_started_at);
 
         let (state_batch, transaction_batch) = batches;
+
+        let load_state_started_at = Instant::now();
         let state = load_state(&state_batch, &verified_body)
             .await
             .expect("block state loading during verification must succeed");
+        let load_state_ms = elapsed_ms(load_state_started_at);
+
         let body_len = verified_body.len();
+
+        let execute_started_at = Instant::now();
         let Some(changeset) = executor::execute(state, &verified_body) else {
             warn!(
                 height = header.height,
@@ -493,13 +622,17 @@ where
             );
             return None;
         };
+        let execute_ms = elapsed_ms(execute_started_at);
 
         let transaction_batch = record_transactions(transaction_batch, &verified_body);
         let state_batch = apply_changeset(state_batch, &changeset);
+
+        let finalize_started_at = Instant::now();
         let (state_merkleized, transaction_merkleized) = self
             .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization during verification must succeed");
+        let finalize_ms = elapsed_ms(finalize_started_at);
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),
@@ -543,6 +676,12 @@ where
             height = header.height,
             txs = verified_body.len(),
             timestamp = header.timestamp,
+            signature_ms,
+            sleep_ms,
+            load_state_ms,
+            execute_ms,
+            finalize_ms,
+            total_ms = elapsed_ms(verify_started_at),
             "verified block"
         );
         Some((state_merkleized, transaction_merkleized))
@@ -609,4 +748,124 @@ where
     };
 
     Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::verify_transaction_chunks;
+    use commonware_cryptography::{Signer as _, blake3, ed25519};
+    use commonware_parallel::Rayon;
+    use constantinople_primitives::{Address, Signable, SignedTransaction, Transaction};
+    use core::{
+        marker::PhantomData,
+        num::{NonZeroU64, NonZeroUsize},
+    };
+    use rand::{SeedableRng, rngs::StdRng};
+
+    const NAMESPACE: &[u8] = b"consensus-test";
+
+    #[derive(Debug, Clone)]
+    struct TestSigner {
+        key: ed25519::PrivateKey,
+        address: Address,
+    }
+
+    impl TestSigner {
+        fn from_seed(seed: u64) -> Self {
+            let key = ed25519::PrivateKey::from_seed(seed);
+            let address =
+                Address::from_public_key(&mut blake3::Blake3::default(), &key.public_key());
+            Self { key, address }
+        }
+    }
+
+    fn signed_transaction(
+        signer: &TestSigner,
+        to: Address,
+        nonce: u64,
+    ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
+        Transaction {
+            sender: signer.key.public_key(),
+            to,
+            value: NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
+            nonce,
+            _digest: PhantomData,
+        }
+        .seal_and_sign(&signer.key, NAMESPACE, &mut blake3::Blake3::default())
+    }
+
+    fn invalid_transaction(
+        claimed_signer: &TestSigner,
+        actual_signer: &TestSigner,
+        to: Address,
+        nonce: u64,
+    ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
+        Transaction {
+            sender: claimed_signer.key.public_key(),
+            to,
+            value: NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
+            nonce,
+            _digest: PhantomData,
+        }
+        .seal_and_sign(
+            &actual_signer.key,
+            NAMESPACE,
+            &mut blake3::Blake3::default(),
+        )
+    }
+
+    #[test]
+    fn chunked_verification_preserves_transaction_order() {
+        let strategy =
+            Rayon::new(NonZeroUsize::new(4).expect("test thread count should be non-zero"))
+                .expect("rayon strategy should construct");
+        let sender = TestSigner::from_seed(7);
+        let recipient = TestSigner::from_seed(9);
+        let transactions = (0..64)
+            .map(|nonce| signed_transaction(&sender, recipient.address, nonce))
+            .collect::<Vec<_>>();
+        let expected_digests = transactions
+            .iter()
+            .map(|transaction| *transaction.message_digest())
+            .collect::<Vec<_>>();
+        let mut rng = StdRng::seed_from_u64(11);
+
+        let verified = verify_transaction_chunks::<
+            ed25519::PublicKey,
+            blake3::Blake3,
+            ed25519::Batch,
+            _,
+        >(&strategy, NAMESPACE, &mut rng, transactions)
+        .expect("valid chunked verification should succeed");
+        let verified_digests = verified
+            .iter()
+            .map(|transaction| *transaction.message_digest())
+            .collect::<Vec<_>>();
+
+        assert_eq!(verified_digests, expected_digests);
+    }
+
+    #[test]
+    fn chunked_verification_rejects_invalid_signature() {
+        let strategy =
+            Rayon::new(NonZeroUsize::new(4).expect("test thread count should be non-zero"))
+                .expect("rayon strategy should construct");
+        let sender = TestSigner::from_seed(13);
+        let attacker = TestSigner::from_seed(17);
+        let recipient = TestSigner::from_seed(19);
+        let mut transactions = (0..64)
+            .map(|nonce| signed_transaction(&sender, recipient.address, nonce))
+            .collect::<Vec<_>>();
+        transactions[31] = invalid_transaction(&sender, &attacker, recipient.address, 31);
+        let mut rng = StdRng::seed_from_u64(23);
+
+        let verified = verify_transaction_chunks::<
+            ed25519::PublicKey,
+            blake3::Blake3,
+            ed25519::Batch,
+            _,
+        >(&strategy, NAMESPACE, &mut rng, transactions);
+
+        assert!(verified.is_none());
+    }
 }
