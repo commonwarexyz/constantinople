@@ -84,7 +84,7 @@ mod tests {
     use commonware_cryptography::{Digest, Signer, blake3, ed25519};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{Address, Header, Transaction, VerifiedTransaction};
-    use core::{marker::PhantomData, num::NonZeroU64};
+    use core::num::NonZeroU64;
 
     const NAMESPACE: &[u8] = b"mempool-test";
 
@@ -93,13 +93,12 @@ mod tests {
         nonce: u64,
     ) -> VerifiedTransaction<ed25519::PublicKey, blake3::Blake3> {
         let hasher = &mut blake3::Blake3::default();
-        Transaction {
-            sender: key.public_key(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(1).expect("test value should be non-zero"),
+        Transaction::new(
+            key.public_key(),
+            Address::EMPTY,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
             nonce,
-            _digest: PhantomData,
-        }
+        )
         .seal_and_sign_verified(key, NAMESPACE, hasher)
     }
 

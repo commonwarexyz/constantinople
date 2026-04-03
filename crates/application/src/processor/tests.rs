@@ -7,7 +7,7 @@ use super::{
 use commonware_cryptography::{Signer, blake3, ed25519};
 use commonware_math::algebra::Random;
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
-use core::{marker::PhantomData, num::NonZeroU64};
+use core::num::NonZeroU64;
 use rand::rngs::OsRng;
 use std::collections::HashMap;
 
@@ -31,13 +31,12 @@ impl TestSigner {
     }
 
     fn sign(&self, to: Address, value: u64, nonce: u64) -> TestTransaction {
-        Transaction {
-            sender: self.key.public_key(),
+        Transaction::new(
+            self.key.public_key(),
             to,
-            value: NonZeroU64::new(value).expect("test values must be non-zero"),
+            NonZeroU64::new(value).expect("test values must be non-zero"),
             nonce,
-            _digest: PhantomData,
-        }
+        )
         .seal_and_sign_verified(&self.key, NAMESPACE, &mut TestHasher::default())
     }
 }

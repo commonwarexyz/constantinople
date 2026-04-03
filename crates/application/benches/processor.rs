@@ -3,7 +3,7 @@ use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
 use commonware_math::algebra::Random;
 use constantinople_application::processor::{executor, state::State};
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
-use core::{marker::PhantomData, num::NonZeroU64};
+use core::num::NonZeroU64;
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
 use std::{collections::HashMap, hint::black_box, sync::OnceLock};
@@ -124,13 +124,12 @@ impl TestSigner {
 
     fn sign(&self, to: Address, value: u64, nonce: u64) -> TestTransaction {
         let key = private_key(self.seed);
-        Transaction {
-            sender: key.public_key(),
+        Transaction::new(
+            key.public_key(),
             to,
-            value: NonZeroU64::new(value).expect("bench value must be non-zero"),
+            NonZeroU64::new(value).expect("bench value must be non-zero"),
             nonce,
-            _digest: PhantomData,
-        }
+        )
         .seal_and_sign_verified(&key, NAMESPACE, &mut TestHasher::default())
     }
 }

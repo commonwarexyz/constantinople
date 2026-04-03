@@ -9,7 +9,7 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{Address, Sealable, Sealed, Transaction};
-use commonware_codec::{EncodeSize, Error, Read, Write};
+use commonware_codec::{EncodeSize, Error, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Signature, Signer, Verifier};
 
 /// A [`Sealed`] object with an attached signature over its seal.
@@ -20,7 +20,7 @@ where
     Sig: Signature,
 {
     inner: Sealed<T, H>,
-    signature: Sig,
+    signature: Lazy<Sig>,
 }
 
 impl<T, H, Sig> PartialEq for Signed<T, H, Sig>
@@ -54,14 +54,20 @@ where
         signer: &impl Signer<Signature = Sig>,
     ) -> Self {
         let signature = signer.sign(namespace, inner.seal().as_ref());
-        Self { inner, signature }
+        Self {
+            inner,
+            signature: Lazy::new(signature),
+        }
     }
 
     /// Creates a new [`Signed`] instance with the given sealed value and signature.
     ///
     /// The caller must ensure `signature` is a valid signature over `inner.seal()`.
-    pub const fn new_unchecked(inner: Sealed<T, H>, signature: Sig) -> Self {
-        Self { inner, signature }
+    pub fn new_unchecked(inner: Sealed<T, H>, signature: Sig) -> Self {
+        Self {
+            inner,
+            signature: Lazy::new(signature),
+        }
     }
 
     /// Returns the inner sealed value.
@@ -84,9 +90,14 @@ where
         self.inner.seal()
     }
 
-    /// Returns a reference to the signature.
-    pub const fn signature(&self) -> &Sig {
+    /// Returns the lazily decoded signature.
+    pub const fn signature_lazy(&self) -> &Lazy<Sig> {
         &self.signature
+    }
+
+    /// Returns the decoded signature.
+    pub fn signature(&self) -> Option<&Sig> {
+        self.signature.get()
     }
 
     /// Verifies the signature against `public_key`.
@@ -94,7 +105,11 @@ where
     where
         P: PublicKey + Verifier<Signature = Sig>,
     {
-        public_key.verify(namespace, self.message_digest().as_ref(), self.signature())
+        let Some(signature) = self.signature() else {
+            return false;
+        };
+
+        public_key.verify(namespace, self.message_digest().as_ref(), signature)
     }
 }
 
@@ -131,8 +146,11 @@ where
         S: Signer<PublicKey = P, Signature = <P as Verifier>::Signature>,
     {
         let signer_public_key = signer.public_key();
+        let sender = self
+            .sender()
+            .expect("locally constructed transaction senders must decode");
         assert!(
-            self.sender == signer_public_key,
+            sender == &signer_public_key,
             "transaction sender must match signer public key",
         );
 
@@ -172,8 +190,10 @@ where
     }
 
     /// Returns a reference to the signature.
-    pub const fn signature(&self) -> &Sig {
-        self.inner.signature()
+    pub fn signature(&self) -> &Sig {
+        self.inner
+            .signature()
+            .expect("verified signatures must decode")
     }
 }
 
@@ -232,8 +252,8 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let inner = Sealed::<T, H>::read_cfg(buf, cfg)?;
-        let signature = Sig::read(buf)?;
-        Ok(Self::new_unchecked(inner, signature))
+        let signature = Lazy::<Sig>::read(buf)?;
+        Ok(Self { inner, signature })
     }
 }
 
@@ -247,7 +267,7 @@ where
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self {
             inner: u.arbitrary::<T>()?.seal(&mut H::new()),
-            signature: u.arbitrary()?,
+            signature: Lazy::new(u.arbitrary()?),
         })
     }
 }
@@ -282,7 +302,11 @@ where
 {
     fn from(signed: Signed<Transaction<D, P>, H, P::Signature>) -> Self {
         let mut hasher = H::default();
-        let signer = Address::from_public_key(&mut hasher, &signed.value().sender);
+        let sender = signed
+            .value()
+            .sender()
+            .expect("verified transaction sender must decode");
+        let signer = Address::from_public_key(&mut hasher, sender);
         Self {
             inner: signed,
             signer,
@@ -355,11 +379,15 @@ mod test {
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(!signed.verify(b"wrong namespace", &private_key.public_key()));
-        assert!(private_key.public_key().verify(
-            NAMESPACE,
-            signed.message_digest().as_ref(),
-            signed.signature()
-        ));
+        assert!(
+            private_key.public_key().verify(
+                NAMESPACE,
+                signed.message_digest().as_ref(),
+                signed
+                    .signature()
+                    .expect("locally created signatures must decode")
+            )
+        );
     }
 
     #[test]
@@ -367,18 +395,25 @@ mod test {
         let hasher = &mut blake3::Blake3::default();
         let private_key = ed25519::PrivateKey::random(&mut OsRng);
         let public_key = private_key.public_key();
-        let verified = Transaction {
-            sender: public_key.clone(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(1).expect("test value should be non-zero"),
-            nonce: 0,
-            _digest: core::marker::PhantomData::<blake3::Digest>,
-        }
+        let verified = Transaction::new(
+            public_key.clone(),
+            Address::EMPTY,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
         .seal_and_sign_verified(&private_key, NAMESPACE, hasher);
 
         let expected = Address::from_public_key(&mut blake3::Blake3::default(), &public_key);
         assert_eq!(verified.signer(), expected);
-        assert!(verified.inner().verify(NAMESPACE, &verified.value().sender));
+        assert!(
+            verified.inner().verify(
+                NAMESPACE,
+                verified
+                    .value()
+                    .sender()
+                    .expect("verified senders must decode"),
+            )
+        );
     }
 
     #[test]
@@ -388,13 +423,12 @@ mod test {
         let private_key = ed25519::PrivateKey::random(&mut OsRng);
         let wrong_key = ed25519::PrivateKey::random(&mut OsRng);
 
-        let _ = Transaction {
-            sender: wrong_key.public_key(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(1).expect("test value should be non-zero"),
-            nonce: 0,
-            _digest: core::marker::PhantomData::<blake3::Digest>,
-        }
+        let _ = Transaction::new(
+            wrong_key.public_key(),
+            Address::EMPTY,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
         .seal_and_sign_verified(&private_key, NAMESPACE, hasher);
     }
 }

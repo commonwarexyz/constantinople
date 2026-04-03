@@ -92,14 +92,8 @@ where
             H::default,
             |hasher, (i, (signer, _))| {
                 let to = self.keys[(i + 1) % self.keys.len()].1;
-                Transaction {
-                    sender: signer.public_key(),
-                    to,
-                    value: NZU64!(1),
-                    nonce: generation,
-                    _digest: PhantomData::<H::Digest>,
-                }
-                .seal_and_sign_verified(signer, b"constantinople-tx", hasher)
+                Transaction::new(signer.public_key(), to, NZU64!(1), generation)
+                    .seal_and_sign_verified(signer, b"constantinople-tx", hasher)
             },
         );
 

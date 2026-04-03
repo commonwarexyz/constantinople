@@ -73,6 +73,9 @@ use tracing::{info, warn};
 /// timestamp to ensure consistent application of block validity rules.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
+/// Number of `load_state` tasks to schedule per available worker.
+const LOAD_STATE_TASKS_PER_WORKER: usize = 2;
+
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 
@@ -138,6 +141,7 @@ pub enum ProcessorError {
 pub async fn load_state<E, H, P, T>(
     batch: &StateBatch<E, H, T>,
     transactions: &[VerifiedTransaction<P, H>],
+    parallelism_hint: usize,
 ) -> Result<State, ProcessorError>
 where
     E: Storage + Clock + Metrics,
@@ -154,29 +158,47 @@ where
     account_keys.sort_unstable();
     account_keys.dedup();
 
+    if account_keys.is_empty() {
+        return Ok(State::from_loaded_accounts(account_keys, Vec::new()));
+    }
+
     let db = batch.lock().await;
     let db = &*db;
     let state_batch = batch.batch();
+    let chunk_size = load_state_chunk_size(account_keys.len(), parallelism_hint);
     let pending_reads = account_keys
-        .iter()
+        .chunks(chunk_size)
         .enumerate()
-        .map(|(index, address)| async move {
-            let account = state_batch.get(address, db).await?;
-            Ok::<_, ProcessorError>((index, account.unwrap_or_default()))
+        .map(|(chunk_index, chunk)| async move {
+            let mut accounts = Vec::with_capacity(chunk.len());
+            for address in chunk {
+                let account = state_batch.get(address, db).await?;
+                accounts.push(account.unwrap_or_default());
+            }
+
+            Ok::<_, ProcessorError>((chunk_index, accounts))
         })
         .collect::<FuturesUnordered<_>>();
-    let mut indexed_accounts = pending_reads
+    let mut chunked_accounts = pending_reads
         .collect::<Vec<_>>()
         .await
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    indexed_accounts.sort_unstable_by_key(|(index, _)| *index);
-    let accounts = indexed_accounts
-        .into_iter()
-        .map(|(_, account)| account)
-        .collect();
+    chunked_accounts.sort_unstable_by_key(|(chunk_index, _)| *chunk_index);
+
+    let mut accounts = Vec::with_capacity(account_keys.len());
+    for (_, chunk_accounts) in chunked_accounts {
+        accounts.extend(chunk_accounts);
+    }
 
     Ok(State::from_loaded_accounts(account_keys, accounts))
+}
+
+fn load_state_chunk_size(address_count: usize, parallelism_hint: usize) -> usize {
+    let worker_count = parallelism_hint.max(1);
+    let chunk_count = address_count.min(worker_count * LOAD_STATE_TASKS_PER_WORKER);
+
+    address_count.div_ceil(chunk_count.max(1))
 }
 
 /// Writes a changeset of account updates to a state batch.
@@ -226,12 +248,23 @@ where
 {
     let mut batch_verifier = B::new();
     for transaction in transactions {
-        batch_verifier.add(
+        // Decode the sender and signature inside the worker so decompression
+        // happens on the rayon pool instead of the runtime thread.
+        let Some(sender) = transaction.value().sender() else {
+            return false;
+        };
+        let Some(signature) = transaction.signature() else {
+            return false;
+        };
+
+        if !batch_verifier.add(
             namespace,
             transaction.message_digest().as_ref(),
-            &transaction.value().sender,
-            transaction.signature(),
-        );
+            sender,
+            signature,
+        ) {
+            return false;
+        }
     }
 
     batch_verifier.verify(rng)
@@ -499,7 +532,7 @@ where
         let (state_batch, transaction_batch) = batches;
 
         let load_state_started_at = Instant::now();
-        let state = load_state(&state_batch, &body)
+        let state = load_state(&state_batch, &body, self.strategy.parallelism_hint())
             .await
             .expect("proposal state loading must succeed");
         let load_state_ms = elapsed_ms(load_state_started_at);
@@ -523,6 +556,8 @@ where
             .await
             .expect("database merkleization must succeed");
         let finalize_ms = elapsed_ms(finalize_started_at);
+        let state_diff_len = state_merkleized.diff_len();
+        let transaction_diff_len = transaction_merkleized.diff_len();
         let transactions_end = parent.header.transactions_range.end() + valid.len() as u64 + 1;
 
         let header = Header {
@@ -554,6 +589,8 @@ where
             load_state_ms,
             execute_ms,
             finalize_ms,
+            state_diff_len,
+            transaction_diff_len,
             total_ms = elapsed_ms(propose_started_at),
             "proposed block"
         );
@@ -607,9 +644,13 @@ where
         let (state_batch, transaction_batch) = batches;
 
         let load_state_started_at = Instant::now();
-        let state = load_state(&state_batch, &verified_body)
-            .await
-            .expect("block state loading during verification must succeed");
+        let state = load_state(
+            &state_batch,
+            &verified_body,
+            self.strategy.parallelism_hint(),
+        )
+        .await
+        .expect("block state loading during verification must succeed");
         let load_state_ms = elapsed_ms(load_state_started_at);
 
         let body_len = verified_body.len();
@@ -633,6 +674,8 @@ where
             .await
             .expect("database merkleization during verification must succeed");
         let finalize_ms = elapsed_ms(finalize_started_at);
+        let state_diff_len = state_merkleized.diff_len();
+        let transaction_diff_len = transaction_merkleized.diff_len();
 
         let state_range = non_empty_range!(
             *state_merkleized.inactivity_floor(),
@@ -681,6 +724,8 @@ where
             load_state_ms,
             execute_ms,
             finalize_ms,
+            state_diff_len,
+            transaction_diff_len,
             total_ms = elapsed_ms(verify_started_at),
             "verified block"
         );
@@ -709,9 +754,13 @@ where
             .expect("certified block contained an invalid signature");
 
         let (state_batch, transaction_batch) = batches;
-        let state = load_state(&state_batch, &verified_body)
-            .await
-            .expect("state loading must succeed for certified apply");
+        let state = load_state(
+            &state_batch,
+            &verified_body,
+            self.strategy.parallelism_hint(),
+        )
+        .await
+        .expect("state loading must succeed for certified apply");
         let changeset = executor::execute(state, &verified_body)
             .expect("certified block contained a statically invalid transaction");
         let transaction_batch = record_transactions(transaction_batch, &verified_body);
@@ -752,14 +801,12 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::verify_transaction_chunks;
+    use super::{load_state_chunk_size, verify_transaction_chunks};
+    use commonware_codec::{DecodeExt, Encode, FixedSize};
     use commonware_cryptography::{Signer as _, blake3, ed25519};
     use commonware_parallel::Rayon;
     use constantinople_primitives::{Address, Signable, SignedTransaction, Transaction};
-    use core::{
-        marker::PhantomData,
-        num::{NonZeroU64, NonZeroUsize},
-    };
+    use core::num::{NonZeroU64, NonZeroUsize};
     use rand::{SeedableRng, rngs::StdRng};
 
     const NAMESPACE: &[u8] = b"consensus-test";
@@ -784,13 +831,12 @@ mod tests {
         to: Address,
         nonce: u64,
     ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
-        Transaction {
-            sender: signer.key.public_key(),
+        Transaction::new(
+            signer.key.public_key(),
             to,
-            value: NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
+            NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
             nonce,
-            _digest: PhantomData,
-        }
+        )
         .seal_and_sign(&signer.key, NAMESPACE, &mut blake3::Blake3::default())
     }
 
@@ -800,13 +846,12 @@ mod tests {
         to: Address,
         nonce: u64,
     ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
-        Transaction {
-            sender: claimed_signer.key.public_key(),
+        Transaction::new(
+            claimed_signer.key.public_key(),
             to,
-            value: NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
+            NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
             nonce,
-            _digest: PhantomData,
-        }
+        )
         .seal_and_sign(
             &actual_signer.key,
             NAMESPACE,
@@ -867,5 +912,53 @@ mod tests {
         >(&strategy, NAMESPACE, &mut rng, transactions);
 
         assert!(verified.is_none());
+    }
+
+    #[test]
+    fn chunked_verification_rejects_malformed_sender() {
+        let strategy =
+            Rayon::new(NonZeroUsize::new(4).expect("test thread count should be non-zero"))
+                .expect("rayon strategy should construct");
+        let sender = TestSigner::from_seed(29);
+        let recipient = TestSigner::from_seed(31);
+        let transaction = signed_transaction(&sender, recipient.address, 0);
+        let mut encoded = transaction.encode().to_vec();
+
+        let invalid_sender = (0u8..=u8::MAX)
+            .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
+            .find_map(|(first, last)| {
+                let mut candidate = [0; ed25519::PublicKey::SIZE];
+                candidate[0] = first;
+                candidate[ed25519::PublicKey::SIZE - 1] = last;
+
+                ed25519::PublicKey::decode(&mut &candidate[..])
+                    .is_err()
+                    .then_some(candidate)
+            })
+            .expect("test should find invalid sender bytes");
+        encoded[..invalid_sender.len()].copy_from_slice(&invalid_sender);
+
+        let malformed =
+            SignedTransaction::<ed25519::PublicKey, blake3::Blake3>::decode(&mut &encoded[..])
+                .expect("decode should defer sender validation");
+        let mut rng = StdRng::seed_from_u64(37);
+
+        let verified = verify_transaction_chunks::<
+            ed25519::PublicKey,
+            blake3::Blake3,
+            ed25519::Batch,
+            _,
+        >(&strategy, NAMESPACE, &mut rng, vec![malformed]);
+
+        assert!(verified.is_none());
+    }
+
+    #[test]
+    fn load_state_chunk_size_scales_with_parallelism() {
+        assert_eq!(load_state_chunk_size(1, 4), 1);
+        assert_eq!(load_state_chunk_size(8, 4), 1);
+        assert_eq!(load_state_chunk_size(16, 4), 2);
+        assert_eq!(load_state_chunk_size(17, 4), 3);
+        assert_eq!(load_state_chunk_size(32, 0), 16);
     }
 }

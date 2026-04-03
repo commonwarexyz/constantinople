@@ -2,7 +2,9 @@
 
 use crate::{Address, Sealable, Sealed, Signed, Verified};
 use bytes::{Buf, BufMut};
-use commonware_codec::{Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write};
+use commonware_codec::{
+    Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
+};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
 use core::num::NonZeroU64;
 
@@ -17,8 +19,8 @@ pub type VerifiedTransaction<P, H> =
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Transaction<D: Digest, P: PublicKey> {
-    /// The sender public key.
-    pub sender: P,
+    /// The sender public key, decoded lazily on demand.
+    pub sender: Lazy<P>,
     /// The recipient address.
     pub to: Address,
     /// The value to send with the transaction.
@@ -30,6 +32,27 @@ pub struct Transaction<D: Digest, P: PublicKey> {
 }
 
 impl<D: Digest, P: PublicKey> Transaction<D, P> {
+    /// Creates a new transaction.
+    pub fn new(sender: P, to: Address, value: NonZeroU64, nonce: u64) -> Self {
+        Self {
+            sender: Lazy::new(sender),
+            to,
+            value,
+            nonce,
+            _digest: core::marker::PhantomData,
+        }
+    }
+
+    /// Returns the decoded sender public key.
+    pub fn sender(&self) -> Option<&P> {
+        self.sender.get()
+    }
+
+    /// Returns the lazily decoded sender public key.
+    pub const fn sender_lazy(&self) -> &Lazy<P> {
+        &self.sender
+    }
+
     /// Hashes the consensus-encoded transaction to produce a [`Digest`].
     ///
     /// If you want to cache the hash, consider using the [`Sealable`] trait.
@@ -66,7 +89,7 @@ impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let _ = cfg;
-        let sender = P::read(buf)?;
+        let sender = Lazy::<P>::read(buf)?;
         let to = Address::read(buf)?;
         let value = u64::read(buf)?;
         let value = NonZeroU64::new(value)
@@ -99,7 +122,7 @@ where
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self {
-            sender: u.arbitrary()?,
+            sender: Lazy::new(u.arbitrary()?),
             to: u.arbitrary()?,
             value: NonZeroU64::new(u.int_in_range(1..=u64::MAX)?)
                 .expect("arbitrary non-zero value should construct"),
@@ -167,13 +190,12 @@ mod test {
 
     #[test]
     fn transaction_roundtrip() {
-        let tx = Transaction::<blake3::Digest, ed25519::PublicKey> {
-            sender: test_sender(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(12_345).expect("test value should be non-zero"),
-            nonce: 1,
-            _digest: core::marker::PhantomData,
-        };
+        let tx = Transaction::<blake3::Digest, ed25519::PublicKey>::new(
+            test_sender(),
+            Address::EMPTY,
+            NonZeroU64::new(12_345).expect("test value should be non-zero"),
+            1,
+        );
 
         let mut buf = Vec::with_capacity(tx.encode_size());
         tx.write(&mut buf);
@@ -185,13 +207,12 @@ mod test {
 
     #[test]
     fn transaction_encode_size_matches_written() {
-        let tx = Transaction::<blake3::Digest, ed25519::PublicKey> {
-            sender: test_sender(),
-            to: Address::arbitrary(&mut Unstructured::new(&[0xCC; 64])).unwrap(),
-            value: NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
-            nonce: u64::MAX,
-            _digest: core::marker::PhantomData,
-        };
+        let tx = Transaction::<blake3::Digest, ed25519::PublicKey>::new(
+            test_sender(),
+            Address::arbitrary(&mut Unstructured::new(&[0xCC; 64])).unwrap(),
+            NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
+            u64::MAX,
+        );
 
         let expected = tx.encode_size();
         let mut buf = Vec::new();
@@ -202,13 +223,12 @@ mod test {
     #[test]
     fn transaction_zero_value_decode_is_rejected() {
         let sender = test_sender();
-        let tx = Transaction::<blake3::Digest, ed25519::PublicKey> {
-            sender: sender.clone(),
-            to: Address::EMPTY,
-            value: NonZeroU64::new(1).expect("test value should be non-zero"),
-            nonce: 7,
-            _digest: core::marker::PhantomData,
-        };
+        let tx = Transaction::<blake3::Digest, ed25519::PublicKey>::new(
+            sender.clone(),
+            Address::EMPTY,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            7,
+        );
 
         let mut buf = Vec::new();
         sender.write(&mut buf);
@@ -218,5 +238,32 @@ mod test {
 
         let result = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..]);
         assert!(result.is_err(), "zero-value transactions must be rejected");
+    }
+
+    #[test]
+    fn transaction_decode_defers_sender_validation() {
+        let invalid_sender = (0u8..=u8::MAX)
+            .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
+            .find_map(|(first, last)| {
+                let mut candidate = [0; ed25519::PublicKey::SIZE];
+                candidate[0] = first;
+                candidate[ed25519::PublicKey::SIZE - 1] = last;
+
+                ed25519::PublicKey::decode(&mut &candidate[..])
+                    .is_err()
+                    .then_some(candidate)
+            })
+            .expect("test should find invalid sender bytes");
+
+        let mut buf = Vec::new();
+        invalid_sender.write(&mut buf);
+        Address::EMPTY.write(&mut buf);
+        1u64.write(&mut buf);
+        9u64.write(&mut buf);
+
+        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
+            .expect("decoding should defer sender validation");
+
+        assert!(decoded.sender().is_none());
     }
 }
