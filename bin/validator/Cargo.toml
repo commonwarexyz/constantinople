@@ -21,7 +21,7 @@ commonware-macros.workspace = true
 
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
-commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 commonware-deployer.workspace = true
 commonware-glue.workspace = true
 commonware-p2p.workspace = true

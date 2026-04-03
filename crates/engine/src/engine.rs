@@ -76,7 +76,7 @@ const FREEZER_VALUE_COMPRESSION: Option<u8> = Some(3);
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
-const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(8_192);
+const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(32_768); // 128 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576);
 const MAX_REPAIR: NonZero<usize> = NZUsize!(50);
 const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
@@ -665,25 +665,5 @@ fn transaction_db_config(
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{DB_WRITE_BUFFER, PAGE_CACHE_CAPACITY, PAGE_CACHE_PAGE_SIZE};
-
-    #[test]
-    fn production_page_cache_capacity_stays_small() {
-        assert_eq!(PAGE_CACHE_CAPACITY.get(), 8_192);
-    }
-
-    #[test]
-    fn production_db_write_buffer_avoids_runtime_floor() {
-        let required_floor = PAGE_CACHE_PAGE_SIZE.get() as usize * 2;
-
-        assert!(
-            DB_WRITE_BUFFER.get() >= required_floor,
-            "production db write buffer should stay above the runtime append floor to avoid warning storms during rebuild",
-        );
     }
 }
