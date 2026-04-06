@@ -6,7 +6,7 @@ use constantinople_primitives::{Account, Address, Transaction, VerifiedTransacti
 use core::num::NonZeroU64;
 use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
-use std::{collections::HashMap, hint::black_box, sync::OnceLock};
+use std::{collections::BTreeMap, hint::black_box, sync::OnceLock};
 
 type TestHasher = blake3::Blake3;
 type TestPublicKey = ed25519::PublicKey;
@@ -51,7 +51,7 @@ struct BenchFixture {
 
 impl BenchFixture {
     fn low_contention(transaction_count: usize) -> Self {
-        let mut accounts = HashMap::with_capacity(transaction_count * 2);
+        let mut accounts = BTreeMap::new();
         let mut transactions = Vec::with_capacity(transaction_count);
 
         for index in 0..transaction_count {
@@ -70,13 +70,13 @@ impl BenchFixture {
 
         let valid = valid_transactions(transactions, &accounts);
         Self {
-            state: State::new(accounts),
+            state: accounts,
             transactions: valid,
         }
     }
 
     fn high_contention(transaction_count: usize) -> Self {
-        let mut accounts = HashMap::with_capacity(transaction_count + 1);
+        let mut accounts = BTreeMap::new();
         let mut transactions = Vec::with_capacity(transaction_count);
         let recipient = address(0, 0x7a);
 
@@ -96,13 +96,13 @@ impl BenchFixture {
 
         let valid = valid_transactions(transactions, &accounts);
         Self {
-            state: State::new(accounts),
+            state: accounts,
             transactions: valid,
         }
     }
 
     fn run(&self) -> usize {
-        executor::execute(self.state.clone(), &self.transactions)
+        executor::execute(&self.state, &self.transactions)
             .expect("bench proposal transactions should execute")
             .len()
     }
@@ -165,9 +165,9 @@ fn build_fixture(contention: Contention, transaction_count: usize) -> BenchFixtu
 
 fn valid_transactions(
     transactions: Vec<TestTransaction>,
-    accounts: &HashMap<Address, Account>,
+    accounts: &BTreeMap<Address, Account>,
 ) -> Vec<TestTransaction> {
-    executor::propose(State::new(accounts.clone()), transactions).valid
+    executor::propose(accounts, transactions).valid
 }
 
 fn address(index: usize, tag: u8) -> Address {

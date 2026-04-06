@@ -1,6 +1,6 @@
 //! Transaction execution engine for simple transfers.
 
-use super::state::{AccountEffect, State, TransferEffect, WorkingState};
+use super::state::{State, Overlay};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_primitives::{Account, Address, VerifiedTransaction};
 
@@ -18,63 +18,31 @@ pub struct ProposalOutput<PK: PublicKey, H: Hasher> {
     pub changeset: Changeset,
 }
 
-/// Resolved indices and values needed to execute a single transfer.
-struct PreparedTransaction {
-    sender_index: usize,
-    recipient_index: usize,
-    value: u64,
-    nonce: u64,
-}
-
-/// Resolves a transaction's sender and recipient to their working-state indices.
-///
-/// Returns `None` if either the sender or recipient is missing from the state.
-fn prepare<H, PK>(
-    state: &WorkingState,
-    transaction: &VerifiedTransaction<PK, H>,
-) -> Option<PreparedTransaction>
-where
-    H: Hasher,
-    PK: PublicKey,
-{
-    Some(PreparedTransaction {
-        sender_index: state.index(transaction.signer())?,
-        recipient_index: state.index(transaction.value().to)?,
-        value: transaction.value().value.get(),
-        nonce: transaction.value().nonce,
-    })
-}
-
 /// Filters invalid proposal candidates and executes the valid transfers.
 pub fn propose<H, PK>(
-    state: State,
+    state: &State,
     transactions: Vec<VerifiedTransaction<PK, H>>,
 ) -> ProposalOutput<PK, H>
 where
     H: Hasher,
     PK: PublicKey,
 {
-    let mut state = WorkingState::new(state);
+    let mut overlay = Overlay::new(state);
     let mut valid = Vec::with_capacity(transactions.len());
     let mut invalid = Vec::new();
 
     for transaction in transactions {
-        let prepared = prepare(&state, &transaction)
-            .expect("state must preload every sender and recipient before execution");
-
-        let Some(effect) = execute_transfer(state.accounts(), &prepared) else {
+        if execute_transfer(&mut overlay, &transaction) {
+            valid.push(transaction);
+        } else {
             invalid.push(transaction);
-            continue;
-        };
-
-        state.apply_transfer(effect);
-        valid.push(transaction);
+        }
     }
 
     ProposalOutput {
         valid,
         invalid,
-        changeset: state.changeset(),
+        changeset: overlay.into_changeset(),
     }
 }
 
@@ -82,68 +50,71 @@ where
 ///
 /// Returns `None` if any transaction in the batch fails validation.
 pub fn execute<H, PK>(
-    state: State,
+    state: &State,
     transactions: &[VerifiedTransaction<PK, H>],
 ) -> Option<Changeset>
 where
     H: Hasher,
     PK: PublicKey,
 {
-    let mut executed = WorkingState::new(state);
+    let mut overlay = Overlay::new(state);
 
     for transaction in transactions {
-        let prepared = prepare(&executed, transaction)?;
-        let effect = execute_transfer(executed.accounts(), &prepared)?;
-        executed.apply_transfer(effect);
+        if !execute_transfer(&mut overlay, transaction) {
+            return None;
+        }
     }
 
-    Some(executed.changeset())
+    Some(overlay.into_changeset())
 }
 
-/// Applies a single prepared transfer against the current account state.
+/// Applies a single transfer against the current account state.
 ///
-/// Returns `None` if the sender has an incorrect nonce, insufficient balance,
+/// Returns `false` if the sender has an incorrect nonce, insufficient balance,
 /// or if the recipient balance would overflow.
-fn execute_transfer(
-    accounts: &[Account],
-    transaction: &PreparedTransaction,
-) -> Option<TransferEffect> {
-    let sender_account = accounts[transaction.sender_index];
-    if sender_account.nonce != transaction.nonce || sender_account.balance < transaction.value {
-        return None;
-    }
+fn execute_transfer<H, PK>(
+    state: &mut Overlay<'_>,
+    transaction: &VerifiedTransaction<PK, H>,
+) -> bool
+where
+    H: Hasher,
+    PK: PublicKey,
+{
+    let sender_address = transaction.signer();
+    let recipient_address = transaction.value().to;
+    let value = transaction.value().value.get();
+    let nonce = transaction.value().nonce;
 
-    let next_nonce = sender_account.nonce.checked_add(1)?;
-    let sender = AccountEffect {
-        index: transaction.sender_index,
-        account: Account {
-            balance: if transaction.sender_index == transaction.recipient_index {
-                sender_account.balance
-            } else {
-                sender_account.balance - transaction.value
-            },
-            nonce: next_nonce,
-        },
+    let Some(sender) = state.get(&sender_address) else {
+        return false;
+    };
+    if sender.nonce != nonce || sender.balance < value {
+        return false;
+    }
+    let Some(next_nonce) = sender.nonce.checked_add(1) else {
+        return false;
     };
 
-    if transaction.sender_index == transaction.recipient_index {
-        return Some(TransferEffect {
-            sender,
-            recipient: None,
-        });
+    // Self-transfer: only bump the nonce.
+    if sender_address == recipient_address {
+        let sender = state.get_mut(&sender_address).expect("checked above");
+        sender.nonce = next_nonce;
+        return true;
     }
 
-    let recipient_account = accounts[transaction.recipient_index];
-    let recipient_balance = recipient_account.balance.checked_add(transaction.value)?;
+    let Some(recipient) = state.get(&recipient_address) else {
+        return false;
+    };
+    let Some(recipient_balance) = recipient.balance.checked_add(value) else {
+        return false;
+    };
 
-    Some(TransferEffect {
-        sender,
-        recipient: Some(AccountEffect {
-            index: transaction.recipient_index,
-            account: Account {
-                balance: recipient_balance,
-                nonce: recipient_account.nonce,
-            },
-        }),
-    })
+    let sender = state.get_mut(&sender_address).expect("checked above");
+    sender.balance -= value;
+    sender.nonce = next_nonce;
+
+    let recipient = state.get_mut(&recipient_address).expect("checked above");
+    recipient.balance = recipient_balance;
+
+    true
 }

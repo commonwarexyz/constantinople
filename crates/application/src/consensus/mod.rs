@@ -276,7 +276,7 @@ where
             valid,
             invalid: _,
             changeset,
-        } = executor::propose(state, body);
+        } = executor::propose(&state, body);
         let execute_ms = execute_started_at.elapsed().as_millis();
 
         self.proposed_transactions.inc_by(valid.len() as u64);
@@ -376,7 +376,7 @@ where
         let load_state_ms = load_state_started_at.elapsed().as_millis();
 
         let execute_started_at = Instant::now();
-        let Some(changeset) = executor::execute(state, &verified_body) else {
+        let Some(changeset) = executor::execute(&state, &verified_body) else {
             warn!(
                 height = header.height,
                 "verify rejected: statically invalid transaction"
@@ -469,7 +469,7 @@ where
         let state = load_state(&batches, &verified_body)
             .await
             .expect("state loading must succeed for certified apply");
-        let changeset = executor::execute(state, &verified_body)
+        let changeset = executor::execute(&state, &verified_body)
             .expect("certified block contained a statically invalid transaction");
         let state_batch = apply_changeset(batches, &changeset);
         state_batch

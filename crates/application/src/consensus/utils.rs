@@ -9,10 +9,11 @@ use commonware_storage::{
     qmdb::Error as StorageError,
     translator::Translator,
 };
-use constantinople_primitives::{Account, SignedTransaction, VerifiedTransaction};
+use constantinople_primitives::{SignedTransaction, VerifiedTransaction};
 use futures::{StreamExt, stream::FuturesUnordered};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
+use std::collections::BTreeMap;
 
 use super::StateBatch;
 
@@ -31,39 +32,37 @@ where
     P: PublicKey,
     T: Translator,
 {
-    let mut account_keys = Vec::with_capacity(transactions.len().saturating_mul(2));
+    let mut addresses = Vec::with_capacity(transactions.len().saturating_mul(2));
     for transaction in transactions {
-        account_keys.push(transaction.signer());
-        account_keys.push(transaction.value().to);
+        addresses.push(transaction.signer());
+        addresses.push(transaction.value().to);
     }
 
-    account_keys.sort_unstable();
-    account_keys.dedup();
+    addresses.sort_unstable();
+    addresses.dedup();
 
-    if account_keys.is_empty() {
-        return Ok(State::from_loaded_accounts(account_keys, Vec::new()));
+    if addresses.is_empty() {
+        return Ok(BTreeMap::new());
     }
 
     let db = batch.lock().await;
     let db = &*db;
     let state_batch = batch.inner();
-    let pending_reads = account_keys
-        .iter()
-        .enumerate()
-        .map(|(index, address)| async move {
-            let account = state_batch.get(address, db).await?;
-            Ok::<_, StorageError<mmr::Family>>((index, account.unwrap_or_default()))
+    let pending_reads: FuturesUnordered<_> = addresses
+        .into_iter()
+        .map(|address| async move {
+            let account = state_batch.get(&address, db).await?;
+            Ok::<_, StorageError<mmr::Family>>((address, account.unwrap_or_default()))
         })
-        .collect::<FuturesUnordered<_>>();
+        .collect();
 
-    let mut accounts = vec![Account::default(); account_keys.len()];
-    let results: Vec<_> = pending_reads.collect().await;
-    for result in results {
-        let (index, account) = result?;
-        accounts[index] = account;
-    }
+    let accounts = pending_reads
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
 
-    Ok(State::from_loaded_accounts(account_keys, accounts))
+    Ok(accounts)
 }
 
 /// Verifies a batch of signed transactions.
