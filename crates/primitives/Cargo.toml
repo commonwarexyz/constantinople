@@ -12,23 +12,23 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-bytes = { workspace = true, features = ["std"] }
-commonware-codec = { workspace = true, features = ["std"] }
-commonware-cryptography = { workspace = true, features = ["std", "sha2-asm", "blake3-parallel"] }
+bytes.workspace = true
+commonware-codec.workspace = true
+commonware-cryptography = { workspace = true, features = ["sha2-asm", "blake3-parallel"] }
 commonware-consensus.workspace = true
-commonware-math = { workspace = true, features = ["std"] }
-commonware-utils = { workspace = true, features = ["std"] }
-derive_more = { workspace = true, features = ["full", "std"] }
+commonware-math.workspace = true
+commonware-utils.workspace = true
+derive_more = { workspace = true, features = ["full"] }
 arbitrary = { workspace = true, features = ["derive"], optional = true }
-rand_core = { workspace = true, features = ["std"] }
+rand_core.workspace = true
 
 [dev-dependencies]
 arbitrary = { workspace = true, features = ["derive"] }
-commonware-codec = { workspace = true, features = ["std", "arbitrary"] }
+commonware-codec = { workspace = true, features = ["arbitrary"] }
 commonware-consensus = { workspace = true, features = ["arbitrary"] }
-commonware-cryptography = { workspace = true, features = ["std", "arbitrary"] }
-commonware-math = { workspace = true, features = ["std", "arbitrary"] }
-commonware-utils = { workspace = true, features = ["std", "arbitrary"] }
+commonware-cryptography = { workspace = true, features = ["arbitrary"] }
+commonware-math = { workspace = true, features = ["arbitrary"] }
+commonware-utils = { workspace = true, features = ["arbitrary"] }
 rand.workspace = true
 
 [features]

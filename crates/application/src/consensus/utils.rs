@@ -153,7 +153,7 @@ where
 mod tests {
     use super::verify_transaction_chunks;
     use commonware_codec::{DecodeExt, Encode, FixedSize};
-    use commonware_cryptography::{Digest, Signer as _, blake3, ed25519};
+    use commonware_cryptography::{Signer as _, blake3, ed25519};
     use commonware_parallel::Rayon;
     use constantinople_primitives::{Address, Signable, SignedTransaction, Transaction};
     use core::num::{NonZeroU64, NonZeroUsize};

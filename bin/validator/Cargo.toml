@@ -21,18 +21,18 @@ commonware-macros.workspace = true
 
 commonware-codec.workspace = true
 commonware-consensus.workspace = true
-commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
+commonware-cryptography = { workspace = true, features = ["sha2-asm"] }
 commonware-deployer.workspace = true
 commonware-glue.workspace = true
 commonware-p2p.workspace = true
-commonware-parallel = { workspace = true, features = ["std"] }
+commonware-parallel.workspace = true
 commonware-runtime.workspace = true
 commonware-utils.workspace = true
 
 axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
-serde = { workspace = true, features = ["derive", "std"] }
+serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

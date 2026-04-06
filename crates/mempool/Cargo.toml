@@ -20,7 +20,7 @@ commonware-cryptography.workspace = true
 commonware-utils.workspace = true
 
 axum.workspace = true
-serde = { workspace = true, features = ["derive", "std"] }
+serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
@@ -33,8 +33,8 @@ mocks = [
 
 [dev-dependencies]
 bytes.workspace = true
-commonware-cryptography = { workspace = true, features = ["std"] }
-commonware-math = { workspace = true, features = ["std"] }
-futures = { workspace = true, features = ["std", "executor"] }
+commonware-cryptography.workspace = true
+commonware-math.workspace = true
+futures = { workspace = true, features = ["executor"] }
 rand.workspace = true
 tower = { workspace = true, features = ["util"] }

@@ -14,14 +14,14 @@ workspace = true
 
 [dependencies]
 commonware-codec.workspace = true
-commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography.workspace = true
 commonware-deployer.workspace = true
 commonware-math.workspace = true
 commonware-utils.workspace = true
 rand_core.workspace = true
 
 clap = { workspace = true, features = ["derive"] }
-serde = { workspace = true, features = ["derive", "std"] }
+serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

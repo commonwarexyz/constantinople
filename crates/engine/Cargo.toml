@@ -45,9 +45,9 @@ tracing.workspace = true
 
 [dev-dependencies]
 constantinople-mempool = { workspace = true, features = ["mocks"] }
-commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-cryptography.workspace = true
 commonware-glue = { workspace = true, features = ["test-utils"] }
 commonware-runtime.workspace = true
-commonware-parallel = { workspace = true, features = ["std"] }
-commonware-math = { workspace = true, features = ["std"] }
+commonware-parallel.workspace = true
+commonware-math.workspace = true
 tracing-subscriber.workspace = true

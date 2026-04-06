@@ -26,17 +26,17 @@ commonware-parallel.workspace = true
 rand.workspace = true
 rand_core.workspace = true
 bytes.workspace = true
-futures = { workspace = true, features = ["std", "executor"] }
+futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
 commonware-storage.workspace = true
 prometheus-client.workspace = true
 
 [dev-dependencies]
 constantinople-mempool = { workspace = true, features = ["mocks"] }
-commonware-cryptography = { workspace = true, features = ["std"] }
-commonware-math = { workspace = true, features = ["std"] }
+commonware-cryptography.workspace = true
+commonware-math.workspace = true
 commonware-runtime.workspace = true
-commonware-parallel = { workspace = true, features = ["std"] }
+commonware-parallel.workspace = true
 divan.workspace = true
 hashbrown.workspace = true
 rand.workspace = true
