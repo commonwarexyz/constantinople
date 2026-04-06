@@ -26,10 +26,7 @@ tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
 
 [features]
-mocks = [
-	"commonware-consensus/mocks",
-	"commonware-cryptography/mocks"
-]
+mocks = [ "commonware-consensus/mocks", "commonware-cryptography/mocks" ]
 
 [dev-dependencies]
 bytes.workspace = true
