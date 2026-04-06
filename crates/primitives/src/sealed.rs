@@ -5,7 +5,7 @@
 
 use commonware_codec::{EncodeSize, Error, Read, Write};
 use commonware_cryptography::{Digest, Digestible, Hasher};
-use core::{fmt, ops::Deref};
+use derive_more::{Debug, Deref};
 
 /// A type that can be hashed and sealed.
 pub trait Sealable {
@@ -19,8 +19,9 @@ pub trait Sealable {
 }
 
 /// A type that has been hashed with a cached digest.
-#[derive(Clone)]
+#[derive(Clone, Debug, Deref)]
 pub struct Sealed<T, H: Hasher> {
+    #[deref]
     inner: T,
     seal: H::Digest,
 }
@@ -44,18 +45,6 @@ where
 {
 }
 
-impl<T, H: Hasher> fmt::Debug for Sealed<T, H>
-where
-    T: fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Sealed")
-            .field("inner", &self.inner)
-            .field("seal", &self.seal)
-            .finish()
-    }
-}
-
 impl<T, H: Hasher> Sealed<T, H> {
     /// Creates a new `Sealed` instance with the given inner value and seal. Does not
     /// require `T` to be [`Sealable`].
@@ -74,17 +63,6 @@ impl<T, H: Hasher> Sealed<T, H> {
     /// Returns a reference to the cached seal.
     pub const fn seal(&self) -> &H::Digest {
         &self.seal
-    }
-}
-
-impl<T, H> Deref for Sealed<T, H>
-where
-    H: Hasher,
-{
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.inner
     }
 }
 
@@ -150,7 +128,7 @@ mod test {
     use commonware_cryptography::{Hasher, blake3};
     use commonware_utils::hex;
 
-    #[derive(Debug, Clone, PartialEq, Eq)]
+    #[derive(core::fmt::Debug, Clone, PartialEq, Eq)]
     #[repr(transparent)]
     struct MockSeal([u8; 8]);
 
