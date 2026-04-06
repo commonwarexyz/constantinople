@@ -50,8 +50,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         json_logs,
         deployer_managed,
-        max_propose_bytes: _,
-        max_pool_bytes: _,
     } = config;
 
     let config_dir = config_path

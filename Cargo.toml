@@ -42,21 +42,21 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-engine = { path = "crates/engine" }
 
 # commonware
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent", default-features = false }
+commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
+commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/temp-glue-batch-parent" }
 
 # external
 rand = { version = "0.8.5", default-features = false }
@@ -69,10 +69,16 @@ rand_core = "0.6.4"
 thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
 derive_more = { version = "2.1.1", default-features = false }
+axum = "0.8"
+clap = { version = "4", default-features = false }
 rayon = "1.10"
 futures = { version = "0.3.31", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
+serde_yaml = "0.9"
+tokio = { version = "1.50", default-features = false }
+tower = { version = "0.5", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
+tracing-subscriber = "0.3"
 divan = "0.1"
 
 [profile.samply]

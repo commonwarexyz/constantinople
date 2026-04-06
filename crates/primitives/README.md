@@ -1,3 +1,3 @@
 # `constantinople-primitives`
 
-Types for `constantinople`
+Core types for the `constantinople` blockchain.

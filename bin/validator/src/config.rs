@@ -15,14 +15,6 @@ use commonware_utils::{NZU32, from_hex, hex};
 use serde::Deserialize;
 use std::{collections::HashMap, net::SocketAddr, path::Path};
 
-pub(crate) const fn default_max_propose_bytes() -> usize {
-    4 * 1024 * 1024 // 4 MiB
-}
-
-pub(crate) const fn default_max_pool_bytes() -> usize {
-    64 * 1024 * 1024 // 64 MiB
-}
-
 pub(crate) const fn default_rayon_threads() -> usize {
     2
 }
@@ -57,12 +49,6 @@ pub struct ValidatorConfig {
     pub http_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
-    /// Max bytes of transactions per propose() call.
-    #[serde(default = "default_max_propose_bytes")]
-    pub max_propose_bytes: usize,
-    /// Max bytes of pending transactions before rejecting.
-    #[serde(default = "default_max_pool_bytes")]
-    pub max_pool_bytes: usize,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
 }
 
@@ -108,8 +94,6 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     pub json_logs: bool,
     pub deployer_managed: bool,
-    pub max_propose_bytes: usize,
-    pub max_pool_bytes: usize,
 }
 
 fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
@@ -202,8 +186,6 @@ fn decode_with_network(
         metrics_listen,
         json_logs,
         deployer_managed: json_logs,
-        max_propose_bytes: config.max_propose_bytes,
-        max_pool_bytes: config.max_pool_bytes,
     }
 }
 
@@ -356,8 +338,6 @@ mod tests {
             rayon_threads: 2,
             http_port: 8080,
             metrics_port: 9090,
-            max_propose_bytes: super::default_max_propose_bytes(),
-            max_pool_bytes: super::default_max_pool_bytes(),
             bootstrappers: vec![NamedBootstrapperEntry {
                 public_key: peer_name.clone(),
                 name: peer_name.clone(),
@@ -447,8 +427,6 @@ mod tests {
             rayon_threads: 2,
             http_port: 8080,
             metrics_port: 9090,
-            max_propose_bytes: super::default_max_propose_bytes(),
-            max_pool_bytes: super::default_max_pool_bytes(),
             bootstrappers: vec![NamedBootstrapperEntry {
                 public_key: peer_name.clone(),
                 name: peer_name.clone(),
@@ -539,8 +517,6 @@ hosts:
             rayon_threads: 2,
             http_port: 8080,
             metrics_port: 9090,
-            max_propose_bytes: super::default_max_propose_bytes(),
-            max_pool_bytes: super::default_max_pool_bytes(),
             bootstrappers: vec![NamedBootstrapperEntry {
                 public_key: bootstrapper_name.clone(),
                 name: bootstrapper_name.clone(),
@@ -621,8 +597,6 @@ hosts:
             rayon_threads: 2,
             http_port: 8080,
             metrics_port: 9090,
-            max_propose_bytes: super::default_max_propose_bytes(),
-            max_pool_bytes: super::default_max_pool_bytes(),
             bootstrappers: vec![NamedBootstrapperEntry {
                 public_key: peer_name.clone(),
                 name: peer_name.clone(),
@@ -700,8 +674,6 @@ hosts:
             rayon_threads: 2,
             http_port: 8080,
             metrics_port: 9090,
-            max_propose_bytes: super::default_max_propose_bytes(),
-            max_pool_bytes: super::default_max_pool_bytes(),
             bootstrappers: vec![NamedBootstrapperEntry {
                 public_key: peer_name.clone(),
                 name: peer_name.clone(),

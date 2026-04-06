@@ -50,4 +50,4 @@ commonware-glue = { workspace = true, features = ["test-utils"] }
 commonware-runtime.workspace = true
 commonware-parallel = { workspace = true, features = ["std"] }
 commonware-math = { workspace = true, features = ["std"] }
-tracing-subscriber = "0.3"
+tracing-subscriber.workspace = true

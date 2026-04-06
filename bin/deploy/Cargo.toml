@@ -20,11 +20,11 @@ commonware-math.workspace = true
 commonware-utils.workspace = true
 rand_core.workspace = true
 
-clap = { version = "4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive", "std"] }
-serde_yaml = "0.9"
+serde_yaml.workspace = true
 tracing.workspace = true
-tracing-subscriber = "0.3"
+tracing-subscriber.workspace = true
 
 [[bin]]
 name = "constantinople-deploy"

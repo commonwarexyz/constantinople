@@ -29,18 +29,18 @@ commonware-parallel = { workspace = true, features = ["std"] }
 commonware-runtime.workspace = true
 commonware-utils.workspace = true
 
-axum = "0.8"
+axum.workspace = true
 bytes.workspace = true
-clap = { version = "4", features = ["derive"] }
+clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive", "std"] }
-serde_yaml = "0.9"
+serde_yaml.workspace = true
 tracing.workspace = true
-tracing-subscriber = "0.3"
-tokio = { version = "1.50", features = ["full"] }
+tracing-subscriber.workspace = true
+tokio = { workspace = true, features = ["full"] }
 rand_core.workspace = true
 
 [dev-dependencies]
-tower = { version = "0.5", features = ["util"] }
+tower = { workspace = true, features = ["util"] }
 
 [[bin]]
 name = "constantinople"
