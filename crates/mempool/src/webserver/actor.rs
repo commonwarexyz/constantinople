@@ -2,7 +2,7 @@
 //!
 //! Owns a byte-bounded FIFO pool of verified transactions. Receives
 //! batch submissions from HTTP handlers and serves proposals to the
-//! consensus layer via the [`Mailbox`](super::Mailbox).
+//! consensus layer via the [`Mailbox`].
 
 use super::{Mailbox, http, mailbox::Message};
 use commonware_consensus::marshal::Update;

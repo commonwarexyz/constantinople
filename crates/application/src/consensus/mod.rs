@@ -60,8 +60,8 @@ use std::{
 use tracing::{info, warn};
 
 mod utils;
-pub use utils::load_state;
 use constantinople_primitives::{verify_transaction_batch, verify_transaction_chunks};
+pub use utils::load_state;
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
 ///
