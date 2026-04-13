@@ -20,4 +20,3 @@ mod mailbox;
 pub use mailbox::Mailbox;
 
 mod http;
-pub use http::{AppState, router};

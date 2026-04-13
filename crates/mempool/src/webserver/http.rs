@@ -8,7 +8,7 @@ use constantinople_primitives::SignedTransaction;
 use std::sync::Arc;
 
 /// Shared state for HTTP handlers.
-pub struct AppState<C, P, H>
+pub(super) struct AppState<C, P, H>
 where
     C: Digest,
     P: PublicKey,
@@ -21,7 +21,7 @@ where
 }
 
 /// Builds the axum [`Router`] for the mempool HTTP API.
-pub fn router<C, P, H>(state: Arc<AppState<C, P, H>>) -> Router
+pub(super) fn router<C, P, H>(state: Arc<AppState<C, P, H>>) -> Router
 where
     C: Digest + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,

@@ -12,7 +12,7 @@ use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Metrics as _, Quota, Runner as _, Spawner as _, ThreadPooler as _,
+    Metrics as _, Quota, Runner as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
@@ -22,7 +22,7 @@ use constantinople_engine::{
     VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::webserver;
-use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, time::Duration};
 use tracing::info;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
@@ -160,22 +160,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_pool_bytes: MAX_POOL_BYTES,
                 max_propose_bytes: MAX_PROPOSE_BYTES,
                 mailbox_size: 65536,
+                namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
             },
         );
-        let mempool_handle = mempool_actor.start();
-
-        let app_state = Arc::new(webserver::AppState {
-            mailbox: mempool_mailbox.clone(),
-            namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-        });
-        let app = webserver::router(app_state);
         let listener = tokio::net::TcpListener::bind(http_listen)
             .await
             .expect("failed to bind mempool HTTP listener");
         info!(%http_listen, "mempool webserver listening");
-        let http_handle = context.with_label("mempool-http").spawn(|_| async {
-            let _ = axum::serve(listener, app).await;
-        });
+        let mempool_handle = mempool_actor.start(listener);
 
         let startup =
             resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;
@@ -216,8 +208,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         tokio::select! {
             _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),
             _ = engine_handle => tracing::warn!("engine exited"),
-            _ = mempool_handle => tracing::warn!("mempool actor exited"),
-            _ = http_handle => tracing::warn!("mempool http server exited"),
+            _ = mempool_handle => tracing::warn!("mempool exited"),
             _ = network_handle => tracing::warn!("network exited"),
         }
     });
