@@ -31,7 +31,7 @@ Constantinople is a high-throughput account-model blockchain example built on to
 | [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (marshal) | Erasure-coded broadcast and backfill of finalized blocks |
 | [`commonware-storage`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-storage) (QMDB)        | Merkleized key-value database for state and transactions |
 | [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful)          | Speculative state management and sync                    |
-| [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p)                       | Authenticated peer-to-peer networking with discovery     |
+| [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p) (discovery)           | Authenticated peer-to-peer networking with discovery     |
 
 ## Demo
 
