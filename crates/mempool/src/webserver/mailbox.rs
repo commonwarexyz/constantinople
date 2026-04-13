@@ -1,5 +1,6 @@
 //! Mailbox for the mempool webserver actor.
 
+use super::actor::TxStatus;
 use crate::TransactionSource;
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
@@ -13,13 +14,15 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    /// A verified transaction submitted by an HTTP handler.
+    /// A batch of verified transactions submitted by an HTTP handler.
     Submit {
-        transaction: VerifiedTransaction<P, H>,
-        size: usize,
+        transactions: Vec<VerifiedTransaction<P, H>>,
+        total_bytes: usize,
+        result: oneshot::Sender<TxStatus>,
     },
     /// Consensus requests transactions for the next proposal.
     Propose {
+        height: u64,
         response: oneshot::Sender<Vec<VerifiedTransaction<P, H>>>,
     },
     /// Consensus reports a finalized or tip block.
@@ -59,14 +62,25 @@ where
         Self { sender }
     }
 
-    /// Non-blocking submission for HTTP handlers.
+    /// Non-blocking batch submission for HTTP handlers.
     ///
-    /// Returns `true` if the transaction was enqueued into the actor channel,
-    /// `false` if the channel is full (backpressure).
-    pub fn try_submit(&self, transaction: VerifiedTransaction<P, H>, size: usize) -> bool {
+    /// On success, returns a receiver that resolves with the batch outcome
+    /// once its block is finalized or dropped. Returns `None` if the channel
+    /// is full.
+    pub fn try_submit(
+        &self,
+        transactions: Vec<VerifiedTransaction<P, H>>,
+        total_bytes: usize,
+    ) -> Option<oneshot::Receiver<TxStatus>> {
+        let (result_tx, result_rx) = oneshot::channel();
         self.sender
-            .try_send(Message::Submit { transaction, size })
-            .is_ok()
+            .try_send(Message::Submit {
+                transactions,
+                total_bytes,
+                result: result_tx,
+            })
+            .ok()
+            .map(|()| result_rx)
     }
 }
 
@@ -78,11 +92,12 @@ where
 {
     async fn propose(
         &mut self,
-        _parent: &Header<C, H::Digest, P>,
+        parent: &Header<C, H::Digest, P>,
         _context: &Context<C, P>,
     ) -> Vec<VerifiedTransaction<P, H>> {
+        let height = parent.height + 1;
         self.sender
-            .request(|response| Message::Propose { response })
+            .request(|response| Message::Propose { height, response })
             .await
             .expect("mempool actor mailbox closed")
     }

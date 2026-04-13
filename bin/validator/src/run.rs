@@ -161,6 +161,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes: MAX_PROPOSE_BYTES,
                 mailbox_size: 65536,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
+                drop_grace_blocks: 3,
             },
         );
         let listener = tokio::net::TcpListener::bind(http_listen)
