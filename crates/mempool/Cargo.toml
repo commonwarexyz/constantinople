@@ -12,26 +12,32 @@ publish = false
 workspace = true
 
 [dependencies]
+# Workspace
 constantinople-primitives.workspace = true
 
+# Commonware
 commonware-codec.workspace = true
+commonware-utils.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true
-commonware-utils.workspace = true
 
+# Other
 axum.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_json.workspace = true
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true
+serde_json.workspace = true
 
 [features]
 mocks = [ "commonware-consensus/mocks", "commonware-cryptography/mocks" ]
 
 [dev-dependencies]
-bytes.workspace = true
-commonware-cryptography.workspace = true
+# Commonware
 commonware-math.workspace = true
-futures = { workspace = true, features = ["executor"] }
+commonware-cryptography.workspace = true
+
+# Other
 rand.workspace = true
+bytes.workspace = true
 tower = { workspace = true, features = ["util"] }
+futures = { workspace = true, features = ["executor"] }

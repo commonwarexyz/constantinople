@@ -35,51 +35,51 @@ option-if-let-else = "warn"
 redundant-clone = "warn"
 
 [workspace.dependencies]
-# workspace
-constantinople-application = { path = "crates/application" }
+# Workspace
+constantinople-engine = { path = "crates/engine" }
 constantinople-mempool = { path = "crates/mempool" }
 constantinople-primitives = { path = "crates/primitives" }
-constantinople-engine = { path = "crates/engine" }
+constantinople-application = { path = "crates/application" }
 
-# commonware
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
+# Commonware
+commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
+commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
+commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue-temp" }
 
-# external
+# Other
+axum = "0.8"
+clap = { version = "4", default-features = false }
 rand = { version = "0.8.5", default-features = false }
-rstest = "0.26.0"
 bytes = { version = "1.11.1", default-features = false }
+divan = "0.1"
+rayon = "1.10"
 serde = { version = "1.0.228", default-features = false }
+tokio = { version = "1.50", default-features = false }
+tower = { version = "0.5", default-features = false }
+rstest = "0.26.0"
+futures = { version = "0.3.31", default-features = false }
+tracing = { version = "0.1.41", default-features = false }
 arbitrary = { version = "1.4.2", features = ["derive"] }
 hashbrown = { version = "0.17.0", default-features = false }
 rand_core = "0.6.4"
 thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
-derive_more = { version = "2.1.1", default-features = false }
-axum = "0.8"
-clap = { version = "4", default-features = false }
-rayon = "1.10"
-futures = { version = "0.3.31", default-features = false }
-prometheus-client = { version = "0.24.0", default-features = false }
 serde_yaml = "0.9"
-tokio = { version = "1.50", default-features = false }
-tower = { version = "0.5", default-features = false }
-tracing = { version = "0.1.41", default-features = false }
+derive_more = { version = "2.1.1", default-features = false }
+prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
-divan = "0.1"
 
 [profile.samply]
 inherits = "release"

@@ -12,35 +12,43 @@ publish = false
 workspace = true
 
 [dependencies]
+# Workspace
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
 
+# Commonware
 commonware-glue.workspace = true
 commonware-codec.workspace = true
 commonware-utils.workspace = true
 commonware-runtime.workspace = true
+commonware-storage.workspace = true
+commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography.workspace = true
-commonware-parallel.workspace = true
 
+# Other
 rand.workspace = true
-rand_core.workspace = true
 bytes.workspace = true
 futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
-commonware-storage.workspace = true
+rand_core.workspace = true
 prometheus-client.workspace = true
 
 [dev-dependencies]
+# Workspace
 constantinople-mempool = { workspace = true, features = ["mocks"] }
-commonware-cryptography.workspace = true
+
+# Commonware
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
-divan.workspace = true
-hashbrown.workspace = true
+commonware-cryptography.workspace = true
+
+# Other
 rand.workspace = true
+divan.workspace = true
 rstest.workspace = true
+hashbrown.workspace = true
 
 [package.metadata.cargo-udeps.ignore]
 development = ["divan"]

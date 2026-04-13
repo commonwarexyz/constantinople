@@ -16,38 +16,46 @@ default = []
 test-utils = [ "commonware-glue/test-utils", "constantinople-mempool/mocks" ]
 
 [dependencies]
-constantinople-application.workspace = true
+# Workspace
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
+constantinople-application.workspace = true
 
-commonware-broadcast.workspace = true
-commonware-coding.workspace = true
-commonware-codec.workspace = true
-commonware-consensus.workspace = true
-commonware-cryptography.workspace = true
-commonware-glue.workspace = true
-commonware-macros.workspace = true
-commonware-math.workspace = true
+# Commonware
 commonware-p2p.workspace = true
-commonware-parallel.workspace = true
-commonware-resolver.workspace = true
+commonware-glue.workspace = true
+commonware-math.workspace = true
+commonware-codec.workspace = true
+commonware-utils.workspace = true
+commonware-coding.workspace = true
+commonware-macros.workspace = true
 commonware-runtime.workspace = true
 commonware-storage.workspace = true
-commonware-utils.workspace = true
+commonware-parallel.workspace = true
+commonware-resolver.workspace = true
+commonware-broadcast.workspace = true
+commonware-consensus.workspace = true
+commonware-cryptography.workspace = true
 
+# Other
+rand.workspace = true
 bytes.workspace = true
 futures.workspace = true
-prometheus-client.workspace = true
-rand.workspace = true
+tracing.workspace = true
 rand_core.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
+prometheus-client.workspace = true
 
 [dev-dependencies]
+# Workspace
 constantinople-mempool = { workspace = true, features = ["mocks"] }
-commonware-cryptography.workspace = true
+
+# Commonware
 commonware-glue = { workspace = true, features = ["test-utils"] }
+commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
-commonware-math.workspace = true
+commonware-cryptography.workspace = true
+
+# Other
 tracing-subscriber.workspace = true

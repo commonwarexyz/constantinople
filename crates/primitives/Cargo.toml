@@ -12,24 +12,30 @@ homepage.workspace = true
 workspace = true
 
 [dependencies]
-bytes.workspace = true
-commonware-codec.workspace = true
-commonware-cryptography = { workspace = true, features = ["sha2-asm", "blake3-parallel"] }
-commonware-consensus.workspace = true
+# Commonware
 commonware-math.workspace = true
+commonware-codec.workspace = true
 commonware-utils.workspace = true
-derive_more = { workspace = true, features = ["full"] }
+commonware-consensus.workspace = true
+commonware-cryptography = { workspace = true, features = ["sha2-asm", "blake3-parallel"] }
+
+# Other
+bytes.workspace = true
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 rand_core.workspace = true
+derive_more = { workspace = true, features = ["full"] }
 
 [dev-dependencies]
-arbitrary = { workspace = true, features = ["derive"] }
+# Commonware
+commonware-math = { workspace = true, features = ["arbitrary"] }
 commonware-codec = { workspace = true, features = ["arbitrary"] }
+commonware-utils = { workspace = true, features = ["arbitrary"] }
 commonware-consensus = { workspace = true, features = ["arbitrary"] }
 commonware-cryptography = { workspace = true, features = ["arbitrary"] }
-commonware-math = { workspace = true, features = ["arbitrary"] }
-commonware-utils = { workspace = true, features = ["arbitrary"] }
+
+# Other
 rand.workspace = true
+arbitrary = { workspace = true, features = ["derive"] }
 
 [features]
 arbitrary = [

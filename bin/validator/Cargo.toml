@@ -13,33 +13,37 @@ publish = false
 workspace = true
 
 [dependencies]
+# Workspace
 constantinople-engine.workspace = true
-constantinople-application.workspace = true
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
-commonware-macros.workspace = true
+constantinople-application.workspace = true
 
+# Commonware
+commonware-p2p.workspace = true
+commonware-glue.workspace = true
 commonware-codec.workspace = true
+commonware-utils.workspace = true
+commonware-macros.workspace = true
+commonware-runtime.workspace = true
+commonware-deployer.workspace = true
+commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["sha2-asm"] }
-commonware-deployer.workspace = true
-commonware-glue.workspace = true
-commonware-p2p.workspace = true
-commonware-parallel.workspace = true
-commonware-runtime.workspace = true
-commonware-utils.workspace = true
 
+# Other
 axum.workspace = true
-bytes.workspace = true
 clap = { workspace = true, features = ["derive"] }
+bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
-serde_yaml.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
 rand_core.workspace = true
+serde_yaml.workspace = true
+tracing-subscriber.workspace = true
 
 [dev-dependencies]
+# Other
 tower = { workspace = true, features = ["util"] }
 
 [[bin]]

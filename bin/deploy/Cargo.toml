@@ -13,17 +13,19 @@ publish = false
 workspace = true
 
 [dependencies]
-commonware-codec.workspace = true
-commonware-cryptography.workspace = true
-commonware-deployer.workspace = true
+# Commonware
 commonware-math.workspace = true
+commonware-codec.workspace = true
 commonware-utils.workspace = true
-rand_core.workspace = true
+commonware-deployer.workspace = true
+commonware-cryptography.workspace = true
 
+# Other
 clap = { workspace = true, features = ["derive"] }
 serde = { workspace = true, features = ["derive"] }
-serde_yaml.workspace = true
 tracing.workspace = true
+rand_core.workspace = true
+serde_yaml.workspace = true
 tracing-subscriber.workspace = true
 
 [[bin]]
