@@ -1,6 +1,6 @@
 //! Transaction execution engine for simple transfers.
 
-use super::state::{State, Overlay};
+use super::state::{Overlay, State};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_primitives::{Account, Address, VerifiedTransaction};
 

@@ -64,7 +64,7 @@ rstest = "0.26.0"
 bytes = { version = "1.11.1", default-features = false }
 serde = { version = "1.0.228", default-features = false }
 arbitrary = { version = "1.4.2", features = ["derive"] }
-hashbrown = { version = "0.16.1", default-features = false }
+hashbrown = { version = "0.17.0", default-features = false }
 rand_core = "0.6.4"
 thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }

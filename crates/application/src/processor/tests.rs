@@ -89,8 +89,8 @@ fn propose_and_verify_match_for_transfer_batch() {
     ];
 
     let proposal = propose(&accounts, transactions);
-    let changeset = execute(&accounts, &proposal.valid)
-        .expect("valid proposal transactions should execute");
+    let changeset =
+        execute(&accounts, &proposal.valid).expect("valid proposal transactions should execute");
 
     assert_eq!(proposal.changeset, changeset);
     assert_eq!(
@@ -113,12 +113,9 @@ fn self_transfer_only_bumps_nonce() {
     let mut accounts = HashMap::new();
     accounts.insert(signer.address, account(9, 3));
 
-    let proposal = propose(
-        &accounts,
-        vec![signer.sign(signer.address, 4, 3)],
-    );
-    let changeset = execute(&accounts, &proposal.valid)
-        .expect("valid proposal transactions should execute");
+    let proposal = propose(&accounts, vec![signer.sign(signer.address, 4, 3)]);
+    let changeset =
+        execute(&accounts, &proposal.valid).expect("valid proposal transactions should execute");
     assert_eq!(
         changeset_account(&changeset, signer.address),
         Some(account(9, 4))
@@ -141,8 +138,8 @@ fn self_transfer_is_included_and_preserves_balance() {
         Some(account(12, 6))
     );
 
-    let changeset = execute(&accounts, &proposal.valid)
-        .expect("self-transfer should execute successfully");
+    let changeset =
+        execute(&accounts, &proposal.valid).expect("self-transfer should execute successfully");
     assert_eq!(
         changeset_account(&changeset, signer.address),
         Some(account(12, 6))
@@ -158,12 +155,9 @@ fn missing_recipient_starts_with_default_balance() {
     accounts.insert(signer.address, account(9, 0));
     accounts.insert(recipient.address, Account::default());
 
-    let proposal = propose(
-        &accounts,
-        vec![signer.sign(recipient.address, 4, 0)],
-    );
-    let changeset = execute(&accounts, &proposal.valid)
-        .expect("valid proposal transactions should execute");
+    let proposal = propose(&accounts, vec![signer.sign(recipient.address, 4, 0)]);
+    let changeset =
+        execute(&accounts, &proposal.valid).expect("valid proposal transactions should execute");
 
     assert_eq!(
         changeset_account(&changeset, recipient.address),

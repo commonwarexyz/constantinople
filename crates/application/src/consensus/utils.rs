@@ -1,5 +1,6 @@
 //! Utility functions for the application.
 
+use super::StateBatch;
 use crate::processor::state::State;
 use commonware_cryptography::{BatchVerifier, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -10,8 +11,6 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
 use std::collections::{HashMap, HashSet};
-
-use super::StateBatch;
 
 /// Maximum number of concurrent read tasks for state loading.
 const MAX_READ_TASKS: usize = 8;

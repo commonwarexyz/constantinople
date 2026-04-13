@@ -1,7 +1,7 @@
-# `commonware-docker`
+# `constantinople-docker`
 
 This directory contains the Docker build configuration used to compile Constantinople's deployable
-binaries for both AWS Graviton and Intel C8i.
+binaries for both AWS Graviton and Intel instances.
 
 ## Install Dependencies
 
@@ -18,7 +18,7 @@ just build-graviton-image
 
 This builds the ARM64 image for AWS Graviton (`linux/arm64`).
 
-To build the Intel image used for `c8i.4xlarge`, run:
+To build the Intel image, e.g. for `c8i` instances, run:
 
 ```sh
 just build-intel-image
@@ -33,14 +33,11 @@ validator to the requested target triple. This avoids running `rustc` inside an 
 
 #### Build Validator Binary
 
+To build the Graviton binary, run:
+
 ```sh
 just validator-graviton-binary
 ```
-
-This writes:
-
-* `deploy/validator`
-* `deploy/validator-debug`
 
 To build the Intel validator binary, run:
 
@@ -48,10 +45,10 @@ To build the Intel validator binary, run:
 just validator-intel-binary
 ```
 
-This writes:
+Either command writes:
 
-* `deploy/validator-intel`
-* `deploy/validator-intel-debug`
+* `deploy/validator`
+* `deploy/validator-debug`
 
 #### Troubleshooting
 

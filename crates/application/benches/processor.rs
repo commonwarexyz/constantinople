@@ -37,7 +37,13 @@ fn build_fixture(transaction_count: usize) -> (State, Vec<TestTransaction>) {
     for index in 0..transaction_count {
         let signer = TestSigner::new(index as u64);
         let recipient = address(index as u64);
-        accounts.insert(signer.address, Account { balance: 1, nonce: 0 });
+        accounts.insert(
+            signer.address,
+            Account {
+                balance: 1,
+                nonce: 0,
+            },
+        );
         accounts.insert(recipient, Account::default());
         transactions.push(signer.sign(recipient, 1, 0));
     }
