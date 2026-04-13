@@ -8,9 +8,14 @@
 //! - [`Signable`] — A convenience trait for types that are [`Sealable`],
 //!   providing a one-step `seal_and_sign` method.
 
-use crate::{Address, Sealable, Sealed, Transaction};
+use crate::{Address, Sealable, Sealed, SignedTransaction, Transaction, VerifiedTransaction};
 use commonware_codec::{EncodeSize, Error, Read, ReadExt, Write, types::lazy::Lazy};
-use commonware_cryptography::{Digest, Hasher, PublicKey, Signature, Signer, Verifier};
+use commonware_cryptography::{
+    BatchVerifier, Digest, Hasher, PublicKey, Signature, Signer, Verifier,
+};
+use commonware_parallel::Strategy;
+use rand::{SeedableRng, rngs::StdRng};
+use rand_core::CryptoRngCore;
 
 /// A [`Sealed`] object with an attached signature over its seal.
 #[derive(Debug, Clone)]
@@ -314,6 +319,91 @@ where
     }
 }
 
+/// Verifies a slice of signed transactions using batch verification.
+///
+/// Returns `true` if all signatures are valid, `false` if any sender or
+/// signature fails to decode or if batch verification fails.
+pub fn verify_transaction_batch<P, H, BV>(
+    namespace: &[u8],
+    rng: &mut impl CryptoRngCore,
+    transactions: &[SignedTransaction<P, H>],
+) -> bool
+where
+    P: PublicKey,
+    H: Hasher,
+    BV: BatchVerifier<PublicKey = P>,
+{
+    let mut verifier = BV::new();
+    for transaction in transactions {
+        // Decode the sender and signature inside the worker so
+        // decompression happens on the rayon pool instead of the
+        // runtime thread.
+        let Some(sender) = transaction.value().sender() else {
+            return false;
+        };
+        let Some(signature) = transaction.signature() else {
+            return false;
+        };
+        if !verifier.add(
+            namespace,
+            transaction.message_digest().as_ref(),
+            sender,
+            signature,
+        ) {
+            return false;
+        }
+    }
+    verifier.verify(rng)
+}
+
+/// Splits transactions into chunks, verifies each chunk in parallel using
+/// batch signature verification, and returns the verified transactions in
+/// their original order.
+///
+/// Returns `None` if any chunk contains an invalid signature.
+pub fn verify_transaction_chunks<P, H, BV, St>(
+    strategy: &St,
+    namespace: &'static [u8],
+    rng: &mut impl CryptoRngCore,
+    transactions: Vec<SignedTransaction<P, H>>,
+) -> Option<Vec<VerifiedTransaction<P, H>>>
+where
+    P: PublicKey,
+    H: Hasher,
+    BV: BatchVerifier<PublicKey = P>,
+    St: Strategy,
+{
+    if transactions.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let chunk_count = strategy.parallelism_hint().min(transactions.len());
+    let chunk_size = transactions.len().div_ceil(chunk_count);
+
+    let mut remaining = transactions;
+    let mut chunks = Vec::with_capacity(chunk_count);
+    while !remaining.is_empty() {
+        let split_at = chunk_size.min(remaining.len());
+        let rest = remaining.split_off(split_at);
+        let mut rng_seed = [0u8; 32];
+        rng.fill_bytes(&mut rng_seed);
+        chunks.push((rng_seed, remaining));
+        remaining = rest;
+    }
+
+    let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
+        let mut chunk_rng = StdRng::from_seed(rng_seed);
+        verify_transaction_batch::<P, H, BV>(namespace, &mut chunk_rng, &chunk)
+            .then(|| chunk.into_iter().map(Into::into).collect::<Vec<_>>())
+    });
+
+    let mut verified = Vec::new();
+    for chunk in verified_chunks {
+        verified.extend(chunk?);
+    }
+    Some(verified)
+}
+
 #[cfg(test)]
 mod test {
     use crate::{Address, Sealable, Sealed, Transaction, signed::Signable};
@@ -321,8 +411,8 @@ mod test {
         Digest, Hasher, Signer, Verifier, blake3, ed25519, secp256r1::recoverable,
     };
     use commonware_math::algebra::Random;
+    use commonware_utils::test_rng;
     use core::num::NonZeroU64;
-    use rand::rngs::OsRng;
 
     const NAMESPACE: &[u8] = b"test namespace";
 
@@ -344,7 +434,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_ed25519() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = ed25519::PrivateKey::random(&mut OsRng);
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -375,7 +465,7 @@ mod test {
     #[test]
     fn wrong_namespace_fails_verification() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = ed25519::PrivateKey::random(&mut OsRng);
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(!signed.verify(b"wrong namespace", &private_key.public_key()));
@@ -393,7 +483,7 @@ mod test {
     #[test]
     fn verified_caches_signer_address() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = ed25519::PrivateKey::random(&mut OsRng);
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let public_key = private_key.public_key();
         let verified = Transaction::new(
             public_key.clone(),
@@ -420,8 +510,8 @@ mod test {
     #[should_panic(expected = "transaction sender must match signer public key")]
     fn seal_and_sign_verified_rejects_mismatched_sender() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = ed25519::PrivateKey::random(&mut OsRng);
-        let wrong_key = ed25519::PrivateKey::random(&mut OsRng);
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let wrong_key = ed25519::PrivateKey::random(&mut test_rng());
 
         let _ = Transaction::new(
             wrong_key.public_key(),

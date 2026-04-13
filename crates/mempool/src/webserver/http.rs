@@ -5,9 +5,8 @@ use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post}
 use commonware_codec::{Decode, EncodeSize, RangeCfg};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{SignedTransaction, VerifiedTransaction};
-use rand::{SeedableRng, rngs::StdRng};
-use rand_core::{OsRng, RngCore};
+use constantinople_primitives::{SignedTransaction, verify_transaction_chunks};
+use rand_core::OsRng;
 use std::sync::Arc;
 
 /// Shared state for HTTP handlers.
@@ -40,7 +39,8 @@ where
         .with_state(state)
 }
 
-/// Accepts a batch of signed transactions as concatenated commonware-codec bytes.
+/// Accepts a batch of signed transactions as a commonware-codec length-prefixed
+/// vector.
 ///
 /// Signatures are verified in parallel using the configured [`Strategy`] and
 /// [`BatchVerifier`]. Blocks until the batch is finalized in a block or dropped.
@@ -78,7 +78,7 @@ where
     let strategy = state.strategy.clone();
     let namespace = state.namespace;
     let verified = match tokio::task::spawn_blocking(move || {
-        verify_batch::<P, H, BV, St>(&strategy, namespace, signed)
+        verify_transaction_chunks::<P, H, BV, _>(&strategy, namespace, &mut OsRng, signed)
     })
     .await
     {
@@ -101,80 +101,4 @@ where
             )
         },
     )
-}
-
-/// Splits transactions into chunks, verifies each chunk in parallel using
-/// batch signature verification, and returns the verified transactions in
-/// their original order.
-fn verify_batch<P, H, BV, St>(
-    strategy: &St,
-    namespace: &'static [u8],
-    transactions: Vec<SignedTransaction<P, H>>,
-) -> Option<Vec<VerifiedTransaction<P, H>>>
-where
-    P: PublicKey,
-    H: Hasher,
-    BV: BatchVerifier<PublicKey = P>,
-    St: Strategy,
-{
-    if transactions.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let chunk_count = strategy.parallelism_hint().min(transactions.len());
-    let chunk_size = transactions.len().div_ceil(chunk_count);
-
-    let mut remaining = transactions;
-    let mut chunks = Vec::with_capacity(chunk_count);
-    while !remaining.is_empty() {
-        let split_at = chunk_size.min(remaining.len());
-        let rest = remaining.split_off(split_at);
-        let mut rng_seed = [0u8; 32];
-        OsRng.fill_bytes(&mut rng_seed);
-        chunks.push((rng_seed, remaining));
-        remaining = rest;
-    }
-
-    let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
-        let mut rng = StdRng::from_seed(rng_seed);
-        verify_chunk::<P, H, BV>(namespace, &mut rng, &chunk)
-            .then(|| chunk.into_iter().map(Into::into).collect::<Vec<_>>())
-    });
-
-    let mut verified = Vec::new();
-    for chunk in verified_chunks {
-        verified.extend(chunk?);
-    }
-    Some(verified)
-}
-
-/// Verifies all signatures in a chunk using batch verification.
-fn verify_chunk<P, H, BV>(
-    namespace: &[u8],
-    rng: &mut impl rand_core::CryptoRngCore,
-    transactions: &[SignedTransaction<P, H>],
-) -> bool
-where
-    P: PublicKey,
-    H: Hasher,
-    BV: BatchVerifier<PublicKey = P>,
-{
-    let mut verifier = BV::new();
-    for transaction in transactions {
-        let Some(sender) = transaction.value().sender() else {
-            return false;
-        };
-        let Some(signature) = transaction.signature() else {
-            return false;
-        };
-        if !verifier.add(
-            namespace,
-            transaction.message_digest().as_ref(),
-            sender,
-            signature,
-        ) {
-            return false;
-        }
-    }
-    verifier.verify(rng)
 }

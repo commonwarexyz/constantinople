@@ -922,6 +922,7 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-math",
+ "commonware-parallel",
  "commonware-utils",
  "derive_more",
  "rand 0.8.5",

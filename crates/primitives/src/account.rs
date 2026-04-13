@@ -150,7 +150,6 @@ mod tests {
     use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
     use commonware_math::algebra::Random;
     use commonware_utils::test_rng;
-    use rand::rngs::OsRng;
 
     #[test]
     fn address_display() {
@@ -161,7 +160,7 @@ mod tests {
 
     #[test]
     fn address_codec_roundtrip() {
-        let address = Address::random(&mut OsRng);
+        let address = Address::random(&mut test_rng());
 
         let mut buf = Vec::with_capacity(Address::SIZE);
         address.write(&mut buf);

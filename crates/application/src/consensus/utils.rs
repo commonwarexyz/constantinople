@@ -2,14 +2,11 @@
 
 use super::StateBatch;
 use crate::processor::state::State;
-use commonware_cryptography::{BatchVerifier, Hasher, PublicKey};
-use commonware_parallel::Strategy;
+use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
-use constantinople_primitives::{SignedTransaction, VerifiedTransaction};
+use constantinople_primitives::VerifiedTransaction;
 use futures::{StreamExt, stream::FuturesUnordered};
-use rand::{SeedableRng, rngs::StdRng};
-use rand_core::CryptoRngCore;
 use std::collections::{HashMap, HashSet};
 
 /// Maximum number of concurrent read tasks for state loading.
@@ -68,92 +65,14 @@ where
     Ok(accounts)
 }
 
-/// Verifies a batch of signed transactions.
-pub(super) fn verify_transaction_batch<P, H, B>(
-    namespace: &[u8],
-    rng: &mut impl CryptoRngCore,
-    transactions: &[SignedTransaction<P, H>],
-) -> bool
-where
-    P: PublicKey,
-    H: Hasher,
-    B: BatchVerifier<PublicKey = P>,
-{
-    let mut batch_verifier = B::new();
-    for transaction in transactions {
-        // Decode the sender and signature inside the worker so decompression
-        // happens on the rayon pool instead of the runtime thread.
-        let Some(sender) = transaction.value().sender() else {
-            return false;
-        };
-        let Some(signature) = transaction.signature() else {
-            return false;
-        };
-
-        if !batch_verifier.add(
-            namespace,
-            transaction.message_digest().as_ref(),
-            sender,
-            signature,
-        ) {
-            return false;
-        }
-    }
-
-    batch_verifier.verify(rng)
-}
-
-/// Verifies transactions across strategy partitions and preserves block order.
-pub(super) fn verify_transaction_chunks<P, H, B, St>(
-    strategy: &St,
-    namespace: &'static [u8],
-    rng: &mut impl CryptoRngCore,
-    transactions: Vec<SignedTransaction<P, H>>,
-) -> Option<Vec<VerifiedTransaction<P, H>>>
-where
-    P: PublicKey,
-    H: Hasher,
-    B: BatchVerifier<PublicKey = P>,
-    St: Strategy,
-{
-    if transactions.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let chunk_count = strategy.parallelism_hint().min(transactions.len());
-    let chunk_size = transactions.len().div_ceil(chunk_count);
-
-    let mut remaining = transactions;
-    let mut chunks = Vec::with_capacity(chunk_count);
-    while !remaining.is_empty() {
-        let split_at = chunk_size.min(remaining.len());
-        let rest = remaining.split_off(split_at);
-        let mut rng_seed = [0; 32];
-        rng.fill_bytes(&mut rng_seed);
-        chunks.push((rng_seed, remaining));
-        remaining = rest;
-    }
-
-    let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
-        let mut chunk_rng = StdRng::from_seed(rng_seed);
-        verify_transaction_batch::<P, H, B>(namespace, &mut chunk_rng, &chunk)
-            .then(|| chunk.into_iter().map(Into::into).collect::<Vec<_>>())
-    });
-
-    let mut verified = Vec::new();
-    for chunk in verified_chunks {
-        verified.extend(chunk?);
-    }
-    Some(verified)
-}
-
 #[cfg(test)]
 mod tests {
-    use super::verify_transaction_chunks;
     use commonware_codec::{DecodeExt, Encode, FixedSize};
     use commonware_cryptography::{Signer as _, blake3, ed25519};
     use commonware_parallel::Rayon;
-    use constantinople_primitives::{Address, Signable, SignedTransaction, Transaction};
+    use constantinople_primitives::{
+        Address, Signable, SignedTransaction, Transaction, verify_transaction_chunks,
+    };
     use core::num::{NonZeroU64, NonZeroUsize};
     use rand::{SeedableRng, rngs::StdRng};
 

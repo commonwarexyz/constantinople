@@ -16,11 +16,13 @@ workspace = true
 commonware-math.workspace = true
 commonware-codec.workspace = true
 commonware-utils.workspace = true
+commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["sha2-asm", "blake3-parallel"] }
 
 # Other
 bytes.workspace = true
+rand.workspace = true
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 rand_core.workspace = true
 derive_more = { workspace = true, features = ["full"] }

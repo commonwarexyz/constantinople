@@ -61,7 +61,7 @@ use tracing::{info, warn};
 
 mod utils;
 pub use utils::load_state;
-use utils::{verify_transaction_batch, verify_transaction_chunks};
+use constantinople_primitives::{verify_transaction_batch, verify_transaction_chunks};
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
 ///
