@@ -14,6 +14,7 @@ use constantinople_primitives::VerifiedTransaction;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
+    fmt::Display,
     hash::Hash,
     sync::Arc,
 };
@@ -21,11 +22,20 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 /// Outcome of a submitted batch, delivered when the result is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxStatus {
     /// The batch's block was finalized.
     Finalized { height: u64 },
+    /// The batch's block was finalized, but some transactions were filtered.
+    ///
+    /// The `included` and `filtered` digests are hex-encoded transaction
+    /// message digests in the original batch order.
+    PartiallyFinalized {
+        height: u64,
+        included: Vec<String>,
+        filtered: Vec<String>,
+    },
     /// The batch was proposed but its block was not finalized.
     Dropped,
 }
@@ -58,8 +68,42 @@ struct PoolEntry<P: PublicKey, H: Hasher> {
 /// A set of batches that were proposed together at a given height.
 struct Proposed<H: Hasher> {
     height: u64,
-    digests: HashSet<H::Digest>,
+    digests: Vec<H::Digest>,
     waiters: Vec<oneshot::Sender<TxStatus>>,
+}
+
+fn status_for_finalized_block<D>(
+    height: u64,
+    digests: &[D],
+    finalized: &HashSet<D>,
+) -> Option<TxStatus>
+where
+    D: Copy + Display + Eq + Hash,
+{
+    let mut included = Vec::new();
+    let mut filtered = Vec::new();
+
+    for digest in digests {
+        if finalized.contains(digest) {
+            included.push(digest.to_string());
+        } else {
+            filtered.push(digest.to_string());
+        }
+    }
+
+    if included.is_empty() {
+        return None;
+    }
+
+    if filtered.is_empty() {
+        return Some(TxStatus::Finalized { height });
+    }
+
+    Some(TxStatus::PartiallyFinalized {
+        height,
+        included,
+        filtered,
+    })
 }
 
 /// The mempool actor.
@@ -178,7 +222,7 @@ where
                 Message::Propose { height, response } => {
                     let mut batch_txs = Vec::new();
                     let mut batch_bytes = 0;
-                    let mut batch_digests = HashSet::new();
+                    let mut batch_digests = Vec::new();
                     let mut batch_waiters = Vec::new();
 
                     while let Some(entry) = pool.front() {
@@ -191,7 +235,7 @@ where
                         pool_bytes -= entry.total_bytes;
                         batch_bytes += entry.total_bytes;
                         for tx in &entry.transactions {
-                            batch_digests.insert(*tx.message_digest());
+                            batch_digests.push(*tx.message_digest());
                         }
                         batch_txs.extend(entry.transactions);
                         batch_waiters.push(entry.waiter);
@@ -213,9 +257,11 @@ where
 
                     let mut remaining = VecDeque::new();
                     for mut batch in proposed.drain(..) {
-                        if batch.digests.iter().any(|d| finalized.contains(d)) {
+                        if let Some(status) =
+                            status_for_finalized_block(height, &batch.digests, &finalized)
+                        {
                             for waiter in batch.waiters.drain(..) {
-                                let _ = waiter.send(TxStatus::Finalized { height });
+                                let _ = waiter.send(status.clone());
                             }
                         } else if height >= batch.height + drop_grace_blocks {
                             for waiter in batch.waiters.drain(..) {
@@ -233,5 +279,48 @@ where
             }
         }
         warn!("mempool actor stopped: all senders dropped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{TxStatus, status_for_finalized_block};
+    use commonware_cryptography::blake3;
+    use commonware_math::algebra::Random;
+    use rand::{SeedableRng, rngs::StdRng};
+    use std::collections::HashSet;
+
+    #[test]
+    fn partial_finalization_reports_filtered_digests() {
+        let mut rng = StdRng::from_seed([7; 32]);
+        let first = blake3::Digest::random(&mut rng);
+        let second = blake3::Digest::random(&mut rng);
+        let third = blake3::Digest::random(&mut rng);
+        let digests = vec![first, second, third];
+        let finalized = HashSet::from([first, third]);
+
+        let status = status_for_finalized_block(42, &digests, &finalized);
+
+        assert_eq!(
+            status,
+            Some(TxStatus::PartiallyFinalized {
+                height: 42,
+                included: vec![first.to_string(), third.to_string()],
+                filtered: vec![second.to_string()],
+            }),
+        );
+    }
+
+    #[test]
+    fn finalized_status_requires_full_inclusion() {
+        let mut rng = StdRng::from_seed([9; 32]);
+        let first = blake3::Digest::random(&mut rng);
+        let second = blake3::Digest::random(&mut rng);
+        let digests = vec![first, second];
+        let finalized = HashSet::from([first, second]);
+
+        let status = status_for_finalized_block(11, &digests, &finalized);
+
+        assert_eq!(status, Some(TxStatus::Finalized { height: 11 }));
     }
 }

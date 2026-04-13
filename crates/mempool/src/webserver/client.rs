@@ -59,7 +59,8 @@ impl Client {
     /// Submits a batch of signed transactions and waits for the result.
     ///
     /// The batch is encoded as a commonware-codec length-prefixed vector.
-    /// The call blocks until the server reports finalization or drop.
+    /// The call blocks until the server reports full finalization, partial
+    /// finalization, or drop.
     pub async fn submit<P, H>(
         &self,
         transactions: &[SignedTransaction<P, H>],

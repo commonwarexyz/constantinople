@@ -65,8 +65,8 @@ where
     /// Non-blocking batch submission for HTTP handlers.
     ///
     /// On success, returns a receiver that resolves with the batch outcome
-    /// once its block is finalized or dropped. Returns `None` if the channel
-    /// is full.
+    /// once its block is fully finalized, partially finalized, or dropped.
+    /// Returns `None` if the channel is full.
     pub fn try_submit(
         &self,
         transactions: Vec<VerifiedTransaction<P, H>>,

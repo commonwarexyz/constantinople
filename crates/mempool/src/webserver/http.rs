@@ -1,13 +1,31 @@
 //! HTTP handlers for the mempool webserver.
 
 use super::Mailbox;
-use axum::{Router, body::Bytes, extract::State, http::StatusCode, routing::post};
-use commonware_codec::{Decode, EncodeSize, RangeCfg};
+use axum::{
+    Router,
+    body::Bytes,
+    extract::{DefaultBodyLimit, State},
+    http::StatusCode,
+    routing::post,
+};
+use commonware_codec::{Decode, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{SignedTransaction, verify_transaction_chunks};
+use constantinople_primitives::{Address, SignedTransaction, verify_transaction_chunks};
 use rand_core::OsRng;
 use std::sync::Arc;
+
+/// Maximum bytes needed to encode the batch-length prefix.
+///
+/// `commonware-codec` encodes `Vec` lengths as `u32` varints, which fit in at
+/// most 5 bytes.
+const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
+
+/// Minimum bytes needed to encode the batch-length prefix.
+const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
+
+/// Minimum bytes needed to encode a `u64` varint.
+const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, St>
@@ -34,16 +52,40 @@ where
     BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
     St: Strategy + Send + Sync + 'static,
 {
+    let max_request_bytes = max_request_bytes(state.max_batch_bytes);
+
     Router::new()
         .route("/transactions", post(submit_batch::<C, P, H, BV, St>))
+        .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
+}
+
+fn max_request_bytes(max_batch_bytes: usize) -> usize {
+    max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
+}
+
+fn min_signed_transaction_bytes<P>() -> usize
+where
+    P: PublicKey,
+{
+    P::SIZE + Address::SIZE + MIN_U64_VARINT_BYTES + MIN_U64_VARINT_BYTES + P::Signature::SIZE
+}
+
+fn max_transaction_count<P>(body_len: usize) -> Option<usize>
+where
+    P: PublicKey,
+{
+    let payload_len = body_len.saturating_sub(MIN_BATCH_LENGTH_PREFIX_BYTES);
+    let max_transactions = payload_len / min_signed_transaction_bytes::<P>();
+    (max_transactions > 0).then_some(max_transactions)
 }
 
 /// Accepts a batch of signed transactions as a commonware-codec length-prefixed
 /// vector.
 ///
 /// Signatures are verified in parallel using the configured [`Strategy`] and
-/// [`BatchVerifier`]. Blocks until the batch is finalized in a block or dropped.
+/// [`BatchVerifier`]. Blocks until the batch is fully finalized, partially
+/// finalized, or dropped.
 ///
 /// Returns:
 /// - `200 OK` with JSON status on finalization or drop.
@@ -62,8 +104,15 @@ where
     BV: BatchVerifier<PublicKey = P> + Send + 'static,
     St: Strategy,
 {
+    if body.len() > max_request_bytes(state.max_batch_bytes) {
+        return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
+    }
+
     // Phase 1: Decode the length-prefixed transaction vector (sequential, fast).
-    let cfg = (RangeCfg::new(1..=usize::MAX), ());
+    let Some(max_transactions) = max_transaction_count::<P>(body.len()) else {
+        return (StatusCode::BAD_REQUEST, String::new());
+    };
+    let cfg = (RangeCfg::new(1..=max_transactions), ());
     let signed = match Vec::<SignedTransaction<P, H>>::decode_cfg(body.as_ref(), &cfg) {
         Ok(txs) => txs,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
@@ -101,4 +150,67 @@ where
             )
         },
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AppState, router};
+    use axum::{
+        body::Body,
+        http::{Request, StatusCode},
+    };
+    use commonware_codec::Encode;
+    use commonware_cryptography::{blake3, ed25519};
+    use commonware_parallel::Sequential;
+    use futures::executor::block_on;
+    use std::{
+        panic::{AssertUnwindSafe, catch_unwind},
+        sync::Arc,
+    };
+    use tokio::sync::mpsc;
+    use tower::ServiceExt;
+
+    fn test_router(max_batch_bytes: usize) -> axum::Router {
+        let (sender, _receiver) = mpsc::channel(1);
+        let state = Arc::new(AppState {
+            mailbox: super::super::mailbox::Mailbox::new(sender),
+            namespace: b"mempool-http-test",
+            max_batch_bytes,
+            strategy: Sequential,
+        });
+
+        router::<blake3::Digest, ed25519::PublicKey, blake3::Blake3, ed25519::Batch, Sequential>(
+            state,
+        )
+    }
+
+    #[test]
+    fn router_accepts_requests_above_axum_default_limit() {
+        let app = test_router(4 * 1024 * 1024);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/transactions")
+            .body(Body::from(vec![0u8; 2 * 1024 * 1024 + 1]))
+            .expect("request should build");
+
+        let response = block_on(app.oneshot(request)).expect("router should return a response");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn router_rejects_malformed_length_prefix_without_panicking() {
+        let app = test_router(4 * 1024 * 1024);
+        let request = Request::builder()
+            .method("POST")
+            .uri("/transactions")
+            .body(Body::from(u32::MAX.encode()))
+            .expect("request should build");
+
+        let result = catch_unwind(AssertUnwindSafe(|| block_on(app.oneshot(request))));
+
+        let response = result.expect("malformed prefixes must not panic");
+        let response = response.expect("router should return a response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }
