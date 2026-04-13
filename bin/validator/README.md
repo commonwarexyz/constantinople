@@ -1,3 +1,3 @@
-# `constantinople-engine`
+# `constantinople-validator`
 
-Blockchain engine for commonware-constantinople
+Validator binary for the constantinople blockchain.
