@@ -166,7 +166,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let app_state = Arc::new(webserver::AppState {
             mailbox: mempool_mailbox.clone(),
-            namespace: b"constantinople-tx",
+            namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
         });
         let app = webserver::router(app_state);
         let listener = tokio::net::TcpListener::bind(http_listen)
@@ -203,7 +203,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     startup,
                     sync_config: production_sync_config(),
                     genesis_leader: decoded.genesis_leader,
-                    transaction_namespace: b"constantinople-tx",
+                    transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
                     bootstrapper: bootstrapper_mailbox.clone(),
                 },
