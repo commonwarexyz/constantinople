@@ -488,14 +488,15 @@ fn run_total_shutdown(engine: TestEngineDefinition) {
 
     PlanBuilder::new(engine)
         .link(default_link())
-        .seeds(0..2)
+        .seeds(0..3)
         .crash(Crash::Random {
-            frequency: Duration::from_secs(3),
+            frequency: Duration::from_secs(5),
             downtime: Duration::from_millis(300),
             count,
         })
-        .exit_condition(FinalizedHeightAtLeast::new(80))
-        .property(BlockAgreementAtHeight::new(80))
+        .timeout(Duration::from_secs(90))
+        .exit_condition(FinalizedHeightAtLeast::new(100))
+        .property(BlockAgreementAtHeight::new(100))
         .run()
         .unwrap();
 }
