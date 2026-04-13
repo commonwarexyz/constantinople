@@ -162,13 +162,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 mailbox_size: 65536,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: 3,
+                strategy: strategy.clone(),
             },
         );
         let listener = tokio::net::TcpListener::bind(http_listen)
             .await
             .expect("failed to bind mempool HTTP listener");
         info!(%http_listen, "mempool webserver listening");
-        let mempool_handle = mempool_actor.start(listener);
+        let mempool_handle = mempool_actor.start::<Batch>(listener);
 
         let startup =
             resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;

@@ -17,6 +17,7 @@ constantinople-primitives.workspace = true
 
 # Commonware
 commonware-codec.workspace = true
+commonware-parallel.workspace = true
 commonware-runtime.workspace = true
 commonware-utils.workspace = true
 commonware-consensus.workspace = true
@@ -25,6 +26,8 @@ commonware-cryptography.workspace = true
 # Other
 axum.workspace = true
 bytes.workspace = true
+rand.workspace = true
+rand_core.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 tracing.workspace = true

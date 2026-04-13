@@ -6,7 +6,8 @@
 
 use super::{Mailbox, http, mailbox::Message};
 use commonware_consensus::marshal::Update;
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
+use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::VerifiedTransaction;
@@ -30,7 +31,7 @@ pub enum TxStatus {
 }
 
 /// Mempool actor configuration.
-pub struct Config {
+pub struct Config<St: Strategy> {
     /// Maximum total bytes the pool will hold.
     pub max_pool_bytes: usize,
     /// Maximum bytes returned in a single `propose` call, and the
@@ -43,6 +44,8 @@ pub struct Config {
     /// Number of finalized blocks to wait before marking a proposed
     /// batch as [`TxStatus::Dropped`].
     pub drop_grace_blocks: u64,
+    /// Parallel execution strategy for batch signature verification.
+    pub strategy: St,
 }
 
 /// A batch of transactions waiting in the pool.
@@ -63,12 +66,13 @@ struct Proposed<H: Hasher> {
 ///
 /// Create via [`Actor::new`], which returns `(Actor, Mailbox)`. Call
 /// [`Actor::start`] to spawn the event loop and HTTP server on the runtime.
-pub struct Actor<E, C, P, H>
+pub struct Actor<E, C, P, H, St>
 where
     E: Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    St: Strategy,
 {
     context: ContextCell<E>,
     mailbox: Mailbox<C, P, H>,
@@ -79,18 +83,20 @@ where
     max_propose_bytes: usize,
     namespace: &'static [u8],
     drop_grace_blocks: u64,
+    strategy: St,
 }
 
-impl<E, C, P, H> Actor<E, C, P, H>
+impl<E, C, P, H, St> Actor<E, C, P, H, St>
 where
     E: Spawner + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
     H::Digest: Hash,
+    St: Strategy,
 {
     /// Creates a new mempool actor and its control [`Mailbox`].
-    pub fn new(context: E, config: Config) -> (Self, Mailbox<C, P, H>) {
+    pub fn new(context: E, config: Config<St>) -> (Self, Mailbox<C, P, H>) {
         let (tx, rx) = mpsc::channel(config.mailbox_size);
         let mailbox = Mailbox::new(tx);
         (
@@ -104,17 +110,27 @@ where
                 max_propose_bytes: config.max_propose_bytes,
                 namespace: config.namespace,
                 drop_grace_blocks: config.drop_grace_blocks,
+                strategy: config.strategy,
             },
             mailbox,
         )
     }
 
     /// Spawns the actor event loop and HTTP server on the runtime.
-    pub fn start(mut self, listener: tokio::net::TcpListener) -> Handle<()> {
-        spawn_cell!(self.context, self.run(listener).await)
+    ///
+    /// The `BV` type parameter selects the batch signature verifier used
+    /// by the HTTP handlers (e.g., `ed25519::Batch`).
+    pub fn start<BV>(mut self, listener: tokio::net::TcpListener) -> Handle<()>
+    where
+        BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+    {
+        spawn_cell!(self.context, self.run::<BV>(listener).await)
     }
 
-    async fn run(self, listener: tokio::net::TcpListener) {
+    async fn run<BV>(self, listener: tokio::net::TcpListener)
+    where
+        BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+    {
         let Self {
             context,
             mailbox,
@@ -125,14 +141,16 @@ where
             max_propose_bytes,
             namespace,
             drop_grace_blocks,
+            strategy,
         } = self;
 
         let app_state = Arc::new(http::AppState {
             mailbox,
             namespace,
             max_batch_bytes: max_propose_bytes,
+            strategy,
         });
-        let app = http::router(app_state);
+        let app = http::router::<C, P, H, BV, St>(app_state);
         let _http_handle = context.as_present().with_label("http").spawn(|_| async {
             let _ = axum::serve(listener, app).await;
         });
