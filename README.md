@@ -1,5 +1,5 @@
 <h1 align="center">
-  <img src="./assets/banner.png" alt="Constantinople" width="100%" align="center">
+  <img src="./assets/banner.png" alt="Constantinople" width="35%" align="center">
 </h1>
 
 <h4 align="center">
