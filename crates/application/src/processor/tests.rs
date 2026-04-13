@@ -3,9 +3,9 @@
 use super::executor::{ProposalOutput, execute, propose};
 use commonware_cryptography::{Signer, blake3, ed25519};
 use commonware_math::algebra::Random;
+use commonware_utils::test_rng;
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
-use rand::rngs::OsRng;
 use std::collections::HashMap;
 
 const NAMESPACE: &[u8] = b"processor-test";
@@ -22,7 +22,7 @@ struct TestSigner {
 
 impl TestSigner {
     fn new() -> Self {
-        let key = ed25519::PrivateKey::random(&mut OsRng);
+        let key = ed25519::PrivateKey::random(&mut test_rng());
         let address = Address::from_public_key(&mut TestHasher::default(), &key.public_key());
         Self { key, address }
     }

@@ -19,4 +19,6 @@ pub use actor::{Actor, Config, TxStatus};
 mod mailbox;
 pub use mailbox::Mailbox;
 
+pub mod client;
+
 mod http;

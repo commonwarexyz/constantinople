@@ -443,7 +443,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_secp256r1() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = recoverable::PrivateKey::random(&mut OsRng);
+        let private_key = recoverable::PrivateKey::random(&mut test_rng());
         let signed = MockValue([5, 6, 7, 8]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -452,7 +452,7 @@ mod test {
     #[test]
     fn signed_into_inner_returns_sealed() {
         let hasher = &mut blake3::Blake3::default();
-        let private_key = ed25519::PrivateKey::random(&mut OsRng);
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let signed = MockValue([9, 10, 11, 12]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         let seal = *signed.message_digest();

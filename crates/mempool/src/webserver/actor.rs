@@ -11,7 +11,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::VerifiedTransaction;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     hash::Hash,
@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 /// Outcome of a submitted batch, delivered when the result is known.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxStatus {
     /// The batch's block was finalized.
