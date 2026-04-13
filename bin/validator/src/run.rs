@@ -1,9 +1,6 @@
 //! Starts a validator from a YAML config.
 
-use crate::{
-    config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config},
-    tx_gen::TransactionGenerator,
-};
+use crate::config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config};
 use commonware_codec::Encode;
 use commonware_consensus::simplex::elector::RoundRobin;
 use commonware_cryptography::{
@@ -24,10 +21,13 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     VOTE_CHANNEL, bootstrapper,
 };
-use std::{future::Future, path::PathBuf, time::Duration};
+use constantinople_mempool::webserver;
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 use tracing::info;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
+const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
+const MAX_PROPOSE_BYTES: usize = 4 * 1024 * 1024;
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
     let loaded = load_local_config(&peers_path, &config_path);
@@ -154,12 +154,23 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
 
-        let (tx_gen, tx_gen_mailbox) = TransactionGenerator::<_, _, ed25519::PrivateKey, _, _>::new(
-            context.with_label("tx_gen"),
-            8192,
-            strategy.clone(),
-        );
-        let tx_gen_handle = tx_gen.start();
+        let (mempool_actor, mempool_mailbox) = webserver::Actor::new(webserver::Config {
+            max_pool_bytes: MAX_POOL_BYTES,
+            max_propose_bytes: MAX_PROPOSE_BYTES,
+            mailbox_size: 65536,
+        });
+        let mempool_handle = mempool_actor.start();
+
+        let app_state = Arc::new(webserver::AppState {
+            mailbox: mempool_mailbox.clone(),
+            namespace: b"constantinople-tx",
+        });
+        let app = webserver::router(app_state);
+        let listener = tokio::net::TcpListener::bind(http_listen)
+            .await
+            .expect("failed to bind mempool HTTP listener");
+        info!(%http_listen, "mempool webserver listening");
+        let http_handle = tokio::spawn(axum::serve(listener, app).into_future());
 
         let startup =
             resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;
@@ -180,7 +191,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     namespace: b"constantinople".to_vec(),
                     output: decoded.dkg_output,
                     share: Some(decoded.share),
-                    input: tx_gen_mailbox.clone(),
+                    input: mempool_mailbox.clone(),
                     partition_prefix: decoded.partition_prefix,
                     freezer_table_initial_size: 1024,
                     strategy,
@@ -195,12 +206,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .await;
 
         info!("starting engine");
-        let engine_handle = engine.start(channels, Some(tx_gen_mailbox));
+        let engine_handle = engine.start(channels, Some(mempool_mailbox));
 
         tokio::select! {
             _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),
             _ = engine_handle => tracing::warn!("engine exited"),
-            _ = tx_gen_handle => tracing::warn!("tx gen exited"),
+            _ = mempool_handle => tracing::warn!("mempool actor exited"),
+            _ = http_handle => tracing::warn!("mempool http server exited"),
             _ = network_handle => tracing::warn!("network exited"),
         }
     });
