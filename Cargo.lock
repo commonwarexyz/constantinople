@@ -932,6 +932,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-spammer"
+version = "0.0.0"
+dependencies = [
+ "clap",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-deployer",
+ "commonware-parallel",
+ "commonware-runtime",
+ "commonware-utils",
+ "constantinople-mempool",
+ "constantinople-primitives",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "constantinople-validator"
 version = "0.0.0"
 dependencies = [

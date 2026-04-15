@@ -10,6 +10,17 @@ validator-graviton-binary: build-graviton-image
     -e OUTPUT_NAME=validator \
     constantinople-builder:graviton-local
 
+# Build the ARM64 spammer binary into deploy/
+spammer-graviton-binary: build-graviton-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-spammer \
+    -e BINARY_NAME=constantinople-spammer \
+    -e OUTPUT_NAME=spammer \
+    constantinople-builder:graviton-local
+
+# Build all ARM64 binaries into deploy/
+graviton-binaries: validator-graviton-binary spammer-graviton-binary
+
 # Build the Intel/C8i Docker builder image
 build-intel-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl intel
@@ -21,3 +32,14 @@ validator-intel-binary: build-intel-image
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
     constantinople-builder:intel-local
+
+# Build the Intel spammer binary into deploy/
+spammer-intel-binary: build-intel-image
+  docker run --rm -v ${PWD}:/constantinople \
+    -e PACKAGE_NAME=constantinople-spammer \
+    -e BINARY_NAME=constantinople-spammer \
+    -e OUTPUT_NAME=spammer \
+    constantinople-builder:intel-local
+
+# Build all Intel binaries into deploy/
+intel-binaries: validator-intel-binary spammer-intel-binary

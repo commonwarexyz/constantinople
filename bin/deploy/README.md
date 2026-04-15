@@ -42,6 +42,34 @@ cargo run --bin constantinople -- --config ./local/validator-2.yaml --peers ./lo
 cargo run --bin constantinople -- --config ./local/validator-3.yaml --peers ./local/peers.yaml
 ```
 
+### Local Deployment with Spammer
+
+Add `--spammer` to include a spam bot in the `mprocs` command:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --output-dir ./local \
+  --spammer \
+  --spammer-accounts 10 \
+  --spammer-value 1 \
+  local \
+  --base-port 3000 \
+  --base-http-port 8080
+```
+
+The spammer waits 10 seconds for validators to start, then continuously submits ring transfers.
+Each validator receives transactions from its own independent set of accounts.
+
+You can also run the spammer manually against an existing local cluster:
+
+```sh
+cargo run --release --bin constantinople-spammer -- \
+  --peers ./local/peers.yaml \
+  --accounts 10 \
+  --value 1
+```
+
 ## Remote Deployment
 
 `generate remote` writes the deployment bundle, but it does not build the validator binary. Use
@@ -95,6 +123,71 @@ deployer aws create --config config.yaml
 
 `--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments.
 
+### Remote Deployment with Spammer
+
+Add `--spammer` to include a spammer instance in the remote deployment:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 20 \
+  --output-dir ./deploy \
+  --worker-threads 4 \
+  --rayon-threads 4 \
+  --spammer \
+  --spammer-accounts 10 \
+  --spammer-value 1 \
+  remote \
+  --http-cidr 0.0.0.0/0 \
+  --regions us-east-1,us-west-2 \
+  --instance-type c8g.2xlarge \
+  --storage-size 75 \
+  --monitoring-instance-type c8g.2xlarge \
+  --monitoring-storage-size 100 \
+  --dashboard ./docker/dashboard.json
+```
+
+This additionally writes `spammer.yaml` and adds a spammer instance to the deployer config.
+
+Build both binaries before creating the deployment. For Graviton instances:
+
+```sh
+just graviton-binaries
+```
+
+For Intel instances:
+
+```sh
+just intel-binaries
+```
+
+These targets write `deploy/validator`, `deploy/validator-debug`, `deploy/spammer`, and
+`deploy/spammer-debug`.
+
+Then create the deployment as usual:
+
+```sh
+cd ./deploy
+deployer aws create --config config.yaml
+```
+
+The spammer is resilient to transient network errors and will retry with backoff until validators
+are reachable. It can safely be deployed before or alongside validators. Spammer logs are emitted
+as JSON in deployer mode so they are scraped by Promtail/Loki alongside validator logs.
+
+Use `--spammer-instance-type` to override the instance type for the spammer (defaults to the
+validator instance type):
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 20 \
+  --output-dir ./deploy \
+  --spammer \
+  remote \
+  --instance-type c8g.2xlarge \
+  --spammer-instance-type c8g.large \
+  ...
+```
+
 ## Runtime Interfaces
 
 Use `--peers` for local bundles:
@@ -107,4 +200,11 @@ Use `--hosts` for deployer-managed remote bundles:
 
 ```sh
 constantinople --config ./validator.yaml --hosts ./hosts.yaml
+```
+
+The spammer follows the same pattern:
+
+```sh
+constantinople-spammer --peers ./peers.yaml --accounts 10 --value 1
+constantinople-spammer --config ./spammer.yaml --hosts ./hosts.yaml
 ```

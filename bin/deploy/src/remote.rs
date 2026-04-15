@@ -1,8 +1,9 @@
 use crate::{
-    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs, STORAGE_CLASS,
-    VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_deployer_tag, generate_remote_cluster_material, write_yaml_config,
+    ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
+    SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE,
+    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
+    default_max_propose_bytes, ensure_output_dir_missing, generate_deployer_tag,
+    generate_remote_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -40,10 +41,25 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         write_yaml_config(&validator.config_file, &validator.config);
     }
 
+    if args.spammer {
+        let spammer_config = SpammerConfig {
+            accounts: args.spammer_accounts,
+            value: args.spammer_value,
+            seed_offset: args.spammer_seed_offset,
+            http_port: remote.http_port,
+        };
+        write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), &spammer_config);
+    }
+
     let copied_dashboard = output_dir.join(DASHBOARD_FILE);
     fs::copy(&dashboard, &copied_dashboard).expect("failed to copy dashboard");
-    let deployer_config =
-        build_deployer_config(remote, VALIDATOR_BINARY_FILE, DASHBOARD_FILE, &validators);
+    let deployer_config = build_deployer_config(
+        args,
+        remote,
+        VALIDATOR_BINARY_FILE,
+        DASHBOARD_FILE,
+        &validators,
+    );
     let config_path = output_dir.join(DEPLOYER_CONFIG_FILE);
     let raw = serde_yaml::to_string(&deployer_config).expect("failed to serialize deployer config");
     fs::write(&config_path, raw).expect("failed to write deployer config");
@@ -53,10 +69,18 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         validators = args.validators,
         "generated remote deployment bundle"
     );
-    info!(
-        validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
-        "build the validator binary into the deployment directory before creating the remote deployment"
-    );
+    if args.spammer {
+        info!(
+            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
+            spammer_binary = %output_dir.join(SPAMMER_BINARY_FILE).display(),
+            "build all binaries into the deployment directory before creating the remote deployment"
+        );
+    } else {
+        info!(
+            validator_binary = %output_dir.join(VALIDATOR_BINARY_FILE).display(),
+            "build the validator binary into the deployment directory before creating the remote deployment"
+        );
+    }
     info!(
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
@@ -114,12 +138,13 @@ fn build_validators(
 }
 
 fn build_deployer_config(
+    args: &GenerateArgs,
     remote: &RemoteArgs,
     validator_binary: &str,
     dashboard: &str,
     validators: &[GeneratedValidator],
 ) -> aws::Config {
-    let instances = validators
+    let mut instances: Vec<aws::InstanceConfig> = validators
         .iter()
         .enumerate()
         .map(|(index, validator)| aws::InstanceConfig {
@@ -132,7 +157,23 @@ fn build_deployer_config(
             config: validator.config_name.clone(),
             profiling: remote.profiling,
         })
-        .collect::<Vec<_>>();
+        .collect();
+
+    if args.spammer {
+        instances.push(aws::InstanceConfig {
+            name: "spammer".to_string(),
+            region: remote.regions[0].clone(),
+            instance_type: remote
+                .spammer_instance_type
+                .clone()
+                .unwrap_or_else(|| remote.instance_type.clone()),
+            storage_size: remote.spammer_storage_size,
+            storage_class: STORAGE_CLASS.to_string(),
+            binary: SPAMMER_BINARY_FILE.to_string(),
+            config: SPAMMER_CONFIG_FILE.to_string(),
+            profiling: false,
+        });
+    }
 
     aws::Config {
         tag: generate_deployer_tag(),
@@ -182,6 +223,10 @@ mod tests {
             worker_threads: 2,
             rayon_threads: 2,
             startup: StartupModeConfig::MarshalSync,
+            spammer: false,
+            spammer_accounts: 10,
+            spammer_value: 1,
+            spammer_seed_offset: 1000,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -202,6 +247,8 @@ mod tests {
             http_port: 8080,
             http_cidrs: vec!["198.51.100.4/32".to_string()],
             profiling: true,
+            spammer_instance_type: None,
+            spammer_storage_size: 25,
         }
     }
 
@@ -237,6 +284,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let config = build_deployer_config(
+            &args,
             &remote,
             VALIDATOR_BINARY_FILE,
             "dashboard.json",

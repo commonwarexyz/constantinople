@@ -1,0 +1,37 @@
+[package]
+name = "constantinople-spammer"
+description = "Spam bot for Constantinople load testing"
+version = "0.0.0"
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# Workspace
+constantinople-primitives.workspace = true
+constantinople-mempool.workspace = true
+
+# Commonware
+commonware-codec.workspace = true
+commonware-cryptography = { workspace = true, features = ["sha2-asm"] }
+commonware-deployer.workspace = true
+commonware-parallel.workspace = true
+commonware-runtime.workspace = true
+commonware-utils.workspace = true
+
+# Other
+clap = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, features = ["full"] }
+tracing.workspace = true
+serde_yaml.workspace = true
+
+[[bin]]
+name = "constantinople-spammer"
+path = "src/main.rs"

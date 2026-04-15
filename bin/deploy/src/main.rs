@@ -31,6 +31,8 @@ const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const VALIDATOR_BINARY_FILE: &str = "validator";
+const SPAMMER_BINARY_FILE: &str = "spammer";
+const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -67,6 +69,20 @@ pub(crate) struct GenerateArgs {
     rayon_threads: usize,
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
+
+    /// Include a spammer instance in the deployment.
+    #[arg(long, default_value_t = false)]
+    spammer: bool,
+    /// Number of spam accounts per validator.
+    #[arg(long, default_value_t = 10)]
+    spammer_accounts: u32,
+    /// Transfer value per spam transaction.
+    #[arg(long, default_value_t = 1)]
+    spammer_value: u64,
+    /// Seed offset for spam account keys.
+    #[arg(long, default_value_t = 1000)]
+    spammer_seed_offset: u64,
+
     #[command(subcommand)]
     target: GenerateTarget,
 }
@@ -109,6 +125,21 @@ pub(crate) struct RemoteArgs {
     http_cidrs: Vec<String>,
     #[arg(long, default_value_t = false)]
     profiling: bool,
+    /// Instance type for the spammer (defaults to --instance-type).
+    #[arg(long)]
+    spammer_instance_type: Option<String>,
+    /// Storage size (GiB) for the spammer instance.
+    #[arg(long, default_value_t = 25)]
+    spammer_storage_size: i32,
+}
+
+/// Spammer configuration, written as YAML by deploy and read by the spammer binary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct SpammerConfig {
+    pub accounts: u32,
+    pub value: u64,
+    pub seed_offset: u64,
+    pub http_port: u16,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

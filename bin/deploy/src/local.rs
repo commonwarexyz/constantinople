@@ -6,7 +6,10 @@ use crate::{
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 use tracing::info;
 
 struct GeneratedValidator {
@@ -36,7 +39,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
 
-    print_local_run_commands(&output_dir, args.validators);
+    print_local_run_commands(&output_dir, args);
 }
 
 fn build_validators(
@@ -103,21 +106,21 @@ fn build_validators(
     validators
 }
 
-fn print_local_run_commands(output_dir: &std::path::Path, validators: u32) {
-    let commands = local_run_commands(output_dir, validators);
+fn print_local_run_commands(output_dir: &Path, args: &GenerateArgs) {
+    let commands = local_run_commands(output_dir, args);
     let mprocs = commands
         .iter()
         .map(|command| format!("\"{command}\""))
         .collect::<Vec<_>>()
         .join(" ");
 
-    info!(output_dir = %output_dir.display(), validators, "generated local deployment bundle");
+    info!(output_dir = %output_dir.display(), validators = args.validators, "generated local deployment bundle");
     info!(command = %format!("mprocs {mprocs}"), "start local deployment");
 }
 
-fn local_run_commands(output_dir: &std::path::Path, validators: u32) -> Vec<String> {
+fn local_run_commands(output_dir: &Path, args: &GenerateArgs) -> Vec<String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
-    (0..validators)
+    let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
@@ -126,21 +129,71 @@ fn local_run_commands(output_dir: &std::path::Path, validators: u32) -> Vec<Stri
                 peers_path.display()
             )
         })
-        .collect()
+        .collect();
+
+    if args.spammer {
+        commands.push(format!(
+            "sleep 10 && cargo run --release --bin constantinople-spammer -- \
+             --peers {} \
+             --accounts {} \
+             --value {} \
+             --seed-offset {}",
+            peers_path.display(),
+            args.spammer_accounts,
+            args.spammer_value,
+            args.spammer_seed_offset,
+        ));
+    }
+
+    commands
 }
 
 #[cfg(test)]
 mod tests {
     use super::local_run_commands;
-    use crate::StartupModeConfig;
-    use std::path::Path;
+    use crate::{GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig};
+    use std::path::{Path, PathBuf};
+
+    fn test_args(spammer: bool) -> GenerateArgs {
+        GenerateArgs {
+            validators: 2,
+            output_dir: PathBuf::from("/tmp/configs"),
+            log_level: "info".to_string(),
+            worker_threads: 2,
+            rayon_threads: 2,
+            startup: StartupModeConfig::MarshalSync,
+            spammer,
+            spammer_accounts: 10,
+            spammer_value: 1,
+            spammer_seed_offset: 1000,
+            target: GenerateTarget::Local(LocalArgs {
+                base_port: 9000,
+                base_http_port: 8080,
+                base_metrics_port: 9090,
+            }),
+        }
+    }
 
     #[test]
     fn local_run_commands_only_start_validators() {
-        let commands = local_run_commands(Path::new("/tmp/configs"), 2);
+        let args = test_args(false);
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args);
 
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
+    }
+
+    #[test]
+    fn local_run_commands_include_spammer_when_enabled() {
+        let args = test_args(true);
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args);
+
+        assert_eq!(commands.len(), 3);
+        assert!(commands[2].contains("constantinople-spammer"));
+        assert!(commands[2].contains("--peers"));
+        assert!(commands[2].contains("--accounts 10"));
+        assert!(commands[2].contains("--value 1"));
+        assert!(commands[2].contains("--seed-offset 1000"));
     }
 
     #[test]
