@@ -346,7 +346,7 @@ where
         S: Sender<PublicKey = P> + Send + 'static,
         R: Receiver<PublicKey = P> + Send + 'static,
     {
-        spawn_cell!(self.context, self.run(network).await)
+        spawn_cell!(self.context, self.run(network))
     }
 
     /// Main event loop: multiplex mailbox and network messages.

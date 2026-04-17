@@ -414,7 +414,7 @@ where
         Rx: Receiver<PublicKey = C::PublicKey> + Send + 'static,
         Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
     {
-        spawn_cell!(self.context, self.run(channels, reporter).await)
+        spawn_cell!(self.context, self.run(channels, reporter))
     }
 
     async fn run<Sx, Rx, Rep>(self, channels: Channels<C::PublicKey, Sx, Rx>, reporter: Option<Rep>)

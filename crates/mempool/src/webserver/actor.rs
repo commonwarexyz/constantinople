@@ -168,7 +168,7 @@ where
     where
         BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
     {
-        spawn_cell!(self.context, self.run::<BV>(listener).await)
+        spawn_cell!(self.context, self.run::<BV>(listener))
     }
 
     async fn run<BV>(self, listener: tokio::net::TcpListener)
