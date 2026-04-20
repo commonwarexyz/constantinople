@@ -8,12 +8,13 @@ use commonware_consensus::{
     types::{Height, View},
 };
 use commonware_cryptography::{
-    Digestible, Sha256, Signer,
+    Digestible, Signer,
     bls12381::{
         dkg::{Output, deal},
         primitives::{group::Share, variant::MinSig},
     },
     ed25519,
+    sha256::Sha256,
 };
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
 use commonware_runtime::{Clock, Metrics, Quota, Storage};

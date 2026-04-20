@@ -6,7 +6,9 @@
 //! - [`Block`] - Execution payload and required consensus metadata.
 
 use crate::{Sealable, Sealed, SignedTransaction};
-use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
+use commonware_codec::{
+    Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write, types::lazy::Lazy,
+};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
@@ -157,7 +159,12 @@ where
     /// The execution header.
     pub header: Header<C, H::Digest, P>,
     /// Ordered transactions included in this execution payload.
-    pub body: Vec<SignedTransaction<P, H>>,
+    ///
+    /// Each transaction is held in a [`Lazy`] so block decoding does not pay
+    /// the per-transaction decode + seal-hash cost on the caller's thread.
+    /// Materialization is typically driven in parallel at verify time via a
+    /// [`commonware_parallel::Strategy`].
+    pub body: Vec<Lazy<SignedTransaction<P, H>>>,
 }
 
 /// A sealed canonical block.
@@ -173,9 +180,10 @@ where
     SignedTransaction<P, H>: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
+        let body: Vec<SignedTransaction<P, H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
-            body: u.arbitrary()?,
+            body: body.into_iter().map(Lazy::new).collect(),
         })
     }
 }
@@ -206,9 +214,12 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    /// Creates a new block.
-    pub const fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<P, H>>) -> Self {
-        Self { header, body }
+    /// Creates a new block from already-decoded transactions.
+    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<P, H>>) -> Self {
+        Self {
+            header,
+            body: body.into_iter().map(Lazy::new).collect(),
+        }
     }
 }
 
@@ -313,30 +324,30 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Signer, blake3, ed25519};
+    use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use rand::{SeedableRng, rngs::StdRng};
 
-    fn test_context() -> Context<blake3::Digest, ed25519::PublicKey> {
+    fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
         let mut rng = StdRng::from_seed([7u8; 32]);
         let leader = ed25519::PrivateKey::random(&mut rng).public_key();
         Context {
             round: Round::new(Epoch::zero(), View::zero()),
             leader,
-            parent: (View::zero(), blake3::Digest::EMPTY),
+            parent: (View::zero(), sha256::Digest::EMPTY),
         }
     }
 
-    fn test_header() -> Header<blake3::Digest, blake3::Digest, ed25519::PublicKey> {
+    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey> {
         Header {
             context: test_context(),
-            parent: blake3::Digest::EMPTY,
+            parent: sha256::Digest::EMPTY,
             height: 42,
             timestamp: 1000,
-            state_root: blake3::Digest::EMPTY,
+            state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
-            transactions_root: blake3::Digest::EMPTY,
+            transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
         }
     }
@@ -348,7 +359,7 @@ mod tests {
         let mut buf = Vec::with_capacity(header.encode_size());
         header.write(&mut buf);
 
-        let decoded = Header::<blake3::Digest, blake3::Digest, ed25519::PublicKey>::decode_cfg(
+        let decoded = Header::<sha256::Digest, sha256::Digest, ed25519::PublicKey>::decode_cfg(
             &mut &buf[..],
             &(),
         )
@@ -369,12 +380,12 @@ mod tests {
     #[test]
     fn block_codec_roundtrip_empty_body() {
         let block =
-            Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(test_header(), vec![]);
+            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(test_header(), vec![]);
 
         let mut buf = Vec::with_capacity(block.encode_size());
         block.write(&mut buf);
 
-        let decoded = Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::decode_cfg(
+        let decoded = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::decode_cfg(
             &mut &buf[..],
             &BlockCfg::default(),
         )
@@ -385,7 +396,7 @@ mod tests {
     #[test]
     fn block_encode_size_matches_written() {
         let block =
-            Block::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(test_header(), vec![]);
+            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(test_header(), vec![]);
         let expected = block.encode_size();
 
         let mut buf = Vec::new();

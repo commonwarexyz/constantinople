@@ -252,8 +252,11 @@ where
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
                     let height = block.header.height;
-                    let finalized: HashSet<H::Digest> =
-                        block.body.iter().map(|tx| *tx.message_digest()).collect();
+                    let finalized: HashSet<H::Digest> = block
+                        .body
+                        .iter()
+                        .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
+                        .collect();
 
                     let mut remaining = VecDeque::new();
                     for mut batch in proposed.drain(..) {
@@ -285,7 +288,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{TxStatus, status_for_finalized_block};
-    use commonware_cryptography::blake3;
+    use commonware_cryptography::sha256;
     use commonware_math::algebra::Random;
     use rand::{SeedableRng, rngs::StdRng};
     use std::collections::HashSet;
@@ -293,9 +296,9 @@ mod tests {
     #[test]
     fn partial_finalization_reports_filtered_digests() {
         let mut rng = StdRng::from_seed([7; 32]);
-        let first = blake3::Digest::random(&mut rng);
-        let second = blake3::Digest::random(&mut rng);
-        let third = blake3::Digest::random(&mut rng);
+        let first = sha256::Digest::random(&mut rng);
+        let second = sha256::Digest::random(&mut rng);
+        let third = sha256::Digest::random(&mut rng);
         let digests = vec![first, second, third];
         let finalized = HashSet::from([first, third]);
 
@@ -314,8 +317,8 @@ mod tests {
     #[test]
     fn finalized_status_requires_full_inclusion() {
         let mut rng = StdRng::from_seed([9; 32]);
-        let first = blake3::Digest::random(&mut rng);
-        let second = blake3::Digest::random(&mut rng);
+        let first = sha256::Digest::random(&mut rng);
+        let second = sha256::Digest::random(&mut rng);
         let digests = vec![first, second];
         let finalized = HashSet::from([first, second]);
 

@@ -6,11 +6,7 @@ use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
 use constantinople_primitives::VerifiedTransaction;
-use futures::{StreamExt, stream::FuturesUnordered};
 use std::collections::{HashMap, HashSet};
-
-/// Maximum number of concurrent read tasks for state loading.
-const MAX_READ_TASKS: usize = 8;
 
 /// Loads the accounts needed by `transactions` from `batch`.
 ///
@@ -40,35 +36,23 @@ where
     }
 
     let addresses: Vec<_> = addresses.into_iter().collect();
-    let chunk_count = addresses.len().min(MAX_READ_TASKS);
-    let chunk_size = addresses.len().div_ceil(chunk_count);
-    let mut pending_reads = addresses
-        .chunks(chunk_size)
-        .map(|chunk| async move {
-            let db = batch.lock().await;
-            let mut results = Vec::with_capacity(chunk.len());
-            for address in chunk {
-                let account = batch.batch().get(address, &*db).await?;
-                results.push((*address, account.unwrap_or_default()));
-            }
-            Ok::<_, StorageError<mmr::Family>>(results)
-        })
-        .collect::<FuturesUnordered<_>>();
+    let keys: Vec<_> = addresses.iter().collect();
+    let db = batch.lock().await;
+    let values = batch.batch().get_many(&keys, &*db).await?;
 
-    let mut accounts = HashMap::with_capacity(addresses.len());
-    while let Some(result) = pending_reads.next().await {
-        for (address, account) in result? {
-            accounts.insert(address, account);
-        }
-    }
+    let accounts = addresses
+        .into_iter()
+        .zip(values)
+        .map(|(addr, account)| (addr, account.unwrap_or_default()))
+        .collect();
 
     Ok(accounts)
 }
 
 #[cfg(test)]
 mod tests {
-    use commonware_codec::{DecodeExt, Encode, FixedSize};
-    use commonware_cryptography::{Signer as _, blake3, ed25519};
+    use commonware_codec::{DecodeExt, Encode, FixedSize, types::lazy::Lazy};
+    use commonware_cryptography::{Signer as _, ed25519, sha256};
     use commonware_parallel::Rayon;
     use constantinople_primitives::{
         Address, Signable, SignedTransaction, Transaction, verify_transaction_chunks,
@@ -88,7 +72,7 @@ mod tests {
         fn from_seed(seed: u64) -> Self {
             let key = ed25519::PrivateKey::from_seed(seed);
             let address =
-                Address::from_public_key(&mut blake3::Blake3::default(), &key.public_key());
+                Address::from_public_key(&mut sha256::Sha256::default(), &key.public_key());
             Self { key, address }
         }
     }
@@ -97,14 +81,14 @@ mod tests {
         signer: &TestSigner,
         to: Address,
         nonce: u64,
-    ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
+    ) -> SignedTransaction<ed25519::PublicKey, sha256::Sha256> {
         Transaction::new(
             signer.key.public_key(),
             to,
             NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
             nonce,
         )
-        .seal_and_sign(&signer.key, NAMESPACE, &mut blake3::Blake3::default())
+        .seal_and_sign(&signer.key, NAMESPACE, &mut sha256::Sha256::default())
     }
 
     fn invalid_transaction(
@@ -112,7 +96,7 @@ mod tests {
         actual_signer: &TestSigner,
         to: Address,
         nonce: u64,
-    ) -> SignedTransaction<ed25519::PublicKey, blake3::Blake3> {
+    ) -> SignedTransaction<ed25519::PublicKey, sha256::Sha256> {
         Transaction::new(
             claimed_signer.key.public_key(),
             to,
@@ -122,7 +106,7 @@ mod tests {
         .seal_and_sign(
             &actual_signer.key,
             NAMESPACE,
-            &mut blake3::Blake3::default(),
+            &mut sha256::Sha256::default(),
         )
     }
 
@@ -141,14 +125,13 @@ mod tests {
             .map(|transaction| *transaction.message_digest())
             .collect::<Vec<_>>();
         let mut rng = StdRng::seed_from_u64(11);
+        let lazy_txs = transactions.into_iter().map(Lazy::new).collect();
 
-        let verified = verify_transaction_chunks::<
-            ed25519::PublicKey,
-            blake3::Blake3,
-            ed25519::Batch,
-            _,
-        >(&strategy, NAMESPACE, &mut rng, transactions)
-        .expect("valid chunked verification should succeed");
+        let verified =
+            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _>(
+                &strategy, NAMESPACE, &mut rng, lazy_txs,
+            )
+            .expect("valid chunked verification should succeed");
         let verified_digests = verified
             .iter()
             .map(|transaction| *transaction.message_digest())
@@ -170,13 +153,12 @@ mod tests {
             .collect::<Vec<_>>();
         transactions[31] = invalid_transaction(&sender, &attacker, recipient.address, 31);
         let mut rng = StdRng::seed_from_u64(23);
+        let lazy_txs = transactions.into_iter().map(Lazy::new).collect();
 
-        let verified = verify_transaction_chunks::<
-            ed25519::PublicKey,
-            blake3::Blake3,
-            ed25519::Batch,
-            _,
-        >(&strategy, NAMESPACE, &mut rng, transactions);
+        let verified =
+            verify_transaction_chunks::<ed25519::PublicKey, sha256::Sha256, ed25519::Batch, _>(
+                &strategy, NAMESPACE, &mut rng, lazy_txs,
+            );
 
         assert!(verified.is_none());
     }
@@ -206,16 +188,16 @@ mod tests {
         encoded[..invalid_sender.len()].copy_from_slice(&invalid_sender);
 
         let malformed =
-            SignedTransaction::<ed25519::PublicKey, blake3::Blake3>::decode(&mut &encoded[..])
+            SignedTransaction::<ed25519::PublicKey, sha256::Sha256>::decode(&mut &encoded[..])
                 .expect("decode should defer sender validation");
         let mut rng = StdRng::seed_from_u64(37);
 
         let verified = verify_transaction_chunks::<
             ed25519::PublicKey,
-            blake3::Blake3,
+            sha256::Sha256,
             ed25519::Batch,
             _,
-        >(&strategy, NAMESPACE, &mut rng, vec![malformed]);
+        >(&strategy, NAMESPACE, &mut rng, vec![Lazy::new(malformed)]);
 
         assert!(verified.is_none());
     }

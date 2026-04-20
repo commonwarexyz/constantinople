@@ -8,7 +8,7 @@ use axum::{
     http::StatusCode,
     routing::post,
 };
-use commonware_codec::{Decode, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Decode, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use constantinople_primitives::{Address, SignedTransaction, verify_transaction_chunks};
@@ -126,8 +126,9 @@ where
     // Phase 2: Verify signatures in parallel on the rayon pool.
     let strategy = state.strategy.clone();
     let namespace = state.namespace;
+    let signed_lazy = signed.into_iter().map(Lazy::new).collect::<Vec<_>>();
     let verified = match tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<P, H, BV, _>(&strategy, namespace, &mut OsRng, signed)
+        verify_transaction_chunks::<P, H, BV, _>(&strategy, namespace, &mut OsRng, signed_lazy)
     })
     .await
     {
@@ -160,7 +161,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use commonware_codec::Encode;
-    use commonware_cryptography::{blake3, ed25519};
+    use commonware_cryptography::{ed25519, sha256};
     use commonware_parallel::Sequential;
     use futures::executor::block_on;
     use std::{
@@ -179,7 +180,7 @@ mod tests {
             strategy: Sequential,
         });
 
-        router::<blake3::Digest, ed25519::PublicKey, blake3::Blake3, ed25519::Batch, Sequential>(
+        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, ed25519::Batch, Sequential>(
             state,
         )
     }

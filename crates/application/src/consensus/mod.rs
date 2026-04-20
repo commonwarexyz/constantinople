@@ -15,6 +15,7 @@
 //! in-memory state transition logic.
 
 use crate::processor::executor::{self, Changeset, ProposalOutput};
+use commonware_codec::types::lazy::Lazy;
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -159,20 +160,28 @@ where
         }
     }
 
-    /// Verifies signed wire transactions and returns verified execution transactions.
+    /// Verifies lazily-encoded signed transactions and returns verified
+    /// execution transactions.
+    ///
+    /// Forcing each [`Lazy`] materializes the underlying
+    /// [`SignedTransaction`] (including recomputing its seal digest); the
+    /// chunked path spreads that cost across the configured
+    /// [`Strategy`]'s worker threads.
     fn verify_transactions(
         &self,
         rng: &mut impl CryptoRngCore,
-        transactions: Vec<SignedTransaction<P, H>>,
+        transactions: Vec<Lazy<SignedTransaction<P, H>>>,
     ) -> Option<Vec<VerifiedTransaction<P, H>>> {
         let parallelism = self.strategy.parallelism_hint();
         if parallelism <= 1 || transactions.len() <= parallelism {
-            return verify_transaction_batch::<P, H, B>(
-                self.transaction_namespace,
-                rng,
-                &transactions,
-            )
-            .then(|| transactions.into_iter().map(Into::into).collect());
+            if !verify_transaction_batch::<P, H, B>(self.transaction_namespace, rng, &transactions)
+            {
+                return None;
+            }
+            return transactions
+                .into_iter()
+                .map(|lazy| lazy.get().cloned().map(Into::into))
+                .collect();
         }
 
         verify_transaction_chunks::<P, H, B, _>(

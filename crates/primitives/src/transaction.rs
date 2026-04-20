@@ -2,9 +2,7 @@
 
 use crate::{Address, Sealable, Sealed, Signed, Verified};
 use bytes::{Buf, BufMut};
-use commonware_codec::{
-    Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
-};
+use commonware_codec::{Encode, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
 use core::num::NonZeroU64;
 
@@ -73,10 +71,8 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
     }
 }
 
-impl<D: Digest, P: PublicKey> EncodeSize for Transaction<D, P> {
-    fn encode_size(&self) -> usize {
-        self.sender.encode_size() + self.to.encode_size() + u64::SIZE + self.nonce.encode_size()
-    }
+impl<D: Digest, P: PublicKey> FixedSize for Transaction<D, P> {
+    const SIZE: usize = P::SIZE + Address::SIZE + u64::SIZE + u64::SIZE;
 }
 
 impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
@@ -129,8 +125,8 @@ where
 mod test {
     use super::*;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
-    use commonware_codec::DecodeExt;
-    use commonware_cryptography::{Signer, blake3, ed25519};
+    use commonware_codec::{DecodeExt, EncodeSize};
+    use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
@@ -142,13 +138,13 @@ mod test {
 
     #[test]
     fn test_roundtrip_transaction_consensus() {
-        let reference_tx: Transaction<blake3::Digest, ed25519::PublicKey> =
+        let reference_tx: Transaction<sha256::Digest, ed25519::PublicKey> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
 
         let mut encoded = Vec::with_capacity(reference_tx.encode_size());
         reference_tx.write(&mut encoded);
 
-        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &encoded[..])
+        let decoded = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &encoded[..])
             .expect("decoding should succeed");
 
         assert_eq!(
@@ -159,9 +155,9 @@ mod test {
 
     #[test]
     fn transaction_hash_slow_deterministic() {
-        let tx: Transaction<blake3::Digest, ed25519::PublicKey> =
+        let tx: Transaction<sha256::Digest, ed25519::PublicKey> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
 
         let h1 = tx.hash_slow(hasher);
         let h2 = tx.hash_slow(hasher);
@@ -172,9 +168,9 @@ mod test {
     fn transaction_seal_matches_hash_slow() {
         use crate::Sealable;
 
-        let tx: Transaction<blake3::Digest, ed25519::PublicKey> =
+        let tx: Transaction<sha256::Digest, ed25519::PublicKey> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
 
         let expected = tx.hash_slow(hasher);
         let sealed = tx.seal(hasher);
@@ -183,7 +179,7 @@ mod test {
 
     #[test]
     fn transaction_roundtrip() {
-        let tx = Transaction::<blake3::Digest, ed25519::PublicKey>::new(
+        let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
             test_sender(),
             Address::EMPTY,
             NonZeroU64::new(12_345).expect("test value should be non-zero"),
@@ -193,14 +189,14 @@ mod test {
         let mut buf = Vec::with_capacity(tx.encode_size());
         tx.write(&mut buf);
 
-        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
+        let decoded = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
             .expect("decoding should succeed");
         assert_eq!(decoded, tx);
     }
 
     #[test]
     fn transaction_encode_size_matches_written() {
-        let tx = Transaction::<blake3::Digest, ed25519::PublicKey>::new(
+        let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
             test_sender(),
             Address::arbitrary(&mut Unstructured::new(&[0xCC; 64])).unwrap(),
             NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
@@ -216,7 +212,7 @@ mod test {
     #[test]
     fn transaction_zero_value_decode_is_rejected() {
         let sender = test_sender();
-        let tx = Transaction::<blake3::Digest, ed25519::PublicKey>::new(
+        let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
             sender.clone(),
             Address::EMPTY,
             NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -229,7 +225,7 @@ mod test {
         0u64.write(&mut buf);
         tx.nonce.write(&mut buf);
 
-        let result = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..]);
+        let result = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &buf[..]);
         assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 
@@ -254,7 +250,7 @@ mod test {
         1u64.write(&mut buf);
         9u64.write(&mut buf);
 
-        let decoded = Transaction::<blake3::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
+        let decoded = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
             .expect("decoding should defer sender validation");
 
         assert!(decoded.sender().is_none());

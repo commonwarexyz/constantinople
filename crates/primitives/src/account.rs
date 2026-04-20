@@ -147,7 +147,7 @@ impl Read for Account {
 mod tests {
     use super::*;
     use commonware_codec::{DecodeExt, FixedSize};
-    use commonware_cryptography::{Signer, blake3, secp256r1::recoverable};
+    use commonware_cryptography::{Signer, secp256r1::recoverable, sha256};
     use commonware_math::algebra::Random;
     use commonware_utils::test_rng;
 
@@ -179,7 +179,7 @@ mod tests {
 
     #[test]
     fn address_from_public_key_deterministic() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let key = recoverable::PrivateKey::random(test_rng());
         let pk = key.public_key();
 

@@ -7,8 +7,6 @@ use constantinople_primitives::{Signable, SignedTransaction, TRANSACTION_NAMESPA
 use core::num::NonZeroU64;
 
 /// Concrete signed transaction type.
-///
-/// Uses [`Sha256`] as the hasher to match the validator's Engine instantiation.
 pub type Tx = SignedTransaction<ed25519::PublicKey, Sha256>;
 
 /// Signs one transaction for a single sender in the ring.
@@ -114,11 +112,15 @@ mod tests {
 
         // Verify signatures as the server would (using Sha256, same as the validator).
         let mut rng = commonware_utils::test_rng();
+        let lazy_decoded: Vec<_> = decoded
+            .into_iter()
+            .map(commonware_codec::types::lazy::Lazy::new)
+            .collect();
         assert!(
             verify_transaction_batch::<ed25519::PublicKey, Sha256, ed25519::Batch>(
                 TRANSACTION_NAMESPACE,
                 &mut rng,
-                &decoded,
+                &lazy_decoded,
             ),
             "batch signature verification should pass"
         );

@@ -125,7 +125,7 @@ where
 #[cfg(test)]
 mod test {
     use super::*;
-    use commonware_cryptography::{Hasher, blake3};
+    use commonware_cryptography::{Hasher, sha256};
     use commonware_utils::hex;
 
     #[derive(core::fmt::Debug, Clone, PartialEq, Eq)]
@@ -133,7 +133,7 @@ mod test {
     struct MockSeal([u8; 8]);
 
     impl Sealable for MockSeal {
-        type SealDigest = blake3::Digest;
+        type SealDigest = sha256::Digest;
 
         fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
             hasher.update(&self.0);
@@ -144,10 +144,10 @@ mod test {
     #[test]
     fn test_seal() {
         const EXPECTED: [u8; 32] =
-            hex!("8e5277642151b76bc776a20d60049e05ea2aba99f14c041ddd293d2d165ef947");
+            hex!("5eb36b538cf44d53a2a091d3ef6b4d719e9ee0d3805505e2aaa12803d78babe1");
 
         let mock = MockSeal(hex!("beefbabe0badc0de"));
-        let sealed = mock.seal(&mut blake3::Blake3::new());
+        let sealed = mock.seal(&mut sha256::Sha256::new());
 
         assert_eq!(sealed.seal().as_ref(), EXPECTED);
     }
@@ -155,14 +155,14 @@ mod test {
     #[test]
     fn sealed_deref() {
         let mock = MockSeal([1, 2, 3, 4, 5, 6, 7, 8]);
-        let sealed = mock.seal(&mut blake3::Blake3::new());
+        let sealed = mock.seal(&mut sha256::Sha256::new());
         assert_eq!(sealed.0, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
     fn sealed_into_inner() {
         let mock = MockSeal([10; 8]);
-        let sealed = mock.seal(&mut blake3::Blake3::new());
+        let sealed = mock.seal(&mut sha256::Sha256::new());
         let inner = sealed.into_inner();
         assert_eq!(inner.0, [10; 8]);
     }
@@ -170,15 +170,15 @@ mod test {
     #[test]
     fn sealed_clone_eq() {
         let mock = MockSeal([0xAB; 8]);
-        let sealed = mock.seal(&mut blake3::Blake3::new());
+        let sealed = mock.seal(&mut sha256::Sha256::new());
         let cloned = sealed.clone();
         assert_eq!(sealed, cloned);
     }
 
     #[test]
     fn different_inputs_produce_different_seals() {
-        let a = MockSeal([0x00; 8]).seal(&mut blake3::Blake3::new());
-        let b = MockSeal([0xFF; 8]).seal(&mut blake3::Blake3::new());
+        let a = MockSeal([0x00; 8]).seal(&mut sha256::Sha256::new());
+        let b = MockSeal([0xFF; 8]).seal(&mut sha256::Sha256::new());
         assert_ne!(a.seal(), b.seal());
     }
 }

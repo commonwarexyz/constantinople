@@ -1,6 +1,6 @@
 //! Deterministic spam account generation.
 
-use commonware_cryptography::{Signer, blake3, ed25519};
+use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::Address;
 
 /// A spam account with its signing key and derived address.
@@ -17,7 +17,7 @@ pub fn generate_accounts(count: u32, seed_offset: u64) -> Vec<SpamAccount> {
         .map(|i| {
             let private_key = ed25519::PrivateKey::from_seed(seed_offset + u64::from(i));
             let public_key = private_key.public_key();
-            let address = Address::from_public_key(&mut blake3::Blake3::default(), &public_key);
+            let address = Address::from_public_key(&mut sha256::Sha256::default(), &public_key);
             SpamAccount {
                 private_key,
                 public_key,

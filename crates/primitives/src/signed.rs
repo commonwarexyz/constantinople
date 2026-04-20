@@ -9,7 +9,7 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{Address, Sealable, Sealed, SignedTransaction, Transaction, VerifiedTransaction};
-use commonware_codec::{EncodeSize, Error, Read, ReadExt, Write, types::lazy::Lazy};
+use commonware_codec::{EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{
     BatchVerifier, Digest, Hasher, PublicKey, Signature, Signer, Verifier,
 };
@@ -215,7 +215,7 @@ where
 
 impl<T, H, Sig> EncodeSize for Verified<T, H, Sig>
 where
-    T: EncodeSize,
+    Signed<T, H, Sig>: EncodeSize,
     H: Hasher,
     Sig: Signature,
 {
@@ -236,15 +236,13 @@ where
     }
 }
 
-impl<T, H, Sig> EncodeSize for Signed<T, H, Sig>
+impl<T, H, Sig> FixedSize for Signed<T, H, Sig>
 where
-    T: EncodeSize,
+    T: FixedSize,
     H: Hasher,
     Sig: Signature,
 {
-    fn encode_size(&self) -> usize {
-        self.inner.encode_size() + self.signature.encode_size()
-    }
+    const SIZE: usize = T::SIZE + Sig::SIZE;
 }
 
 impl<T, H, Sig> Read for Signed<T, H, Sig>
@@ -319,14 +317,21 @@ where
     }
 }
 
-/// Verifies a slice of signed transactions using batch verification.
+/// Verifies a slice of lazily-encoded signed transactions using batch
+/// verification.
 ///
-/// Returns `true` if all signatures are valid, `false` if any sender or
-/// signature fails to decode or if batch verification fails.
+/// Calling `.get()` on each [`Lazy`] forces the underlying
+/// [`SignedTransaction`] to be decoded and its seal digest computed. When this
+/// function runs inside a worker thread (via [`verify_transaction_chunks`])
+/// that per-transaction cost is paid on the worker rather than the runtime
+/// thread.
+///
+/// Returns `true` if every transaction decodes and all signatures verify,
+/// `false` otherwise.
 pub fn verify_transaction_batch<P, H, BV>(
     namespace: &[u8],
     rng: &mut impl CryptoRngCore,
-    transactions: &[SignedTransaction<P, H>],
+    transactions: &[Lazy<SignedTransaction<P, H>>],
 ) -> bool
 where
     P: PublicKey,
@@ -334,10 +339,13 @@ where
     BV: BatchVerifier<PublicKey = P>,
 {
     let mut verifier = BV::new();
-    for transaction in transactions {
-        // Decode the sender and signature inside the worker so
-        // decompression happens on the rayon pool instead of the
-        // runtime thread.
+    for lazy in transactions {
+        // Force materialization on this thread (the chunked caller runs this
+        // inside a parallel worker, so decoding + seal hashing is spread
+        // across cores).
+        let Some(transaction) = lazy.get() else {
+            return false;
+        };
         let Some(sender) = transaction.value().sender() else {
             return false;
         };
@@ -356,16 +364,18 @@ where
     verifier.verify(rng)
 }
 
-/// Splits transactions into chunks, verifies each chunk in parallel using
-/// batch signature verification, and returns the verified transactions in
-/// their original order.
+/// Splits lazily-encoded transactions into chunks, verifies each chunk in
+/// parallel using batch signature verification, and returns the verified
+/// transactions in their original order.
 ///
-/// Returns `None` if any chunk contains an invalid signature.
+/// Forcing each [`Lazy`] happens inside the worker, so transaction decoding
+/// and seal hashing are performed on the strategy's threads. Returns `None`
+/// if any chunk contains an invalid or undecodable transaction.
 pub fn verify_transaction_chunks<P, H, BV, St>(
     strategy: &St,
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
-    transactions: Vec<SignedTransaction<P, H>>,
+    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
 ) -> Option<Vec<VerifiedTransaction<P, H>>>
 where
     P: PublicKey,
@@ -393,8 +403,17 @@ where
 
     let verified_chunks = strategy.map_collect_vec(chunks, |(rng_seed, chunk)| {
         let mut chunk_rng = StdRng::from_seed(rng_seed);
-        verify_transaction_batch::<P, H, BV>(namespace, &mut chunk_rng, &chunk)
-            .then(|| chunk.into_iter().map(Into::into).collect::<Vec<_>>())
+        if !verify_transaction_batch::<P, H, BV>(namespace, &mut chunk_rng, &chunk) {
+            return None;
+        }
+        // Each lazy was forced during verification above, so unwrapping the
+        // materialized value and converting into a `VerifiedTransaction` is
+        // infallible here.
+        let verified: Option<Vec<_>> = chunk
+            .into_iter()
+            .map(|lazy| lazy.get().cloned().map(Into::into))
+            .collect();
+        verified
     });
 
     let mut verified = Vec::new();
@@ -408,7 +427,7 @@ where
 mod test {
     use crate::{Address, Sealable, Sealed, Transaction, signed::Signable};
     use commonware_cryptography::{
-        Digest, Hasher, Signer, Verifier, blake3, ed25519, secp256r1::recoverable,
+        Digest, Hasher, Signer, Verifier, ed25519, secp256r1::recoverable, sha256,
     };
     use commonware_math::algebra::Random;
     use commonware_utils::test_rng;
@@ -420,7 +439,7 @@ mod test {
     struct MockValue([u8; 4]);
 
     impl Sealable for MockValue {
-        type SealDigest = blake3::Digest;
+        type SealDigest = sha256::Digest;
 
         fn seal<H: Hasher<Digest = Self::SealDigest>>(
             self,
@@ -433,7 +452,7 @@ mod test {
 
     #[test]
     fn signed_verify_works_for_ed25519() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
@@ -442,7 +461,7 @@ mod test {
 
     #[test]
     fn signed_verify_works_for_secp256r1() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let private_key = recoverable::PrivateKey::random(&mut test_rng());
         let signed = MockValue([5, 6, 7, 8]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
@@ -451,7 +470,7 @@ mod test {
 
     #[test]
     fn signed_into_inner_returns_sealed() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let signed = MockValue([9, 10, 11, 12]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
@@ -464,7 +483,7 @@ mod test {
 
     #[test]
     fn wrong_namespace_fails_verification() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
@@ -482,7 +501,7 @@ mod test {
 
     #[test]
     fn verified_caches_signer_address() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let public_key = private_key.public_key();
         let verified = Transaction::new(
@@ -493,7 +512,7 @@ mod test {
         )
         .seal_and_sign_verified(&private_key, NAMESPACE, hasher);
 
-        let expected = Address::from_public_key(&mut blake3::Blake3::default(), &public_key);
+        let expected = Address::from_public_key(&mut sha256::Sha256::default(), &public_key);
         assert_eq!(verified.signer(), expected);
         assert!(
             verified.inner().verify(
@@ -509,7 +528,7 @@ mod test {
     #[test]
     #[should_panic(expected = "transaction sender must match signer public key")]
     fn seal_and_sign_verified_rejects_mismatched_sender() {
-        let hasher = &mut blake3::Blake3::default();
+        let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::from_seed(0);
         let wrong_key = ed25519::PrivateKey::from_seed(1);
 

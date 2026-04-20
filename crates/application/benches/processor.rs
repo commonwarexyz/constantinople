@@ -1,5 +1,5 @@
 use commonware_codec::{DecodeExt, FixedSize};
-use commonware_cryptography::{Signer, blake3, ed25519};
+use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
 use constantinople_application::processor::{executor, state::State};
 use constantinople_primitives::{Account, Address, Transaction, VerifiedTransaction};
@@ -8,7 +8,7 @@ use divan::Bencher;
 use rand::{SeedableRng, rngs::StdRng};
 use std::{collections::HashMap, hint::black_box};
 
-type TestHasher = blake3::Blake3;
+type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
 
 const NAMESPACE: &[u8] = b"processor-bench";

@@ -18,7 +18,7 @@ commonware-codec.workspace = true
 commonware-utils.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
-commonware-cryptography = { workspace = true, features = ["sha2-asm", "blake3-parallel"] }
+commonware-cryptography = { workspace = true, features = ["sha2-asm"] }
 
 # Other
 bytes.workspace = true

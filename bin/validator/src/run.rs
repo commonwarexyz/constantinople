@@ -4,9 +4,9 @@ use crate::config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_
 use commonware_codec::Encode;
 use commonware_consensus::simplex::elector::RoundRobin;
 use commonware_cryptography::{
-    Sha256,
     bls12381::primitives::variant::MinSig,
     ed25519::{self, Batch},
+    sha256::Sha256,
 };
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
 use commonware_p2p::{Ingress, Manager as _, authenticated::discovery};
@@ -27,7 +27,7 @@ use tracing::info;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
-const MAX_PROPOSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
     let loaded = load_local_config(&peers_path, &config_path);

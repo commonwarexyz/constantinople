@@ -81,7 +81,7 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Digest, Signer, blake3, ed25519};
+    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{Address, Header, Transaction, VerifiedTransaction};
     use core::num::NonZeroU64;
@@ -91,8 +91,8 @@ mod tests {
     fn sign_tx(
         key: &ed25519::PrivateKey,
         nonce: u64,
-    ) -> VerifiedTransaction<ed25519::PublicKey, blake3::Blake3> {
-        let hasher = &mut blake3::Blake3::default();
+    ) -> VerifiedTransaction<ed25519::PublicKey, sha256::Sha256> {
+        let hasher = &mut sha256::Sha256::default();
         Transaction::new(
             key.public_key(),
             Address::EMPTY,
@@ -102,7 +102,7 @@ mod tests {
         .seal_and_sign_verified(key, NAMESPACE, hasher)
     }
 
-    fn test_context() -> Context<blake3::Digest, ed25519::PublicKey> {
+    fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
         use commonware_math::algebra::Random;
         use rand::{SeedableRng, rngs::StdRng};
 
@@ -111,7 +111,7 @@ mod tests {
         Context {
             round: Round::new(Epoch::zero(), View::zero()),
             leader,
-            parent: (View::zero(), blake3::Digest::EMPTY),
+            parent: (View::zero(), sha256::Digest::EMPTY),
         }
     }
 
@@ -125,17 +125,17 @@ mod tests {
         let tx1 = sign_tx(&key, 0);
         let tx2 = sign_tx(&key, 1);
         let mut source =
-            StaticTransactionSource::<blake3::Digest, ed25519::PublicKey, blake3::Blake3>::new(
+            StaticTransactionSource::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::new(
                 vec![vec![tx1.clone()], vec![tx2]],
             );
         let parent = Header {
             context: test_context(),
-            parent: blake3::Digest::EMPTY,
+            parent: sha256::Digest::EMPTY,
             height: 0,
             timestamp: 0,
-            state_root: blake3::Digest::EMPTY,
+            state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
-            transactions_root: blake3::Digest::EMPTY,
+            transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
         };
 
