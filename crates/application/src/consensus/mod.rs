@@ -33,7 +33,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
-    mmr,
+    mmb,
     qmdb::{
         any::{
             operation::Operation as AnyOperation,
@@ -71,13 +71,14 @@ pub use utils::load_state;
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Shared QMDB handle for the application state database.
-type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
+type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmb::Family, E, Address, Account, H, T>>>;
 
 /// Unmerkleized application state batch used for processor read-through.
 type StateBatch<E, H, T> = AnyUnmerkleized<
+    mmb::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<Address, FixedEncoding<Account>>>>,
-    UnorderedIndex<T, mmr::Location>,
+    FixedJournal<E, AnyOperation<mmb::Family, UnorderedUpdate<Address, FixedEncoding<Account>>>>,
+    UnorderedIndex<T, mmb::Location>,
     H,
     UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
@@ -240,8 +241,8 @@ where
         Target {
             root: block.header.state_root,
             range: non_empty_range!(
-                mmr::Location::new(block.header.state_range.start()),
-                mmr::Location::new(block.header.state_range.end())
+                mmb::Location::new(block.header.state_range.start()),
+                mmb::Location::new(block.header.state_range.end())
             ),
         }
     }

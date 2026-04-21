@@ -43,8 +43,11 @@ use commonware_runtime::{
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
-    archive::immutable, journal::contiguous::fixed::Config as FixedJournalConfig,
-    mmr::journaled::Config as MmrConfig, qmdb::any::FixedConfig, translator::EightCap,
+    archive::immutable,
+    journal::contiguous::fixed::Config as FixedJournalConfig,
+    mmb::{self, journaled::Config as MmbConfig},
+    qmdb::any::FixedConfig,
+    translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
 use constantinople_application::consensus::Application;
@@ -172,7 +175,7 @@ where
     signer: C,
     manager: M,
     blocker: B,
-    state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, StateDb<E, H>>,
+    state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, mmb::Family, StateDb<E, H>>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, T>,
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
@@ -244,7 +247,7 @@ where
             ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            qmdb_resolver::Actor::<_, C::PublicKey, _, _, StateDb<E, H>>::new(
+            qmdb_resolver::Actor::<_, C::PublicKey, _, _, _, StateDb<E, H>>::new(
                 context.with_label("state_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
@@ -600,7 +603,7 @@ fn state_db_config(
     thread_pool: Option<&ThreadPool>,
 ) -> FixedConfig<EightCap> {
     FixedConfig {
-        merkle_config: MmrConfig {
+        merkle_config: MmbConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,

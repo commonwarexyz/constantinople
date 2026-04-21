@@ -17,7 +17,7 @@ use commonware_consensus::{
 use commonware_cryptography::certificate::ConstantProvider;
 use commonware_glue::stateful::Stateful;
 use commonware_storage::{
-    mmr,
+    mmb,
     qmdb::{any::unordered::fixed, sync::resolver::Resolver as SyncResolver},
     translator::EightCap,
 };
@@ -40,12 +40,13 @@ pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitme
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub(crate) type StateDb<E, H> = fixed::Db<mmr::Family, E, Address, Account, H, EightCap>;
+pub(crate) type StateDb<E, H> = fixed::Db<mmb::Family, E, Address, Account, H, EightCap>;
 
 pub(crate) type StateSyncDb<E, H> = Arc<AsyncRwLock<StateDb<E, H>>>;
 
 pub(crate) type StateResolverMailbox<E, H> = commonware_glue::stateful::db::p2p::Mailbox<
     StateDb<E, H>,
+    mmb::Family,
     <StateSyncDb<E, H> as SyncResolver>::Op,
     <StateSyncDb<E, H> as SyncResolver>::Digest,
 >;

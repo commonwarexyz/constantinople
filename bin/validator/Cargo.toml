@@ -25,7 +25,7 @@ commonware-glue.workspace = true
 commonware-codec.workspace = true
 commonware-utils.workspace = true
 commonware-macros.workspace = true
-commonware-runtime.workspace = true
+commonware-runtime = { workspace = true, features = ["iouring"] }
 commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true

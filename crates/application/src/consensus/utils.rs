@@ -4,7 +4,7 @@ use super::StateBatch;
 use crate::processor::state::State;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
-use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
+use commonware_storage::{mmb, qmdb::Error as StorageError, translator::Translator};
 use constantinople_primitives::VerifiedTransaction;
 use std::collections::{HashMap, HashSet};
 
@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 pub async fn load_state<E, H, P, T>(
     batch: &StateBatch<E, H, T>,
     transactions: &[VerifiedTransaction<P, H>],
-) -> Result<State, StorageError<mmr::Family>>
+) -> Result<State, StorageError<mmb::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
