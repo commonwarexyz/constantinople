@@ -1,17 +1,18 @@
 //! HTTP handlers for the mempool webserver.
 
-use super::Mailbox;
+use super::{Mailbox, actor::AccountReaderCell};
 use axum::{
     Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, State},
+    extract::{DefaultBodyLimit, Path, State},
     http::StatusCode,
-    routing::post,
+    routing::{get, post},
 };
-use commonware_codec::{Decode, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
+use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{Address, SignedTransaction, verify_transaction_chunks};
+use commonware_utils::from_hex;
+use constantinople_primitives::{Account, Address, SignedTransaction, verify_transaction_chunks};
 use rand_core::OsRng;
 use std::sync::Arc;
 
@@ -39,6 +40,7 @@ where
     pub namespace: &'static [u8],
     pub max_batch_bytes: usize,
     pub strategy: St,
+    pub account_reader: AccountReaderCell,
 }
 
 /// Builds the axum [`Router`] for the mempool HTTP API.
@@ -56,6 +58,7 @@ where
 
     Router::new()
         .route("/transactions", post(submit_batch::<C, P, H, BV, St>))
+        .route("/account/{address}", get(fetch_account::<C, P, H, St>))
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .with_state(state)
 }
@@ -153,6 +156,65 @@ where
     )
 }
 
+/// Returns the committed account at the hex-encoded address.
+///
+/// Responds with:
+/// - `200 OK` and `{"balance": u64, "nonce": u64}` if the account exists.
+/// - `404 Not Found` if the account has not been written.
+/// - `400 Bad Request` if the path is not a 20-byte hex string.
+/// - `503 Service Unavailable` if the state database has not been attached yet.
+async fn fetch_account<C, P, H, St>(
+    State(state): State<Arc<AppState<C, P, H, St>>>,
+    Path(address): Path<String>,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let Some(bytes) = from_hex(&address) else {
+        return (StatusCode::BAD_REQUEST, String::new());
+    };
+    if bytes.len() != Address::SIZE {
+        return (StatusCode::BAD_REQUEST, String::new());
+    }
+    let address = match Address::decode(bytes.as_slice()) {
+        Ok(address) => address,
+        Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
+    };
+
+    let Some(reader) = state.account_reader.get() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    };
+
+    reader.get(address).await.map_or_else(
+        || (StatusCode::NOT_FOUND, String::new()),
+        |account| {
+            (
+                StatusCode::OK,
+                serde_json::to_string(&AccountResponse::from(account))
+                    .expect("account serialization cannot fail"),
+            )
+        },
+    )
+}
+
+#[derive(serde::Serialize)]
+struct AccountResponse {
+    balance: u64,
+    nonce: u64,
+}
+
+impl From<Account> for AccountResponse {
+    fn from(account: Account) -> Self {
+        Self {
+            balance: account.balance,
+            nonce: account.nonce,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{AppState, router};
@@ -178,6 +240,7 @@ mod tests {
             namespace: b"mempool-http-test",
             max_batch_bytes,
             strategy: Sequential,
+            account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
         });
 
         router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, ed25519::Batch, Sequential>(

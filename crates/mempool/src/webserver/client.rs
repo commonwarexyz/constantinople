@@ -3,8 +3,9 @@
 use super::TxStatus;
 use commonware_codec::Encode;
 use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_primitives::SignedTransaction;
+use constantinople_primitives::{Address, SignedTransaction};
 use derive_more::Display;
+use serde::Deserialize;
 
 /// Error returned by [`Client::submit`].
 #[derive(Debug, Display)]
@@ -90,4 +91,41 @@ impl Client {
             other => Err(SubmitError::Unexpected(other)),
         }
     }
+
+    /// Fetches the committed account at `address`.
+    ///
+    /// Returns `Ok(Some(account))` when the account has been written, `Ok(None)`
+    /// when no record exists yet, and [`SubmitError::ServiceUnavailable`]
+    /// while the validator's state database is still attaching.
+    pub async fn fetch_account(
+        &self,
+        address: &Address,
+    ) -> Result<Option<AccountView>, SubmitError> {
+        let response = self
+            .http
+            .get(format!("{}/account/{}", self.url, address))
+            .send()
+            .await?;
+
+        match response.status().as_u16() {
+            200 => {
+                let bytes = response.bytes().await?;
+                serde_json::from_slice(&bytes)
+                    .map(Some)
+                    .map_err(SubmitError::InvalidResponse)
+            }
+            404 => Ok(None),
+            400 => Err(SubmitError::BadRequest),
+            500 => Err(SubmitError::InternalServerError),
+            503 => Err(SubmitError::ServiceUnavailable),
+            other => Err(SubmitError::Unexpected(other)),
+        }
+    }
+}
+
+/// Committed account snapshot returned by [`Client::fetch_account`].
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct AccountView {
+    pub balance: u64,
+    pub nonce: u64,
 }

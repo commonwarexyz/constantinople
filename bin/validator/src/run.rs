@@ -1,6 +1,9 @@
 //! Starts a validator from a YAML config.
 
-use crate::config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config};
+use crate::{
+    config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config},
+    state_reader::StateDbReader,
+};
 use commonware_codec::Encode;
 use commonware_consensus::simplex::elector::RoundRobin;
 use commonware_cryptography::{
@@ -21,9 +24,17 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     VOTE_CHANNEL, bootstrapper,
 };
-use constantinople_mempool::webserver;
-use std::{future::Future, path::PathBuf, pin::Pin, time::Duration};
+use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
+use std::{
+    future::Future,
+    path::PathBuf,
+    pin::Pin,
+    sync::{Arc, OnceLock},
+    time::Duration,
+};
 use tracing::info;
+
+const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
@@ -154,16 +165,20 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
         let network_handle = network.start();
 
-        let (mempool_actor, mempool_mailbox) = webserver::Actor::new(
+        let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
+        let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
+        let mempool_actor = webserver::Actor::new(
             context.with_label("mempool"),
             webserver::Config {
                 max_pool_bytes: MAX_POOL_BYTES,
                 max_propose_bytes: MAX_PROPOSE_BYTES,
-                mailbox_size: 65536,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: 3,
                 strategy: strategy.clone(),
             },
+            mempool_mailbox.clone(),
+            mempool_receiver,
+            account_reader.clone(),
         );
         let is_primary = decoded.share.is_some();
         let mempool_handle: Pin<Box<dyn Future<Output = ()> + Send>> = if is_primary {
@@ -214,6 +229,19 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             )
             .await;
 
+        // Install the account reader as soon as the stateful actor attaches
+        // its databases. Runs concurrently with engine.start so the HTTP
+        // listener can come up immediately; account lookups return 503 until
+        // the cell is populated.
+        let subscribe_fut = engine.subscribe_databases_detached();
+        let account_reader_setter = account_reader.clone();
+        let subscribe_handle = tokio::spawn(async move {
+            let db = subscribe_fut.await;
+            let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(db));
+            let _ = account_reader_setter.set(reader);
+            info!("account reader attached");
+        });
+
         info!("starting engine");
         let reporter = is_primary.then(|| mempool_mailbox.clone());
         let engine_handle = engine.start(channels, reporter);
@@ -223,6 +251,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             _ = engine_handle => tracing::warn!("engine exited"),
             _ = mempool_handle => tracing::warn!("mempool exited"),
             _ = network_handle => tracing::warn!("network exited"),
+            _ = subscribe_handle => tracing::warn!("account reader setup exited"),
         }
     });
 }

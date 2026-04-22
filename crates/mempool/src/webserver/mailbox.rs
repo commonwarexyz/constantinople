@@ -8,6 +8,17 @@ use commonware_utils::channel::fallible::AsyncFallibleExt;
 use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
 use tokio::sync::{mpsc, oneshot};
 
+/// Opaque receiver handle produced by [`Mailbox::channel`] and consumed by
+/// [`Actor::new`](super::Actor::new).
+pub struct ActorReceiver<C, P, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    pub(super) rx: mpsc::Receiver<Message<C, P, H>>,
+}
+
 pub(super) enum Message<C, P, H>
 where
     C: Digest,
@@ -60,6 +71,16 @@ where
 {
     pub(super) const fn new(sender: mpsc::Sender<Message<C, P, H>>) -> Self {
         Self { sender }
+    }
+
+    /// Creates a new mailbox backed by a bounded channel of the given
+    /// capacity, returning the mailbox handle and the receiver half.
+    ///
+    /// Use this when the mailbox needs to exist before the [`Actor`](super::Actor)
+    /// is constructed (e.g. to hand it to consensus as a transaction source).
+    pub fn channel(capacity: usize) -> (Self, ActorReceiver<C, P, H>) {
+        let (tx, rx) = mpsc::channel(capacity);
+        (Self::new(tx), ActorReceiver { rx })
     }
 
     /// Non-blocking batch submission for HTTP handlers.

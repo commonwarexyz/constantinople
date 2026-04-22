@@ -13,11 +13,14 @@
 //!   [`TransactionSource`](crate::TransactionSource) and
 //!   [`Reporter`](commonware_consensus::Reporter).
 
+mod account_reader;
+pub use account_reader::AccountReader;
+
 mod actor;
 pub use actor::{Actor, Config, TxStatus};
 
 mod mailbox;
-pub use mailbox::Mailbox;
+pub use mailbox::{ActorReceiver, Mailbox};
 
 pub mod client;
 

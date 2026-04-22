@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod run;
+mod state_reader;
 
 use clap::Parser;
 

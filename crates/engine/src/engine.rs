@@ -226,6 +226,19 @@ where
         self.stateful_mailbox.subscribe_databases().await
     }
 
+    /// Returns a standalone future that resolves to the state database once
+    /// the stateful actor has initialized it.
+    ///
+    /// Unlike [`subscribe_databases`](Self::subscribe_databases), the returned
+    /// future borrows nothing from `self`, so callers can poll it concurrently
+    /// with [`start`](Self::start) (which consumes the engine).
+    pub fn subscribe_databases_detached(
+        &self,
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H>> + Send + 'static {
+        let mailbox = self.stateful_mailbox.clone();
+        async move { mailbox.subscribe_databases().await }
+    }
+
     /// Initializes the full engine stack.
     pub async fn new(context: E, config: Config<C, M, B, V, T, I, H>) -> Self {
         let page_cache = CacheRef::from_pooler(

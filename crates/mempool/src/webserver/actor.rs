@@ -4,7 +4,7 @@
 //! batch submissions from HTTP handlers and serves proposals to the
 //! consensus layer via the [`Mailbox`].
 
-use super::{Mailbox, http, mailbox::Message};
+use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
 use commonware_consensus::marshal::Update;
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -16,10 +16,15 @@ use std::{
     collections::{HashSet, VecDeque},
     fmt::Display,
     hash::Hash,
-    sync::Arc,
+    sync::{Arc, OnceLock},
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
+
+/// Shared cell that lets the mempool answer account lookups once the
+/// validator's state database is attached. The cell is populated after engine
+/// startup; HTTP handlers return 503 until then.
+pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
 
 /// Outcome of a submitted batch, delivered when the result is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -47,8 +52,6 @@ pub struct Config<St: Strategy> {
     /// Maximum bytes returned in a single `propose` call, and the
     /// maximum accepted batch size for submissions.
     pub max_propose_bytes: usize,
-    /// Bounded channel capacity for the actor mailbox.
-    pub mailbox_size: usize,
     /// Transaction signing namespace used for signature verification.
     pub namespace: &'static [u8],
     /// Number of finalized blocks to wait before marking a proposed
@@ -108,7 +111,8 @@ where
 
 /// The mempool actor.
 ///
-/// Create via [`Actor::new`], which returns `(Actor, Mailbox)`. Call
+/// Create via [`Actor::new`], which consumes the receiver half of a mailbox
+/// created by [`Mailbox::channel`](super::Mailbox::channel). Call
 /// [`Actor::start`] to spawn the event loop and HTTP server on the runtime.
 pub struct Actor<E, C, P, H, St>
 where
@@ -128,6 +132,7 @@ where
     namespace: &'static [u8],
     drop_grace_blocks: u64,
     strategy: St,
+    account_reader: AccountReaderCell,
 }
 
 impl<E, C, P, H, St> Actor<E, C, P, H, St>
@@ -139,25 +144,33 @@ where
     H::Digest: Hash,
     St: Strategy,
 {
-    /// Creates a new mempool actor and its control [`Mailbox`].
-    pub fn new(context: E, config: Config<St>) -> (Self, Mailbox<C, P, H>) {
-        let (tx, rx) = mpsc::channel(config.mailbox_size);
-        let mailbox = Mailbox::new(tx);
-        (
-            Self {
-                context: ContextCell::new(context),
-                mailbox: mailbox.clone(),
-                rx,
-                pool: VecDeque::new(),
-                pool_bytes: 0,
-                max_pool_bytes: config.max_pool_bytes,
-                max_propose_bytes: config.max_propose_bytes,
-                namespace: config.namespace,
-                drop_grace_blocks: config.drop_grace_blocks,
-                strategy: config.strategy,
-            },
+    /// Creates a new mempool actor.
+    ///
+    /// `mailbox` is the handle previously paired with `receiver` by
+    /// [`Mailbox::channel`](super::Mailbox::channel). `account_reader` is a
+    /// shared cell populated once the validator's state database is attached;
+    /// HTTP account lookups return `503 Service Unavailable` while it is
+    /// empty.
+    pub fn new(
+        context: E,
+        config: Config<St>,
+        mailbox: Mailbox<C, P, H>,
+        receiver: ActorReceiver<C, P, H>,
+        account_reader: AccountReaderCell,
+    ) -> Self {
+        Self {
+            context: ContextCell::new(context),
             mailbox,
-        )
+            rx: receiver.rx,
+            pool: VecDeque::new(),
+            pool_bytes: 0,
+            max_pool_bytes: config.max_pool_bytes,
+            max_propose_bytes: config.max_propose_bytes,
+            namespace: config.namespace,
+            drop_grace_blocks: config.drop_grace_blocks,
+            strategy: config.strategy,
+            account_reader,
+        }
     }
 
     /// Spawns the actor event loop and HTTP server on the runtime.
@@ -186,6 +199,7 @@ where
             namespace,
             drop_grace_blocks,
             strategy,
+            account_reader,
         } = self;
 
         let app_state = Arc::new(http::AppState {
@@ -193,6 +207,7 @@ where
             namespace,
             max_batch_bytes: max_propose_bytes,
             strategy,
+            account_reader,
         });
         let app = http::router::<C, P, H, BV, St>(app_state);
         let _http_handle = context.as_present().with_label("http").spawn(|_| async {

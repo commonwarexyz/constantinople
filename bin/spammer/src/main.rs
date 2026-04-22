@@ -14,20 +14,21 @@ mod config;
 mod signer;
 mod submitter;
 
-use accounts::generate_accounts;
+use accounts::{SpamAccount, generate_accounts};
 use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Metrics as _, Runner as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
+use constantinople_mempool::webserver::client::{Client, SubmitError};
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
 use signer::sign_rounds;
 use std::{
     sync::{Arc, atomic::Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 use submitter::{Stats, ValidatorSubmitter};
-use tracing::info;
+use tracing::{info, warn};
 
 fn main() {
     let cli = Cli::parse();
@@ -120,8 +121,17 @@ fn main() {
             let strategy = strategy.clone();
             let stats = stats.clone();
             tokio::spawn(async move {
+                // Resume from the highest committed nonce across the ring so a
+                // restart after prior progress does not replay stale nonces.
+                let starting_round = fetch_starting_round(&client, i, &accounts).await;
+                if starting_round > 0 {
+                    info!(
+                        validator = i,
+                        starting_round, "resuming from committed nonce"
+                    );
+                }
                 let submitter = ValidatorSubmitter::new(client, stats, i);
-                let mut round = 0u64;
+                let mut round = starting_round;
                 loop {
                     // Sign one round: n txs, one per account, all at nonce = round.
                     let batch = sign_rounds(&strategy, &accounts, value, round, 1);
@@ -160,4 +170,45 @@ fn main() {
             );
         }
     });
+}
+
+/// Polls the validator for each account's committed nonce and returns the
+/// highest observed value. The ring signs with `nonce = round` for every
+/// account simultaneously, so using the max lets the run resume past any
+/// already-executed rounds instead of replaying them as stale submissions.
+///
+/// Retries `ServiceUnavailable` (the validator has not yet attached its state
+/// database) and transport errors with a fixed backoff so the spammer tolerates
+/// a validator that is still coming up.
+async fn fetch_starting_round(
+    client: &Client,
+    validator_index: usize,
+    accounts: &[SpamAccount],
+) -> u64 {
+    const RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+    let mut max_nonce = 0u64;
+    for account in accounts {
+        loop {
+            match client.fetch_account(&account.address).await {
+                Ok(Some(view)) => {
+                    max_nonce = max_nonce.max(view.nonce);
+                    break;
+                }
+                Ok(None) => break,
+                Err(SubmitError::ServiceUnavailable) => {
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                }
+                Err(e) => {
+                    warn!(
+                        validator = validator_index,
+                        error = %e,
+                        "nonce lookup failed, retrying"
+                    );
+                    tokio::time::sleep(RETRY_BACKOFF).await;
+                }
+            }
+        }
+    }
+    max_nonce
 }

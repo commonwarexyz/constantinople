@@ -25,7 +25,7 @@ commonware-glue.workspace = true
 commonware-codec.workspace = true
 commonware-utils.workspace = true
 commonware-macros.workspace = true
-commonware-runtime = { workspace = true, features = ["iouring"] }
+commonware-runtime.workspace = true
 commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
@@ -41,6 +41,7 @@ tracing.workspace = true
 rand_core.workspace = true
 serde_yaml.workspace = true
 tracing-subscriber.workspace = true
+futures.workspace = true
 
 [dev-dependencies]
 # Other
