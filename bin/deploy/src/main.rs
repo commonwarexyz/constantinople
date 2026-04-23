@@ -35,6 +35,10 @@ const SPAMMER_BINARY_FILE: &str = "spammer";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 
+const fn default_transaction_history_prune_cadence() -> u64 {
+    64
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartupModeConfig {
@@ -185,6 +189,7 @@ pub(crate) struct ValidatorConfig {
     rayon_threads: usize,
     http_port: u16,
     metrics_port: u16,
+    transaction_history_prune_cadence: u64,
     max_propose_bytes: usize,
     max_pool_bytes: usize,
     bootstrappers: Vec<NamedBootstrapperEntry>,

@@ -2,8 +2,9 @@ use crate::{
     ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, GenerateArgs, RemoteArgs,
     SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE,
     ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
-    default_max_propose_bytes, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, write_yaml_config,
+    default_max_propose_bytes, default_transaction_history_prune_cadence,
+    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -130,6 +131,7 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
+            transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
@@ -180,6 +182,7 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
+            transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
@@ -352,6 +355,7 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 bootstrappers: Vec::new(),

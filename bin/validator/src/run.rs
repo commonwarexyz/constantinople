@@ -22,11 +22,12 @@ use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    VOTE_CHANNEL, bootstrapper,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
+    num::NonZeroU64,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -59,6 +60,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         rayon_threads,
         http_listen,
         metrics_listen,
+        transaction_history_prune_cadence,
         json_logs,
         deployer_managed,
     } = config;
@@ -141,6 +143,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             marshal: network.register(MARSHAL_CHANNEL, quota, backlog),
             marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota, backlog),
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
+            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
         };
         let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
 
@@ -223,6 +226,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     sync_config: production_sync_config(),
                     genesis_leader: decoded.genesis_leader,
                     transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
+                    transaction_history_prune_cadence: NonZeroU64::new(
+                        transaction_history_prune_cadence,
+                    ),
                     block_codec: Default::default(),
                     bootstrapper: bootstrapper_mailbox.clone(),
                 },
@@ -235,7 +241,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // the cell is populated.
         let subscribe_fut = engine.subscribe_databases_detached();
         let account_reader_setter = account_reader.clone();
-        let subscribe_handle = tokio::spawn(async move {
+        let _account_reader_setup = tokio::spawn(async move {
             let db = subscribe_fut.await;
             let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(db));
             let _ = account_reader_setter.set(reader);
@@ -246,14 +252,33 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let reporter = is_primary.then(|| mempool_mailbox.clone());
         let engine_handle = engine.start(channels, reporter);
 
-        tokio::select! {
-            _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),
-            _ = engine_handle => tracing::warn!("engine exited"),
-            _ = mempool_handle => tracing::warn!("mempool exited"),
-            _ = network_handle => tracing::warn!("network exited"),
-            _ = subscribe_handle => tracing::warn!("account reader setup exited"),
-        }
+        wait_for_critical_task_exit(
+            bootstrapper_handle,
+            engine_handle,
+            mempool_handle,
+            network_handle,
+        )
+        .await;
     });
+}
+
+async fn wait_for_critical_task_exit<B, E, M, N>(
+    bootstrapper_handle: B,
+    engine_handle: E,
+    mempool_handle: M,
+    network_handle: N,
+) where
+    B: Future,
+    E: Future,
+    M: Future,
+    N: Future,
+{
+    tokio::select! {
+        _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),
+        _ = engine_handle => tracing::warn!("engine exited"),
+        _ = mempool_handle => tracing::warn!("mempool exited"),
+        _ = network_handle => tracing::warn!("network exited"),
+    }
 }
 
 const fn production_sync_config() -> SyncEngineConfig {
@@ -282,5 +307,33 @@ where
                 .expect("bootstrapper actor exited before selecting a state-sync target");
             StartupMode::StateSync { block }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_for_critical_task_exit;
+    use std::{future::pending, time::Duration};
+
+    #[tokio::test]
+    async fn completed_setup_task_is_not_a_runtime_exit_condition() {
+        let setup_task = tokio::spawn(async {});
+        setup_task.await.expect("setup task should complete");
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_critical_task_exit(
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+            ),
+        )
+        .await;
+
+        assert!(
+            result.is_err(),
+            "completed setup work must not terminate the validator runtime",
+        );
     }
 }

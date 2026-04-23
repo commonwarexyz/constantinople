@@ -5,7 +5,8 @@ mod properties;
 
 use crate::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
+    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use common::{
     HeightMonitorReporter, NoopReporter, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
@@ -144,6 +145,7 @@ impl EngineDefinition for TestEngineDefinition {
             (MARSHAL_CHANNEL, TEST_QUOTA),
             (MARSHAL_RESOLVER_CHANNEL, TEST_QUOTA),
             (STATE_RESOLVER_CHANNEL, TEST_QUOTA),
+            (TRANSACTION_RESOLVER_CHANNEL, TEST_QUOTA),
             (BOOTSTRAPPER_CHANNEL, TEST_QUOTA),
         ]
     }
@@ -199,6 +201,9 @@ impl EngineDefinition for TestEngineDefinition {
                     .next()
                     .expect("marshal resolver channel must exist");
                 let state_resolver = channels.next().expect("state resolver channel must exist");
+                let transaction_resolver = channels
+                    .next()
+                    .expect("transaction resolver channel must exist");
                 let bootstrapper_network =
                     channels.next().expect("bootstrapper channel must exist");
                 assert!(channels.next().is_none(), "unexpected extra channel");
@@ -256,6 +261,7 @@ impl EngineDefinition for TestEngineDefinition {
                     marshal,
                     marshal_resolver,
                     state_resolver,
+                    transaction_resolver,
                 };
 
                 let input = StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(
@@ -297,6 +303,7 @@ impl EngineDefinition for TestEngineDefinition {
                         },
                         genesis_leader,
                         transaction_namespace: TRANSACTION_NAMESPACE,
+                        transaction_history_prune_cadence: None,
                         block_codec: Default::default(),
                         bootstrapper: bootstrapper_mailbox.clone(),
                     },

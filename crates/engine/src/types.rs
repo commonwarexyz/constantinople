@@ -22,7 +22,9 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::sync::AsyncRwLock;
-use constantinople_application::consensus::Application;
+use constantinople_application::consensus::{
+    Application, TransactionHistoryDb, TransactionHistoryResolverMailbox,
+};
 use constantinople_primitives::{Account, Address, Block, Sealed};
 use std::sync::Arc;
 
@@ -51,6 +53,12 @@ pub(crate) type StateResolverMailbox<E, H> = commonware_glue::stateful::db::p2p:
     <StateSyncDb<E, H> as SyncResolver>::Digest,
 >;
 
+pub type TransactionDb<E, H> = TransactionHistoryDb<E, H>;
+
+pub type TransactionSyncDb<E, H> = Arc<AsyncRwLock<TransactionDb<E, H>>>;
+
+pub(crate) type TransactionResolverMailbox<E, H> = TransactionHistoryResolverMailbox<E, H>;
+
 pub(crate) type App<H, P, V, I, B, T> =
     Application<H, Commitment, ThresholdScheme<P, V>, P, I, B, T>;
 
@@ -59,8 +67,12 @@ pub(crate) type AppMailbox<E, H, P, V, I, B, T> =
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, B, T> =
-    Stateful<E, App<H, P, V, I, B, T>, EngineMarshalMailbox<H, P, V>, StateResolverMailbox<E, H>>;
+pub(crate) type StatefulApp<E, H, P, V, I, B, T> = Stateful<
+    E,
+    App<H, P, V, I, B, T>,
+    EngineMarshalMailbox<H, P, V>,
+    (StateResolverMailbox<E, H>, TransactionResolverMailbox<E, H>),
+>;
 
 pub(crate) type MarshaledApp<E, H, P, V, I, B, T> = Marshaled<
     E,

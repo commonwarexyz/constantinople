@@ -23,6 +23,10 @@ pub(crate) const fn default_metrics_port() -> u16 {
     9090
 }
 
+pub(crate) const fn default_transaction_history_prune_cadence() -> u64 {
+    64
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupModeConfig {
@@ -58,6 +62,8 @@ pub struct ValidatorConfig {
     pub http_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    #[serde(default = "default_transaction_history_prune_cadence")]
+    pub transaction_history_prune_cadence: u64,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
 }
 
@@ -107,6 +113,7 @@ pub struct LoadedConfig {
     pub rayon_threads: usize,
     pub http_listen: SocketAddr,
     pub metrics_listen: SocketAddr,
+    pub transaction_history_prune_cadence: u64,
     pub json_logs: bool,
     pub deployer_managed: bool,
 }
@@ -201,6 +208,7 @@ fn decode_with_network(
         rayon_threads: config.rayon_threads,
         http_listen,
         metrics_listen,
+        transaction_history_prune_cadence: config.transaction_history_prune_cadence,
         json_logs,
         deployer_managed: json_logs,
     }
@@ -335,8 +343,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 #[cfg(test)]
 mod tests {
     use super::{
-        NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig, load_deployer_config,
-        load_local_config,
+        NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
+        default_transaction_history_prune_cadence, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -449,6 +457,7 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
                 bootstrappers,
             }
         }
@@ -477,6 +486,7 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
                 bootstrappers,
             }
         }
@@ -532,6 +542,10 @@ mod tests {
         assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
+        assert_eq!(
+            loaded.transaction_history_prune_cadence,
+            default_transaction_history_prune_cadence()
+        );
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,
@@ -594,6 +608,10 @@ hosts:
         assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
+        assert_eq!(
+            loaded.transaction_history_prune_cadence,
+            default_transaction_history_prune_cadence()
+        );
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,

@@ -37,8 +37,7 @@ where
 
     let addresses: Vec<_> = addresses.into_iter().collect();
     let keys: Vec<_> = addresses.iter().collect();
-    let db = batch.lock().await;
-    let values = batch.batch().get_many(&keys, &*db).await?;
+    let values = batch.get_many(&keys).await?;
 
     let accounts = addresses
         .into_iter()

@@ -86,3 +86,20 @@ tracing-subscriber = "0.3"
 [profile.samply]
 inherits = "release"
 debug = true
+
+[patch."https://github.com/commonwarexyz/monorepo.git"]
+commonware-p2p = { path = "../commonware/p2p" }
+commonware-glue = { path = "../commonware/glue" }
+commonware-math = { path = "../commonware/math" }
+commonware-codec = { path = "../commonware/codec" }
+commonware-utils = { path = "../commonware/utils" }
+commonware-coding = { path = "../commonware/coding" }
+commonware-macros = { path = "../commonware/macros" }
+commonware-runtime = { path = "../commonware/runtime" }
+commonware-storage = { path = "../commonware/storage" }
+commonware-deployer = { path = "../commonware/deployer" }
+commonware-parallel = { path = "../commonware/parallel" }
+commonware-resolver = { path = "../commonware/resolver" }
+commonware-broadcast = { path = "../commonware/broadcast" }
+commonware-consensus = { path = "../commonware/consensus" }
+commonware-cryptography = { path = "../commonware/cryptography" }

@@ -7,7 +7,7 @@
 //! - filtering or rejecting invalid signatures before execution
 //! - loading processor state from speculative database batches
 //! - executing transaction slices against that loaded state
-//! - finalizing state roots while carrying placeholder transaction history
+//! - finalizing state and transaction-history roots together
 //! - verifying and applying certified blocks
 //!
 //! The execution boundary is intentionally narrow: the [`Application`] owns
@@ -26,7 +26,7 @@ use commonware_cryptography::{
 };
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
-    db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized},
+    db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized, p2p},
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
@@ -40,6 +40,7 @@ use commonware_storage::{
             unordered::{Update as UnorderedUpdate, fixed},
             value::FixedEncoding,
         },
+        keyless::fixed as keyless_fixed,
         sync::Target,
     },
     translator::EightCap,
@@ -55,6 +56,7 @@ use rand::Rng;
 use rand_core::CryptoRngCore;
 use std::{
     marker::PhantomData,
+    num::NonZeroU64,
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -73,6 +75,26 @@ const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 
+pub type TransactionHistoryDb<E, H> = keyless_fixed::Db<mmr::Family, E, <H as Hasher>::Digest, H>;
+
+pub type TransactionHistoryOperation<H> =
+    keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
+
+pub type TransactionHistoryTarget<D> = Target<mmr::Family, D>;
+
+pub type TransactionHistoryResolverMailbox<E, H> = p2p::Mailbox<
+    TransactionHistoryDb<E, H>,
+    mmr::Family,
+    TransactionHistoryOperation<H>,
+    <H as Hasher>::Digest,
+>;
+
+/// Shared QMDB handle for the append-only transaction history database.
+type TransactionDatabase<E, H> = Arc<AsyncRwLock<TransactionHistoryDb<E, H>>>;
+
+/// The backing databases owned by the application.
+type Databases<E, H, T> = (StateDatabase<E, H, T>, TransactionDatabase<E, H>);
+
 /// Unmerkleized application state batch used for processor read-through.
 type StateBatch<E, H, T> = AnyUnmerkleized<
     mmr::Family,
@@ -82,6 +104,12 @@ type StateBatch<E, H, T> = AnyUnmerkleized<
     H,
     UnorderedUpdate<Address, FixedEncoding<Account>>,
 >;
+
+type TransactionBatch<E, H> = <TransactionDatabase<E, H> as DatabaseSet<E>>::Unmerkleized;
+
+type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
+
+type TransactionMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
 
 /// Writes a changeset of account updates to a state batch.
 fn apply_changeset<E, H>(
@@ -97,14 +125,76 @@ where
     })
 }
 
+fn apply_transaction_digests<E, H, P>(
+    batch: TransactionBatch<E, H>,
+    transactions: &[VerifiedTransaction<P, H>],
+) -> TransactionBatch<E, H>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+{
+    transactions.iter().fold(batch, |batch, transaction| {
+        batch.append(*transaction.message_digest())
+    })
+}
+
+fn transaction_range_to_header(
+    range: commonware_utils::range::NonEmptyRange<mmr::Location>,
+) -> commonware_utils::range::NonEmptyRange<u64> {
+    non_empty_range!(*range.start(), *range.end())
+}
+
+fn header_range_to_target<D>(
+    root: D,
+    range: commonware_utils::range::NonEmptyRange<u64>,
+) -> TransactionHistoryTarget<D>
+where
+    D: Digest,
+{
+    TransactionHistoryTarget {
+        root,
+        range: non_empty_range!(
+            mmr::Location::new(range.start()),
+            mmr::Location::new(range.end())
+        ),
+    }
+}
+
+fn block_transaction_prune_due(height: u64, cadence: Option<NonZeroU64>) -> bool {
+    cadence.is_some_and(|cadence| height % cadence.get() == 0)
+}
+
+fn parent_transactions_inactivity_floor<C, P, H>(parent: &SealedBlock<C, P, H>) -> mmr::Location
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let parent_body_len = u64::try_from(parent.body.len()).expect("transaction count exceeded u64");
+    let floor = parent
+        .header
+        .transactions_range
+        .end()
+        .checked_sub(parent_body_len)
+        .and_then(|end| end.checked_sub(1))
+        .expect("parent transaction range must include the parent commit");
+    mmr::Location::new(floor)
+}
+
 /// Core constantinople application.
 ///
 /// This type implements the consensus application trait on top of the
 /// processor and the managed state databases.
-pub struct Application<H, C, S, P, I, B, St> {
+pub struct Application<H, C, S, P, I, B, St>
+where
+    H: Hasher,
+{
     strategy: St,
     genesis_leader: P,
     transaction_namespace: &'static [u8],
+    genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
+    transaction_history_prune_cadence: Option<NonZeroU64>,
     proposed_transactions: Counter,
     _marker: PhantomData<(H, C, S, I, B)>,
 }
@@ -120,6 +210,8 @@ where
             strategy: self.strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
+            genesis_transactions_target: self.genesis_transactions_target.clone(),
+            transaction_history_prune_cadence: self.transaction_history_prune_cadence,
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
@@ -144,6 +236,8 @@ where
         strategy: St,
         genesis_leader: P,
         transaction_namespace: &'static [u8],
+        genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
+        transaction_history_prune_cadence: Option<NonZeroU64>,
     ) -> Self {
         let proposed_transactions = Counter::default();
         context.register(
@@ -156,6 +250,8 @@ where
             strategy,
             genesis_leader,
             transaction_namespace,
+            genesis_transactions_target,
+            transaction_history_prune_cadence,
             proposed_transactions,
             _marker: PhantomData,
         }
@@ -217,6 +313,22 @@ where
             .checked_add(Duration::from_millis(block_timestamp_ms))
             .expect("block timestamp exceeded maximum")
     }
+
+    async fn finalize_execution<E>(
+        &self,
+        state_batch: StateBatch<E, H, EightCap>,
+        transaction_batch: TransactionBatch<E, H>,
+    ) -> Result<
+        (StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>),
+        commonware_storage::qmdb::Error<mmr::Family>,
+    >
+    where
+        E: Storage + Clock + Metrics,
+    {
+        let (state_merkleized, transaction_merkleized) =
+            futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
+        Ok((state_merkleized?, transaction_merkleized?))
+    }
 }
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<H, C, S, P, I, B, St>
@@ -233,18 +345,24 @@ where
     type SigningScheme = S;
     type Context = Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = StateDatabase<E, H, EightCap>;
+    type Databases = Databases<E, H, EightCap>;
     type InputProvider = I;
 
     /// Returns the sync targets required to fetch the block's state.
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
-        Target {
-            root: block.header.state_root,
-            range: non_empty_range!(
-                mmr::Location::new(block.header.state_range.start()),
-                mmr::Location::new(block.header.state_range.end())
+        (
+            Target {
+                root: block.header.state_root,
+                range: non_empty_range!(
+                    mmr::Location::new(block.header.state_range.start()),
+                    mmr::Location::new(block.header.state_range.end())
+                ),
+            },
+            header_range_to_target(
+                block.header.transactions_root,
+                block.header.transactions_range.clone(),
             ),
-        }
+        )
     }
 
     /// Builds the genesis block.
@@ -252,7 +370,12 @@ where
     /// The genesis block always uses timestamp `0` and the configured genesis
     /// leader.
     async fn genesis(&mut self) -> Self::Block {
-        genesis_block(&mut H::default(), self.genesis_leader.clone(), 0)
+        genesis_block(
+            &mut H::default(),
+            self.genesis_leader.clone(),
+            0,
+            self.genesis_transactions_target.clone(),
+        )
     }
 
     /// Proposes the next block from the mempool and current ancestry.
@@ -275,8 +398,10 @@ where
         let body = input.propose(&parent.header, &context).await;
         let input_ms = input_started_at.elapsed().as_millis();
 
+        let (state_batches, transaction_batch) = batches;
+
         let load_state_started_at = Instant::now();
-        let state = load_state(&batches, &body)
+        let state = load_state(&state_batches, &body)
             .await
             .expect("proposal state loading must succeed");
         let load_state_ms = load_state_started_at.elapsed().as_millis();
@@ -291,11 +416,13 @@ where
 
         self.proposed_transactions.inc_by(valid.len() as u64);
 
-        let state_batch = apply_changeset(batches, &changeset);
+        let state_batch = apply_changeset(state_batches, &changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &valid)
+            .with_inactivity_floor(parent_transactions_inactivity_floor(&parent));
 
         let finalize_started_at = Instant::now();
-        let state_merkleized = state_batch
-            .merkleize()
+        let (state_merkleized, transaction_merkleized) = self
+            .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed");
         let finalize_ms = finalize_started_at.elapsed().as_millis();
@@ -310,8 +437,11 @@ where
                 *state_merkleized.inactivity_floor(),
                 *state_merkleized.size()
             ),
-            transactions_root: H::Digest::EMPTY,
-            transactions_range: non_empty_range!(0, 1),
+            transactions_root: transaction_merkleized.root(),
+            transactions_range: transaction_range_to_header(non_empty_range!(
+                transaction_merkleized.inactivity_floor(),
+                transaction_merkleized.size()
+            )),
         };
         let body = valid
             .into_iter()
@@ -335,7 +465,7 @@ where
 
         Some(Proposed {
             block,
-            merkleized: state_merkleized,
+            merkleized: (state_merkleized, transaction_merkleized),
         })
     }
 
@@ -379,8 +509,10 @@ where
         runtime.sleep_until(deadline).await;
         let sleep_ms = sleep_started_at.elapsed().as_millis();
 
+        let (state_batches, transaction_batch) = batches;
+
         let load_state_started_at = Instant::now();
-        let state = load_state(&batches, &verified_body)
+        let state = load_state(&state_batches, &verified_body)
             .await
             .expect("block state loading during verification must succeed");
         let load_state_ms = load_state_started_at.elapsed().as_millis();
@@ -395,11 +527,13 @@ where
         };
         let execute_ms = execute_started_at.elapsed().as_millis();
 
-        let state_batch = apply_changeset(batches, &changeset);
+        let state_batch = apply_changeset(state_batches, &changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &verified_body)
+            .with_inactivity_floor(parent_transactions_inactivity_floor(&parent));
 
         let finalize_started_at = Instant::now();
-        let state_merkleized = state_batch
-            .merkleize()
+        let (state_merkleized, transaction_merkleized) = self
+            .finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization during verification must succeed");
         let finalize_ms = finalize_started_at.elapsed().as_millis();
@@ -423,17 +557,21 @@ where
             );
             return None;
         }
-        if header.transactions_root != H::Digest::EMPTY {
+        if transaction_merkleized.root() != header.transactions_root {
             warn!(
                 height = header.height,
-                "verify rejected: unexpected transactions root"
+                "verify rejected: transaction root mismatch"
             );
             return None;
         }
-        if header.transactions_range != non_empty_range!(0, 1) {
+        if transaction_range_to_header(non_empty_range!(
+            transaction_merkleized.inactivity_floor(),
+            transaction_merkleized.size()
+        )) != header.transactions_range
+        {
             warn!(
                 height = header.height,
-                "verify rejected: unexpected transactions range"
+                "verify rejected: transaction range mismatch"
             );
             return None;
         }
@@ -452,7 +590,7 @@ where
             total_ms = verify_started_at.elapsed().as_millis(),
             "verified block"
         );
-        Some(state_merkleized)
+        Some((state_merkleized, transaction_merkleized))
     }
 
     /// Applies a certified block to speculative batches and returns merkleized state.
@@ -476,24 +614,51 @@ where
             .verify_transactions(&mut runtime, block.body.clone())
             .expect("certified block contained an invalid signature");
 
-        let state = load_state(&batches, &verified_body)
+        let (state_batches, transaction_batch) = batches;
+
+        let state = load_state(&state_batches, &verified_body)
             .await
             .expect("state loading must succeed for certified apply");
         let changeset = executor::execute(&state, &verified_body)
             .expect("certified block contained a statically invalid transaction");
-        let state_batch = apply_changeset(batches, &changeset);
-        state_batch
-            .merkleize()
+        let state_batch = apply_changeset(state_batches, &changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &verified_body)
+            .with_inactivity_floor(mmr::Location::new(block.header.transactions_range.start()));
+        self.finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed")
+    }
+
+    async fn finalized(
+        &mut self,
+        _context: (E, Self::Context),
+        block: &Self::Block,
+        databases: &Self::Databases,
+    ) {
+        if !block_transaction_prune_due(block.header.height, self.transaction_history_prune_cadence)
+        {
+            return;
+        }
+
+        let mut transaction_db = databases.1.write().await;
+        let prune_to = transaction_db.inactivity_floor_loc();
+        transaction_db
+            .prune(prune_to)
+            .await
+            .expect("transaction history prune must succeed");
     }
 }
 
 /// Creates the genesis block.
 ///
-/// The genesis block starts with empty state, empty transaction-history
-/// placeholders, and the provided leader and timestamp.
-pub fn genesis_block<C, P, H>(hasher: &mut H, leader: P, timestamp: u64) -> SealedBlock<C, P, H>
+/// The genesis block starts with empty state, the initialized transaction
+/// history target, and the provided leader and timestamp.
+pub fn genesis_block<C, P, H>(
+    hasher: &mut H,
+    leader: P,
+    timestamp: u64,
+    transactions_target: TransactionHistoryTarget<H::Digest>,
+) -> SealedBlock<C, P, H>
 where
     C: Digest,
     P: PublicKey,
@@ -510,9 +675,100 @@ where
         timestamp,
         state_root: H::Digest::EMPTY,
         state_range: non_empty_range!(0, 1),
-        transactions_root: H::Digest::EMPTY,
-        transactions_range: non_empty_range!(0, 1),
+        transactions_root: transactions_target.root,
+        transactions_range: transaction_range_to_header(transactions_target.range),
     };
 
     Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TransactionHistoryTarget, block_transaction_prune_due, genesis_block,
+        parent_transactions_inactivity_floor,
+    };
+    use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
+    use commonware_utils::non_empty_range;
+    use constantinople_primitives::{Address, Block, Sealable, Signable, Transaction};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn parent_inactivity_floor_skips_the_parent_commit() {
+        let leader = ed25519::PrivateKey::from_seed(7);
+        let recipient = ed25519::PrivateKey::from_seed(8);
+        let genesis_target = TransactionHistoryTarget {
+            root: sha256::Digest::EMPTY,
+            range: non_empty_range!(
+                commonware_storage::mmr::Location::new(0),
+                commonware_storage::mmr::Location::new(1)
+            ),
+        };
+        let mut header = genesis_block::<sha256::Digest, _, sha256::Sha256>(
+            &mut sha256::Sha256::default(),
+            leader.public_key(),
+            0,
+            genesis_target,
+        )
+        .into_inner()
+        .header;
+        header.transactions_range = non_empty_range!(5, 10);
+
+        let to = Address::from_public_key(&mut sha256::Sha256::default(), &recipient.public_key());
+        let parent = Block::<sha256::Digest, _, sha256::Sha256>::new(
+            header,
+            (0..3)
+                .map(|nonce| {
+                    Transaction::new(
+                        leader.public_key(),
+                        to,
+                        NonZeroU64::new(nonce + 1).expect("test value should be non-zero"),
+                        nonce,
+                    )
+                    .seal_and_sign(
+                        &leader,
+                        constantinople_primitives::TRANSACTION_NAMESPACE,
+                        &mut sha256::Sha256::default(),
+                    )
+                })
+                .collect(),
+        )
+        .seal(&mut sha256::Sha256::default());
+
+        assert_eq!(
+            parent_transactions_inactivity_floor(&parent),
+            commonware_storage::mmr::Location::new(6)
+        );
+    }
+
+    #[test]
+    fn block_prune_due_respects_the_configured_cadence() {
+        let cadence = NonZeroU64::new(4);
+        assert!(!block_transaction_prune_due(3, cadence));
+        assert!(block_transaction_prune_due(4, cadence));
+        assert!(!block_transaction_prune_due(5, cadence));
+        assert!(!block_transaction_prune_due(4, None));
+    }
+
+    #[test]
+    fn genesis_block_uses_the_initialized_transaction_target() {
+        let leader = ed25519::PrivateKey::from_seed(11).public_key();
+        let target = TransactionHistoryTarget {
+            root: sha256::Sha256::hash(b"genesis"),
+            range: non_empty_range!(
+                commonware_storage::mmr::Location::new(0),
+                commonware_storage::mmr::Location::new(1)
+            ),
+        };
+
+        let block = genesis_block::<sha256::Digest, _, sha256::Sha256>(
+            &mut sha256::Sha256::default(),
+            leader,
+            0,
+            target.clone(),
+        );
+
+        assert_eq!(block.header.transactions_root, target.root);
+        assert_eq!(block.header.transactions_range, non_empty_range!(0, 1));
+    }
 }
