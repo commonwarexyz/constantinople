@@ -18,6 +18,7 @@
 pub mod bootstrapper;
 pub mod types;
 
+mod compact_resolver;
 mod engine;
 
 #[doc(inline)]

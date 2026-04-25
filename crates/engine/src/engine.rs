@@ -45,7 +45,8 @@ use commonware_runtime::{
 use commonware_storage::{
     archive::immutable,
     journal::contiguous::fixed::Config as FixedJournalConfig,
-    mmr::{self, journaled::Config as MmrConfig},
+    merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
+    mmr,
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
@@ -182,7 +183,7 @@ where
     blocker: B,
     state_resolver: qmdb_resolver::Actor<E, C::PublicKey, M, B, mmr::Family, StateDb<E, H>>,
     transaction_resolver:
-        qmdb_resolver::Actor<E, C::PublicKey, M, B, mmr::Family, TransactionDb<E, H>>,
+        crate::compact_resolver::Actor<E, C::PublicKey, M, B, mmr::Family, TransactionDb<E, H>, H>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, T>,
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, T>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, T>,
@@ -283,23 +284,29 @@ where
                     max_serve_ops: NZU64!(4096),
                 },
             );
-        let (transaction_resolver, transaction_sync_resolver) =
-            qmdb_resolver::Actor::<_, C::PublicKey, _, _, _, TransactionDb<E, H>>::new(
-                context.with_label("transaction_resolver"),
-                qmdb_resolver::Config {
-                    peer_provider: config.manager.clone(),
-                    blocker: config.blocker.clone(),
-                    database: None,
-                    mailbox_size: MAILBOX_SIZE,
-                    me: Some(config.signer.public_key()),
-                    initial: STATE_SYNC_INITIAL,
-                    timeout: STATE_SYNC_TIMEOUT,
-                    fetch_retry_timeout: STATE_SYNC_RETRY,
-                    priority_requests: false,
-                    priority_responses: false,
-                    max_serve_ops: NZU64!(4096),
-                },
-            );
+        let (transaction_resolver, transaction_sync_resolver) = crate::compact_resolver::Actor::<
+            _,
+            C::PublicKey,
+            _,
+            _,
+            _,
+            TransactionDb<E, H>,
+            H,
+        >::new(
+            context.with_label("transaction_resolver"),
+            crate::compact_resolver::Config {
+                peer_provider: config.manager.clone(),
+                blocker: config.blocker.clone(),
+                database: None,
+                mailbox_size: MAILBOX_SIZE,
+                me: Some(config.signer.public_key()),
+                initial: STATE_SYNC_INITIAL,
+                timeout: STATE_SYNC_TIMEOUT,
+                fetch_retry_timeout: STATE_SYNC_RETRY,
+                priority_requests: false,
+                priority_responses: false,
+            },
+        );
 
         let (finalizations_by_height, finalized_blocks) = futures::join!(
             init_finalizations_archive::<E, H, C::PublicKey, V>(
@@ -357,11 +364,8 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
-        let transaction_db_config = transaction_db_config(
-            &config.partition_prefix,
-            &storage_page_cache,
-            merkle_thread_pool.as_ref(),
-        );
+        let transaction_db_config =
+            transaction_db_config(&config.partition_prefix, merkle_thread_pool.as_ref());
         let genesis_transaction_db = TransactionDb::<E, H>::init(
             context.with_label("genesis_transactions"),
             transaction_db_config.clone(),
@@ -683,23 +687,13 @@ fn state_db_config(
 
 fn transaction_db_config(
     partition_prefix: &str,
-    page_cache: &CacheRef,
     thread_pool: Option<&ThreadPool>,
-) -> keyless_fixed::Config {
-    keyless_fixed::Config {
-        merkle: MmrConfig {
-            journal_partition: format!("{partition_prefix}-transactions-journal"),
-            metadata_partition: format!("{partition_prefix}-transactions-metadata"),
-            items_per_blob: ITEMS_PER_BLOB,
-            write_buffer: DB_WRITE_BUFFER,
+) -> keyless_fixed::CompactConfig {
+    keyless_fixed::CompactConfig {
+        merkle: CompactMerkleConfig {
+            partition: format!("{partition_prefix}-transactions-merkle"),
             thread_pool: thread_pool.cloned(),
-            page_cache: page_cache.clone(),
         },
-        log: FixedJournalConfig {
-            partition: format!("{partition_prefix}-transactions-log"),
-            items_per_blob: ITEMS_PER_BLOB,
-            page_cache: page_cache.clone(),
-            write_buffer: DB_WRITE_BUFFER,
-        },
+        commit_codec_config: (),
     }
 }

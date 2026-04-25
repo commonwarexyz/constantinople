@@ -293,6 +293,7 @@ mod tests {
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, RemoteArgs, STORAGE_CLASS, StartupModeConfig,
         VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        default_transaction_history_prune_cadence,
     };
     use std::path::PathBuf;
 

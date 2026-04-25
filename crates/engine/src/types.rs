@@ -16,14 +16,10 @@ use commonware_consensus::{
 };
 use commonware_cryptography::certificate::ConstantProvider;
 use commonware_glue::stateful::Stateful;
-use commonware_storage::{
-    mmr,
-    qmdb::{any::unordered::fixed, sync::resolver::Resolver as SyncResolver},
-    translator::EightCap,
-};
+use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
 use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
-    Application, TransactionHistoryDb, TransactionHistoryResolverMailbox,
+    Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
 use constantinople_primitives::{Account, Address, Block, Sealed};
 use std::sync::Arc;
@@ -49,15 +45,20 @@ pub type StateSyncDb<E, H> = Arc<AsyncRwLock<StateDb<E, H>>>;
 pub(crate) type StateResolverMailbox<E, H> = commonware_glue::stateful::db::p2p::Mailbox<
     StateDb<E, H>,
     mmr::Family,
-    <StateSyncDb<E, H> as SyncResolver>::Op,
-    <StateSyncDb<E, H> as SyncResolver>::Digest,
+    <StateSyncDb<E, H> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
+    <StateSyncDb<E, H> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
 >;
 
 pub type TransactionDb<E, H> = TransactionHistoryDb<E, H>;
 
 pub type TransactionSyncDb<E, H> = Arc<AsyncRwLock<TransactionDb<E, H>>>;
 
-pub(crate) type TransactionResolverMailbox<E, H> = TransactionHistoryResolverMailbox<E, H>;
+pub(crate) type TransactionResolverMailbox<E, H> = crate::compact_resolver::Mailbox<
+    TransactionDb<E, H>,
+    mmr::Family,
+    TransactionHistoryOperation<H>,
+    H,
+>;
 
 pub(crate) type App<H, P, V, I, B, T> =
     Application<H, Commitment, ThresholdScheme<P, V>, P, I, B, T>;

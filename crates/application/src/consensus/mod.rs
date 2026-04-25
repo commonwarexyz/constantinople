@@ -26,7 +26,7 @@ use commonware_cryptography::{
 };
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
-    db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized, p2p},
+    db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
@@ -41,7 +41,7 @@ use commonware_storage::{
             value::FixedEncoding,
         },
         keyless::fixed as keyless_fixed,
-        sync::Target,
+        sync::{Target, compact::Target as CompactTarget},
     },
     translator::EightCap,
 };
@@ -75,19 +75,13 @@ const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 /// Shared QMDB handle for the application state database.
 type StateDatabase<E, H, T> = Arc<AsyncRwLock<fixed::Db<mmr::Family, E, Address, Account, H, T>>>;
 
-pub type TransactionHistoryDb<E, H> = keyless_fixed::Db<mmr::Family, E, <H as Hasher>::Digest, H>;
+pub type TransactionHistoryDb<E, H> =
+    keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H>;
 
 pub type TransactionHistoryOperation<H> =
     keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
 
-pub type TransactionHistoryTarget<D> = Target<mmr::Family, D>;
-
-pub type TransactionHistoryResolverMailbox<E, H> = p2p::Mailbox<
-    TransactionHistoryDb<E, H>,
-    mmr::Family,
-    TransactionHistoryOperation<H>,
-    <H as Hasher>::Digest,
->;
+pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
 type TransactionDatabase<E, H> = Arc<AsyncRwLock<TransactionHistoryDb<E, H>>>;
@@ -139,12 +133,6 @@ where
     })
 }
 
-fn transaction_range_to_header(
-    range: commonware_utils::range::NonEmptyRange<mmr::Location>,
-) -> commonware_utils::range::NonEmptyRange<u64> {
-    non_empty_range!(*range.start(), *range.end())
-}
-
 fn header_range_to_target<D>(
     root: D,
     range: commonware_utils::range::NonEmptyRange<u64>,
@@ -154,15 +142,8 @@ where
 {
     TransactionHistoryTarget {
         root,
-        range: non_empty_range!(
-            mmr::Location::new(range.start()),
-            mmr::Location::new(range.end())
-        ),
+        leaf_count: mmr::Location::new(range.end()),
     }
-}
-
-fn block_transaction_prune_due(height: u64, cadence: Option<NonZeroU64>) -> bool {
-    cadence.is_some_and(|cadence| height % cadence.get() == 0)
 }
 
 fn parent_transactions_inactivity_floor<C, P, H>(parent: &SealedBlock<C, P, H>) -> mmr::Location
@@ -180,6 +161,27 @@ where
         .and_then(|end| end.checked_sub(1))
         .expect("parent transaction range must include the parent commit");
     mmr::Location::new(floor)
+}
+
+fn child_transactions_range<C, P, H>(
+    parent: &SealedBlock<C, P, H>,
+    transaction_count: usize,
+) -> commonware_utils::range::NonEmptyRange<u64>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    let transaction_count =
+        u64::try_from(transaction_count).expect("transaction count exceeded u64");
+    let end = parent
+        .header
+        .transactions_range
+        .end()
+        .checked_add(transaction_count)
+        .and_then(|end| end.checked_add(1))
+        .expect("transaction history size exceeded u64");
+    non_empty_range!(*parent_transactions_inactivity_floor(parent), end)
 }
 
 /// Core constantinople application.
@@ -419,6 +421,7 @@ where
         let state_batch = apply_changeset(state_batches, &changeset);
         let transaction_batch = apply_transaction_digests(transaction_batch, &valid)
             .with_inactivity_floor(parent_transactions_inactivity_floor(&parent));
+        let transactions_range = child_transactions_range(&parent, valid.len());
 
         let finalize_started_at = Instant::now();
         let (state_merkleized, transaction_merkleized) = self
@@ -438,10 +441,7 @@ where
                 *state_merkleized.size()
             ),
             transactions_root: transaction_merkleized.root(),
-            transactions_range: transaction_range_to_header(non_empty_range!(
-                transaction_merkleized.inactivity_floor(),
-                transaction_merkleized.size()
-            )),
+            transactions_range,
         };
         let body = valid
             .into_iter()
@@ -530,6 +530,7 @@ where
         let state_batch = apply_changeset(state_batches, &changeset);
         let transaction_batch = apply_transaction_digests(transaction_batch, &verified_body)
             .with_inactivity_floor(parent_transactions_inactivity_floor(&parent));
+        let transactions_range = child_transactions_range(&parent, verified_body.len());
 
         let finalize_started_at = Instant::now();
         let (state_merkleized, transaction_merkleized) = self
@@ -564,11 +565,7 @@ where
             );
             return None;
         }
-        if transaction_range_to_header(non_empty_range!(
-            transaction_merkleized.inactivity_floor(),
-            transaction_merkleized.size()
-        )) != header.transactions_range
-        {
+        if transactions_range != header.transactions_range {
             warn!(
                 height = header.height,
                 "verify rejected: transaction range mismatch"
@@ -628,25 +625,6 @@ where
             .await
             .expect("database merkleization must succeed")
     }
-
-    async fn finalized(
-        &mut self,
-        _context: (E, Self::Context),
-        block: &Self::Block,
-        databases: &Self::Databases,
-    ) {
-        if !block_transaction_prune_due(block.header.height, self.transaction_history_prune_cadence)
-        {
-            return;
-        }
-
-        let mut transaction_db = databases.1.write().await;
-        let prune_to = transaction_db.inactivity_floor_loc();
-        transaction_db
-            .prune(prune_to)
-            .await
-            .expect("transaction history prune must succeed");
-    }
 }
 
 /// Creates the genesis block.
@@ -676,7 +654,7 @@ where
         state_root: H::Digest::EMPTY,
         state_range: non_empty_range!(0, 1),
         transactions_root: transactions_target.root,
-        transactions_range: transaction_range_to_header(transactions_target.range),
+        transactions_range: non_empty_range!(0, *transactions_target.leaf_count),
     };
 
     Block::<C, P, H>::new(header, Vec::new()).seal(hasher)
@@ -684,10 +662,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        TransactionHistoryTarget, block_transaction_prune_due, genesis_block,
-        parent_transactions_inactivity_floor,
-    };
+    use super::{TransactionHistoryTarget, genesis_block, parent_transactions_inactivity_floor};
     use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{Address, Block, Sealable, Signable, Transaction};
@@ -699,10 +674,7 @@ mod tests {
         let recipient = ed25519::PrivateKey::from_seed(8);
         let genesis_target = TransactionHistoryTarget {
             root: sha256::Digest::EMPTY,
-            range: non_empty_range!(
-                commonware_storage::mmr::Location::new(0),
-                commonware_storage::mmr::Location::new(1)
-            ),
+            leaf_count: commonware_storage::mmr::Location::new(1),
         };
         let mut header = genesis_block::<sha256::Digest, _, sha256::Sha256>(
             &mut sha256::Sha256::default(),
@@ -742,23 +714,11 @@ mod tests {
     }
 
     #[test]
-    fn block_prune_due_respects_the_configured_cadence() {
-        let cadence = NonZeroU64::new(4);
-        assert!(!block_transaction_prune_due(3, cadence));
-        assert!(block_transaction_prune_due(4, cadence));
-        assert!(!block_transaction_prune_due(5, cadence));
-        assert!(!block_transaction_prune_due(4, None));
-    }
-
-    #[test]
     fn genesis_block_uses_the_initialized_transaction_target() {
         let leader = ed25519::PrivateKey::from_seed(11).public_key();
         let target = TransactionHistoryTarget {
             root: sha256::Sha256::hash(b"genesis"),
-            range: non_empty_range!(
-                commonware_storage::mmr::Location::new(0),
-                commonware_storage::mmr::Location::new(1)
-            ),
+            leaf_count: commonware_storage::mmr::Location::new(1),
         };
 
         let block = genesis_block::<sha256::Digest, _, sha256::Sha256>(
