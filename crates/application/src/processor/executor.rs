@@ -1,6 +1,7 @@
 //! Transaction execution engine for simple transfers.
 
 use super::state::{Overlay, State};
+use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_primitives::{Account, SignedTransaction};
 
@@ -61,6 +62,28 @@ where
 
     for transaction in transactions {
         if !execute_transfer(&mut overlay, transaction) {
+            return None;
+        }
+    }
+
+    Some(overlay.into_changeset())
+}
+
+/// Executes lazily decoded block transactions.
+///
+/// Returns `None` if any transaction fails to decode or execute.
+pub fn execute_lazy<H, PK>(
+    state: &State<PK>,
+    transactions: &[Lazy<SignedTransaction<PK, H>>],
+) -> Option<Changeset<PK>>
+where
+    H: Hasher,
+    PK: PublicKey,
+{
+    let mut overlay = Overlay::new(state);
+
+    for transaction in transactions {
+        if !execute_transfer(&mut overlay, transaction.get()?) {
             return None;
         }
     }

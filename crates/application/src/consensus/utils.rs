@@ -2,6 +2,7 @@
 
 use super::StateBatch;
 use crate::processor::state::State;
+use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
@@ -31,6 +32,48 @@ where
         public_keys.insert(sender.clone());
         public_keys.insert(transaction.value().to.clone());
     }
+
+    load_accounts(batch, public_keys).await
+}
+
+/// Loads the accounts needed by lazily decoded `transactions`.
+///
+/// Returns `Ok(None)` if any transaction fails to decode.
+pub async fn load_lazy_state<E, H, P, T>(
+    batch: &StateBatch<E, H, P, T>,
+    transactions: &[Lazy<SignedTransaction<P, H>>],
+) -> Result<Option<State<P>>, StorageError<mmr::Family>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    T: Translator,
+{
+    let mut public_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
+    for transaction in transactions {
+        let Some(transaction) = transaction.get() else {
+            return Ok(None);
+        };
+        let Some(sender) = transaction.value().sender() else {
+            return Ok(None);
+        };
+        public_keys.insert(sender.clone());
+        public_keys.insert(transaction.value().to.clone());
+    }
+
+    load_accounts(batch, public_keys).await
+}
+
+async fn load_accounts<E, H, P, T>(
+    batch: &StateBatch<E, H, P, T>,
+    public_keys: HashSet<P>,
+) -> Result<Option<State<P>>, StorageError<mmr::Family>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    T: Translator,
+{
     if public_keys.is_empty() {
         return Ok(Some(HashMap::new()));
     }

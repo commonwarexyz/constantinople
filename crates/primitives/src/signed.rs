@@ -217,6 +217,41 @@ where
         .collect()
 }
 
+/// Forces lazily encoded signed transactions to decode in parallel.
+///
+/// Returns the original lazy transactions after warming their cached decoded
+/// values, or `None` if any transaction fails to decode.
+pub fn preload_transaction_chunks<P, H, St>(
+    strategy: &St,
+    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+) -> Option<Vec<Lazy<SignedTransaction<P, H>>>>
+where
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    if transactions.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let parallelism = strategy.parallelism_hint();
+    if parallelism <= 1 || transactions.len() <= parallelism {
+        return transactions
+            .iter()
+            .all(|lazy| lazy.get().is_some())
+            .then_some(transactions);
+    }
+
+    strategy
+        .fold(
+            &transactions,
+            || true,
+            |decoded, lazy| decoded && lazy.get().is_some(),
+            |left, right| left && right,
+        )
+        .then_some(transactions)
+}
+
 /// Verifies a slice of lazily-encoded signed transactions using batch
 /// verification.
 ///

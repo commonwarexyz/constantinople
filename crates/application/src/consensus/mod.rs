@@ -15,6 +15,7 @@
 //! in-memory state transition logic.
 
 use crate::processor::executor::{self, Changeset, ProposalOutput};
+use commonware_codec::types::lazy::Lazy;
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -63,7 +64,7 @@ use tracing::{info, warn};
 
 mod utils;
 mod verification;
-pub use utils::load_state;
+pub use utils::{load_lazy_state, load_state};
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
 ///
@@ -133,6 +134,22 @@ where
     transactions.iter().fold(batch, |batch, transaction| {
         batch.append(*transaction.message_digest())
     })
+}
+
+fn apply_lazy_transaction_digests<E, H, P>(
+    batch: TransactionBatch<E, H>,
+    transactions: &[Lazy<SignedTransaction<P, H>>],
+) -> Option<TransactionBatch<E, H>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+{
+    let mut batch = batch;
+    for transaction in transactions {
+        batch = batch.append(*transaction.get()?.message_digest());
+    }
+    Some(batch)
 }
 
 const fn header_range_to_target<D>(

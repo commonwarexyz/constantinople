@@ -2,7 +2,7 @@
 
 use super::{
     StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
-    apply_transaction_digests, child_transactions_range, finalize_execution, load_state,
+    apply_lazy_transaction_digests, child_transactions_range, finalize_execution, load_lazy_state,
     parent_transactions_inactivity_floor,
 };
 use crate::processor::executor;
@@ -14,7 +14,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
-    Header, SealedBlock, SignedTransaction, materialize_transaction_chunks,
+    Header, SealedBlock, SignedTransaction, preload_transaction_chunks,
 };
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
@@ -28,13 +28,13 @@ const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
-/// Decoded transactions ready for execution.
+/// Lazily decoded transactions ready for verification and execution.
 pub(super) struct Prepared<P, H>
 where
     H: Hasher,
     P: PublicKey,
 {
-    pub(super) transactions: Vec<SignedTransaction<P, H>>,
+    pub(super) transactions: Vec<Lazy<SignedTransaction<P, H>>>,
 }
 
 /// Timing information for the execution side of verification.
@@ -75,11 +75,11 @@ where
     }
 }
 
-/// Verifies already-materialized signed transactions.
+/// Verifies lazily decoded signed transactions.
 fn verify_transaction_batch<P, H, B>(
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
-    transactions: &[SignedTransaction<P, H>],
+    transactions: &[Lazy<SignedTransaction<P, H>>],
 ) -> bool
 where
     P: PublicKey,
@@ -87,7 +87,10 @@ where
     B: BatchVerifier<PublicKey = P>,
 {
     let mut verifier = B::new();
-    for transaction in transactions {
+    for lazy in transactions {
+        let Some(transaction) = lazy.get() else {
+            return false;
+        };
         let Some(sender) = transaction.value().sender() else {
             return false;
         };
@@ -112,7 +115,7 @@ fn verify_transactions<P, H, B, St>(
     strategy: &St,
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
-    transactions: &[SignedTransaction<P, H>],
+    transactions: &[Lazy<SignedTransaction<P, H>>],
 ) -> bool
 where
     P: PublicKey,
@@ -193,7 +196,7 @@ where
     Ok(started_at.elapsed().as_millis())
 }
 
-/// Materializes transactions.
+/// Preloads transactions for verification and execution.
 pub(super) fn prepare_transactions<P, H, St>(
     strategy: &St,
     transactions: Vec<Lazy<SignedTransaction<P, H>>>,
@@ -204,7 +207,7 @@ where
     St: Strategy,
 {
     let transactions =
-        materialize_transaction_chunks(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
+        preload_transaction_chunks(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
     Ok(Prepared { transactions })
 }
 
@@ -223,7 +226,7 @@ where
     H: Hasher,
 {
     let load_state_started_at = Instant::now();
-    let state = load_state(&state_batches, &prepared.transactions)
+    let state = load_lazy_state(&state_batches, &prepared.transactions)
         .await
         .expect("block state loading during verification must succeed")
         .ok_or(MALFORMED_TRANSACTION)?;
@@ -231,12 +234,14 @@ where
 
     let execute_started_at = Instant::now();
     let changeset =
-        executor::execute(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
+        executor::execute_lazy(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
 
     let state_batch = apply_changeset(state_batches, &changeset);
-    let transaction_batch = apply_transaction_digests(transaction_batch, &prepared.transactions)
-        .with_inactivity_floor(parent_transactions_inactivity_floor(parent));
+    let transaction_batch =
+        apply_lazy_transaction_digests(transaction_batch, &prepared.transactions)
+            .ok_or(MALFORMED_TRANSACTION)?
+            .with_inactivity_floor(parent_transactions_inactivity_floor(parent));
     let transactions_range = child_transactions_range(parent, prepared.transactions.len());
 
     let finalize_started_at = Instant::now();
@@ -274,16 +279,18 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    let state = load_state(&state_batches, &prepared.transactions)
+    let state = load_lazy_state(&state_batches, &prepared.transactions)
         .await
         .expect("state loading must succeed for certified apply")
         .ok_or(MALFORMED_TRANSACTION)?;
     let changeset =
-        executor::execute(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
+        executor::execute_lazy(&state, &prepared.transactions).ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let state_batch = apply_changeset(state_batches, &changeset);
-    let transaction_batch = apply_transaction_digests(transaction_batch, &prepared.transactions)
-        .with_inactivity_floor(transactions_floor);
+    let transaction_batch =
+        apply_lazy_transaction_digests(transaction_batch, &prepared.transactions)
+            .ok_or(MALFORMED_TRANSACTION)?
+            .with_inactivity_floor(transactions_floor);
     Ok(finalize_execution(state_batch, transaction_batch)
         .await
         .expect("database merkleization must succeed"))
