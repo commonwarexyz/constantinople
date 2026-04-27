@@ -15,7 +15,6 @@
 //! in-memory state transition logic.
 
 use crate::processor::executor::{self, Changeset, ProposalOutput};
-use commonware_codec::types::lazy::Lazy;
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -63,10 +62,8 @@ use std::{
 use tracing::{info, warn};
 
 mod utils;
-use constantinople_primitives::{
-    materialize_transaction_chunks, transaction_senders, verify_transaction_batch,
-    verify_transaction_chunks,
-};
+mod verification;
+use constantinople_primitives::transaction_senders;
 pub use utils::load_state;
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
@@ -107,8 +104,6 @@ type TransactionBatch<E, H> = <TransactionDatabase<E, H> as DatabaseSet<E>>::Unm
 type StateMerkleized<E, H, T> = <StateBatch<E, H, T> as Unmerkleized>::Merkleized;
 
 type TransactionMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
-
-type PreparedTransactions<P, H> = (Vec<SignedTransaction<P, H>>, Vec<Address>);
 
 /// Writes a changeset of account updates to a state batch.
 fn apply_changeset<E, H>(
@@ -189,6 +184,22 @@ where
     non_empty_range!(*parent_transactions_inactivity_floor(parent), end)
 }
 
+async fn finalize_execution<E, H>(
+    state_batch: StateBatch<E, H, EightCap>,
+    transaction_batch: TransactionBatch<E, H>,
+) -> Result<
+    (StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>),
+    commonware_storage::qmdb::Error<mmr::Family>,
+>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+{
+    let (state_merkleized, transaction_merkleized) =
+        futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
+    Ok((state_merkleized?, transaction_merkleized?))
+}
+
 /// Core constantinople application.
 ///
 /// This type implements the consensus application trait on top of the
@@ -264,47 +275,6 @@ where
         }
     }
 
-    /// Verifies lazily-encoded signed transactions and returns decoded transactions.
-    ///
-    /// Forcing each [`Lazy`] materializes the underlying
-    /// [`SignedTransaction`] (including recomputing its seal digest); the
-    /// chunked path spreads that cost across the configured
-    /// [`Strategy`]'s worker threads.
-    fn verify_transactions(
-        &self,
-        rng: &mut impl CryptoRngCore,
-        transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-    ) -> Option<Vec<SignedTransaction<P, H>>> {
-        let parallelism = self.strategy.parallelism_hint();
-        if parallelism <= 1 || transactions.len() <= parallelism {
-            if !verify_transaction_batch::<P, H, B>(self.transaction_namespace, rng, &transactions)
-            {
-                return None;
-            }
-            return transactions
-                .into_iter()
-                .map(|lazy| lazy.get().cloned())
-                .collect();
-        }
-
-        verify_transaction_chunks::<P, H, B, _>(
-            &self.strategy,
-            self.transaction_namespace,
-            rng,
-            transactions,
-        )
-    }
-
-    /// Materializes transactions and caches sender addresses.
-    fn prepare_transactions(
-        &self,
-        transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-    ) -> Option<PreparedTransactions<P, H>> {
-        let transactions = materialize_transaction_chunks(&self.strategy, transactions)?;
-        let signers = transaction_senders(&self.strategy, &transactions)?;
-        Some((transactions, signers))
-    }
-
     /// Returns the current Unix timestamp in milliseconds.
     fn timestamp<E>(&self, runtime: &E) -> u64
     where
@@ -328,22 +298,6 @@ where
         UNIX_EPOCH
             .checked_add(Duration::from_millis(block_timestamp_ms))
             .expect("block timestamp exceeded maximum")
-    }
-
-    async fn finalize_execution<E>(
-        &self,
-        state_batch: StateBatch<E, H, EightCap>,
-        transaction_batch: TransactionBatch<E, H>,
-    ) -> Result<
-        (StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>),
-        commonware_storage::qmdb::Error<mmr::Family>,
-    >
-    where
-        E: Storage + Clock + Metrics,
-    {
-        let (state_merkleized, transaction_merkleized) =
-            futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
-        Ok((state_merkleized?, transaction_merkleized?))
     }
 }
 
@@ -443,10 +397,10 @@ where
         let transactions_range = child_transactions_range(&parent, valid.len());
 
         let finalize_started_at = Instant::now();
-        let (state_merkleized, transaction_merkleized) = self
-            .finalize_execution(state_batch, transaction_batch)
-            .await
-            .expect("database merkleization must succeed");
+        let (state_merkleized, transaction_merkleized) =
+            finalize_execution(state_batch, transaction_batch)
+                .await
+                .expect("database merkleization must succeed");
         let finalize_ms = finalize_started_at.elapsed().as_millis();
 
         let header = Header {
@@ -512,149 +466,33 @@ where
             return None;
         }
 
-        enum VerifyRejection {
-            InvalidSignature,
-            MalformedTransaction,
-            StaticInvalidTransaction,
-        }
-
-        let signature_body = body.clone();
-        let verifier = self.clone();
-        let signature_handle = runtime
-            .clone()
-            .shared(true)
-            .spawn(move |mut runtime| async move {
-                let signature_started_at = Instant::now();
-                verifier
-                    .verify_transactions(&mut runtime, signature_body)
-                    .map(|_| signature_started_at.elapsed().as_millis())
-            });
-
-        let signature = async move {
-            signature_handle
-                .await
-                .expect("signature verification task failed")
-                .ok_or(VerifyRejection::InvalidSignature)
-        };
-
         let deadline = self.block_deadline(header.timestamp);
         let (state_batches, transaction_batch) = batches;
-
-        let sleep = async move {
-            let sleep_started_at = Instant::now();
-            runtime.sleep_until(deadline).await;
-            Ok(sleep_started_at.elapsed().as_millis())
-        };
-
-        let execution = async {
-            let prepare_started_at = Instant::now();
-            let Some((body, signers)) = self.prepare_transactions(body) else {
-                return Err(VerifyRejection::MalformedTransaction);
-            };
-            let prepare_ms = prepare_started_at.elapsed().as_millis();
-
-            let load_state_started_at = Instant::now();
-            let state = load_state(&state_batches, &body, &signers)
-                .await
-                .expect("block state loading during verification must succeed");
-            let load_state_ms = load_state_started_at.elapsed().as_millis();
-
-            let execute_started_at = Instant::now();
-            let Some(changeset) = executor::execute(&state, &body, &signers) else {
-                return Err(VerifyRejection::StaticInvalidTransaction);
-            };
-            let execute_ms = execute_started_at.elapsed().as_millis();
-
-            let state_batch = apply_changeset(state_batches, &changeset);
-            let transaction_batch = apply_transaction_digests(transaction_batch, &body)
-                .with_inactivity_floor(parent_transactions_inactivity_floor(&parent));
-            let transactions_range = child_transactions_range(&parent, body.len());
-
-            let finalize_started_at = Instant::now();
-            let (state_merkleized, transaction_merkleized) = self
-                .finalize_execution(state_batch, transaction_batch)
-                .await
-                .expect("database merkleization during verification must succeed");
-            let finalize_ms = finalize_started_at.elapsed().as_millis();
-
-            Ok((
-                state_merkleized,
-                transaction_merkleized,
-                transactions_range,
-                body.len(),
-                prepare_ms,
-                load_state_ms,
-                execute_ms,
-                finalize_ms,
-            ))
-        };
-
-        let (
-            signature_ms,
-            (
-                state_merkleized,
-                transaction_merkleized,
-                transactions_range,
-                transaction_count,
-                prepare_ms,
-                load_state_ms,
-                execute_ms,
-                finalize_ms,
-            ),
-            sleep_ms,
-        ) = match futures::try_join!(signature, execution, sleep) {
-            Ok(result) => result,
-            Err(VerifyRejection::InvalidSignature) => {
-                warn!(height = header.height, "verify rejected: invalid signature");
-                return None;
-            }
-            Err(VerifyRejection::MalformedTransaction) => {
-                warn!(
-                    height = header.height,
-                    "verify rejected: malformed transaction"
-                );
-                return None;
-            }
-            Err(VerifyRejection::StaticInvalidTransaction) => {
-                warn!(
-                    height = header.height,
-                    "verify rejected: statically invalid transaction"
-                );
-                return None;
-            }
-        };
-
-        let state_range = non_empty_range!(
-            *state_merkleized.inactivity_floor(),
-            *state_merkleized.size()
+        let signature = verification::verify_signatures::<E, P, H, B, St>(
+            runtime.clone(),
+            self.strategy.clone(),
+            self.transaction_namespace,
+            body.clone(),
         );
+        let execution = verification::execute_block(
+            &self.strategy,
+            state_batches,
+            transaction_batch,
+            &parent,
+            body,
+        );
+        let sleep = verification::wait_for_timestamp(runtime, deadline);
 
-        if state_merkleized.root() != header.state_root {
-            warn!(
-                height = header.height,
-                "verify rejected: state root mismatch"
-            );
-            return None;
-        }
-        if state_range != header.state_range {
-            warn!(
-                height = header.height,
-                "verify rejected: state range mismatch"
-            );
-            return None;
-        }
-        if transaction_merkleized.root() != header.transactions_root {
-            warn!(
-                height = header.height,
-                "verify rejected: transaction root mismatch"
-            );
-            return None;
-        }
-        if transactions_range != header.transactions_range {
-            warn!(
-                height = header.height,
-                "verify rejected: transaction range mismatch"
-            );
+        let (signature_ms, execution, sleep_ms) =
+            match futures::try_join!(signature, execution, sleep) {
+                Ok(result) => result,
+                Err(reason) => {
+                    verification::reject(header.height, reason);
+                    return None;
+                }
+            };
+
+        if !verification::commitments_match(&header, &execution) {
             return None;
         }
 
@@ -662,18 +500,18 @@ where
             epoch = header.context.round.epoch().get(),
             view = header.context.round.view().get(),
             height = header.height,
-            txs = transaction_count,
+            txs = execution.transaction_count,
             timestamp = header.timestamp,
             signature_ms,
             sleep_ms,
-            prepare_ms,
-            load_state_ms,
-            execute_ms,
-            finalize_ms,
+            prepare_ms = execution.timings.prepare_ms,
+            load_state_ms = execution.timings.load_state_ms,
+            execute_ms = execution.timings.execute_ms,
+            finalize_ms = execution.timings.finalize_ms,
             total_ms = verify_started_at.elapsed().as_millis(),
             "verified block"
         );
-        Some((state_merkleized, transaction_merkleized))
+        Some(execution.into_merkleized())
     }
 
     /// Applies a certified block to speculative batches and returns merkleized state.
@@ -693,9 +531,13 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let verified_body = self
-            .verify_transactions(&mut runtime, block.body.clone())
-            .expect("certified block contained an invalid signature");
+        let verified_body = verification::verify_transactions::<P, H, B, _>(
+            &self.strategy,
+            self.transaction_namespace,
+            &mut runtime,
+            block.body.clone(),
+        )
+        .expect("certified block contained an invalid signature");
         let signers = transaction_senders(&self.strategy, &verified_body)
             .expect("certified block contained a malformed sender");
 
@@ -709,7 +551,7 @@ where
         let state_batch = apply_changeset(state_batches, &changeset);
         let transaction_batch = apply_transaction_digests(transaction_batch, &verified_body)
             .with_inactivity_floor(mmr::Location::new(block.header.transactions_range.start()));
-        self.finalize_execution(state_batch, transaction_batch)
+        finalize_execution(state_batch, transaction_batch)
             .await
             .expect("database merkleization must succeed")
     }
