@@ -527,33 +527,30 @@ where
     /// execution or database finalization fails.
     async fn apply(
         &mut self,
-        (mut runtime, _): (E, Self::Context),
+        (runtime, _): (E, Self::Context),
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let verified_body = verification::verify_transactions::<P, H, B, _>(
-            &self.strategy,
+        let body = block.body.clone();
+        let signature = verification::verify_signatures::<E, P, H, B, St>(
+            runtime,
+            self.strategy.clone(),
             self.transaction_namespace,
-            &mut runtime,
-            block.body.clone(),
-        )
-        .expect("certified block contained an invalid signature");
-        let signers = transaction_senders(&self.strategy, &verified_body)
-            .expect("certified block contained a malformed sender");
-
+            body.clone(),
+        );
         let (state_batches, transaction_batch) = batches;
+        let execution = verification::apply_block(
+            &self.strategy,
+            state_batches,
+            transaction_batch,
+            mmr::Location::new(block.header.transactions_range.start()),
+            body,
+        );
 
-        let state = load_state(&state_batches, &verified_body, &signers)
-            .await
-            .expect("state loading must succeed for certified apply");
-        let changeset = executor::execute(&state, &verified_body, &signers)
-            .expect("certified block contained a statically invalid transaction");
-        let state_batch = apply_changeset(state_batches, &changeset);
-        let transaction_batch = apply_transaction_digests(transaction_batch, &verified_body)
-            .with_inactivity_floor(mmr::Location::new(block.header.transactions_range.start()));
-        finalize_execution(state_batch, transaction_batch)
-            .await
-            .expect("database merkleization must succeed")
+        match futures::try_join!(signature, execution) {
+            Ok((_signature_ms, merkleized)) => merkleized,
+            Err(reason) => panic!("certified block contained {reason}"),
+        }
     }
 }
 

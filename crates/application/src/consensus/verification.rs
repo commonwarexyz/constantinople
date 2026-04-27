@@ -11,7 +11,7 @@ use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
-use commonware_storage::translator::EightCap;
+use commonware_storage::{mmr, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
     Address, Header, SealedBlock, SignedTransaction, materialize_transaction_chunks,
@@ -207,6 +207,35 @@ where
             finalize_ms,
         },
     })
+}
+
+/// Executes and merkleizes a certified block body.
+pub(super) async fn apply_block<E, P, H, St>(
+    strategy: &St,
+    state_batches: StateBatch<E, H, EightCap>,
+    transaction_batch: TransactionBatch<E, H>,
+    transactions_floor: mmr::Location,
+    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+) -> Result<(StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>)>
+where
+    E: Storage + Clock + Metrics,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let prepared = prepare_transactions(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let state = load_state(&state_batches, &prepared.transactions, &prepared.signers)
+        .await
+        .expect("state loading must succeed for certified apply");
+    let changeset = executor::execute(&state, &prepared.transactions, &prepared.signers)
+        .ok_or(STATIC_INVALID_TRANSACTION)?;
+
+    let state_batch = apply_changeset(state_batches, &changeset);
+    let transaction_batch = apply_transaction_digests(transaction_batch, &prepared.transactions)
+        .with_inactivity_floor(transactions_floor);
+    Ok(finalize_execution(state_batch, transaction_batch)
+        .await
+        .expect("database merkleization must succeed"))
 }
 
 /// Logs a verification rejection.
