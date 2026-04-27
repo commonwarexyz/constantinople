@@ -25,6 +25,7 @@ use tracing::warn;
 pub(super) type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
+const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
@@ -145,7 +146,7 @@ where
         .all(|verified| verified)
 }
 
-/// Spawns prepared signature verification and returns the elapsed time.
+/// Verifies prepared signatures and returns the elapsed time.
 pub(super) async fn verify_signatures<E, P, H, B, St>(
     runtime: E,
     strategy: St,
@@ -159,21 +160,21 @@ where
     B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
     St: Strategy + Send + Sync + 'static,
 {
-    let handle = runtime.shared(true).spawn(move |mut runtime| async move {
+    let (result_tx, result_rx) = futures::channel::oneshot::channel();
+    let _handle = runtime.shared(true).spawn(move |mut runtime| async move {
         let started_at = Instant::now();
-        verify_transactions::<P, H, B, _>(
+        let result = verify_transactions::<P, H, B, _>(
             &strategy,
             namespace,
             &mut runtime,
             &prepared.transactions,
         )
         .then_some(started_at.elapsed().as_millis())
+        .ok_or(INVALID_SIGNATURE);
+        let _ = result_tx.send(result);
     });
 
-    handle
-        .await
-        .expect("signature verification task failed")
-        .ok_or(INVALID_SIGNATURE)
+    result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
 }
 
 /// Waits until a block timestamp deadline and returns the elapsed time.
