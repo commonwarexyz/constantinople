@@ -467,19 +467,29 @@ where
         }
 
         let deadline = self.block_deadline(header.timestamp);
+        let prepare_started_at = Instant::now();
+        let prepared = match verification::prepare_transactions(&self.strategy, body) {
+            Ok(prepared) => Arc::new(prepared),
+            Err(reason) => {
+                verification::reject(header.height, reason);
+                return None;
+            }
+        };
+        let prepare_ms = prepare_started_at.elapsed().as_millis();
+
         let (state_batches, transaction_batch) = batches;
         let signature = verification::verify_signatures::<E, P, H, B, St>(
             runtime.clone(),
             self.strategy.clone(),
             self.transaction_namespace,
-            body.clone(),
+            Arc::clone(&prepared),
         );
         let execution = verification::execute_block(
-            &self.strategy,
             state_batches,
             transaction_batch,
             &parent,
-            body,
+            prepared.as_ref(),
+            prepare_ms,
         );
         let sleep = verification::wait_for_timestamp(runtime, deadline);
 
@@ -531,20 +541,22 @@ where
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let body = block.body.clone();
+        let prepared = Arc::new(
+            verification::prepare_transactions(&self.strategy, block.body.clone())
+                .unwrap_or_else(|reason| panic!("certified block contained {reason}")),
+        );
         let signature = verification::verify_signatures::<E, P, H, B, St>(
             runtime,
             self.strategy.clone(),
             self.transaction_namespace,
-            body.clone(),
+            Arc::clone(&prepared),
         );
         let (state_batches, transaction_batch) = batches;
         let execution = verification::apply_block(
-            &self.strategy,
             state_batches,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
-            body,
+            prepared.as_ref(),
         );
 
         match futures::try_join!(signature, execution) {

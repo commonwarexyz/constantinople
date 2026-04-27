@@ -15,10 +15,11 @@ use commonware_storage::{mmr, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
     Address, Header, SealedBlock, SignedTransaction, materialize_transaction_chunks,
-    transaction_senders, verify_transaction_batch, verify_transaction_chunks,
+    transaction_senders,
 };
+use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 use tracing::warn;
 
 pub(super) type Result<T> = core::result::Result<T, &'static str>;
@@ -70,39 +71,86 @@ where
     }
 }
 
-/// Verifies lazily-encoded signed transactions and returns decoded transactions.
-pub(super) fn verify_transactions<P, H, B, St>(
+/// Verifies already-materialized signed transactions.
+fn verify_transaction_batch<P, H, B>(
+    namespace: &'static [u8],
+    rng: &mut impl CryptoRngCore,
+    transactions: &[SignedTransaction<P, H>],
+) -> bool
+where
+    P: PublicKey,
+    H: Hasher,
+    B: BatchVerifier<PublicKey = P>,
+{
+    let mut verifier = B::new();
+    for transaction in transactions {
+        let Some(sender) = transaction.value().sender() else {
+            return false;
+        };
+        let Some(signature) = transaction.signature() else {
+            return false;
+        };
+        if !verifier.add(
+            namespace,
+            transaction.message_digest().as_ref(),
+            sender,
+            signature,
+        ) {
+            return false;
+        }
+    }
+
+    verifier.verify(rng)
+}
+
+/// Verifies prepared signed transactions in parallel.
+fn verify_transactions<P, H, B, St>(
     strategy: &St,
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Option<Vec<SignedTransaction<P, H>>>
+    transactions: &[SignedTransaction<P, H>],
+) -> bool
 where
     P: PublicKey,
     H: Hasher,
     B: BatchVerifier<PublicKey = P>,
     St: Strategy,
 {
-    let parallelism = strategy.parallelism_hint();
-    if parallelism <= 1 || transactions.len() <= parallelism {
-        if !verify_transaction_batch::<P, H, B>(namespace, rng, &transactions) {
-            return None;
-        }
-        return transactions
-            .into_iter()
-            .map(|lazy| lazy.get().cloned())
-            .collect();
+    if transactions.is_empty() {
+        return true;
     }
 
-    verify_transaction_chunks::<P, H, B, _>(strategy, namespace, rng, transactions)
+    let parallelism = strategy.parallelism_hint();
+    if parallelism <= 1 || transactions.len() <= parallelism {
+        return verify_transaction_batch::<P, H, B>(namespace, rng, transactions);
+    }
+
+    let chunk_count = parallelism.min(transactions.len());
+    let chunk_size = transactions.len().div_ceil(chunk_count);
+    let chunks = transactions
+        .chunks(chunk_size)
+        .map(|chunk| {
+            let mut rng_seed = [0; 32];
+            rng.fill_bytes(&mut rng_seed);
+            (rng_seed, chunk)
+        })
+        .collect::<Vec<_>>();
+
+    strategy
+        .map_collect_vec(chunks, |(rng_seed, chunk)| {
+            let mut chunk_rng = StdRng::from_seed(rng_seed);
+            verify_transaction_batch::<P, H, B>(namespace, &mut chunk_rng, chunk)
+        })
+        .into_iter()
+        .all(|verified| verified)
 }
 
-/// Spawns signature verification and returns the elapsed time.
+/// Spawns prepared signature verification and returns the elapsed time.
 pub(super) async fn verify_signatures<E, P, H, B, St>(
     runtime: E,
     strategy: St,
     namespace: &'static [u8],
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+    prepared: Arc<Prepared<P, H>>,
 ) -> Result<u128>
 where
     E: Spawner + CryptoRngCore,
@@ -113,8 +161,13 @@ where
 {
     let handle = runtime.shared(true).spawn(move |mut runtime| async move {
         let started_at = Instant::now();
-        verify_transactions::<P, H, B, _>(&strategy, namespace, &mut runtime, transactions)
-            .map(|_| started_at.elapsed().as_millis())
+        verify_transactions::<P, H, B, _>(
+            &strategy,
+            namespace,
+            &mut runtime,
+            &prepared.transactions,
+        )
+        .then_some(started_at.elapsed().as_millis())
     });
 
     handle
@@ -140,39 +193,35 @@ where
 pub(super) fn prepare_transactions<P, H, St>(
     strategy: &St,
     transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Option<Prepared<P, H>>
+) -> Result<Prepared<P, H>>
 where
     P: PublicKey,
     H: Hasher,
     St: Strategy,
 {
-    let transactions = materialize_transaction_chunks(strategy, transactions)?;
-    let signers = transaction_senders(strategy, &transactions)?;
-    Some(Prepared {
+    let transactions =
+        materialize_transaction_chunks(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let signers = transaction_senders(strategy, &transactions).ok_or(MALFORMED_TRANSACTION)?;
+    Ok(Prepared {
         transactions,
         signers,
     })
 }
 
 /// Executes and merkleizes a block body for verification.
-pub(super) async fn execute_block<E, C, P, H, St>(
-    strategy: &St,
+pub(super) async fn execute_block<E, C, P, H>(
     state_batches: StateBatch<E, H, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
     parent: &SealedBlock<C, P, H>,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+    prepared: &Prepared<P, H>,
+    prepare_ms: u128,
 ) -> Result<Execution<E, H>>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
 {
-    let prepare_started_at = Instant::now();
-    let prepared = prepare_transactions(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
-    let prepare_ms = prepare_started_at.elapsed().as_millis();
-
     let load_state_started_at = Instant::now();
     let state = load_state(&state_batches, &prepared.transactions, &prepared.signers)
         .await
@@ -210,20 +259,17 @@ where
 }
 
 /// Executes and merkleizes a certified block body.
-pub(super) async fn apply_block<E, P, H, St>(
-    strategy: &St,
+pub(super) async fn apply_block<E, P, H>(
     state_batches: StateBatch<E, H, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
     transactions_floor: mmr::Location,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+    prepared: &Prepared<P, H>,
 ) -> Result<(StateMerkleized<E, H, EightCap>, TransactionMerkleized<E, H>)>
 where
     E: Storage + Clock + Metrics,
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
 {
-    let prepared = prepare_transactions(strategy, transactions).ok_or(MALFORMED_TRANSACTION)?;
     let state = load_state(&state_batches, &prepared.transactions, &prepared.signers)
         .await
         .expect("state loading must succeed for certified apply");
