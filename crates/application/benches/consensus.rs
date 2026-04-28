@@ -488,7 +488,6 @@ async fn new_application(
         leader,
         TRANSACTION_NAMESPACE,
         genesis_transactions_target,
-        None,
     )
 }
 

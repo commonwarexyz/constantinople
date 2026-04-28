@@ -39,17 +39,13 @@ use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
-use std::{
-    marker::PhantomData,
-    num::NonZeroU64,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
-};
+use std::{marker::PhantomData, sync::Arc, time::Instant};
 use tracing::{info, warn};
 
 mod db;
 mod execution;
 mod history;
+mod time;
 mod utils;
 mod verification;
 use db::{Databases, apply_changeset, apply_transaction_digests};
@@ -57,12 +53,6 @@ pub use db::{TransactionHistoryDb, TransactionHistoryOperation, TransactionHisto
 use execution::finalize_child_execution;
 use history::header_range_to_target;
 pub use utils::{load_lazy_state, load_state};
-
-/// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
-///
-/// Different platforms have different `SystemTime` limits, so we use a fixed
-/// timestamp to ensure consistent application of block validity rules.
-const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
 
 /// Core constantinople application.
 ///
@@ -76,7 +66,6 @@ where
     genesis_leader: P,
     transaction_namespace: &'static [u8],
     genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
-    transaction_history_prune_cadence: Option<NonZeroU64>,
     proposed_transactions: Counter,
     _marker: PhantomData<(H, C, S, I, B)>,
 }
@@ -93,7 +82,6 @@ where
             genesis_leader: self.genesis_leader.clone(),
             transaction_namespace: self.transaction_namespace,
             genesis_transactions_target: self.genesis_transactions_target.clone(),
-            transaction_history_prune_cadence: self.transaction_history_prune_cadence,
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
@@ -119,7 +107,6 @@ where
         genesis_leader: P,
         transaction_namespace: &'static [u8],
         genesis_transactions_target: TransactionHistoryTarget<<H as Hasher>::Digest>,
-        transaction_history_prune_cadence: Option<NonZeroU64>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
@@ -131,35 +118,9 @@ where
             genesis_leader,
             transaction_namespace,
             genesis_transactions_target,
-            transaction_history_prune_cadence,
             proposed_transactions,
             _marker: PhantomData,
         }
-    }
-
-    /// Returns the current Unix timestamp in milliseconds.
-    fn timestamp<E>(&self, runtime: &E) -> u64
-    where
-        E: Clock,
-    {
-        let timestamp_ms = runtime
-            .current()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock moved before unix epoch")
-            .as_millis();
-        u64::try_from(timestamp_ms).expect("timestamp milliseconds exceeded u64")
-    }
-
-    /// Returns the absolute wakeup time for `block_timestamp_ms`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `block_timestamp_ms` cannot be represented as a
-    /// [`SystemTime`] offset from the Unix epoch.
-    fn block_deadline(&self, block_timestamp_ms: u64) -> SystemTime {
-        UNIX_EPOCH
-            .checked_add(Duration::from_millis(block_timestamp_ms))
-            .expect("block timestamp exceeded maximum")
     }
 
     /// Proposes a child block from an already fetched parent.
@@ -221,7 +182,7 @@ where
             context,
             parent: parent.digest(),
             height: parent.header.height + 1,
-            timestamp: self.timestamp(&runtime),
+            timestamp: time::timestamp_ms(&runtime),
             state_root: execution.state.root(),
             state_range: execution.state_range(),
             transactions_root: execution.transactions.root(),
@@ -268,8 +229,7 @@ where
         let verify_started_at = Instant::now();
         let Block { header, body } = block.clone().into_inner();
 
-        if header.timestamp <= parent.header.timestamp || header.timestamp > MAX_BLOCK_TIMESTAMP_MS
-        {
+        if !time::is_valid_child_timestamp(parent.header.timestamp, header.timestamp) {
             warn!(
                 height = header.height,
                 block_ts = header.timestamp,
@@ -279,7 +239,7 @@ where
             return None;
         }
 
-        let deadline = self.block_deadline(header.timestamp);
+        let deadline = time::block_deadline(header.timestamp);
         let prepare_started_at = Instant::now();
         let prepared = match verification::prepare_transactions(&self.strategy, body) {
             Ok(prepared) => Arc::new(prepared),

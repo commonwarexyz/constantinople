@@ -57,7 +57,7 @@ use constantinople_primitives::BlockCfg;
 use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
-    num::{NonZero, NonZeroU16, NonZeroU64},
+    num::{NonZero, NonZeroU16},
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -158,7 +158,6 @@ where
     pub sync_config: SyncEngineConfig,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
-    pub transaction_history_prune_cadence: Option<NonZeroU64>,
     pub block_codec: BlockCfg,
     pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
 }
@@ -381,7 +380,6 @@ where
             config.genesis_leader.clone(),
             config.transaction_namespace,
             genesis_transactions_target,
-            config.transaction_history_prune_cadence,
         );
         let (stateful, stateful_mailbox) = Stateful::init(
             context.with_label("stateful"),

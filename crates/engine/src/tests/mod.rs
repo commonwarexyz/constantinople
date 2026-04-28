@@ -303,7 +303,6 @@ impl EngineDefinition for TestEngineDefinition {
                         },
                         genesis_leader,
                         transaction_namespace: TRANSACTION_NAMESPACE,
-                        transaction_history_prune_cadence: None,
                         block_codec: Default::default(),
                         bootstrapper: bootstrapper_mailbox.clone(),
                     },

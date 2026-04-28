@@ -1,8 +1,8 @@
 use crate::{
     ClusterMaterial, GenerateArgs, LocalArgs, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
     ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
-    default_max_propose_bytes, default_transaction_history_prune_cadence,
-    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
+    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_utils::hex;
@@ -99,7 +99,6 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
@@ -170,7 +169,6 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            transaction_history_prune_cadence: default_transaction_history_prune_cadence(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),

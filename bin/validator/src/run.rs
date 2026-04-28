@@ -27,7 +27,6 @@ use constantinople_engine::{
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
-    num::NonZeroU64,
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -60,7 +59,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         rayon_threads,
         http_listen,
         metrics_listen,
-        transaction_history_prune_cadence,
         json_logs,
         deployer_managed,
     } = config;
@@ -227,9 +225,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     sync_config: production_sync_config(),
                     genesis_leader: decoded.genesis_leader,
                     transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                    transaction_history_prune_cadence: NonZeroU64::new(
-                        transaction_history_prune_cadence,
-                    ),
                     block_codec: Default::default(),
                     bootstrapper: bootstrapper_mailbox.clone(),
                 },
