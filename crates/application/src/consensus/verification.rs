@@ -1,9 +1,12 @@
 //! Block verification pipeline helpers.
 
 use super::{
-    StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
-    apply_lazy_transaction_digests, child_transactions_range, finalize_execution, load_lazy_state,
-    parent_transactions_inactivity_floor,
+    db::{
+        StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
+        apply_lazy_transaction_digests, finalize_execution,
+    },
+    history::{child_transactions_range, parent_transactions_inactivity_floor},
+    load_lazy_state,
 };
 use crate::processor::executor;
 use commonware_codec::types::lazy::Lazy;

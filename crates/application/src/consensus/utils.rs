@@ -1,6 +1,6 @@
 //! Utility functions for the application.
 
-use super::StateBatch;
+use super::db::StateBatch;
 use crate::processor::state::State;
 use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};

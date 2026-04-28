@@ -14,8 +14,7 @@
 //! the execution strategy and QMDB integration, while the processor owns the
 //! in-memory state transition logic.
 
-use crate::processor::executor::{self, Changeset, ProposalOutput};
-use commonware_codec::types::lazy::Lazy;
+use crate::processor::executor::{self, ProposalOutput};
 use commonware_consensus::{
     marshal::ancestry::{AncestorStream, BlockProvider},
     simplex::types::Context,
@@ -26,33 +25,17 @@ use commonware_cryptography::{
 };
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
-    db::{DatabaseSet, Merkleized as _, Unmerkleized, any::AnyUnmerkleized},
+    db::{DatabaseSet, Merkleized as _},
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     Clock, Metrics, Spawner, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
-use commonware_storage::{
-    index::unordered::Index as UnorderedIndex,
-    journal::contiguous::fixed::Journal as FixedJournal,
-    mmr,
-    qmdb::{
-        any::{
-            operation::Operation as AnyOperation,
-            unordered::{Update as UnorderedUpdate, fixed},
-            value::FixedEncoding,
-        },
-        keyless::fixed as keyless_fixed,
-        sync::{Target, compact::Target as CompactTarget},
-    },
-    translator::EightCap,
-};
-use commonware_utils::{non_empty_range, sync::AsyncRwLock};
+use commonware_storage::{mmr, qmdb::sync::Target, translator::EightCap};
+use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{
-    Account, AccountKey, Block, Header, Sealable, SealedBlock, SignedTransaction,
-};
+use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
@@ -64,8 +47,15 @@ use std::{
 };
 use tracing::{info, warn};
 
+mod db;
+mod history;
 mod utils;
 mod verification;
+use db::{Databases, apply_changeset, apply_transaction_digests, finalize_execution};
+pub use db::{TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget};
+use history::{
+    child_transactions_range, header_range_to_target, parent_transactions_inactivity_floor,
+};
 pub use utils::{load_lazy_state, load_state};
 
 /// Fixed consensus cutoff for block timestamps: 2200-01-01T00:00:00Z.
@@ -73,161 +63,6 @@ pub use utils::{load_lazy_state, load_state};
 /// Different platforms have different `SystemTime` limits, so we use a fixed
 /// timestamp to ensure consistent application of block validity rules.
 const MAX_BLOCK_TIMESTAMP_MS: u64 = 7_258_118_400_000;
-
-/// Shared QMDB handle for the application state database.
-type StateDatabase<E, H, P, T> =
-    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T>>>;
-
-pub type TransactionHistoryDb<E, H> =
-    keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H>;
-
-pub type TransactionHistoryOperation<H> =
-    keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
-
-pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
-
-/// Shared QMDB handle for the append-only transaction history database.
-type TransactionDatabase<E, H> = Arc<AsyncRwLock<TransactionHistoryDb<E, H>>>;
-
-/// The backing databases owned by the application.
-type Databases<E, H, P, T> = (StateDatabase<E, H, P, T>, TransactionDatabase<E, H>);
-
-/// Unmerkleized application state batch used for processor read-through.
-type StateBatch<E, H, P, T> = AnyUnmerkleized<
-    mmr::Family,
-    E,
-    FixedJournal<
-        E,
-        AnyOperation<mmr::Family, UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>>,
-    >,
-    UnorderedIndex<T, mmr::Location>,
-    H,
-    UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>,
->;
-
-type TransactionBatch<E, H> = <TransactionDatabase<E, H> as DatabaseSet<E>>::Unmerkleized;
-
-type StateMerkleized<E, H, P, T> = <StateBatch<E, H, P, T> as Unmerkleized>::Merkleized;
-
-type TransactionMerkleized<E, H> = <TransactionBatch<E, H> as Unmerkleized>::Merkleized;
-
-/// Writes a changeset of account updates to a state batch.
-fn apply_changeset<E, H, P>(
-    batch: StateBatch<E, H, P, EightCap>,
-    changeset: &Changeset<P>,
-) -> StateBatch<E, H, P, EightCap>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    changeset
-        .iter()
-        .fold(batch, |batch, (account_key, account)| {
-            batch.write(account_key.clone(), Some(*account))
-        })
-}
-
-fn apply_transaction_digests<E, H, P>(
-    batch: TransactionBatch<E, H>,
-    transactions: &[SignedTransaction<P, H>],
-) -> TransactionBatch<E, H>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    transactions.iter().fold(batch, |batch, transaction| {
-        batch.append(*transaction.message_digest())
-    })
-}
-
-fn apply_lazy_transaction_digests<E, H, P>(
-    batch: TransactionBatch<E, H>,
-    transactions: &[Lazy<SignedTransaction<P, H>>],
-) -> Option<TransactionBatch<E, H>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    let mut batch = batch;
-    for transaction in transactions {
-        batch = batch.append(*transaction.get()?.message_digest());
-    }
-    Some(batch)
-}
-
-const fn header_range_to_target<D>(
-    root: D,
-    range: commonware_utils::range::NonEmptyRange<u64>,
-) -> TransactionHistoryTarget<D>
-where
-    D: Digest,
-{
-    TransactionHistoryTarget {
-        root,
-        leaf_count: mmr::Location::new(range.end()),
-    }
-}
-
-fn parent_transactions_inactivity_floor<C, P, H>(parent: &SealedBlock<C, P, H>) -> mmr::Location
-where
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
-{
-    let parent_body_len = u64::try_from(parent.body.len()).expect("transaction count exceeded u64");
-    let floor = parent
-        .header
-        .transactions_range
-        .end()
-        .checked_sub(parent_body_len)
-        .and_then(|end| end.checked_sub(1))
-        .expect("parent transaction range must include the parent commit");
-    mmr::Location::new(floor)
-}
-
-fn child_transactions_range<C, P, H>(
-    parent: &SealedBlock<C, P, H>,
-    transaction_count: usize,
-) -> commonware_utils::range::NonEmptyRange<u64>
-where
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
-{
-    let transaction_count =
-        u64::try_from(transaction_count).expect("transaction count exceeded u64");
-    let end = parent
-        .header
-        .transactions_range
-        .end()
-        .checked_add(transaction_count)
-        .and_then(|end| end.checked_add(1))
-        .expect("transaction history size exceeded u64");
-    non_empty_range!(*parent_transactions_inactivity_floor(parent), end)
-}
-
-async fn finalize_execution<E, H, P>(
-    state_batch: StateBatch<E, H, P, EightCap>,
-    transaction_batch: TransactionBatch<E, H>,
-) -> Result<
-    (
-        StateMerkleized<E, H, P, EightCap>,
-        TransactionMerkleized<E, H>,
-    ),
-    commonware_storage::qmdb::Error<mmr::Family>,
->
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    let (state_merkleized, transaction_merkleized) =
-        futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
-    Ok((state_merkleized?, transaction_merkleized?))
-}
 
 /// Core constantinople application.
 ///
@@ -680,7 +515,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{TransactionHistoryTarget, genesis_block, parent_transactions_inactivity_floor};
+    use super::{
+        TransactionHistoryTarget, genesis_block, history::parent_transactions_inactivity_floor,
+    };
     use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::{Block, Sealable, Signable, Transaction};
