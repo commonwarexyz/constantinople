@@ -241,13 +241,7 @@ where
 
         let deadline = time::block_deadline(header.timestamp);
         let prepare_started_at = Instant::now();
-        let prepared = match verification::prepare_transactions(&self.strategy, body) {
-            Ok(prepared) => Arc::new(prepared),
-            Err(reason) => {
-                verification::reject(header.height, reason);
-                return None;
-            }
-        };
+        let prepared = Arc::new(verification::prepare_transactions(body));
         let prepare_ms = prepare_started_at.elapsed().as_millis();
 
         let (state_batches, transaction_batch) = batches;
@@ -260,6 +254,7 @@ where
         let execution = verification::execute_block(
             state_batches,
             transaction_batch,
+            &self.strategy,
             parent,
             prepared.as_ref(),
         );
@@ -311,10 +306,7 @@ where
         B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
         St: Strategy + Clone + Send + Sync + 'static,
     {
-        let prepared = Arc::new(
-            verification::prepare_transactions(&self.strategy, block.body.clone())
-                .unwrap_or_else(|reason| panic!("certified block contained {reason}")),
-        );
+        let prepared = Arc::new(verification::prepare_transactions(block.body.clone()));
         let signature = verification::verify_signatures::<E, P, H, B, St>(
             runtime,
             self.strategy.clone(),
@@ -325,6 +317,7 @@ where
         let execution = verification::apply_block(
             state_batches,
             transaction_batch,
+            &self.strategy,
             mmr::Location::new(block.header.transactions_range.start()),
             prepared.as_ref(),
         );

@@ -9,7 +9,8 @@ use super::{
     load_lazy_state,
 };
 use crate::processor::executor;
-use commonware_codec::types::lazy::Lazy;
+use bytes::BytesMut;
+use commonware_codec::{Write as _, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
@@ -35,7 +36,6 @@ where
     P: PublicKey,
 {
     pub(super) transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-    pub(super) signers: Vec<AccountKey<P>>,
 }
 
 /// Verifies lazily decoded signed transactions.
@@ -159,22 +159,15 @@ where
     Ok(started_at.elapsed().as_millis())
 }
 
-/// Preloads transactions for verification and execution.
-pub(super) fn prepare_transactions<P, H, St>(
-    strategy: &St,
+/// Wraps transactions for verification and execution.
+pub(super) const fn prepare_transactions<P, H>(
     transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Result<Prepared<P, H>>
+) -> Prepared<P, H>
 where
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
 {
-    let signers = prepare_signers(strategy, &transactions).ok_or(MALFORMED_TRANSACTION)?;
-
-    Ok(Prepared {
-        transactions,
-        signers,
-    })
+    Prepared { transactions }
 }
 
 fn prepare_signers<P, H, St>(
@@ -211,14 +204,23 @@ where
     H: Hasher,
 {
     let transaction = transaction.get()?;
-    let sender = transaction.value().sender()?;
-    Some(AccountKey::from_public_key(sender))
+    account_key_from_public_key_bytes(transaction.value().sender_lazy())
+}
+
+fn account_key_from_public_key_bytes<P>(public_key: &Lazy<P>) -> Option<AccountKey<P>>
+where
+    P: PublicKey,
+{
+    let mut bytes = BytesMut::with_capacity(P::SIZE);
+    public_key.write(&mut bytes);
+    AccountKey::from_bytes(bytes.freeze())
 }
 
 /// Executes and merkleizes a block body for verification.
-pub(super) async fn execute_block<E, C, P, H>(
+pub(super) async fn execute_block<E, C, P, H, St>(
     state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
+    strategy: &St,
     parent: &SealedBlock<C, P, H>,
     prepared: &Prepared<P, H>,
 ) -> Result<BlockExecution<E, H, P>>
@@ -227,16 +229,18 @@ where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    St: Strategy,
 {
     let load_state_started_at = Instant::now();
-    let state = load_lazy_state(&state_batches, &prepared.transactions, &prepared.signers)
+    let signers = prepare_signers(strategy, &prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let state = load_lazy_state(&state_batches, &prepared.transactions, &signers)
         .await
         .expect("block state loading during verification must succeed")
         .ok_or(MALFORMED_TRANSACTION)?;
     let load_state_ms = load_state_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let changeset = executor::execute_lazy(&state, &prepared.transactions, &prepared.signers)
+    let changeset = executor::execute_lazy(&state, &prepared.transactions, &signers)
         .ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
 
@@ -257,9 +261,10 @@ where
 }
 
 /// Executes and merkleizes a certified block body.
-pub(super) async fn apply_block<E, P, H>(
+pub(super) async fn apply_block<E, P, H, St>(
     state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
+    strategy: &St,
     transactions_floor: mmr::Location,
     prepared: &Prepared<P, H>,
 ) -> Result<(
@@ -270,12 +275,14 @@ where
     E: Storage + Clock + Metrics,
     P: PublicKey,
     H: Hasher,
+    St: Strategy,
 {
-    let state = load_lazy_state(&state_batches, &prepared.transactions, &prepared.signers)
+    let signers = prepare_signers(strategy, &prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let state = load_lazy_state(&state_batches, &prepared.transactions, &signers)
         .await
         .expect("state loading must succeed for certified apply")
         .ok_or(MALFORMED_TRANSACTION)?;
-    let changeset = executor::execute_lazy(&state, &prepared.transactions, &prepared.signers)
+    let changeset = executor::execute_lazy(&state, &prepared.transactions, &signers)
         .ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let state_batch = apply_changeset(state_batches, &changeset);
