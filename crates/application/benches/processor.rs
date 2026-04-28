@@ -3,7 +3,7 @@ use commonware_math::algebra::Random;
 use constantinople_application::processor::{executor, state::State};
 use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
-use divan::Bencher;
+use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{SeedableRng, rngs::StdRng};
 use std::{collections::HashMap, hint::black_box};
 
@@ -13,20 +13,28 @@ type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
 const NAMESPACE: &[u8] = b"processor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
 
-fn main() {
-    divan::main();
-}
+fn processor(c: &mut Criterion) {
+    let mut group = c.benchmark_group("processor");
 
-#[divan::bench(args = TRANSACTION_COUNTS)]
-fn execution(bencher: Bencher<'_, '_>, transaction_count: usize) {
-    let (state, transactions) = build_fixture(transaction_count);
-    bencher.bench_local(|| {
-        black_box(
-            executor::execute(&state, &transactions)
-                .expect("bench transactions should execute")
-                .len(),
-        )
-    });
+    for &transaction_count in TRANSACTION_COUNTS {
+        group.throughput(Throughput::Elements(transaction_count as u64));
+        group.bench_with_input(
+            BenchmarkId::new("execution", transaction_count),
+            &transaction_count,
+            |bencher, &transaction_count| {
+                let (state, transactions) = build_fixture(transaction_count);
+                bencher.iter(|| {
+                    black_box(
+                        executor::execute(black_box(&state), black_box(&transactions))
+                            .expect("bench transactions should execute")
+                            .len(),
+                    )
+                });
+            },
+        );
+    }
+
+    group.finish();
 }
 
 fn build_fixture(transaction_count: usize) -> (State<ed25519::PublicKey>, Vec<TestTransaction>) {
@@ -73,3 +81,10 @@ impl TestSigner {
         .seal_and_sign(&self.key, NAMESPACE, &mut TestHasher::default())
     }
 }
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default().sample_size(10);
+    targets = processor
+}
+criterion_main!(benches);

@@ -72,7 +72,7 @@ type TestDatabases = (TestStateDatabase, TestTransactionDatabase);
 type TestBlock = SealedBlock<TestCommitment, TestPublicKey, TestHasher>;
 type TestConsensusContext = Context<TestCommitment, TestPublicKey>;
 
-const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16384, 32768];
+const TRANSACTION_COUNTS: &[usize] = &[16384, 32768];
 const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(1_048_576);
 const WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192);
