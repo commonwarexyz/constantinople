@@ -326,6 +326,221 @@ where
             .checked_add(Duration::from_millis(block_timestamp_ms))
             .expect("block timestamp exceeded maximum")
     }
+
+    /// Proposes a child block from an already fetched parent.
+    #[doc(hidden)]
+    pub async fn propose_child<E>(
+        &mut self,
+        (runtime, context): (E, Context<C, P>),
+        parent: &SealedBlock<C, P, H>,
+        batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
+        input: &mut I,
+    ) -> Option<Proposed<Self, E>>
+    where
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+        S: Scheme<PublicKey = P>,
+        I: TransactionSource<C, P, H> + Sync,
+        B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+        St: Strategy + Clone + Send + Sync + 'static,
+    {
+        let propose_started_at = Instant::now();
+
+        let input_started_at = Instant::now();
+        let body = input.propose(&parent.header, &context).await;
+        let input_ms = input_started_at.elapsed().as_millis();
+
+        let (state_batches, transaction_batch) = batches;
+
+        let load_state_started_at = Instant::now();
+        let state = load_state(&state_batches, &body)
+            .await
+            .expect("proposal state loading must succeed")
+            .expect("proposal transactions must have decodable senders");
+        let load_state_ms = load_state_started_at.elapsed().as_millis();
+
+        let execute_started_at = Instant::now();
+        let ProposalOutput {
+            valid,
+            invalid: _,
+            changeset,
+        } = executor::propose(&state, body);
+        let execute_ms = execute_started_at.elapsed().as_millis();
+
+        self.proposed_transactions.inc_by(valid.len() as u64);
+
+        let state_batch = apply_changeset(state_batches, &changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &valid)
+            .with_inactivity_floor(parent_transactions_inactivity_floor(parent));
+        let transactions_range = child_transactions_range(parent, valid.len());
+
+        let finalize_started_at = Instant::now();
+        let (state_merkleized, transaction_merkleized) =
+            finalize_execution(state_batch, transaction_batch)
+                .await
+                .expect("database merkleization must succeed");
+        let finalize_ms = finalize_started_at.elapsed().as_millis();
+
+        let header = Header {
+            context,
+            parent: parent.digest(),
+            height: parent.header.height + 1,
+            timestamp: self.timestamp(&runtime),
+            state_root: state_merkleized.root(),
+            state_range: non_empty_range!(
+                *state_merkleized.inactivity_floor(),
+                *state_merkleized.size()
+            ),
+            transactions_root: transaction_merkleized.root(),
+            transactions_range,
+        };
+        let block = Block::new(header, valid).seal(&mut H::default());
+
+        info!(
+            epoch = block.header.context.round.epoch().get(),
+            view = block.header.context.round.view().get(),
+            height = block.header.height,
+            txs = block.body.len(),
+            timestamp = block.header.timestamp,
+            input_ms,
+            load_state_ms,
+            execute_ms,
+            finalize_ms,
+            total_ms = propose_started_at.elapsed().as_millis(),
+            "proposed block"
+        );
+
+        Some(Proposed {
+            block,
+            merkleized: (state_merkleized, transaction_merkleized),
+        })
+    }
+
+    /// Verifies a child block against an already fetched parent.
+    #[doc(hidden)]
+    pub async fn verify_child<E>(
+        &mut self,
+        (runtime, _context): (E, Context<C, P>),
+        block: &SealedBlock<C, P, H>,
+        parent: &SealedBlock<C, P, H>,
+        batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
+    ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
+    where
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+        S: Scheme<PublicKey = P>,
+        I: TransactionSource<C, P, H> + Sync,
+        B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+        St: Strategy + Clone + Send + Sync + 'static,
+    {
+        let verify_started_at = Instant::now();
+        let Block { header, body } = block.clone().into_inner();
+
+        if header.timestamp <= parent.header.timestamp || header.timestamp > MAX_BLOCK_TIMESTAMP_MS
+        {
+            warn!(
+                height = header.height,
+                block_ts = header.timestamp,
+                parent_ts = parent.header.timestamp,
+                "verify rejected: invalid timestamp"
+            );
+            return None;
+        }
+
+        let deadline = self.block_deadline(header.timestamp);
+        let prepare_started_at = Instant::now();
+        let prepared = match verification::prepare_transactions(&self.strategy, body) {
+            Ok(prepared) => Arc::new(prepared),
+            Err(reason) => {
+                verification::reject(header.height, reason);
+                return None;
+            }
+        };
+        let prepare_ms = prepare_started_at.elapsed().as_millis();
+
+        let (state_batches, transaction_batch) = batches;
+        let signature = verification::verify_signatures::<E, P, H, B, St>(
+            runtime.clone(),
+            self.strategy.clone(),
+            self.transaction_namespace,
+            Arc::clone(&prepared),
+        );
+        let execution = verification::execute_block(
+            state_batches,
+            transaction_batch,
+            parent,
+            prepared.as_ref(),
+            prepare_ms,
+        );
+        let sleep = verification::wait_for_timestamp(runtime, deadline);
+
+        let (signature_ms, execution, sleep_ms) =
+            match futures::try_join!(signature, execution, sleep) {
+                Ok(result) => result,
+                Err(reason) => {
+                    verification::reject(header.height, reason);
+                    return None;
+                }
+            };
+
+        if !verification::commitments_match(&header, &execution) {
+            return None;
+        }
+
+        info!(
+            epoch = header.context.round.epoch().get(),
+            view = header.context.round.view().get(),
+            height = header.height,
+            txs = execution.transaction_count,
+            timestamp = header.timestamp,
+            signature_ms,
+            sleep_ms,
+            prepare_ms = execution.timings.prepare_ms,
+            load_state_ms = execution.timings.load_state_ms,
+            execute_ms = execution.timings.execute_ms,
+            finalize_ms = execution.timings.finalize_ms,
+            total_ms = verify_started_at.elapsed().as_millis(),
+            "verified block"
+        );
+        Some(execution.into_merkleized())
+    }
+
+    /// Applies a certified block to speculative batches.
+    #[doc(hidden)]
+    pub async fn apply_certified<E>(
+        &mut self,
+        (runtime, _): (E, Context<C, P>),
+        block: &SealedBlock<C, P, H>,
+        batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
+    ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
+    where
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+        S: Scheme<PublicKey = P>,
+        I: TransactionSource<C, P, H> + Sync,
+        B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+        St: Strategy + Clone + Send + Sync + 'static,
+    {
+        let prepared = Arc::new(
+            verification::prepare_transactions(&self.strategy, block.body.clone())
+                .unwrap_or_else(|reason| panic!("certified block contained {reason}")),
+        );
+        let signature = verification::verify_signatures::<E, P, H, B, St>(
+            runtime,
+            self.strategy.clone(),
+            self.transaction_namespace,
+            Arc::clone(&prepared),
+        );
+        let (state_batches, transaction_batch) = batches;
+        let execution = verification::apply_block(
+            state_batches,
+            transaction_batch,
+            mmr::Location::new(block.header.transactions_range.start()),
+            prepared.as_ref(),
+        );
+
+        match futures::try_join!(signature, execution) {
+            Ok((_signature_ms, merkleized)) => merkleized,
+            Err(reason) => panic!("certified block contained {reason}"),
+        }
+    }
 }
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<H, C, S, P, I, B, St>
@@ -383,82 +598,13 @@ where
     /// construction.
     async fn propose<A: BlockProvider<Block = Self::Block>>(
         &mut self,
-        (runtime, context): (E, Self::Context),
+        context: (E, Self::Context),
         mut ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut Self::InputProvider,
     ) -> Option<Proposed<Self, E>> {
-        let propose_started_at = Instant::now();
         let parent = ancestry.next().await?;
-
-        let input_started_at = Instant::now();
-        let body = input.propose(&parent.header, &context).await;
-        let input_ms = input_started_at.elapsed().as_millis();
-
-        let (state_batches, transaction_batch) = batches;
-
-        let load_state_started_at = Instant::now();
-        let state = load_state(&state_batches, &body)
-            .await
-            .expect("proposal state loading must succeed")
-            .expect("proposal transactions must have decodable senders");
-        let load_state_ms = load_state_started_at.elapsed().as_millis();
-
-        let execute_started_at = Instant::now();
-        let ProposalOutput {
-            valid,
-            invalid: _,
-            changeset,
-        } = executor::propose(&state, body);
-        let execute_ms = execute_started_at.elapsed().as_millis();
-
-        self.proposed_transactions.inc_by(valid.len() as u64);
-
-        let state_batch = apply_changeset(state_batches, &changeset);
-        let transaction_batch = apply_transaction_digests(transaction_batch, &valid)
-            .with_inactivity_floor(parent_transactions_inactivity_floor(&parent));
-        let transactions_range = child_transactions_range(&parent, valid.len());
-
-        let finalize_started_at = Instant::now();
-        let (state_merkleized, transaction_merkleized) =
-            finalize_execution(state_batch, transaction_batch)
-                .await
-                .expect("database merkleization must succeed");
-        let finalize_ms = finalize_started_at.elapsed().as_millis();
-
-        let header = Header {
-            context,
-            parent: parent.digest(),
-            height: parent.header.height + 1,
-            timestamp: self.timestamp(&runtime),
-            state_root: state_merkleized.root(),
-            state_range: non_empty_range!(
-                *state_merkleized.inactivity_floor(),
-                *state_merkleized.size()
-            ),
-            transactions_root: transaction_merkleized.root(),
-            transactions_range,
-        };
-        let block = Block::new(header, valid).seal(&mut H::default());
-
-        info!(
-            epoch = block.header.context.round.epoch().get(),
-            view = block.header.context.round.view().get(),
-            height = block.header.height,
-            txs = block.body.len(),
-            timestamp = block.header.timestamp,
-            input_ms,
-            load_state_ms,
-            execute_ms,
-            finalize_ms,
-            total_ms = propose_started_at.elapsed().as_millis(),
-            "proposed block"
-        );
-
-        Some(Proposed {
-            block,
-            merkleized: (state_merkleized, transaction_merkleized),
-        })
+        self.propose_child(context, &parent, batches, input).await
     }
 
     /// Verifies a proposed block against speculative execution.
@@ -469,81 +615,13 @@ where
     /// and compares all derived roots and ranges.
     async fn verify<A: BlockProvider<Block = Self::Block>>(
         &mut self,
-        (runtime, _context): (E, Self::Context),
+        context: (E, Self::Context),
         mut ancestry: AncestorStream<A, Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
-        let verify_started_at = Instant::now();
-        let Block { header, body } = ancestry.next().await?.into_inner();
+        let block = ancestry.next().await?;
         let parent = ancestry.next().await?;
-
-        if header.timestamp <= parent.header.timestamp || header.timestamp > MAX_BLOCK_TIMESTAMP_MS
-        {
-            warn!(
-                height = header.height,
-                block_ts = header.timestamp,
-                parent_ts = parent.header.timestamp,
-                "verify rejected: invalid timestamp"
-            );
-            return None;
-        }
-
-        let deadline = self.block_deadline(header.timestamp);
-        let prepare_started_at = Instant::now();
-        let prepared = match verification::prepare_transactions(&self.strategy, body) {
-            Ok(prepared) => Arc::new(prepared),
-            Err(reason) => {
-                verification::reject(header.height, reason);
-                return None;
-            }
-        };
-        let prepare_ms = prepare_started_at.elapsed().as_millis();
-
-        let (state_batches, transaction_batch) = batches;
-        let signature = verification::verify_signatures::<E, P, H, B, St>(
-            runtime.clone(),
-            self.strategy.clone(),
-            self.transaction_namespace,
-            Arc::clone(&prepared),
-        );
-        let execution = verification::execute_block(
-            state_batches,
-            transaction_batch,
-            &parent,
-            prepared.as_ref(),
-            prepare_ms,
-        );
-        let sleep = verification::wait_for_timestamp(runtime, deadline);
-
-        let (signature_ms, execution, sleep_ms) =
-            match futures::try_join!(signature, execution, sleep) {
-                Ok(result) => result,
-                Err(reason) => {
-                    verification::reject(header.height, reason);
-                    return None;
-                }
-            };
-
-        if !verification::commitments_match(&header, &execution) {
-            return None;
-        }
-
-        info!(
-            epoch = header.context.round.epoch().get(),
-            view = header.context.round.view().get(),
-            height = header.height,
-            txs = execution.transaction_count,
-            timestamp = header.timestamp,
-            signature_ms,
-            sleep_ms,
-            prepare_ms = execution.timings.prepare_ms,
-            load_state_ms = execution.timings.load_state_ms,
-            execute_ms = execution.timings.execute_ms,
-            finalize_ms = execution.timings.finalize_ms,
-            total_ms = verify_started_at.elapsed().as_millis(),
-            "verified block"
-        );
-        Some(execution.into_merkleized())
+        self.verify_child(context, &block, &parent, batches).await
     }
 
     /// Applies a certified block to speculative batches and returns merkleized state.
@@ -559,32 +637,11 @@ where
     /// execution or database finalization fails.
     async fn apply(
         &mut self,
-        (runtime, _): (E, Self::Context),
+        context: (E, Self::Context),
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        let prepared = Arc::new(
-            verification::prepare_transactions(&self.strategy, block.body.clone())
-                .unwrap_or_else(|reason| panic!("certified block contained {reason}")),
-        );
-        let signature = verification::verify_signatures::<E, P, H, B, St>(
-            runtime,
-            self.strategy.clone(),
-            self.transaction_namespace,
-            Arc::clone(&prepared),
-        );
-        let (state_batches, transaction_batch) = batches;
-        let execution = verification::apply_block(
-            state_batches,
-            transaction_batch,
-            mmr::Location::new(block.header.transactions_range.start()),
-            prepared.as_ref(),
-        );
-
-        match futures::try_join!(signature, execution) {
-            Ok((_signature_ms, merkleized)) => merkleized,
-            Err(reason) => panic!("certified block contained {reason}"),
-        }
+        self.apply_certified(context, block, batches).await
     }
 }
 

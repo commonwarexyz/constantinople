@@ -47,6 +47,7 @@ commonware-cryptography.workspace = true
 # Other
 rand.workspace = true
 divan.workspace = true
+criterion.workspace = true
 hashbrown.workspace = true
 
 [package.metadata.cargo-udeps.ignore]
@@ -54,4 +55,8 @@ development = ["divan"]
 
 [[bench]]
 name = "processor"
+harness = false
+
+[[bench]]
+name = "consensus"
 harness = false
