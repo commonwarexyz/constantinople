@@ -276,14 +276,12 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
         // so operators get a live view of streaming blocks for free.
         // `VITE_SQL_URL` is consumed by `explorer/src/App.tsx`; the
         // default there matches `--sql-port`, but we pass it explicitly
-        // so a non-default port still works. `VITE_INDEXER_URL` is also
-        // forwarded for any future drill-down that needs to fetch a
-        // specific block / transaction body via the KV path.
+        // so a non-default port still works. The KV indexer URL is
+        // intentionally NOT forwarded — the explorer only consumes the
+        // SQL metadata path today.
         commands.push(format!(
-            "VITE_INDEXER_URL=http://127.0.0.1:{} \
-             VITE_SQL_URL=http://127.0.0.1:{} \
-             npm --prefix explorer run dev",
-            local.indexer_port, local.sql_port,
+            "VITE_SQL_URL=http://127.0.0.1:{} npm --prefix explorer run dev",
+            local.sql_port,
         ));
     }
 
@@ -452,10 +450,10 @@ mod tests {
             .iter()
             .find(|c| c.contains("npm --prefix explorer"))
             .expect("explorer dev server command should be present");
-        // Explorer must be wired to the SQL server (subscribe path) and
-        // also told the KV indexer URL for any future drill-down.
-        assert!(explorer_cmd.contains("VITE_INDEXER_URL=http://127.0.0.1:8090"));
+        // Explorer is wired to the SQL server only — the KV indexer URL
+        // is intentionally not forwarded because the UI doesn't read it.
         assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:8091"));
+        assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
         assert!(explorer_cmd.contains("run dev"));
     }
 

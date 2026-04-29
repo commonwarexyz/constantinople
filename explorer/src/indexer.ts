@@ -5,11 +5,10 @@
 // rows from one atomic ingest batch, and at the indexer's "one flush per
 // finalized block" cadence that is exactly one row per finalized block.
 //
-// The full-storage KV path (BLOCK / BLOCK_BY_H / TX / TX_BY_H /
-// FINALIZED / NOTARIZED) is unchanged — fetching a specific transaction
-// body or QMDB proof by digest still goes through the indexer's KV
-// `StoreClient` at `VITE_INDEXER_URL`. This module only owns the
-// metadata stream surfaced via the SQL server at `VITE_SQL_URL`.
+// This is the only store the explorer talks to. The full-storage KV
+// path (BLOCK / TX / FINALIZED / NOTARIZED) is also published by the
+// indexer for tools that need full transaction bodies or QMDB proofs
+// by digest, but the explorer doesn't read it.
 //
 // Column names mirror `crates/indexer/src/sql_schema.rs` and must stay in
 // sync with `BLOCK_META_*` constants there.

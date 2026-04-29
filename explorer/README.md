@@ -31,25 +31,19 @@ The indexer publishes every finalized block to two parallel surfaces
 (see [`crates/indexer/README.md`](../crates/indexer/README.md)):
 
 - **Full storage (KV)** — `BLOCK`, `TX`, `BLOCK_BY_H`, `TX_BY_H`,
-  `FINALIZED`, `NOTARIZED`. Use this path when you need the full
-  `SignedTransaction` body or a QMDB proof; fetch by digest through
-  the existing `StoreClient`. The default port for that store in
-  local-deploy mode is `8090` (`VITE_INDEXER_URL`).
+  `FINALIZED`, `NOTARIZED`. Tools that need the full
+  `SignedTransaction` body or a QMDB proof fetch by digest through the
+  `StoreClient`. The explorer does not consume this path.
 - **Metadata stream (SQL)** — `block_meta` / `tx_meta` tables on top
   of the same store. Cheap to subscribe to from the browser and
-  already deduplicated to one row per block; this is what the live UI
-  consumes.
-
-A future drill-down feature ("click a row, see its transactions") would
-combine both: subscribe via SQL for the live tail, then fetch a specific
-tx body or QMDB proof from the KV store on demand.
+  already deduplicated to one row per block; this is the only surface
+  the explorer reads.
 
 ## Configuration
 
-| Env var             | Default                  | Notes                                          |
-| ------------------- | ------------------------ | ---------------------------------------------- |
-| `VITE_SQL_URL`      | `http://127.0.0.1:8091`  | The `exoware-sql` server. Matches the local-deploy `--sql-port` default. |
-| `VITE_INDEXER_URL`  | _(unset by default)_     | The KV store. Forwarded by the local-deploy mprocs script for future drill-down; the current UI does not read it. |
+| Env var        | Default                 | Notes                                                                    |
+| -------------- | ----------------------- | ------------------------------------------------------------------------ |
+| `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `exoware-sql` server. Matches the local-deploy `--sql-port` default. |
 
 The exoware Store and the SQL server both enable a permissive CORS
 layer, so the dev server can talk to them cross-origin without a Vite

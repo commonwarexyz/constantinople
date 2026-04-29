@@ -22,12 +22,10 @@ type Status =
     | { kind: 'live' }
     | { kind: 'error'; message: string };
 
-// The explorer subscribes to the SQL metadata server (block_meta), NOT
-// the raw KV store. The default port matches `--sql-port` in
+// The explorer subscribes to the SQL metadata server (block_meta) and
+// reads from no other store. The default port matches `--sql-port` in
 // `bin/deploy/src/local.rs`; override via `VITE_SQL_URL` for non-default
-// deployments. The KV store lives on a separate port (`VITE_INDEXER_URL`)
-// and would be used for any future drill-down that fetches a tx body or
-// QMDB proof by digest — not consumed by this UI today.
+// deployments.
 const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
