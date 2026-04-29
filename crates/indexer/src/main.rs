@@ -2,9 +2,14 @@
 //!
 //! This binary is a thin wrapper around [`exoware_simulator::server::run`].
 //! It is intended for local development and integration testing only — point
-//! the validator's `indexer.{blocks,transactions,meta}_url` at three
-//! instances of this binary (one per backing store) to capture and inspect
-//! uploads without standing up the full hosted exoware service.
+//! the validator's `indexer.{blocks,transactions,sql}_url` at instances of
+//! this binary (one per backing store, or all at the same instance for
+//! local dev) to capture and inspect uploads without standing up the full
+//! hosted exoware service.
+//!
+//! The companion `[[bin]] sql` (see `crates/indexer/src/bin/sql.rs`)
+//! exposes the SQL metadata tables that the explorer subscribes to; it
+//! reads from this same store via the `query` and `stream` services.
 
 use clap::Parser;
 use std::path::PathBuf;

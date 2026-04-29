@@ -1,42 +1,59 @@
 # constantinople / explorer
 
-A small React + Vite app that subscribes to the constantinople indexer
-(exoware simulator) and renders newly finalized transactions as they arrive,
-batched per finalized block.
+A small React + Vite app that streams newly finalized blocks from the
+constantinople indexer's SQL metadata path and renders them as they
+arrive.
 
 ## What it does
 
-The explorer opens a single `subscribe()` stream against the indexer's
-[`store.stream.v1.Service`][rpc] for the `TX_BY_H` key family
-(`reservedBits = 4`, `prefix = 0x6` — see
-[`crates/indexer/src/keys.rs`](../crates/indexer/src/keys.rs)). Every key in
-that family is `(u64 BE height, u32 BE index) → 32-byte tx digest`, and each
-atomic store batch corresponds to the transactions of a single finalized
-block.
+The explorer opens a single `Subscribe` stream against
+[`store.sql.v1.Service`][rpc] for the `block_meta` table. Every
+delivered `SubscribeResponse` frame carries the rows from one atomic
+ingest batch, and the indexer flushes once per finalized block, so most
+frames decode to exactly one new block summary —
+`(height, txCount, arrival time, sequence)`.
 
-[rpc]: https://github.com/exowarexyz/monorepo/blob/main/proto/store/v1/stream.proto
+The schema column names (`height`, `tx_count`, …) come from
+[`crates/indexer/src/sql_schema.rs`](../crates/indexer/src/sql_schema.rs),
+which is the canonical source of truth for both the publisher and this
+client.
 
-Rather than streaming every transaction (a single block can contain tens of
-thousands during spammer runs), the UI aggregates each batch into a one-line
-block summary — `(height, txCount, arrival time)` — and renders a multi-line
-ASCII histogram at the top showing tx-count-per-block over the last
-~80 blocks so the operator can see throughput scale at a glance. The
-histogram's y-axis is auto-scaled to the peak in the visible window.
+[rpc]: https://github.com/exowarexyz/monorepo/blob/main/proto/store/v1/sql.proto
 
-The full transaction body lives in the `TX` family (`prefix = 0x5`). Decoding
-it requires deserializing `SignedTransaction`, which is non-trivial from
-TypeScript; the explorer deliberately leaves that out — height + tx count is
-enough to read the live cadence of the chain.
+The UI renders a one-line block summary plus a multi-line ASCII
+histogram showing tx-count-per-block over the last ~80 blocks so the
+operator can see throughput scale at a glance. The histogram's y-axis
+is auto-scaled to the peak in the visible window.
+
+### Why SQL, not the raw KV stream?
+
+The indexer publishes every finalized block to two parallel surfaces
+(see [`crates/indexer/README.md`](../crates/indexer/README.md)):
+
+- **Full storage (KV)** — `BLOCK`, `TX`, `BLOCK_BY_H`, `TX_BY_H`,
+  `FINALIZED`, `NOTARIZED`. Use this path when you need the full
+  `SignedTransaction` body or a QMDB proof; fetch by digest through
+  the existing `StoreClient`. The default port for that store in
+  local-deploy mode is `8090` (`VITE_INDEXER_URL`).
+- **Metadata stream (SQL)** — `block_meta` / `tx_meta` tables on top
+  of the same store. Cheap to subscribe to from the browser and
+  already deduplicated to one row per block; this is what the live UI
+  consumes.
+
+A future drill-down feature ("click a row, see its transactions") would
+combine both: subscribe via SQL for the live tail, then fetch a specific
+tx body or QMDB proof from the KV store on demand.
 
 ## Configuration
 
 | Env var             | Default                  | Notes                                          |
 | ------------------- | ------------------------ | ---------------------------------------------- |
-| `VITE_INDEXER_URL`  | `http://127.0.0.1:8090`  | Matches the local-deploy `--indexer-port` default |
+| `VITE_SQL_URL`      | `http://127.0.0.1:8091`  | The `exoware-sql` server. Matches the local-deploy `--sql-port` default. |
+| `VITE_INDEXER_URL`  | _(unset by default)_     | The KV store. Forwarded by the local-deploy mprocs script for future drill-down; the current UI does not read it. |
 
-The exoware simulator already enables a permissive CORS layer
-(`tower_http::cors::CorsLayer::very_permissive()`), so the dev server can
-talk to it cross-origin without a Vite proxy.
+The exoware Store and the SQL server both enable a permissive CORS
+layer, so the dev server can talk to them cross-origin without a Vite
+proxy.
 
 ## Local development
 
@@ -45,8 +62,8 @@ npm install
 npm run dev
 ```
 
-The dev server defaults to <http://localhost:5173>. To get live data, point
-the validator's indexer wiring at the simulator and start the spammer:
+The dev server defaults to <http://localhost:5173>. To get live data,
+point a secondary validator at the simulator and start the spammer:
 
 ```sh
 cargo run -p constantinople-deploy -- generate \
@@ -55,7 +72,8 @@ cargo run -p constantinople-deploy -- generate \
 mprocs ...   # the deploy job prints the full mprocs invocation
 ```
 
-`local --indexer` automatically appends both the simulator and this dev
+`local --indexer` automatically appends the simulator (`indexer` bin),
+the SQL server (`sql` bin from `constantinople-indexer`), and this dev
 server to the printed mprocs command list (see
 [`bin/deploy/src/local.rs`](../bin/deploy/src/local.rs)).
 
@@ -66,8 +84,8 @@ npm run build
 ```
 
 Outputs a static bundle to `dist/`. The explorer lives outside the cargo
-workspace and is **not** exercised by `just test`; ship-time verification is
-just `npm run build`.
+workspace and is **not** exercised by `just test`; ship-time verification
+is just `npm run build`.
 
 ## Styling: why we don't depend on www-sacred directly
 
