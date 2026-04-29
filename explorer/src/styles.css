@@ -53,6 +53,22 @@ body {
     min-height: 0;
 }
 
+/*
+ * Centered max-width container so header, summary, histogram and table all
+ * align to the same gutters regardless of viewport width. The histogram's
+ * responsive column count (see App.tsx) keys off the chart's clientWidth, so
+ * everything visually scales together up to this max-width.
+ */
+.app__container {
+    width: 100%;
+    max-width: 1400px;
+    margin: 0 auto;
+    display: flex;
+    flex-direction: column;
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
 .app__header {
     border-bottom: 1px solid var(--theme-border);
     padding: 1ch 2ch;
@@ -163,6 +179,7 @@ body {
     grid-column: 2;
     grid-row: 1;
     margin: 0;
+    width: 100%;
     color: var(--theme-accent);
     font-family: var(--font-family-mono);
     line-height: 1;
@@ -171,6 +188,21 @@ body {
     border-left: 1px solid var(--theme-border);
     padding-left: 1ch;
     overflow: hidden;
+    position: relative;
+}
+
+/*
+ * Hidden 1ch ruler used by the Histogram component to convert the chart's
+ * pixel width into a column count. Stays inside the chart so it inherits
+ * the exact same font metrics, but doesn't take any layout space.
+ */
+.histogram__measure {
+    position: absolute;
+    visibility: hidden;
+    pointer-events: none;
+    white-space: pre;
+    top: 0;
+    left: 0;
 }
 
 .histogram__caption {

@@ -5,8 +5,15 @@ import { type ObservedBlock, subscribeBlocks } from './indexer';
 const MAX_ROWS = 200;
 /** Height (rows) of the throughput histogram at the top of the page. */
 const HISTOGRAM_HEIGHT = 8;
-/** Width (cols) of the throughput histogram. Each column is one block. */
-const HISTOGRAM_WIDTH = 80;
+/**
+ * Upper bound on the responsive histogram column count. We measure the
+ * container width and divide by 1ch to derive the actual column count, but
+ * keep an absolute ceiling so each column still represents a meaningful
+ * slice of recent history on ultra-wide displays.
+ */
+const HISTOGRAM_MAX_COLUMNS = 400;
+/** Initial column count used before the ResizeObserver fires its first measurement. */
+const HISTOGRAM_INITIAL_COLUMNS = 80;
 /** 8-step unicode block ramp; index 0 is empty so unused cells stay blank. */
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 
@@ -53,17 +60,19 @@ export default function App() {
 
     return (
         <div className="app">
-            <header className="app__header">
-                <h1 className="app__title">
-                    <span className="accent">constantinople</span> / explorer
-                </h1>
-                <StatusBadge status={status} url={indexerUrl} />
-            </header>
-            <SummaryPanel blocks={blocks} />
-            <Histogram blocks={blocks} />
-            <main className="app__main">
-                <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
-            </main>
+            <div className="app__container">
+                <header className="app__header">
+                    <h1 className="app__title">
+                        <span className="accent">constantinople</span> / explorer
+                    </h1>
+                    <StatusBadge status={status} url={indexerUrl} />
+                </header>
+                <SummaryPanel blocks={blocks} />
+                <Histogram blocks={blocks} />
+                <main className="app__main">
+                    <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
+                </main>
+            </div>
         </div>
     );
 }
@@ -153,42 +162,89 @@ function computeStats(blocks: ObservedBlock[]): DerivedStats {
 }
 
 /**
- * ASCII histogram of `txCount` for the last `HISTOGRAM_WIDTH` blocks. Each
- * column is one block (oldest left → newest right) and uses an 8-step
- * vertical block ramp so a column can be partially filled with sub-row
- * resolution.
+ * ASCII histogram of `txCount` for the most recent blocks. Each column is
+ * one block (oldest left → newest right) and uses an 8-step vertical block
+ * ramp so a column can be partially filled with sub-row resolution.
+ *
+ * The column count is responsive: we measure 1ch in the chart's font via a
+ * hidden `<span>x</span>` and divide the chart's content width by it on
+ * mount and on every resize, so the histogram always fills the available
+ * width without changing the monospace cell aesthetic.
  *
  * The y-axis is auto-scaled to the peak in the visible window so a quiet
  * stretch of empty blocks doesn't compress later activity into the baseline.
  */
 function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
-    const { lines, peak } = useMemo(() => buildHistogram(blocks), [blocks]);
+    const chartRef = useRef<HTMLPreElement>(null);
+    const measureRef = useRef<HTMLSpanElement>(null);
+    const [columns, setColumns] = useState<number>(HISTOGRAM_INITIAL_COLUMNS);
+
+    useEffect(() => {
+        const chart = chartRef.current;
+        const measure = measureRef.current;
+        if (!chart || !measure) return;
+
+        const recompute = () => {
+            const chWidth = measure.getBoundingClientRect().width;
+            if (chWidth <= 0) return;
+            const style = window.getComputedStyle(chart);
+            const padLeft = parseFloat(style.paddingLeft) || 0;
+            const padRight = parseFloat(style.paddingRight) || 0;
+            const contentWidth = chart.clientWidth - padLeft - padRight;
+            if (contentWidth <= 0) return;
+            const cols = Math.max(
+                1,
+                Math.min(HISTOGRAM_MAX_COLUMNS, Math.floor(contentWidth / chWidth)),
+            );
+            setColumns((prev) => (prev === cols ? prev : cols));
+        };
+
+        recompute();
+        const observer = new ResizeObserver(recompute);
+        observer.observe(chart);
+        return () => observer.disconnect();
+    }, []);
+
+    const { lines, peak } = useMemo(
+        () => buildHistogram(blocks, columns),
+        [blocks, columns],
+    );
     return (
         <section className="histogram">
             <div className="histogram__y-axis">
                 <span>{peak > 0 ? peak.toLocaleString() : ''}</span>
                 <span>0</span>
             </div>
-            <pre className="histogram__chart" aria-label="recent block tx count histogram">
+            <pre
+                ref={chartRef}
+                className="histogram__chart"
+                aria-label="recent block tx count histogram"
+            >
+                <span ref={measureRef} className="histogram__measure" aria-hidden="true">
+                    x
+                </span>
                 {lines.join('\n')}
             </pre>
             <div className="histogram__caption">
-                tx count per block · last {Math.min(blocks.length, HISTOGRAM_WIDTH)} blocks ·
+                tx count per block · last {Math.min(blocks.length, columns)} blocks ·
                 oldest → newest
             </div>
         </section>
     );
 }
 
-function buildHistogram(blocks: ObservedBlock[]): { lines: string[]; peak: number } {
+function buildHistogram(
+    blocks: ObservedBlock[],
+    width: number,
+): { lines: string[]; peak: number } {
     // Newest-first → oldest-first so the histogram reads left=old, right=new.
-    const recent = blocks.slice(0, HISTOGRAM_WIDTH).reverse();
+    const recent = blocks.slice(0, width).reverse();
     let peak = 0;
     for (const block of recent) {
         if (block.txCount > peak) peak = block.txCount;
     }
     if (peak === 0) {
-        const blank = ' '.repeat(HISTOGRAM_WIDTH);
+        const blank = ' '.repeat(width);
         return { lines: Array.from({ length: HISTOGRAM_HEIGHT }, () => blank), peak };
     }
 
@@ -200,7 +256,7 @@ function buildHistogram(blocks: ObservedBlock[]): { lines: string[]; peak: numbe
         Math.min(eighthsPerColumn, Math.max(1, Math.round((block.txCount / peak) * eighthsPerColumn))),
     );
     // Pad the left side with empty columns when we don't have enough history.
-    while (columnEighths.length < HISTOGRAM_WIDTH) {
+    while (columnEighths.length < width) {
         columnEighths.unshift(0);
     }
 
