@@ -18,7 +18,7 @@
     --theme-text: #eeeeee;
     --theme-text-dim: #8a8a8a;
     --theme-border: #2a2a2a;
-    --theme-accent: #e4f221;
+    --theme-accent: #ffb200;
     --theme-row-alt: #131415;
     --theme-row-hover: #1c1d1e;
 }
@@ -254,7 +254,7 @@ body {
 
 @keyframes flash {
     from {
-        background: rgba(228, 242, 33, 0.18);
+        background: rgba(255, 178, 0, 0.18);
     }
     to {
         background: transparent;
