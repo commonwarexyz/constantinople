@@ -15,9 +15,30 @@ use std::time::Instant;
 
 /// Timing information for deterministic block execution.
 pub(super) struct ExecutionTimings {
+    pub(super) prepare_signers_ms: u128,
     pub(super) load_state_ms: u128,
     pub(super) execute_ms: u128,
     pub(super) finalize_ms: u128,
+}
+
+impl ExecutionTimings {
+    pub(super) const fn before_finalize(
+        prepare_signers_ms: u128,
+        load_state_ms: u128,
+        execute_ms: u128,
+    ) -> Self {
+        Self {
+            prepare_signers_ms,
+            load_state_ms,
+            execute_ms,
+            finalize_ms: 0,
+        }
+    }
+
+    const fn with_finalize_ms(mut self, finalize_ms: u128) -> Self {
+        self.finalize_ms = finalize_ms;
+        self
+    }
 }
 
 /// Merkleized output produced by block execution.
@@ -59,8 +80,7 @@ pub(super) async fn finalize_child_execution<E, C, P, H>(
     transaction_batch: TransactionBatch<E, H>,
     parent: &SealedBlock<C, P, H>,
     transaction_count: usize,
-    load_state_ms: u128,
-    execute_ms: u128,
+    timings: ExecutionTimings,
     expect_message: &'static str,
 ) -> BlockExecution<E, H, P>
 where
@@ -84,10 +104,6 @@ where
         transactions,
         transactions_range,
         transaction_count,
-        timings: ExecutionTimings {
-            load_state_ms,
-            execute_ms,
-            finalize_ms,
-        },
+        timings: timings.with_finalize_ms(finalize_ms),
     }
 }

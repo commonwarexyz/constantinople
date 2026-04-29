@@ -5,7 +5,7 @@ use super::{
         StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
         apply_lazy_transaction_digests, finalize_execution,
     },
-    execution::{BlockExecution, finalize_child_execution},
+    execution::{BlockExecution, ExecutionTimings, finalize_child_execution},
     load_lazy_state,
 };
 use crate::processor::executor;
@@ -231,8 +231,11 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let load_state_started_at = Instant::now();
+    let prepare_signers_started_at = Instant::now();
     let signers = prepare_signers(strategy, &prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let prepare_signers_ms = prepare_signers_started_at.elapsed().as_millis();
+
+    let load_state_started_at = Instant::now();
     let state = load_lazy_state(&state_batches, &prepared.transactions, &signers)
         .await
         .expect("block state loading during verification must succeed")
@@ -248,13 +251,13 @@ where
     let transaction_batch =
         apply_lazy_transaction_digests(transaction_batch, &prepared.transactions)
             .ok_or(MALFORMED_TRANSACTION)?;
+    let timings = ExecutionTimings::before_finalize(prepare_signers_ms, load_state_ms, execute_ms);
     Ok(finalize_child_execution(
         state_batch,
         transaction_batch,
         parent,
         prepared.transactions.len(),
-        load_state_ms,
-        execute_ms,
+        timings,
         "database merkleization during verification must succeed",
     )
     .await)

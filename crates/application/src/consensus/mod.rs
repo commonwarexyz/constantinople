@@ -50,7 +50,7 @@ mod utils;
 mod verification;
 use db::{Databases, apply_changeset, apply_transaction_digests};
 pub use db::{TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget};
-use execution::finalize_child_execution;
+use execution::{ExecutionTimings, finalize_child_execution};
 use history::header_range_to_target;
 pub use utils::{load_lazy_state, load_state};
 
@@ -167,13 +167,15 @@ where
         let state_batch = apply_changeset(state_batches, &changeset);
         let transaction_count = valid.len();
         let transaction_batch = apply_transaction_digests(transaction_batch, &valid);
+        let prepare_signers_ms = 0;
+        let timings =
+            ExecutionTimings::before_finalize(prepare_signers_ms, load_state_ms, execute_ms);
         let execution = finalize_child_execution(
             state_batch,
             transaction_batch,
             parent,
             transaction_count,
-            load_state_ms,
-            execute_ms,
+            timings,
             "database merkleization must succeed",
         )
         .await;
@@ -282,6 +284,7 @@ where
             signature_ms,
             sleep_ms,
             prepare_ms,
+            prepare_signers_ms = execution.timings.prepare_signers_ms,
             load_state_ms = execution.timings.load_state_ms,
             execute_ms = execution.timings.execute_ms,
             finalize_ms = execution.timings.finalize_ms,
