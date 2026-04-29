@@ -200,17 +200,19 @@ fn build_secondaries(
 }
 
 /// Build the indexer wiring written into every secondary's YAML when the
-/// local deploy is started with `--indexer`. All three URLs point at the same
+/// local deploy is started with `--indexer`. All four URLs point at the same
 /// simulator; routing-by-family in the indexer client keeps writes correct
-/// because key prefixes are disjoint. Splitting the simulator into three
-/// processes is deferred until we actually need physically separate stores.
+/// because key prefixes are disjoint (KV families occupy `0x10..=0x7F`, SQL
+/// table prefixes occupy `0x00..=0x0F`). Splitting the simulator into
+/// physically separate stores is deferred until we need it.
 fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         enabled: true,
         blocks_url: url.clone(),
         transactions_url: url.clone(),
-        meta_url: url,
+        meta_url: url.clone(),
+        sql_url: url,
         upload_buffer: 1024,
     }
 }
@@ -474,6 +476,7 @@ mod tests {
         assert_eq!(indexer.blocks_url, expected_url);
         assert_eq!(indexer.transactions_url, expected_url);
         assert_eq!(indexer.meta_url, expected_url);
+        assert_eq!(indexer.sql_url, expected_url);
     }
 
     #[test]

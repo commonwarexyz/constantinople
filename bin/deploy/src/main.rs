@@ -224,7 +224,7 @@ pub(crate) struct ValidatorConfig {
 ///
 /// Mirrors the schema in `bin/validator/src/config.rs::IndexerConfig`. The
 /// local deploy currently only spins up a single exoware simulator and routes
-/// all three URLs to the same backend; routing-by-family in the indexer
+/// all four URLs to the same backend; routing-by-family in the indexer
 /// client keeps the data correct because key prefixes are disjoint.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
@@ -232,6 +232,7 @@ pub(crate) struct IndexerConfig {
     pub blocks_url: String,
     pub transactions_url: String,
     pub meta_url: String,
+    pub sql_url: String,
     pub upload_buffer: usize,
 }
 

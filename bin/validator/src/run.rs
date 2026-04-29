@@ -95,21 +95,25 @@ fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Opti
         blocks_url = %cfg.blocks_url,
         transactions_url = %cfg.transactions_url,
         meta_url = %cfg.meta_url,
+        sql_url = %cfg.sql_url,
         "starting indexer uploaders",
     );
     let blocks_store = constantinople_indexer::standard_store_client(&cfg.blocks_url);
     let transactions_store = constantinople_indexer::standard_store_client(&cfg.transactions_url);
     let meta_store = constantinople_indexer::standard_store_client(&cfg.meta_url);
+    let sql_store = constantinople_indexer::standard_store_client(&cfg.sql_url);
     let uploaders = spawn_uploaders(
         blocks_store,
         transactions_store,
         meta_store,
+        sql_store,
         cfg.upload_buffer,
     );
     let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
         uploaders.meta.clone(),
+        uploaders.sql.clone(),
     );
     // Certificates (FINALIZED, NOTARIZED) live in the blocks store.
     let cert_reporter = EngineCertReporter::new(uploaders.blocks.clone());

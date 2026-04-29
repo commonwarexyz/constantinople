@@ -24,11 +24,19 @@ use commonware_utils::{
 use constantinople_engine::types::EngineBlock;
 use constantinople_indexer::{
     BlockReporter, IndexerClient, UploaderHandles, keys as indexer_keys, spawn_uploaders,
+    sql_schema::{
+        BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TX_COUNT, TX_META_TABLE,
+        build_meta_schema,
+    },
 };
 use constantinople_primitives::{
     Block, Header, Sealable, Signable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
 };
 use core::num::NonZeroU64;
+use datafusion::{
+    arrow::array::{FixedSizeBinaryArray, UInt64Array},
+    prelude::SessionContext,
+};
 use exoware_sdk::{RangeMode, RetryConfig, StoreClient, keys::Key};
 use rand::{SeedableRng, rngs::StdRng};
 use std::time::Duration;
@@ -91,14 +99,15 @@ fn valid_commitment() -> Commitment {
     ))
 }
 
-/// Three running simulators with their connected store clients. The temp dirs
+/// Four running simulators with their connected store clients. The temp dirs
 /// and join handles are kept alive for the duration of the test.
 struct Stores {
     blocks: StoreClient,
     transactions: StoreClient,
     meta: StoreClient,
-    _handles: [tokio::task::JoinHandle<()>; 3],
-    _dirs: [TempDir; 3],
+    sql: StoreClient,
+    _handles: [tokio::task::JoinHandle<()>; 4],
+    _dirs: [TempDir; 4],
 }
 
 async fn spawn_stores() -> Stores {
@@ -114,12 +123,14 @@ async fn spawn_stores() -> Stores {
     let (h_b, d_b, blocks) = one().await;
     let (h_t, d_t, transactions) = one().await;
     let (h_m, d_m, meta) = one().await;
+    let (h_s, d_s, sql) = one().await;
     Stores {
         blocks,
         transactions,
         meta,
-        _handles: [h_b, h_t, h_m],
-        _dirs: [d_b, d_t, d_m],
+        sql,
+        _handles: [h_b, h_t, h_m, h_s],
+        _dirs: [d_b, d_t, d_m, d_s],
     }
 }
 
@@ -129,6 +140,7 @@ fn make_uploaders(stores: &Stores) -> UploaderHandles {
         stores.blocks.clone(),
         stores.transactions.clone(),
         stores.meta.clone(),
+        stores.sql.clone(),
         16,
     )
 }
@@ -172,6 +184,7 @@ async fn block_reporter_uploads_block_transactions_and_meta_to_separate_stores()
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
         uploaders.meta.clone(),
+        uploaders.sql.clone(),
     );
 
     // Build, hand off to reporter, and wait for all three uploaders to ack.
@@ -242,6 +255,7 @@ async fn block_reporter_advances_latest_height_monotonically() {
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
         uploaders.meta.clone(),
+        uploaders.sql.clone(),
     );
 
     for height in 1u64..=4 {
@@ -276,6 +290,7 @@ async fn block_reporter_handles_empty_block_body() {
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
         uploaders.meta.clone(),
+        uploaders.sql.clone(),
     );
 
     let block = build_block(1, 0, 0xBABE);
@@ -299,6 +314,7 @@ async fn block_reporter_ignores_tip_updates() {
         uploaders.blocks.clone(),
         uploaders.transactions.clone(),
         uploaders.meta.clone(),
+        uploaders.sql.clone(),
     );
 
     reporter
@@ -317,6 +333,96 @@ async fn block_reporter_ignores_tip_updates() {
     assert_eq!(count_all(&stores.blocks).await, 0);
     assert_eq!(count_all(&stores.transactions).await, 0);
     assert_eq!(count_all(&stores.meta).await, 0);
+
+    drop(uploaders);
+}
+
+/// SQL metadata path: a finalized block must produce one `block_meta` row
+/// (with the matching height, digest, and tx_count) and one `tx_meta` row
+/// per contained transaction. This drives the same store URL through both
+/// the writer (`build_meta_schema(...).batch_writer()`, owned by the
+/// uploader task) and the reader (`SessionContext` registered against the
+/// same schema), confirming the metadata is queryable end-to-end.
+#[tokio::test]
+async fn block_reporter_writes_block_meta_and_tx_meta_rows() {
+    let stores = spawn_stores().await;
+    let uploaders = make_uploaders(&stores);
+    let mut reporter: BlockReporter<Sha256, PublicKey> = BlockReporter::new(
+        uploaders.blocks.clone(),
+        uploaders.transactions.clone(),
+        uploaders.meta.clone(),
+        uploaders.sql.clone(),
+    );
+
+    let block = build_block(42, 3, 0xDECAF);
+    let expected_digest: [u8; 32] = block.seal().as_ref().try_into().expect("32-byte digest");
+    let expected_tx_count = block.body.len() as u64;
+
+    let (ack, waiter) = Exact::handle();
+    reporter.report(Update::Block(block.clone(), ack)).await;
+    waiter.await.expect("uploader must acknowledge");
+
+    // Register a fresh DataFusion session against the SQL store; the
+    // uploader has already committed so all rows are visible.
+    let ctx = SessionContext::new();
+    build_meta_schema(stores.sql.clone())
+        .expect("build schema")
+        .register_all(&ctx)
+        .expect("register schema");
+
+    // block_meta: exactly one row matching the encoded block.
+    let block_meta_query = format!(
+        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_DIGEST}, {BLOCK_META_TX_COUNT} FROM {BLOCK_META_TABLE}",
+    );
+    let batches = ctx
+        .sql(&block_meta_query)
+        .await
+        .expect("block_meta select")
+        .collect()
+        .await
+        .expect("collect block_meta");
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 1, "exactly one block_meta row expected");
+    let batch = &batches[0];
+    let height = batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("height col")
+        .value(0);
+    assert_eq!(height, 42);
+    let digest = batch
+        .column(1)
+        .as_any()
+        .downcast_ref::<FixedSizeBinaryArray>()
+        .expect("digest col")
+        .value(0);
+    assert_eq!(digest, expected_digest);
+    let tx_count = batch
+        .column(2)
+        .as_any()
+        .downcast_ref::<UInt64Array>()
+        .expect("tx_count col")
+        .value(0);
+    assert_eq!(tx_count, expected_tx_count);
+
+    // tx_meta: exactly `expected_tx_count` rows, all at height=42.
+    let tx_meta_query = format!("SELECT COUNT(*) FROM {TX_META_TABLE}");
+    let agg = ctx
+        .sql(&tx_meta_query)
+        .await
+        .expect("tx_meta count")
+        .collect()
+        .await
+        .expect("collect tx_meta");
+    let agg_batch = &agg[0];
+    let count = agg_batch
+        .column(0)
+        .as_any()
+        .downcast_ref::<datafusion::arrow::array::Int64Array>()
+        .expect("count col")
+        .value(0);
+    assert_eq!(count as u64, expected_tx_count);
 
     drop(uploaders);
 }

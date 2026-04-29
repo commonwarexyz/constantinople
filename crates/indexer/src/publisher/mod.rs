@@ -33,9 +33,11 @@ use tracing::{debug, error, warn};
 
 pub mod block;
 pub mod certificate;
+pub mod sql;
 
 pub use block::BlockReporter;
 pub use certificate::CertificateReporter;
+pub use sql::{SqlBatch, SqlRow, spawn_sql_uploader};
 
 /// One atomic write to a single exoware store.
 ///
@@ -52,10 +54,14 @@ pub struct UploadBatch {
     pub ack: Option<Exact>,
 }
 
-/// Handles for the three uploader tasks and their feeder channels.
+/// Handles for the four uploader tasks and their feeder channels.
 ///
-/// Cloneable [`BlockReporter`] / [`CertificateReporter`] instances clone the
-/// senders below and forward batches to the per-store uploader tasks.
+/// Three of the channels carry pre-encoded KV [`UploadBatch`]es to the
+/// `blocks`, `transactions`, and `meta` exoware Stores. The fourth carries
+/// typed [`SqlBatch`]es to the SQL metadata uploader, which owns a single
+/// [`exoware_sql::BatchWriter`] over its own [`StoreClient`]. Cloneable
+/// [`BlockReporter`] / [`CertificateReporter`] instances clone these
+/// senders and forward batches to the per-store tasks.
 pub struct UploaderHandles {
     /// Sender for the `blocks` store (BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED).
     pub blocks: mpsc::Sender<UploadBatch>,
@@ -63,16 +69,24 @@ pub struct UploaderHandles {
     pub transactions: mpsc::Sender<UploadBatch>,
     /// Sender for the `meta` store (META).
     pub meta: mpsc::Sender<UploadBatch>,
+    /// Sender for the SQL metadata uploader (`block_meta`, `tx_meta`).
+    pub sql: mpsc::Sender<SqlBatch>,
     /// Background uploader join handles, kept alive for the lifetime of the
     /// validator process so the tasks are not aborted prematurely.
-    pub joins: [JoinHandle<()>; 3],
+    pub joins: [JoinHandle<()>; 4],
 }
 
 /// Spawn one uploader task per backing store on the current tokio runtime.
+///
+/// The first three uploaders write pre-encoded KV pairs through
+/// [`StoreClient::ingest`]; the fourth (`sql_client`) is a SQL metadata
+/// publisher that owns an [`exoware_sql::BatchWriter`] and flushes once
+/// per finalized block.
 pub fn spawn_uploaders(
     blocks_client: StoreClient,
     transactions_client: StoreClient,
     meta_client: StoreClient,
+    sql_client: StoreClient,
     buffer: usize,
 ) -> UploaderHandles {
     let (blocks_tx, blocks_rx) = mpsc::channel::<UploadBatch>(buffer);
@@ -82,12 +96,14 @@ pub fn spawn_uploaders(
     let blocks_join = tokio::spawn(run_uploader("blocks", blocks_client, blocks_rx));
     let txs_join = tokio::spawn(run_uploader("transactions", transactions_client, txs_rx));
     let meta_join = tokio::spawn(run_uploader("meta", meta_client, meta_rx));
+    let (sql_tx, sql_join) = spawn_sql_uploader(sql_client, buffer);
 
     UploaderHandles {
         blocks: blocks_tx,
         transactions: txs_tx,
         meta: meta_tx,
-        joins: [blocks_join, txs_join, meta_join],
+        sql: sql_tx,
+        joins: [blocks_join, txs_join, meta_join, sql_join],
     }
 }
 
