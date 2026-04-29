@@ -261,6 +261,15 @@ fn local_run_commands(output_dir: &Path, args: &GenerateArgs, local: &LocalArgs)
             local.indexer_port,
             data_dir.display(),
         ));
+        // Bring up the React explorer dev server alongside the simulator so
+        // operators get a live view of streaming transactions for free.
+        // `VITE_INDEXER_URL` is consumed by `explorer/src/App.tsx`; the
+        // default there matches `--indexer-port`, but we pass it explicitly
+        // so a non-default port still works.
+        commands.push(format!(
+            "VITE_INDEXER_URL=http://127.0.0.1:{} npm --prefix explorer run dev",
+            local.indexer_port,
+        ));
     }
 
     if args.spammer {
@@ -375,14 +384,47 @@ mod tests {
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
 
-        // 2 validators + 1 secondary + 1 indexer = 4 commands.
-        assert_eq!(commands.len(), 4);
+        // 2 validators + 1 secondary + 1 indexer + 1 explorer = 5 commands.
+        assert_eq!(commands.len(), 5);
         let indexer_cmd = commands
             .iter()
             .find(|c| c.contains("constantinople-indexer"))
             .expect("indexer command should be present");
         assert!(indexer_cmd.contains("--port 8090"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/indexer-data"));
+    }
+
+    #[test]
+    fn local_run_commands_include_explorer_when_indexer_enabled() {
+        let mut args = test_args(false);
+        args.secondaries = 1;
+        enable_indexer(&mut args, 8090);
+
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+
+        let explorer_cmd = commands
+            .iter()
+            .find(|c| c.contains("npm --prefix explorer"))
+            .expect("explorer dev server command should be present");
+        // Explorer must be wired to the same port the simulator binds.
+        assert!(explorer_cmd.contains("VITE_INDEXER_URL=http://127.0.0.1:8090"));
+        assert!(explorer_cmd.contains("run dev"));
+    }
+
+    #[test]
+    fn local_run_commands_omit_explorer_when_indexer_disabled() {
+        // No `enable_indexer`; the explorer must stay out of the mprocs list.
+        let mut args = test_args(false);
+        args.secondaries = 1;
+
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args));
+
+        assert!(
+            commands
+                .iter()
+                .all(|c| !c.contains("npm --prefix explorer")),
+            "explorer must only launch when --indexer is enabled: {commands:?}"
+        );
     }
 
     #[test]

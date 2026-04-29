@@ -70,6 +70,51 @@ cargo run --release --bin constantinople-spammer -- \
   --value 1
 ```
 
+### Local Deployment with Indexer + Explorer
+
+Add `--indexer` (a flag on the `local` subcommand) to spin up the exoware
+simulator backing the indexer **and** the React explorer dev server alongside
+the validators:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --secondaries 1 \
+  --output-dir ./local \
+  --spammer \
+  local \
+  --indexer
+```
+
+This requires `--secondaries >= 1` because only secondaries upload to the
+indexer; primaries leave their `indexer:` block unset.
+
+The printed `mprocs` command list grows by two entries:
+
+- `cargo run -p constantinople-indexer --bin indexer -- --port 8090 --data-dir ./local/indexer-data`
+  — the simulator-backed indexer store. `--indexer-port` overrides the port.
+- `VITE_INDEXER_URL=http://127.0.0.1:8090 npm --prefix explorer run dev`
+  — the [React explorer](../../explorer/README.md), which subscribes to the
+  indexer's `TX_BY_H` family and streams new transactions live.
+
+End-to-end "spin everything up" with the spammer for live transaction flow:
+
+```sh
+# 1. install explorer deps once
+npm --prefix explorer install
+
+# 2. generate the bundle and run the printed mprocs command
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 --secondaries 1 \
+  --output-dir ./local \
+  --spammer \
+  local --indexer
+mprocs ...   # paste the line printed by `generate`
+```
+
+Then open <http://localhost:5173> in your browser to watch transactions
+arrive in real time.
+
 ## Remote Deployment
 
 `generate remote` writes the deployment bundle, but it does not build the validator binary. Use
