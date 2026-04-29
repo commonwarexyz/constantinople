@@ -18,9 +18,10 @@ block.
 
 Rather than streaming every transaction (a single block can contain tens of
 thousands during spammer runs), the UI aggregates each batch into a one-line
-block summary — `(height, txCount, arrival time)` — and renders an ASCII
-throughput bar per row plus a rolling sparkline at the top so the operator
-can see throughput scale at a glance.
+block summary — `(height, txCount, arrival time)` — and renders a multi-line
+ASCII histogram at the top showing tx-count-per-block over the last
+~80 blocks so the operator can see throughput scale at a glance. The
+histogram's y-axis is auto-scaled to the peak in the visible window.
 
 The full transaction body lives in the `TX` family (`prefix = 0x5`). Decoding
 it requires deserializing `SignedTransaction`, which is non-trivial from

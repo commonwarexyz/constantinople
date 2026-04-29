@@ -3,12 +3,12 @@ import { type ObservedBlock, subscribeBlocks } from './indexer';
 
 /** Most recent batches to keep in the live feed. Old entries fall off the table. */
 const MAX_ROWS = 200;
-/** Width (chars) of the per-row throughput bar. */
-const BAR_WIDTH = 48;
-/** Width (chars) of the rolling sparkline in the header. */
-const SPARK_WIDTH = 60;
-/** 8-step unicode block ramp used for the sparkline. `' '` slot keeps zero values readable. */
-const SPARK_GLYPHS = ' ▁▂▃▄▅▆▇█';
+/** Height (rows) of the throughput histogram at the top of the page. */
+const HISTOGRAM_HEIGHT = 8;
+/** Width (cols) of the throughput histogram. Each column is one block. */
+const HISTOGRAM_WIDTH = 80;
+/** 8-step unicode block ramp; index 0 is empty so unused cells stay blank. */
+const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 
 type Status =
     | { kind: 'connecting' }
@@ -60,6 +60,7 @@ export default function App() {
                 <StatusBadge status={status} url={indexerUrl} />
             </header>
             <SummaryPanel blocks={blocks} />
+            <Histogram blocks={blocks} />
             <main className="app__main">
                 <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
             </main>
@@ -108,14 +109,7 @@ function SummaryPanel({ blocks }: { blocks: ObservedBlock[] }) {
             <Stat label="blocks" value={stats.blockCount.toLocaleString()} />
             <Stat label="total txs" value={stats.totalTx.toLocaleString()} />
             <Stat label="peak txs/block" value={stats.peakTx.toLocaleString()} />
-            <Stat
-                label="recent throughput"
-                value={
-                    <span className="summary__spark" title="txs per block, oldest → newest">
-                        {stats.spark}
-                    </span>
-                }
-            />
+            <Stat label="avg txs/block" value={stats.avgTx.toLocaleString()} />
         </section>
     );
 }
@@ -134,18 +128,12 @@ interface DerivedStats {
     blockCount: number;
     totalTx: number;
     peakTx: number;
-    spark: string;
+    avgTx: number;
 }
 
 function computeStats(blocks: ObservedBlock[]): DerivedStats {
     if (blocks.length === 0) {
-        return {
-            latestHeight: null,
-            blockCount: 0,
-            totalTx: 0,
-            peakTx: 0,
-            spark: ' '.repeat(SPARK_WIDTH),
-        };
+        return { latestHeight: null, blockCount: 0, totalTx: 0, peakTx: 0, avgTx: 0 };
     }
     let totalTx = 0;
     let peakTx = 0;
@@ -160,40 +148,75 @@ function computeStats(blocks: ObservedBlock[]): DerivedStats {
         blockCount: blocks.length,
         totalTx,
         peakTx,
-        spark: renderSparkline(blocks, peakTx),
+        avgTx: Math.round(totalTx / blocks.length),
     };
 }
 
 /**
- * Render an oldest→newest sparkline of the last `SPARK_WIDTH` blocks. Each
- * column uses one of `SPARK_GLYPHS` (8-step unicode block ramp) sized to the
- * current peak so a single huge block doesn't crush all the others into the
- * baseline.
+ * ASCII histogram of `txCount` for the last `HISTOGRAM_WIDTH` blocks. Each
+ * column is one block (oldest left → newest right) and uses an 8-step
+ * vertical block ramp so a column can be partially filled with sub-row
+ * resolution.
+ *
+ * The y-axis is auto-scaled to the peak in the visible window so a quiet
+ * stretch of empty blocks doesn't compress later activity into the baseline.
  */
-function renderSparkline(blocks: ObservedBlock[], peakTx: number): string {
-    if (peakTx <= 0) {
-        return ' '.repeat(SPARK_WIDTH);
-    }
-    // Blocks list is newest-first; sparkline reads left-to-right oldest→newest.
-    const recent = blocks.slice(0, SPARK_WIDTH).reverse();
-    let out = '';
-    // Left-pad with spaces if we don't have enough history yet.
-    for (let pad = recent.length; pad < SPARK_WIDTH; pad++) {
-        out += ' ';
-    }
-    for (const block of recent) {
-        out += sparkGlyph(block.txCount, peakTx);
-    }
-    return out;
+function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
+    const { lines, peak } = useMemo(() => buildHistogram(blocks), [blocks]);
+    return (
+        <section className="histogram">
+            <div className="histogram__y-axis">
+                <span>{peak > 0 ? peak.toLocaleString() : ''}</span>
+                <span>0</span>
+            </div>
+            <pre className="histogram__chart" aria-label="recent block tx count histogram">
+                {lines.join('\n')}
+            </pre>
+            <div className="histogram__caption">
+                tx count per block · last {Math.min(blocks.length, HISTOGRAM_WIDTH)} blocks ·
+                oldest → newest
+            </div>
+        </section>
+    );
 }
 
-function sparkGlyph(value: number, peak: number): string {
-    if (value <= 0) return SPARK_GLYPHS[0];
-    // 8 non-empty steps (indices 1..8). Round up so any non-zero value is at
-    // least visible.
-    const ramp = SPARK_GLYPHS.length - 1;
-    const step = Math.min(ramp, Math.max(1, Math.ceil((value / peak) * ramp)));
-    return SPARK_GLYPHS[step];
+function buildHistogram(blocks: ObservedBlock[]): { lines: string[]; peak: number } {
+    // Newest-first → oldest-first so the histogram reads left=old, right=new.
+    const recent = blocks.slice(0, HISTOGRAM_WIDTH).reverse();
+    let peak = 0;
+    for (const block of recent) {
+        if (block.txCount > peak) peak = block.txCount;
+    }
+    if (peak === 0) {
+        const blank = ' '.repeat(HISTOGRAM_WIDTH);
+        return { lines: Array.from({ length: HISTOGRAM_HEIGHT }, () => blank), peak };
+    }
+
+    // Total fill in 1/8th steps for the entire HISTOGRAM_HEIGHT-tall column.
+    const ramp = BLOCK_GLYPHS.length - 1; // 8
+    const eighthsPerColumn = HISTOGRAM_HEIGHT * ramp;
+
+    const columnEighths = recent.map((block) =>
+        Math.min(eighthsPerColumn, Math.max(1, Math.round((block.txCount / peak) * eighthsPerColumn))),
+    );
+    // Pad the left side with empty columns when we don't have enough history.
+    while (columnEighths.length < HISTOGRAM_WIDTH) {
+        columnEighths.unshift(0);
+    }
+
+    // Render top-to-bottom. For each row (top=0, bottom=HEIGHT-1), the slot
+    // for column j gets the 1/8 step left after subtracting the rows below it.
+    const lines: string[] = [];
+    for (let row = 0; row < HISTOGRAM_HEIGHT; row++) {
+        const rowsBelow = HISTOGRAM_HEIGHT - 1 - row;
+        let line = '';
+        for (const eighths of columnEighths) {
+            const remainingForThisRow = Math.max(0, Math.min(ramp, eighths - rowsBelow * ramp));
+            line += BLOCK_GLYPHS[remainingForThisRow];
+        }
+        lines.push(line);
+    }
+    return { lines, peak };
 }
 
 function BlockTable({
@@ -213,13 +236,6 @@ function BlockTable({
             }),
         [],
     );
-    const peak = useMemo(() => {
-        let max = 0;
-        for (const block of blocks) {
-            if (block.txCount > max) max = block.txCount;
-        }
-        return max;
-    }, [blocks]);
 
     if (blocks.length === 0) {
         return (
@@ -234,7 +250,6 @@ function BlockTable({
                 <tr>
                     <th className="col-height">height</th>
                     <th className="col-txs">txs</th>
-                    <th className="col-bar">throughput</th>
                     <th className="col-time">arrived</th>
                 </tr>
             </thead>
@@ -245,9 +260,6 @@ function BlockTable({
                         <tr key={block.sequence.toString()} className={isFresh ? 'is-fresh' : undefined}>
                             <td className="col-height">{block.height.toString()}</td>
                             <td className="col-txs">{block.txCount.toLocaleString()}</td>
-                            <td className="col-bar">
-                                <span className="bar">{renderBar(block.txCount, peak)}</span>
-                            </td>
                             <td className="col-time">{formatter.format(block.arrivedAt)}</td>
                         </tr>
                     );
@@ -255,20 +267,4 @@ function BlockTable({
             </tbody>
         </table>
     );
-}
-
-function renderBar(value: number, peak: number): string {
-    if (peak <= 0 || value <= 0) {
-        return '';
-    }
-    // One full block per 1/BAR_WIDTH of peak; fractional remainder picks an
-    // intermediate glyph so small differences are still visible.
-    const exact = (value / peak) * BAR_WIDTH;
-    const full = Math.floor(exact);
-    const remainder = exact - full;
-    const finalGlyph =
-        remainder > 0 && full < BAR_WIDTH
-            ? SPARK_GLYPHS[Math.min(SPARK_GLYPHS.length - 1, Math.ceil(remainder * (SPARK_GLYPHS.length - 1)))]
-            : '';
-    return '█'.repeat(full) + finalGlyph;
 }
