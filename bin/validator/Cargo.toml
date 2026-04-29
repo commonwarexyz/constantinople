@@ -15,6 +15,7 @@ workspace = true
 [dependencies]
 # Workspace
 constantinople-engine.workspace = true
+constantinople-indexer.workspace = true
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
 constantinople-application.workspace = true

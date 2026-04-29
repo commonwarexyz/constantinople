@@ -1306,6 +1306,7 @@ dependencies = [
  "commonware-utils",
  "constantinople-application",
  "constantinople-engine",
+ "constantinople-indexer",
  "constantinople-mempool",
  "constantinople-primitives",
  "futures",

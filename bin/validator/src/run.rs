@@ -1,14 +1,18 @@
 //! Starts a validator from a YAML config.
 
 use crate::{
-    config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config},
+    config::{
+        IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
+    },
     state_reader::StateDbReader,
 };
 use commonware_codec::Encode;
-use commonware_consensus::simplex::elector::RoundRobin;
+use commonware_consensus::{
+    Reporter, marshal::Update, simplex::elector::RoundRobin, types::coding::Commitment,
+};
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
-    ed25519::{self, Batch},
+    ed25519::{self, Batch, PublicKey},
     sha256::Sha256,
 };
 use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
@@ -22,8 +26,9 @@ use commonware_utils::{NZU64, NZUsize, TryCollect, hex, ordered::Set, union};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper, types::NoopActivityReporter,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
 };
+use constantinople_indexer::{BlockReporter, CertificateReporter, UploaderHandle, spawn_uploader};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -39,6 +44,62 @@ const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
 const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Concrete type the engine sees in the `simplex_observer` slot.
+///
+/// We always pin `O` to the indexer's certificate publisher so the engine type
+/// stays the same whether or not the indexer is enabled. Validators that opt
+/// out simply pass `simplex_observer: None`.
+type EngineCertReporter = CertificateReporter<ThresholdScheme<PublicKey, MinSig>, Commitment>;
+
+/// Concrete type the engine sees in `engine.start(_, reporter)`.
+///
+/// Primaries report finalized blocks to the local mempool; secondaries with an
+/// indexer enabled report them to the indexer. The two reporter implementations
+/// have unrelated types, so we tee them through this small dispatch enum.
+#[derive(Clone)]
+enum BlockUpdateReporter {
+    Mempool(Mailbox<Commitment, PublicKey, Sha256>),
+    Indexer(BlockReporter<Sha256, PublicKey>),
+}
+
+impl Reporter for BlockUpdateReporter {
+    type Activity = Update<EngineBlock<Sha256, PublicKey>>;
+
+    async fn report(&mut self, activity: Self::Activity) {
+        match self {
+            Self::Mempool(m) => m.report(activity).await,
+            Self::Indexer(i) => i.report(activity).await,
+        }
+    }
+}
+
+/// Bundle of indexer state that needs to outlive engine startup.
+struct IndexerHandle {
+    block_reporter: BlockReporter<Sha256, PublicKey>,
+    cert_reporter: EngineCertReporter,
+    /// Kept alive so the uploader task is not aborted while the validator runs.
+    _uploader: UploaderHandle,
+}
+
+/// Build the indexer wiring iff the secondary validator opted in.
+fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Option<IndexerHandle> {
+    let cfg = indexer?;
+    if !cfg.enabled || is_primary {
+        return None;
+    }
+
+    info!(exoware_url = %cfg.exoware_url, "starting indexer uploader");
+    let store = constantinople_indexer::standard_store_client(&cfg.exoware_url);
+    let uploader = spawn_uploader(store, cfg.upload_buffer);
+    let block_reporter = BlockReporter::<Sha256, PublicKey>::new(uploader.tx.clone());
+    let cert_reporter = EngineCertReporter::new(uploader.tx.clone());
+    Some(IndexerHandle {
+        block_reporter,
+        cert_reporter,
+        _uploader: uploader,
+    })
+}
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
     let loaded = load_local_config(&peers_path, &config_path);
@@ -61,6 +122,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         json_logs,
         deployer_managed,
+        indexer,
     } = config;
 
     let config_dir = config_path
@@ -206,6 +268,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         };
         info!(startup_mode, "selected validator startup mode");
 
+        // Build the indexer wiring up-front. This consumes `indexer` from the
+        // loaded config and returns `None` for primaries, validators that did
+        // not declare an `indexer` block, or those that declared one with
+        // `enabled: false`.
+        let indexer_handle = maybe_build_indexer(is_primary, indexer);
+
         info!("initializing engine");
         let engine = Engine::<
             _,
@@ -218,7 +286,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             Rayon,
             _,
             Batch,
-            NoopActivityReporter<ed25519::PublicKey, MinSig>,
+            EngineCertReporter,
         >::new(
             context.with_label("engine"),
             EngineConfig {
@@ -238,7 +306,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
                 bootstrapper: bootstrapper_mailbox.clone(),
-                simplex_observer: None,
+                simplex_observer: indexer_handle.as_ref().map(|h| h.cert_reporter.clone()),
             },
         )
         .await;
@@ -258,7 +326,17 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
 
         info!("starting engine");
-        let reporter = is_primary.then(|| mempool_mailbox.clone());
+        // Primaries report to the local mempool; secondaries with an indexer
+        // configured report to the indexer; secondaries without report to no
+        // one. The three cases share a single dispatch enum so the engine
+        // type is fixed regardless of role.
+        let reporter: Option<BlockUpdateReporter> = if is_primary {
+            Some(BlockUpdateReporter::Mempool(mempool_mailbox.clone()))
+        } else {
+            indexer_handle
+                .as_ref()
+                .map(|h| BlockUpdateReporter::Indexer(h.block_reporter.clone()))
+        };
         let engine_handle = engine.start(channels, reporter);
 
         wait_for_critical_task_exit(

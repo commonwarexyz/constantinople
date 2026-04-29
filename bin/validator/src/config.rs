@@ -23,6 +23,23 @@ pub(crate) const fn default_metrics_port() -> u16 {
     9090
 }
 
+pub(crate) const fn default_upload_buffer() -> usize {
+    1024
+}
+
+/// Indexer wiring for a secondary validator.
+///
+/// Primary (voting) validators ignore this section; secondaries with
+/// `enabled = true` upload finalized blocks, transactions, and consensus
+/// certificates to the configured exoware store.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct IndexerConfig {
+    pub enabled: bool,
+    pub exoware_url: String,
+    #[serde(default = "default_upload_buffer")]
+    pub upload_buffer: usize,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StartupModeConfig {
@@ -59,6 +76,10 @@ pub struct ValidatorConfig {
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
+    /// Optional indexer wiring. Honored only for secondary (non-voting)
+    /// validators when `enabled` is true.
+    #[serde(default)]
+    pub indexer: Option<IndexerConfig>,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -109,6 +130,7 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     pub json_logs: bool,
     pub deployer_managed: bool,
+    pub indexer: Option<IndexerConfig>,
 }
 
 fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
@@ -203,6 +225,7 @@ fn decode_with_network(
         metrics_listen,
         json_logs,
         deployer_managed: json_logs,
+        indexer: config.indexer,
     }
 }
 
@@ -450,6 +473,7 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 bootstrappers,
+                indexer: None,
             }
         }
 
@@ -478,6 +502,7 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 bootstrappers,
+                indexer: None,
             }
         }
     }
