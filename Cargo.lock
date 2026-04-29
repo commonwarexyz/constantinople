@@ -1207,6 +1207,7 @@ name = "constantinople-indexer"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "clap",
  "commonware-codec 2026.4.0 (git+https://github.com/commonwarexyz/monorepo.git?branch=cl%2Fglue)",
  "commonware-coding",
  "commonware-consensus",
@@ -1223,6 +1224,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
