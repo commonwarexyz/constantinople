@@ -90,6 +90,44 @@ body {
     color: var(--theme-accent);
 }
 
+/*
+ * Three accent-colored ">" chevrons that pulse in a left-to-right wave next
+ * to the "explorer" title, mirroring the chevron animation on the
+ * exoware.xyz home page. Each chevron blanks (opacity 0) for 100ms in
+ * sequence with a 50ms stagger, then the whole row pauses for ~550ms before
+ * repeating — total cycle 750ms. We use staggered animation-delays on a
+ * single shared keyframe so the wave self-aligns without any JS timer.
+ */
+.app__chevrons {
+    color: var(--theme-accent);
+    margin-left: 0.5ch;
+    letter-spacing: 0.1ch;
+}
+
+.app__chevron {
+    display: inline-block;
+    animation: app__chevron-pulse 750ms infinite;
+}
+
+.app__chevron:nth-child(2) {
+    animation-delay: 50ms;
+}
+
+.app__chevron:nth-child(3) {
+    animation-delay: 100ms;
+}
+
+@keyframes app__chevron-pulse {
+    0%,
+    13.33% {
+        opacity: 0;
+    }
+    13.34%,
+    100% {
+        opacity: 1;
+    }
+}
+
 .app__status {
     color: var(--theme-text-dim);
     display: flex;

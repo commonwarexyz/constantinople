@@ -70,7 +70,12 @@ export default function App() {
             <div className="app__container">
                 <header className="app__header">
                     <h1 className="app__title">
-                        <span className="accent">constantinople</span> / explorer
+                        <span className="accent">constantinople</span> / explorer{' '}
+                        <span className="app__chevrons" aria-hidden="true">
+                            <span className="app__chevron">&gt;</span>
+                            <span className="app__chevron">&gt;</span>
+                            <span className="app__chevron">&gt;</span>
+                        </span>
                     </h1>
                     <StatusBadge status={status} url={indexerUrl} />
                 </header>
