@@ -1,15 +1,25 @@
-//! Reporters and uploader actor for indexer publishing.
+//! Reporters and uploader actors for indexer publishing.
 //!
 //! The publisher is split in two halves:
 //!
 //! - One or more cloneable [`Reporter`] implementations that encode incoming
 //!   consensus events into atomic [`UploadBatch`]es and push them to a bounded
 //!   MPSC channel.
-//! - A single uploader task (see [`spawn_uploader`]) that owns the
-//!   [`StoreClient`] and drains the channel, retrying until the store accepts
-//!   the batch. On success it fulfills the marshal acknowledgement bundled
-//!   with the batch (if any), giving the engine at-least-once delivery and
-//!   marshal-driven back-pressure.
+//! - Three uploader tasks (see [`spawn_uploaders`]) — one per backing store —
+//!   that each own a [`StoreClient`] and drain their channel, retrying until
+//!   the store accepts the batch. On success each task fulfills its clone of
+//!   the marshal acknowledgement bundled with the batch (if any).
+//!
+//! Constantinople fans its data out across three independent exoware stores:
+//!
+//! | Store          | Families                                   |
+//! | -------------- | ------------------------------------------ |
+//! | `blocks`       | `BLOCK`, `BLOCK_BY_H`, `FINALIZED`, `NOTARIZED` |
+//! | `transactions` | `TX`, `TX_BY_H`                            |
+//! | `meta`         | `META`                                     |
+//!
+//! The marshal [`Exact`] acknowledgement is cloned once per uploader so the
+//! waiter resolves only after every store has durably accepted its batch.
 //!
 //! [`Reporter`]: commonware_consensus::Reporter
 //! [`StoreClient`]: exoware_sdk::StoreClient
@@ -27,7 +37,7 @@ pub mod certificate;
 pub use block::BlockReporter;
 pub use certificate::CertificateReporter;
 
-/// One atomic write to the exoware store.
+/// One atomic write to a single exoware store.
 ///
 /// The uploader uses `ingest().put` so every key in `rows` is committed in a
 /// single store sequence number. If `ack` is `Some`, the uploader fulfills the
@@ -35,34 +45,64 @@ pub use certificate::CertificateReporter;
 pub struct UploadBatch {
     /// Pre-encoded `(key, value)` pairs to ingest atomically.
     pub rows: Vec<(Key, Bytes)>,
-    /// Marshal acknowledgement to release once the store has accepted the batch.
+    /// Marshal acknowledgement to release once this store has accepted the
+    /// batch. When the same logical event spans multiple stores the caller
+    /// clones the [`Exact`] handle once per store; the waiter only resolves
+    /// after every clone has acknowledged.
     pub ack: Option<Exact>,
 }
 
-/// Handle to the uploader task and the channel that feeds it.
+/// Handles for the three uploader tasks and their feeder channels.
 ///
-/// Cloneable [`BlockReporter`]s share `tx` and forward batches to the single
-/// uploader task that owns the [`StoreClient`].
-pub struct UploaderHandle {
-    pub tx: mpsc::Sender<UploadBatch>,
-    pub join: JoinHandle<()>,
+/// Cloneable [`BlockReporter`] / [`CertificateReporter`] instances clone the
+/// senders below and forward batches to the per-store uploader tasks.
+pub struct UploaderHandles {
+    /// Sender for the `blocks` store (BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED).
+    pub blocks: mpsc::Sender<UploadBatch>,
+    /// Sender for the `transactions` store (TX, TX_BY_H).
+    pub transactions: mpsc::Sender<UploadBatch>,
+    /// Sender for the `meta` store (META).
+    pub meta: mpsc::Sender<UploadBatch>,
+    /// Background uploader join handles, kept alive for the lifetime of the
+    /// validator process so the tasks are not aborted prematurely.
+    pub joins: [JoinHandle<()>; 3],
 }
 
-/// Spawn the uploader task on the current tokio runtime.
-pub fn spawn_uploader(client: StoreClient, buffer: usize) -> UploaderHandle {
-    let (tx, rx) = mpsc::channel::<UploadBatch>(buffer);
-    let join = tokio::spawn(run_uploader(client, rx));
-    UploaderHandle { tx, join }
+/// Spawn one uploader task per backing store on the current tokio runtime.
+pub fn spawn_uploaders(
+    blocks_client: StoreClient,
+    transactions_client: StoreClient,
+    meta_client: StoreClient,
+    buffer: usize,
+) -> UploaderHandles {
+    let (blocks_tx, blocks_rx) = mpsc::channel::<UploadBatch>(buffer);
+    let (txs_tx, txs_rx) = mpsc::channel::<UploadBatch>(buffer);
+    let (meta_tx, meta_rx) = mpsc::channel::<UploadBatch>(buffer);
+
+    let blocks_join = tokio::spawn(run_uploader("blocks", blocks_client, blocks_rx));
+    let txs_join = tokio::spawn(run_uploader("transactions", transactions_client, txs_rx));
+    let meta_join = tokio::spawn(run_uploader("meta", meta_client, meta_rx));
+
+    UploaderHandles {
+        blocks: blocks_tx,
+        transactions: txs_tx,
+        meta: meta_tx,
+        joins: [blocks_join, txs_join, meta_join],
+    }
 }
 
-async fn run_uploader(client: StoreClient, mut rx: mpsc::Receiver<UploadBatch>) {
+async fn run_uploader(
+    store: &'static str,
+    client: StoreClient,
+    mut rx: mpsc::Receiver<UploadBatch>,
+) {
     while let Some(batch) = rx.recv().await {
-        upload_with_retry(&client, &batch).await;
+        upload_with_retry(store, &client, &batch).await;
         if let Some(ack) = batch.ack {
             ack.acknowledge();
         }
     }
-    debug!("indexer uploader task exiting: channel closed");
+    debug!(store, "indexer uploader task exiting: channel closed");
 }
 
 /// Retry the put indefinitely with standard backoff until the store accepts it.
@@ -70,18 +110,19 @@ async fn run_uploader(client: StoreClient, mut rx: mpsc::Receiver<UploadBatch>) 
 /// Marshal back-pressures the engine on the still-held ack, so retrying here
 /// is the right way to express at-least-once delivery: we never lose a batch
 /// and the engine slows down if the store is unhealthy.
-async fn upload_with_retry(client: &StoreClient, batch: &UploadBatch) {
+async fn upload_with_retry(store: &'static str, client: &StoreClient, batch: &UploadBatch) {
     let kvs: Vec<(&Key, &[u8])> = batch.rows.iter().map(|(k, v)| (k, v.as_ref())).collect();
     let mut attempt: u32 = 0;
     loop {
         match client.ingest().put(&kvs).await {
             Ok(seq) => {
-                debug!(seq, rows = kvs.len(), "indexer uploaded batch");
+                debug!(store, seq, rows = kvs.len(), "indexer uploaded batch");
                 return;
             }
             Err(error) => {
                 attempt = attempt.saturating_add(1);
                 warn!(
+                    store,
                     ?error,
                     attempt,
                     rows = kvs.len(),
@@ -115,11 +156,22 @@ pub fn standard_store_client(url: &str) -> StoreClient {
 /// while the uploader queue grows, marshal still considers the block
 /// undelivered and refuses to admit new ones.
 ///
+/// If the batch carries no rows (e.g. a transactions batch for an empty
+/// block), the put is skipped and the bundled acknowledgement (if any) is
+/// fulfilled immediately — the corresponding store has nothing to durably
+/// accept, so we must not stall the waiter.
+///
 /// If the uploader channel is closed (the task has exited) the batch is
 /// dropped and any associated acknowledgement is canceled, which matches the
 /// documented "drop = shutdown" semantics on
 /// [`commonware_consensus::marshal::Update`].
 pub(crate) fn dispatch_batch(tx: &mpsc::Sender<UploadBatch>, batch: UploadBatch) {
+    if batch.rows.is_empty() {
+        if let Some(ack) = batch.ack {
+            ack.acknowledge();
+        }
+        return;
+    }
     let tx = tx.clone();
     tokio::spawn(async move {
         if let Err(error) = tx.send(batch).await {

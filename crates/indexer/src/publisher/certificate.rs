@@ -1,12 +1,13 @@
 //! Certificate reporter that uploads simplex notarization and finalization
-//! certificates.
+//! certificates to the **blocks** store.
 //!
 //! Wired into the engine via the new `simplex_observer` slot on
 //! [`constantinople_engine::Config`]. On every
 //! [`simplex::types::Activity::Notarization`] or
 //! [`simplex::types::Activity::Finalization`] we encode a single-row batch
-//! and dispatch it to the uploader. All other activity variants (votes,
-//! Byzantine evidence, etc.) are dropped.
+//! and dispatch it to the blocks-store uploader. The FINALIZED and NOTARIZED
+//! key families share the blocks store with BLOCK and BLOCK_BY_H. All other
+//! activity variants (votes, Byzantine evidence, etc.) are dropped.
 //!
 //! Like [`super::block::BlockReporter`], certificate uploads are non-blocking
 //! and run on a fresh tokio task.
@@ -25,17 +26,18 @@ use std::marker::PhantomData;
 use tokio::sync::mpsc;
 
 /// Cloneable [`Reporter`] over `Activity<S, D>` that filters notarizations and
-/// finalizations and uploads each as a single atomic row.
+/// finalizations and uploads each as a single atomic row to the blocks store.
 pub struct CertificateReporter<S, D> {
-    tx: mpsc::Sender<UploadBatch>,
+    blocks: mpsc::Sender<UploadBatch>,
     _marker: PhantomData<fn() -> (S, D)>,
 }
 
 impl<S, D> CertificateReporter<S, D> {
-    /// Build a reporter that forwards certificate batches to the uploader.
-    pub const fn new(tx: mpsc::Sender<UploadBatch>) -> Self {
+    /// Build a reporter that forwards certificate batches to the blocks-store
+    /// uploader.
+    pub const fn new(blocks: mpsc::Sender<UploadBatch>) -> Self {
         Self {
-            tx,
+            blocks,
             _marker: PhantomData,
         }
     }
@@ -44,7 +46,7 @@ impl<S, D> CertificateReporter<S, D> {
 impl<S, D> Clone for CertificateReporter<S, D> {
     fn clone(&self) -> Self {
         Self {
-            tx: self.tx.clone(),
+            blocks: self.blocks.clone(),
             _marker: PhantomData,
         }
     }
@@ -66,7 +68,7 @@ where
                 let key = keys::notarized(view).expect("u64 view fits NOTARIZED family payload");
                 let value = notarization.encode();
                 dispatch_batch(
-                    &self.tx,
+                    &self.blocks,
                     UploadBatch {
                         rows: vec![(key, value)],
                         ack: None,
@@ -78,7 +80,7 @@ where
                 let key = keys::finalized(view).expect("u64 view fits FINALIZED family payload");
                 let value = finalization.encode();
                 dispatch_batch(
-                    &self.tx,
+                    &self.blocks,
                     UploadBatch {
                         rows: vec![(key, value)],
                         ack: None,

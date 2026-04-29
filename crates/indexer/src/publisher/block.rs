@@ -1,13 +1,18 @@
-//! Block reporter that uploads finalized blocks atomically.
+//! Block reporter that fans a finalized block out across three exoware stores.
 //!
 //! Wired into the engine via the existing `marshal` reporter slot. On every
 //! `Update::Block(block, ack)` we:
 //!
-//! 1. Encode one atomic batch containing the block, its `BLOCK_BY_H` index,
-//!    every contained transaction, and a META cursor update.
-//! 2. Forward the batch (with the marshal acknowledgement) to the uploader.
-//! 3. Return immediately so consensus is not blocked on the network store —
-//!    marshal itself back-pressures the engine through the still-held ack.
+//! 1. Encode three batches:
+//!    - **blocks store**: BLOCK + BLOCK_BY_H rows (block payload + height index).
+//!    - **transactions store**: TX + TX_BY_H rows for every contained tx.
+//!    - **meta store**: the META `latest_finalized_height` cursor.
+//! 2. Clone the marshal acknowledgement once per uploader. Each uploader
+//!    fulfills its clone after its own put succeeds; the marshal waiter only
+//!    resolves after every store has durably accepted its batch.
+//! 3. Forward each batch to its uploader and return immediately so consensus
+//!    is not blocked on the network store — marshal itself back-pressures
+//!    the engine through the still-held ack.
 
 use crate::{
     keys,
@@ -18,24 +23,33 @@ use commonware_codec::Encode;
 use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
+use exoware_sdk::keys::Key;
 use std::marker::PhantomData;
 use tokio::sync::mpsc;
 use tracing::warn;
 
 /// Cloneable [`Reporter`] over `Update<EngineBlock<H, P>>`.
 ///
-/// The reporter is itself stateless beyond the channel handle; cloning it
-/// lets the engine fan the same upload pipeline out to multiple consumers.
+/// Holds one sender per backing store. Cloning the reporter is cheap; the
+/// senders are reference-counted MPSC channels.
 pub struct BlockReporter<H, P> {
-    tx: mpsc::Sender<UploadBatch>,
+    blocks: mpsc::Sender<UploadBatch>,
+    transactions: mpsc::Sender<UploadBatch>,
+    meta: mpsc::Sender<UploadBatch>,
     _marker: PhantomData<fn() -> (H, P)>,
 }
 
 impl<H, P> BlockReporter<H, P> {
-    /// Build a reporter that forwards batches to the given uploader channel.
-    pub const fn new(tx: mpsc::Sender<UploadBatch>) -> Self {
+    /// Build a reporter that forwards batches to the per-store uploader channels.
+    pub const fn new(
+        blocks: mpsc::Sender<UploadBatch>,
+        transactions: mpsc::Sender<UploadBatch>,
+        meta: mpsc::Sender<UploadBatch>,
+    ) -> Self {
         Self {
-            tx,
+            blocks,
+            transactions,
+            meta,
             _marker: PhantomData,
         }
     }
@@ -44,7 +58,9 @@ impl<H, P> BlockReporter<H, P> {
 impl<H, P> Clone for BlockReporter<H, P> {
     fn clone(&self) -> Self {
         Self {
-            tx: self.tx.clone(),
+            blocks: self.blocks.clone(),
+            transactions: self.transactions.clone(),
+            meta: self.meta.clone(),
             _marker: PhantomData,
         }
     }
@@ -62,16 +78,44 @@ where
             // Tip-only updates carry no block payload; nothing to upload.
             Update::Tip(_, _, _) => {}
             Update::Block(block, ack) => {
-                // Encoding is cheap and synchronous. The actual store write
-                // is dispatched onto a background task so this method never
+                // Encoding is cheap and synchronous. The actual store writes
+                // are dispatched onto background tasks so this method never
                 // blocks consensus — see `dispatch_batch` for back-pressure
                 // semantics.
-                let rows = encode_block_rows(&block);
+                let EncodedRows {
+                    blocks,
+                    transactions,
+                    meta,
+                } = encode_block_rows(&block);
+
+                // Clone the ack once per uploader. `Exact::clone` increments
+                // the remaining count, so the marshal waiter only resolves
+                // after each uploader's clone has been acknowledged. If a
+                // batch is empty (e.g. a block with no transactions) the
+                // dispatcher fulfills its clone immediately.
+                let ack_blocks = ack.clone();
+                let ack_transactions = ack.clone();
+                let ack_meta = ack;
+
                 dispatch_batch(
-                    &self.tx,
+                    &self.blocks,
                     UploadBatch {
-                        rows,
-                        ack: Some(ack),
+                        rows: blocks,
+                        ack: Some(ack_blocks),
+                    },
+                );
+                dispatch_batch(
+                    &self.transactions,
+                    UploadBatch {
+                        rows: transactions,
+                        ack: Some(ack_transactions),
+                    },
+                );
+                dispatch_batch(
+                    &self.meta,
+                    UploadBatch {
+                        rows: meta,
+                        ack: Some(ack_meta),
                     },
                 );
             }
@@ -79,8 +123,15 @@ where
     }
 }
 
-/// Build every key-value row that the block ingest batch must contain.
-fn encode_block_rows<H, P>(block: &EngineBlock<H, P>) -> Vec<(exoware_sdk::keys::Key, Bytes)>
+/// Encoded rows split by destination store.
+struct EncodedRows {
+    blocks: Vec<(Key, Bytes)>,
+    transactions: Vec<(Key, Bytes)>,
+    meta: Vec<(Key, Bytes)>,
+}
+
+/// Build every key-value row for a finalized block, partitioned by destination store.
+fn encode_block_rows<H, P>(block: &EngineBlock<H, P>) -> EncodedRows
 where
     H: Hasher,
     P: PublicKey,
@@ -89,21 +140,21 @@ where
     let height = block.header.height;
     let body_len = block.body.len();
 
-    let mut rows = Vec::with_capacity(3 + 2 * body_len);
-
     // BLOCK family: digest -> encoded SealedBlock (which serializes the inner Block).
-    rows.push((
-        keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
-        block.encode(),
-    ));
-
     // BLOCK_BY_H family: height -> block digest (32 bytes).
-    rows.push((
-        keys::block_by_height(height).expect("u64 height fits family payload"),
-        Bytes::copy_from_slice(block_digest.as_ref()),
-    ));
+    let blocks = vec![
+        (
+            keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
+            block.encode(),
+        ),
+        (
+            keys::block_by_height(height).expect("u64 height fits family payload"),
+            Bytes::copy_from_slice(block_digest.as_ref()),
+        ),
+    ];
 
-    // Per-transaction rows.
+    // Per-transaction rows: TX (digest -> encoded tx) and TX_BY_H ((height, idx) -> tx digest).
+    let mut transactions = Vec::with_capacity(2 * body_len);
     for (idx, lazy) in block.body.iter().enumerate() {
         let Some(tx) = lazy.get() else {
             // Marshal must have already verified each tx upstream, so a decode
@@ -119,22 +170,25 @@ where
         let tx_bytes = lazy.encode();
         let idx_u32 = u32::try_from(idx).expect("transaction index fits u32");
 
-        rows.push((
+        transactions.push((
             keys::tx(tx_digest.as_ref()).expect("tx digest fits family payload"),
             tx_bytes,
         ));
-        rows.push((
+        transactions.push((
             keys::tx_by_height(height, idx_u32).expect("(height, idx) fits family payload"),
             Bytes::copy_from_slice(tx_digest.as_ref()),
         ));
     }
 
-    // META: latest_finalized_height = u64 BE. Stored last in the batch but
-    // committed atomically with everything above.
-    rows.push((
+    // META: latest_finalized_height = u64 BE.
+    let meta = vec![(
         keys::meta_latest_height().expect("meta key fits family payload"),
         Bytes::copy_from_slice(&height.to_be_bytes()),
-    ));
+    )];
 
-    rows
+    EncodedRows {
+        blocks,
+        transactions,
+        meta,
+    }
 }

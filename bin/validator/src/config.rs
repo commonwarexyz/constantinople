@@ -31,11 +31,17 @@ pub(crate) const fn default_upload_buffer() -> usize {
 ///
 /// Primary (voting) validators ignore this section; secondaries with
 /// `enabled = true` upload finalized blocks, transactions, and consensus
-/// certificates to the configured exoware store.
+/// certificates to three independent exoware stores:
+///
+/// - `blocks_url`       — BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED.
+/// - `transactions_url` — TX, TX_BY_H.
+/// - `meta_url`         — META (`latest_finalized_height` cursor).
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
     pub enabled: bool,
-    pub exoware_url: String,
+    pub blocks_url: String,
+    pub transactions_url: String,
+    pub meta_url: String,
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
 }

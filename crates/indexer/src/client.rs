@@ -1,9 +1,13 @@
-//! Typed read-only wrapper around [`StoreClient`].
+//! Typed read-only wrapper around three [`StoreClient`]s.
 //!
-//! `IndexerClient` is the canonical way for tests and library consumers to
-//! pull constantinople artifacts back out of an exoware store. It does not
-//! own any sockets beyond the underlying [`StoreClient`], so it is cheap to
-//! clone.
+//! Constantinople fans its data out across three independent exoware stores:
+//! one for blocks + consensus certificates, one for transactions, and one for
+//! metadata. `IndexerClient` is the canonical way for tests and library
+//! consumers to pull artifacts back out of those stores; it routes each query
+//! to the store that owns the relevant key family.
+//!
+//! The struct does not own any sockets beyond the underlying [`StoreClient`]s,
+//! so it is cheap to clone.
 
 use crate::{codec, keys};
 use bytes::Bytes;
@@ -28,21 +32,44 @@ pub enum ReadError {
     Malformed { expected: usize, got: usize },
 }
 
-/// Typed read client over an exoware [`StoreClient`].
+/// Typed read client over the three exoware [`StoreClient`]s that back the
+/// indexer.
+///
+/// | Field          | Families served                                |
+/// | -------------- | ---------------------------------------------- |
+/// | `blocks`       | BLOCK, BLOCK_BY_H, FINALIZED, NOTARIZED        |
+/// | `transactions` | TX, TX_BY_H                                    |
+/// | `meta`         | META                                           |
 #[derive(Clone, Debug)]
 pub struct IndexerClient {
-    inner: StoreClient,
+    blocks: StoreClient,
+    transactions: StoreClient,
+    meta: StoreClient,
 }
 
 impl IndexerClient {
-    /// Wrap an existing [`StoreClient`].
-    pub const fn new(inner: StoreClient) -> Self {
-        Self { inner }
+    /// Wrap three existing [`StoreClient`]s, one per backing store.
+    pub const fn new(blocks: StoreClient, transactions: StoreClient, meta: StoreClient) -> Self {
+        Self {
+            blocks,
+            transactions,
+            meta,
+        }
     }
 
-    /// Borrow the underlying [`StoreClient`] for raw access (e.g. streams).
-    pub const fn inner(&self) -> &StoreClient {
-        &self.inner
+    /// Borrow the blocks-store [`StoreClient`] for raw access (e.g. streams).
+    pub const fn blocks(&self) -> &StoreClient {
+        &self.blocks
+    }
+
+    /// Borrow the transactions-store [`StoreClient`] for raw access.
+    pub const fn transactions(&self) -> &StoreClient {
+        &self.transactions
+    }
+
+    /// Borrow the meta-store [`StoreClient`] for raw access.
+    pub const fn meta(&self) -> &StoreClient {
+        &self.meta
     }
 
     /// Fetch the encoded block for `digest`, or `None` if absent.
@@ -51,7 +78,7 @@ impl IndexerClient {
         digest: &D,
     ) -> Result<Option<Bytes>, ReadError> {
         let key = keys::block(digest.as_ref()).expect("block digest fits family payload");
-        Ok(self.inner.query().get(&key).await?)
+        Ok(self.blocks.query().get(&key).await?)
     }
 
     /// Decode and return the block for `digest`, or `None` if absent.
@@ -74,7 +101,7 @@ impl IndexerClient {
     /// Fetch the block digest at `height`, or `None` if absent.
     pub async fn digest_by_height<D: Digest>(&self, height: u64) -> Result<Option<D>, ReadError> {
         let key = keys::block_by_height(height).expect("u64 height fits family payload");
-        let Some(bytes) = self.inner.query().get(&key).await? else {
+        let Some(bytes) = self.blocks.query().get(&key).await? else {
             return Ok(None);
         };
         Ok(Some(decode_digest::<D>(&bytes)?))
@@ -99,7 +126,7 @@ impl IndexerClient {
     /// Latest finalized block height stored in the META family, if any.
     pub async fn latest_height(&self) -> Result<Option<u64>, ReadError> {
         let key = keys::meta_latest_height().expect("meta key fits family payload");
-        let Some(bytes) = self.inner.query().get(&key).await? else {
+        let Some(bytes) = self.meta.query().get(&key).await? else {
             return Ok(None);
         };
         if bytes.len() != 8 {
@@ -134,7 +161,7 @@ impl IndexerClient {
         digest: &D,
     ) -> Result<Option<Bytes>, ReadError> {
         let key = keys::tx(digest.as_ref()).expect("tx digest fits family payload");
-        Ok(self.inner.query().get(&key).await?)
+        Ok(self.transactions.query().get(&key).await?)
     }
 
     /// Decode and return the transaction for `digest`, or `None` if absent.
@@ -158,7 +185,7 @@ impl IndexerClient {
     /// Fetch the encoded finalization certificate for `view`, or `None` if absent.
     pub async fn finalization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
         let key = keys::finalized(view).expect("u64 view fits family payload");
-        Ok(self.inner.query().get(&key).await?)
+        Ok(self.blocks.query().get(&key).await?)
     }
 
     /// Decode and return the finalization certificate for `view`.
@@ -180,7 +207,7 @@ impl IndexerClient {
     /// Fetch the encoded notarization certificate for `view`, or `None` if absent.
     pub async fn notarization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
         let key = keys::notarized(view).expect("u64 view fits family payload");
-        Ok(self.inner.query().get(&key).await?)
+        Ok(self.blocks.query().get(&key).await?)
     }
 
     /// Decode and return the notarization certificate for `view`.
@@ -207,7 +234,7 @@ impl IndexerClient {
     ) -> Result<Vec<(u64, D)>, ReadError> {
         let (lo, hi) = keys::block_by_height_bounds();
         let rows = self
-            .inner
+            .blocks
             .query()
             .range_with_mode(&lo, &hi, limit, RangeMode::Forward)
             .await?;

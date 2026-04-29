@@ -28,7 +28,9 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
 };
-use constantinople_indexer::{BlockReporter, CertificateReporter, UploaderHandle, spawn_uploader};
+use constantinople_indexer::{
+    BlockReporter, CertificateReporter, UploaderHandles, spawn_uploaders,
+};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -78,8 +80,8 @@ impl Reporter for BlockUpdateReporter {
 struct IndexerHandle {
     block_reporter: BlockReporter<Sha256, PublicKey>,
     cert_reporter: EngineCertReporter,
-    /// Kept alive so the uploader task is not aborted while the validator runs.
-    _uploader: UploaderHandle,
+    /// Kept alive so the uploader tasks are not aborted while the validator runs.
+    _uploaders: UploaderHandles,
 }
 
 /// Build the indexer wiring iff the secondary validator opted in.
@@ -89,15 +91,32 @@ fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Opti
         return None;
     }
 
-    info!(exoware_url = %cfg.exoware_url, "starting indexer uploader");
-    let store = constantinople_indexer::standard_store_client(&cfg.exoware_url);
-    let uploader = spawn_uploader(store, cfg.upload_buffer);
-    let block_reporter = BlockReporter::<Sha256, PublicKey>::new(uploader.tx.clone());
-    let cert_reporter = EngineCertReporter::new(uploader.tx.clone());
+    info!(
+        blocks_url = %cfg.blocks_url,
+        transactions_url = %cfg.transactions_url,
+        meta_url = %cfg.meta_url,
+        "starting indexer uploaders",
+    );
+    let blocks_store = constantinople_indexer::standard_store_client(&cfg.blocks_url);
+    let transactions_store = constantinople_indexer::standard_store_client(&cfg.transactions_url);
+    let meta_store = constantinople_indexer::standard_store_client(&cfg.meta_url);
+    let uploaders = spawn_uploaders(
+        blocks_store,
+        transactions_store,
+        meta_store,
+        cfg.upload_buffer,
+    );
+    let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
+        uploaders.blocks.clone(),
+        uploaders.transactions.clone(),
+        uploaders.meta.clone(),
+    );
+    // Certificates (FINALIZED, NOTARIZED) live in the blocks store.
+    let cert_reporter = EngineCertReporter::new(uploaders.blocks.clone());
     Some(IndexerHandle {
         block_reporter,
         cert_reporter,
-        _uploader: uploader,
+        _uploaders: uploaders,
     })
 }
 
