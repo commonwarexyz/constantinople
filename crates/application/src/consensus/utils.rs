@@ -7,7 +7,7 @@ use commonware_cryptography::{Hasher, PublicKey};
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{mmr, qmdb::Error as StorageError, translator::Translator};
 use constantinople_primitives::{AccountKey, SignedTransaction};
-use std::collections::{HashMap, HashSet};
+use hashbrown::HashSet;
 
 /// Loads the accounts needed by `transactions` from `batch`.
 ///
@@ -79,7 +79,7 @@ where
     T: Translator,
 {
     if account_keys.is_empty() {
-        return Ok(Some(HashMap::new()));
+        return Ok(Some(State::new()));
     }
 
     let account_keys: Vec<_> = account_keys.into_iter().collect();

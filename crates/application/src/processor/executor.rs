@@ -28,7 +28,8 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let mut overlay = Overlay::new(state);
+    let overlay_capacity = overlay_capacity(state, transactions.len());
+    let mut overlay = Overlay::with_capacity(state, overlay_capacity);
     let mut valid = Vec::with_capacity(transactions.len());
     let mut invalid = Vec::new();
 
@@ -58,7 +59,7 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let mut overlay = Overlay::new(state);
+    let mut overlay = Overlay::with_capacity(state, overlay_capacity(state, transactions.len()));
 
     for transaction in transactions {
         if !execute_transfer(&mut overlay, transaction) {
@@ -87,7 +88,7 @@ where
         "transactions and cached signer keys must have the same length",
     );
 
-    let mut overlay = Overlay::new(state);
+    let mut overlay = Overlay::with_capacity(state, overlay_capacity(state, transactions.len()));
 
     for (transaction, signer) in transactions.iter().zip(signers) {
         if !execute_transfer_with_sender(&mut overlay, transaction.get()?, signer) {
@@ -96,6 +97,14 @@ where
     }
 
     Some(overlay.into_changeset())
+}
+
+/// Returns an upper bound for accounts modified by a batch.
+fn overlay_capacity<PK>(state: &State<PK>, transaction_count: usize) -> usize
+where
+    PK: PublicKey,
+{
+    state.len().min(transaction_count.saturating_mul(2))
 }
 
 /// Applies a single transfer against the current account state.
@@ -110,11 +119,8 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let Some(sender_key) = transaction
-        .value()
-        .sender()
-        .map(AccountKey::from_public_key)
-    else {
+    let transfer = transaction.value();
+    let Some(sender_key) = transfer.sender().map(AccountKey::from_public_key) else {
         return false;
     };
     execute_transfer_with_sender(state, transaction, &sender_key)
@@ -129,11 +135,12 @@ where
     H: Hasher,
     PK: PublicKey,
 {
-    let recipient_key = &transaction.value().to;
-    let value = transaction.value().value.get();
-    let nonce = transaction.value().nonce;
+    let transfer = transaction.value();
+    let recipient_key = &transfer.to;
+    let value = transfer.value.get();
+    let nonce = transfer.nonce;
 
-    let Some(sender) = state.get(sender_key) else {
+    let Some(mut sender) = state.get(sender_key) else {
         return false;
     };
     if sender.nonce != nonce || sender.balance < value {
@@ -143,26 +150,26 @@ where
         return false;
     };
 
+    sender.nonce = next_nonce;
+
     // Self-transfer: only bump the nonce.
     if sender_key == recipient_key {
-        let sender = state.get_mut(sender_key).expect("checked above");
-        sender.nonce = next_nonce;
+        state.set(sender_key.clone(), sender);
         return true;
     }
 
-    let Some(recipient) = state.get(recipient_key) else {
+    let Some(mut recipient) = state.get(recipient_key) else {
         return false;
     };
     let Some(recipient_balance) = recipient.balance.checked_add(value) else {
         return false;
     };
 
-    let sender = state.get_mut(sender_key).expect("checked above");
     sender.balance -= value;
-    sender.nonce = next_nonce;
-
-    let recipient = state.get_mut(recipient_key).expect("checked above");
     recipient.balance = recipient_balance;
+
+    state.set(sender_key.clone(), sender);
+    state.set(recipient_key.clone(), recipient);
 
     true
 }

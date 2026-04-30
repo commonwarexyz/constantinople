@@ -3,7 +3,7 @@
 use super::executor::Changeset;
 use commonware_cryptography::PublicKey;
 use constantinople_primitives::{Account, AccountKey};
-use std::collections::HashMap;
+use hashbrown::HashMap;
 
 /// Fully loaded account state for one execution batch.
 pub type State<P> = HashMap<AccountKey<P>, Account>;
@@ -26,29 +26,24 @@ where
     P: PublicKey,
 {
     /// Creates an overlay on top of the given base state.
-    pub(crate) fn new(base: &'a State<P>) -> Self {
+    pub(crate) fn with_capacity(base: &'a State<P>, capacity: usize) -> Self {
         Self {
             base,
-            overlay: HashMap::new(),
+            overlay: HashMap::with_capacity(capacity),
         }
     }
 
-    /// Returns the current account for `account_key`.
-    pub(crate) fn get(&self, account_key: &AccountKey<P>) -> Option<&Account> {
+    /// Returns a copy of the current account for `account_key`.
+    pub(crate) fn get(&self, account_key: &AccountKey<P>) -> Option<Account> {
         self.overlay
             .get(account_key)
             .or_else(|| self.base.get(account_key))
+            .copied()
     }
 
-    /// Returns a mutable reference to the account for `account_key`.
-    ///
-    /// Copies the account from base into the overlay on first mutation.
-    pub(crate) fn get_mut(&mut self, account_key: &AccountKey<P>) -> Option<&mut Account> {
-        if !self.overlay.contains_key(account_key) {
-            let account = *self.base.get(account_key)?;
-            self.overlay.insert(account_key.clone(), account);
-        }
-        self.overlay.get_mut(account_key)
+    /// Stores the current account value for `account_key`.
+    pub(crate) fn set(&mut self, account_key: AccountKey<P>, account: Account) {
+        self.overlay.insert(account_key, account);
     }
 
     /// Returns the overlay as a deterministically ordered changeset.

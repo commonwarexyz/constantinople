@@ -5,7 +5,7 @@ use constantinople_primitives::{Account, AccountKey, Signable, Transaction, Veri
 use core::num::NonZeroU64;
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use rand::{SeedableRng, rngs::StdRng};
-use std::{collections::HashMap, hint::black_box};
+use std::hint::black_box;
 
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<ed25519::PublicKey, TestHasher>;
@@ -38,7 +38,7 @@ fn processor(c: &mut Criterion) {
 }
 
 fn build_fixture(transaction_count: usize) -> (State<ed25519::PublicKey>, Vec<TestTransaction>) {
-    let mut accounts = HashMap::new();
+    let mut accounts = State::new();
     let mut transactions = Vec::with_capacity(transaction_count);
 
     for index in 0..transaction_count {

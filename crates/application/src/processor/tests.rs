@@ -1,10 +1,12 @@
 //! End-to-end processor tests for transfer-only execution.
 
-use super::executor::{ProposalOutput, execute, propose};
+use super::{
+    executor::{ProposalOutput, execute, propose},
+    state::State,
+};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{Account, AccountKey, Signable, Transaction, VerifiedTransaction};
 use core::num::NonZeroU64;
-use std::collections::HashMap;
 
 const NAMESPACE: &[u8] = b"processor-test";
 
@@ -58,7 +60,7 @@ fn changeset_account(
 fn validate_tracks_pending_nonce_and_balance() {
     let signer = TestSigner::from_seed(0);
     let recipient = TestSigner::from_seed(1);
-    let mut accounts = HashMap::new();
+    let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
     accounts.insert(account_key(&recipient.public_key), Account::default());
 
@@ -82,7 +84,7 @@ fn propose_and_verify_match_for_transfer_batch() {
     let sender_b = TestSigner::from_seed(11);
     let recipient = TestSigner::from_seed(12);
 
-    let mut accounts = HashMap::new();
+    let mut accounts = State::new();
     accounts.insert(account_key(&sender_a.public_key), account(11, 0));
     accounts.insert(account_key(&sender_b.public_key), account(13, 0));
     accounts.insert(account_key(&recipient.public_key), account(5, 0));
@@ -114,7 +116,7 @@ fn propose_and_verify_match_for_transfer_batch() {
 #[test]
 fn self_transfer_only_bumps_nonce() {
     let signer = TestSigner::from_seed(0);
-    let mut accounts = HashMap::new();
+    let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(9, 3));
 
     let transactions = vec![signer.sign(signer.public_key.clone(), 4, 3)];
@@ -130,7 +132,7 @@ fn self_transfer_only_bumps_nonce() {
 #[test]
 fn self_transfer_is_included_and_preserves_balance() {
     let signer = TestSigner::from_seed(0);
-    let mut accounts = HashMap::new();
+    let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(12, 5));
 
     let transaction = signer.sign(signer.public_key.clone(), 7, 5);
@@ -157,7 +159,7 @@ fn self_transfer_is_included_and_preserves_balance() {
 fn missing_recipient_starts_with_default_balance() {
     let signer = TestSigner::from_seed(20);
     let recipient = TestSigner::from_seed(21);
-    let mut accounts = HashMap::new();
+    let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(9, 0));
     accounts.insert(account_key(&recipient.public_key), Account::default());
 
@@ -173,4 +175,47 @@ fn missing_recipient_starts_with_default_balance() {
             nonce: 0,
         })
     );
+}
+
+#[test]
+fn invalid_transfer_does_not_mutate_overlay() {
+    let signer = TestSigner::from_seed(30);
+    let recipient = TestSigner::from_seed(31);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(5, 0));
+    accounts.insert(account_key(&recipient.public_key), account(0, 0));
+
+    let transactions = vec![
+        signer.sign(recipient.public_key.clone(), 6, 0),
+        signer.sign(recipient.public_key.clone(), 4, 0),
+    ];
+    let proposal = propose(&accounts, transactions);
+
+    assert_eq!(proposal.invalid.len(), 1);
+    assert_eq!(proposal.valid.len(), 1);
+    assert_eq!(
+        changeset_account(&proposal.changeset, signer.public_key),
+        Some(account(1, 1))
+    );
+    assert_eq!(
+        changeset_account(&proposal.changeset, recipient.public_key),
+        Some(account(4, 0))
+    );
+}
+
+#[test]
+fn recipient_overflow_rejects_without_charging_sender() {
+    let signer = TestSigner::from_seed(40);
+    let recipient = TestSigner::from_seed(41);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), account(u64::MAX, 0));
+
+    let transactions = vec![signer.sign(recipient.public_key, 1, 0)];
+    let proposal = propose(&accounts, transactions);
+
+    assert!(proposal.valid.is_empty());
+    assert_eq!(proposal.invalid.len(), 1);
+    assert!(proposal.changeset.is_empty());
+    assert!(execute(&accounts, &proposal.invalid).is_none());
 }
