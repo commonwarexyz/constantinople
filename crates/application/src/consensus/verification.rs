@@ -3,10 +3,10 @@
 use super::{
     db::{
         StateBatch, StateMerkleized, TransactionBatch, TransactionMerkleized, apply_changeset,
-        apply_lazy_transaction_digests, finalize_execution,
+        finalize_execution,
     },
     execution::{BlockExecution, ExecutionTimings, finalize_child_execution},
-    load_lazy_state,
+    utils::load_accounts,
 };
 use crate::processor::executor;
 use bytes::BytesMut;
@@ -17,6 +17,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, translator::EightCap};
 use constantinople_primitives::{AccountKey, Header, SealedBlock, SignedTransaction};
+use hashbrown::HashSet;
 use rand::{SeedableRng, rngs::StdRng};
 use rand_core::CryptoRngCore;
 use std::{sync::Arc, time::Instant};
@@ -36,6 +37,19 @@ where
     P: PublicKey,
 {
     pub(super) transactions: Vec<Lazy<SignedTransaction<P, H>>>,
+}
+
+/// Transfer metadata prepared once for state loading and execution.
+struct PreparedTransfer<P, H>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    sender: AccountKey<P>,
+    recipient: AccountKey<P>,
+    value: u64,
+    nonce: u64,
+    digest: H::Digest,
 }
 
 /// Verifies lazily decoded signed transactions.
@@ -170,41 +184,36 @@ where
     Prepared { transactions }
 }
 
-fn prepare_signers<P, H, St>(
-    strategy: &St,
+fn prepare_transfers<P, H>(
     transactions: &[Lazy<SignedTransaction<P, H>>],
-) -> Option<Vec<AccountKey<P>>>
+) -> Option<Vec<PreparedTransfer<P, H>>>
 where
     P: PublicKey,
     H: Hasher,
-    St: Strategy,
 {
-    if transactions.is_empty() {
-        return Some(Vec::new());
+    let mut transfers = Vec::with_capacity(transactions.len());
+    for transaction in transactions {
+        transfers.push(prepare_transfer(transaction)?);
     }
-
-    let parallelism = strategy.parallelism_hint();
-    if parallelism <= 1 || transactions.len() <= parallelism {
-        let mut signers = Vec::with_capacity(transactions.len());
-        for transaction in transactions {
-            signers.push(prepare_signer(transaction)?);
-        }
-        return Some(signers);
-    }
-
-    strategy
-        .map_collect_vec(transactions, prepare_signer)
-        .into_iter()
-        .collect()
+    Some(transfers)
 }
 
-fn prepare_signer<P, H>(transaction: &Lazy<SignedTransaction<P, H>>) -> Option<AccountKey<P>>
+fn prepare_transfer<P, H>(
+    transaction: &Lazy<SignedTransaction<P, H>>,
+) -> Option<PreparedTransfer<P, H>>
 where
     P: PublicKey,
     H: Hasher,
 {
     let transaction = transaction.get()?;
-    account_key_from_public_key_bytes(transaction.value().sender_lazy())
+    let transfer = transaction.value();
+    Some(PreparedTransfer {
+        sender: account_key_from_public_key_bytes(transfer.sender_lazy())?,
+        recipient: transfer.to.clone(),
+        value: transfer.value.get(),
+        nonce: transfer.nonce,
+        digest: *transaction.message_digest(),
+    })
 }
 
 fn account_key_from_public_key_bytes<P>(public_key: &Lazy<P>) -> Option<AccountKey<P>>
@@ -216,11 +225,67 @@ where
     AccountKey::from_bytes(bytes.freeze())
 }
 
+async fn load_transfer_state<E, H, P>(
+    batch: &StateBatch<E, H, P, EightCap>,
+    transfers: &[PreparedTransfer<P, H>],
+) -> core::result::Result<
+    Option<crate::processor::state::State<P>>,
+    commonware_storage::qmdb::Error<mmr::Family>,
+>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+{
+    let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
+    for transfer in transfers {
+        account_keys.insert(transfer.sender.clone());
+        account_keys.insert(transfer.recipient.clone());
+    }
+    load_accounts(batch, account_keys).await
+}
+
+fn execute_transfers<P, H>(
+    state: &crate::processor::state::State<P>,
+    transfers: &[PreparedTransfer<P, H>],
+) -> Option<executor::Changeset<P>>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    executor::execute_transfers(
+        state,
+        transfers.len(),
+        transfers.iter().map(|transfer| {
+            Some(executor::Transfer {
+                sender: &transfer.sender,
+                recipient: &transfer.recipient,
+                value: transfer.value,
+                nonce: transfer.nonce,
+            })
+        }),
+    )
+}
+
+fn apply_transfer_digests<E, H, P>(
+    batch: TransactionBatch<E, H>,
+    transfers: &[PreparedTransfer<P, H>],
+) -> TransactionBatch<E, H>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+{
+    transfers
+        .iter()
+        .fold(batch, |batch, transfer| batch.append(transfer.digest))
+}
+
 /// Executes and merkleizes a block body for verification.
 pub(super) async fn execute_block<E, C, P, H, St>(
     state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
-    strategy: &St,
+    _strategy: &St,
     parent: &SealedBlock<C, P, H>,
     prepared: &Prepared<P, H>,
 ) -> Result<BlockExecution<E, H, P>>
@@ -232,25 +297,22 @@ where
     St: Strategy,
 {
     let prepare_signers_started_at = Instant::now();
-    let signers = prepare_signers(strategy, &prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let transfers = prepare_transfers(&prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
     let prepare_signers_ms = prepare_signers_started_at.elapsed().as_millis();
 
     let load_state_started_at = Instant::now();
-    let state = load_lazy_state(&state_batches, &prepared.transactions, &signers)
+    let state = load_transfer_state(&state_batches, &transfers)
         .await
         .expect("block state loading during verification must succeed")
         .ok_or(MALFORMED_TRANSACTION)?;
     let load_state_ms = load_state_started_at.elapsed().as_millis();
 
     let execute_started_at = Instant::now();
-    let changeset = executor::execute_lazy(&state, &prepared.transactions, &signers)
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = execute_transfers(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
 
     let state_batch = apply_changeset(state_batches, &changeset);
-    let transaction_batch =
-        apply_lazy_transaction_digests(transaction_batch, &prepared.transactions)
-            .ok_or(MALFORMED_TRANSACTION)?;
+    let transaction_batch = apply_transfer_digests(transaction_batch, &transfers);
     let timings = ExecutionTimings::before_finalize(prepare_signers_ms, load_state_ms, execute_ms);
     Ok(finalize_child_execution(
         state_batch,
@@ -267,7 +329,7 @@ where
 pub(super) async fn apply_block<E, P, H, St>(
     state_batches: StateBatch<E, H, P, EightCap>,
     transaction_batch: TransactionBatch<E, H>,
-    strategy: &St,
+    _strategy: &St,
     transactions_floor: mmr::Location,
     prepared: &Prepared<P, H>,
 ) -> Result<(
@@ -280,19 +342,16 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let signers = prepare_signers(strategy, &prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
-    let state = load_lazy_state(&state_batches, &prepared.transactions, &signers)
+    let transfers = prepare_transfers(&prepared.transactions).ok_or(MALFORMED_TRANSACTION)?;
+    let state = load_transfer_state(&state_batches, &transfers)
         .await
         .expect("state loading must succeed for certified apply")
         .ok_or(MALFORMED_TRANSACTION)?;
-    let changeset = executor::execute_lazy(&state, &prepared.transactions, &signers)
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let changeset = execute_transfers(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let state_batch = apply_changeset(state_batches, &changeset);
-    let transaction_batch =
-        apply_lazy_transaction_digests(transaction_batch, &prepared.transactions)
-            .ok_or(MALFORMED_TRANSACTION)?
-            .with_inactivity_floor(transactions_floor);
+    let transaction_batch = apply_transfer_digests(transaction_batch, &transfers)
+        .with_inactivity_floor(transactions_floor);
     Ok(finalize_execution(state_batch, transaction_batch)
         .await
         .expect("database merkleization must succeed"))

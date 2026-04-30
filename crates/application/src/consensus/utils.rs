@@ -68,7 +68,7 @@ where
     load_accounts(batch, account_keys).await
 }
 
-async fn load_accounts<E, H, P, T>(
+pub(super) async fn load_accounts<E, H, P, T>(
     batch: &StateBatch<E, H, P, T>,
     account_keys: HashSet<AccountKey<P>>,
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>

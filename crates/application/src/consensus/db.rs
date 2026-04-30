@@ -1,7 +1,6 @@
 //! Database aliases and batch helpers for consensus execution.
 
 use crate::processor::executor::Changeset;
-use commonware_codec::types::lazy::Lazy;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, any::AnyUnmerkleized};
 use commonware_runtime::{Clock, Metrics, Storage};
@@ -91,22 +90,6 @@ where
     transactions.iter().fold(batch, |batch, transaction| {
         batch.append(*transaction.message_digest())
     })
-}
-
-pub(super) fn apply_lazy_transaction_digests<E, H, P>(
-    batch: TransactionBatch<E, H>,
-    transactions: &[Lazy<SignedTransaction<P, H>>],
-) -> Option<TransactionBatch<E, H>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-{
-    let mut batch = batch;
-    for transaction in transactions {
-        batch = batch.append(*transaction.get()?.message_digest());
-    }
-    Some(batch)
 }
 
 pub(super) async fn finalize_execution<E, H, P>(

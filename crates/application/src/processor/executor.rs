@@ -8,6 +8,18 @@ use constantinople_primitives::{Account, AccountKey, SignedTransaction};
 /// Deterministic account writes produced by execution.
 pub type Changeset<PK> = Vec<(AccountKey<PK>, Account)>;
 
+/// Transfer data with account keys already prepared for execution.
+pub struct Transfer<'a, PK: PublicKey> {
+    /// Account sending funds and consuming a nonce.
+    pub sender: &'a AccountKey<PK>,
+    /// Account receiving funds.
+    pub recipient: &'a AccountKey<PK>,
+    /// Amount to move from sender to recipient.
+    pub value: u64,
+    /// Expected sender nonce.
+    pub nonce: u64,
+}
+
 /// The final result of proposal-side filtering and execution.
 #[derive(Debug)]
 pub struct ProposalOutput<PK: PublicKey, H: Hasher> {
@@ -88,10 +100,45 @@ where
         "transactions and cached signer keys must have the same length",
     );
 
-    let mut overlay = Overlay::with_capacity(state, overlay_capacity(state, transactions.len()));
+    execute_transfers(
+        state,
+        transactions.len(),
+        transactions
+            .iter()
+            .zip(signers)
+            .map(|(transaction, signer)| {
+                let transfer = transaction.get()?.value();
+                Some(Transfer {
+                    sender: signer,
+                    recipient: &transfer.to,
+                    value: transfer.value.get(),
+                    nonce: transfer.nonce,
+                })
+            }),
+    )
+}
 
-    for (transaction, signer) in transactions.iter().zip(signers) {
-        if !execute_transfer_with_sender(&mut overlay, transaction.get()?, signer) {
+/// Executes transfers whose account keys and scalar fields are already prepared.
+pub fn execute_transfers<'a, PK, I>(
+    state: &State<PK>,
+    transfer_count: usize,
+    transfers: I,
+) -> Option<Changeset<PK>>
+where
+    PK: PublicKey,
+    I: IntoIterator<Item = Option<Transfer<'a, PK>>>,
+{
+    let mut overlay = Overlay::with_capacity(state, overlay_capacity(state, transfer_count));
+
+    for transfer in transfers {
+        let transfer = transfer?;
+        if !execute_transfer_parts(
+            &mut overlay,
+            transfer.sender,
+            transfer.recipient,
+            transfer.value,
+            transfer.nonce,
+        ) {
             return None;
         }
     }
@@ -136,10 +183,25 @@ where
     PK: PublicKey,
 {
     let transfer = transaction.value();
-    let recipient_key = &transfer.to;
-    let value = transfer.value.get();
-    let nonce = transfer.nonce;
+    execute_transfer_parts(
+        state,
+        sender_key,
+        &transfer.to,
+        transfer.value.get(),
+        transfer.nonce,
+    )
+}
 
+fn execute_transfer_parts<PK>(
+    state: &mut Overlay<'_, PK>,
+    sender_key: &AccountKey<PK>,
+    recipient_key: &AccountKey<PK>,
+    value: u64,
+    nonce: u64,
+) -> bool
+where
+    PK: PublicKey,
+{
     let Some(mut sender) = state.get(sender_key) else {
         return false;
     };
