@@ -17,6 +17,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     ca-certificates \
     cmake \
+    clang \
+    llvm-dev \
+    libclang-dev \
     curl \
     gcc-aarch64-linux-gnu \
     gcc-x86-64-linux-gnu \
@@ -24,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libc6-dev-arm64-cross \
     libc6-dev-amd64-cross \
     libssl-dev \
+    libgflags-dev \
     pkg-config \
     protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
