@@ -20,11 +20,9 @@ members = [
   "bin/deploy",
   "bin/spammer",
   "bin/validator",
-  "vendor/commonware-glue",
 ]
 
 [workspace.lints.rust]
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(full_bench)', 'cfg(generate_conformance_tests)', 'cfg(commonware_stability_BETA)', 'cfg(commonware_stability_GAMMA)', 'cfg(commonware_stability_DELTA)', 'cfg(commonware_stability_EPSILON)', 'cfg(commonware_stability_RESERVED)'] }
 unused-must-use = "deny"
 rust-2018-idioms = "deny"
 
@@ -48,13 +46,12 @@ constantinople-application = { path = "crates/application" }
 
 # Commonware
 commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-glue = { path = "vendor/commonware-glue" }
+commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-conformance = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
