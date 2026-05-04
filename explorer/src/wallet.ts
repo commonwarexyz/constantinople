@@ -1,15 +1,14 @@
 import initCrypto, { ChainKey } from './crypto-wasm/constantinople_explorer_crypto';
 import { toHex } from './codec';
 
-// Passkeys gate local key activation. Chain transactions are still signed by
-// a Constantinople Ed25519 account key, using the same payload shape as
-// commonware-cryptography.
-const DB_NAME = 'constantinople-wallet';
-const DB_VERSION = 1;
-const KEY_STORE = 'keys';
+const textEncoder = new TextEncoder();
 const META_STORAGE_KEY = 'constantinople.wallets.v1';
 const SESSION_STORAGE_KEY = 'constantinople.session.v1';
 const PASSKEY_TIMEOUT_MS = 90_000;
+const PRF_INPUT = textEncoder.encode('constantinople:explorer:ed25519-prf:v1');
+const HKDF_SALT = textEncoder.encode('constantinople:explorer:wallet-salt:v1');
+const HKDF_INFO = textEncoder.encode('constantinople:ed25519-private-key:v1');
+const ED25519_PRIVATE_KEY_BYTES = 32;
 
 export interface WalletProfile {
     readonly publicKeyHex: string;
@@ -22,10 +21,11 @@ export interface ActiveWallet extends WalletProfile {
     readonly sign: (namespace: Uint8Array, message: Uint8Array) => Promise<Uint8Array>;
 }
 
-interface StoredKey {
-    readonly publicKeyHex: string;
-    readonly publicKey: Uint8Array;
-    readonly privateKeySeed: Uint8Array;
+interface PrfExtensionOutput {
+    readonly enabled?: boolean;
+    readonly results?: {
+        readonly first?: ArrayBuffer;
+    };
 }
 
 let cryptoReady: Promise<unknown> | null = null;
@@ -47,21 +47,22 @@ export async function createWallet(): Promise<ActiveWallet> {
     await loadCrypto();
 
     const credential = await createPasskey();
-    const privateKeySeed = randomSeed();
-    const chainKey = ChainKey.fromSeed(privateKeySeed);
+    const prf = getPrfOutput(credential);
+    if (!prf.results?.first && prf.enabled !== true) {
+        throw new Error('this passkey does not support WebAuthn PRF');
+    }
+
+    const credentialId = encodeBase64Url(new Uint8Array(credential.rawId));
+    const prfOutput = prf.results?.first ?? (await evaluateCredentialPrf(credentialId));
+    const chainKey = ChainKey.fromSeed(await derivePrivateKeySeed(prfOutput));
     const publicKey = chainKey.publicKey();
     const publicKeyHex = toHex(publicKey);
     const profile = {
         publicKeyHex,
-        credentialId: encodeBase64Url(new Uint8Array(credential.rawId)),
+        credentialId,
         createdAt: Date.now(),
     };
 
-    await putStoredKey({
-        publicKeyHex,
-        publicKey,
-        privateKeySeed,
-    });
     writeProfiles([profile, ...readProfiles().filter((item) => item.publicKeyHex !== publicKeyHex)]);
     writeSession(publicKeyHex);
 
@@ -77,18 +78,7 @@ export async function signInWithPasskey(): Promise<ActiveWallet> {
         throw new Error('create a passkey wallet first');
     }
 
-    const assertion = await navigator.credentials.get({
-        publicKey: {
-            challenge: randomChallenge(),
-            timeout: PASSKEY_TIMEOUT_MS,
-            userVerification: 'required',
-            allowCredentials: profiles.map((profile) => ({
-                type: 'public-key',
-                id: decodeBase64Url(profile.credentialId),
-                transports: ['internal'],
-            })),
-        },
-    });
+    const assertion = await getPasskeyAssertion(profiles);
     if (!(assertion instanceof PublicKeyCredential)) {
         throw new Error('passkey sign-in was cancelled');
     }
@@ -99,13 +89,14 @@ export async function signInWithPasskey(): Promise<ActiveWallet> {
         throw new Error('passkey is not linked to a local wallet');
     }
 
-    const stored = await getStoredKey(profile.publicKeyHex);
-    if (!stored) {
-        throw new Error('local Ed25519 key is missing for this passkey');
+    const prfOutput = readPrfResult(assertion);
+    const chainKey = ChainKey.fromSeed(await derivePrivateKeySeed(prfOutput));
+    const publicKeyHex = toHex(chainKey.publicKey());
+    if (publicKeyHex !== profile.publicKeyHex) {
+        throw new Error('passkey derived a different account key');
     }
-
     writeSession(profile.publicKeyHex);
-    return activeWallet(profile, ChainKey.fromSeed(stored.privateKeySeed));
+    return activeWallet(profile, chainKey);
 }
 
 function activeWallet(profile: WalletProfile, chainKey: ChainKey): ActiveWallet {
@@ -132,7 +123,10 @@ async function createPasskey(): Promise<PublicKeyCredential> {
                 name: 'constantinople-wallet',
                 displayName: 'Constantinople Wallet',
             },
-            pubKeyCredParams: [{ type: 'public-key', alg: -8 }],
+            pubKeyCredParams: [
+                { type: 'public-key', alg: -7 },
+                { type: 'public-key', alg: -8 },
+            ],
             authenticatorSelection: {
                 authenticatorAttachment: 'platform',
                 residentKey: 'preferred',
@@ -140,6 +134,7 @@ async function createPasskey(): Promise<PublicKeyCredential> {
             },
             timeout: PASSKEY_TIMEOUT_MS,
             attestation: 'none',
+            extensions: prfCreationExtensions(),
         },
     });
 
@@ -147,6 +142,94 @@ async function createPasskey(): Promise<PublicKeyCredential> {
         throw new Error('passkey creation was cancelled');
     }
     return credential;
+}
+
+async function getPasskeyAssertion(profiles: WalletProfile[]): Promise<Credential | null> {
+    return navigator.credentials.get({
+        publicKey: {
+            challenge: randomChallenge(),
+            timeout: PASSKEY_TIMEOUT_MS,
+            userVerification: 'required',
+            allowCredentials: profiles.map((profile) => ({
+                type: 'public-key',
+                id: decodeBase64Url(profile.credentialId),
+                transports: ['internal'],
+            })),
+            extensions: prfRequestExtensions(profiles.map((profile) => profile.credentialId)),
+        },
+    });
+}
+
+async function evaluateCredentialPrf(credentialId: string): Promise<ArrayBuffer> {
+    const assertion = await navigator.credentials.get({
+        publicKey: {
+            challenge: randomChallenge(),
+            timeout: PASSKEY_TIMEOUT_MS,
+            userVerification: 'required',
+            allowCredentials: [
+                {
+                    type: 'public-key',
+                    id: decodeBase64Url(credentialId),
+                    transports: ['internal'],
+                },
+            ],
+            extensions: prfRequestExtensions([credentialId]),
+        },
+    });
+
+    if (!(assertion instanceof PublicKeyCredential)) {
+        throw new Error('passkey verification was cancelled');
+    }
+    return readPrfResult(assertion);
+}
+
+function readPrfResult(credential: PublicKeyCredential): ArrayBuffer {
+    const prfOutput = getPrfOutput(credential);
+    const result = prfOutput.results?.first;
+    if (!result) {
+        throw new Error('this passkey did not return WebAuthn PRF output');
+    }
+    return result;
+}
+
+function getPrfOutput(credential: PublicKeyCredential): PrfExtensionOutput {
+    const results = credential.getClientExtensionResults() as { prf?: PrfExtensionOutput };
+    return results.prf ?? {};
+}
+
+async function derivePrivateKeySeed(prfOutput: ArrayBuffer): Promise<Uint8Array> {
+    const key = await crypto.subtle.importKey('raw', prfOutput, 'HKDF', false, ['deriveBits']);
+    const bits = await crypto.subtle.deriveBits(
+        {
+            name: 'HKDF',
+            hash: 'SHA-256',
+            salt: HKDF_SALT,
+            info: HKDF_INFO,
+        },
+        key,
+        ED25519_PRIVATE_KEY_BYTES * 8,
+    );
+    return new Uint8Array(bits);
+}
+
+function prfCreationExtensions(): AuthenticationExtensionsClientInputs {
+    return {
+        prf: {
+            eval: {
+                first: PRF_INPUT,
+            },
+        },
+    } as unknown as AuthenticationExtensionsClientInputs;
+}
+
+function prfRequestExtensions(credentialIds: string[]): AuthenticationExtensionsClientInputs {
+    return {
+        prf: {
+            evalByCredential: Object.fromEntries(
+                credentialIds.map((credentialId) => [credentialId, { first: PRF_INPUT }]),
+            ),
+        },
+    } as unknown as AuthenticationExtensionsClientInputs;
 }
 
 function assertWalletSupport() {
@@ -159,51 +242,15 @@ function assertWalletSupport() {
     if (!crypto.getRandomValues) {
         throw new Error('this browser does not expose secure randomness');
     }
-}
-
-function randomSeed(): Uint8Array {
-    const seed = new Uint8Array(32);
-    crypto.getRandomValues(seed);
-    return seed;
+    if (!crypto.subtle) {
+        throw new Error('this browser does not expose WebCrypto key derivation');
+    }
 }
 
 function randomChallenge(): ArrayBuffer {
     const challenge = new Uint8Array(32);
     crypto.getRandomValues(challenge);
     return challenge.buffer;
-}
-
-async function putStoredKey(key: StoredKey): Promise<void> {
-    const db = await openDb();
-    await requestToPromise(db.transaction(KEY_STORE, 'readwrite').objectStore(KEY_STORE).put(key));
-    db.close();
-}
-
-async function getStoredKey(publicKeyHex: string): Promise<StoredKey | null> {
-    const db = await openDb();
-    const result = await requestToPromise<StoredKey | undefined>(
-        db.transaction(KEY_STORE, 'readonly').objectStore(KEY_STORE).get(publicKeyHex),
-    );
-    db.close();
-    return result ?? null;
-}
-
-function openDb(): Promise<IDBDatabase> {
-    return new Promise((resolve, reject) => {
-        const request = indexedDB.open(DB_NAME, DB_VERSION);
-        request.onupgradeneeded = () => {
-            request.result.createObjectStore(KEY_STORE, { keyPath: 'publicKeyHex' });
-        };
-        request.onerror = () => reject(request.error ?? new Error('failed to open wallet database'));
-        request.onsuccess = () => resolve(request.result);
-    });
-}
-
-function requestToPromise<T = unknown>(request: IDBRequest<T>): Promise<T> {
-    return new Promise((resolve, reject) => {
-        request.onerror = () => reject(request.error ?? new Error('wallet database request failed'));
-        request.onsuccess = () => resolve(request.result);
-    });
 }
 
 function readProfiles(): WalletProfile[] {
