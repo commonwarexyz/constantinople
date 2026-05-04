@@ -273,7 +273,7 @@ body {
 
 .transfer {
     display: grid;
-    grid-template-columns: minmax(18ch, 1fr) 12ch 12ch auto;
+    grid-template-columns: minmax(18ch, 1fr) 12ch auto;
     gap: 1ch;
     align-items: end;
 }

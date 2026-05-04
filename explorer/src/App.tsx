@@ -257,7 +257,6 @@ export default function App() {
                     onRefreshAccount={refreshAccount}
                     onToKeyChange={setToKey}
                     onValueChange={setValue}
-                    onNonceChange={setNonce}
                     onSubmit={submitTransfer}
                 />
                 <TransactionHistory transactions={history} />
@@ -287,7 +286,6 @@ function WalletPanel({
     onRefreshAccount,
     onToKeyChange,
     onValueChange,
-    onNonceChange,
     onSubmit,
 }: {
     wallet: ActiveWallet | null;
@@ -306,11 +304,9 @@ function WalletPanel({
     onRefreshAccount: () => void;
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
-    onNonceChange: (value: string) => void;
     onSubmit: () => void;
 }) {
     const balance = account?.balance ?? 100;
-    const accountNonce = account?.nonce ?? 0;
 
     return (
         <section className="wallet">
@@ -337,7 +333,7 @@ function WalletPanel({
                 </div>
                 <div className="wallet__cell">
                     <span>nonce</span>
-                    <strong>{accountNonce.toLocaleString()}</strong>
+                    <strong>{nonce}</strong>
                 </div>
                 <div className="wallet__cell span-2">
                     <span>mempool</span>
@@ -370,15 +366,6 @@ function WalletPanel({
                     <input
                         value={value}
                         onChange={(event) => onValueChange(event.target.value)}
-                        inputMode="numeric"
-                        disabled={!wallet || isSubmitting}
-                    />
-                </label>
-                <label>
-                    <span>nonce</span>
-                    <input
-                        value={nonce}
-                        onChange={(event) => onNonceChange(event.target.value)}
                         inputMode="numeric"
                         disabled={!wallet || isSubmitting}
                     />
