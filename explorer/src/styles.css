@@ -90,48 +90,43 @@ body {
     color: var(--theme-accent);
 }
 
-/*
- * Three accent-colored ">" chevrons that pulse in a left-to-right wave next
- * to the "explorer" title, mirroring the chevron animation on the
- * exoware.xyz home page. Each chevron blanks (opacity 0) for 100ms in
- * sequence with a 50ms stagger, then the whole row pauses for ~550ms before
- * repeating — total cycle 750ms. We use staggered animation-delays on a
- * single shared keyframe so the wave self-aligns without any JS timer.
- */
-.app__chevrons {
+.app__header-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 1ch;
+}
+
+.app__header-separator {
+    color: var(--theme-text-dim);
+}
+
+.app__live-text {
     color: var(--theme-accent);
-    margin-left: 0.5ch;
-    letter-spacing: 0.1ch;
 }
 
-.app__chevron {
+.app__live-symbol {
     display: inline-block;
-    animation: app__chevron-pulse 750ms infinite;
+    width: 1ch;
 }
 
-.app__chevron:nth-child(2) {
-    animation-delay: 50ms;
-}
-
-.app__chevron:nth-child(3) {
-    animation-delay: 100ms;
-}
-
-@keyframes app__chevron-pulse {
-    0%,
-    13.33% {
-        opacity: 0;
-    }
-    13.34%,
-    100% {
-        opacity: 1;
-    }
+.visually-hidden {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    margin: -1px;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+    border: 0;
 }
 
 .app__status {
     color: var(--theme-text-dim);
     display: flex;
-    gap: 2ch;
+    gap: 1ch;
     align-items: center;
 }
 
@@ -156,6 +151,68 @@ body {
 
 .app__status.error .dot {
     background: #ff6b6b;
+}
+
+.wallet-trigger,
+.modal__close,
+.wallet button:not(.copyable--plain),
+.transfer button {
+    color: var(--theme-background);
+    background: var(--theme-accent);
+    border: 1px solid var(--theme-accent);
+    font: inherit;
+    padding: 0.35ch 1ch;
+    cursor: pointer;
+}
+
+.wallet-trigger {
+    text-align: center;
+}
+
+.spinner {
+    color: var(--theme-accent);
+    display: inline-block;
+    width: 1.2ch;
+    text-align: center;
+}
+
+.modal {
+    position: fixed;
+    inset: 0;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2ch;
+    background: rgba(14, 15, 16, 0.72);
+}
+
+.modal__panel {
+    width: min(121ch, calc(100vw - 4ch));
+    max-height: min(86vh, 72ch);
+    overflow: auto;
+    background: var(--theme-background);
+    border: 1px solid var(--theme-border);
+    box-shadow: 0 0 0 1px rgba(255, 178, 0, 0.12), 0 2ch 6ch rgba(0, 0, 0, 0.45);
+}
+
+.modal__header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 2ch;
+    padding: 1.2ch 2ch;
+    background: var(--theme-background);
+    border-bottom: 1px solid var(--theme-border);
+}
+
+.modal__header h2 {
+    margin: 0;
+    font: inherit;
+    color: var(--theme-text);
 }
 
 .app__main {
@@ -227,18 +284,9 @@ body {
     gap: 1ch;
 }
 
-.wallet button,
-.transfer button {
-    color: var(--theme-background);
-    background: var(--theme-accent);
-    border: 1px solid var(--theme-accent);
-    font: inherit;
-    padding: 0.35ch 1ch;
-    cursor: pointer;
-}
-
 .wallet button:disabled,
-.transfer button:disabled {
+.transfer button:disabled,
+.copyable:disabled {
     cursor: default;
     opacity: 0.45;
 }
@@ -271,11 +319,88 @@ body {
     font-weight: 400;
 }
 
+.copyable {
+    width: 100%;
+    min-width: 0;
+    display: block;
+    color: var(--theme-text);
+    background: transparent;
+    border: 0;
+    font: inherit;
+    text-align: left;
+    padding: 0;
+    cursor: pointer;
+}
+
+.wallet__cell .copyable {
+    display: inline;
+    width: auto;
+}
+
+.wallet__cell .copyable--plain {
+    color: var(--theme-text);
+    background: transparent;
+    border: 0;
+    padding: 0;
+}
+
+.wallet__cell .copyable--plain.is-copied {
+    color: var(--theme-accent);
+}
+
+.copyable__value {
+    display: block;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.wallet__cell .copyable__value {
+    display: inline;
+    overflow-wrap: anywhere;
+    white-space: normal;
+}
+
+.copyable.is-copied {
+    color: var(--theme-accent);
+}
+
+.terminal-toast {
+    position: fixed;
+    right: 2ch;
+    bottom: 2ch;
+    left: 2ch;
+    z-index: 20;
+    width: max-content;
+    max-width: calc(100vw - 4ch);
+    color: var(--theme-text);
+    background: var(--theme-background);
+    border: 1px solid var(--theme-border);
+    padding: 0.7ch 1ch;
+    overflow-wrap: anywhere;
+    box-shadow: 0.5ch 0.5ch 0 rgba(0, 0, 0, 0.35);
+}
+
+.terminal-toast__prompt {
+    color: var(--theme-accent);
+}
+
 .transfer {
     display: grid;
-    grid-template-columns: minmax(18ch, 1fr) 12ch auto;
+    grid-template-columns: minmax(18ch, 1fr) 12ch calc(10ch + 2px);
     gap: 1ch;
     align-items: end;
+}
+
+.transfer__submit {
+    width: calc(10ch + 2px);
+    height: calc(1lh + 0.7ch + 2px);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    line-height: 1;
 }
 
 .transfer label {
@@ -306,14 +431,47 @@ body {
     margin-top: 0.7ch;
 }
 
+.tx-col-digest,
+.tx-col-to {
+    width: 15ch;
+}
+
+.tx-col-amount,
+.tx-col-nonce {
+    width: 8ch;
+}
+
+.tx-col-status {
+    width: 18ch;
+}
+
+.tx-col-latency {
+    width: 24ch;
+}
+
+.tx-col-time {
+    width: 13ch;
+}
+
 .tx-table th,
 .tx-table td {
     border-bottom: 1px solid var(--theme-border);
     padding: 0.45ch 1ch 0.45ch 0;
     text-align: left;
     white-space: nowrap;
-    overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.tx-table td {
+    overflow: hidden;
+}
+
+.tx-table th {
+    overflow: visible;
+}
+
+.tx-table .copyable {
+    max-width: 100%;
 }
 
 .tx-table th {
@@ -322,6 +480,38 @@ body {
     letter-spacing: 0.06em;
     font-size: 0.85em;
     font-weight: 400;
+}
+
+.ascii-tooltip {
+    position: relative;
+    display: inline-block;
+    cursor: help;
+}
+
+.ascii-tooltip__hint,
+.ascii-tooltip__corner {
+    color: var(--theme-accent);
+}
+
+.ascii-tooltip__box {
+    position: absolute;
+    left: 0;
+    top: calc(100% + 0.7ch);
+    z-index: 2;
+    display: none;
+    width: min(48ch, calc(100vw - 8ch));
+    color: var(--theme-text);
+    background: var(--theme-background);
+    border: 1px solid var(--theme-border);
+    padding: 0.6ch 1ch;
+    text-transform: none;
+    letter-spacing: 0;
+    white-space: normal;
+    box-shadow: 0.5ch 0.5ch 0 rgba(0, 0, 0, 0.35);
+}
+
+.ascii-tooltip:hover .ascii-tooltip__box {
+    display: block;
 }
 
 .histogram {

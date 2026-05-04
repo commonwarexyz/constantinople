@@ -29,6 +29,11 @@ const HISTOGRAM_MAX_COLUMNS = 400;
 const HISTOGRAM_INITIAL_COLUMNS = 80;
 /** 8-step unicode block ramp; index 0 is empty so unused cells stay blank. */
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
+const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const LIVE_STATUS_TEXT = '>>> live';
+const LIVE_STATUS_STAGGER_MS = 50;
+const LIVE_STATUS_BLANK_MS = 100;
+const LIVE_STATUS_PAUSE_MS = 550;
 
 type Status =
     | { kind: 'connecting' }
@@ -52,6 +57,7 @@ interface SubmittedTransaction {
     readonly value: string;
     readonly nonce: string;
     readonly submittedAt: number;
+    readonly finalizedInMs: number | null;
     readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
 }
@@ -65,6 +71,7 @@ export default function App() {
     const [totalTxObserved, setTotalTxObserved] = useState(0);
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const lastSequenceRef = useRef<bigint | null>(null);
+    const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
@@ -75,6 +82,15 @@ export default function App() {
     const [submitMessage, setSubmitMessage] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [history, setHistory] = useState<SubmittedTransaction[]>(() => readHistory());
+    const [copiedValue, setCopiedValue] = useState('');
+    const [copyToast, setCopyToast] = useState('');
+    const copiedValueTimeoutRef = useRef<number | null>(null);
+    const copyToastTimeoutRef = useRef<number | null>(null);
+    const isWalletBusy =
+        walletMessage === 'opening passkey prompt' ||
+        accountMessage === 'loading account metadata' ||
+        isSubmitting;
+    const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -108,6 +124,17 @@ export default function App() {
     useEffect(() => {
         writeHistory(history);
     }, [history]);
+
+    useEffect(() => {
+        return () => {
+            if (copiedValueTimeoutRef.current !== null) {
+                window.clearTimeout(copiedValueTimeoutRef.current);
+            }
+            if (copyToastTimeoutRef.current !== null) {
+                window.clearTimeout(copyToastTimeoutRef.current);
+            }
+        };
+    }, []);
 
     useEffect(() => {
         if (!wallet) {
@@ -185,6 +212,38 @@ export default function App() {
         setWalletMessage('signed out');
     };
 
+    const copyValue = async (value: string) => {
+        try {
+            await navigator.clipboard.writeText(value);
+            if (copiedValueTimeoutRef.current !== null) {
+                window.clearTimeout(copiedValueTimeoutRef.current);
+            }
+            if (copyToastTimeoutRef.current !== null) {
+                window.clearTimeout(copyToastTimeoutRef.current);
+            }
+
+            setCopiedValue(value);
+            setCopyToast(`copied "${value}" to clipboard`);
+            copiedValueTimeoutRef.current = window.setTimeout(() => {
+                setCopiedValue((current) => (current === value ? '' : current));
+                copiedValueTimeoutRef.current = null;
+            }, 1_000);
+            copyToastTimeoutRef.current = window.setTimeout(() => {
+                setCopyToast('');
+                copyToastTimeoutRef.current = null;
+            }, 1_400);
+        } catch (error) {
+            if (copyToastTimeoutRef.current !== null) {
+                window.clearTimeout(copyToastTimeoutRef.current);
+            }
+            setCopyToast(error instanceof Error ? error.message : String(error));
+            copyToastTimeoutRef.current = window.setTimeout(() => {
+                setCopyToast('');
+                copyToastTimeoutRef.current = null;
+            }, 1_400);
+        }
+    };
+
     const submitTransfer = async () => {
         if (!wallet || isSubmitting) return;
 
@@ -209,6 +268,7 @@ export default function App() {
                 value: parsedValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
+                finalizedInMs: null,
                 status: 'pending',
                 detail: 'submitted to mempool',
             };
@@ -216,8 +276,9 @@ export default function App() {
             setSubmitMessage('waiting for finalization');
 
             const txStatus = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
-            setHistory((current) => updateTransactionStatus(encoded.digestHex, txStatus, current));
-            setSubmitMessage(formatTxStatus(txStatus));
+            const detail = formatTxStatus(txStatus, encoded.digestHex);
+            setHistory((current) => updateTransactionStatus(encoded.digestHex, txStatus, detail, current));
+            setSubmitMessage(detail);
             await refreshAccount();
         } catch (error) {
             setSubmitMessage(error instanceof Error ? error.message : String(error));
@@ -233,38 +294,94 @@ export default function App() {
                     <h1 className="app__title">
                         <span className="accent">constantinople</span> / explorer
                     </h1>
-                    <StatusBadge status={status} url={indexerUrl} />
+                    <div className="app__header-actions">
+                        <StatusBadge status={status} spinner={spinner} />
+                        <span className="app__header-separator" aria-hidden="true">
+                            ⬝
+                        </span>
+                        <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
+                            {wallet ? `wallet ${shortHex(wallet.publicKeyHex)}` : 'wallet'}
+                        </button>
+                    </div>
                 </header>
                 <SummaryPanel
                     blocks={blocks}
                     blocksObserved={blocksObserved}
                     totalTxObserved={totalTxObserved}
                 />
-                <WalletPanel
-                    wallet={wallet}
-                    walletMessage={walletMessage}
-                    account={account}
-                    accountMessage={accountMessage}
-                    mempoolUrl={mempoolUrl}
-                    toKey={toKey}
-                    value={value}
-                    nonce={nonce}
-                    submitMessage={submitMessage}
-                    isSubmitting={isSubmitting}
-                    onCreateWallet={handleCreateWallet}
-                    onSignIn={handleSignIn}
-                    onSignOut={handleSignOut}
-                    onRefreshAccount={refreshAccount}
-                    onToKeyChange={setToKey}
-                    onValueChange={setValue}
-                    onSubmit={submitTransfer}
-                />
-                <TransactionHistory transactions={history} />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
                     <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
                 </main>
+                {isWalletOpen && (
+                    <WalletModal onClose={() => setIsWalletOpen(false)}>
+                        <WalletPanel
+                            wallet={wallet}
+                            walletMessage={walletMessage}
+                            account={account}
+                            accountMessage={accountMessage}
+                            toKey={toKey}
+                            value={value}
+                            nonce={nonce}
+                            submitMessage={submitMessage}
+                            isSubmitting={isSubmitting}
+                            spinner={spinner}
+                            copiedValue={copiedValue}
+                            onCreateWallet={handleCreateWallet}
+                            onSignIn={handleSignIn}
+                            onSignOut={handleSignOut}
+                            onRefreshAccount={refreshAccount}
+                            onCopy={copyValue}
+                            onToKeyChange={setToKey}
+                            onValueChange={setValue}
+                            onSubmit={submitTransfer}
+                        />
+                        <TransactionHistory
+                            transactions={history}
+                            copiedValue={copiedValue}
+                            onCopy={copyValue}
+                        />
+                    </WalletModal>
+                )}
+                {copyToast && <TerminalToast message={copyToast} />}
             </div>
+        </div>
+    );
+}
+
+function WalletModal({
+    children,
+    onClose,
+}: {
+    children: React.ReactNode;
+    onClose: () => void;
+}) {
+    useEffect(() => {
+        const closeOnEscape = (event: KeyboardEvent) => {
+            if (event.key !== 'Escape') return;
+            onClose();
+        };
+        window.addEventListener('keydown', closeOnEscape);
+        return () => window.removeEventListener('keydown', closeOnEscape);
+    }, [onClose]);
+
+    return (
+        <div
+            className="modal"
+            role="presentation"
+            onMouseDown={(event) => {
+                if (event.target === event.currentTarget) onClose();
+            }}
+        >
+            <section className="modal__panel" role="dialog" aria-modal="true" aria-label="wallet">
+                <header className="modal__header">
+                    <h2>wallet</h2>
+                    <button className="modal__close" onClick={onClose}>
+                        close
+                    </button>
+                </header>
+                {children}
+            </section>
         </div>
     );
 }
@@ -274,16 +391,18 @@ function WalletPanel({
     walletMessage,
     account,
     accountMessage,
-    mempoolUrl,
     toKey,
     value,
     nonce,
     submitMessage,
     isSubmitting,
+    spinner,
+    copiedValue,
     onCreateWallet,
     onSignIn,
     onSignOut,
     onRefreshAccount,
+    onCopy,
     onToKeyChange,
     onValueChange,
     onSubmit,
@@ -292,40 +411,61 @@ function WalletPanel({
     walletMessage: string;
     account: AccountView | null;
     accountMessage: string;
-    mempoolUrl: string;
     toKey: string;
     value: string;
     nonce: string;
     submitMessage: string;
     isSubmitting: boolean;
+    spinner: string;
+    copiedValue: string;
     onCreateWallet: () => void;
     onSignIn: () => void;
     onSignOut: () => void;
     onRefreshAccount: () => void;
+    onCopy: (value: string) => void;
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
     onSubmit: () => void;
 }) {
     const balance = account?.balance ?? 100;
+    const isWalletLoading = walletMessage === 'opening passkey prompt';
+    const isAccountLoading = accountMessage === 'loading account metadata';
 
     return (
         <section className="wallet">
             <div className="wallet__header">
                 <div>
-                    <div className="wallet__label">wallet</div>
-                    <div className="wallet__status">{walletMessage}</div>
+                    <div className="wallet__label">status</div>
+                    <div className="wallet__status">
+                        <SpinnerText active={isWalletLoading} spinner={spinner}>
+                            {walletMessage}
+                        </SpinnerText>
+                    </div>
                 </div>
                 <div className="wallet__actions">
                     {!wallet && <button onClick={onSignIn}>sign in</button>}
                     {!wallet && <button onClick={onCreateWallet}>new passkey</button>}
-                    {wallet && <button onClick={onRefreshAccount}>refresh</button>}
+                    {wallet && (
+                        <button onClick={onRefreshAccount}>
+                            <SpinnerText active={isAccountLoading} spinner={spinner}>
+                                refresh
+                            </SpinnerText>
+                        </button>
+                    )}
                     {wallet && <button onClick={onSignOut}>sign out</button>}
                 </div>
             </div>
             <div className="wallet__grid">
                 <div className="wallet__cell span-2">
                     <span>account</span>
-                    <strong>{wallet?.publicKeyHex ?? 'not authenticated'}</strong>
+                    <CopyableValue
+                        disabled={!wallet}
+                        plain
+                        flashOnCopy
+                        copiedValue={copiedValue}
+                        value={wallet?.publicKeyHex ?? 'not authenticated'}
+                        onCopy={onCopy}
+                    />
                 </div>
                 <div className="wallet__cell">
                     <span>balance</span>
@@ -334,14 +474,6 @@ function WalletPanel({
                 <div className="wallet__cell">
                     <span>nonce</span>
                     <strong>{nonce}</strong>
-                </div>
-                <div className="wallet__cell span-2">
-                    <span>mempool</span>
-                    <strong>{mempoolUrl}</strong>
-                </div>
-                <div className="wallet__cell span-2">
-                    <span>metadata</span>
-                    <strong>{accountMessage}</strong>
                 </div>
             </div>
             <form
@@ -352,17 +484,17 @@ function WalletPanel({
                 }}
             >
                 <label>
-                    <span>to_key</span>
+                    <span>to</span>
                     <input
                         value={toKey}
                         onChange={(event) => onToKeyChange(event.target.value)}
-                        placeholder="64 hex chars"
+                        placeholder="Public key of recipient"
                         spellCheck={false}
                         disabled={!wallet || isSubmitting}
                     />
                 </label>
                 <label>
-                    <span>n</span>
+                    <span>amount</span>
                     <input
                         value={value}
                         onChange={(event) => onValueChange(event.target.value)}
@@ -370,16 +502,95 @@ function WalletPanel({
                         disabled={!wallet || isSubmitting}
                     />
                 </label>
-                <button disabled={!wallet || isSubmitting} type="submit">
+                <button className="transfer__submit" disabled={!wallet || isSubmitting} type="submit">
                     {isSubmitting ? 'submitting' : 'submit'}
                 </button>
             </form>
-            {submitMessage && <div className="wallet__status">{submitMessage}</div>}
+            {submitMessage && (
+                <div className="wallet__status">
+                    <SpinnerText active={isSubmitting} spinner={spinner}>
+                        {submitMessage}
+                    </SpinnerText>
+                </div>
+            )}
         </section>
     );
 }
 
-function TransactionHistory({ transactions }: { transactions: SubmittedTransaction[] }) {
+function CopyableValue({
+    disabled = false,
+    flashOnCopy = true,
+    plain = false,
+    copiedValue,
+    value,
+    onCopy,
+}: {
+    disabled?: boolean;
+    flashOnCopy?: boolean;
+    plain?: boolean;
+    copiedValue: string;
+    value: string;
+    onCopy: (value: string) => void;
+}) {
+    const isCopied = flashOnCopy && copiedValue === value;
+    const className = [
+        'copyable',
+        plain ? 'copyable--plain' : '',
+        isCopied ? 'is-copied' : '',
+    ]
+        .filter(Boolean)
+        .join(' ');
+
+    return (
+        <button
+            className={className}
+            disabled={disabled}
+            onClick={() => onCopy(value)}
+            type="button"
+        >
+            <span className="copyable__value">{value}</span>
+        </button>
+    );
+}
+
+function TerminalToast({ message }: { message: string }) {
+    return (
+        <div className="terminal-toast" role="status">
+            <span className="terminal-toast__prompt">+ </span>
+            {message}
+        </div>
+    );
+}
+
+function SpinnerText({
+    active,
+    children,
+    spinner,
+}: {
+    active: boolean;
+    children: React.ReactNode;
+    spinner: string;
+}) {
+    if (!active) return <>{children}</>;
+    return (
+        <>
+            <span className="spinner" aria-hidden="true">
+                {spinner}
+            </span>{' '}
+            {children}
+        </>
+    );
+}
+
+function TransactionHistory({
+    transactions,
+    copiedValue,
+    onCopy,
+}: {
+    transactions: SubmittedTransaction[];
+    copiedValue: string;
+    onCopy: (value: string) => void;
+}) {
     const formatter = useMemo(
         () =>
             new Intl.DateTimeFormat(undefined, {
@@ -400,28 +611,61 @@ function TransactionHistory({ transactions }: { transactions: SubmittedTransacti
             <table className="tx-table">
                 <thead>
                     <tr>
-                        <th>digest</th>
-                        <th>to</th>
-                        <th>n</th>
-                        <th>nonce</th>
-                        <th>status</th>
-                        <th>time</th>
+                        <th className="tx-col-digest">digest</th>
+                        <th className="tx-col-to">to</th>
+                        <th className="tx-col-amount">amount</th>
+                        <th className="tx-col-nonce">nonce</th>
+                        <th className="tx-col-status">status</th>
+                        <th className="tx-col-latency">
+                            <AsciiTooltip
+                                tooltip="delta between finalization response and submission timestamp"
+                            >
+                                finalization latency
+                            </AsciiTooltip>
+                        </th>
+                        <th className="tx-col-time">time</th>
                     </tr>
                 </thead>
                 <tbody>
                     {transactions.map((tx) => (
                         <tr key={tx.digest}>
-                            <td>{shortHex(tx.digest)}</td>
-                            <td>{shortHex(tx.to)}</td>
+                            <td>
+                                <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
+                            </td>
+                            <td>
+                                <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
+                            </td>
                             <td>{tx.value}</td>
                             <td>{tx.nonce}</td>
                             <td>{tx.detail}</td>
+                            <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
                             <td>{formatter.format(tx.submittedAt)}</td>
                         </tr>
                     ))}
                 </tbody>
             </table>
         </section>
+    );
+}
+
+function AsciiTooltip({
+    children,
+    tooltip,
+}: {
+    children: React.ReactNode;
+    tooltip: string;
+}) {
+    return (
+        <span className="ascii-tooltip">
+            <span className="ascii-tooltip__hint" aria-hidden="true">
+                ?{' '}
+            </span>
+            {children}
+            <span className="ascii-tooltip__box" role="tooltip">
+                <span className="ascii-tooltip__corner">+ </span>
+                <span>{tooltip}</span>
+            </span>
+        </span>
     );
 }
 
@@ -443,6 +687,7 @@ function prependTransaction(
 function updateTransactionStatus(
     digest: string,
     status: TxStatus,
+    detail: string,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
     return current.map((tx) => {
@@ -450,17 +695,21 @@ function updateTransactionStatus(
         return {
             ...tx,
             status: status.status,
-            detail: formatTxStatus(status),
+            detail,
+            finalizedInMs: Date.now() - tx.submittedAt,
         };
     });
 }
 
-function formatTxStatus(status: TxStatus): string {
+function formatTxStatus(status: TxStatus, digest: string): string {
     if (status.status === 'finalized') {
         return `finalized at ${status.height}`;
     }
     if (status.status === 'partially_finalized') {
-        return `partial at ${status.height}`;
+        if (status.filtered.includes(digest)) {
+            return `rejected at ${status.height}: filtered ${shortHex(digest)}`;
+        }
+        return `partial at ${status.height}: filtered ${status.filtered.map(shortHex).join(', ')}`;
     }
     return status.status;
 }
@@ -475,7 +724,13 @@ function readHistory(): SubmittedTransaction[] {
 
     try {
         const parsed = JSON.parse(raw);
-        return Array.isArray(parsed) ? parsed.filter(isSubmittedTransaction) : [];
+        return Array.isArray(parsed)
+            ? parsed.reduce<SubmittedTransaction[]>((transactions, item) => {
+                  const transaction = normalizeSubmittedTransaction(item);
+                  if (transaction) transactions.push(transaction);
+                  return transactions;
+              }, [])
+            : [];
     } catch {
         return [];
     }
@@ -485,26 +740,111 @@ function writeHistory(history: SubmittedTransaction[]) {
     window.localStorage.setItem(LOCAL_HISTORY_KEY, JSON.stringify(history));
 }
 
-function isSubmittedTransaction(value: unknown): value is SubmittedTransaction {
-    return (
-        typeof value === 'object' &&
-        value !== null &&
-        'digest' in value &&
-        'to' in value &&
-        'value' in value &&
-        'nonce' in value &&
-        'submittedAt' in value &&
-        'status' in value &&
-        'detail' in value
-    );
+function useBrailleSpinner(active: boolean): string {
+    const [index, setIndex] = useState(0);
+
+    useEffect(() => {
+        if (!active) return;
+        const interval = window.setInterval(() => {
+            setIndex((current) => (current + 1) % BRAILLE_SPINNER.length);
+        }, 80);
+        return () => window.clearInterval(interval);
+    }, [active]);
+
+    return BRAILLE_SPINNER[index];
 }
 
-function StatusBadge({ status, url }: { status: Status; url: string }) {
+function useLiveStatusText(active: boolean): string[] {
+    const [symbols, setSymbols] = useState(() => [...LIVE_STATUS_TEXT]);
+
+    useEffect(() => {
+        if (!active) {
+            setSymbols([...LIVE_STATUS_TEXT]);
+            return;
+        }
+
+        const timeouts: number[] = [];
+        const pulseIndexes = [...LIVE_STATUS_TEXT]
+            .map((symbol, index) => (symbol === ' ' ? -1 : index))
+            .filter((index) => index >= 0);
+
+        const pulseSymbol = (index: number) => {
+            setSymbols((current) => current.map((symbol, symbolIndex) => (symbolIndex === index ? ' ' : symbol)));
+            timeouts.push(
+                window.setTimeout(() => {
+                    setSymbols((current) =>
+                        current.map((symbol, symbolIndex) =>
+                            symbolIndex === index ? LIVE_STATUS_TEXT[index] : symbol,
+                        ),
+                    );
+                }, LIVE_STATUS_BLANK_MS),
+            );
+        };
+
+        const animate = () => {
+            for (let groupIndex = 0; groupIndex < pulseIndexes.length; groupIndex++) {
+                const symbolIndex = pulseIndexes[groupIndex];
+                timeouts.push(window.setTimeout(() => pulseSymbol(symbolIndex), groupIndex * LIVE_STATUS_STAGGER_MS));
+            }
+
+            const totalTime = (pulseIndexes.length - 1) * LIVE_STATUS_STAGGER_MS + LIVE_STATUS_BLANK_MS;
+            timeouts.push(window.setTimeout(animate, totalTime + LIVE_STATUS_PAUSE_MS));
+        };
+
+        animate();
+        return () => {
+            for (const timeout of timeouts) {
+                window.clearTimeout(timeout);
+            }
+        };
+    }, [active]);
+
+    return symbols;
+}
+
+function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | null {
+    if (typeof value !== 'object' || value === null) {
+        return null;
+    }
+
+    const transaction = value as Record<string, unknown>;
+    if (
+        typeof transaction.digest !== 'string' ||
+        typeof transaction.to !== 'string' ||
+        typeof transaction.value !== 'string' ||
+        typeof transaction.nonce !== 'string' ||
+        typeof transaction.submittedAt !== 'number' ||
+        typeof transaction.status !== 'string' ||
+        typeof transaction.detail !== 'string'
+    ) {
+        return null;
+    }
+
+    const finalizedInMs =
+        typeof transaction.finalizedInMs === 'number' ? transaction.finalizedInMs : null;
+
+    return {
+        digest: transaction.digest,
+        to: transaction.to,
+        value: transaction.value,
+        nonce: transaction.nonce,
+        submittedAt: transaction.submittedAt,
+        finalizedInMs,
+        status: transaction.status as SubmittedTransaction['status'],
+        detail: transaction.detail,
+    };
+}
+
+function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
+    const liveStatusText = useLiveStatusText(status.kind === 'live');
+
     if (status.kind === 'connecting') {
         return (
             <span className="app__status">
-                <span className="dot" />
-                connecting to {url}
+                <span className="spinner" aria-hidden="true">
+                    {spinner}
+                </span>
+                connecting
             </span>
         );
     }
@@ -518,12 +858,14 @@ function StatusBadge({ status, url }: { status: Status; url: string }) {
     }
     return (
         <span className="app__status live">
-            <span className="app__chevrons" aria-hidden="true">
-                <span className="app__chevron">&gt;</span>
-                <span className="app__chevron">&gt;</span>
-                <span className="app__chevron">&gt;</span>
+            <span className="app__live-text" aria-hidden="true">
+                {liveStatusText.map((symbol, index) => (
+                    <span className="app__live-symbol" key={index}>
+                        {symbol}
+                    </span>
+                ))}
             </span>
-            live · {url}
+            <span className="visually-hidden">live</span>
         </span>
     );
 }

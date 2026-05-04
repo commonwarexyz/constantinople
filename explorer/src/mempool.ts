@@ -39,7 +39,9 @@ export async function submitTransactions(
     });
 
     if (!response.ok) {
-        throw new Error(`transaction submission failed with HTTP ${response.status}`);
+        const detail = await response.text();
+        const suffix = detail ? `: ${detail}` : '';
+        throw new Error(`transaction submission failed with HTTP ${response.status}${suffix}`);
     }
     return response.json();
 }
