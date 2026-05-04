@@ -101,7 +101,8 @@ pub(crate) struct GenerateArgs {
     spammer_seed_offset: u64,
     /// Fractional account-count jitter per spammer batch.
     ///
-    /// `0.2` submits `spammer_accounts..=spammer_accounts + 20%` txs.
+    /// `0.2` submits `spammer_accounts + rand(0..=floor(spammer_accounts * 0.2))`
+    /// txs per batch.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
 
@@ -204,7 +205,7 @@ pub(crate) struct SpammerConfig {
     pub primary_validators: Vec<String>,
     /// Fractional account-count jitter per submitted batch.
     ///
-    /// `0.2` submits `accounts..=accounts + floor(accounts * 0.2)` txs.
+    /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
 }

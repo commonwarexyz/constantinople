@@ -26,7 +26,7 @@ pub struct SpammerConfig {
     pub primary_validators: Vec<String>,
     /// Fractional account-count jitter per submitted batch.
     ///
-    /// `0.2` submits `accounts..=accounts + floor(accounts * 0.2)` txs.
+    /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs.
     #[serde(default)]
     pub accounts_jitter: f64,
 }

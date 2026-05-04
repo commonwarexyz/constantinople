@@ -62,8 +62,8 @@ The spammer waits 10 seconds for validators to start, then continuously submits 
 Each validator receives transactions from its own independent set of accounts.
 
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
-batch size in `accounts..=accounts + floor(accounts*J)`. With `J>0` blocks no longer pin to
-a flat `accounts`-per-block size, which gives the indexer histogram (see
+batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
+With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
 [Local Deployment with Indexer + Explorer](#local-deployment-with-indexer--explorer)) a
 visibly varying throughput stream:
 
@@ -80,7 +80,8 @@ You can also run the spammer manually against an existing local cluster:
 cargo run --release --bin constantinople-spammer -- \
   --peers ./local/peers.yaml \
   --accounts 10 \
-  --value 1
+  --value 1 \
+  --accounts-jitter 0.25
 ```
 
 ### Local Deployment with Indexer + Explorer

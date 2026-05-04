@@ -62,6 +62,11 @@ interface SubmittedTransaction {
     readonly detail: string;
 }
 
+interface ObservedRateWindow {
+    readonly firstBlockAt: number | null;
+    readonly latestBlockAt: number | null;
+}
+
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
     // Cumulative counters across every block we've ever observed on the
@@ -69,6 +74,10 @@ export default function App() {
     // keep climbing when older entries roll off the MAX_ROWS buffer.
     const [blocksObserved, setBlocksObserved] = useState(0);
     const [totalTxObserved, setTotalTxObserved] = useState(0);
+    const [observedRateWindow, setObservedRateWindow] = useState<ObservedRateWindow>({
+        firstBlockAt: null,
+        latestBlockAt: null,
+    });
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
     const lastSequenceRef = useRef<bigint | null>(null);
     const [isWalletOpen, setIsWalletOpen] = useState(false);
@@ -104,6 +113,10 @@ export default function App() {
                     setBlocks((current) => prependBounded(block, current));
                     setBlocksObserved((current) => current + 1);
                     setTotalTxObserved((current) => current + block.txCount);
+                    setObservedRateWindow((current) => ({
+                        firstBlockAt: current.firstBlockAt ?? block.arrivedAt,
+                        latestBlockAt: block.arrivedAt,
+                    }));
                     setStatus({ kind: 'live' });
                 }
             } catch (error) {
@@ -308,6 +321,7 @@ export default function App() {
                     blocks={blocks}
                     blocksObserved={blocksObserved}
                     totalTxObserved={totalTxObserved}
+                    observedRateWindow={observedRateWindow}
                 />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
@@ -874,17 +888,21 @@ function SummaryPanel({
     blocks,
     blocksObserved,
     totalTxObserved,
+    observedRateWindow,
 }: {
     blocks: ObservedBlock[];
     blocksObserved: number;
     totalTxObserved: number;
+    observedRateWindow: ObservedRateWindow;
 }) {
     const stats = useMemo(() => computeStats(blocks), [blocks]);
+    const observedTxPerSecond = formatObservedTxPerSecond(totalTxObserved, observedRateWindow);
     return (
         <section className="summary">
             <Stat label="latest height" value={stats.latestHeight ?? '—'} />
             <Stat label="blocks observed" value={blocksObserved.toLocaleString()} />
             <Stat label="total txs observed" value={totalTxObserved.toLocaleString()} />
+            <Stat label="observed tx/sec" value={observedTxPerSecond} />
             <Stat label="peak txs/block" value={stats.peakTx.toLocaleString()} />
             <Stat label="avg txs/block" value={stats.avgTx.toLocaleString()} />
         </section>
@@ -923,6 +941,28 @@ function computeStats(blocks: ObservedBlock[]): DerivedStats {
         peakTx,
         avgTx: Math.round(totalTx / blocks.length),
     };
+}
+
+function formatObservedTxPerSecond(
+    totalTxObserved: number,
+    observedRateWindow: ObservedRateWindow,
+): string {
+    const { firstBlockAt, latestBlockAt } = observedRateWindow;
+    if (firstBlockAt === null || latestBlockAt === null) {
+        return '—';
+    }
+    const elapsedSeconds = (latestBlockAt - firstBlockAt) / 1000;
+    if (elapsedSeconds <= 0) {
+        return '—';
+    }
+
+    const txPerSecond = totalTxObserved / elapsedSeconds;
+    if (txPerSecond >= 100) {
+        return Math.round(txPerSecond).toLocaleString();
+    }
+    return txPerSecond.toLocaleString(undefined, {
+        maximumFractionDigits: 1,
+    });
 }
 
 /**

@@ -45,8 +45,8 @@ pub struct Cli {
 
     /// Fractional account-count jitter per submitted batch.
     ///
-    /// `0.2` submits a random batch size in
-    /// `accounts..=accounts + 20%`. Must be in `0..=1`.
+    /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per
+    /// batch. Must be in `0..=1`.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     pub accounts_jitter: f64,
 }
