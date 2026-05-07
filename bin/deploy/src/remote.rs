@@ -310,6 +310,8 @@ fn build_deployer_config(
     secondaries: &[GeneratedValidator],
 ) -> aws::Config {
     let regions = &remote.regions;
+    let indexer_enabled = remote.indexer_mode().is_some();
+    let shared_indexer_region = regions[0].clone();
     let mut instances: Vec<aws::InstanceConfig> = validators
         .iter()
         .enumerate()
@@ -326,12 +328,16 @@ fn build_deployer_config(
         })
         .collect();
 
-    // Spread secondary instances across regions independently of the primary
-    // rotation so they don't all land in the same AZ as primary 0.
     for (index, secondary) in secondaries.iter().enumerate() {
+        let region = if indexer_enabled {
+            shared_indexer_region.clone()
+        } else {
+            regions[index % regions.len()].clone()
+        };
+
         instances.push(aws::InstanceConfig {
             name: secondary.public_key_hex.clone(),
-            region: regions[index % regions.len()].clone(),
+            region,
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
@@ -342,10 +348,10 @@ fn build_deployer_config(
         });
     }
 
-    if remote.indexer_mode().is_some() {
+    if indexer_enabled {
         instances.push(aws::InstanceConfig {
             name: CHAIN_INDEXER_HOST.to_string(),
-            region: regions[0].clone(),
+            region: shared_indexer_region.clone(),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
@@ -356,7 +362,7 @@ fn build_deployer_config(
         });
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
-            region: regions[0].clone(),
+            region: shared_indexer_region.clone(),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
@@ -719,16 +725,24 @@ mod tests {
     #[test]
     fn remote_deployer_config_includes_shared_indexer_services() {
         let mut args = generate_args();
-        args.secondaries = 1;
+        args.secondaries = 2;
         let mut remote = remote_args();
         remote.indexer = true;
         let validators = vec![validator(0), validator(1), validator(2)];
-        let secondaries = vec![super::GeneratedValidator {
-            public_key_hex: "secondary-0".to_string(),
-            config_name: "secondary-0.yaml".to_string(),
-            config_file: PathBuf::from("/tmp/secondary-0.yaml"),
-            config: validator(0).config,
-        }];
+        let secondaries = vec![
+            super::GeneratedValidator {
+                public_key_hex: "secondary-0".to_string(),
+                config_name: "secondary-0.yaml".to_string(),
+                config_file: PathBuf::from("/tmp/secondary-0.yaml"),
+                config: validator(0).config,
+            },
+            super::GeneratedValidator {
+                public_key_hex: "secondary-1".to_string(),
+                config_name: "secondary-1.yaml".to_string(),
+                config_file: PathBuf::from("/tmp/secondary-1.yaml"),
+                config: validator(0).config,
+            },
+        ];
 
         let config = build_deployer_config(
             &args,
@@ -739,11 +753,14 @@ mod tests {
             &secondaries,
         );
 
-        assert_eq!(config.instances.len(), 6);
-        assert_eq!(config.instances[4].name, "chain-indexer");
-        assert_eq!(config.instances[4].binary, CHAIN_INDEXER_BINARY_FILE);
-        assert_eq!(config.instances[5].name, "metadata-indexer");
-        assert_eq!(config.instances[5].binary, METADATA_INDEXER_BINARY_FILE);
+        assert_eq!(config.instances.len(), 7);
+        assert_eq!(config.instances[5].name, "chain-indexer");
+        assert_eq!(config.instances[5].binary, CHAIN_INDEXER_BINARY_FILE);
+        assert_eq!(config.instances[6].name, "metadata-indexer");
+        assert_eq!(config.instances[6].binary, METADATA_INDEXER_BINARY_FILE);
+        assert_eq!(config.instances[3].region, config.instances[5].region);
+        assert_eq!(config.instances[4].region, config.instances[5].region);
+        assert_eq!(config.instances[6].region, config.instances[5].region);
         assert!(config.ports.iter().any(|port| port.port == 8090));
         assert!(config.ports.iter().any(|port| port.port == 8091));
     }
