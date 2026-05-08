@@ -186,16 +186,14 @@ enum Operation {
     Verify,
     VerifyDecoded,
     Apply,
-    LocalLifecycle,
 }
 
 impl Operation {
-    const ALL: [Self; 5] = [
+    const ALL: [Self; 4] = [
         Self::Propose,
         Self::Verify,
         Self::VerifyDecoded,
         Self::Apply,
-        Self::LocalLifecycle,
     ];
 
     const fn name(self) -> &'static str {
@@ -204,7 +202,6 @@ impl Operation {
             Self::Verify => "verify",
             Self::VerifyDecoded => "verify-decoded",
             Self::Apply => "apply",
-            Self::LocalLifecycle => "local-lifecycle",
         }
     }
 
@@ -225,7 +222,6 @@ impl Operation {
             Self::Verify => verify_once(runtime, transaction_count, &prefix).await,
             Self::VerifyDecoded => verify_decoded_once(runtime, transaction_count, &prefix).await,
             Self::Apply => apply_once(runtime, transaction_count, &prefix).await,
-            Self::LocalLifecycle => lifecycle_once(runtime, transaction_count, &prefix).await,
         };
 
         cleanup_partitions(runtime, &prefix).await;
@@ -373,69 +369,6 @@ async fn apply_once(runtime: &RuntimeContext, transaction_count: usize, prefix: 
     black_box(merkleized.0.root());
     black_box(merkleized.1.root());
     drop(merkleized);
-    drop(databases);
-    elapsed
-}
-
-async fn lifecycle_once(
-    runtime: &RuntimeContext,
-    transaction_count: usize,
-    prefix: &str,
-) -> Duration {
-    let Fixture {
-        mut app,
-        databases,
-        parent,
-        context,
-        transactions,
-    } = Fixture::new(runtime, transaction_count, prefix).await;
-    let mut input = TestTransactionSource::new(vec![transactions]);
-
-    let started_at = Instant::now();
-    let propose_batches = databases.new_batches().await;
-    let proposed = app
-        .propose_child(
-            (runtime.child("lifecycle_propose"), context),
-            &parent,
-            propose_batches,
-            &mut input,
-        )
-        .await
-        .expect("proposal should succeed");
-    let block = proposed.block;
-    black_box(proposed.merkleized.0.root());
-    black_box(proposed.merkleized.1.root());
-    drop(proposed.merkleized);
-
-    let verify_batches = databases.new_batches().await;
-    let verify_context = block.header.context.clone();
-    let verified = app
-        .verify_child(
-            (runtime.child("lifecycle_verify"), verify_context),
-            block.clone(),
-            &parent,
-            verify_batches,
-        )
-        .await
-        .expect("verification should accept the proposed block");
-    black_box(verified.0.root());
-    black_box(verified.1.root());
-    drop(verified);
-
-    let apply_batches = databases.new_batches().await;
-    let apply_context = block.header.context.clone();
-    let applied = app
-        .apply_certified(
-            (runtime.child("lifecycle_apply"), apply_context),
-            &block,
-            apply_batches,
-        )
-        .await;
-    let elapsed = started_at.elapsed();
-
-    black_box(applied.0.root());
-    black_box(applied.1.root());
-    drop(applied);
     drop(databases);
     elapsed
 }
