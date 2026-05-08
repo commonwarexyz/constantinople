@@ -37,7 +37,7 @@ use commonware_glue::stateful::{
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
-use commonware_parallel::{Sequential, Strategy};
+use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
     buffer::paged::CacheRef, spawn_cell,
@@ -190,7 +190,7 @@ where
     signer: C,
     manager: M,
     blocker: B,
-    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H>,
+    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, HashT>,
     transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, HashT>,
     stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, SigT, HashT>,
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, SigT, HashT>,
@@ -245,7 +245,7 @@ where
 
     /// Returns the state database once the stateful actor has initialized it.
     /// Blocks until the database is ready.
-    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, C::PublicKey> {
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, C::PublicKey, HashT> {
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
@@ -257,7 +257,8 @@ where
     /// with [`start`](Self::start) (which consumes the engine).
     pub fn subscribe_databases_detached(
         &self,
-    ) -> impl std::future::Future<Output = StateSyncDb<E, H, C::PublicKey>> + Send + 'static {
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H, C::PublicKey, HashT>> + Send + 'static
+    {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
     }
@@ -282,7 +283,7 @@ where
             ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            StateResolverActor::<_, C::PublicKey, _, _, H>::new(
+            StateResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
                 context.child("state_resolver"),
                 qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
@@ -371,15 +372,20 @@ where
         );
         let transaction_db_config =
             transaction_db_config(&config.partition_prefix, config.hash_strategy.clone());
-        let genesis_state_db = StateDb::<E, H, C::PublicKey>::init(
+        let genesis_state_db = StateDb::<E, H, C::PublicKey, HashT>::init(
             context.child("genesis_state"),
-            state_db_config(&config.partition_prefix, &storage_page_cache),
+            state_db_config(
+                &config.partition_prefix,
+                &storage_page_cache,
+                config.hash_strategy.clone(),
+            ),
         )
         .await
         .expect("state db must initialize for genesis target");
         let genesis_state_root = genesis_state_db.root();
         let genesis_state_target =
-            <StateDb<E, H, C::PublicKey> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
+            <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(&genesis_state_db)
+                .await;
         let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
             context.child("genesis_transactions"),
             transaction_db_config.clone(),
@@ -419,7 +425,11 @@ where
             StatefulConfig {
                 app: application,
                 db_config: (
-                    state_db_config(&config.partition_prefix, &storage_page_cache),
+                    state_db_config(
+                        &config.partition_prefix,
+                        &storage_page_cache,
+                        config.hash_strategy.clone(),
+                    ),
                     transaction_db_config,
                 ),
                 input_provider: config.input,
@@ -655,14 +665,21 @@ where
     archive
 }
 
-fn state_db_config(partition_prefix: &str, page_cache: &CacheRef) -> FixedConfig<EightCap> {
+fn state_db_config<T>(
+    partition_prefix: &str,
+    page_cache: &CacheRef,
+    strategy: T,
+) -> FixedConfig<EightCap, T>
+where
+    T: Strategy,
+{
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
-            strategy: Sequential,
+            strategy,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {

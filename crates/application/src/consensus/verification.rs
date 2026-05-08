@@ -249,8 +249,8 @@ where
     AccountKey::from_bytes(bytes.freeze())
 }
 
-async fn load_transfer_state<E, H, P>(
-    batch: &StateBatch<E, H, P, EightCap>,
+async fn load_transfer_state<E, H, P, St>(
+    batch: &StateBatch<E, H, P, EightCap, St>,
     transfers: &[PreparedTransfer<P, H>],
 ) -> core::result::Result<
     Option<crate::processor::state::State<P>>,
@@ -260,6 +260,7 @@ where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
+    St: Strategy,
 {
     let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
@@ -308,7 +309,7 @@ where
 
 /// Executes and merkleizes a block body for verification.
 pub(super) async fn execute_block<E, C, P, H, St>(
-    state_batches: StateBatch<E, H, P, EightCap>,
+    state_batches: StateBatch<E, H, P, EightCap, St>,
     transaction_batch: TransactionBatch<E, H, St>,
     _strategy: &St,
     parent: &SealedBlock<C, P, H>,
@@ -355,7 +356,7 @@ where
 
 /// Executes and merkleizes a certified block body.
 pub(super) async fn apply_block<E, P, H, St>(
-    state_batches: StateBatch<E, H, P, EightCap>,
+    state_batches: StateBatch<E, H, P, EightCap, St>,
     transaction_batch: TransactionBatch<E, H, St>,
     _strategy: &St,
     transactions_floor: mmr::Location,

@@ -19,7 +19,6 @@ use commonware_cryptography::{
     PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
 };
 use commonware_glue::stateful::Stateful;
-use commonware_parallel::Sequential;
 use commonware_storage::{mmr, qmdb::current::unordered::fixed, translator::EightCap};
 use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
@@ -81,26 +80,26 @@ where
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, P> =
-    fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, EightCap, STATE_BITMAP_CHUNK_BYTES>;
+pub type StateDb<E, H, P, T> =
+    fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, EightCap, STATE_BITMAP_CHUNK_BYTES, T>;
 
-pub type StateSyncDb<E, H, P> = Arc<AsyncRwLock<StateDb<E, H, P>>>;
+pub type StateSyncDb<E, H, P, T> = Arc<AsyncRwLock<StateDb<E, H, P, T>>>;
 
-pub(crate) type StateResolverMailbox<E, H, P> = commonware_glue::stateful::db::p2p::Mailbox<
-    StateDb<E, H, P>,
+pub(crate) type StateResolverMailbox<E, H, P, T> = commonware_glue::stateful::db::p2p::Mailbox<
+    StateDb<E, H, P, T>,
     mmr::Family,
-    <StateSyncDb<E, H, P> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
-    <StateSyncDb<E, H, P> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
+    <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
+    <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
 >;
 
-pub(crate) type StateResolverActor<E, P, M, B, H> =
-    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, StateDb<E, H, P>>;
+pub(crate) type StateResolverActor<E, P, M, B, H, T> =
+    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, StateDb<E, H, P, T>>;
 
-pub type TransactionDb<E, H, T = Sequential> = TransactionHistoryDb<E, H, T>;
+pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
-pub type TransactionSyncDb<E, H, T = Sequential> = Arc<AsyncRwLock<TransactionDb<E, H, T>>>;
+pub type TransactionSyncDb<E, H, T> = Arc<AsyncRwLock<TransactionDb<E, H, T>>>;
 
-pub(crate) type TransactionResolverMailbox<E, H, T = Sequential> =
+pub(crate) type TransactionResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::compact_p2p::Mailbox<
         TransactionDb<E, H, T>,
         mmr::Family,
@@ -108,7 +107,7 @@ pub(crate) type TransactionResolverMailbox<E, H, T = Sequential> =
         H,
     >;
 
-pub(crate) type TransactionResolverActor<E, P, M, B, H, T = Sequential> =
+pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
     commonware_glue::stateful::db::compact_p2p::Actor<
         E,
         P,
@@ -132,7 +131,7 @@ pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
     App<H, P, V, I, B, SigT, HashT>,
     EngineMarshalMailbox<H, P, V>,
     (
-        StateResolverMailbox<E, H, P>,
+        StateResolverMailbox<E, H, P, HashT>,
         TransactionResolverMailbox<E, H, HashT>,
     ),
 >;

@@ -8,7 +8,7 @@ use super::{
     history::{child_transactions_range, parent_transactions_inactivity_floor},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use commonware_parallel::{Sequential, Strategy};
+use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::translator::EightCap;
 use commonware_utils::non_empty_range;
@@ -44,14 +44,14 @@ impl ExecutionTimings {
 }
 
 /// Merkleized output produced by block execution.
-pub(super) struct BlockExecution<E, H, P, S = Sequential>
+pub(super) struct BlockExecution<E, H, P, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     S: Strategy,
 {
-    pub(super) state: StateMerkleized<E, H, P, EightCap>,
+    pub(super) state: StateMerkleized<E, H, P, EightCap, S>,
     pub(super) transactions: TransactionMerkleized<E, H, S>,
     pub(super) state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
@@ -95,7 +95,7 @@ where
 }
 
 pub(super) async fn finalize_child_execution<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap>,
+    state_batch: StateBatch<E, H, P, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     state_sync_range: commonware_utils::range::NonEmptyRange<u64>,

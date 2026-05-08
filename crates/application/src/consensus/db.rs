@@ -3,7 +3,7 @@
 use crate::processor::executor::Changeset;
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, current::CurrentUnmerkleized};
-use commonware_parallel::{Sequential, Strategy};
+use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
     index::unordered::Index as UnorderedIndex,
@@ -27,11 +27,13 @@ use std::sync::Arc;
 pub const STATE_BITMAP_CHUNK_BYTES: usize = 64;
 
 /// Shared QMDB handle for the application state database.
-pub(super) type StateDatabase<E, H, P, T> = Arc<
-    AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, STATE_BITMAP_CHUNK_BYTES>>,
+pub(super) type StateDatabase<E, H, P, T, S> = Arc<
+    AsyncRwLock<
+        fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, STATE_BITMAP_CHUNK_BYTES, S>,
+    >,
 >;
 
-pub type TransactionHistoryDb<E, H, S = Sequential> =
+pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
 
 pub type TransactionHistoryOperation<H> =
@@ -40,15 +42,14 @@ pub type TransactionHistoryOperation<H> =
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
-pub(super) type TransactionDatabase<E, H, S = Sequential> =
-    Arc<AsyncRwLock<TransactionHistoryDb<E, H, S>>>;
+pub(super) type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistoryDb<E, H, S>>>;
 
 /// The backing databases owned by the application.
-pub(super) type Databases<E, H, P, T, S = Sequential> =
-    (StateDatabase<E, H, P, T>, TransactionDatabase<E, H, S>);
+pub(super) type Databases<E, H, P, T, S> =
+    (StateDatabase<E, H, P, T, S>, TransactionDatabase<E, H, S>);
 
 /// Unmerkleized application state batch used for processor read-through.
-pub(super) type StateBatch<E, H, P, T> = CurrentUnmerkleized<
+pub(super) type StateBatch<E, H, P, T, S> = CurrentUnmerkleized<
     mmr::Family,
     E,
     FixedJournal<
@@ -59,31 +60,33 @@ pub(super) type StateBatch<E, H, P, T> = CurrentUnmerkleized<
     H,
     UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>,
     STATE_BITMAP_CHUNK_BYTES,
-    Sequential,
+    S,
 >;
 
-pub(super) type TransactionBatch<E, H, S = Sequential> =
+pub(super) type TransactionBatch<E, H, S> =
     <TransactionDatabase<E, H, S> as DatabaseSet<E>>::Unmerkleized;
 
-pub(super) type StateMerkleized<E, H, P, T> = <StateBatch<E, H, P, T> as Unmerkleized>::Merkleized;
+pub(super) type StateMerkleized<E, H, P, T, S> =
+    <StateBatch<E, H, P, T, S> as Unmerkleized>::Merkleized;
 
-pub(super) type TransactionMerkleized<E, H, S = Sequential> =
+pub(super) type TransactionMerkleized<E, H, S> =
     <TransactionBatch<E, H, S> as Unmerkleized>::Merkleized;
 
-pub(super) type MerkleizedDatabases<E, H, P, S = Sequential> = (
-    StateMerkleized<E, H, P, EightCap>,
+pub(super) type MerkleizedDatabases<E, H, P, S> = (
+    StateMerkleized<E, H, P, EightCap, S>,
     TransactionMerkleized<E, H, S>,
 );
 
 /// Writes a changeset of account updates to a state batch.
-pub(super) fn apply_changeset<E, H, P>(
-    batch: StateBatch<E, H, P, EightCap>,
+pub(super) fn apply_changeset<E, H, P, S>(
+    batch: StateBatch<E, H, P, EightCap, S>,
     changeset: &Changeset<P>,
-) -> StateBatch<E, H, P, EightCap>
+) -> StateBatch<E, H, P, EightCap, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
+    S: Strategy,
 {
     changeset
         .iter()
@@ -108,7 +111,7 @@ where
 }
 
 pub(super) async fn finalize_execution<E, H, P, S>(
-    state_batch: StateBatch<E, H, P, EightCap>,
+    state_batch: StateBatch<E, H, P, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
 ) -> Result<MerkleizedDatabases<E, H, P, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where

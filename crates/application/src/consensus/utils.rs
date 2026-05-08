@@ -14,8 +14,8 @@ use hashbrown::HashSet;
 /// The loader gathers every unique sender and recipient across the block body,
 /// reads each account at most once, and builds an in-memory [`State`] snapshot
 /// for verification.
-pub async fn load_state<E, H, P, T>(
-    batch: &StateBatch<E, H, P, T>,
+pub async fn load_state<E, H, P, T, S>(
+    batch: &StateBatch<E, H, P, T, S>,
     transactions: &[SignedTransaction<P, H>],
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
@@ -23,6 +23,7 @@ where
     H: Hasher,
     P: PublicKey,
     T: Translator,
+    S: commonware_parallel::Strategy,
 {
     let mut account_keys = HashSet::with_capacity(transactions.len().saturating_mul(2));
     for transaction in transactions {
@@ -39,8 +40,8 @@ where
 /// Loads the accounts needed by lazily decoded `transactions`.
 ///
 /// Returns `Ok(None)` if any transaction fails to decode.
-pub async fn load_lazy_state<E, H, P, T>(
-    batch: &StateBatch<E, H, P, T>,
+pub async fn load_lazy_state<E, H, P, T, S>(
+    batch: &StateBatch<E, H, P, T, S>,
     transactions: &[Lazy<SignedTransaction<P, H>>],
     signers: &[AccountKey<P>],
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
@@ -49,6 +50,7 @@ where
     H: Hasher,
     P: PublicKey,
     T: Translator,
+    S: commonware_parallel::Strategy,
 {
     assert_eq!(
         transactions.len(),
@@ -68,8 +70,8 @@ where
     load_accounts(batch, account_keys).await
 }
 
-pub(super) async fn load_accounts<E, H, P, T>(
-    batch: &StateBatch<E, H, P, T>,
+pub(super) async fn load_accounts<E, H, P, T, S>(
+    batch: &StateBatch<E, H, P, T, S>,
     account_keys: HashSet<AccountKey<P>>,
 ) -> Result<Option<State<P>>, StorageError<mmr::Family>>
 where
@@ -77,6 +79,7 @@ where
     H: Hasher,
     P: PublicKey,
     T: Translator,
+    S: commonware_parallel::Strategy,
 {
     if account_keys.is_empty() {
         return Ok(Some(State::new()));

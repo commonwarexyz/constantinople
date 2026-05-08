@@ -69,6 +69,7 @@ type TestStateDb = fixed::Db<
     TestHasher,
     EightCap,
     STATE_BITMAP_CHUNK_BYTES,
+    Rayon,
 >;
 type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
 type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher, Rayon>;
@@ -517,7 +518,7 @@ async fn init_databases(
     let databases = TestDatabases::init(
         runtime.clone(),
         (
-            state_db_config(&runtime, prefix),
+            state_db_config(&runtime, prefix, strategy.clone()),
             transaction_db_config(prefix, strategy),
         ),
     )
@@ -599,7 +600,11 @@ const fn block_context(leader: TestPublicKey) -> TestConsensusContext {
     }
 }
 
-fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightCap> {
+fn state_db_config(
+    runtime: &RuntimeContext,
+    prefix: &str,
+    strategy: Rayon,
+) -> FixedConfig<EightCap, Rayon> {
     let page_cache = CacheRef::from_pooler(
         &runtime.child("state_page_cache"),
         PAGE_CACHE_PAGE_SIZE,
@@ -612,7 +617,7 @@ fn state_db_config(runtime: &RuntimeContext, prefix: &str) -> FixedConfig<EightC
             metadata_partition: format!("{prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
-            strategy: commonware_parallel::Sequential,
+            strategy,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
