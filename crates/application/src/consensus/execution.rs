@@ -5,7 +5,7 @@ use super::{
     body::PreparedBody,
     db::{self, StateBatch, TransactionBatch, apply_changeset, apply_transaction_digests},
     history::{child_transactions_range, parent_transactions_inactivity_floor},
-    telemetry::reject_verify,
+    reject_verify,
 };
 use crate::executor::{self, PreparedTransfer, State};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
@@ -153,15 +153,31 @@ where
         .ok_or(MALFORMED_TRANSACTION)?;
     let prepare_ms = prepare_started_at.elapsed().as_millis();
 
-    execute_prepared_child(
+    let load_started_at = Instant::now();
+    let state = load_state(&state_batch, &transfers)
+        .await
+        .expect("block state loading must succeed");
+    let load_state_ms = load_started_at.elapsed().as_millis();
+
+    let execute_started_at = Instant::now();
+    let changeset = executor::execute(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let execute_ms = execute_started_at.elapsed().as_millis();
+    let state_sync_range = child_state_sync_range(parent, state_sync_start, changeset.len());
+    let digests = transfer_digests(&transfers);
+    let state_batch = apply_changeset(state_batch, &changeset);
+    let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
+    let timings = Timings::before_finalize(prepare_ms, load_state_ms, execute_ms);
+
+    Ok(finalize_child(
         state_batch,
         transaction_batch,
         parent,
-        state_sync_start,
-        &transfers,
-        prepare_ms,
+        state_sync_range,
+        transfers.len(),
+        timings,
+        "database merkleization during verification must succeed",
     )
-    .await
+    .await)
 }
 
 pub(super) async fn apply_prepared_body<E, P, H, S>(
@@ -223,48 +239,6 @@ where
     }
 
     true
-}
-
-async fn execute_prepared_child<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
-    transaction_batch: TransactionBatch<E, H, S>,
-    parent: &SealedBlock<C, P, H>,
-    state_sync_start: u64,
-    transfers: &[PreparedTransfer<P, H>],
-    prepare_ms: u128,
-) -> Result<BlockExecution<E, H, P, S>>
-where
-    E: Storage + Clock + Metrics,
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
-    S: Strategy,
-{
-    let load_started_at = Instant::now();
-    let state = load_state(&state_batch, transfers)
-        .await
-        .expect("block state loading must succeed");
-    let load_state_ms = load_started_at.elapsed().as_millis();
-
-    let execute_started_at = Instant::now();
-    let changeset = executor::execute(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
-    let execute_ms = execute_started_at.elapsed().as_millis();
-    let state_sync_range = child_state_sync_range(parent, state_sync_start, changeset.len());
-    let digests = transfer_digests(transfers);
-    let state_batch = apply_changeset(state_batch, &changeset);
-    let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
-    let timings = Timings::before_finalize(prepare_ms, load_state_ms, execute_ms);
-
-    Ok(finalize_child(
-        state_batch,
-        transaction_batch,
-        parent,
-        state_sync_range,
-        transfers.len(),
-        timings,
-        "database merkleization during verification must succeed",
-    )
-    .await)
 }
 
 async fn load_state<E, H, P, S>(

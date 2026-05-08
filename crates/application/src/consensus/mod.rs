@@ -29,7 +29,6 @@ mod genesis;
 mod glue;
 mod history;
 mod lifecycle;
-mod telemetry;
 #[cfg(test)]
 mod tests;
 mod time;
@@ -158,4 +157,8 @@ where
             .start()
             .max(self.finalized_state_sync_start.load(Ordering::Relaxed))
     }
+}
+
+fn reject_verify(height: u64, reason: &'static str) {
+    tracing::warn!(height, reason, "application.verify.reject");
 }

@@ -4,8 +4,7 @@ use super::{
     Application, MALFORMED_TRANSACTION,
     body::{materialize_body, verify_signatures, wait_for_timestamp},
     execution::{apply_prepared_body, commitments_match, execute_body, execute_proposal},
-    telemetry::reject_verify,
-    time,
+    reject_verify, time,
 };
 use crate::executor;
 use commonware_consensus::simplex::types::Context;
