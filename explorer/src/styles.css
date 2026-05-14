@@ -507,8 +507,64 @@ body {
     overflow: visible;
 }
 
+.tx-proof-row td {
+    padding: 0.7ch 0 1.2ch 0;
+    white-space: normal;
+}
+
 .tx-table .copyable {
     max-width: 100%;
+}
+
+.mmr-proof {
+    border-left: 2px solid var(--theme-accent);
+    padding-left: 1ch;
+}
+
+.mmr-proof__meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.5ch;
+    color: var(--theme-text-dim);
+    font-size: 0.85em;
+    text-transform: uppercase;
+}
+
+.mmr-proof__svg {
+    display: block;
+    width: 100%;
+    height: 9rem;
+    margin-top: 0.6ch;
+    background: var(--theme-row-alt);
+    border: 1px solid var(--theme-border);
+}
+
+.mmr-proof__peak {
+    fill: none;
+    stroke: var(--theme-border);
+    stroke-width: 1;
+    vector-effect: non-scaling-stroke;
+}
+
+.mmr-proof__node {
+    vector-effect: non-scaling-stroke;
+}
+
+.mmr-proof__node--proof {
+    fill: var(--theme-text-dim);
+    stroke: var(--theme-bg);
+    stroke-width: 1;
+}
+
+.mmr-proof__node--target {
+    fill: var(--theme-accent);
+    stroke: var(--theme-bg);
+    stroke-width: 1.5;
+}
+
+.mmr-proof__label {
+    fill: var(--theme-text);
+    font: 11px monospace;
 }
 
 .tx-table th {

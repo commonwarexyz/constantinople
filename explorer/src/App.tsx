@@ -14,7 +14,11 @@ import {
     type SubmitResponse,
     type TxStatus,
 } from './mempool';
-import { fetchAndVerifyTransactionProof, type VerifiedTransactionProof } from './qmdb';
+import {
+    fetchAndVerifyTransactionProof,
+    type MmrProofVisualization,
+    type VerifiedTransactionProof,
+} from './qmdb';
 import {
     clearSession,
     createWallet,
@@ -83,6 +87,7 @@ type TransactionProofState =
           readonly location: string;
           readonly tip: string;
           readonly proofSizeBytes: number;
+          readonly mmr: MmrProofVisualization;
       }
     | { readonly status: 'error'; readonly detail: string };
 
@@ -716,25 +721,163 @@ function TransactionHistory({
                 </thead>
                 <tbody>
                     {transactions.map((tx) => (
-                        <tr key={tx.digest}>
-                            <td>
-                                <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
-                            </td>
-                            <td>
-                                <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
-                            </td>
-                            <td>{tx.value}</td>
-                            <td>{tx.nonce}</td>
-                            <td>{tx.detail}</td>
-                            <td>{tx.proof.detail}</td>
-                            <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
-                            <td>{formatter.format(tx.submittedAt)}</td>
-                        </tr>
+                        <TransactionRow
+                            key={tx.digest}
+                            copiedValue={copiedValue}
+                            formatter={formatter}
+                            onCopy={onCopy}
+                            tx={tx}
+                        />
                     ))}
                 </tbody>
             </table>
         </section>
     );
+}
+
+function TransactionRow({
+    copiedValue,
+    formatter,
+    onCopy,
+    tx,
+}: {
+    copiedValue: string;
+    formatter: Intl.DateTimeFormat;
+    onCopy: (value: string) => void;
+    tx: SubmittedTransaction;
+}) {
+    return (
+        <>
+            <tr>
+                <td>
+                    <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
+                </td>
+                <td>
+                    <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
+                </td>
+                <td>{tx.value}</td>
+                <td>{tx.nonce}</td>
+                <td>{tx.detail}</td>
+                <td>{tx.proof.detail}</td>
+                <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
+                <td>{formatter.format(tx.submittedAt)}</td>
+            </tr>
+            {tx.proof.status === 'verified' && (
+                <tr className="tx-proof-row">
+                    <td colSpan={8}>
+                        <MmrProofMap proof={tx.proof} />
+                    </td>
+                </tr>
+            )}
+        </>
+    );
+}
+
+function MmrProofMap({
+    proof,
+}: {
+    proof: Extract<TransactionProofState, { readonly status: 'verified' }>;
+}) {
+    const layout = useMemo(() => buildMmrLayout(proof.mmr), [proof.mmr]);
+    return (
+        <div className="mmr-proof">
+            <div className="mmr-proof__meta">
+                <span>MMR leaves {proof.mmr.leaves}</span>
+                <span>tip {proof.tip}</span>
+                <span>{proof.proofSizeBytes.toLocaleString()}B proof</span>
+            </div>
+            <svg
+                className="mmr-proof__svg"
+                role="img"
+                aria-label={`verified transaction proof at MMR operation ${proof.location}`}
+                viewBox={`0 0 ${layout.width} ${layout.height}`}
+            >
+                {layout.peaks.map((peak) => (
+                    <path
+                        className="mmr-proof__peak"
+                        d={peak.path}
+                        key={`peak-${peak.position}`}
+                    />
+                ))}
+                {layout.nodes.map((node) => (
+                    <g key={`node-${node.position}-${node.height}`}>
+                        <circle
+                            className={`mmr-proof__node mmr-proof__node--${node.kind}`}
+                            cx={node.x}
+                            cy={node.y}
+                            r={node.kind === 'target' ? 5 : 3.5}
+                        />
+                        {node.kind === 'target' && (
+                            <text className="mmr-proof__label" x={node.x + 7} y={node.y + 4}>
+                                op {proof.location}
+                            </text>
+                        )}
+                    </g>
+                ))}
+            </svg>
+        </div>
+    );
+}
+
+interface MmrLayout {
+    readonly width: number;
+    readonly height: number;
+    readonly peaks: { readonly position: string; readonly path: string }[];
+    readonly nodes: {
+        readonly position: string;
+        readonly height: number;
+        readonly kind: 'target' | 'proof';
+        readonly x: number;
+        readonly y: number;
+    }[];
+}
+
+function buildMmrLayout(mmr: MmrProofVisualization): MmrLayout {
+    const width = 720;
+    const height = 120;
+    const paddingX = 18;
+    const paddingY = 16;
+    const positions = [
+        ...mmr.peaks.map((peak) => BigInt(peak.position)),
+        ...mmr.nodes.map((node) => BigInt(node.position)),
+    ];
+    const min = positions.reduce((best, value) => (value < best ? value : best), positions[0] ?? 0n);
+    const max = positions.reduce((best, value) => (value > best ? value : best), min);
+    const maxHeight = Math.max(
+        1,
+        ...mmr.peaks.map((peak) => peak.height),
+        ...mmr.nodes.map((node) => node.height),
+    );
+    const x = (position: string) => {
+        const span = max - min;
+        if (span === 0n) return width / 2;
+        const offset = Number(BigInt(position) - min);
+        const scale = (width - paddingX * 2) / Number(span);
+        return paddingX + offset * scale;
+    };
+    const y = (nodeHeight: number) => height - paddingY - (nodeHeight / maxHeight) * (height - paddingY * 2);
+
+    return {
+        width,
+        height,
+        peaks: mmr.peaks.map((peak) => {
+            const center = x(peak.position);
+            const top = y(peak.height);
+            const base = height - paddingY;
+            const radius = Math.max(16, peak.height * 10);
+            return {
+                position: peak.position,
+                path: `M ${center} ${top} L ${center - radius} ${base} L ${center + radius} ${base} Z`,
+            };
+        }),
+        nodes: mmr.nodes.map((node) => ({
+            position: node.position,
+            height: node.height,
+            kind: node.kind,
+            x: x(node.position),
+            y: y(node.height),
+        })),
+    };
 }
 
 function AsciiTooltip({
@@ -837,6 +980,7 @@ function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofSt
         location: proof.location.toString(),
         tip: proof.tip.toString(),
         proofSizeBytes: proof.proofSizeBytes,
+        mmr: proof.mmr,
     };
 }
 
@@ -1007,6 +1151,7 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
             location: typeof proof.location === 'string' ? proof.location : '',
             tip: typeof proof.tip === 'string' ? proof.tip : '',
             proofSizeBytes: typeof proof.proofSizeBytes === 'number' ? proof.proofSizeBytes : 0,
+            mmr: normalizeMmrProofVisualization(proof.mmr),
         };
     }
     if (
@@ -1016,6 +1161,54 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
         return { status: proof.status, detail: proof.detail };
     }
     return { status: 'waiting', detail: 'waiting for finalization' };
+}
+
+function normalizeMmrProofVisualization(value: unknown): MmrProofVisualization {
+    if (typeof value !== 'object' || value === null) {
+        return emptyMmrProofVisualization();
+    }
+    const mmr = value as Record<string, unknown>;
+    const peaks = Array.isArray(mmr.peaks) ? mmr.peaks : [];
+    const nodes = Array.isArray(mmr.nodes) ? mmr.nodes : [];
+    return {
+        leaves: typeof mmr.leaves === 'string' ? mmr.leaves : '0',
+        inactivePeaks: typeof mmr.inactivePeaks === 'number' ? mmr.inactivePeaks : 0,
+        targetPosition: typeof mmr.targetPosition === 'string' ? mmr.targetPosition : '0',
+        peaks: peaks.flatMap(normalizeMmrPeak),
+        nodes: nodes.flatMap(normalizeMmrNode),
+    };
+}
+
+function normalizeMmrPeak(value: unknown): MmrProofVisualization['peaks'] {
+    if (typeof value !== 'object' || value === null) return [];
+    const peak = value as Record<string, unknown>;
+    if (typeof peak.position !== 'string' || typeof peak.height !== 'number') return [];
+    return [{ position: peak.position, height: peak.height }];
+}
+
+function normalizeMmrNode(value: unknown): MmrProofVisualization['nodes'] {
+    if (typeof value !== 'object' || value === null) return [];
+    const node = value as Record<string, unknown>;
+    const kind = node.kind;
+    if (
+        typeof node.position !== 'string' ||
+        typeof node.height !== 'number' ||
+        typeof node.digest !== 'string' ||
+        (kind !== 'target' && kind !== 'proof')
+    ) {
+        return [];
+    }
+    return [{ position: node.position, height: node.height, digest: node.digest, kind }];
+}
+
+function emptyMmrProofVisualization(): MmrProofVisualization {
+    return {
+        leaves: '0',
+        inactivePeaks: 0,
+        targetPosition: '0',
+        peaks: [],
+        nodes: [],
+    };
 }
 
 function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {

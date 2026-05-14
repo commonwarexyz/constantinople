@@ -3,9 +3,10 @@
 use commonware_codec::{Decode, DecodeExt as _, Encode as _, FixedSize as _};
 use commonware_cryptography::{Sha256, Signer as _, ed25519, sha256};
 use commonware_storage::{
-    merkle::{self, Location, mmr},
+    merkle::{self, Family as _, Location, Position, mmr},
     qmdb::{
-        any::value::FixedEncoding, current::proof::OpsRootWitness, keyless, verify::verify_proof,
+        any::value::FixedEncoding, current::proof::OpsRootWitness, keyless,
+        verify::verify_proof_and_extract_digests,
     },
 };
 use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
@@ -75,15 +76,18 @@ pub fn verify_transaction_proof(
     let proof = merkle::Proof::<mmr::Family, sha256::Digest>::decode_cfg(proof, &max_digests)
         .map_err(|error| JsError::new(&format!("failed to decode transaction proof: {error}")))?;
     let hasher = commonware_storage::qmdb::hasher::<Sha256>();
-    if !verify_proof(
+    let nodes = verify_proof_and_extract_digests(
         &hasher,
         &proof,
         Location::new(start_location),
         &operations,
         &target_root,
-    ) {
-        return Err(JsError::new("transaction proof failed MMR verification"));
-    }
+    )
+    .map_err(|error| {
+        JsError::new(&format!(
+            "transaction proof failed MMR verification: {error}"
+        ))
+    })?;
 
     let Some(offset) = expected_location.checked_sub(start_location) else {
         return Err(JsError::new(
@@ -124,6 +128,11 @@ pub fn verify_transaction_proof(
         &result,
         "operationCount",
         JsValue::from_f64(operations.len() as f64),
+    )?;
+    set(
+        &result,
+        "mmr",
+        mmr_visualization(&proof, &nodes, expected_location)?,
     )?;
     Ok(result.into())
 }
@@ -191,4 +200,65 @@ fn set(target: &Object, key: &str, value: JsValue) -> Result<(), JsError> {
     Reflect::set(target, &JsValue::from_str(key), &value)
         .map(|_| ())
         .map_err(|_| JsError::new("failed to build verification result"))
+}
+
+fn mmr_visualization(
+    proof: &merkle::Proof<mmr::Family, sha256::Digest>,
+    nodes: &[(Position<mmr::Family>, sha256::Digest)],
+    expected_location: u64,
+) -> Result<JsValue, JsError> {
+    let object = Object::new();
+    let size = Position::<mmr::Family>::try_from(proof.leaves)
+        .map_err(|error| JsError::new(&format!("failed to compute MMR size: {error}")))?;
+    let target_position = mmr::Family::location_to_position(Location::new(expected_location));
+
+    set(
+        &object,
+        "leaves",
+        BigInt::from(proof.leaves.as_u64()).into(),
+    )?;
+    set(
+        &object,
+        "inactivePeaks",
+        JsValue::from_f64(proof.inactive_peaks as f64),
+    )?;
+    set(&object, "targetPosition", position_value(target_position))?;
+
+    let peak_array = Array::new();
+    for (position, height) in mmr::Family::peaks(size) {
+        let peak = Object::new();
+        set(&peak, "position", position_value(position))?;
+        set(&peak, "height", JsValue::from_f64(height as f64))?;
+        peak_array.push(&peak);
+    }
+    set(&object, "peaks", peak_array.into())?;
+
+    let node_array = Array::new();
+    for (position, digest) in nodes {
+        let node = Object::new();
+        set(&node, "position", position_value(*position))?;
+        set(
+            &node,
+            "height",
+            JsValue::from_f64(mmr::Family::pos_to_height(*position) as f64),
+        )?;
+        set(&node, "digest", Uint8Array::from(digest.as_ref()).into())?;
+        set(
+            &node,
+            "kind",
+            JsValue::from_str(if *position == target_position {
+                "target"
+            } else {
+                "proof"
+            }),
+        )?;
+        node_array.push(&node);
+    }
+    set(&object, "nodes", node_array.into())?;
+
+    Ok(object.into())
+}
+
+fn position_value(position: Position<mmr::Family>) -> JsValue {
+    BigInt::from(position.as_u64()).into()
 }
