@@ -13,8 +13,8 @@
 // Column names mirror `crates/indexer/src/sql_schema.rs` and must stay in
 // sync with `BLOCK_META_*` constants there.
 
-import { createTransport, type SqlSubscribeResponse, SqlService } from '@exowarexyz/sdk';
-import { Code, ConnectError, createClient } from '@connectrpc/connect';
+import { Code, ConnectError } from '@connectrpc/connect';
+import { type DecodedSubscribeFrame, SqlClient } from '@exowarexyz/sql';
 
 /** `block_meta` column names (mirror `crates/indexer/src/sql_schema.rs`). */
 const COL_HEIGHT = 'height';
@@ -49,12 +49,7 @@ export async function* subscribeBlocks(
     sqlUrl: string,
     signal?: AbortSignal,
 ): AsyncGenerator<ObservedBlock, void, void> {
-    // The SDK's `createTransport` is the right wire format for the SQL
-    // server (Connect-over-HTTP). We pass it to `createClient` because
-    // `@exowarexyz/sdk`'s `Client` only exposes compact/ingest/query/stream
-    // — there is no high-level wrapper for `SqlService`.
-    const transport = createTransport(sqlUrl);
-    const sql = createClient(SqlService, transport);
+    const sql = new SqlClient(sqlUrl);
 
     // Cap consecutive transient retries so a genuinely broken server can't
     // trap us in a tight reconnect loop. A single delivered frame resets
@@ -107,9 +102,9 @@ export async function* subscribeBlocks(
  * carry exactly one row. We still iterate `frame.rows` defensively in case
  * the server batches rows differently in the future.
  */
-function* decodeFrame(frame: SqlSubscribeResponse): Generator<ObservedBlock> {
-    const heightIdx = frame.column.indexOf(COL_HEIGHT);
-    const txCountIdx = frame.column.indexOf(COL_TX_COUNT);
+function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
+    const heightIdx = frame.columns.indexOf(COL_HEIGHT);
+    const txCountIdx = frame.columns.indexOf(COL_TX_COUNT);
     if (heightIdx < 0 || txCountIdx < 0) {
         // Server schema diverged from the explorer's compile-time
         // expectations — surface as zero rows so the UI keeps streaming
@@ -120,17 +115,14 @@ function* decodeFrame(frame: SqlSubscribeResponse): Generator<ObservedBlock> {
     for (const row of frame.rows) {
         const heightCell = row.cells[heightIdx];
         const txCountCell = row.cells[txCountIdx];
-        if (
-            heightCell?.kind.case !== 'uint64Value' ||
-            txCountCell?.kind.case !== 'uint64Value'
-        ) {
+        if (typeof heightCell !== 'bigint' || typeof txCountCell !== 'bigint') {
             continue;
         }
         // `block_meta.tx_count` is u64; Number() is safe for any realistic
         // block (Number.MAX_SAFE_INTEGER is 2^53 - 1, far above per-block tx counts).
         yield {
-            height: heightCell.kind.value,
-            txCount: Number(txCountCell.kind.value),
+            height: heightCell,
+            txCount: Number(txCountCell),
             arrivedAt,
             sequence: frame.sequenceNumber,
         };
