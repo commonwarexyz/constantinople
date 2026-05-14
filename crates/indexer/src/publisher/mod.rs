@@ -79,7 +79,7 @@ pub struct UploaderHandles {
 
 /// Spawn one uploader task per backing store on the current tokio runtime.
 ///
-/// The first two uploaders write pre-encoded KV pairs through
+/// The first two uploaders coalesce queued pre-encoded KV batches through
 /// [`StoreClient::ingest`]; the third (`sql_client`) is a SQL metadata
 /// publisher that owns an [`exoware_sql::BatchWriter`] and coalesces queued
 /// finalized blocks into larger flushes.
@@ -109,11 +109,32 @@ async fn run_uploader(
     client: StoreClient,
     mut rx: mpsc::Receiver<UploadBatch>,
 ) {
-    while let Some(batch) = rx.recv().await {
-        upload_with_retry(store, &client, &batch).await;
-        if let Some(ack) = batch.ack {
-            ack.acknowledge();
+    while let Some(first) = rx.recv().await {
+        let mut batches = vec![first];
+        while let Ok(batch) = rx.try_recv() {
+            batches.push(batch);
         }
+
+        let batch_count = batches.len();
+        let row_count: usize = batches.iter().map(|batch| batch.rows.len()).sum();
+        upload_with_retry(
+            store,
+            &client,
+            batches.iter().flat_map(|batch| batch.rows.iter()),
+        )
+        .await;
+
+        for batch in batches {
+            if let Some(ack) = batch.ack {
+                ack.acknowledge();
+            }
+        }
+        debug!(
+            store,
+            batches = batch_count,
+            rows = row_count,
+            "indexer acknowledged coalesced batches"
+        );
     }
     debug!(store, "indexer uploader task exiting: channel closed");
 }
@@ -123,8 +144,12 @@ async fn run_uploader(
 /// Marshal back-pressures the engine on the still-held ack, so retrying here
 /// is the right way to express at-least-once delivery: we never lose a batch
 /// and the engine slows down if the store is unhealthy.
-async fn upload_with_retry(store: &'static str, client: &StoreClient, batch: &UploadBatch) {
-    let kvs: Vec<(&Key, &[u8])> = batch.rows.iter().map(|(k, v)| (k, v.as_ref())).collect();
+async fn upload_with_retry<'a>(
+    store: &'static str,
+    client: &StoreClient,
+    rows: impl Iterator<Item = &'a (Key, Bytes)>,
+) {
+    let kvs: Vec<(&Key, &[u8])> = rows.map(|(k, v)| (k, v.as_ref())).collect();
     let mut attempt: u32 = 0;
     loop {
         match client.ingest().put(&kvs).await {

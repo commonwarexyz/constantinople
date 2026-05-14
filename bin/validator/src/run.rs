@@ -118,7 +118,7 @@ async fn maybe_build_indexer(
             );
             let qmd_publisher = if cfg.qmdb_upload {
                 Some(Arc::new(
-                    QmdbPublisher::connect(&cfg.chain_indexer_url)
+                    QmdbPublisher::connect(&cfg.chain_indexer_url, cfg.upload_buffer)
                         .await
                         .expect("failed to initialize qmd publisher"),
                 ))

@@ -31,7 +31,7 @@ export interface ObservedBlock {
     readonly txCount: number;
     /** Wall-clock arrival time on this client, in epoch milliseconds. */
     readonly arrivedAt: number;
-    /** Underlying store batch sequence number; useful as a stable React key. */
+    /** Underlying store batch sequence number. Multiple rows may share it. */
     readonly sequence: bigint;
 }
 

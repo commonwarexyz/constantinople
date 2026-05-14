@@ -104,7 +104,6 @@ export default function App() {
         latestBlockAt: null,
     });
     const [status, setStatus] = useState<Status>({ kind: 'connecting' });
-    const lastSequenceRef = useRef<bigint | null>(null);
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
@@ -135,7 +134,6 @@ export default function App() {
             try {
                 for await (const block of subscribeBlocks(indexerUrl, controller.signal)) {
                     if (cancelled) return;
-                    lastSequenceRef.current = block.sequence;
                     setBlocks((current) => prependBounded(block, current));
                     setBlocksObserved((current) => current + 1);
                     setTotalTxObserved((current) => current + block.txCount);
@@ -424,7 +422,7 @@ export default function App() {
                 />
                 <Histogram blocks={blocks} />
                 <main className="app__main">
-                    <BlockTable blocks={blocks} latestSequence={lastSequenceRef.current} />
+                    <BlockTable blocks={blocks} />
                 </main>
                 {isWalletOpen && (
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
@@ -1357,13 +1355,7 @@ function buildHistogram(
     return { lines, peak };
 }
 
-function BlockTable({
-    blocks,
-    latestSequence,
-}: {
-    blocks: ObservedBlock[];
-    latestSequence: bigint | null;
-}) {
+function BlockTable({ blocks }: { blocks: ObservedBlock[] }) {
     const formatter = useMemo(
         () =>
             new Intl.DateTimeFormat(undefined, {
@@ -1392,10 +1384,10 @@ function BlockTable({
                 </tr>
             </thead>
             <tbody>
-                {blocks.map((block) => {
-                    const isFresh = latestSequence !== null && block.sequence === latestSequence;
+                {blocks.map((block, index) => {
+                    const isFresh = index === 0;
                     return (
-                        <tr key={block.sequence.toString()} className={isFresh ? 'is-fresh' : undefined}>
+                        <tr key={block.height.toString()} className={isFresh ? 'is-fresh' : undefined}>
                             <td className="col-height">{block.height.toString()}</td>
                             <td className="col-txs">{block.txCount.toLocaleString()}</td>
                             <td className="col-time">{formatter.format(block.arrivedAt)}</td>

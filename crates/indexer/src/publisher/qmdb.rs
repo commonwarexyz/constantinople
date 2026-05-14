@@ -25,8 +25,12 @@ use exoware_qmdb::{
     UnorderedWriter, WriterState, recover_boundary_state,
 };
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
-use std::{num::NonZeroU64, time::Duration};
-use tokio::{sync::Mutex, time::sleep};
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+    time::sleep,
+};
 use tracing::{debug, warn};
 
 /// Store prefix reserved for QMDB account-state rows.
@@ -62,6 +66,8 @@ pub enum PublishError {
         "QMDB writer is at operation {writer_next}, but finalized block starts at {block_start}"
     )]
     WriterOutOfSync { writer_next: u64, block_start: u64 },
+    #[error("QMDB commit worker stopped before accepting height {height}")]
+    CommitterStopped { height: u64 },
 }
 
 /// Owns QMDB writers for the two Store-prefixed indexer namespaces.
@@ -71,10 +77,20 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    commit_client: StoreClient,
-    state_writer: StateWriter<H, P>,
+    state_writer: Arc<StateWriter<H, P>>,
     state_operations: Mutex<Vec<StateOperation<P>>>,
-    transaction_writer: TransactionWriter<H>,
+    state_next_location: Mutex<u64>,
+    transaction_writer: Arc<TransactionWriter<H>>,
+    transaction_next_location: Mutex<u64>,
+    commit_tx: mpsc::Sender<PreparedQmdbUpload>,
+    _commit_join: JoinHandle<()>,
+}
+
+#[derive(Debug)]
+struct PreparedQmdbUpload {
+    height: u64,
+    state: PreparedUpload<QmdbFamily>,
+    transactions: PreparedUpload<QmdbFamily>,
 }
 
 impl<H, P> QmdbPublisher<H, P>
@@ -84,19 +100,35 @@ where
     P: PublicKey + Send + Sync + 'static,
 {
     /// Construct writers over the two reserved QMDB Store prefixes.
-    pub async fn connect(store_url: &str) -> Result<Self, PublishError> {
+    pub async fn connect(store_url: &str, buffer: usize) -> Result<Self, PublishError> {
         let commit_client = super::standard_store_client(store_url);
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
         let state = recover_state_writer_state::<H, P>(state_client.clone()).await?;
         let transactions =
             recover_transaction_writer_state::<H>(transaction_client.clone()).await?;
+        let state_writer = Arc::new(StateWriter::new(state_client, state));
+        let transaction_writer = Arc::new(TransactionWriter::new(transaction_client, transactions));
+        let state_next_location =
+            next_writer_location(state_writer.latest_published_watermark().await);
+        let transaction_next_location =
+            next_writer_location(transaction_writer.latest_published_watermark().await);
+        let (commit_tx, commit_rx) = mpsc::channel(buffer);
+        let commit_join = tokio::spawn(run_qmdb_committer(
+            commit_client.clone(),
+            state_writer.clone(),
+            transaction_writer.clone(),
+            commit_rx,
+        ));
 
         Ok(Self {
-            commit_client,
-            state_writer: StateWriter::new(state_client, state),
+            state_writer,
             state_operations: Mutex::new(Vec::new()),
-            transaction_writer: TransactionWriter::new(transaction_client, transactions),
+            state_next_location: Mutex::new(state_next_location),
+            transaction_writer,
+            transaction_next_location: Mutex::new(transaction_next_location),
+            commit_tx,
+            _commit_join: commit_join,
         })
     }
 
@@ -111,35 +143,111 @@ where
         S: Strategy + Send + Sync + 'static,
         AccountKey<P>: Send + Sync,
     {
-        let state = prepare_state_upload::<E, H, P, S>(
-            &self.state_writer,
-            &self.state_operations,
-            block,
-            &databases.0,
-        )
-        .await?;
-        let transactions = prepare_transaction_upload(&self.transaction_writer, block).await?;
-
-        let mut batch = StoreWriteBatch::new();
-        self.state_writer.stage_upload(&state, &mut batch)?;
-        self.transaction_writer
-            .stage_upload(&transactions, &mut batch)?;
-
-        let seq = commit_with_retry(&self.commit_client, &batch).await;
-        let state_receipt = self.state_writer.mark_upload_persisted(state, seq).await;
-        let transaction_receipt = self
-            .transaction_writer
-            .mark_upload_persisted(transactions, seq)
-            .await;
-        debug!(
-            height = block.header.height,
-            state_location = %state_receipt.latest_location,
-            transaction_location = %transaction_receipt.latest_location,
-            store_sequence = seq,
-            "indexer uploaded qmd batch"
-        );
+        let state = self
+            .prepare_state_upload::<E, S>(block, &databases.0)
+            .await?;
+        let transactions = self.prepare_transaction_upload(block).await?;
+        self.commit_tx
+            .send(PreparedQmdbUpload {
+                height: block.header.height,
+                state,
+                transactions,
+            })
+            .await
+            .map_err(|_| PublishError::CommitterStopped {
+                height: block.header.height,
+            })?;
         Ok(())
     }
+
+    async fn prepare_state_upload<E, S>(
+        &self,
+        block: &EngineBlock<H, P>,
+        state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
+    ) -> Result<PreparedUpload<QmdbFamily>, PublishError>
+    where
+        E: Storage + Clock + Metrics,
+        S: Strategy + Send + Sync + 'static,
+        AccountKey<P>: Send + Sync,
+    {
+        let mut next = self.state_next_location.lock().await;
+        let prepared = prepare_state_upload::<E, H, P, S>(
+            &self.state_writer,
+            &self.state_operations,
+            *next,
+            block,
+            state_db,
+        )
+        .await?;
+        *next = next_writer_location(Some(prepared.latest_location()));
+        Ok(prepared)
+    }
+
+    async fn prepare_transaction_upload(
+        &self,
+        block: &EngineBlock<H, P>,
+    ) -> Result<PreparedUpload<QmdbFamily>, PublishError> {
+        let mut next = self.transaction_next_location.lock().await;
+        let prepared = prepare_transaction_upload(&self.transaction_writer, block, *next).await?;
+        *next = next_writer_location(Some(prepared.latest_location()));
+        Ok(prepared)
+    }
+}
+
+async fn run_qmdb_committer<H, P>(
+    commit_client: StoreClient,
+    state_writer: Arc<StateWriter<H, P>>,
+    transaction_writer: Arc<TransactionWriter<H>>,
+    mut rx: mpsc::Receiver<PreparedQmdbUpload>,
+) where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+    P: PublicKey + Send + Sync + 'static,
+{
+    while let Some(first) = rx.recv().await {
+        let mut uploads = vec![first];
+        while let Ok(upload) = rx.try_recv() {
+            uploads.push(upload);
+        }
+
+        let mut batch = StoreWriteBatch::new();
+        for upload in &uploads {
+            state_writer
+                .stage_upload(&upload.state, &mut batch)
+                .expect("prepared QMDB state upload must stage");
+            transaction_writer
+                .stage_upload(&upload.transactions, &mut batch)
+                .expect("prepared QMDB transaction upload must stage");
+        }
+
+        let seq = commit_with_retry(&commit_client, &batch).await;
+        let count = uploads.len();
+        let first_height = uploads[0].height;
+        let last_height = uploads[count - 1].height;
+        let rows = batch.len();
+        for upload in uploads {
+            let state_receipt = state_writer.mark_upload_persisted(upload.state, seq).await;
+            let transaction_receipt = transaction_writer
+                .mark_upload_persisted(upload.transactions, seq)
+                .await;
+            debug!(
+                height = upload.height,
+                state_location = %state_receipt.latest_location,
+                transaction_location = %transaction_receipt.latest_location,
+                store_sequence = seq,
+                "indexer marked qmd upload persisted"
+            );
+        }
+        debug!(
+            first_height,
+            last_height,
+            count,
+            rows,
+            store_sequence = seq,
+            "indexer uploaded coalesced qmd batch"
+        );
+    }
+    debug!("indexer qmd committer task exiting: channel closed");
 }
 
 /// Store prefix for account-state QMDB rows.
@@ -245,6 +353,7 @@ where
 async fn prepare_state_upload<E, H, P, S>(
     writer: &StateWriter<H, P>,
     operation_cache: &Mutex<Vec<StateOperation<P>>>,
+    writer_next: u64,
     block: &EngineBlock<H, P>,
     state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
 ) -> Result<PreparedUpload<QmdbFamily>, PublishError>
@@ -256,7 +365,6 @@ where
     S: Strategy + Send + Sync + 'static,
     AccountKey<P>: Send + Sync,
 {
-    let writer_next = next_writer_location(writer.latest_published_watermark().await);
     if writer_next == 0 && block.header.height > 1 {
         return Err(PublishError::StoreEmptyPastGenesis {
             height: block.header.height,
@@ -466,13 +574,13 @@ where
 async fn prepare_transaction_upload<H, P>(
     writer: &TransactionWriter<H>,
     block: &EngineBlock<H, P>,
+    writer_next: u64,
 ) -> Result<PreparedUpload<QmdbFamily>, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
     P: PublicKey,
 {
-    let writer_next = next_writer_location(writer.latest_published_watermark().await);
     if writer_next == 0 && block.header.height > 1 {
         return Err(PublishError::StoreEmptyPastGenesis {
             height: block.header.height,
