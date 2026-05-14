@@ -74,6 +74,16 @@ pub struct UploaderHandles {
     pub joins: [JoinHandle<()>; 2],
 }
 
+/// Spawn a raw KV uploader task on the current tokio runtime.
+pub fn spawn_raw_uploader(
+    raw_client: StoreClient,
+    buffer: usize,
+) -> (mpsc::Sender<UploadBatch>, JoinHandle<()>) {
+    let (raw_tx, raw_rx) = mpsc::channel::<UploadBatch>(buffer);
+    let raw_join = tokio::spawn(run_uploader("raw", raw_client, raw_rx));
+    (raw_tx, raw_join)
+}
+
 /// Spawn one uploader task per backing store on the current tokio runtime.
 ///
 /// The raw uploader coalesces queued pre-encoded KV batches through
@@ -85,9 +95,7 @@ pub fn spawn_uploaders(
     sql_client: StoreClient,
     buffer: usize,
 ) -> UploaderHandles {
-    let (raw_tx, raw_rx) = mpsc::channel::<UploadBatch>(buffer);
-
-    let raw_join = tokio::spawn(run_uploader("raw", raw_client, raw_rx));
+    let (raw_tx, raw_join) = spawn_raw_uploader(raw_client, buffer);
     let (sql_tx, sql_join) = spawn_sql_uploader(sql_client, buffer);
 
     UploaderHandles {

@@ -1,5 +1,7 @@
-//! QMDB publisher for finalized state and transaction hashes.
+//! Combined publisher for finalized raw KV, SQL metadata, and QMDB rows.
 
+use super::block::{IndexedBlockRows, encode_indexed_block_rows};
+use crate::sql_schema::build_meta_schema;
 use commonware_codec::{Codec, Encode, FixedSize};
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -25,6 +27,7 @@ use exoware_qmdb::{
     UnorderedWriter, WriterState, recover_boundary_state,
 };
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
+use exoware_sql::{BatchWriter, PreparedBatch};
 use std::{num::NonZeroU64, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, mpsc},
@@ -58,6 +61,12 @@ pub enum PublishError {
     Qmdb(#[from] QmdbError),
     #[error("Store client error: {0}")]
     Store(#[from] ClientError),
+    #[error("failed to configure SQL metadata schema: {0}")]
+    SqlSchema(String),
+    #[error("failed to stage SQL metadata rows: {0}")]
+    Sql(#[from] datafusion::error::DataFusionError),
+    #[error("failed to encode SQL metadata row: {0}")]
+    SqlRow(String),
     #[error("cannot initialize QMDB writer from {locations} operation locations")]
     CheckpointTooLarge { locations: u64 },
     #[error("QMDB Store is empty but finalized block height {height} needs historical backfill")]
@@ -70,7 +79,7 @@ pub enum PublishError {
     CommitterStopped { height: u64 },
 }
 
-/// Owns QMDB writers for the two Store-prefixed indexer namespaces.
+/// Owns the combined finalized-block index upload path.
 #[derive(Debug)]
 pub struct QmdbPublisher<H, P>
 where
@@ -91,14 +100,16 @@ where
     P: PublicKey,
 {
     height: u64,
+    block_rows: IndexedBlockRows,
     state_delta: Vec<StateOperation<P>>,
     state_boundary: CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>,
     transaction_ops: Vec<TransactionOperation<H>>,
 }
 
-#[derive(Debug)]
 struct PreparedQmdbUpload {
     height: u64,
+    raw_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
+    sql_rows: Vec<super::SqlRow>,
     state: PreparedUpload<QmdbFamily>,
     transactions: PreparedUpload<QmdbFamily>,
 }
@@ -114,6 +125,9 @@ where
         let commit_client = super::standard_store_client(store_url);
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
+        let sql_writer = build_meta_schema(commit_client.clone())
+            .map_err(PublishError::SqlSchema)?
+            .batch_writer();
         let state = recover_state_writer_state::<H, P>(state_client.clone()).await?;
         let transactions =
             recover_transaction_writer_state::<H>(transaction_client.clone()).await?;
@@ -127,6 +141,7 @@ where
         let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
         let commit_join = tokio::spawn(run_qmdb_committer(
             commit_client.clone(),
+            sql_writer,
             state_writer.clone(),
             transaction_writer.clone(),
             commit_rx,
@@ -148,7 +163,7 @@ where
         })
     }
 
-    /// Upload QMDB rows for one finalized block and current state boundary.
+    /// Upload all finalized-block index rows in one Store commit.
     pub async fn upload_finalized<E, S>(
         &self,
         block: &EngineBlock<H, P>,
@@ -159,11 +174,13 @@ where
         S: Strategy + Send + Sync + 'static,
         AccountKey<P>: Send + Sync,
     {
+        let block_rows = encode_indexed_block_rows(block);
         let state = self.build_state_upload::<E, S>(block, &databases.0).await?;
         let transactions = self.build_transaction_upload(block).await?;
         self.prepare_tx
             .send(PendingQmdbUpload {
                 height: block.header.height,
+                block_rows,
                 state_delta: state.delta,
                 state_boundary: state.boundary,
                 transaction_ops: transactions.ops,
@@ -242,6 +259,7 @@ where
     P: PublicKey + Send + Sync + 'static,
 {
     let height = upload.height;
+    let IndexedBlockRows { raw, sql } = upload.block_rows;
     let (state, transactions) = tokio::try_join!(
         state_writer.prepare_current_upload(&upload.state_delta, &upload.state_boundary),
         transaction_writer.prepare_upload(&upload.transaction_ops),
@@ -249,6 +267,8 @@ where
     commit_tx
         .send(PreparedQmdbUpload {
             height,
+            raw_rows: raw,
+            sql_rows: sql,
             state,
             transactions,
         })
@@ -259,6 +279,7 @@ where
 
 async fn run_qmdb_committer<H, P>(
     commit_client: StoreClient,
+    mut sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H, P>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     mut rx: mpsc::Receiver<PreparedQmdbUpload>,
@@ -275,6 +296,12 @@ async fn run_qmdb_committer<H, P>(
 
         let mut batch = StoreWriteBatch::new();
         for upload in &uploads {
+            stage_raw_rows(&commit_client, &mut batch, &upload.raw_rows)
+                .expect("prepared raw KV rows must stage");
+        }
+        let sql = prepare_sql_upload(&mut sql_writer, &uploads)
+            .expect("prepared SQL metadata upload must stage");
+        for upload in &uploads {
             state_writer
                 .stage_upload(&upload.state, &mut batch)
                 .expect("prepared QMDB state upload must stage");
@@ -282,12 +309,26 @@ async fn run_qmdb_committer<H, P>(
                 .stage_upload(&upload.transactions, &mut batch)
                 .expect("prepared QMDB transaction upload must stage");
         }
+        if let Some(prepared) = &sql {
+            sql_writer
+                .stage_flush(prepared, &mut batch)
+                .expect("prepared SQL metadata upload must stage");
+        }
 
         let seq = commit_with_retry(&commit_client, &batch).await;
         let count = uploads.len();
         let first_height = uploads[0].height;
         let last_height = uploads[count - 1].height;
         let rows = batch.len();
+        if let Some(prepared) = sql {
+            let receipt = sql_writer.mark_flush_persisted(prepared, seq);
+            debug!(
+                request_id = receipt.writer_request_id,
+                rows = receipt.entry_count,
+                store_sequence = receipt.store_sequence_number,
+                "indexer marked sql metadata upload persisted"
+            );
+        }
         for upload in uploads {
             let state_receipt = state_writer.mark_upload_persisted(upload.state, seq).await;
             let transaction_receipt = transaction_writer
@@ -307,10 +348,43 @@ async fn run_qmdb_committer<H, P>(
             count,
             rows,
             store_sequence = seq,
-            "indexer uploaded coalesced qmd batch"
+            "indexer uploaded coalesced finalized index batch"
         );
     }
     debug!("indexer qmd committer task exiting: channel closed");
+}
+
+fn stage_raw_rows(
+    client: &StoreClient,
+    batch: &mut StoreWriteBatch,
+    rows: &[(exoware_sdk::keys::Key, bytes::Bytes)],
+) -> Result<(), PublishError> {
+    for (key, value) in rows {
+        batch.push(client, key, value)?;
+    }
+    Ok(())
+}
+
+fn prepare_sql_upload(
+    writer: &mut BatchWriter,
+    uploads: &[PreparedQmdbUpload],
+) -> Result<Option<PreparedBatch>, PublishError> {
+    prepare_sql_rows(
+        writer,
+        uploads.iter().flat_map(|upload| upload.sql_rows.iter()),
+    )
+}
+
+fn prepare_sql_rows<'a>(
+    writer: &mut BatchWriter,
+    rows: impl Iterator<Item = &'a super::SqlRow>,
+) -> Result<Option<PreparedBatch>, PublishError> {
+    for row in rows {
+        writer
+            .insert(row.table, row.values.clone())
+            .map_err(PublishError::SqlRow)?;
+    }
+    Ok(writer.prepare_flush()?)
 }
 
 /// Store prefix for account-state QMDB rows.
@@ -731,7 +805,7 @@ async fn commit_with_retry(client: &StoreClient, batch: &StoreWriteBatch) -> u64
                     ?error,
                     attempt,
                     rows = batch.len(),
-                    "indexer qmd upload failed, retrying"
+                    "indexer finalized index upload failed, retrying"
                 );
                 sleep(retry_backoff(attempt)).await;
             }
@@ -749,6 +823,10 @@ fn retry_backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
+    use bytes::Bytes;
+    use exoware_sdk::RetryConfig;
+    use exoware_sql::CellValue;
 
     #[test]
     fn qmdb_store_prefixes_are_reserved_and_distinct() {
@@ -769,5 +847,52 @@ mod tests {
             assert_ne!(STATE_QMDB_PREFIX_VALUE, prefix);
             assert_ne!(TRANSACTIONS_QMDB_PREFIX_VALUE, prefix);
         }
+    }
+
+    #[test]
+    fn raw_and_sql_rows_stage_into_one_store_batch() {
+        let client = StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
+        let mut batch = StoreWriteBatch::new();
+        let raw = vec![(
+            crate::keys::block(&[7u8; 32]).expect("block key"),
+            Bytes::from_static(b"block"),
+        )];
+        stage_raw_rows(&client, &mut batch, &raw).expect("raw rows stage");
+
+        let schema = build_meta_schema(client.clone()).expect("schema");
+        let mut writer = schema.batch_writer();
+        let rows = [
+            super::super::SqlRow {
+                table: BLOCK_META_TABLE,
+                values: vec![
+                    CellValue::UInt64(1),
+                    CellValue::FixedBinary(vec![1u8; 32]),
+                    CellValue::UInt64(1),
+                    CellValue::FixedBinary(vec![2u8; 32]),
+                    CellValue::UInt64(2),
+                    CellValue::UInt64(0),
+                    CellValue::Timestamp(1_000),
+                ],
+            },
+            super::super::SqlRow {
+                table: TX_META_TABLE,
+                values: vec![
+                    CellValue::UInt64(1),
+                    CellValue::UInt64(0),
+                    CellValue::FixedBinary(vec![3u8; 32]),
+                    CellValue::UInt64(1),
+                ],
+            },
+        ];
+        let prepared = prepare_sql_rows(&mut writer, rows.iter())
+            .expect("sql rows prepare")
+            .expect("sql rows are present");
+        writer
+            .stage_flush(&prepared, &mut batch)
+            .expect("sql rows stage");
+
+        // One raw row, one block_meta row, and tx_meta base + digest index rows.
+        assert_eq!(batch.len(), 4);
+        assert_eq!(prepared.entry_count(), 3);
     }
 }

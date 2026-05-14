@@ -31,7 +31,9 @@ use constantinople_engine::{
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
 };
-use constantinople_indexer::{BlockReporter, CertificateReporter, QmdbPublisher, spawn_uploaders};
+use constantinople_indexer::{
+    BlockReporter, CertificateReporter, QmdbPublisher, spawn_raw_uploader, spawn_uploaders,
+};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -81,7 +83,7 @@ impl Reporter for BlockUpdateReporter {
 
 /// Bundle of indexer state that needs to outlive engine startup.
 struct IndexerHandle {
-    block_reporter: BlockReporter<Sha256, PublicKey>,
+    block_reporter: Option<BlockReporter<Sha256, PublicKey>>,
     cert_reporter: Option<EngineCertReporter>,
     qmd_publisher: Option<Arc<QmdbPublisher<Sha256, PublicKey>>>,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
@@ -106,35 +108,43 @@ async fn maybe_build_indexer(
     match cfg.mode {
         IndexerMode::Full => {
             let raw_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-            let sql_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
-            let uploaders = spawn_uploaders(raw_store, sql_store, cfg.upload_buffer);
-            let qmd_publisher = if cfg.qmdb_upload {
-                Some(Arc::new(
+            if cfg.qmdb_upload {
+                let qmd_publisher = Some(Arc::new(
                     QmdbPublisher::connect(&cfg.chain_indexer_url, cfg.upload_buffer)
                         .await
                         .expect("failed to initialize qmd publisher"),
-                ))
+                ));
+                let (raw, raw_join) = spawn_raw_uploader(raw_store, cfg.upload_buffer);
+                let cert_reporter = Some(EngineCertReporter::new(raw));
+                Some(IndexerHandle {
+                    block_reporter: None,
+                    cert_reporter,
+                    qmd_publisher,
+                    _uploaders: vec![raw_join],
+                })
             } else {
-                None
-            };
-            let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
-                uploaders.raw.clone(),
-                uploaders.sql.clone(),
-            );
-            let cert_reporter = Some(EngineCertReporter::new(uploaders.raw.clone()));
-            Some(IndexerHandle {
-                block_reporter,
-                cert_reporter,
-                qmd_publisher,
-                _uploaders: Vec::from(uploaders.joins),
-            })
+                let sql_store =
+                    constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
+                let uploaders = spawn_uploaders(raw_store, sql_store, cfg.upload_buffer);
+                let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
+                    uploaders.raw.clone(),
+                    uploaders.sql.clone(),
+                );
+                let cert_reporter = Some(EngineCertReporter::new(uploaders.raw.clone()));
+                Some(IndexerHandle {
+                    block_reporter: Some(block_reporter),
+                    cert_reporter,
+                    qmd_publisher: None,
+                    _uploaders: Vec::from(uploaders.joins),
+                })
+            }
         }
         IndexerMode::MetadataOnly => {
             let sql_store = constantinople_indexer::standard_store_client(&cfg.chain_indexer_url);
             let (sql, sql_join) =
                 constantinople_indexer::publisher::spawn_sql_uploader(sql_store, cfg.upload_buffer);
             Some(IndexerHandle {
-                block_reporter: BlockReporter::<Sha256, PublicKey>::metadata_only(sql),
+                block_reporter: Some(BlockReporter::<Sha256, PublicKey>::metadata_only(sql)),
                 cert_reporter: None,
                 qmd_publisher: None,
                 _uploaders: vec![sql_join],
@@ -143,7 +153,7 @@ async fn maybe_build_indexer(
     }
 }
 
-fn qmd_finalized_hook(
+fn indexer_finalized_hook(
     indexer: Option<&IndexerHandle>,
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
 {
@@ -154,7 +164,7 @@ fn qmd_finalized_hook(
             publisher
                 .upload_finalized(block, databases)
                 .await
-                .expect("qmd index upload failed");
+                .expect("finalized index upload failed");
         })
     }))
 }
@@ -334,7 +344,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // not declare an `indexer` block, or those that declared one with
         // `enabled: false`.
         let indexer_handle = maybe_build_indexer(is_primary, indexer).await;
-        let finalized_hook = qmd_finalized_hook(indexer_handle.as_ref());
+        let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
 
         info!("initializing engine");
         let engine = Engine::<
@@ -403,7 +413,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         } else {
             indexer_handle
                 .as_ref()
-                .map(|h| BlockUpdateReporter::Indexer(h.block_reporter.clone()))
+                .and_then(|h| h.block_reporter.clone())
+                .map(BlockUpdateReporter::Indexer)
         };
         let engine_handle = engine.start(channels, reporter);
 

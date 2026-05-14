@@ -19,7 +19,7 @@
 use crate::{
     keys,
     publisher::{
-        SqlBatch, UploadBatch, dispatch_batch,
+        SqlBatch, SqlRow, UploadBatch, dispatch_batch,
         sql::{BlockMetaRow, dispatch_sql_batch, encode_sql_rows},
     },
 };
@@ -97,7 +97,7 @@ where
                 // are dispatched onto background tasks so this method never
                 // blocks consensus — see `dispatch_batch` for back-pressure
                 // semantics.
-                let EncodedRows { raw, sql } = encode_block_rows(&block);
+                let IndexedBlockRows { raw, sql } = encode_indexed_block_rows(&block);
 
                 // Clone the ack once per backing path. `Exact::clone`
                 // increments the remaining count, so the marshal waiter only
@@ -123,14 +123,16 @@ where
     }
 }
 
-/// Encoded rows split by destination store.
-struct EncodedRows {
-    raw: Vec<(Key, Bytes)>,
-    sql: Vec<crate::publisher::SqlRow>,
+/// Encoded block rows split by index family.
+pub(crate) struct IndexedBlockRows {
+    /// Raw KV rows for the block and contained transactions.
+    pub raw: Vec<(Key, Bytes)>,
+    /// SQL metadata rows for the block and contained transactions.
+    pub sql: Vec<SqlRow>,
 }
 
 /// Build every row for a finalized block, partitioned by destination store.
-fn encode_block_rows<H, P>(block: &EngineBlock<H, P>) -> EncodedRows
+pub(crate) fn encode_indexed_block_rows<H, P>(block: &EngineBlock<H, P>) -> IndexedBlockRows
 where
     H: Hasher,
     P: PublicKey,
@@ -225,5 +227,5 @@ where
         &tx_qmdb_locations,
     );
 
-    EncodedRows { raw, sql }
+    IndexedBlockRows { raw, sql }
 }
