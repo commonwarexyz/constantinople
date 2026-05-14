@@ -4,7 +4,7 @@ use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
     db::{self, StateBatch, TransactionBatch, apply_changeset, apply_transaction_digests},
-    history::{child_transactions_range, parent_transactions_inactivity_floor},
+    history::parent_transactions_inactivity_floor,
     reject_verify,
 };
 use crate::executor::{self, PreparedTransfer, State};
@@ -12,7 +12,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
-use commonware_storage::{mmr, translator::EightCap};
+use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{Header, SealedBlock, SignedTransaction};
 use hashbrown::HashSet;
@@ -84,7 +84,6 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     state_batch: StateBatch<E, H, P, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
-    state_sync_start: u64,
     input: executor::ProposalInput<P, H>,
     candidate_transfers: &[PreparedTransfer<P, H>],
 ) -> ProposalExecution<E, H, P, S>
@@ -111,7 +110,6 @@ where
         .collect::<Option<Vec<_>>>()
         .expect("included proposal transactions were already prepared");
     let digests = transfer_digests(&transfers);
-    let state_sync_range = child_state_sync_range(parent, state_sync_start, output.changeset.len());
     let state_batch = apply_changeset(state_batch, &output.changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
     let timings = Timings::before_finalize(0, load_state_ms, execute_ms);
@@ -121,7 +119,6 @@ where
             state_batch,
             transaction_batch,
             parent,
-            state_sync_range,
             output.valid.len(),
             timings,
             "database merkleization must succeed",
@@ -135,7 +132,6 @@ pub(super) async fn execute_body<E, C, P, H, S>(
     state_batch: StateBatch<E, H, P, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
-    state_sync_start: u64,
     body: PreparedBody<P, H>,
 ) -> Result<BlockExecution<E, H, P, S>>
 where
@@ -162,7 +158,6 @@ where
     let execute_started_at = Instant::now();
     let changeset = executor::execute(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
     let execute_ms = execute_started_at.elapsed().as_millis();
-    let state_sync_range = child_state_sync_range(parent, state_sync_start, changeset.len());
     let digests = transfer_digests(&transfers);
     let state_batch = apply_changeset(state_batch, &changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
@@ -172,7 +167,6 @@ where
         state_batch,
         transaction_batch,
         parent,
-        state_sync_range,
         transfers.len(),
         timings,
         "database merkleization during verification must succeed",
@@ -275,7 +269,6 @@ async fn finalize_child<E, C, P, H, S>(
     state_batch: StateBatch<E, H, P, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
-    state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     transaction_count: usize,
     timings: Timings,
     expect_message: &'static str,
@@ -289,12 +282,13 @@ where
 {
     let transaction_batch =
         transaction_batch.with_inactivity_floor(parent_transactions_inactivity_floor(parent));
-    let transactions_range = child_transactions_range(parent, transaction_count);
     let finalize_started_at = Instant::now();
     let (state, transactions) = db::finalize_execution(state_batch, transaction_batch)
         .await
         .expect(expect_message);
     let finalize_ms = finalize_started_at.elapsed().as_millis();
+    let state_sync_range = range_from_bounds(state.bounds());
+    let transactions_range = range_from_bounds(transactions.bounds());
 
     BlockExecution {
         state,
@@ -306,27 +300,11 @@ where
     }
 }
 
-fn child_state_sync_range<C, P, H>(
-    parent: &SealedBlock<C, P, H>,
-    state_sync_start: u64,
-    state_write_count: usize,
-) -> commonware_utils::range::NonEmptyRange<u64>
+fn range_from_bounds<F>(bounds: &Bounds<F>) -> commonware_utils::range::NonEmptyRange<u64>
 where
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
+    F: Family,
 {
-    let state_ops = u64::try_from(state_write_count)
-        .expect("state write count must fit into u64")
-        .checked_add(1)
-        .expect("state batch commit must not overflow u64");
-    let state_sync_end = parent
-        .header
-        .state_range
-        .end()
-        .checked_add(state_ops)
-        .expect("state sync range end must not overflow u64");
-    non_empty_range!(state_sync_start, state_sync_end)
+    non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
 }
 
 fn transfer_digests<P, H>(transfers: &[PreparedTransfer<P, H>]) -> Vec<H::Digest>
@@ -335,4 +313,24 @@ where
     P: PublicKey,
 {
     transfers.iter().map(|transfer| transfer.digest).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::range_from_bounds;
+    use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
+    use commonware_utils::non_empty_range;
+
+    #[test]
+    fn range_comes_from_qmdb_bounds() {
+        let bounds = Bounds {
+            base_size: 7,
+            db_size: 9,
+            total_size: 15,
+            ancestors: Vec::new(),
+            inactivity_floor: mmr::Location::new(11),
+        };
+
+        assert_eq!(range_from_bounds(&bounds), non_empty_range!(11, 15));
+    }
 }

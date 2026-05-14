@@ -13,7 +13,6 @@ use constantinople_primitives::SealedBlock;
 use futures::StreamExt;
 use rand::Rng;
 use rand_core::CryptoRngCore;
-use std::sync::atomic::Ordering;
 
 impl<E, H, C, S, P, I, B, SigSt, HashSt> CApplication<E>
     for Application<H, C, S, P, I, B, SigSt, HashSt>
@@ -113,7 +112,5 @@ where
             .prune(prune_to)
             .await
             .expect("state db prune must not fail at the sync boundary");
-        self.finalized_state_sync_start
-            .store(*prune_to, Ordering::Relaxed);
     }
 }

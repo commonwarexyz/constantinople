@@ -78,7 +78,6 @@ where
             state_batch,
             transaction_batch,
             parent,
-            self.state_sync_start(parent),
             input,
             &candidate_transfers,
         )
@@ -169,13 +168,7 @@ where
             self.transaction_namespace,
             Arc::clone(&body),
         );
-        let execution = execute_body(
-            state_batch,
-            transaction_batch,
-            parent,
-            self.state_sync_start(parent),
-            Arc::clone(&body),
-        );
+        let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let (signature_ms, execution, sleep_ms) =

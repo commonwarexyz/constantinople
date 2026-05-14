@@ -5,22 +5,12 @@
 //! commitments consensus votes on.
 
 use commonware_consensus::types::Height;
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::Hasher;
 use commonware_runtime::{
     Metrics,
     telemetry::metrics::{Counter, MetricsExt},
 };
-use constantinople_primitives::SealedBlock;
-use std::{
-    future::Future,
-    marker::PhantomData,
-    num::NonZeroU64,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-};
+use std::{future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc};
 
 mod body;
 mod db;
@@ -64,7 +54,6 @@ where
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     prune_cadence_blocks: NonZeroU64,
     finalized_pruner: FinalizedPruneFn,
-    finalized_state_sync_start: Arc<AtomicU64>,
     proposed_transactions: Counter,
     _marker: PhantomData<(C, S, I, B)>,
 }
@@ -88,7 +77,6 @@ where
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             prune_cadence_blocks: self.prune_cadence_blocks,
             finalized_pruner: self.finalized_pruner.clone(),
-            finalized_state_sync_start: self.finalized_state_sync_start.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
@@ -133,7 +121,6 @@ where
             genesis_transactions_target,
             prune_cadence_blocks,
             finalized_pruner,
-            finalized_state_sync_start: Arc::new(AtomicU64::new(0)),
             proposed_transactions,
             _marker: PhantomData,
         }
@@ -141,21 +128,6 @@ where
 
     const fn should_prune_after_finalize(&self, height: u64) -> bool {
         height != 0 && height.is_multiple_of(self.prune_cadence_blocks.get())
-    }
-}
-
-impl<H, C, S, P, I, B, SigSt, HashSt> Application<H, C, S, P, I, B, SigSt, HashSt>
-where
-    C: Digest,
-    H: Hasher,
-    P: PublicKey,
-{
-    fn state_sync_start(&self, parent: &SealedBlock<C, P, H>) -> u64 {
-        parent
-            .header
-            .state_range
-            .start()
-            .max(self.finalized_state_sync_start.load(Ordering::Relaxed))
     }
 }
 
