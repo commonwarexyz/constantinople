@@ -5,9 +5,8 @@
 //! `Update::Block` the [`BlockReporter`] dispatches a single [`SqlBatch`]
 //! containing one [`crate::sql_schema::BLOCK_META_TABLE`] row plus one
 //! [`crate::sql_schema::TX_META_TABLE`] row per contained transaction. A
-//! dedicated uploader task drains the channel, inserts every row into a
-//! reused [`BatchWriter`], and flushes once per block — never batching
-//! multiple blocks together.
+//! dedicated uploader task drains the channel, inserts every queued row into
+//! a reused [`BatchWriter`], and flushes once for the drained batch.
 //!
 //! Failure model: the flush is retried indefinitely with the standard
 //! `retry_backoff` ladder shared with the KV uploaders. The marshal
@@ -36,12 +35,13 @@ pub struct SqlRow {
     pub values: Vec<CellValue>,
 }
 
-/// One atomic SQL flush per finalized block.
+/// SQL rows for one finalized block.
 ///
 /// A single [`SqlBatch`] always contains exactly one `block_meta` row plus
 /// zero or more `tx_meta` rows for the transactions in that block. The
-/// uploader inserts all rows then issues a single `flush().await` so the
-/// underlying KV store sees one atomic put per finalized block.
+/// uploader may coalesce multiple queued [`SqlBatch`] values into one
+/// `flush().await`; each batch's acknowledgement is still released only after
+/// the coalesced flush succeeds.
 pub struct SqlBatch {
     pub rows: Vec<SqlRow>,
     pub ack: Option<Exact>,
@@ -77,7 +77,7 @@ pub(crate) fn dispatch_sql_batch(tx: &mpsc::Sender<SqlBatch>, batch: SqlBatch) {
 /// Spawn the SQL uploader task on the current tokio runtime.
 ///
 /// Returns the sender for the bounded MPSC channel and the task's join
-/// handle. The task owns the [`BatchWriter`] and flushes once per block.
+/// handle. The task owns the [`BatchWriter`] and coalesces queued blocks.
 pub fn spawn_sql_uploader(
     client: StoreClient,
     buffer: usize,
@@ -93,11 +93,30 @@ async fn run_sql_uploader(client: StoreClient, mut rx: mpsc::Receiver<SqlBatch>)
     let schema = build_meta_schema(client).expect("meta schema must build");
     let mut writer = schema.batch_writer();
 
-    while let Some(batch) = rx.recv().await {
-        flush_with_retry(&mut writer, &batch.rows).await;
-        if let Some(ack) = batch.ack {
-            ack.acknowledge();
+    while let Some(first) = rx.recv().await {
+        let mut batches = vec![first];
+        while let Ok(batch) = rx.try_recv() {
+            batches.push(batch);
         }
+
+        let block_count = batches.len();
+        let row_count: usize = batches.iter().map(|batch| batch.rows.len()).sum();
+        flush_with_retry(
+            &mut writer,
+            batches.iter().flat_map(|batch| batch.rows.iter()),
+        )
+        .await;
+
+        for batch in batches {
+            if let Some(ack) = batch.ack {
+                ack.acknowledge();
+            }
+        }
+        debug!(
+            blocks = block_count,
+            rows = row_count,
+            "indexer acknowledged sql batches"
+        );
     }
     debug!("indexer sql uploader task exiting: channel closed");
 }
@@ -107,8 +126,10 @@ async fn run_sql_uploader(client: StoreClient, mut rx: mpsc::Receiver<SqlBatch>)
 /// On a flush error [`BatchWriter`] internally stashes the prepared batch
 /// into `failed_prepared` so the next `flush()` call re-sends the same
 /// rows; we therefore never re-`insert` after a failure.
-async fn flush_with_retry(writer: &mut BatchWriter, rows: &[SqlRow]) {
+async fn flush_with_retry<'a>(writer: &mut BatchWriter, rows: impl Iterator<Item = &'a SqlRow>) {
+    let mut row_count = 0usize;
     for row in rows {
+        row_count += 1;
         if let Err(error) = writer.insert(row.table, row.values.clone()) {
             // A row-encoding failure here means the schema and the row
             // construction site disagree — that's a bug. Log and skip the
@@ -117,7 +138,6 @@ async fn flush_with_retry(writer: &mut BatchWriter, rows: &[SqlRow]) {
         }
     }
 
-    let row_count = rows.len();
     let mut attempt: u32 = 0;
     loop {
         match writer.flush().await {

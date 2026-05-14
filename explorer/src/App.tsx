@@ -126,7 +126,6 @@ export default function App() {
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInPublicKey = wallet?.publicKeyHex ?? null;
-    const proofSpinner = useBrailleSpinner(hasActiveProofFetch(history, signedInPublicKey));
 
     useEffect(() => {
         const controller = new AbortController();
@@ -167,59 +166,61 @@ export default function App() {
 
     useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
-        const candidates = history.filter((tx) => shouldFetchTransactionProof(tx, signedInSender));
-        for (const tx of candidates) {
-            setHistory((current) =>
-                updateTransactionProof(
-                    tx.digest,
-                    { status: 'fetching', detail: 'fetching QMDB proof' },
-                    current,
-                ),
-            );
-            fetchAndVerifyTransactionProof({
-                sqlUrl: indexerUrl,
-                qmdbUrl,
-                digest: tx.digest,
-                height: tx.finalizedHeight,
+        if (hasFetchingProof(history, signedInSender)) return;
+
+        const tx = history.find((entry) => shouldFetchTransactionProof(entry, signedInSender));
+        if (!tx) return;
+
+        setHistory((current) =>
+            updateTransactionProof(
+                tx.digest,
+                { status: 'fetching', detail: 'fetching QMDB proof' },
+                current,
+            ),
+        );
+        fetchAndVerifyTransactionProof({
+            sqlUrl: indexerUrl,
+            qmdbUrl,
+            digest: tx.digest,
+            height: tx.finalizedHeight,
+        })
+            .then((proof) => {
+                setHistory((current) =>
+                    updateTransactionProof(tx.digest, verifiedProofState(proof), current),
+                );
             })
-                .then((proof) => {
-                    setHistory((current) =>
-                        updateTransactionProof(tx.digest, verifiedProofState(proof), current),
-                    );
-                })
-                .catch((error) => {
-                    const detail = error instanceof Error ? error.message : String(error);
-                    if (isRetryableProofError(detail)) {
-                        setHistory((current) =>
-                            updateTransactionProof(
-                                tx.digest,
-                                { status: 'fetching', detail: 'waiting for indexer metadata' },
-                                current,
-                            ),
-                        );
-                        window.setTimeout(() => {
-                            setHistory((current) =>
-                                updateTransactionProof(
-                                    tx.digest,
-                                    { status: 'waiting', detail: 'waiting for QMDB proof' },
-                                    current,
-                                ),
-                            );
-                        }, 1_000);
-                        return;
-                    }
+            .catch((error) => {
+                const detail = error instanceof Error ? error.message : String(error);
+                if (isRetryableProofError(detail)) {
                     setHistory((current) =>
                         updateTransactionProof(
                             tx.digest,
-                            {
-                                status: 'error',
-                                detail,
-                            },
+                            { status: 'fetching', detail: 'waiting for indexer metadata' },
                             current,
                         ),
                     );
-                });
-        }
+                    window.setTimeout(() => {
+                        setHistory((current) =>
+                            updateTransactionProof(
+                                tx.digest,
+                                { status: 'waiting', detail: 'waiting for QMDB proof' },
+                                current,
+                            ),
+                        );
+                    }, 1_000);
+                    return;
+                }
+                setHistory((current) =>
+                    updateTransactionProof(
+                        tx.digest,
+                        {
+                            status: 'error',
+                            detail,
+                        },
+                        current,
+                    ),
+                );
+            });
     }, [history, wallet]);
 
     useEffect(() => {
@@ -451,7 +452,6 @@ export default function App() {
                         <TransactionHistory
                             transactions={history}
                             signedInPublicKey={signedInPublicKey}
-                            proofSpinner={proofSpinner}
                             copiedValue={copiedValue}
                             onCopy={copyValue}
                         />
@@ -699,13 +699,11 @@ function SpinnerText({
 function TransactionHistory({
     transactions,
     signedInPublicKey,
-    proofSpinner,
     copiedValue,
     onCopy,
 }: {
     transactions: SubmittedTransaction[];
     signedInPublicKey: string | null;
-    proofSpinner: string;
     copiedValue: string;
     onCopy: (value: string) => void;
 }) {
@@ -752,7 +750,6 @@ function TransactionHistory({
                             copiedValue={copiedValue}
                             formatter={formatter}
                             onCopy={onCopy}
-                            proofSpinner={proofSpinner}
                             signedInPublicKey={signedInPublicKey}
                             tx={tx}
                         />
@@ -767,14 +764,12 @@ function TransactionRow({
     copiedValue,
     formatter,
     onCopy,
-    proofSpinner,
     signedInPublicKey,
     tx,
 }: {
     copiedValue: string;
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
-    proofSpinner: string;
     signedInPublicKey: string | null;
     tx: SubmittedTransaction;
 }) {
@@ -791,7 +786,7 @@ function TransactionRow({
             <td>{tx.nonce}</td>
             <td>{tx.detail}</td>
             <td>
-                <ProofCell ownsTx={ownsTx} proof={tx.proof} spinner={proofSpinner} />
+                <ProofCell ownsTx={ownsTx} proof={tx.proof} />
             </td>
             <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
             <td>{formatter.format(tx.submittedAt)}</td>
@@ -802,11 +797,9 @@ function TransactionRow({
 function ProofCell({
     ownsTx,
     proof,
-    spinner,
 }: {
     ownsTx: boolean;
     proof: TransactionProofState;
-    spinner: string;
 }) {
     if (!ownsTx) {
         return (
@@ -830,9 +823,7 @@ function ProofCell({
         );
     }
     return (
-        <span className="tx-proof-spinner" aria-label={proof.detail} title={proof.detail}>
-            {spinner}
-        </span>
+        <span className="tx-proof-spinner" aria-label={proof.detail} title={proof.detail} />
     );
 }
 
@@ -914,16 +905,12 @@ function shouldFetchTransactionProof(
     );
 }
 
-function hasActiveProofFetch(
+function hasFetchingProof(
     transactions: SubmittedTransaction[],
     signedInSender: string | null,
 ): boolean {
     if (signedInSender === null) return false;
-    return transactions.some(
-        (tx) =>
-            tx.sender === signedInSender &&
-            (tx.proof.status === 'waiting' || tx.proof.status === 'fetching'),
-    );
+    return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
 }
 
 function isRetryableProofError(detail: string): boolean {

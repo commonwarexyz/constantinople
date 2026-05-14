@@ -81,8 +81,8 @@ pub struct UploaderHandles {
 ///
 /// The first two uploaders write pre-encoded KV pairs through
 /// [`StoreClient::ingest`]; the third (`sql_client`) is a SQL metadata
-/// publisher that owns an [`exoware_sql::BatchWriter`] and flushes once
-/// per finalized block.
+/// publisher that owns an [`exoware_sql::BatchWriter`] and coalesces queued
+/// finalized blocks into larger flushes.
 pub fn spawn_uploaders(
     blocks_client: StoreClient,
     transactions_client: StoreClient,

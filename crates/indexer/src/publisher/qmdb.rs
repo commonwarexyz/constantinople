@@ -26,7 +26,7 @@ use exoware_qmdb::{
 };
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
 use std::{num::NonZeroU64, time::Duration};
-use tokio::time::sleep;
+use tokio::{sync::Mutex, time::sleep};
 use tracing::{debug, warn};
 
 /// Store prefix reserved for QMDB account-state rows.
@@ -73,6 +73,7 @@ where
 {
     commit_client: StoreClient,
     state_writer: StateWriter<H, P>,
+    state_operations: Mutex<Vec<StateOperation<P>>>,
     transaction_writer: TransactionWriter<H>,
 }
 
@@ -94,6 +95,7 @@ where
         Ok(Self {
             commit_client,
             state_writer: StateWriter::new(state_client, state),
+            state_operations: Mutex::new(Vec::new()),
             transaction_writer: TransactionWriter::new(transaction_client, transactions),
         })
     }
@@ -109,8 +111,13 @@ where
         S: Strategy + Send + Sync + 'static,
         AccountKey<P>: Send + Sync,
     {
-        let state =
-            prepare_state_upload::<E, H, P, S>(&self.state_writer, block, &databases.0).await?;
+        let state = prepare_state_upload::<E, H, P, S>(
+            &self.state_writer,
+            &self.state_operations,
+            block,
+            &databases.0,
+        )
+        .await?;
         let transactions = prepare_transaction_upload(&self.transaction_writer, block).await?;
 
         let mut batch = StoreWriteBatch::new();
@@ -237,6 +244,7 @@ where
 
 async fn prepare_state_upload<E, H, P, S>(
     writer: &StateWriter<H, P>,
+    operation_cache: &Mutex<Vec<StateOperation<P>>>,
     block: &EngineBlock<H, P>,
     state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
 ) -> Result<PreparedUpload<QmdbFamily>, PublishError>
@@ -264,19 +272,56 @@ where
             block_start: end,
         });
     }
-    let operations = load_state_ops::<E, H, P, S>(&state, 0, end).await?;
+    let mut operations = operation_cache.lock().await;
+    extend_state_ops::<E, H, P, S>(&state, &mut operations, end).await?;
     let previous_operations = if writer_next == 0 {
         None
     } else {
         Some(&operations[..writer_next as usize])
     };
-    let delta = &operations[writer_next as usize..];
+    let delta = operations[writer_next as usize..].to_vec();
     let boundary = state_boundary::<E, H, P, S>(&state, previous_operations, &operations).await?;
+    drop(operations);
 
     writer
-        .prepare_current_upload(delta, &boundary)
+        .prepare_current_upload(&delta, &boundary)
         .await
         .map_err(Into::into)
+}
+
+async fn extend_state_ops<E, H, P, S>(
+    state: &commonware_storage::qmdb::current::unordered::fixed::Db<
+        QmdbFamily,
+        E,
+        AccountKey<P>,
+        Account,
+        H,
+        commonware_storage::translator::EightCap,
+        { STATE_BITMAP_CHUNK_BYTES },
+        S,
+    >,
+    operations: &mut Vec<StateOperation<P>>,
+    end: u64,
+) -> Result<(), PublishError>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
+{
+    let start = u64::try_from(operations.len()).expect("state operation cache length fits u64");
+    if start > end {
+        return Err(PublishError::WriterOutOfSync {
+            writer_next: start,
+            block_start: end,
+        });
+    }
+    if start == end {
+        return Ok(());
+    }
+
+    operations.extend(load_state_ops::<E, H, P, S>(state, start, end).await?);
+    Ok(())
 }
 
 async fn load_state_ops<E, H, P, S>(

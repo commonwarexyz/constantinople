@@ -75,8 +75,9 @@ async function fetchTransactionProofMetadata(
     const sql = new SqlClient(sqlUrl);
     const minHeight = Math.max(0, height - TX_META_HEIGHT_SEARCH_WINDOW);
     const maxHeight = height + TX_META_HEIGHT_SEARCH_WINDOW;
+    const digestLiteral = fixedBinarySqlLiteral(digest);
     const txRows = await sql.query(
-        `SELECT ${TX_META_HEIGHT}, ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION} FROM ${TX_META_TABLE} WHERE ${TX_META_HEIGHT} >= ${minHeight} AND ${TX_META_HEIGHT} <= ${maxHeight}`,
+        `SELECT ${TX_META_HEIGHT}, ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION} FROM ${TX_META_TABLE} WHERE ${TX_META_DIGEST} = ${digestLiteral} AND ${TX_META_HEIGHT} >= ${minHeight} AND ${TX_META_HEIGHT} <= ${maxHeight}`,
         { signal },
     );
     const tx = txRows.rows.find((row) => cellDigestHex(row, TX_META_DIGEST) === digest);
@@ -144,6 +145,13 @@ function cellDigestHex(row: DecodedRow, column: string): string {
 
 function shortHex(value: string): string {
     return value.length <= 18 ? value : `${value.slice(0, 10)}...${value.slice(-8)}`;
+}
+
+function fixedBinarySqlLiteral(value: string): string {
+    if (!/^[0-9a-fA-F]+$/.test(value) || value.length % 2 !== 0) {
+        throw new Error(`invalid fixed binary hex literal ${shortHex(value)}`);
+    }
+    return `X'${value.toUpperCase()}'`;
 }
 
 function trimTrailingSlash(value: string): string {

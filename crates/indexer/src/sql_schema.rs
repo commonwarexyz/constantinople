@@ -18,14 +18,12 @@
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::StoreClient;
-use exoware_sql::{KvSchema, TableColumnConfig};
+use exoware_sql::{IndexSpec, KvSchema, TableColumnConfig};
 
 /// Name of the SQL table that the explorer subscribes to.
 pub const BLOCK_META_TABLE: &str = "block_meta";
 
 /// Name of the SQL table that records one row per finalized transaction.
-///
-/// Currently written but not consumed; reserved for future drill-down UIs.
 pub const TX_META_TABLE: &str = "tx_meta";
 
 // ---------- block_meta columns ----------
@@ -55,6 +53,8 @@ pub const TX_META_INDEX: &str = "index";
 pub const TX_META_DIGEST: &str = "tx_digest";
 /// `tx_meta`: transaction-hash QMDB operation location for this digest.
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
+/// `tx_meta`: secondary index used to resolve proof metadata by digest.
+pub const TX_META_DIGEST_INDEX: &str = "tx_meta_by_digest";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
@@ -104,7 +104,10 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
             ],
             vec![TX_META_HEIGHT.to_string(), TX_META_INDEX.to_string()],
-            vec![],
+            vec![
+                IndexSpec::lexicographic(TX_META_DIGEST_INDEX, vec![TX_META_DIGEST.to_string()])?
+                    .with_cover_columns(vec![TX_META_QMDB_LOCATION.to_string()]),
+            ],
         )
 }
 
@@ -156,5 +159,6 @@ mod tests {
         assert_eq!(TX_META_INDEX, "index");
         assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
+        assert_eq!(TX_META_DIGEST_INDEX, "tx_meta_by_digest");
     }
 }

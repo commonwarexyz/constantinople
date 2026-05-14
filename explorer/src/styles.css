@@ -518,7 +518,53 @@ body {
 }
 
 .tx-proof-spinner {
+    display: inline-block;
+    width: 1ch;
     color: var(--theme-accent);
+}
+
+.tx-proof-spinner::before {
+    animation: tx-proof-spinner 800ms steps(1, end) infinite;
+    content: "⠋";
+}
+
+@keyframes tx-proof-spinner {
+    10% {
+        content: "⠙";
+    }
+
+    20% {
+        content: "⠹";
+    }
+
+    30% {
+        content: "⠸";
+    }
+
+    40% {
+        content: "⠼";
+    }
+
+    50% {
+        content: "⠴";
+    }
+
+    60% {
+        content: "⠦";
+    }
+
+    70% {
+        content: "⠧";
+    }
+
+    80% {
+        content: "⠇";
+    }
+
+    90%,
+    100% {
+        content: "⠏";
+    }
 }
 
 .tx-proof-muted {
