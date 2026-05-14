@@ -52,6 +52,7 @@ type TestPublicKey = ed25519::PublicKey;
 type TestTransaction = VerifiedTransaction<TestPublicKey, TestHasher>;
 type TestTransactionSource = StaticTransactionSource<TestCommitment, TestPublicKey, TestHasher>;
 type TestApplication = Application<
+    RuntimeContext,
     TestHasher,
     TestCommitment,
     BenchScheme,
@@ -574,6 +575,7 @@ async fn new_application(
         genesis_transactions_target,
         NZU64!(1024),
         Arc::new(|_| Box::pin(async {})),
+        None,
     )
 }
 

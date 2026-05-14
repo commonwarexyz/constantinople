@@ -44,8 +44,12 @@ const CHAIN_INDEXER_HOST: &str = "chain-indexer";
 const METADATA_INDEXER_BINARY_FILE: &str = "metadata-indexer";
 const METADATA_INDEXER_CONFIG_FILE: &str = "metadata-indexer.yaml";
 const METADATA_INDEXER_HOST: &str = "metadata-indexer";
+const QMDB_INDEXER_BINARY_FILE: &str = "qmdb-indexer";
+const QMDB_INDEXER_CONFIG_FILE: &str = "qmdb-indexer.yaml";
+const QMDB_INDEXER_HOST: &str = "qmdb-indexer";
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
+const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const DEFAULT_INDEXER_UPLOAD_BUFFER: usize = 1024;
 
@@ -145,6 +149,9 @@ pub(crate) struct LocalArgs {
     /// port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
+    /// Port for the local `qmdb-indexer` service launched by `--indexer`.
+    #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
+    qmdb_indexer_port: u16,
 }
 
 #[derive(Debug, Args)]
@@ -185,6 +192,9 @@ pub(crate) struct RemoteArgs {
     /// Port for the shared `metadata-indexer` query/stream service.
     #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
+    /// Port for the shared `qmdb-indexer` query facade.
+    #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
+    qmdb_indexer_port: u16,
     #[arg(long, default_value_t = false)]
     profiling: bool,
     /// Instance type for the spammer (defaults to --instance-type).
@@ -307,6 +317,8 @@ pub(crate) struct IndexerConfig {
     pub mode: IndexerMode,
     pub chain_indexer_url: String,
     pub upload_buffer: usize,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub qmdb_upload: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -317,6 +329,12 @@ pub(crate) struct ChainIndexerConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataIndexerConfig {
+    pub port: u16,
+    pub chain_indexer_url: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct QmdbIndexerConfig {
     pub port: u16,
     pub chain_indexer_url: String,
 }
@@ -379,6 +397,10 @@ pub(crate) const fn relayer_enabled(args: &GenerateArgs) -> bool {
 
 const fn usize_is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+const fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 fn main() {

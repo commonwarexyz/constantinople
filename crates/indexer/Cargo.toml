@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 # Workspace
+constantinople-application.workspace = true
 constantinople-engine.workspace = true
 constantinople-primitives.workspace = true
 
@@ -21,9 +22,13 @@ commonware-codec.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-deployer.workspace = true
+commonware-parallel.workspace = true
+commonware-runtime.workspace = true
+commonware-storage.workspace = true
 commonware-utils.workspace = true
 
 # Exoware
+exoware-qmdb.workspace = true
 exoware-sdk.workspace = true
 exoware-simulator.workspace = true
 exoware-sql.workspace = true
@@ -50,6 +55,7 @@ commonware-math.workspace = true
 rand.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
+tower = { workspace = true, features = ["util"] }
 
 [[bin]]
 name = "chain-indexer"
@@ -58,6 +64,10 @@ path = "src/main.rs"
 [[bin]]
 name = "metadata-indexer"
 path = "src/bin/sql.rs"
+
+[[bin]]
+name = "qmdb-indexer"
+path = "src/bin/qmdb.rs"
 
 [lib]
 name = "constantinople_indexer"

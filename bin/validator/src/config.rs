@@ -58,6 +58,8 @@ pub struct IndexerConfig {
     pub chain_indexer_url: String,
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
+    #[serde(default)]
+    pub qmdb_upload: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -861,6 +863,7 @@ hosts:
             mode: IndexerMode::MetadataOnly,
             chain_indexer_url: "http://chain-indexer:8090".to_string(),
             upload_buffer: default_upload_buffer(),
+            qmdb_upload: false,
         });
         fs::write(
             &config_path,

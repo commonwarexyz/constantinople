@@ -25,11 +25,13 @@ use rand_core::CryptoRngCore;
 use std::{sync::Arc, time::Instant};
 use tracing::{info, warn};
 
-impl<H, C, S, P, I, B, SigSt, HashSt> Application<H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, SigSt, HashSt> Application<E, H, C, S, P, I, B, SigSt, HashSt>
 where
+    E: Storage + Metrics + Clock,
     C: Digest,
     H: Hasher,
     P: PublicKey,
+    HashSt: Strategy,
 {
     /// Proposes a child block from an already fetched parent.
     #[doc(hidden)]
@@ -43,7 +45,7 @@ where
             height = parent.header.height + 1,
         )
     )]
-    pub async fn propose_child<E>(
+    pub async fn propose_child(
         &mut self,
         (runtime, context): (E, Context<C, P>),
         parent: &SealedBlock<C, P, H>,
@@ -130,7 +132,7 @@ where
             parent_height = parent.header.height,
         )
     )]
-    pub async fn verify_child<E>(
+    pub async fn verify_child(
         &mut self,
         (runtime, _context): (E, Context<C, P>),
         block: SealedBlock<C, P, H>,
@@ -210,7 +212,7 @@ where
         skip_all,
         fields(height = block.header.height)
     )]
-    pub async fn apply_certified<E>(
+    pub async fn apply_certified(
         &mut self,
         (runtime, _): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,

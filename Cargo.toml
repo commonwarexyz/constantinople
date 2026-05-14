@@ -47,25 +47,26 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
+commonware-p2p = "2026.4.0"
+commonware-glue = "2026.4.0"
+commonware-math = "2026.4.0"
+commonware-codec = "2026.4.0"
+commonware-formatting = "2026.4.0"
+commonware-utils = "2026.4.0"
+commonware-coding = "2026.4.0"
+commonware-macros = "2026.4.0"
+commonware-runtime = "2026.4.0"
+commonware-storage = "2026.4.0"
+commonware-deployer = "2026.4.0"
+commonware-parallel = "2026.4.0"
+commonware-resolver = "2026.4.0"
+commonware-broadcast = "2026.4.0"
+commonware-consensus = "2026.4.0"
+commonware-cryptography = { version = "2026.4.0", default-features = false }
 
 # Exoware
 exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
 exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
 exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
 datafusion = "52"
@@ -93,6 +94,54 @@ serde_yaml = "0.9"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+
+[patch.crates-io]
+commonware-broadcast = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-codec = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-coding = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-conformance = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-conformance-macros = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-consensus = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-cryptography = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-deployer = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-formatting = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-glue = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-invariants = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-macros = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-macros-impl = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-math = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-p2p = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-parallel = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-resolver = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-runtime = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-runtime-macros = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-storage = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-stream = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-utils = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+
+[patch."https://github.com/commonwarexyz/monorepo"]
+commonware-broadcast = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-codec = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-coding = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-conformance = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-conformance-macros = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-consensus = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-cryptography = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-deployer = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-formatting = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-glue = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-invariants = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-macros = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-macros-impl = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-math = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-p2p = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-parallel = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-resolver = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-runtime = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-runtime-macros = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-storage = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-stream = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
+commonware-utils = { git = "https://git@github.com/commonwarexyz/monorepo.git", branch = "cl/glue" }
 
 [profile.samply]
 inherits = "release"

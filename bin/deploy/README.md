@@ -117,8 +117,8 @@ to primary validators.
 ### Local Deployment with Indexer + Explorer
 
 Add `--indexer` (a flag on the `local` subcommand) to spin up the shared
-`chain-indexer` store, the `metadata-indexer` query/stream service, and the
-React explorer dev server alongside the validators:
+`chain-indexer` store, the `metadata-indexer` query/stream service, the
+`qmdb-indexer` query facade, and the React explorer dev server alongside the validators:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -131,17 +131,29 @@ cargo run --bin constantinople-deploy -- generate \
 ```
 
 This requires `--secondaries >= 1` because only secondaries upload to the
-indexer; primaries leave their `indexer:` block unset.
+indexer; primaries leave their `indexer:` block unset. In full indexer mode,
+the first secondary also owns the QMDB upload path. Other secondaries may still
+upload the existing KV and SQL indexer data, but they leave QMDB disabled so the
+QMDB writer contract has a single writer.
 
-The printed `mprocs` command list grows by two entries:
+The printed `mprocs` command list grows by four entries:
 
 - `cargo run -p constantinople-indexer --bin chain-indexer -- --port 8090 --data-dir ./local/chain-indexer`
   — the simulator-backed shared store. `--chain-indexer-port` overrides the port.
 - `cargo run -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
   — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
+- `cargo run -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
+  — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
+  overrides the port.
 - `VITE_SQL_URL=http://127.0.0.1:8091 npm --prefix explorer run dev`
   — the [React explorer](../../explorer/README.md), which subscribes to the
   metadata service and streams new finalized blocks live.
+
+Validators do not upload QMDB data to `qmdb-indexer` directly. The first
+secondary writes QMDB rows into the shared `chain-indexer` store using reserved
+Store prefixes. `qmdb-indexer` reads those rows from the same store and exposes
+account-state QMDB APIs under `/state` and transaction-hash QMDB APIs under
+`/transactions`.
 
 If `--relayer` is also enabled, the explorer command receives `VITE_MEMPOOL_URL` pointing at the
 local relayer. Otherwise it uses its default direct mempool URL.
@@ -343,17 +355,27 @@ The generated bundle now also includes:
 
 - `chain-indexer.yaml` — deployer config for the shared store instance.
 - `metadata-indexer.yaml` — deployer config for the metadata query/stream service.
-- two extra deployer instances in `config.yaml`: `chain-indexer` and `metadata-indexer`.
+- `qmdb-indexer.yaml` — deployer config for the QMDB query facade.
+- three extra deployer instances in `config.yaml`: `chain-indexer`, `metadata-indexer`, and
+  `qmdb-indexer`.
 
 Topology and defaults:
 
 - `chain-indexer` is a single shared simulator-backed store instance.
 - `metadata-indexer` is a single shared SQL query/stream service layered on that store.
+- `qmdb-indexer` is a single shared QMDB Connect facade layered on that store.
 - both shared services land in the first remote region.
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
+- `qmdb-indexer` listens on port `8092` by default.
+- full indexer mode enables QMDB uploads on only the first secondary. All other secondaries leave
+  QMDB disabled to preserve the QMDB single-writer contract.
 - even in metadata-only mode, the shared `chain-indexer` store is still required because the
   metadata service reads from that backing store.
+
+QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
+writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state current/proof APIs are
+mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
 
 The deployer opens both shared-service ports globally because `commonware-deployer`'s port list is
 deployment-wide rather than per-instance.
@@ -377,6 +399,7 @@ Those aggregate targets now write:
 - `deploy/relayer` when `--relayer` is enabled
 - `deploy/chain-indexer`
 - `deploy/metadata-indexer`
+- `deploy/qmdb-indexer`
 
 ### Remote Metadata-Only Mode
 
@@ -401,7 +424,8 @@ cargo run --bin constantinople-deploy -- generate \
 
 This is a real runtime split, not just a deploy-time flag: secondary validators only spawn the SQL
 metadata uploader in this mode. The shared `chain-indexer` and `metadata-indexer` services are
-still deployed because the metadata service reads from the shared store.
+still deployed because the metadata service reads from the shared store. `qmdb-indexer` is not
+deployed in metadata-only mode, and QMDB uploads remain disabled.
 
 ## Secondary Validators
 

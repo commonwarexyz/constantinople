@@ -1,10 +1,11 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
     DEFAULT_INDEXER_UPLOAD_BUFFER, GenerateArgs, IndexerConfig, IndexerMode, LocalArgs,
-    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig, RELAYER_CONFIG_FILE,
-    RelayerConfig, RelayerLeaderConfig, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_local_cluster_material, relayer_enabled, write_yaml_config,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
+    QMDB_INDEXER_BINARY_FILE, RELAYER_CONFIG_FILE, RelayerConfig, RelayerLeaderConfig,
+    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
+    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
+    relayer_enabled, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -143,10 +144,6 @@ fn build_secondaries(
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
-    let indexer_config = local
-        .indexer
-        .then(|| local_indexer_config(local.chain_indexer_port));
-
     // Secondary ports start after the primary range to avoid collisions on
     // the same loopback host.
     let primary_span = args.validators as u16;
@@ -190,7 +187,9 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: indexer_config.clone(),
+            indexer: local
+                .indexer
+                .then(|| local_indexer_config(local.chain_indexer_port, index == 0)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -246,12 +245,13 @@ fn local_relayer_config(
 /// because key prefixes are disjoint (KV families occupy `0x10..=0x6F`, SQL
 /// table prefixes occupy `0x00..=0x0F`). Splitting the simulator into
 /// physically separate stores is deferred until we need it.
-fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
+fn local_indexer_config(indexer_port: u16, qmdb_upload: bool) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         mode: IndexerMode::Full,
         chain_indexer_url: url,
         upload_buffer: DEFAULT_INDEXER_UPLOAD_BUFFER,
+        qmdb_upload,
     }
 }
 
@@ -329,6 +329,11 @@ fn local_run_commands(
             "sleep 2 && cargo run -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
+        ));
+        commands.push(format!(
+            "sleep 2 && cargo run -p constantinople-indexer --bin {} -- \
+             --store-url http://127.0.0.1:{} --port {}",
+            QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
         // Bring up the React explorer dev server alongside the
         // `metadata-indexer` service
@@ -417,6 +422,7 @@ mod tests {
             indexer: false,
             chain_indexer_port: 8090,
             metadata_indexer_port: 8091,
+            qmdb_indexer_port: 8092,
         }
     }
 
@@ -521,8 +527,8 @@ mod tests {
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
-        // 2 validators + 1 secondary + 1 indexer + 1 sql + 1 explorer = 6.
-        assert_eq!(commands.len(), 6);
+        // 2 validators + 1 secondary + 1 store + 1 sql + 1 qmd + 1 explorer = 7.
+        assert_eq!(commands.len(), 7);
         let indexer_cmd = commands
             .iter()
             .find(|c| c.contains("--bin chain-indexer"))
@@ -546,6 +552,22 @@ mod tests {
         // The metadata service reads from the store and serves on its own port.
         assert!(metadata_cmd.contains("--store-url http://127.0.0.1:8090"));
         assert!(metadata_cmd.contains("--port 8091"));
+    }
+
+    #[test]
+    fn local_run_commands_include_qmdb_indexer_when_indexer_enabled() {
+        let mut args = test_args(false);
+        args.secondaries = 1;
+        enable_indexer(&mut args, 8090);
+
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+
+        let qmdb_cmd = commands
+            .iter()
+            .find(|c| c.contains("--bin qmdb-indexer"))
+            .expect("qmdb-indexer command should be present");
+        assert!(qmdb_cmd.contains("--store-url http://127.0.0.1:8090"));
+        assert!(qmdb_cmd.contains("--port 8092"));
     }
 
     #[test]
@@ -613,6 +635,7 @@ mod tests {
             .as_ref()
             .expect("secondary should have indexer config");
         assert_eq!(indexer.mode, IndexerMode::Full);
+        assert!(indexer.qmdb_upload);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
     }

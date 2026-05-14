@@ -34,10 +34,12 @@ use tracing::{debug, error, warn};
 
 pub mod block;
 pub mod certificate;
+pub mod qmdb;
 pub mod sql;
 
 pub use block::BlockReporter;
 pub use certificate::CertificateReporter;
+pub use qmdb::QmdbPublisher;
 pub use sql::{SqlBatch, SqlRow, spawn_sql_uploader};
 
 /// One atomic write to a single exoware store.

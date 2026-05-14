@@ -118,17 +118,17 @@ pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
         H,
     >;
 
-pub(crate) type App<H, P, V, I, B, SigT, HashT> =
-    Application<H, Commitment, ThresholdScheme<P, V>, P, I, B, SigT, HashT>;
+pub(crate) type App<E, H, P, V, I, B, SigT, HashT> =
+    Application<E, H, Commitment, ThresholdScheme<P, V>, P, I, B, SigT, HashT>;
 
 pub(crate) type AppMailbox<E, H, P, V, I, B, SigT, HashT> =
-    commonware_glue::stateful::Mailbox<E, App<H, P, V, I, B, SigT, HashT>>;
+    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, SigT, HashT>>;
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
 pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
     E,
-    App<H, P, V, I, B, SigT, HashT>,
+    App<E, H, P, V, I, B, SigT, HashT>,
     EngineMarshalMailbox<H, P, V>,
     (
         StateResolverMailbox<E, H, P, HashT>,

@@ -304,6 +304,7 @@ impl EngineDefinition for TestEngineDefinition {
                     block_codec: Default::default(),
                     bootstrapper: bootstrapper_mailbox.clone(),
                     simplex_observer: None,
+                    finalized_hook: None,
                 },
             )
             .await;

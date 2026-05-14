@@ -27,7 +27,7 @@ use std::sync::Arc;
 pub const STATE_BITMAP_CHUNK_BYTES: usize = 64;
 
 /// Shared QMDB handle for the application state database.
-pub(super) type StateDatabase<E, H, P, T, S> = Arc<
+pub type StateDatabase<E, H, P, T, S> = Arc<
     AsyncRwLock<
         fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, STATE_BITMAP_CHUNK_BYTES, S>,
     >,
@@ -42,11 +42,10 @@ pub type TransactionHistoryOperation<H> =
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
-pub(super) type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistoryDb<E, H, S>>>;
+pub type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistoryDb<E, H, S>>>;
 
 /// The backing databases owned by the application.
-pub(super) type Databases<E, H, P, T, S> =
-    (StateDatabase<E, H, P, T, S>, TransactionDatabase<E, H, S>);
+pub type Databases<E, H, P, T, S> = (StateDatabase<E, H, P, T, S>, TransactionDatabase<E, H, S>);
 
 /// Unmerkleized application state batch used for executor read-through.
 pub(super) type StateBatch<E, H, P, T, S> = CurrentUnmerkleized<

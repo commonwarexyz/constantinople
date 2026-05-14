@@ -9,6 +9,6 @@ pub mod sql_schema;
 
 pub use client::{IndexerClient, ReadError};
 pub use publisher::{
-    BlockReporter, CertificateReporter, UploadBatch, UploaderHandles, spawn_uploaders,
-    standard_store_client,
+    BlockReporter, CertificateReporter, QmdbPublisher, UploadBatch, UploaderHandles,
+    spawn_uploaders, standard_store_client,
 };

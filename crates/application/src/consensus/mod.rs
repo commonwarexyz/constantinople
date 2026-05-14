@@ -5,11 +5,13 @@
 //! commitments consensus votes on.
 
 use commonware_consensus::types::Height;
-use commonware_cryptography::Hasher;
+use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_parallel::Strategy;
 use commonware_runtime::{
-    Metrics,
+    Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
+use constantinople_primitives::SealedBlock;
 use std::{future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc};
 
 mod body;
@@ -24,13 +26,22 @@ mod tests;
 mod time;
 
 pub use db::{
-    STATE_BITMAP_CHUNK_BYTES, TransactionHistoryDb, TransactionHistoryOperation,
-    TransactionHistoryTarget,
+    Databases, STATE_BITMAP_CHUNK_BYTES, StateDatabase, TransactionDatabase, TransactionHistoryDb,
+    TransactionHistoryOperation, TransactionHistoryTarget,
 };
 pub use genesis::genesis_block;
 
 type FinalizedPruneFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
 type FinalizedPruneFn = Arc<dyn Fn(Height) -> FinalizedPruneFuture + Send + Sync>;
+type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+pub type FinalizedHookFn<E, C, H, P, HashSt> = Arc<
+    dyn for<'a> Fn(
+            &'a SealedBlock<C, P, H>,
+            &'a Databases<E, H, P, commonware_storage::translator::EightCap, HashSt>,
+        ) -> FinalizedHookFuture<'a>
+        + Send
+        + Sync,
+>;
 type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
@@ -40,9 +51,13 @@ const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
 /// Core Constantinople application.
-pub struct Application<H, C, S, P, I, B, SigSt, HashSt>
+pub struct Application<E, H, C, S, P, I, B, SigSt, HashSt>
 where
     H: Hasher,
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
+    HashSt: Strategy,
 {
     signature_strategy: SigSt,
     hash_strategy: HashSt,
@@ -54,16 +69,20 @@ where
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     prune_cadence_blocks: NonZeroU64,
     finalized_pruner: FinalizedPruneFn,
+    finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
     proposed_transactions: Counter,
-    _marker: PhantomData<(C, S, I, B)>,
+    _marker: PhantomData<(E, C, S, I, B)>,
 }
 
-impl<H, C, S, P, I, B, SigSt, HashSt> Clone for Application<H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, SigSt, HashSt> Clone for Application<E, H, C, S, P, I, B, SigSt, HashSt>
 where
     H: Hasher,
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
     P: Clone,
     SigSt: Clone,
-    HashSt: Clone,
+    HashSt: Strategy + Clone,
 {
     fn clone(&self) -> Self {
         Self {
@@ -77,15 +96,20 @@ where
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             prune_cadence_blocks: self.prune_cadence_blocks,
             finalized_pruner: self.finalized_pruner.clone(),
+            finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<H, C, S, P, I, B, SigSt, HashSt> Application<H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, SigSt, HashSt> Application<E, H, C, S, P, I, B, SigSt, HashSt>
 where
     H: Hasher,
+    E: Storage + Clock + Metrics,
+    C: Digest,
+    P: PublicKey,
+    HashSt: Strategy,
 {
     /// Creates an application.
     #[expect(
@@ -104,6 +128,7 @@ where
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         prune_cadence_blocks: NonZeroU64,
         finalized_pruner: FinalizedPruneFn,
+        finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
@@ -121,6 +146,7 @@ where
             genesis_transactions_target,
             prune_cadence_blocks,
             finalized_pruner,
+            finalized_hook,
             proposed_transactions,
             _marker: PhantomData,
         }

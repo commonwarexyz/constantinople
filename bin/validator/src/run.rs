@@ -25,12 +25,13 @@ use commonware_runtime::{
     tokio::telemetry::{self, Logging},
 };
 use commonware_utils::{NZU64, NZUsize, TryCollect, ordered::Set, union};
+use constantinople_application::consensus::FinalizedHookFn;
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
 };
-use constantinople_indexer::{BlockReporter, CertificateReporter, spawn_uploaders};
+use constantinople_indexer::{BlockReporter, CertificateReporter, QmdbPublisher, spawn_uploaders};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
@@ -82,12 +83,16 @@ impl Reporter for BlockUpdateReporter {
 struct IndexerHandle {
     block_reporter: BlockReporter<Sha256, PublicKey>,
     cert_reporter: Option<EngineCertReporter>,
+    qmd_publisher: Option<Arc<QmdbPublisher<Sha256, PublicKey>>>,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
     _uploaders: Vec<JoinHandle<()>>,
 }
 
 /// Build the indexer wiring iff the secondary validator opted in.
-fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Option<IndexerHandle> {
+async fn maybe_build_indexer(
+    is_primary: bool,
+    indexer: Option<IndexerConfig>,
+) -> Option<IndexerHandle> {
     let cfg = indexer?;
     if is_primary {
         return None;
@@ -111,6 +116,15 @@ fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Opti
                 sql_store,
                 cfg.upload_buffer,
             );
+            let qmd_publisher = if cfg.qmdb_upload {
+                Some(Arc::new(
+                    QmdbPublisher::connect(&cfg.chain_indexer_url)
+                        .await
+                        .expect("failed to initialize qmd publisher"),
+                ))
+            } else {
+                None
+            };
             let block_reporter = BlockReporter::<Sha256, PublicKey>::new(
                 uploaders.blocks.clone(),
                 uploaders.transactions.clone(),
@@ -121,6 +135,7 @@ fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Opti
             Some(IndexerHandle {
                 block_reporter,
                 cert_reporter,
+                qmd_publisher,
                 _uploaders: Vec::from(uploaders.joins),
             })
         }
@@ -131,10 +146,27 @@ fn maybe_build_indexer(is_primary: bool, indexer: Option<IndexerConfig>) -> Opti
             Some(IndexerHandle {
                 block_reporter: BlockReporter::<Sha256, PublicKey>::metadata_only(sql),
                 cert_reporter: None,
+                qmd_publisher: None,
                 _uploaders: vec![sql_join],
             })
         }
     }
+}
+
+fn qmd_finalized_hook(
+    indexer: Option<&IndexerHandle>,
+) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
+{
+    let publisher = indexer?.qmd_publisher.clone()?;
+    Some(Arc::new(move |block, databases| {
+        let publisher = publisher.clone();
+        Box::pin(async move {
+            publisher
+                .upload_finalized(block, databases)
+                .await
+                .expect("qmd index upload failed");
+        })
+    }))
 }
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
@@ -311,7 +343,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // loaded config and returns `None` for primaries, validators that did
         // not declare an `indexer` block, or those that declared one with
         // `enabled: false`.
-        let indexer_handle = maybe_build_indexer(is_primary, indexer);
+        let indexer_handle = maybe_build_indexer(is_primary, indexer).await;
+        let finalized_hook = qmd_finalized_hook(indexer_handle.as_ref());
 
         info!("initializing engine");
         let engine = Engine::<
@@ -351,6 +384,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 simplex_observer: indexer_handle
                     .as_ref()
                     .and_then(|h| h.cert_reporter.clone()),
+                finalized_hook,
             },
         )
         .await;

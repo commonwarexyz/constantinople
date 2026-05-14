@@ -3,6 +3,7 @@ use crate::{
     CHAIN_INDEXER_HOST, ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE,
     DEFAULT_INDEXER_UPLOAD_BUFFER, DEPLOYER_CONFIG_FILE, GenerateArgs, IndexerConfig, IndexerMode,
     METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
+    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
     RELAYER_BINARY_FILE, RELAYER_CONFIG_FILE, RELAYER_HOST, RelayerConfig, RelayerLeaderConfig,
     RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SpammerConfig,
     VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
@@ -62,6 +63,9 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     if let Some(config) = metadata_indexer_config(remote) {
         write_yaml_config(&output_dir.join(METADATA_INDEXER_CONFIG_FILE), &config);
     }
+    if let Some(config) = qmdb_indexer_config(remote) {
+        write_yaml_config(&output_dir.join(QMDB_INDEXER_CONFIG_FILE), &config);
+    }
     if relayer_enabled {
         let relayer_config = remote_relayer_config(remote, &material);
         write_yaml_config(&output_dir.join(RELAYER_CONFIG_FILE), &relayer_config);
@@ -97,6 +101,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
             ?mode,
             chain_indexer_port = remote.chain_indexer_port,
             metadata_indexer_port = remote.metadata_indexer_port,
+            qmdb_indexer_port = remote.qmdb_indexer_port,
             "configured shared remote indexer services"
         );
     }
@@ -111,6 +116,12 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         binaries.push(
             output_dir
                 .join(METADATA_INDEXER_BINARY_FILE)
+                .display()
+                .to_string(),
+        );
+        binaries.push(
+            output_dir
+                .join(QMDB_INDEXER_BINARY_FILE)
                 .display()
                 .to_string(),
         );
@@ -196,10 +207,6 @@ fn build_secondaries(
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
-    let indexer_config = remote
-        .indexer_mode()
-        .map(|mode| remote_indexer_config(mode, remote.chain_indexer_port));
-
     for index in 0..args.secondaries {
         let secondary_index = index as usize;
         let public_key = &material.secondary_public_keys[secondary_index];
@@ -224,7 +231,9 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: indexer_config.clone(),
+            indexer: remote
+                .indexer_mode()
+                .map(|mode| remote_indexer_config(mode, remote.chain_indexer_port, index == 0)),
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -240,11 +249,12 @@ fn build_secondaries(
     secondaries
 }
 
-fn remote_indexer_config(mode: IndexerMode, port: u16) -> IndexerConfig {
+fn remote_indexer_config(mode: IndexerMode, port: u16, first_secondary: bool) -> IndexerConfig {
     IndexerConfig {
         mode,
         chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{port}"),
         upload_buffer: DEFAULT_INDEXER_UPLOAD_BUFFER,
+        qmdb_upload: mode == IndexerMode::Full && first_secondary,
     }
 }
 
@@ -297,6 +307,13 @@ fn chain_indexer_config(remote: &RemoteArgs) -> Option<ChainIndexerConfig> {
 fn metadata_indexer_config(remote: &RemoteArgs) -> Option<MetadataIndexerConfig> {
     remote.indexer_mode().map(|_| MetadataIndexerConfig {
         port: remote.metadata_indexer_port,
+        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+    })
+}
+
+fn qmdb_indexer_config(remote: &RemoteArgs) -> Option<QmdbIndexerConfig> {
+    matches!(remote.indexer_mode(), Some(IndexerMode::Full)).then(|| QmdbIndexerConfig {
+        port: remote.qmdb_indexer_port,
         chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
     })
 }
@@ -359,7 +376,7 @@ fn build_deployer_config(
         });
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
-            region: shared_indexer_region,
+            region: shared_indexer_region.clone(),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
@@ -367,6 +384,18 @@ fn build_deployer_config(
             config: METADATA_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
         });
+        if matches!(remote.indexer_mode(), Some(IndexerMode::Full)) {
+            instances.push(aws::InstanceConfig {
+                name: QMDB_INDEXER_HOST.to_string(),
+                region: shared_indexer_region,
+                instance_type: remote.instance_type.clone(),
+                storage_size: remote.storage_size,
+                storage_class: STORAGE_CLASS.to_string(),
+                binary: QMDB_INDEXER_BINARY_FILE.to_string(),
+                config: QMDB_INDEXER_CONFIG_FILE.to_string(),
+                profiling: false,
+            });
+        }
     }
 
     if args.spammer {
@@ -429,6 +458,13 @@ fn port_configs(remote: &RemoteArgs) -> Vec<aws::PortConfig> {
             port: remote.metadata_indexer_port,
             cidr: "0.0.0.0/0".to_string(),
         });
+        if matches!(remote.indexer_mode(), Some(IndexerMode::Full)) {
+            ports.push(aws::PortConfig {
+                protocol: "tcp".to_string(),
+                port: remote.qmdb_indexer_port,
+                cidr: "0.0.0.0/0".to_string(),
+            });
+        }
     }
 
     for cidr in &remote.http_cidrs {
@@ -447,8 +483,8 @@ mod tests {
     use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, GenerateArgs, GenerateTarget, IndexerMode, LocalArgs,
-        METADATA_INDEXER_BINARY_FILE, RELAYER_BINARY_FILE, RELAYER_HOST, RemoteArgs,
-        SPAMMER_BINARY_FILE, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE,
+        METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE, RELAYER_BINARY_FILE, RELAYER_HOST,
+        RemoteArgs, SPAMMER_BINARY_FILE, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE,
         ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
         generate_local_cluster_material,
     };
@@ -476,6 +512,7 @@ mod tests {
                 indexer: false,
                 chain_indexer_port: 8090,
                 metadata_indexer_port: 8091,
+                qmdb_indexer_port: 8092,
             }),
         }
     }
@@ -495,6 +532,7 @@ mod tests {
             indexer_metadata_only: false,
             chain_indexer_port: 8090,
             metadata_indexer_port: 8091,
+            qmdb_indexer_port: 8092,
             profiling: true,
             spammer_instance_type: None,
             spammer_storage_size: 25,
@@ -694,6 +732,7 @@ mod tests {
             .as_ref()
             .expect("secondary should have indexer wiring");
         assert_eq!(indexer.mode, IndexerMode::Full);
+        assert!(indexer.qmdb_upload);
         assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
     }
 
@@ -713,6 +752,7 @@ mod tests {
             .as_ref()
             .expect("secondary should have indexer wiring");
         assert_eq!(indexer.mode, IndexerMode::MetadataOnly);
+        assert!(!indexer.qmdb_upload);
     }
 
     #[test]
@@ -746,15 +786,19 @@ mod tests {
             &secondaries,
         );
 
-        assert_eq!(config.instances.len(), 7);
+        assert_eq!(config.instances.len(), 8);
         assert_eq!(config.instances[5].name, "chain-indexer");
         assert_eq!(config.instances[5].binary, CHAIN_INDEXER_BINARY_FILE);
         assert_eq!(config.instances[6].name, "metadata-indexer");
         assert_eq!(config.instances[6].binary, METADATA_INDEXER_BINARY_FILE);
+        assert_eq!(config.instances[7].name, "qmdb-indexer");
+        assert_eq!(config.instances[7].binary, QMDB_INDEXER_BINARY_FILE);
         assert_eq!(config.instances[3].region, config.instances[5].region);
         assert_eq!(config.instances[4].region, config.instances[5].region);
         assert_eq!(config.instances[6].region, config.instances[5].region);
+        assert_eq!(config.instances[7].region, config.instances[5].region);
         assert!(config.ports.iter().any(|port| port.port == 8090));
         assert!(config.ports.iter().any(|port| port.port == 8091));
+        assert!(config.ports.iter().any(|port| port.port == 8092));
     }
 }

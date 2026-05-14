@@ -15,7 +15,7 @@ use rand::Rng;
 use rand_core::CryptoRngCore;
 
 impl<E, H, C, S, P, I, B, SigSt, HashSt> CApplication<E>
-    for Application<H, C, S, P, I, B, SigSt, HashSt>
+    for Application<E, H, C, S, P, I, B, SigSt, HashSt>
 where
     E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
     H: Hasher,
@@ -99,6 +99,10 @@ where
         databases: &Self::Databases,
     ) {
         let height = block.header.height;
+        if let Some(hook) = &self.finalized_hook {
+            hook(block, databases).await;
+        }
+
         if !self.should_prune_after_finalize(height) {
             return;
         }

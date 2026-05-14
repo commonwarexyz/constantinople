@@ -50,7 +50,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
-use constantinople_application::consensus::Application;
+use constantinople_application::consensus::{Application, FinalizedHookFn};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::BlockCfg;
 use futures::future::try_join_all;
@@ -135,8 +135,9 @@ where
 /// `O` is the type of an optional simplex activity observer (e.g. the
 /// indexer's certificate publisher). Pass `None::<NoopActivityReporter<P, V>>`
 /// when no external observer is wired in.
-pub struct Config<C, M, B, V, SigT, HashT, I, H, O>
+pub struct Config<E, C, M, B, V, SigT, HashT, I, H, O>
 where
+    E: Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -168,6 +169,9 @@ where
     /// [`commonware_consensus::Reporters`] so primaries that pass `None`
     /// behave exactly as before.
     pub simplex_observer: Option<O>,
+    /// Optional hook that observes finalized blocks after local database
+    /// application and before state pruning.
+    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, HashT>>,
 }
 
 /// Fully assembled validator engine.
@@ -264,7 +268,7 @@ where
     }
 
     /// Initializes the full engine stack.
-    pub async fn new(context: E, config: Config<C, M, B, V, SigT, HashT, I, H, O>) -> Self {
+    pub async fn new(context: E, config: Config<E, C, M, B, V, SigT, HashT, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
@@ -419,6 +423,7 @@ where
                     })
                 }
             }),
+            config.finalized_hook,
         );
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),
