@@ -65,9 +65,9 @@ commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", 
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", branch = "cl/glue", default-features = false }
 
 # Exoware
-exoware-sdk = "2026.4.1"
-exoware-simulator = "2026.4.1"
-exoware-sql = "2026.4.1"
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "296d6423634c2ea7b5f34133c79a7b7386c44f60" }
 datafusion = "52"
 
 # Other
