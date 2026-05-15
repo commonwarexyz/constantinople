@@ -34,6 +34,7 @@ use tracing::{debug, error, warn};
 pub mod block;
 pub mod certificate;
 pub mod qmdb;
+mod qmdb_boundary;
 pub mod sql;
 
 pub use block::BlockReporter;

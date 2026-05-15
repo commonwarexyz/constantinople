@@ -7,11 +7,17 @@ use constantinople_indexer::{
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use exoware_sdk::{RetryConfig, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, CellValue};
-use std::time::{Duration, Instant};
+use std::{
+    collections::{HashMap, HashSet},
+    hint::black_box,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 
 const TX_COUNTS: [usize; 2] = [512, 4096];
 const COALESCED_BLOCKS: usize = 8;
+const HISTORY_OPS: [usize; 2] = [10_000, 100_000];
+const DELTA_KEYS: usize = 512;
 
 fn bench_raw_sql_upload(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
@@ -100,6 +106,40 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
 
     group.finish();
     drop(store);
+}
+
+fn bench_qmdb_boundary_lookup(c: &mut Criterion) {
+    let mut group = c.benchmark_group("indexer/qmdb_boundary_lookup");
+
+    for history_len in HISTORY_OPS {
+        let history = history_keys(history_len);
+        let index = latest_key_index(&history);
+        let delta = rewrite_delta_keys(history_len, DELTA_KEYS);
+        group.throughput(Throughput::Elements(delta.len() as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("legacy_reverse_scan", history_len),
+            &history_len,
+            |bencher, _| {
+                bencher.iter(|| {
+                    black_box(reverse_scan_locations(
+                        black_box(&history),
+                        black_box(&delta),
+                    ))
+                });
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("indexed_lookup", history_len),
+            &history_len,
+            |bencher, _| {
+                bencher.iter(|| black_box(indexed_locations(black_box(&index), black_box(&delta))));
+            },
+        );
+    }
+
+    group.finish();
 }
 
 struct BenchStore {
@@ -248,11 +288,66 @@ fn digest(seed: u64) -> [u8; 32] {
     out
 }
 
+fn history_keys(count: usize) -> Vec<Vec<u8>> {
+    (0..count).map(key_bytes).collect()
+}
+
+fn rewrite_delta_keys(history_len: usize, count: usize) -> Vec<Vec<u8>> {
+    (0..count)
+        .map(|idx| {
+            let distance = idx
+                .checked_mul(history_len / count.max(1))
+                .expect("benchmark key distance fits usize");
+            key_bytes(history_len.saturating_sub(1 + distance))
+        })
+        .collect()
+}
+
+fn latest_key_index(history: &[Vec<u8>]) -> HashMap<Vec<u8>, usize> {
+    history
+        .iter()
+        .enumerate()
+        .map(|(location, key)| (key.clone(), location))
+        .collect()
+}
+
+fn reverse_scan_locations(history: &[Vec<u8>], delta: &[Vec<u8>]) -> Vec<usize> {
+    let mut touched: HashSet<&[u8]> = delta.iter().map(Vec::as_slice).collect();
+    let mut locations = Vec::with_capacity(touched.len());
+    for (location, key) in history.iter().enumerate().rev() {
+        if touched.is_empty() {
+            break;
+        }
+        if touched.remove(key.as_slice()) {
+            locations.push(location);
+        }
+    }
+    locations
+}
+
+fn indexed_locations(index: &HashMap<Vec<u8>, usize>, delta: &[Vec<u8>]) -> Vec<usize> {
+    let mut seen = HashSet::new();
+    let mut locations = Vec::with_capacity(delta.len());
+    for key in delta {
+        if !seen.insert(key.as_slice()) {
+            continue;
+        }
+        if let Some(location) = index.get(key).copied() {
+            locations.push(location);
+        }
+    }
+    locations
+}
+
+fn key_bytes(seed: usize) -> Vec<u8> {
+    digest(seed as u64).to_vec()
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(3));
-    targets = bench_raw_sql_upload
+    targets = bench_raw_sql_upload, bench_qmdb_boundary_lookup
 }
 criterion_main!(benches);

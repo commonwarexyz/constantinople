@@ -24,13 +24,13 @@ use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::{
     CurrentBoundaryState, KeylessClient, KeylessWriter, PreparedUpload, QmdbError, UnorderedClient,
-    UnorderedWriter, WriterState, recover_boundary_state,
+    UnorderedWriter, WriterState,
 };
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
-use std::{num::NonZeroU64, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 use tokio::{
-    sync::{Mutex, mpsc},
+    sync::{Mutex, Semaphore, mpsc},
     task::JoinHandle,
     time::sleep,
 };
@@ -86,7 +86,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    state_operations: Mutex<Vec<StateOperation<P>>>,
+    state_operations: Mutex<StateOperationCache<P>>,
     state_next_location: Mutex<u64>,
     transaction_next_location: Mutex<u64>,
     prepare_tx: mpsc::Sender<PendingQmdbUpload<H, P>>,
@@ -139,6 +139,7 @@ where
             next_writer_location(transaction_writer.latest_published_watermark().await);
         let (commit_tx, commit_rx) = mpsc::channel(buffer);
         let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
+        let prepare_limit = Arc::new(Semaphore::new(buffer.max(1)));
         let commit_join = tokio::spawn(run_qmdb_committer(
             commit_client.clone(),
             sql_writer,
@@ -151,10 +152,11 @@ where
             transaction_writer.clone(),
             prepare_rx,
             commit_tx,
+            prepare_limit,
         ));
 
         Ok(Self {
-            state_operations: Mutex::new(Vec::new()),
+            state_operations: Mutex::new(StateOperationCache::new()),
             state_next_location: Mutex::new(state_next_location),
             transaction_next_location: Mutex::new(transaction_next_location),
             prepare_tx,
@@ -226,33 +228,87 @@ async fn run_qmdb_preparer<H, P>(
     transaction_writer: Arc<TransactionWriter<H>>,
     mut rx: mpsc::Receiver<PendingQmdbUpload<H, P>>,
     commit_tx: mpsc::Sender<PreparedQmdbUpload>,
+    prepare_limit: Arc<Semaphore>,
 ) where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
     P: PublicKey + Send + Sync + 'static,
 {
-    while let Some(upload) = rx.recv().await {
-        let state_writer = state_writer.clone();
-        let transaction_writer = transaction_writer.clone();
-        let commit_tx = commit_tx.clone();
-        tokio::spawn(async move {
-            let height = upload.height;
-            if let Err(error) =
-                prepare_and_queue_upload(state_writer, transaction_writer, commit_tx, upload).await
-            {
-                panic!("qmd prepare worker failed at height {height}: {error}");
+    let (done_tx, mut done_rx) = mpsc::channel(prepare_limit.available_permits().max(1));
+    let mut completed = BTreeMap::new();
+    let mut next_height = None::<u64>;
+    let mut in_flight = 0usize;
+    let mut rx_closed = false;
+
+    loop {
+        tokio::select! {
+            maybe_upload = rx.recv(), if !rx_closed && prepare_limit.available_permits() > 0 => {
+                let Some(upload) = maybe_upload else {
+                    rx_closed = true;
+                    continue;
+                };
+                next_height.get_or_insert(upload.height);
+                let permit = prepare_limit
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("qmd prepare semaphore is never closed");
+                in_flight += 1;
+                let state_writer = state_writer.clone();
+                let transaction_writer = transaction_writer.clone();
+                let done_tx = done_tx.clone();
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    let height = upload.height;
+                    let result = prepare_qmdb_upload(state_writer, transaction_writer, upload)
+                        .await
+                        .map_err(|error| (height, error));
+                    let _ = done_tx.send(result).await;
+                });
             }
-        });
+            maybe_result = done_rx.recv(), if in_flight > 0 => {
+                in_flight -= 1;
+                match maybe_result {
+                    Some(Ok(upload)) => {
+                        completed.insert(upload.height, upload);
+                    }
+                    Some(Err((height, error))) => {
+                        panic!("qmd prepare worker failed at height {height}: {error}");
+                    }
+                    None => {
+                        panic!("qmd prepare worker result channel closed with {in_flight} uploads in flight");
+                    }
+                }
+            }
+            else => break,
+        }
+
+        while let Some(height) = next_height {
+            let Some(upload) = completed.remove(&height) else {
+                break;
+            };
+            commit_tx
+                .send(upload)
+                .await
+                .map_err(|upload| PublishError::CommitterStopped {
+                    height: upload.0.height,
+                })
+                .expect("qmd committer stopped");
+            next_height = Some(height + 1);
+        }
+
+        if rx_closed && in_flight == 0 && completed.is_empty() {
+            break;
+        }
     }
     debug!("indexer qmd preparer task exiting: channel closed");
 }
 
-async fn prepare_and_queue_upload<H, P>(
+async fn prepare_qmdb_upload<H, P>(
     state_writer: Arc<StateWriter<H, P>>,
     transaction_writer: Arc<TransactionWriter<H>>,
-    commit_tx: mpsc::Sender<PreparedQmdbUpload>,
     upload: PendingQmdbUpload<H, P>,
-) -> Result<(), PublishError>
+) -> Result<PreparedQmdbUpload, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
@@ -264,17 +320,13 @@ where
         state_writer.prepare_current_upload(&upload.state_delta, &upload.state_boundary),
         transaction_writer.prepare_upload(&upload.transaction_ops),
     )?;
-    commit_tx
-        .send(PreparedQmdbUpload {
-            height,
-            raw_rows: raw,
-            sql_rows: sql,
-            state,
-            transactions,
-        })
-        .await
-        .map_err(|_| PublishError::CommitterStopped { height })?;
-    Ok(())
+    Ok(PreparedQmdbUpload {
+        height,
+        raw_rows: raw,
+        sql_rows: sql,
+        state,
+        transactions,
+    })
 }
 
 async fn run_qmdb_committer<H, P>(
@@ -342,16 +394,63 @@ async fn run_qmdb_committer<H, P>(
                 "indexer marked qmd upload persisted"
             );
         }
+        let watermark_seq =
+            flush_qmdb_watermarks(&commit_client, &state_writer, &transaction_writer).await;
         debug!(
             first_height,
             last_height,
             count,
             rows,
             store_sequence = seq,
+            watermark_sequence = watermark_seq,
             "indexer uploaded coalesced finalized index batch"
         );
     }
     debug!("indexer qmd committer task exiting: channel closed");
+}
+
+async fn flush_qmdb_watermarks<H, P>(
+    commit_client: &StoreClient,
+    state_writer: &StateWriter<H, P>,
+    transaction_writer: &TransactionWriter<H>,
+) -> Option<u64>
+where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+    P: PublicKey + Send + Sync + 'static,
+{
+    let state = state_writer
+        .prepare_flush()
+        .await
+        .expect("qmd state watermark flush must prepare");
+    let transactions = transaction_writer
+        .prepare_flush()
+        .await
+        .expect("qmd transaction watermark flush must prepare");
+    if state.is_none() && transactions.is_none() {
+        return None;
+    }
+
+    let mut batch = StoreWriteBatch::new();
+    if let Some(prepared) = &state {
+        state_writer
+            .stage_flush(prepared, &mut batch)
+            .expect("qmd state watermark flush must stage");
+    }
+    if let Some(prepared) = &transactions {
+        transaction_writer
+            .stage_flush(prepared, &mut batch)
+            .expect("qmd transaction watermark flush must stage");
+    }
+
+    let seq = commit_with_retry(commit_client, &batch).await;
+    if let Some(prepared) = state {
+        state_writer.mark_flush_persisted(prepared, seq).await;
+    }
+    if let Some(prepared) = transactions {
+        transaction_writer.mark_flush_persisted(prepared, seq).await;
+    }
+    Some(seq)
 }
 
 fn stage_raw_rows(
@@ -506,7 +605,7 @@ where
 }
 
 async fn build_state_upload<E, H, P, S>(
-    operation_cache: &Mutex<Vec<StateOperation<P>>>,
+    operation_cache: &Mutex<StateOperationCache<P>>,
     writer_next: u64,
     block: &EngineBlock<H, P>,
     state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
@@ -534,20 +633,51 @@ where
             block_start: end,
         });
     }
-    let mut operations = operation_cache.lock().await;
-    extend_state_ops::<E, H, P, S>(&state, &mut operations, end).await?;
-    let previous_operations = if writer_next == 0 {
-        None
-    } else {
-        Some(&operations[..writer_next as usize])
-    };
-    let delta = operations[writer_next as usize..].to_vec();
-    let boundary = state_boundary::<E, H, P, S>(&state, previous_operations, &operations).await?;
+    let mut cache = operation_cache.lock().await;
+    extend_state_ops::<E, H, P, S>(&state, &mut cache, writer_next).await?;
+    let delta = load_state_ops::<E, H, P, S>(&state, writer_next, end).await?;
+    let previous_update_locations = cache.index.previous_update_locations(&delta);
+    cache.append(delta.clone());
+    let boundary = state_boundary::<E, H, P, S>(
+        &state,
+        writer_next as usize,
+        &previous_update_locations,
+        &cache.operations,
+    )
+    .await?;
     Ok(PendingStateUpload {
         delta,
         boundary,
         next_location: end,
     })
+}
+
+#[derive(Debug)]
+struct StateOperationCache<P>
+where
+    P: PublicKey,
+{
+    operations: Vec<StateOperation<P>>,
+    index: super::qmdb_boundary::BoundaryIndex<QmdbFamily>,
+}
+
+impl<P> StateOperationCache<P>
+where
+    P: PublicKey,
+{
+    fn new() -> Self {
+        Self {
+            operations: Vec::new(),
+            index: super::qmdb_boundary::BoundaryIndex::new(),
+        }
+    }
+
+    fn append(&mut self, operations: Vec<StateOperation<P>>) {
+        let start =
+            u64::try_from(self.operations.len()).expect("state operation cache length fits u64");
+        self.index.append(start, &operations);
+        self.operations.extend(operations);
+    }
 }
 
 async fn extend_state_ops<E, H, P, S>(
@@ -561,7 +691,7 @@ async fn extend_state_ops<E, H, P, S>(
         { STATE_BITMAP_CHUNK_BYTES },
         S,
     >,
-    operations: &mut Vec<StateOperation<P>>,
+    cache: &mut StateOperationCache<P>,
     end: u64,
 ) -> Result<(), PublishError>
 where
@@ -570,7 +700,8 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let start = u64::try_from(operations.len()).expect("state operation cache length fits u64");
+    let start =
+        u64::try_from(cache.operations.len()).expect("state operation cache length fits u64");
     if start > end {
         return Err(PublishError::WriterOutOfSync {
             writer_next: start,
@@ -581,7 +712,8 @@ where
         return Ok(());
     }
 
-    operations.extend(load_state_ops::<E, H, P, S>(state, start, end).await?);
+    let operations = load_state_ops::<E, H, P, S>(state, start, end).await?;
+    cache.append(operations);
     Ok(())
 }
 
@@ -652,7 +784,8 @@ async fn state_boundary<E, H, P, S>(
         { STATE_BITMAP_CHUNK_BYTES },
         S,
     >,
-    previous_operations: Option<&[StateOperation<P>]>,
+    previous_len: usize,
+    previous_update_locations: &[Location<QmdbFamily>],
     operations: &[StateOperation<P>],
 ) -> Result<CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>, PublishError>
 where
@@ -669,8 +802,16 @@ where
         .await
         .map_err(|err| QmdbError::CorruptData(format!("local state ops root witness: {err}")))?;
     let pruned_chunks = state.sync_boundary().as_u64() / (STATE_BITMAP_CHUNK_BYTES as u64 * 8);
-    recover_boundary_state::<QmdbFamily, H, _, { STATE_BITMAP_CHUNK_BYTES }, _, _>(
-        previous_operations,
+    super::qmdb_boundary::recover_boundary_state::<
+        QmdbFamily,
+        H,
+        _,
+        { STATE_BITMAP_CHUNK_BYTES },
+        _,
+        _,
+    >(
+        previous_len,
+        previous_update_locations,
         operations,
         state.root(),
         pruned_chunks,
