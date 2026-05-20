@@ -3,7 +3,7 @@ use super::{
     history::parent_transactions_inactivity_floor,
 };
 use commonware_cryptography::{Digest as _, Hasher as _, Signer as _, ed25519, sha256};
-use commonware_storage::{merkle::mmr, qmdb::current::proof::OpsRootWitness};
+use commonware_storage::merkle::mmr;
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{Block, Sealable, Signable, Transaction};
 use std::num::NonZeroU64;
@@ -11,12 +11,6 @@ use std::num::NonZeroU64;
 fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     StateSyncTarget::new(
         sha256::Digest::EMPTY,
-        sha256::Digest::EMPTY,
-        OpsRootWitness {
-            grafted_root: sha256::Digest::EMPTY,
-            pending_chunk_digest: Default::default(),
-            partial_chunk: None,
-        },
         non_empty_range!(mmr::Location::new(0), mmr::Location::new(1)),
     )
 }

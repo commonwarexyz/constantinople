@@ -26,8 +26,8 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, STATE_BITMAP_CHUNK_BYTES, StateDatabase, StateSyncTarget, TransactionDatabase,
-    TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
+    Databases, StateDatabase, StateSyncTarget, TransactionDatabase, TransactionHistoryDb,
+    TransactionHistoryOperation, TransactionHistoryTarget,
 };
 pub use genesis::genesis_block;
 

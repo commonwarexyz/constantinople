@@ -14,17 +14,16 @@ use commonware_storage::{
             unordered::{Operation as UnorderedOperation, Update as UnorderedUpdate},
             value::FixedEncoding,
         },
-        current::proof::RangeProof,
         keyless,
     },
 };
 use commonware_utils::sequence::FixedBytes;
-use constantinople_application::consensus::{Databases, STATE_BITMAP_CHUNK_BYTES, StateDatabase};
+use constantinople_application::consensus::{Databases, StateDatabase};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::{
-    CurrentBoundaryState, KeylessClient, KeylessWriter, PreparedUpload, QmdbError, UnorderedClient,
-    UnorderedWriter, WriterState,
+    KeylessClient, KeylessWriter, PreparedUpload, QmdbError, UnorderedClient, UnorderedWriter,
+    WriterState,
 };
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
@@ -86,7 +85,6 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    state_operations: Mutex<StateOperationCache<P>>,
     state_next_location: Mutex<u64>,
     transaction_next_location: Mutex<u64>,
     prepare_tx: mpsc::Sender<PendingQmdbUpload<H, P>>,
@@ -102,7 +100,6 @@ where
     height: u64,
     block_rows: IndexedBlockRows,
     state_delta: Vec<StateOperation<P>>,
-    state_boundary: CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>,
     transaction_ops: Vec<TransactionOperation<H>>,
 }
 
@@ -156,7 +153,6 @@ where
         ));
 
         Ok(Self {
-            state_operations: Mutex::new(StateOperationCache::new()),
             state_next_location: Mutex::new(state_next_location),
             transaction_next_location: Mutex::new(transaction_next_location),
             prepare_tx,
@@ -184,7 +180,6 @@ where
                 height: block.header.height,
                 block_rows,
                 state_delta: state.delta,
-                state_boundary: state.boundary,
                 transaction_ops: transactions.ops,
             })
             .await
@@ -198,16 +193,14 @@ where
         &self,
         block: &EngineBlock<H, P>,
         state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
-    ) -> Result<PendingStateUpload<H, P>, PublishError>
+    ) -> Result<PendingStateUpload<P>, PublishError>
     where
         E: Storage + Clock + Metrics,
         S: Strategy + Send + Sync + 'static,
         AccountKey<P>: Send + Sync,
     {
         let mut next = self.state_next_location.lock().await;
-        let pending =
-            build_state_upload::<E, H, P, S>(&self.state_operations, *next, block, state_db)
-                .await?;
+        let pending = build_state_upload::<E, H, P, S>(*next, block, state_db).await?;
         *next = pending.next_location;
         Ok(pending)
     }
@@ -317,7 +310,7 @@ where
     let height = upload.height;
     let IndexedBlockRows { raw, sql } = upload.block_rows;
     let (state, transactions) = tokio::try_join!(
-        state_writer.prepare_current_upload(&upload.state_delta, &upload.state_boundary),
+        state_writer.prepare_upload(&upload.state_delta),
         transaction_writer.prepare_upload(&upload.transaction_ops),
     )?;
     Ok(PreparedQmdbUpload {
@@ -586,13 +579,11 @@ where
     Ok(WriterState::from_checkpoint::<H>(&checkpoint)?)
 }
 
-struct PendingStateUpload<H, P>
+struct PendingStateUpload<P>
 where
-    H: Hasher,
     P: PublicKey,
 {
     delta: Vec<StateOperation<P>>,
-    boundary: CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>,
     next_location: u64,
 }
 
@@ -605,18 +596,15 @@ where
 }
 
 async fn build_state_upload<E, H, P, S>(
-    operation_cache: &Mutex<StateOperationCache<P>>,
     writer_next: u64,
     block: &EngineBlock<H, P>,
     state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
-) -> Result<PendingStateUpload<H, P>, PublishError>
+) -> Result<PendingStateUpload<P>, PublishError>
 where
     E: Storage + Clock + Metrics,
-    H: Hasher + Send + Sync + 'static,
-    H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
-    S: Strategy + Send + Sync + 'static,
-    AccountKey<P>: Send + Sync,
+    H: Hasher,
+    P: PublicKey,
+    S: Strategy,
 {
     if writer_next == 0 && block.header.height > 1 {
         return Err(PublishError::StoreEmptyPastGenesis {
@@ -633,99 +621,21 @@ where
             block_start: end,
         });
     }
-    let mut cache = operation_cache.lock().await;
-    extend_state_ops::<E, H, P, S>(&state, &mut cache, writer_next).await?;
     let delta = load_state_ops::<E, H, P, S>(&state, writer_next, end).await?;
-    let previous_update_locations = cache.index.previous_update_locations(&delta);
-    cache.append(delta.clone());
-    let boundary = state_boundary::<E, H, P, S>(
-        &state,
-        writer_next as usize,
-        &previous_update_locations,
-        &cache.operations,
-    )
-    .await?;
     Ok(PendingStateUpload {
         delta,
-        boundary,
         next_location: end,
     })
 }
 
-#[derive(Debug)]
-struct StateOperationCache<P>
-where
-    P: PublicKey,
-{
-    operations: Vec<StateOperation<P>>,
-    index: super::qmdb_boundary::BoundaryIndex<QmdbFamily>,
-}
-
-impl<P> StateOperationCache<P>
-where
-    P: PublicKey,
-{
-    fn new() -> Self {
-        Self {
-            operations: Vec::new(),
-            index: super::qmdb_boundary::BoundaryIndex::new(),
-        }
-    }
-
-    fn append(&mut self, operations: Vec<StateOperation<P>>) {
-        let start =
-            u64::try_from(self.operations.len()).expect("state operation cache length fits u64");
-        self.index.append(start, &operations);
-        self.operations.extend(operations);
-    }
-}
-
-async fn extend_state_ops<E, H, P, S>(
-    state: &commonware_storage::qmdb::current::unordered::fixed::Db<
-        QmdbFamily,
-        E,
-        AccountKey<P>,
-        Account,
-        H,
-        commonware_storage::translator::EightCap,
-        { STATE_BITMAP_CHUNK_BYTES },
-        S,
-    >,
-    cache: &mut StateOperationCache<P>,
-    end: u64,
-) -> Result<(), PublishError>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-    S: Strategy,
-{
-    let start =
-        u64::try_from(cache.operations.len()).expect("state operation cache length fits u64");
-    if start > end {
-        return Err(PublishError::WriterOutOfSync {
-            writer_next: start,
-            block_start: end,
-        });
-    }
-    if start == end {
-        return Ok(());
-    }
-
-    let operations = load_state_ops::<E, H, P, S>(state, start, end).await?;
-    cache.append(operations);
-    Ok(())
-}
-
 async fn load_state_ops<E, H, P, S>(
-    state: &commonware_storage::qmdb::current::unordered::fixed::Db<
+    state: &commonware_storage::qmdb::any::unordered::fixed::Db<
         QmdbFamily,
         E,
         AccountKey<P>,
         Account,
         H,
         commonware_storage::translator::EightCap,
-        { STATE_BITMAP_CHUNK_BYTES },
         S,
     >,
     start: u64,
@@ -742,7 +652,7 @@ where
         .and_then(NonZeroU64::new)
         .ok_or(QmdbError::EmptyBatch)?;
     let (_, operations) = state
-        .ops_historical_proof(Location::new(end), Location::new(start), count)
+        .historical_proof(Location::new(end), Location::new(start), count)
         .await
         .map_err(|err| QmdbError::CorruptData(format!("local state op proof: {err}")))?;
     Ok(operations
@@ -771,98 +681,6 @@ fn encode_account(account: Account) -> AccountValue {
     let mut out = [0u8; Account::SIZE];
     out.copy_from_slice(&bytes);
     FixedBytes::new(out)
-}
-
-async fn state_boundary<E, H, P, S>(
-    state: &commonware_storage::qmdb::current::unordered::fixed::Db<
-        QmdbFamily,
-        E,
-        AccountKey<P>,
-        Account,
-        H,
-        commonware_storage::translator::EightCap,
-        { STATE_BITMAP_CHUNK_BYTES },
-        S,
-    >,
-    previous_len: usize,
-    previous_update_locations: &[Location<QmdbFamily>],
-    operations: &[StateOperation<P>],
-) -> Result<CurrentBoundaryState<H::Digest, { STATE_BITMAP_CHUNK_BYTES }, QmdbFamily>, PublishError>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher + Send + Sync + 'static,
-    H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
-    S: Strategy + Send + Sync + 'static,
-    AccountKey<P>: Send + Sync,
-{
-    let ops_root_hasher = commonware_storage::qmdb::hasher::<H>();
-    let ops_root_witness = state
-        .ops_root_witness(&ops_root_hasher)
-        .await
-        .map_err(|err| QmdbError::CorruptData(format!("local state ops root witness: {err}")))?;
-    let pruned_chunks = state.sync_boundary().as_u64() / (STATE_BITMAP_CHUNK_BYTES as u64 * 8);
-    super::qmdb_boundary::recover_boundary_state::<
-        QmdbFamily,
-        H,
-        _,
-        { STATE_BITMAP_CHUNK_BYTES },
-        _,
-        _,
-    >(
-        previous_len,
-        previous_update_locations,
-        operations,
-        state.root(),
-        pruned_chunks,
-        ops_root_witness,
-        |location| async move { current_range_proof::<E, H, P, S>(state, location).await },
-    )
-    .await
-    .map_err(Into::into)
-}
-
-async fn current_range_proof<E, H, P, S>(
-    state: &commonware_storage::qmdb::current::unordered::fixed::Db<
-        QmdbFamily,
-        E,
-        AccountKey<P>,
-        Account,
-        H,
-        commonware_storage::translator::EightCap,
-        { STATE_BITMAP_CHUNK_BYTES },
-        S,
-    >,
-    location: Location<QmdbFamily>,
-) -> Result<
-    (
-        RangeProof<QmdbFamily, H::Digest>,
-        [u8; STATE_BITMAP_CHUNK_BYTES],
-    ),
-    QmdbError,
->
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    P: PublicKey,
-    S: Strategy,
-{
-    let hasher = commonware_storage::qmdb::hasher::<H>();
-    let (proof, mut proof_ops, mut chunks) = state
-        .range_proof(&hasher, location, NonZeroU64::MIN)
-        .await
-        .map_err(|err| QmdbError::CorruptData(format!("local state range proof: {err}")))?;
-    proof_ops.pop().ok_or_else(|| {
-        QmdbError::CorruptData(format!(
-            "local state range proof at {location} returned no operations"
-        ))
-    })?;
-    let chunk = chunks.pop().ok_or_else(|| {
-        QmdbError::CorruptData(format!(
-            "local state range proof at {location} returned no chunks"
-        ))
-    })?;
-    Ok((proof, chunk))
 }
 
 fn build_transaction_upload<H, P>(

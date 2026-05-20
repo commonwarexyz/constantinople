@@ -32,8 +32,6 @@ where
         height: 0,
         timestamp,
         state_root: state_target.root,
-        state_ops_root: state_target.ops_root,
-        state_ops_witness: state_target.witness,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transactions_target.root,
         transactions_range: non_empty_range!(0, *transactions_target.leaf_count),

@@ -20,7 +20,6 @@ commonware-utils.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
-commonware-storage.workspace = true
 
 # Other
 bytes.workspace = true
@@ -47,7 +46,6 @@ arbitrary = [
 	"commonware-consensus/arbitrary",
 	"commonware-cryptography/arbitrary",
 	"commonware-math/arbitrary",
-	"commonware-storage/arbitrary",
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",
 ]

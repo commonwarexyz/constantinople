@@ -215,18 +215,6 @@ where
         reject_verify(header.height, "state_root_mismatch");
         return false;
     }
-    if execution.state.ops_root() != header.state_ops_root {
-        reject_verify(header.height, "state_ops_root_mismatch");
-        return false;
-    }
-    let hasher = commonware_storage::qmdb::hasher::<H>();
-    if !header
-        .state_ops_witness
-        .verify(&hasher, &header.state_ops_root, &header.state_root)
-    {
-        reject_verify(header.height, "state_ops_witness_mismatch");
-        return false;
-    }
     if execution.state_sync_range != header.state_range {
         reject_verify(header.height, "state_range_mismatch");
         return false;
@@ -295,7 +283,7 @@ where
         .await
         .expect(expect_message);
     let finalize_ms = finalize_started_at.elapsed().as_millis();
-    let state_sync_range = full_range_from_bounds(state.bounds());
+    let state_sync_range = range_from_bounds(state.bounds());
     let transactions_range = range_from_bounds(transactions.bounds());
 
     BlockExecution {
@@ -315,13 +303,6 @@ where
     non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
 }
 
-fn full_range_from_bounds<F>(bounds: &Bounds<F>) -> commonware_utils::range::NonEmptyRange<u64>
-where
-    F: Family,
-{
-    non_empty_range!(0, bounds.total_size)
-}
-
 fn transfer_digests<P, H>(transfers: &[PreparedTransfer<P, H>]) -> Vec<H::Digest>
 where
     H: Hasher,
@@ -332,7 +313,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{full_range_from_bounds, range_from_bounds};
+    use super::range_from_bounds;
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
 
@@ -347,18 +328,5 @@ mod tests {
         };
 
         assert_eq!(range_from_bounds(&bounds), non_empty_range!(11, 15));
-    }
-
-    #[test]
-    fn full_range_keeps_current_state_rewind_targets_stable() {
-        let bounds = Bounds {
-            base_size: 7,
-            db_size: 9,
-            total_size: 15,
-            ancestors: Vec::new(),
-            inactivity_floor: mmr::Location::new(11),
-        };
-
-        assert_eq!(full_range_from_bounds(&bounds), non_empty_range!(0, 15));
     }
 }

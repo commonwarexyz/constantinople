@@ -22,7 +22,7 @@ use commonware_storage::{
     merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
     mmr,
     qmdb::{
-        current::{FixedConfig, unordered::fixed},
+        any::{FixedConfig, unordered::fixed},
         keyless::fixed as keyless_fixed,
     },
     translator::EightCap,
@@ -30,9 +30,7 @@ use commonware_storage::{
 use commonware_utils::{
     Faults, NZU16, NZU64, NZUsize, non_empty_range, sequence::U64, sync::AsyncRwLock,
 };
-use constantinople_application::consensus::{
-    Application, STATE_BITMAP_CHUNK_BYTES, TransactionHistoryDb,
-};
+use constantinople_application::consensus::{Application, TransactionHistoryDb};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
     Account, AccountKey, Block, BlockCfg, Header, Sealable, SealedBlock, Signable,
@@ -69,7 +67,6 @@ type TestStateDb = fixed::Db<
     Account,
     TestHasher,
     EightCap,
-    STATE_BITMAP_CHUNK_BYTES,
     Rayon,
 >;
 type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
@@ -588,8 +585,6 @@ async fn parent_block(leader: TestPublicKey, databases: &TestDatabases) -> TestB
         height: 0,
         timestamp: 0,
         state_root: state_target.root,
-        state_ops_root: state_target.ops_root,
-        state_ops_witness: state_target.witness,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transaction_target.root,
         transactions_range: non_empty_range!(0, *transaction_target.leaf_count),
@@ -632,7 +627,6 @@ fn state_db_config(
             page_cache,
             write_buffer: WRITE_BUFFER,
         },
-        grafted_metadata_partition: format!("{prefix}-state-grafted-metadata"),
         translator: EightCap,
     }
 }

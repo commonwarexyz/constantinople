@@ -5,7 +5,7 @@ use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey, certific
 use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
-use commonware_storage::{mmr, qmdb::current::sync::Target as CurrentTarget, translator::EightCap};
+use commonware_storage::{mmr, qmdb::any::sync::Target as AnyTarget, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
@@ -34,10 +34,8 @@ where
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
-            CurrentTarget::new(
+            AnyTarget::new(
                 block.header.state_root,
-                block.header.state_ops_root,
-                block.header.state_ops_witness.clone(),
                 non_empty_range!(
                     mmr::Location::new(block.header.state_range.start()),
                     mmr::Location::new(block.header.state_range.end())

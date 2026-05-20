@@ -2,7 +2,7 @@
 
 use crate::executor::Changeset;
 use commonware_cryptography::{Hasher, PublicKey};
-use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, current::CurrentUnmerkleized};
+use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, any::AnyUnmerkleized};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
@@ -11,10 +11,11 @@ use commonware_storage::{
     mmr,
     qmdb::{
         any::{
-            operation::Operation as AnyOperation, unordered::Update as UnorderedUpdate,
+            operation::Operation as AnyOperation,
+            sync::Target as AnyTarget,
+            unordered::{Update as UnorderedUpdate, fixed},
             value::FixedEncoding,
         },
-        current::{sync::Target as CurrentTarget, unordered::fixed},
         keyless::fixed as keyless_fixed,
         sync::compact::Target as CompactTarget,
     },
@@ -24,14 +25,9 @@ use commonware_utils::sync::AsyncRwLock;
 use constantinople_primitives::{Account, AccountKey};
 use std::sync::Arc;
 
-pub const STATE_BITMAP_CHUNK_BYTES: usize = 64;
-
 /// Shared QMDB handle for the application state database.
-pub type StateDatabase<E, H, P, T, S> = Arc<
-    AsyncRwLock<
-        fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, STATE_BITMAP_CHUNK_BYTES, S>,
-    >,
->;
+pub type StateDatabase<E, H, P, T, S> =
+    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, T, S>>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -39,7 +35,7 @@ pub type TransactionHistoryDb<E, H, S> =
 pub type TransactionHistoryOperation<H> =
     keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
 
-pub type StateSyncTarget<D> = CurrentTarget<mmr::Family, D>;
+pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
@@ -49,7 +45,7 @@ pub type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistoryDb<E, 
 pub type Databases<E, H, P, T, S> = (StateDatabase<E, H, P, T, S>, TransactionDatabase<E, H, S>);
 
 /// Unmerkleized application state batch used for executor read-through.
-pub(super) type StateBatch<E, H, P, T, S> = CurrentUnmerkleized<
+pub(super) type StateBatch<E, H, P, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
     FixedJournal<
@@ -59,7 +55,6 @@ pub(super) type StateBatch<E, H, P, T, S> = CurrentUnmerkleized<
     UnorderedIndex<T, mmr::Location>,
     H,
     UnorderedUpdate<AccountKey<P>, FixedEncoding<Account>>,
-    STATE_BITMAP_CHUNK_BYTES,
     S,
 >;
 

@@ -46,7 +46,7 @@ use commonware_storage::{
     archive::{prunable, prunable::Archive as PrunableArchive},
     journal::contiguous::fixed::Config as FixedJournalConfig,
     merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
-    qmdb::{current::FixedConfig, keyless::fixed as keyless_fixed},
+    qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, union};
@@ -432,7 +432,7 @@ where
                     transaction_db_config,
                 ),
                 input_provider: config.input,
-                marshal: EngineBlockProvider::from(marshal_mailbox.clone()),
+                marshal: marshal_mailbox.clone(),
                 mailbox_size: MAILBOX_SIZE.get(),
                 partition_prefix: format!("{}_stateful", config.partition_prefix),
                 startup: config.startup,
@@ -687,7 +687,6 @@ where
             page_cache: page_cache.clone(),
             write_buffer: DB_WRITE_BUFFER,
         },
-        grafted_metadata_partition: format!("{partition_prefix}-state-grafted-metadata"),
         translator: EightCap,
     }
 }

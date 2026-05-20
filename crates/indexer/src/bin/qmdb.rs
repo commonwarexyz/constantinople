@@ -11,11 +11,11 @@ use commonware_cryptography::{ed25519::PublicKey, sha256::Sha256};
 use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
-use constantinople_application::consensus::STATE_BITMAP_CHUNK_BYTES;
 use constantinople_indexer::publisher::qmdb::{state_qmdb_client, transactions_qmdb_client};
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::{
-    KeylessClient, UnorderedClient, keyless_operation_log_connect_stack, unordered_connect_stack,
+    KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
+    unordered_operation_log_connect_stack,
 };
 use exoware_sdk::StoreClient;
 use serde::Deserialize;
@@ -144,10 +144,7 @@ fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send
 
     Ok(Router::new()
         .route("/health", get(health))
-        .nest_service(
-            "/state",
-            unordered_connect_stack::<_, _, _, _, { STATE_BITMAP_CHUNK_BYTES }, _>(state),
-        )
+        .nest_service("/state", unordered_operation_log_connect_stack(state))
         .nest_service(
             "/transactions",
             keyless_operation_log_connect_stack(transactions),
@@ -301,7 +298,7 @@ mod tests {
         assert_eq!(&body[..], b"ok");
 
         for path in [
-            "/state/qmdb.v1.KeyLookupService/Get",
+            "/state/qmdb.v1.OperationLogService/GetOperationRange",
             "/transactions/qmdb.v1.OperationLogService/GetOperationRange",
         ] {
             let response = app

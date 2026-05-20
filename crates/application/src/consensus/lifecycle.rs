@@ -94,8 +94,6 @@ where
             height: parent.header.height + 1,
             timestamp: time::timestamp_ms(&runtime),
             state_root: execution.block.state.root(),
-            state_ops_root: execution.block.state.ops_root(),
-            state_ops_witness: execution.block.state.ops_root_witness(),
             state_range: execution.block.state_sync_range.clone(),
             transactions_root: execution.block.transactions.root(),
             transactions_range: execution.block.transactions_range.clone(),

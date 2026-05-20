@@ -8,26 +8,22 @@ use crate::ThresholdScheme;
 use commonware_actor::Feedback;
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
-    CertifiableBlock, Heightable, Reporter, Reporters,
+    Reporter, Reporters,
     marshal::{
-        ancestry::BlockProvider,
         coding::{Coding, Marshaled, shards, types::StoredCodedBlock},
-        core::{
-            CommitmentFallback, DigestFallback, Mailbox as MarshalMailbox,
-            Variant as MarshalVariant,
-        },
+        core::Mailbox as MarshalMailbox,
     },
     simplex::{self, types::Finalization},
     types::{Epoch, FixedEpocher, coding::Commitment},
 };
 use commonware_cryptography::{
-    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
+    PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
 };
 use commonware_glue::stateful::Stateful;
-use commonware_storage::{mmr, qmdb::current::unordered::fixed, translator::EightCap};
+use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
 use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
-    Application, STATE_BITMAP_CHUNK_BYTES, TransactionHistoryDb, TransactionHistoryOperation,
+    Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
 use constantinople_primitives::{Account, AccountKey, Block, Sealed};
 use std::{marker::PhantomData, sync::Arc};
@@ -40,71 +36,6 @@ pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
 pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
-
-/// Block provider backed by the engine marshal mailbox.
-#[derive(Clone)]
-pub(crate) struct EngineBlockProvider<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    mailbox: EngineMarshalMailbox<H, P, V>,
-}
-
-impl<H, P, V> From<EngineMarshalMailbox<H, P, V>> for EngineBlockProvider<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    fn from(mailbox: EngineMarshalMailbox<H, P, V>) -> Self {
-        Self { mailbox }
-    }
-}
-
-impl<H, P, V> From<EngineBlockProvider<H, P, V>> for EngineMarshalMailbox<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    fn from(provider: EngineBlockProvider<H, P, V>) -> Self {
-        provider.mailbox
-    }
-}
-
-impl<H, P, V> BlockProvider for EngineBlockProvider<H, P, V>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-{
-    type Block = EngineBlock<H, P>;
-
-    async fn subscribe(self, digest: H::Digest) -> Option<Self::Block> {
-        self.mailbox
-            .subscribe_by_digest(digest, DigestFallback::Wait)
-            .await
-            .ok()
-            .map(<EngineVariant<H, P> as MarshalVariant>::into_inner)
-    }
-
-    async fn subscribe_parent(self, block: Self::Block) -> Option<Self::Block> {
-        let parent_height = block.height().previous()?;
-        let commitment = block.context().parent.1;
-        self.mailbox
-            .subscribe_by_commitment(
-                commitment,
-                CommitmentFallback::FetchByCommitment {
-                    height: parent_height,
-                },
-            )
-            .await
-            .ok()
-            .map(<EngineVariant<H, P> as MarshalVariant>::into_inner)
-    }
-}
 
 /// A finalization certificate over the engine's threshold scheme.
 pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;
@@ -152,8 +83,7 @@ where
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, P, T> =
-    fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, EightCap, STATE_BITMAP_CHUNK_BYTES, T>;
+pub type StateDb<E, H, P, T> = fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, EightCap, T>;
 
 pub type StateSyncDb<E, H, P, T> = Arc<AsyncRwLock<StateDb<E, H, P, T>>>;
 
@@ -201,7 +131,7 @@ pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, E
 pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
     E,
     App<E, H, P, V, I, B, SigT, HashT>,
-    EngineBlockProvider<H, P, V>,
+    EngineMarshalMailbox<H, P, V>,
     (
         StateResolverMailbox<E, H, P, HashT>,
         TransactionResolverMailbox<E, H, HashT>,

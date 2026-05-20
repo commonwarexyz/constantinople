@@ -65,12 +65,6 @@ fn build_block(height: u64, tx_count: usize, seed: u64) -> TestBlock {
         height,
         timestamp: 1_000 + height,
         state_root: sha256::Digest::EMPTY,
-        state_ops_root: sha256::Digest::EMPTY,
-        state_ops_witness: commonware_storage::qmdb::current::proof::OpsRootWitness {
-            grafted_root: sha256::Digest::EMPTY,
-            pending_chunk_digest: Default::default(),
-            partial_chunk: None,
-        },
         state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
         transactions_root: sha256::Digest::EMPTY,
         transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
