@@ -4,14 +4,19 @@ export interface ConfigureCertificateVerifierRequest {
     readonly simplexVerificationMaterial: string;
 }
 
-export interface VerifyBlockCertificatesRequest {
-    readonly kind: 'verify';
-    readonly heights: readonly number[];
+export interface WatchBlockCertificatesRequest {
+    readonly kind: 'watch';
+    readonly blocks: readonly WatchedBlockCertificate[];
 }
 
 export type CertificateWorkerRequest =
     | ConfigureCertificateVerifierRequest
-    | VerifyBlockCertificatesRequest;
+    | WatchBlockCertificatesRequest;
+
+export interface WatchedBlockCertificate {
+    readonly height: number;
+    readonly digest: Uint8Array;
+}
 
 export type CertificateWorkerResponse =
     | {

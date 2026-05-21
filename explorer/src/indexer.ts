@@ -18,6 +18,7 @@ import { collectLiveBlocks, createBlockSequenceCursor } from './blockSequence';
 
 /** `block_meta` column names (mirror `crates/indexer/src/sql_schema.rs`). */
 const COL_HEIGHT = 'height';
+const COL_DIGEST = 'digest';
 const COL_TX_COUNT = 'tx_count';
 
 /** The SQL table the explorer subscribes to. */
@@ -28,6 +29,8 @@ const NETWORK_RECONNECT_DELAY_MS = 5_000;
 export interface ObservedBlock {
     /** Finalized block height the row corresponds to. */
     readonly height: bigint;
+    /** Finalized block digest certified by Simplex. */
+    readonly digest: Uint8Array;
     /** Number of transactions contained in the block. */
     readonly txCount: number;
     /** Wall-clock arrival time on this client, in epoch milliseconds. */
@@ -124,8 +127,9 @@ export async function* subscribeBlocks(
  */
 function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
     const heightIdx = frame.columns.indexOf(COL_HEIGHT);
+    const digestIdx = frame.columns.indexOf(COL_DIGEST);
     const txCountIdx = frame.columns.indexOf(COL_TX_COUNT);
-    if (heightIdx < 0 || txCountIdx < 0) {
+    if (heightIdx < 0 || digestIdx < 0 || txCountIdx < 0) {
         // Server schema diverged from the explorer's compile-time
         // expectations — surface as zero rows so the UI keeps streaming
         // (rather than crashing) until the schema is rolled forward.
@@ -135,14 +139,20 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
     const blocks: ObservedBlock[] = [];
     for (const row of frame.rows) {
         const heightCell = row.cells[heightIdx];
+        const digestCell = row.cells[digestIdx];
         const txCountCell = row.cells[txCountIdx];
-        if (typeof heightCell !== 'bigint' || typeof txCountCell !== 'bigint') {
+        if (
+            typeof heightCell !== 'bigint' ||
+            !(digestCell instanceof Uint8Array) ||
+            typeof txCountCell !== 'bigint'
+        ) {
             continue;
         }
         // `block_meta.tx_count` is u64; Number() is safe for any realistic
         // block (Number.MAX_SAFE_INTEGER is 2^53 - 1, far above per-block tx counts).
         blocks.push({
             height: heightCell,
+            digest: digestCell,
             txCount: Number(txCountCell),
             arrivedAt,
             sequence: frame.sequenceNumber,

@@ -220,6 +220,56 @@ pub fn verify_finalization(
     Ok(result.into())
 }
 
+/// Verifies a Simplex finalization certificate against an expected block digest.
+///
+/// This intentionally does not decode the finalized block body appended after
+/// the certified commitment. The live explorer already has the block digest in
+/// `block_meta`, and decoding thousands of transactions per block just to draw
+/// a certificate checkmark would put certificate work back on the hot path.
+#[wasm_bindgen(js_name = verifyBlockCertificate)]
+pub fn verify_block_certificate(
+    verification_material: &[u8],
+    finalized_artifact: &[u8],
+    expected_block_digest: &[u8],
+) -> Result<JsValue, JsError> {
+    let identity = simplex_identity(verification_material)?;
+    let expected_block_digest = decode_digest(expected_block_digest, "expected block digest")?;
+
+    let scheme = ConsensusScheme::certificate_verifier(CONSENSUS_NAMESPACE, identity);
+    let mut reader = finalized_artifact;
+    let proof = Finalization::<ConsensusScheme, Commitment>::read_cfg(
+        &mut reader,
+        &scheme.certificate_codec_config(),
+    )
+    .map_err(|error| JsError::new(&format!("failed to decode finalization proof: {error}")))?;
+    let mut rng = StdRng::seed_from_u64(0);
+    if !proof.verify(&mut rng, &scheme, &Sequential) {
+        return Err(JsError::new("finalization certificate verification failed"));
+    }
+
+    let commitment = Commitment::read(&mut reader).map_err(|error| {
+        JsError::new(&format!("failed to decode certified commitment: {error}"))
+    })?;
+    if proof.proposal.payload != commitment {
+        return Err(JsError::new(
+            "finalization payload does not match certified commitment",
+        ));
+    }
+    if commitment.block::<sha256::Digest>() != expected_block_digest {
+        return Err(JsError::new(
+            "certified commitment does not match block metadata digest",
+        ));
+    }
+
+    let result = Object::new();
+    set(
+        &result,
+        "view",
+        BigInt::from(proof.proposal.round.view().get()).into(),
+    )?;
+    Ok(result.into())
+}
+
 fn simplex_identity(verification_material: &[u8]) -> Result<<MinSig as Variant>::Public, JsError> {
     let mut identity_bytes = verification_material;
     match <MinSig as Variant>::Public::read(&mut identity_bytes) {

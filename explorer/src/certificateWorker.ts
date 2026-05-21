@@ -1,31 +1,33 @@
-import { SimplexClient } from '@exowarexyz/simplex';
-import initCrypto, { verifyFinalization } from './crypto-wasm/constantinople_explorer_crypto';
+import { SimplexClient, SimplexRecordKind } from '@exowarexyz/simplex';
+import initCrypto, { verifyBlockCertificate } from './crypto-wasm/constantinople_explorer_crypto';
 import type {
     CertificateWorkerRequest,
     CertificateWorkerResponse,
+    WatchedBlockCertificate,
 } from './certificateWorkerTypes';
 
-const RETRY_DELAY_MS = 1_000;
-const MAX_PENDING_HEIGHTS = 512;
+const STREAM_RETRY_DELAY_MS = 1_000;
+const RAW_CACHE_LIMIT = 4_096;
 
 interface CertificateWorkerConfig {
     readonly storeUrl: string;
     readonly simplexVerificationMaterial: string;
-    readonly simplex: SimplexClient;
 }
 
 interface FinalizedTransactionTarget {
-    readonly height: bigint;
     readonly view: bigint;
 }
 
+const wanted = new Map<number, Uint8Array>();
 const verified = new Set<number>();
-const pending = new Set<number>();
-const queued: number[] = [];
-const retryTimers = new Map<number, number>();
+const queued = new Set<number>();
+const rawByHeight = new Map<number, Uint8Array>();
+const verifyQueue: number[] = [];
 let cryptoReady: Promise<unknown> | null = null;
 let config: CertificateWorkerConfig | null = null;
-let processing = false;
+let streamController: AbortController | null = null;
+let streamRetryTimer: number | null = null;
+let verifying = false;
 
 const workerScope = self as unknown as {
     onmessage: ((event: MessageEvent<CertificateWorkerRequest>) => void) | null;
@@ -37,59 +39,120 @@ const workerScope = self as unknown as {
 workerScope.onmessage = (event) => {
     const request = event.data;
     if (request.kind === 'configure') {
-        configure(request.storeUrl, request.simplexVerificationMaterial);
+        configure({
+            storeUrl: request.storeUrl,
+            simplexVerificationMaterial: request.simplexVerificationMaterial,
+        });
         return;
     }
 
-    enqueueHeights(request.heights);
+    watchBlocks(request.blocks);
 };
 
-function configure(storeUrl: string, simplexVerificationMaterial: string) {
-    config = {
-        storeUrl,
-        simplexVerificationMaterial,
-        simplex: new SimplexClient(trimTrailingSlash(storeUrl)),
-    };
+function configure(nextConfig: CertificateWorkerConfig) {
+    config = nextConfig;
+    wanted.clear();
     verified.clear();
-    pending.clear();
-    queued.length = 0;
-    for (const timer of retryTimers.values()) {
-        workerScope.clearTimeout(timer);
+    queued.clear();
+    rawByHeight.clear();
+    verifyQueue.length = 0;
+    verifying = false;
+
+    streamController?.abort();
+    streamController = null;
+    if (streamRetryTimer !== null) {
+        workerScope.clearTimeout(streamRetryTimer);
+        streamRetryTimer = null;
     }
-    retryTimers.clear();
+    startStream(nextConfig);
 }
 
-function enqueueHeights(heights: readonly number[]) {
-    for (const height of heights) {
-        enqueueHeight(height);
+function watchBlocks(blocks: readonly WatchedBlockCertificate[]) {
+    for (const block of blocks) {
+        const { height, digest } = block;
+        if (!Number.isSafeInteger(height) || height < 0 || digest.length !== 32) continue;
+        if (verified.has(height)) continue;
+        wanted.set(height, digest);
+        if (rawByHeight.has(height)) {
+            enqueueVerification(height);
+        }
     }
-    queued.sort((left, right) => right - left);
-    while (queued.length > MAX_PENDING_HEIGHTS) {
-        pending.delete(queued.pop() ?? 0);
-    }
-    scheduleProcessing();
+    scheduleVerification();
 }
 
-function enqueueHeight(height: number) {
-    if (!Number.isSafeInteger(height) || height < 0) return;
-    if (verified.has(height) || pending.has(height)) return;
-    pending.add(height);
-    queued.push(height);
+function startStream(activeConfig: CertificateWorkerConfig) {
+    streamController = new AbortController();
+    void runStream(activeConfig, streamController.signal);
 }
 
-function scheduleProcessing() {
-    if (processing) return;
-    processing = true;
-    void processQueue();
-}
-
-async function processQueue() {
-    for (;;) {
-        const height = queued.shift();
-        if (height === undefined) {
-            processing = false;
+async function runStream(activeConfig: CertificateWorkerConfig, signal: AbortSignal) {
+    try {
+        await loadCrypto();
+        const simplex = new SimplexClient(trimTrailingSlash(activeConfig.storeUrl));
+        for await (const batch of simplex.subscribeRaw(
+            SimplexRecordKind.FinalizedByHeight,
+            {},
+            { signal },
+        )) {
+            for (const entry of batch.entries) {
+                if (entry.type !== 'finalization' || entry.index !== 'height') continue;
+                const height = Number(entry.height);
+                if (!Number.isSafeInteger(height) || height < 0 || verified.has(height)) continue;
+                rememberRawFinalization(height, entry.finalized);
+            if (wanted.has(height)) {
+                enqueueVerification(height);
+            }
+            }
+            scheduleVerification();
+        }
+        if (!signal.aborted) {
+            scheduleStreamRetry(activeConfig);
+        }
+    } catch (error) {
+        if (signal.aborted) return;
+        const detail = error instanceof Error ? error.message : String(error);
+        if (!isRetryableCertificateError(detail)) {
+            workerScope.postMessage({ kind: 'error', height: 0, detail });
             return;
         }
+        scheduleStreamRetry(activeConfig);
+    }
+}
+
+function rememberRawFinalization(height: number, finalized: Uint8Array) {
+    rawByHeight.set(height, finalized);
+    while (rawByHeight.size > RAW_CACHE_LIMIT) {
+        let evicted = false;
+        for (const cachedHeight of rawByHeight.keys()) {
+            if (wanted.has(cachedHeight) && !verified.has(cachedHeight)) continue;
+            rawByHeight.delete(cachedHeight);
+            evicted = true;
+            break;
+        }
+        if (!evicted) return;
+    }
+}
+
+function enqueueVerification(height: number) {
+    if (verified.has(height) || queued.has(height)) return;
+    queued.add(height);
+    verifyQueue.push(height);
+}
+
+function scheduleVerification() {
+    if (verifying) return;
+    verifying = true;
+    void processVerificationQueue();
+}
+
+async function processVerificationQueue() {
+    for (;;) {
+        const height = verifyQueue.shift();
+        if (height === undefined) {
+            verifying = false;
+            return;
+        }
+        queued.delete(height);
         await verifyHeight(height);
         await yieldToWorker();
     }
@@ -97,57 +160,39 @@ async function processQueue() {
 
 async function verifyHeight(height: number) {
     const activeConfig = config;
-    if (!activeConfig) {
-        pending.delete(height);
-        return;
-    }
+    const finalized = rawByHeight.get(height);
+    const expectedDigest = wanted.get(height);
+    if (!activeConfig || !finalized || !expectedDigest || verified.has(height)) return;
 
     try {
-        await loadCrypto();
-        const finalized = await activeConfig.simplex.getFinalizationByHeightRaw(BigInt(height));
-        if (!finalized) {
-            retryHeight(height);
-            return;
-        }
-
-        const target = verifyFinalization(
+        const target = verifyBlockCertificate(
             fromHex(activeConfig.simplexVerificationMaterial),
             finalized,
+            expectedDigest,
         ) as FinalizedTransactionTarget;
-        const verifiedHeight = Number(target.height);
-        verified.add(verifiedHeight);
-        pending.delete(height);
-        pending.delete(verifiedHeight);
+        verified.add(height);
+        wanted.delete(height);
+        rawByHeight.delete(height);
         workerScope.postMessage({
             kind: 'verified',
-            height: verifiedHeight,
+            height,
             view: target.view.toString(),
         });
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
-        if (isRetryableCertificateError(detail)) {
-            retryHeight(height);
-            return;
-        }
-
-        pending.delete(height);
+        wanted.delete(height);
+        rawByHeight.delete(height);
         workerScope.postMessage({ kind: 'error', height, detail });
     }
 }
 
-function retryHeight(height: number) {
-    if (!pending.has(height) || retryTimers.has(height)) return;
-    const timer = workerScope.setTimeout(() => {
-        retryTimers.delete(height);
-        if (!pending.has(height) || verified.has(height)) {
-            pending.delete(height);
-            return;
-        }
-        queued.push(height);
-        queued.sort((left, right) => right - left);
-        scheduleProcessing();
-    }, RETRY_DELAY_MS);
-    retryTimers.set(height, timer);
+function scheduleStreamRetry(activeConfig: CertificateWorkerConfig) {
+    if (streamRetryTimer !== null) return;
+    streamRetryTimer = workerScope.setTimeout(() => {
+        streamRetryTimer = null;
+        if (config !== activeConfig) return;
+        startStream(activeConfig);
+    }, STREAM_RETRY_DELAY_MS);
 }
 
 async function loadCrypto() {

@@ -7,8 +7,8 @@ import {
 } from './codec';
 import {
     configureCertificateVerification,
-    requestCertificateVerification,
     subscribeCertificateVerification,
+    watchBlockCertificates,
 } from './certificateClient';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
@@ -162,6 +162,7 @@ export default function App() {
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const pendingCertificatesRef = useRef<CertificateUpdate[]>([]);
     const certificateFlushTimeoutRef = useRef<number | null>(null);
+    const requestedCertificateHeightsRef = useRef<Set<number>>(new Set());
     const copiedValueTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isWalletBusy =
@@ -171,9 +172,24 @@ export default function App() {
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInPublicKey = wallet?.publicKeyHex ?? null;
 
+    const watchCertificatesForBlocks = (blocks: Iterable<ObservedBlock>) => {
+        if (!verifyCertificates) return;
+
+        const next: { height: number; digest: Uint8Array }[] = [];
+        for (const block of blocks) {
+            const height = Number(block.height);
+            if (!Number.isSafeInteger(height) || height < 0) continue;
+            if (requestedCertificateHeightsRef.current.has(height)) continue;
+            requestedCertificateHeightsRef.current.add(height);
+            next.push({ height, digest: block.digest });
+        }
+        watchBlockCertificates(next);
+    };
+
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
 
+        watchCertificatesForBlocks(nextBlocks);
         pendingBlocksRef.current.push(...nextBlocks);
         if (blockFlushTimeoutRef.current !== null) return;
 
@@ -231,8 +247,37 @@ export default function App() {
 
     useEffect(() => {
         if (!verifyCertificates) return;
-        requestCertificateVerification(certificateVerificationHeights(blocks, history, blockCertificates));
-    }, [blocks, history, blockCertificates]);
+        return subscribeCertificateVerification((response) => {
+            if (response.height === 0) return;
+            if (response.kind === 'verified') {
+                const certificate = {
+                    status: 'verified',
+                    detail: `verified at height ${response.height}`,
+                    height: String(response.height),
+                    view: response.view,
+                } satisfies BlockCertificateState;
+                queueCertificateUpdate({
+                    height: response.height,
+                    certificate,
+                });
+                setHistory((current) =>
+                    updateBlockCertificateByHeight(response.height, certificate, current),
+                );
+                return;
+            }
+            const certificate = {
+                status: 'error',
+                detail: response.detail,
+            } satisfies BlockCertificateState;
+            queueCertificateUpdate({
+                height: response.height,
+                certificate,
+            });
+            setHistory((current) =>
+                updateBlockCertificateByHeight(response.height, certificate, current),
+            );
+        });
+    }, []);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -271,29 +316,6 @@ export default function App() {
     useEffect(() => {
         setBlockCertificates((current) => pruneBlockCertificates(blocks, current));
     }, [blocks]);
-
-    useEffect(() => {
-        if (!verifyCertificates) return;
-        return subscribeCertificateVerification((response) => {
-            if (response.height === 0) return;
-            if (response.kind === 'verified') {
-                queueCertificateUpdate({
-                    height: response.height,
-                    certificate: {
-                        status: 'verified',
-                        detail: `verified at height ${response.height}`,
-                        height: String(response.height),
-                        view: response.view,
-                    },
-                });
-                return;
-            }
-            queueCertificateUpdate({
-                height: response.height,
-                certificate: { status: 'error', detail: response.detail },
-            });
-        });
-    }, []);
 
     useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
@@ -1171,37 +1193,23 @@ function updateBlockCertificateByHeight(
     certificate: BlockCertificateState,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return current.map((tx) => (tx.finalizedHeight === height ? { ...tx, certificate } : tx));
+    let changed = false;
+    const next = current.map((tx) => {
+        if (tx.finalizedHeight !== height) return tx;
+        if (sameBlockCertificate(tx.certificate, certificate)) return tx;
+        changed = true;
+        return { ...tx, certificate };
+    });
+    return changed ? next : current;
 }
 
-function certificateVerificationHeights(
-    blocks: readonly ObservedBlock[],
-    history: readonly SubmittedTransaction[],
-    certificates: BlockCertificateByHeight,
-): number[] {
-    const heights = new Set<number>();
-    for (const block of blocks) {
-        const height = Number(block.height);
-        if (!Number.isSafeInteger(height)) continue;
-        if (shouldVerifyCertificate(blockCertificateForHeight(block.height, certificates))) {
-            heights.add(height);
-        }
-    }
-    for (const tx of history) {
-        if (tx.finalizedHeight === null) continue;
-        if (shouldVerifyCertificate(tx.certificate)) {
-            heights.add(tx.finalizedHeight);
-        }
-    }
-    return [...heights].sort((left, right) => right - left);
-}
-
-function shouldVerifyCertificate(certificate: BlockCertificateState): boolean {
-    return (
-        certificate.status === 'waiting' ||
-        certificate.status === 'fetching' ||
-        (certificate.status === 'error' && isRetryableCertificateError(certificate.detail))
-    );
+function sameBlockCertificate(
+    left: BlockCertificateState,
+    right: BlockCertificateState,
+): boolean {
+    if (left.status !== right.status || left.detail !== right.detail) return false;
+    if (left.status !== 'verified' || right.status !== 'verified') return true;
+    return left.height === right.height && left.view === right.view;
 }
 
 function shouldFetchTransactionProof(
@@ -1229,12 +1237,6 @@ function hasFetchingProof(
 
 function isRetryableProofError(detail: string): boolean {
     return /tx_meta missing|finalization missing|QMDB transaction proof response missing|failed to decode Simplex identity|failed to decode Simplex verification material|Simplex verification material contains trailing bytes|out_of_range|unavailable|fetch/i.test(
-        detail,
-    );
-}
-
-function isRetryableCertificateError(detail: string): boolean {
-    return /finalization missing|not found|missing proof|failed to decode Simplex identity|failed to decode Simplex verification material|Simplex verification material contains trailing bytes|out_of_range|unavailable|fetch/i.test(
         detail,
     );
 }

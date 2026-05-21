@@ -1,6 +1,7 @@
 import type {
     CertificateWorkerRequest,
     CertificateWorkerResponse,
+    WatchedBlockCertificate,
 } from './certificateWorkerTypes';
 
 type CertificateListener = (response: CertificateWorkerResponse) => void;
@@ -28,11 +29,11 @@ export function configureCertificateVerification({
     getCertificateWorker().postMessage(request);
 }
 
-export function requestCertificateVerification(heights: readonly number[]) {
-    if (heights.length === 0) return;
+export function watchBlockCertificates(blocks: readonly WatchedBlockCertificate[]) {
+    if (blocks.length === 0) return;
     getCertificateWorker().postMessage({
-        kind: 'verify',
-        heights,
+        kind: 'watch',
+        blocks,
     } satisfies CertificateWorkerRequest);
 }
 
