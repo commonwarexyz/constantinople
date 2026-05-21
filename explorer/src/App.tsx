@@ -48,10 +48,10 @@ type Status =
     | { kind: 'live' }
     | { kind: 'error'; message: string };
 
-// The explorer subscribes to the `metadata-indexer` service (`block_meta`)
-// and reads from no other store. The default port matches
-// `--metadata-indexer-port` in `bin/deploy/src/local.rs`; override via
-// `VITE_SQL_URL` for non-default deployments.
+// The explorer subscribes to `metadata-indexer` for block rows and queries
+// `qmdb-indexer` for submitted-transaction proofs. Defaults match
+// `bin/deploy/src/local.rs`; override via `VITE_SQL_URL` and `VITE_QMDB_URL`
+// for non-default deployments.
 const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
 const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';

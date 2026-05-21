@@ -650,12 +650,11 @@ async fn cleanup_partitions(runtime: &RuntimeContext, prefix: &str) {
     }
 }
 
-fn partition_names(prefix: &str) -> [String; 5] {
+fn partition_names(prefix: &str) -> [String; 4] {
     [
         format!("{prefix}-state-journal"),
         format!("{prefix}-state-metadata"),
         format!("{prefix}-state-log"),
-        format!("{prefix}-state-grafted-metadata"),
         format!("{prefix}-transactions-merkle"),
     ]
 }

@@ -1,8 +1,8 @@
 # constantinople / explorer
 
 A small React + Vite app that streams newly finalized blocks from the
-constantinople indexer's SQL metadata path and renders them as they
-arrive.
+constantinople indexer's SQL metadata path, verifies submitted-transaction
+proofs through QMDB, and renders both as they arrive.
 
 ## What it does
 
@@ -25,29 +25,36 @@ histogram showing tx-count-per-block over the last ~80 blocks so the
 operator can see throughput scale at a glance. The histogram's y-axis
 is auto-scaled to the peak in the visible window.
 
+When the signed-in account submits transactions, the explorer also looks up
+their `tx_meta.qmdb_location`, fetches a transaction operation-log proof from
+`qmdb-indexer` under `/transactions`, verifies it in the browser with the
+WASM verifier in `crates/explorer-crypto`, and shows a checkmark after
+verification succeeds.
+
 ### Why SQL, not the raw KV stream?
 
-The indexer publishes every finalized block to two parallel surfaces
+The indexer publishes every finalized block to complementary surfaces
 (see [`crates/indexer/README.md`](../crates/indexer/README.md)):
 
 - **Full storage (KV)** — `BLOCK`, `TX`, `BLOCK_BY_H`, `TX_BY_H`,
   `FINALIZED`, `NOTARIZED`. Tools that need the full
-  `SignedTransaction` body or a QMDB proof fetch by digest through the
-  `StoreClient`. The explorer does not consume this path.
+  `SignedTransaction` body fetch by digest through the `StoreClient`. The
+  explorer does not consume this path.
 - **Metadata stream (SQL)** — `block_meta` / `tx_meta` tables on top
   of the same store. Cheap to subscribe to from the browser and
-  already deduplicated to one row per block; this is the only surface
-  the explorer reads.
+  already deduplicated to one row per block.
+- **QMDB operation logs** — transaction-hash operation proofs. The explorer
+  only fetches these for transactions submitted by the signed-in account.
 
 ## Configuration
 
 | Env var        | Default                 | Notes                                                                    |
 | -------------- | ----------------------- | ------------------------------------------------------------------------ |
 | `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
+| `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service. Matches the local-deploy `--qmdb-indexer-port` default. |
 
-The exoware Store and the SQL server both enable a permissive CORS
-layer, so the dev server can talk to them cross-origin without a Vite
-proxy.
+The metadata and QMDB services enable permissive CORS layers, so the dev
+server can talk to them cross-origin without a Vite proxy.
 
 ## Local development
 

@@ -43,8 +43,23 @@ Constantinople is a high-throughput account-model blockchain example built on to
 
 ## Demo
 
-> [!IMPORTANT]
-> TODO.
+Generate a local four-validator network with one secondary, the spammer,
+relayer, metadata indexer, QMDB indexer, and explorer:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 \
+  --secondaries 1 \
+  --output-dir ./local \
+  --spammer --spammer-accounts 4096 --spammer-accounts-jitter 0.1 \
+  --relayer \
+  local \
+  --indexer
+```
+
+The command prints an `mprocs` invocation that starts the generated local
+network. See [`bin/deploy/README.md`](./bin/deploy/README.md) for port and
+service details.
 
 ## Deployment
 

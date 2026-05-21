@@ -335,14 +335,11 @@ fn local_run_commands(
              --store-url http://127.0.0.1:{} --port {}",
             QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
-        // Bring up the React explorer dev server alongside the
-        // `metadata-indexer` service
-        // so operators get a live view of streaming blocks for free.
-        // `VITE_SQL_URL` is consumed by `explorer/src/App.tsx`; the default
-        // there matches `--metadata-indexer-port`, but we pass it explicitly
-        // so a non-default port still works. The raw `chain-indexer` URL is
-        // intentionally not forwarded — the UI only consumes the metadata
-        // service today.
+        // Bring up the React explorer dev server alongside the metadata and
+        // QMDB facades so operators get a live view and browser-verified
+        // submitted-transaction proofs.
+        // The defaults in `explorer/src/App.tsx` match these ports, but pass
+        // both URLs explicitly so non-default deployer ports still work.
         let relayer_env = if relayer_enabled(args) {
             format!(
                 " VITE_MEMPOOL_URL=http://127.0.0.1:{}",
@@ -352,8 +349,8 @@ fn local_run_commands(
             String::new()
         };
         commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{}{} npm --prefix explorer run dev",
-            local.metadata_indexer_port, relayer_env,
+            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{}{} npm --prefix explorer run dev",
+            local.metadata_indexer_port, local.qmdb_indexer_port, relayer_env,
         ));
     }
 
@@ -575,6 +572,11 @@ mod tests {
         let mut args = test_args(false);
         args.secondaries = 1;
         enable_indexer(&mut args, 8090);
+        let GenerateTarget::Local(local) = &mut args.target else {
+            panic!("test_args must construct a Local target");
+        };
+        local.metadata_indexer_port = 18_091;
+        local.qmdb_indexer_port = 18_092;
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
@@ -582,9 +584,8 @@ mod tests {
             .iter()
             .find(|c| c.contains("npm --prefix explorer"))
             .expect("explorer dev server command should be present");
-        // Explorer is wired to the metadata service only — the raw store URL
-        // is intentionally not forwarded because the UI doesn't read it.
-        assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:8091"));
+        assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:18091"));
+        assert!(explorer_cmd.contains("VITE_QMDB_URL=http://127.0.0.1:18092"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
         assert!(explorer_cmd.contains("run dev"));
     }

@@ -1,6 +1,6 @@
 //! Reporters and uploader actors for indexer publishing.
 //!
-//! The publisher is split in two halves:
+//! The non-QMDB publisher is split in two halves:
 //!
 //! - One or more cloneable [`Reporter`] implementations that encode incoming
 //!   consensus events into atomic [`UploadBatch`]es and push them to a bounded
@@ -11,7 +11,8 @@
 //!   success each task fulfills its clone of the marshal acknowledgement
 //!   bundled with the batch (if any).
 //!
-//! Constantinople fans its data across one raw KV stream plus one SQL stream:
+//! Constantinople's metadata-only and non-QMDB full modes fan data across one
+//! raw KV stream plus one SQL stream:
 //!
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
@@ -20,6 +21,10 @@
 //!
 //! The marshal [`Exact`] acknowledgement is cloned once per uploader so the
 //! waiter resolves only after every path has durably accepted its batch.
+//! When QMDB upload is enabled on the single owning secondary,
+//! [`QmdbPublisher`] replaces the block reporter and stages raw KV rows, SQL
+//! rows, account-state QMDB rows, and transaction-hash QMDB rows into one
+//! Store batch per finalized block.
 //!
 //! [`Reporter`]: commonware_consensus::Reporter
 //! [`StoreClient`]: exoware_sdk::StoreClient
