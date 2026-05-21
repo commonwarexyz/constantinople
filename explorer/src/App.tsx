@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { memo, startTransition, useEffect, useMemo, useRef, useState } from 'react';
 import {
     encodeSignedTransaction,
     encodeTransactionBatch,
@@ -10,6 +10,7 @@ import {
     subscribeCertificateVerification,
     watchBlockCertificates,
 } from './certificateClient';
+import type { CertificateWorkerResult } from './certificateWorkerTypes';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
@@ -51,7 +52,7 @@ const LIVE_STATUS_STAGGER_MS = 50;
 const LIVE_STATUS_BLANK_MS = 100;
 const LIVE_STATUS_PAUSE_MS = 550;
 const BLOCK_FLUSH_INTERVAL_MS = 50;
-const CERTIFICATE_FLUSH_INTERVAL_MS = 100;
+const CERTIFICATE_FLUSH_INTERVAL_MS = 250;
 const MAX_CERTIFICATE_CACHE = 1_000;
 
 type Status =
@@ -108,6 +109,15 @@ type BlockCertificateState =
       }
     | { readonly status: 'error'; readonly detail: string };
 
+const WAITING_FINALIZATION_CERTIFICATE = {
+    status: 'waiting',
+    detail: 'waiting for finalization',
+} satisfies BlockCertificateState;
+const WAITING_BLOCK_CERTIFICATE = {
+    status: 'waiting',
+    detail: 'waiting for block certificate',
+} satisfies BlockCertificateState;
+
 type TransactionProofState =
     | { readonly status: 'waiting'; readonly detail: string }
     | { readonly status: 'fetching'; readonly detail: string }
@@ -160,6 +170,10 @@ export default function App() {
     const [copyToast, setCopyToast] = useState('');
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
+    const certificateCacheRef = useRef<BlockCertificateByHeight>({});
+    const certificateCacheOrderRef = useRef<string[]>([]);
+    const visibleBlockHeightsRef = useRef<Set<string>>(new Set());
+    const historyFinalizedHeightsRef = useRef<Set<number>>(new Set());
     const pendingCertificatesRef = useRef<CertificateUpdate[]>([]);
     const certificateFlushTimeoutRef = useRef<number | null>(null);
     const requestedCertificateHeightsRef = useRef<Set<number>>(new Set());
@@ -189,7 +203,6 @@ export default function App() {
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
 
-        watchCertificatesForBlocks(nextBlocks);
         pendingBlocksRef.current.push(...nextBlocks);
         if (blockFlushTimeoutRef.current !== null) return;
 
@@ -199,7 +212,14 @@ export default function App() {
             pendingBlocksRef.current = [];
             if (flushed.length === 0) return;
 
-            setBlocks((current) => upsertBoundedBatch(flushed, current));
+            watchCertificatesForBlocks(flushed);
+            setBlocks((current) => {
+                const next = upsertBoundedBatch(flushed, current);
+                visibleBlockHeightsRef.current = new Set(
+                    next.map((block) => block.height.toString()),
+                );
+                return next;
+            });
             setBlocksObserved((current) => current + flushed.length);
             setTotalTxObserved(
                 (current) =>
@@ -214,6 +234,11 @@ export default function App() {
     };
 
     const queueCertificateUpdate = (update: CertificateUpdate) => {
+        rememberCertificate(update);
+        if (!visibleBlockHeightsRef.current.has(String(update.height))) {
+            return;
+        }
+
         pendingCertificatesRef.current.push(update);
         if (certificateFlushTimeoutRef.current !== null) return;
 
@@ -223,18 +248,63 @@ export default function App() {
             pendingCertificatesRef.current = [];
             if (flushed.length === 0) return;
 
-            setBlockCertificates((current) =>
-                flushed.reduce(
-                    (certificates, entry) =>
-                        updateObservedBlockCertificate(
-                            entry.height,
-                            entry.certificate,
-                            certificates,
-                        ),
-                    current,
-                ),
+            startTransition(() =>
+                setBlockCertificates((current) => applyCertificateUpdates(current, flushed)),
             );
         }, CERTIFICATE_FLUSH_INTERVAL_MS);
+    };
+
+    const rememberCertificate = (update: CertificateUpdate) => {
+        const key = String(update.height);
+        if (!Object.prototype.hasOwnProperty.call(certificateCacheRef.current, key)) {
+            certificateCacheOrderRef.current.push(key);
+        }
+        certificateCacheRef.current[key] = update.certificate;
+        pruneCertificateCache();
+    };
+
+    const pruneCertificateCache = () => {
+        let rotations = 0;
+        while (certificateCacheOrderRef.current.length > MAX_CERTIFICATE_CACHE) {
+            const key = certificateCacheOrderRef.current.shift();
+            if (key === undefined) return;
+            if (shouldKeepCachedCertificate(key)) {
+                certificateCacheOrderRef.current.push(key);
+                rotations++;
+                if (rotations >= certificateCacheOrderRef.current.length) return;
+                continue;
+            }
+            delete certificateCacheRef.current[key];
+            rotations = 0;
+        }
+    };
+
+    const shouldKeepCachedCertificate = (key: string) =>
+        visibleBlockHeightsRef.current.has(key) ||
+        historyFinalizedHeightsRef.current.has(Number(key));
+
+    const applyCertificateResult = (result: CertificateWorkerResult) => {
+        if (result.height === 0) return;
+
+        const certificate =
+            result.kind === 'verified'
+                ? ({
+                      status: 'verified',
+                      detail: `verified at height ${result.height}`,
+                      height: String(result.height),
+                      view: result.view,
+                  } satisfies BlockCertificateState)
+                : ({
+                      status: 'error',
+                      detail: result.detail,
+                  } satisfies BlockCertificateState);
+
+        queueCertificateUpdate({ height: result.height, certificate });
+        if (!historyFinalizedHeightsRef.current.has(result.height)) return;
+
+        setHistory((current) =>
+            updateBlockCertificateByHeight(result.height, certificate, current),
+        );
     };
 
     useEffect(() => {
@@ -248,34 +318,10 @@ export default function App() {
     useEffect(() => {
         if (!verifyCertificates) return;
         return subscribeCertificateVerification((response) => {
-            if (response.height === 0) return;
-            if (response.kind === 'verified') {
-                const certificate = {
-                    status: 'verified',
-                    detail: `verified at height ${response.height}`,
-                    height: String(response.height),
-                    view: response.view,
-                } satisfies BlockCertificateState;
-                queueCertificateUpdate({
-                    height: response.height,
-                    certificate,
-                });
-                setHistory((current) =>
-                    updateBlockCertificateByHeight(response.height, certificate, current),
-                );
-                return;
+            const results = response.kind === 'batch' ? response.results : [response];
+            for (const result of results) {
+                applyCertificateResult(result);
             }
-            const certificate = {
-                status: 'error',
-                detail: response.detail,
-            } satisfies BlockCertificateState;
-            queueCertificateUpdate({
-                height: response.height,
-                certificate,
-            });
-            setHistory((current) =>
-                updateBlockCertificateByHeight(response.height, certificate, current),
-            );
         });
     }, []);
 
@@ -311,10 +357,20 @@ export default function App() {
 
     useEffect(() => {
         writeHistory(history);
+        historyFinalizedHeightsRef.current = finalizedHeights(history);
     }, [history]);
 
     useEffect(() => {
-        setBlockCertificates((current) => pruneBlockCertificates(blocks, current));
+        visibleBlockHeightsRef.current = new Set(blocks.map((block) => block.height.toString()));
+        startTransition(() => {
+            setBlockCertificates((current) =>
+                projectVisibleCertificates(
+                    blocks,
+                    current,
+                    certificateCacheRef.current,
+                ),
+            );
+        });
     }, [blocks]);
 
     useEffect(() => {
@@ -339,18 +395,20 @@ export default function App() {
             height: tx.finalizedHeight,
         })
             .then((proof) => {
+                const certificate = verifiedBlockCertificateState(proof);
+                rememberCertificate({ height: Number(proof.height), certificate });
                 setHistory((current) =>
                     updateBlockCertificateByHeight(
                         Number(proof.height),
-                        verifiedBlockCertificateState(proof),
+                        certificate,
                         updateTransactionProof(tx.digest, verifiedProofState(proof), current),
                     ),
                 );
-                setBlockCertificates((current) =>
-                    updateObservedBlockCertificate(
-                        Number(proof.height),
-                        verifiedBlockCertificateState(proof),
-                        current,
+                startTransition(() =>
+                    setBlockCertificates((current) =>
+                        applyCertificateUpdates(current, [
+                            { height: Number(proof.height), certificate },
+                        ]),
                     ),
                 );
             })
@@ -553,7 +611,13 @@ export default function App() {
             if ('batch_id' in submitResponse) {
                 const accepted: TxStatus = { status: 'accepted', digests: submitResponse.digests };
                 setHistory((current) =>
-                    updateTransactionStatus(encoded.digestHex, accepted, 'accepted by relayer', current),
+                    updateTransactionStatus(
+                        encoded.digestHex,
+                        accepted,
+                        'accepted by relayer',
+                        current,
+                        certificateCacheRef.current,
+                    ),
                 );
                 setSubmitMessage('accepted by relayer');
                 txStatus = await pollTransactionStatus(mempoolUrl, submitResponse);
@@ -561,7 +625,15 @@ export default function App() {
                 txStatus = submitResponse;
             }
             const detail = formatTxStatus(txStatus, encoded.digestHex);
-            setHistory((current) => updateTransactionStatus(encoded.digestHex, txStatus, detail, current));
+            setHistory((current) =>
+                updateTransactionStatus(
+                    encoded.digestHex,
+                    txStatus,
+                    detail,
+                    current,
+                    certificateCacheRef.current,
+                ),
+            );
             setSubmitMessage(detail);
             await refreshAccount();
         } catch (error) {
@@ -1142,15 +1214,55 @@ function recentCertificateEntries(
         .slice(0, MAX_CERTIFICATE_CACHE);
 }
 
-function updateObservedBlockCertificate(
-    height: number,
-    certificate: BlockCertificateState,
-    certificates: BlockCertificateByHeight,
+function projectVisibleCertificates(
+    blocks: ObservedBlock[],
+    current: BlockCertificateByHeight,
+    cache: BlockCertificateByHeight,
 ): BlockCertificateByHeight {
-    return {
-        ...certificates,
-        [String(height)]: certificate,
-    };
+    return pruneBlockCertificates(blocks, applyCachedVisibleCertificates(blocks, current, cache));
+}
+
+function applyCachedVisibleCertificates(
+    blocks: ObservedBlock[],
+    current: BlockCertificateByHeight,
+    cache: BlockCertificateByHeight,
+): BlockCertificateByHeight {
+    const updates: CertificateUpdate[] = [];
+    for (const block of blocks) {
+        const height = Number(block.height);
+        const certificate = cache[String(height)];
+        if (certificate) {
+            updates.push({ height, certificate });
+        }
+    }
+    return applyCertificateUpdates(current, updates);
+}
+
+function applyCertificateUpdates(
+    current: BlockCertificateByHeight,
+    updates: readonly CertificateUpdate[],
+): BlockCertificateByHeight {
+    let next = current;
+    for (const { height, certificate } of updates) {
+        const key = String(height);
+        const existing = next[key];
+        if (existing && sameBlockCertificate(existing, certificate)) continue;
+        if (next === current) {
+            next = { ...current };
+        }
+        next[key] = certificate;
+    }
+    return next;
+}
+
+function finalizedHeights(transactions: readonly SubmittedTransaction[]): Set<number> {
+    const heights = new Set<number>();
+    for (const tx of transactions) {
+        if (tx.finalizedHeight !== null) {
+            heights.add(tx.finalizedHeight);
+        }
+    }
+    return heights;
 }
 
 function prependTransaction(
@@ -1165,16 +1277,22 @@ function updateTransactionStatus(
     status: TxStatus,
     detail: string,
     current: SubmittedTransaction[],
+    certificates: BlockCertificateByHeight,
 ): SubmittedTransaction[] {
     return current.map((tx) => {
         if (tx.digest !== digest) return tx;
+        const finalizedHeight = statusHasHeight(status) ? status.height : tx.finalizedHeight;
         return {
             ...tx,
             status: status.status,
             detail,
             finalizedInMs: status.status === 'accepted' ? null : Date.now() - tx.submittedAt,
-            finalizedHeight: statusHasHeight(status) ? status.height : tx.finalizedHeight,
-            certificate: nextBlockCertificateState(status, tx.certificate),
+            finalizedHeight,
+            certificate:
+                finalizedHeight === null
+                    ? nextBlockCertificateState(status, tx.certificate)
+                    : certificates[String(finalizedHeight)] ??
+                      nextBlockCertificateState(status, tx.certificate),
             proof: nextProofState(status, digest, tx.proof),
         };
     });
@@ -1485,9 +1603,9 @@ function normalizeBlockCertificate(
 
 function defaultBlockCertificate(finalizedHeight: number | null): BlockCertificateState {
     if (finalizedHeight === null) {
-        return { status: 'waiting', detail: 'waiting for finalization' };
+        return WAITING_FINALIZATION_CERTIFICATE;
     }
-    return { status: 'waiting', detail: 'waiting for block certificate' };
+    return WAITING_BLOCK_CERTIFICATE;
 }
 
 function normalizeTransactionProof(value: unknown): TransactionProofState {
@@ -1548,7 +1666,7 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
     );
 }
 
-function SummaryPanel({
+const SummaryPanel = memo(function SummaryPanel({
     blocks,
     blocksObserved,
     totalTxObserved,
@@ -1571,7 +1689,7 @@ function SummaryPanel({
             <Stat label="avg txs/block" value={stats.avgTx.toLocaleString()} />
         </section>
     );
-}
+});
 
 function Stat({ label, value }: { label: string; value: React.ReactNode }) {
     return (
@@ -1642,7 +1760,7 @@ function formatObservedTxPerSecond(
  * The y-axis is auto-scaled to the peak in the visible window so a quiet
  * stretch of empty blocks doesn't compress later activity into the baseline.
  */
-function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
+const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
     const chartRef = useRef<HTMLPreElement>(null);
     const measureRef = useRef<HTMLSpanElement>(null);
     const [columns, setColumns] = useState<number>(HISTOGRAM_INITIAL_COLUMNS);
@@ -1699,7 +1817,7 @@ function Histogram({ blocks }: { blocks: ObservedBlock[] }) {
             </div>
         </section>
     );
-}
+});
 
 function buildHistogram(
     blocks: ObservedBlock[],
@@ -1743,7 +1861,7 @@ function buildHistogram(
     return { lines, peak };
 }
 
-function BlockTable({
+const BlockTable = memo(function BlockTable({
     blocks,
     certificates,
     verifyCertificates,
@@ -1782,26 +1900,48 @@ function BlockTable({
             </thead>
             <tbody>
                 {blocks.map((block, index) => {
-                    const isFresh = index === 0;
+                    const height = block.height.toString();
                     return (
-                        <tr key={block.height.toString()} className={isFresh ? 'is-fresh' : undefined}>
-                            <td className="col-height">{block.height.toString()}</td>
-                            <td className="col-txs">{block.txCount.toLocaleString()}</td>
-                            <td className="col-cert">
-                                <CertificateCell
-                                    certificate={blockCertificateForHeight(
-                                        block.height,
-                                        certificates,
-                                    )}
-                                    finalizedHeight={Number(block.height)}
-                                    verifyCertificates={verifyCertificates}
-                                />
-                            </td>
-                            <td className="col-time">{formatter.format(block.arrivedAt)}</td>
-                        </tr>
+                        <BlockRow
+                            key={height}
+                            block={block}
+                            certificate={blockCertificateForHeight(block.height, certificates)}
+                            formatter={formatter}
+                            isFresh={index === 0}
+                            verifyCertificates={verifyCertificates}
+                        />
                     );
                 })}
             </tbody>
         </table>
     );
-}
+});
+
+const BlockRow = memo(function BlockRow({
+    block,
+    certificate,
+    formatter,
+    isFresh,
+    verifyCertificates,
+}: {
+    block: ObservedBlock;
+    certificate: BlockCertificateState;
+    formatter: Intl.DateTimeFormat;
+    isFresh: boolean;
+    verifyCertificates: boolean;
+}) {
+    return (
+        <tr className={isFresh ? 'is-fresh' : undefined}>
+            <td className="col-height">{block.height.toString()}</td>
+            <td className="col-txs">{block.txCount.toLocaleString()}</td>
+            <td className="col-cert">
+                <CertificateCell
+                    certificate={certificate}
+                    finalizedHeight={Number(block.height)}
+                    verifyCertificates={verifyCertificates}
+                />
+            </td>
+            <td className="col-time">{formatter.format(block.arrivedAt)}</td>
+        </tr>
+    );
+});

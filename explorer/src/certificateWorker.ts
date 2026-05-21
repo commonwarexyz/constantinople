@@ -4,6 +4,7 @@ import initCrypto, { verifyBlockCertificate } from './crypto-wasm/constantinople
 import type {
     CertificateWorkerRequest,
     CertificateWorkerResponse,
+    CertificateWorkerResult,
     WatchedBlockCertificate,
 } from './certificateWorkerTypes';
 
@@ -134,6 +135,7 @@ async function fetchAndVerifyBatch(
     try {
         const results = await activeStore.getMany(keys, FETCH_BATCH_SIZE);
         const byKey = new Map(results.map((result) => [bytesKey(result.key), result.value]));
+        const responses: CertificateWorkerResult[] = [];
         for (let index = 0; index < heights.length; index++) {
             const height = heights[index];
             const finalized = byKey.get(bytesKey(keys[index]));
@@ -141,8 +143,12 @@ async function fetchAndVerifyBatch(
                 retryFetch(height);
                 continue;
             }
-            verifyFetchedFinalization(activeConfig, height, finalized);
+            const response = verifyFetchedFinalization(activeConfig, height, finalized);
+            if (response) {
+                responses.push(response);
+            }
         }
+        postResults(responses);
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         if (isRetryableCertificateError(detail)) {
@@ -151,10 +157,12 @@ async function fetchAndVerifyBatch(
             }
             return;
         }
-        for (const height of heights) {
-            wanted.delete(height);
-            workerScope.postMessage({ kind: 'error', height, detail });
-        }
+        postResults(
+            heights.map((height) => {
+                wanted.delete(height);
+                return { kind: 'error', height, detail };
+            }),
+        );
     }
 }
 
@@ -162,9 +170,9 @@ function verifyFetchedFinalization(
     activeConfig: CertificateWorkerConfig,
     height: number,
     finalized: Uint8Array,
-) {
+): CertificateWorkerResult | null {
     const expectedDigest = wanted.get(height);
-    if (!expectedDigest || verified.has(height)) return;
+    if (!expectedDigest || verified.has(height)) return null;
 
     try {
         const target = verifyBlockCertificate(
@@ -174,16 +182,25 @@ function verifyFetchedFinalization(
         ) as FinalizedTransactionTarget;
         verified.add(height);
         wanted.delete(height);
-        workerScope.postMessage({
+        return {
             kind: 'verified',
             height,
             view: target.view.toString(),
-        });
+        };
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         wanted.delete(height);
-        workerScope.postMessage({ kind: 'error', height, detail });
+        return { kind: 'error', height, detail };
     }
+}
+
+function postResults(results: readonly CertificateWorkerResult[]) {
+    if (results.length === 0) return;
+    if (results.length === 1) {
+        workerScope.postMessage(results[0]);
+        return;
+    }
+    workerScope.postMessage({ kind: 'batch', results });
 }
 
 function retryFetch(height: number) {

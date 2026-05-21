@@ -18,7 +18,7 @@ export interface WatchedBlockCertificate {
     readonly digest: Uint8Array;
 }
 
-export type CertificateWorkerResponse =
+export type CertificateWorkerResult =
     | {
           readonly kind: 'verified';
           readonly height: number;
@@ -28,4 +28,11 @@ export type CertificateWorkerResponse =
           readonly kind: 'error';
           readonly height: number;
           readonly detail: string;
+      };
+
+export type CertificateWorkerResponse =
+    | CertificateWorkerResult
+    | {
+          readonly kind: 'batch';
+          readonly results: readonly CertificateWorkerResult[];
       };
