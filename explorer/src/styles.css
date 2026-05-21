@@ -318,21 +318,30 @@ body {
     pointer-events: none;
 }
 
-.observed-rate {
-    display: flex;
-    flex-direction: column;
-    align-items: center;
+.observed-stats {
+    width: min(54rem, 100%);
+    justify-self: center;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: end;
     gap: 0.35rem;
     text-align: center;
 }
 
-.observed-rate__value {
+.observed-stat {
+    min-width: 0;
+}
+
+.observed-stat__value {
     color: var(--theme-text);
     font-size: 6rem;
     line-height: 0.9;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-.observed-rate__label {
+.observed-stat__label {
     color: var(--theme-text-dim);
     text-transform: uppercase;
     letter-spacing: 0.06em;
@@ -715,7 +724,11 @@ body {
         font-size: 5px;
     }
 
-    .observed-rate__value {
+    .observed-stats {
+        gap: 1rem;
+    }
+
+    .observed-stat__value {
         font-size: 3.5rem;
     }
 
@@ -887,11 +900,17 @@ body {
         font-size: 4px;
     }
 
-    .observed-rate__value {
+    .observed-stat__value {
         font-size: 3rem;
     }
 
     .tx-table td {
         grid-template-columns: 7ch minmax(0, 1fr);
+    }
+}
+
+@media (max-width: 360px) {
+    .observed-stats {
+        grid-template-columns: 1fr;
     }
 }

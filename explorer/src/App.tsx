@@ -496,7 +496,8 @@ export default function App() {
                 <main className="app__main app__main--minimal">
                     <section className="explorer-stage" aria-label="live transaction throughput">
                         <Histogram blocks={blocks} />
-                        <ObservedTxRate
+                        <ExplorerStats
+                            blocks={blocks}
                             observedRateWindow={observedRateWindow}
                             totalTxObserved={totalTxObserved}
                         />
@@ -1410,22 +1411,41 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
     );
 }
 
-const ObservedTxRate = memo(function ObservedTxRate({
+const ExplorerStats = memo(function ExplorerStats({
+    blocks,
     totalTxObserved,
     observedRateWindow,
 }: {
+    blocks: ObservedBlock[];
     totalTxObserved: number;
     observedRateWindow: ObservedRateWindow;
 }) {
+    const latestHeight = useMemo(() => formatLatestHeight(blocks), [blocks]);
     return (
-        <div className="observed-rate">
-            <div className="observed-rate__value">
-                {formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
+        <div className="observed-stats">
+            <div className="observed-stat">
+                <div className="observed-stat__value">{latestHeight}</div>
+                <div className="observed-stat__label">latest height</div>
             </div>
-            <div className="observed-rate__label">observed tx/sec</div>
+            <div className="observed-stat">
+                <div className="observed-stat__value">
+                    {formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
+                </div>
+                <div className="observed-stat__label">observed tx/sec</div>
+            </div>
         </div>
     );
 });
+
+function formatLatestHeight(blocks: ObservedBlock[]): string {
+    let latest: bigint | null = null;
+    for (const block of blocks) {
+        if (latest === null || block.height > latest) {
+            latest = block.height;
+        }
+    }
+    return latest?.toString() ?? '—';
+}
 
 function formatObservedTxPerSecond(
     totalTxObserved: number,
