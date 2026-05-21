@@ -313,15 +313,14 @@ fn local_run_commands(
         // `metadata-indexer`: exposes Constantinople's `block_meta` /
         // `tx_meta` tables over `store.sql.v1.Service`. The explorer
         // subscribes to this service (not the raw store) for live block
-        // metadata. Sleep briefly so the store has bound its port first;
-        // otherwise the service's first GET races the bind.
+        // metadata.
         commands.push(format!(
-            "sleep 2 && cargo run -p constantinople-indexer --bin {} -- \
+            "cargo run -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
         ));
         commands.push(format!(
-            "sleep 2 && cargo run -p constantinople-indexer --bin {} -- \
+            "cargo run -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
@@ -357,7 +356,7 @@ fn local_run_commands(
             format!("--peers {}", peers_path.display())
         };
         commands.push(format!(
-            "sleep 10 && cargo run --release --bin constantinople-spammer -- \
+            "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
              --accounts {} \
              --value {} \
@@ -493,6 +492,19 @@ mod tests {
         assert_eq!(commands.len(), 8);
         assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("secondary-1.yaml"));
+    }
+
+    #[test]
+    fn local_run_commands_do_not_sleep() {
+        let mut args = test_args(true);
+        args.secondaries = 1;
+
+        let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
+
+        assert!(
+            commands.iter().all(|command| !command.contains("sleep ")),
+            "local commands should start directly: {commands:?}"
+        );
     }
 
     fn set_local_ports(args: &mut GenerateArgs, chain: u16, metadata: u16, qmdb: u16) {
