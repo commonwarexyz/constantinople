@@ -3,7 +3,7 @@
 mod local;
 mod remote;
 
-use clap::{ArgGroup, Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use commonware_codec::Encode;
 use commonware_cryptography::{
     Signer,
@@ -134,32 +134,19 @@ pub(crate) struct LocalArgs {
     base_http_port: u16,
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
-    /// Spawn a local exoware simulator and wire secondaries to upload to it.
-    ///
-    /// Requires `--secondaries >= 1`. The simulator backs both the KV
-    /// publisher (BLOCK / TX families) and the SQL publisher
-    /// (`block_meta` / `tx_meta` tables).
-    #[arg(long, default_value_t = false)]
-    indexer: bool,
-    /// Port for the local `chain-indexer` store launched by `--indexer`.
+    /// Port for the local `chain-indexer` store launched when secondaries exist.
     #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
-    /// Port for the local `metadata-indexer` service launched by `--indexer`.
-    /// The explorer reads from this
-    /// port via `VITE_SQL_URL`.
+    /// Port for the local `metadata-indexer` service launched when secondaries exist.
+    /// The explorer reads from this port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
-    /// Port for the local `qmdb-indexer` service launched by `--indexer`.
+    /// Port for the local `qmdb-indexer` service launched when secondaries exist.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
 }
 
 #[derive(Debug, Args)]
-#[command(group(
-    ArgGroup::new("indexer_mode")
-        .args(["indexer", "indexer_metadata_only"])
-        .multiple(false)
-))]
 pub(crate) struct RemoteArgs {
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
@@ -179,13 +166,6 @@ pub(crate) struct RemoteArgs {
     http_port: u16,
     #[arg(long = "http-cidr", value_delimiter = ',')]
     http_cidrs: Vec<String>,
-    /// Launch the shared `chain-indexer` + `metadata-indexer` stack.
-    #[arg(long, default_value_t = false)]
-    indexer: bool,
-    /// Launch the shared indexer stack, but have secondaries upload only SQL
-    /// metadata (`block_meta`, `tx_meta`) into the shared `chain-indexer`.
-    #[arg(long = "indexer-metadata-only", default_value_t = false)]
-    indexer_metadata_only: bool,
     /// Port for the shared `chain-indexer` store.
     #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
@@ -376,18 +356,6 @@ impl ClusterMaterial {
             .iter()
             .map(|pk| hex(&pk.encode()))
             .collect()
-    }
-}
-
-impl RemoteArgs {
-    pub(crate) const fn indexer_mode(&self) -> Option<IndexerMode> {
-        if self.indexer_metadata_only {
-            return Some(IndexerMode::MetadataOnly);
-        }
-        if self.indexer {
-            return Some(IndexerMode::Full);
-        }
-        None
     }
 }
 
@@ -587,50 +555,6 @@ mod tests {
             remote.http_cidrs,
             vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
         );
-    }
-
-    #[test]
-    fn remote_parses_metadata_only_indexer_mode() {
-        let cli = Cli::try_parse_from([
-            "constantinople-deploy",
-            "generate",
-            "--validators",
-            "4",
-            "--secondaries",
-            "1",
-            "--output-dir",
-            "out",
-            "remote",
-            "--regions",
-            "us-east-1,us-west-2",
-            "--instance-type",
-            "c8g.large",
-            "--storage-size",
-            "25",
-            "--monitoring-instance-type",
-            "c8g.2xlarge",
-            "--monitoring-storage-size",
-            "100",
-            "--dashboard",
-            "dashboard.json",
-            "--indexer-metadata-only",
-            "--chain-indexer-port",
-            "18090",
-            "--metadata-indexer-port",
-            "18091",
-        ])
-        .expect("remote invocation should parse");
-
-        let Command::Generate(generate) = cli.command;
-        let GenerateTarget::Remote(remote) = generate.target else {
-            panic!("expected remote target");
-        };
-
-        assert!(remote.indexer_mode().is_some());
-        assert!(!remote.indexer);
-        assert!(remote.indexer_metadata_only);
-        assert_eq!(remote.chain_indexer_port, 18_090);
-        assert_eq!(remote.metadata_indexer_port, 18_091);
     }
 
     #[test]

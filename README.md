@@ -53,8 +53,7 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./local \
   --spammer --spammer-accounts 4096 --spammer-accounts-jitter 0.1 \
   --relayer \
-  local \
-  --indexer
+  local
 ```
 
 The command prints an `mprocs` invocation that starts the generated local

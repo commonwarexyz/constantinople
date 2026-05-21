@@ -74,7 +74,7 @@ visibly varying throughput stream:
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 --secondaries 1 --output-dir ./local \
   --spammer --spammer-accounts-jitter 0.25 \
-  local --indexer
+  local
 ```
 
 You can also run the spammer manually against an existing local cluster:
@@ -116,9 +116,9 @@ to primary validators.
 
 ### Local Deployment with Indexer + Explorer
 
-Add `--indexer` (a flag on the `local` subcommand) to spin up the shared
-`chain-indexer` store, the `metadata-indexer` query/stream service, the
-`qmdb-indexer` query facade, and the React explorer dev server alongside the validators:
+Set `--secondaries` to a non-zero value to spin up the shared `chain-indexer`
+store, the `metadata-indexer` query/stream service, the `qmdb-indexer` query
+facade, and the React explorer dev server alongside the validators:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -126,15 +126,15 @@ cargo run --bin constantinople-deploy -- generate \
   --secondaries 1 \
   --output-dir ./local \
   --spammer \
-  local \
-  --indexer
+  local
 ```
 
-This requires `--secondaries >= 1` because only secondaries upload to the
-indexer; primaries leave their `indexer:` block unset. In full indexer mode,
-the first secondary also owns the QMDB upload path. Other secondaries may still
-upload the existing KV and SQL indexer data, but they leave QMDB disabled so the
-QMDB writer contract has a single writer.
+There are only two local deployment shapes: validators only when
+`--secondaries 0`, or validators plus secondaries, explorer, and the full
+indexer stack when `--secondaries > 0`. Primaries leave their `indexer:` block
+unset. The first secondary owns the QMDB upload path; other secondaries still
+upload KV and SQL indexer data but leave QMDB disabled so the QMDB writer
+contract has a single writer.
 
 The printed `mprocs` command list grows by four entries:
 
@@ -170,7 +170,7 @@ cargo run --bin constantinople-deploy -- generate \
   --validators 4 --secondaries 1 \
   --output-dir ./local \
   --spammer \
-  local --indexer
+  local
 mprocs ...   # paste the line printed by `generate`
 ```
 
@@ -332,7 +332,7 @@ cargo run --bin constantinople-deploy -- generate \
 
 ### Remote Deployment with Indexer Stack
 
-Add `--indexer` to launch the shared remote indexer stack:
+Set `--secondaries` to a non-zero value to launch the shared remote indexer stack:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -340,7 +340,6 @@ cargo run --bin constantinople-deploy -- generate \
   --secondaries 2 \
   --output-dir ./deploy \
   remote \
-  --indexer \
   --regions us-east-1,us-west-2 \
   --instance-type c8g.2xlarge \
   --storage-size 75 \
@@ -349,8 +348,9 @@ cargo run --bin constantinople-deploy -- generate \
   --dashboard ./docker/dashboard.json
 ```
 
-This requires `--secondaries >= 1` because only secondaries upload to the
-shared `chain-indexer` store. Primaries still omit their `indexer:` block.
+There are only two remote deployment shapes: validators only when
+`--secondaries 0`, or validators plus secondaries and the full shared indexer
+stack when `--secondaries > 0`. Primaries still omit their `indexer:` block.
 
 The generated bundle now also includes:
 
@@ -365,20 +365,18 @@ Topology and defaults:
 - `chain-indexer` is a single shared simulator-backed store instance.
 - `metadata-indexer` is a single shared SQL query/stream service layered on that store.
 - `qmdb-indexer` is a single shared QMDB Connect facade layered on that store.
-- both shared services land in the first remote region.
+- all shared indexer services land in the first remote region.
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
 - `qmdb-indexer` listens on port `8092` by default.
-- full indexer mode enables QMDB uploads on only the first secondary. All other secondaries leave
+- QMDB uploads are enabled on only the first secondary. All other secondaries leave
   QMDB disabled to preserve the QMDB single-writer contract.
-- even in metadata-only mode, the shared `chain-indexer` store is still required because the
-  metadata service reads from that backing store.
 
 QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
 writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
 mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
 
-The deployer opens both shared-service ports globally because `commonware-deployer`'s port list is
+The deployer opens shared-service ports globally because `commonware-deployer`'s port list is
 deployment-wide rather than per-instance.
 
 Build every deployable binary before creating the deployment. For Graviton instances:
@@ -401,32 +399,6 @@ Those aggregate targets now write:
 - `deploy/chain-indexer`
 - `deploy/metadata-indexer`
 - `deploy/qmdb-indexer`
-
-### Remote Metadata-Only Mode
-
-Add `--indexer-metadata-only` instead of `--indexer` when secondaries should publish only the SQL
-metadata tables (`block_meta`, `tx_meta`) and skip the full KV block / transaction / certificate
-path:
-
-```sh
-cargo run --bin constantinople-deploy -- generate \
-  --validators 20 \
-  --secondaries 2 \
-  --output-dir ./deploy \
-  remote \
-  --indexer-metadata-only \
-  --regions us-east-1,us-west-2 \
-  --instance-type c8g.2xlarge \
-  --storage-size 75 \
-  --monitoring-instance-type c8g.2xlarge \
-  --monitoring-storage-size 100 \
-  --dashboard ./docker/dashboard.json
-```
-
-This is a real runtime split, not just a deploy-time flag: secondary validators only spawn the SQL
-metadata uploader in this mode. The shared `chain-indexer` and `metadata-indexer` services are
-still deployed because the metadata service reads from the shared store. `qmdb-indexer` is not
-deployed in metadata-only mode, and QMDB uploads remain disabled.
 
 ## Secondary Validators
 

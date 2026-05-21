@@ -23,12 +23,6 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     assert!(args.validators >= 1, "need at least one validator");
-    if local.indexer {
-        assert!(
-            args.secondaries >= 1,
-            "--indexer requires at least one secondary; only secondaries upload",
-        );
-    }
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -187,9 +181,7 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: local
-                .indexer
-                .then(|| local_indexer_config(local.chain_indexer_port, index == 0)),
+            indexer: Some(local_indexer_config(local.chain_indexer_port, index == 0)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -239,12 +231,10 @@ fn local_relayer_config(
     }
 }
 
-/// Build the indexer wiring written into every secondary's YAML when the
-/// local deploy is started with `--indexer`. All three URLs point at the same
-/// simulator; routing-by-family in the indexer client keeps writes correct
-/// because key prefixes are disjoint (KV families occupy `0x10..=0x6F`, SQL
-/// table prefixes occupy `0x00..=0x0F`). Splitting the simulator into
-/// physically separate stores is deferred until we need it.
+/// Build the indexer wiring written into every secondary's YAML.
+///
+/// All rows go through the shared `chain-indexer` Store URL. Store prefixes
+/// keep raw KV, SQL, and QMDB rows disjoint.
 fn local_indexer_config(indexer_port: u16, qmdb_upload: bool) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
@@ -312,7 +302,7 @@ fn local_run_commands(
         ));
     }
 
-    if local.indexer {
+    if args.secondaries > 0 {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
         commands.push(format!(
             "cargo run -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
@@ -416,7 +406,6 @@ mod tests {
             base_port: 9000,
             base_http_port: 8080,
             base_metrics_port: 9090,
-            indexer: false,
             chain_indexer_port: 8090,
             metadata_indexer_port: 8091,
             qmdb_indexer_port: 8092,
@@ -496,31 +485,30 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_secondaries() {
+    fn local_run_commands_include_secondaries_and_indexer_stack() {
         let mut args = test_args(false);
         args.secondaries = 2;
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
-        assert_eq!(commands.len(), 4);
+        assert_eq!(commands.len(), 8);
         assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("secondary-1.yaml"));
     }
 
-    /// Mutate the [`LocalArgs`] embedded in the test [`GenerateArgs`] in a
-    /// short-lived scope so the test can immutably re-borrow it later.
-    fn enable_indexer(args: &mut GenerateArgs, port: u16) {
+    fn set_local_ports(args: &mut GenerateArgs, chain: u16, metadata: u16, qmdb: u16) {
         let GenerateTarget::Local(ref mut local) = args.target else {
             panic!("test_args must construct a Local target");
         };
-        local.indexer = true;
-        local.chain_indexer_port = port;
+        local.chain_indexer_port = chain;
+        local.metadata_indexer_port = metadata;
+        local.qmdb_indexer_port = qmdb;
     }
 
     #[test]
-    fn local_run_commands_include_indexer_when_enabled() {
+    fn local_run_commands_include_indexer_when_secondaries_exist() {
         let mut args = test_args(false);
         args.secondaries = 1;
-        enable_indexer(&mut args, 8090);
+        set_local_ports(&mut args, 8090, 8091, 8092);
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
@@ -535,10 +523,10 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_metadata_indexer_when_indexer_enabled() {
+    fn local_run_commands_include_metadata_indexer_when_secondaries_exist() {
         let mut args = test_args(false);
         args.secondaries = 1;
-        enable_indexer(&mut args, 8090);
+        set_local_ports(&mut args, 8090, 8091, 8092);
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
@@ -552,10 +540,10 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_qmdb_indexer_when_indexer_enabled() {
+    fn local_run_commands_include_qmdb_indexer_when_secondaries_exist() {
         let mut args = test_args(false);
         args.secondaries = 1;
-        enable_indexer(&mut args, 8090);
+        set_local_ports(&mut args, 8090, 8091, 8092);
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
@@ -568,15 +556,10 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_explorer_when_indexer_enabled() {
+    fn local_run_commands_include_explorer_when_secondaries_exist() {
         let mut args = test_args(false);
         args.secondaries = 1;
-        enable_indexer(&mut args, 8090);
-        let GenerateTarget::Local(local) = &mut args.target else {
-            panic!("test_args must construct a Local target");
-        };
-        local.metadata_indexer_port = 18_091;
-        local.qmdb_indexer_port = 18_092;
+        set_local_ports(&mut args, 18_090, 18_091, 18_092);
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
@@ -591,10 +574,8 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_omit_explorer_when_indexer_disabled() {
-        // No `enable_indexer`; the explorer must stay out of the mprocs list.
-        let mut args = test_args(false);
-        args.secondaries = 1;
+    fn local_run_commands_omit_explorer_without_secondaries() {
+        let args = test_args(false);
 
         let commands = local_run_commands(Path::new("/tmp/configs"), &args, local_args(&args), &[]);
 
@@ -602,15 +583,15 @@ mod tests {
             commands
                 .iter()
                 .all(|c| !c.contains("npm --prefix explorer")),
-            "explorer must only launch when --indexer is enabled: {commands:?}"
+            "explorer must only launch when secondaries exist: {commands:?}"
         );
     }
 
     #[test]
-    fn secondary_yaml_gets_indexer_when_enabled() {
+    fn secondary_yaml_gets_full_indexer() {
         let mut args = test_args(false);
         args.secondaries = 1;
-        enable_indexer(&mut args, 8090);
+        set_local_ports(&mut args, 8090, 8091, 8092);
 
         let material = generate_local_cluster_material(args.validators, args.secondaries);
         let validators = build_validators(
@@ -642,32 +623,18 @@ mod tests {
     }
 
     #[test]
-    fn secondary_yaml_has_no_indexer_when_disabled() {
-        let mut args = test_args(false);
-        args.secondaries = 1;
+    fn validators_only_has_no_indexer_configs() {
+        let args = test_args(false);
 
         let material = generate_local_cluster_material(args.validators, args.secondaries);
-        let secondaries = build_secondaries(
+        let validators = build_validators(
             &args,
             local_args(&args),
             Path::new("/tmp/configs"),
             &material,
         );
 
-        assert!(secondaries[0].config.indexer.is_none());
-    }
-
-    #[test]
-    #[should_panic(expected = "--indexer requires at least one secondary")]
-    fn indexer_requires_at_least_one_secondary() {
-        let mut args = test_args(false);
-        args.secondaries = 0;
-        // Use a unique nonexistent output dir so `ensure_output_dir_missing`
-        // does not fire before our intended assertion.
-        args.output_dir = PathBuf::from("/tmp/constantinople-deploy-test-indexer-no-secondaries");
-        enable_indexer(&mut args, 8090);
-
-        super::generate(&args, local_args(&args));
+        assert!(validators.iter().all(|v| v.config.indexer.is_none()));
     }
 
     #[test]
