@@ -27,6 +27,11 @@ export interface VerifiedTransactionProof {
     readonly proofSizeBytes: number;
 }
 
+export interface VerifiedFinalizationTarget {
+    readonly height: bigint;
+    readonly view: bigint;
+}
+
 interface TransactionProofMetadata {
     readonly location: bigint;
     readonly height: bigint;
@@ -47,6 +52,7 @@ export async function fetchAndVerifyTransactionProof({
     digest,
     height,
     signal,
+    onFinalizationVerified,
 }: {
     qmdbUrl: string;
     storeUrl: string;
@@ -54,6 +60,7 @@ export async function fetchAndVerifyTransactionProof({
     digest: string;
     height: number;
     signal?: AbortSignal;
+    onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
     await loadCrypto();
     const target = await finalizedTransactionTarget(
@@ -62,6 +69,7 @@ export async function fetchAndVerifyTransactionProof({
         BigInt(height),
         signal,
     );
+    onFinalizationVerified?.(target);
     const metadata = await fetchTransactionProofMetadata(storeUrl, digest, target);
     if (target.height !== metadata.height) {
         throw new Error(`finalized certificate height ${target.height} does not match tx height ${metadata.height}`);

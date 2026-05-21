@@ -25,6 +25,7 @@ import {
     fetchAndVerifyTransactionProof,
     type VerifiedTransactionProof,
 } from './qmdb';
+import { isRetryableProofError } from './proofRetry';
 import {
     clearSession,
     createWallet,
@@ -37,6 +38,8 @@ const HISTOGRAM_MAX_COLUMNS = 180;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
 const HISTOGRAM_HEIGHT = 18;
+const HISTOGRAM_MAX_ROWS = 200;
+const HISTOGRAM_MIN_ROWS = 8;
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_STATUS_TEXT = '>>> live';
@@ -239,6 +242,12 @@ export default function App() {
             simplexVerificationMaterial,
             digest: tx.digest,
             height: tx.finalizedHeight,
+            onFinalizationVerified: (target) => {
+                const certificate = verifiedBlockCertificateState(target);
+                setHistory((current) =>
+                    updateBlockCertificateByHeight(Number(target.height), certificate, current),
+                );
+            },
         })
             .then((proof) => {
                 const certificate = verifiedBlockCertificateState(proof);
@@ -1098,12 +1107,6 @@ function hasFetchingProof(
     return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
 }
 
-function isRetryableProofError(detail: string): boolean {
-    return /tx_meta missing|finalization missing|QMDB transaction proof response missing|failed to decode Simplex identity|failed to decode Simplex verification material|Simplex verification material contains trailing bytes|out_of_range|unavailable|fetch/i.test(
-        detail,
-    );
-}
-
 function nextBlockCertificateState(
     status: TxStatus,
     current: BlockCertificateState,
@@ -1473,6 +1476,7 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
     const frameRef = useRef<HTMLDivElement>(null);
     const measureRef = useRef<HTMLSpanElement>(null);
     const [columns, setColumns] = useState(HISTOGRAM_INITIAL_COLUMNS);
+    const [rows, setRows] = useState(HISTOGRAM_HEIGHT);
 
     useEffect(() => {
         const frame = frameRef.current;
@@ -1480,15 +1484,24 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
         if (!frame || !measure) return;
 
         const recompute = () => {
-            const columnWidth = measure.getBoundingClientRect().width;
-            if (columnWidth <= 0) return;
+            const { width: charWidth, height: charHeight } = measure.getBoundingClientRect();
+            if (charWidth <= 0 || charHeight <= 0) return;
 
-            const availableColumns = Math.floor(frame.clientWidth / columnWidth);
+            const availableColumns = Math.floor(frame.clientWidth / charWidth);
             const nextColumns = Math.max(
                 HISTOGRAM_MIN_COLUMNS,
                 Math.min(HISTOGRAM_MAX_COLUMNS, availableColumns),
             );
             setColumns((current) => (current === nextColumns ? current : nextColumns));
+
+            const rawRows = Math.floor(frame.clientHeight / charHeight);
+            const isMobile = window.matchMedia('(max-width: 760px)').matches;
+            const availableRows = isMobile ? rawRows : Math.floor(rawRows / 2);
+            const nextRows = Math.max(
+                HISTOGRAM_MIN_ROWS,
+                Math.min(HISTOGRAM_MAX_ROWS, availableRows),
+            );
+            setRows((current) => (current === nextRows ? current : nextRows));
         };
 
         recompute();
@@ -1501,7 +1514,7 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
         };
     }, []);
 
-    const lines = useMemo(() => buildHistogram(blocks, columns), [blocks, columns]);
+    const lines = useMemo(() => buildHistogram(blocks, columns, rows), [blocks, columns, rows]);
     return (
         <div className="histogram-frame" ref={frameRef}>
             <pre className="histogram" aria-label="recent block transaction count histogram">
@@ -1512,7 +1525,7 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
                     <span
                         className="histogram__line"
                         key={index}
-                        style={histogramLineStyle(index)}
+                        style={histogramLineStyle(index, rows)}
                     >
                         {line}
                     </span>
@@ -1522,7 +1535,7 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
     );
 });
 
-function buildHistogram(blocks: ObservedBlock[], width: number): string[] {
+function buildHistogram(blocks: ObservedBlock[], width: number, rows: number): string[] {
     const recent = blocks.slice(0, width).reverse();
     let peak = 0;
     for (const block of recent) {
@@ -1531,11 +1544,11 @@ function buildHistogram(blocks: ObservedBlock[], width: number): string[] {
 
     if (peak === 0) {
         const blank = ' '.repeat(width);
-        return Array.from({ length: HISTOGRAM_HEIGHT }, () => blank);
+        return Array.from({ length: rows }, () => blank);
     }
 
     const ramp = BLOCK_GLYPHS.length - 1;
-    const stepsPerColumn = HISTOGRAM_HEIGHT * ramp;
+    const stepsPerColumn = rows * ramp;
     const columnSteps = recent.map((block) => {
         const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
         return Math.min(stepsPerColumn, Math.max(1, scaledSteps));
@@ -1545,8 +1558,8 @@ function buildHistogram(blocks: ObservedBlock[], width: number): string[] {
     }
 
     const lines: string[] = [];
-    for (let row = 0; row < HISTOGRAM_HEIGHT; row++) {
-        const rowsBelow = HISTOGRAM_HEIGHT - 1 - row;
+    for (let row = 0; row < rows; row++) {
+        const rowsBelow = rows - 1 - row;
         let line = '';
         for (const steps of columnSteps) {
             const glyphIndex = Math.max(0, Math.min(ramp, steps - rowsBelow * ramp));
@@ -1557,8 +1570,8 @@ function buildHistogram(blocks: ObservedBlock[], width: number): string[] {
     return lines;
 }
 
-function histogramLineStyle(rowIndex: number): CSSProperties {
-    const ratio = 1 - rowIndex / Math.max(1, HISTOGRAM_HEIGHT - 1);
+function histogramLineStyle(rowIndex: number, rows: number): CSSProperties {
+    const ratio = 1 - rowIndex / Math.max(1, rows - 1);
     return { color: histogramLineColor(ratio) };
 }
 
