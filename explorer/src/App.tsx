@@ -360,7 +360,7 @@ export default function App() {
         try {
             const nextWallet = await createWallet();
             setWallet(nextWallet);
-            setWalletMessage('wallet created');
+            setWalletMessage('signed in');
         } catch (error) {
             setWalletMessage(error instanceof Error ? error.message : String(error));
         }
@@ -498,7 +498,7 @@ export default function App() {
                             ⬝
                         </span>
                         <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
-                            {wallet ? `wallet ${shortHex(wallet.publicKeyHex)}` : 'wallet'}
+                            wallet{wallet && <span className="wallet-trigger__key"> {shortHex(wallet.publicKeyHex)}</span>}
                         </button>
                     </div>
                 </header>
@@ -657,12 +657,11 @@ function WalletPanel({
                 </div>
             </div>
             <div className="wallet__grid">
-                <div className="wallet__cell span-2">
+                <div className="wallet__cell">
                     <span>account</span>
                     <CopyableValue
                         disabled={!wallet}
                         plain
-                        flashOnCopy
                         copiedValue={copiedValue}
                         value={wallet?.publicKeyHex ?? 'not authenticated'}
                         onCopy={onCopy}
@@ -704,7 +703,7 @@ function WalletPanel({
                     />
                 </label>
                 <button className="transfer__submit" disabled={!wallet || isSubmitting} type="submit">
-                    {isSubmitting ? 'submitting' : 'submit'}
+                    submit
                 </button>
             </form>
             {submitMessage && (
@@ -733,7 +732,21 @@ function CopyableValue({
     value: string;
     onCopy: (value: string) => void;
 }) {
-    const isCopied = flashOnCopy && copiedValue === value;
+    const [flashing, setFlashing] = useState(false);
+    const flashTimeoutRef = useRef<number | null>(null);
+
+    const handleClick = () => {
+        onCopy(value);
+        if (!flashOnCopy) return;
+        if (flashTimeoutRef.current !== null) clearTimeout(flashTimeoutRef.current);
+        setFlashing(true);
+        flashTimeoutRef.current = window.setTimeout(() => {
+            setFlashing(false);
+            flashTimeoutRef.current = null;
+        }, 800);
+    };
+
+    const isCopied = flashing || (flashOnCopy && copiedValue === value);
     const className = [
         'copyable',
         plain ? 'copyable--plain' : '',
@@ -746,7 +759,7 @@ function CopyableValue({
         <button
             className={className}
             disabled={disabled}
-            onClick={() => onCopy(value)}
+            onClick={handleClick}
             type="button"
         >
             <span className="copyable__value">{value}</span>
@@ -807,51 +820,30 @@ function TransactionHistory({
     );
 
     if (transactions.length === 0) {
-        return <section className="tx-history empty">no submitted transactions for this browser</section>;
+        return null;
     }
 
     return (
         <section className="tx-history">
             <div className="tx-history__title">submitted transactions</div>
-            <table className="tx-table">
-                <thead>
-                    <tr>
-                        <th className="tx-col-digest">digest</th>
-                        <th className="tx-col-to">to</th>
-                        <th className="tx-col-amount">amount</th>
-                        <th className="tx-col-nonce">nonce</th>
-                        <th className="tx-col-status">status</th>
-                        <th className="tx-col-cert">cert</th>
-                        <th className="tx-col-proof">proof</th>
-                        <th className="tx-col-latency">
-                            <AsciiTooltip
-                                tooltip="delta between finalization response and submission timestamp"
-                            >
-                                finalization latency
-                            </AsciiTooltip>
-                        </th>
-                        <th className="tx-col-time">time</th>
-                    </tr>
-                </thead>
-                <tbody>
-                    {transactions.map((tx) => (
-                        <TransactionRow
-                            key={tx.digest}
-                            copiedValue={copiedValue}
-                            formatter={formatter}
-                            onCopy={onCopy}
-                            signedInPublicKey={signedInPublicKey}
-                            tx={tx}
-                            verifyCertificates={verifyCertificates}
-                        />
-                    ))}
-                </tbody>
-            </table>
+            <div className="tx-list">
+                {transactions.map((tx) => (
+                    <TransactionRecord
+                        key={tx.digest}
+                        copiedValue={copiedValue}
+                        formatter={formatter}
+                        onCopy={onCopy}
+                        signedInPublicKey={signedInPublicKey}
+                        tx={tx}
+                        verifyCertificates={verifyCertificates}
+                    />
+                ))}
+            </div>
         </section>
     );
 }
 
-function TransactionRow({
+function TransactionRecord({
     copiedValue,
     formatter,
     onCopy,
@@ -868,29 +860,40 @@ function TransactionRow({
 }) {
     const ownsTx = tx.sender !== null && tx.sender === signedInPublicKey;
     return (
-        <tr>
-            <td>
+        <div className="tx-record">
+            <div className="tx-record__primary">
                 <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
-            </td>
-            <td>
+                <span className="tx-record__arrow" aria-hidden="true">→</span>
                 <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
-            </td>
-            <td>{tx.value}</td>
-            <td>{tx.nonce}</td>
-            <td>{tx.detail}</td>
-            <td>
-                <CertificateCell
-                    certificate={tx.certificate}
-                    finalizedHeight={tx.finalizedHeight}
-                    verifyCertificates={verifyCertificates}
-                />
-            </td>
-            <td>
+                <span className="tx-record__nonce">value {tx.value}</span>
+                <span className="tx-record__nonce">nonce {tx.nonce}</span>
+                <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
+            </div>
+            <div className="tx-record__secondary">
+                <span className="tx-record__detail">{tx.detail}</span>
+                {verifyCertificates && (
+                    <>
+                        <span className="tx-sep" aria-hidden="true">·</span>
+                        <span className="tx-label">cert</span>
+                        <CertificateCell
+                            certificate={tx.certificate}
+                            finalizedHeight={tx.finalizedHeight}
+                            verifyCertificates={verifyCertificates}
+                        />
+                    </>
+                )}
+                <span className="tx-sep" aria-hidden="true">·</span>
+                <span className="tx-label">proof</span>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
-            </td>
-            <td>{tx.finalizedInMs === null ? 'pending' : `${tx.finalizedInMs}ms`}</td>
-            <td>{formatter.format(tx.submittedAt)}</td>
-        </tr>
+                {tx.finalizedInMs !== null && (
+                    <>
+                        <span className="tx-sep" aria-hidden="true">·</span>
+                        <span className="tx-label">e2e latency</span>
+                        <span>{tx.finalizedInMs}ms</span>
+                    </>
+                )}
+            </div>
+        </div>
     );
 }
 
@@ -977,26 +980,6 @@ function ProofCell({
     );
 }
 
-function AsciiTooltip({
-    children,
-    tooltip,
-}: {
-    children: React.ReactNode;
-    tooltip: string;
-}) {
-    return (
-        <span className="ascii-tooltip">
-            <span className="ascii-tooltip__hint" aria-hidden="true">
-                ?{' '}
-            </span>
-            {children}
-            <span className="ascii-tooltip__box" role="tooltip">
-                <span className="ascii-tooltip__corner">+ </span>
-                <span>{tooltip}</span>
-            </span>
-        </span>
-    );
-}
 
 function upsertBoundedBatch(
     blocks: readonly ObservedBlock[],
@@ -1339,9 +1322,7 @@ function normalizeBlockCertificate(
         };
     }
     if (
-        (certificate.status === 'waiting' ||
-            certificate.status === 'fetching' ||
-            certificate.status === 'error') &&
+        (certificate.status === 'waiting' || certificate.status === 'error') &&
         typeof certificate.detail === 'string'
     ) {
         return { status: certificate.status, detail: certificate.detail };
@@ -1371,7 +1352,7 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
         };
     }
     if (
-        (proof.status === 'waiting' || proof.status === 'fetching' || proof.status === 'error') &&
+        (proof.status === 'waiting' || proof.status === 'error') &&
         typeof proof.detail === 'string'
     ) {
         return { status: proof.status, detail: proof.detail };
