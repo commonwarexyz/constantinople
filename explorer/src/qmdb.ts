@@ -27,11 +27,6 @@ export interface VerifiedTransactionProof {
     readonly proofSizeBytes: number;
 }
 
-export interface VerifiedBlockCertificate {
-    readonly height: bigint;
-    readonly view: bigint;
-}
-
 interface TransactionProofMetadata {
     readonly location: bigint;
     readonly height: bigint;
@@ -93,30 +88,6 @@ export async function fetchAndVerifyTransactionProof({
         height: target.height,
         view: target.view,
         proofSizeBytes: verification.proofSizeBytes,
-    };
-}
-
-export async function fetchAndVerifyBlockCertificate({
-    storeUrl,
-    simplexVerificationMaterial,
-    height,
-    signal,
-}: {
-    storeUrl: string;
-    simplexVerificationMaterial: string;
-    height: number;
-    signal?: AbortSignal;
-}): Promise<VerifiedBlockCertificate> {
-    await loadCrypto();
-    const target = await finalizedTransactionTarget(
-        storeUrl,
-        simplexVerificationMaterial,
-        BigInt(height),
-        signal,
-    );
-    return {
-        height: target.height,
-        view: target.view,
     };
 }
 

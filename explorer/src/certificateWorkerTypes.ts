@@ -1,10 +1,17 @@
-export interface StartCertificateStreamRequest {
-    readonly kind: 'start';
+export interface ConfigureCertificateVerifierRequest {
+    readonly kind: 'configure';
     readonly storeUrl: string;
     readonly simplexVerificationMaterial: string;
 }
 
-export type CertificateWorkerRequest = StartCertificateStreamRequest;
+export interface VerifyBlockCertificatesRequest {
+    readonly kind: 'verify';
+    readonly heights: readonly number[];
+}
+
+export type CertificateWorkerRequest =
+    | ConfigureCertificateVerifierRequest
+    | VerifyBlockCertificatesRequest;
 
 export type CertificateWorkerResponse =
     | {

@@ -6,26 +6,34 @@ import type {
 type CertificateListener = (response: CertificateWorkerResponse) => void;
 
 let certificateWorker: Worker | null = null;
-let activeStreamKey = '';
+let activeConfigKey = '';
 const listeners = new Set<CertificateListener>();
 
-export function startCertificateVerificationStream({
+export function configureCertificateVerification({
     storeUrl,
     simplexVerificationMaterial,
 }: {
     readonly storeUrl: string;
     readonly simplexVerificationMaterial: string;
 }) {
-    const streamKey = `${storeUrl}\n${simplexVerificationMaterial}`;
-    if (activeStreamKey === streamKey) return;
-    activeStreamKey = streamKey;
+    const configKey = `${storeUrl}\n${simplexVerificationMaterial}`;
+    if (activeConfigKey === configKey) return;
+    activeConfigKey = configKey;
 
     const request: CertificateWorkerRequest = {
-        kind: 'start',
+        kind: 'configure',
         storeUrl,
         simplexVerificationMaterial,
     };
     getCertificateWorker().postMessage(request);
+}
+
+export function requestCertificateVerification(heights: readonly number[]) {
+    if (heights.length === 0) return;
+    getCertificateWorker().postMessage({
+        kind: 'verify',
+        heights,
+    } satisfies CertificateWorkerRequest);
 }
 
 export function subscribeCertificateVerification(
@@ -58,7 +66,7 @@ function getCertificateWorker(): Worker {
         }
         certificateWorker?.terminate();
         certificateWorker = null;
-        activeStreamKey = '';
+        activeConfigKey = '';
     };
     return certificateWorker;
 }

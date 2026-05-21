@@ -6,7 +6,8 @@ import {
     parseU64,
 } from './codec';
 import {
-    startCertificateVerificationStream,
+    configureCertificateVerification,
+    requestCertificateVerification,
     subscribeCertificateVerification,
 } from './certificateClient';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
@@ -19,9 +20,7 @@ import {
     type TxStatus,
 } from './mempool';
 import {
-    fetchAndVerifyBlockCertificate,
     fetchAndVerifyTransactionProof,
-    type VerifiedBlockCertificate,
     type VerifiedTransactionProof,
 } from './qmdb';
 import {
@@ -215,11 +214,15 @@ export default function App() {
     };
 
     useEffect(() => {
-        startCertificateVerificationStream({
+        configureCertificateVerification({
             storeUrl,
             simplexVerificationMaterial,
         });
     }, []);
+
+    useEffect(() => {
+        requestCertificateVerification(certificateVerificationHeights(blocks, history, blockCertificates));
+    }, [blocks, history, blockCertificates]);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -351,56 +354,6 @@ export default function App() {
                 );
             });
     }, [history, wallet]);
-
-    useEffect(() => {
-        if (hasFetchingBlockCertificate(history)) return;
-
-        const tx = history.find(shouldFetchBlockCertificate);
-        if (!tx) return;
-
-        const height = tx.finalizedHeight;
-        setHistory((current) =>
-            updateBlockCertificateByHeight(
-                height,
-                fetchingBlockCertificateState(),
-                current,
-            ),
-        );
-        fetchAndVerifyBlockCertificate({
-            storeUrl,
-            simplexVerificationMaterial,
-            height,
-        })
-            .then((certificate) => {
-                setHistory((current) =>
-                    updateBlockCertificateByHeight(
-                        Number(certificate.height),
-                        verifiedBlockCertificateState(certificate),
-                        current,
-                    ),
-                );
-            })
-            .catch((error) => {
-                const detail = error instanceof Error ? error.message : String(error);
-                const nextCertificate: BlockCertificateState = isRetryableCertificateError(detail)
-                    ? { status: 'fetching', detail: 'waiting for block certificate' }
-                    : { status: 'error', detail };
-                setHistory((current) =>
-                    updateBlockCertificateByHeight(height, nextCertificate, current),
-                );
-                if (!isRetryableCertificateError(detail)) return;
-
-                window.setTimeout(() => {
-                    setHistory((current) =>
-                        updateBlockCertificateByHeight(
-                            height,
-                            { status: 'waiting', detail: 'waiting for block certificate' },
-                            current,
-                        ),
-                    );
-                }, 1_000);
-            });
-    }, [history]);
 
     useEffect(() => {
         return () => {
@@ -1183,6 +1136,36 @@ function updateBlockCertificateByHeight(
     return current.map((tx) => (tx.finalizedHeight === height ? { ...tx, certificate } : tx));
 }
 
+function certificateVerificationHeights(
+    blocks: readonly ObservedBlock[],
+    history: readonly SubmittedTransaction[],
+    certificates: BlockCertificateByHeight,
+): number[] {
+    const heights = new Set<number>();
+    for (const block of blocks) {
+        const height = Number(block.height);
+        if (!Number.isSafeInteger(height)) continue;
+        if (shouldVerifyCertificate(blockCertificateForHeight(block.height, certificates))) {
+            heights.add(height);
+        }
+    }
+    for (const tx of history) {
+        if (tx.finalizedHeight === null) continue;
+        if (shouldVerifyCertificate(tx.certificate)) {
+            heights.add(tx.finalizedHeight);
+        }
+    }
+    return [...heights].sort((left, right) => right - left);
+}
+
+function shouldVerifyCertificate(certificate: BlockCertificateState): boolean {
+    return (
+        certificate.status === 'waiting' ||
+        certificate.status === 'fetching' ||
+        (certificate.status === 'error' && isRetryableCertificateError(certificate.detail))
+    );
+}
+
 function shouldFetchTransactionProof(
     tx: SubmittedTransaction,
     signedInSender: string | null,
@@ -1198,28 +1181,12 @@ function shouldFetchTransactionProof(
     );
 }
 
-function shouldFetchBlockCertificate(
-    tx: SubmittedTransaction,
-): tx is SubmittedTransaction & { readonly finalizedHeight: number } {
-    return (
-        tx.finalizedHeight !== null &&
-        (tx.status === 'finalized' || tx.status === 'partially_finalized') &&
-        (tx.certificate.status === 'waiting' ||
-            (tx.certificate.status === 'error' &&
-                isRetryableCertificateError(tx.certificate.detail)))
-    );
-}
-
 function hasFetchingProof(
     transactions: SubmittedTransaction[],
     signedInSender: string | null,
 ): boolean {
     if (signedInSender === null) return false;
     return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
-}
-
-function hasFetchingBlockCertificate(transactions: SubmittedTransaction[]): boolean {
-    return transactions.some((tx) => tx.certificate.status === 'fetching');
 }
 
 function isRetryableProofError(detail: string): boolean {
@@ -1232,10 +1199,6 @@ function isRetryableCertificateError(detail: string): boolean {
     return /finalization missing|not found|missing proof|failed to decode Simplex identity|failed to decode Simplex verification material|Simplex verification material contains trailing bytes|out_of_range|unavailable|fetch/i.test(
         detail,
     );
-}
-
-function fetchingBlockCertificateState(): BlockCertificateState {
-    return { status: 'fetching', detail: 'fetching block certificate' };
 }
 
 function nextBlockCertificateState(
@@ -1278,7 +1241,10 @@ function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofSt
     };
 }
 
-function verifiedBlockCertificateState(certificate: VerifiedBlockCertificate): BlockCertificateState {
+function verifiedBlockCertificateState(certificate: {
+    readonly height: bigint;
+    readonly view: bigint;
+}): BlockCertificateState {
     return {
         status: 'verified',
         detail: `verified at height ${certificate.height.toString()}`,
