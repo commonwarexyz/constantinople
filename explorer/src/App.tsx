@@ -36,7 +36,7 @@ import {
 const HISTOGRAM_MAX_COLUMNS = 180;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
-const HISTOGRAM_HEIGHT = 36;
+const HISTOGRAM_HEIGHT = 18;
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_STATUS_TEXT = '>>> live';

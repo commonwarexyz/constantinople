@@ -289,7 +289,7 @@ body {
 .histogram {
     width: max-content;
     max-width: 100%;
-    height: clamp(260px, 54vh, 560px);
+    height: clamp(150px, 30vh, 300px);
     margin: 0;
     display: flex;
     flex-direction: column;
@@ -720,7 +720,7 @@ body {
     }
 
     .histogram {
-        height: clamp(200px, 48vh, 420px);
+        height: clamp(120px, 28vh, 240px);
         font-size: 5px;
     }
 
