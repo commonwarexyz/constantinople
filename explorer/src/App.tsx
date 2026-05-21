@@ -5,7 +5,11 @@ import {
     parsePublicKeyHex,
     parseU64,
 } from './codec';
-import { type ObservedBlock, subscribeBlocks } from './indexer';
+import {
+    enqueueCertificateVerification,
+    subscribeCertificateVerification,
+} from './certificateClient';
+import { fetchBlocksByHeightRange, type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
     fetchTransactionStatus,
@@ -47,6 +51,9 @@ const LIVE_STATUS_TEXT = '>>> live';
 const LIVE_STATUS_STAGGER_MS = 50;
 const LIVE_STATUS_BLANK_MS = 100;
 const LIVE_STATUS_PAUSE_MS = 550;
+const BLOCK_FLUSH_INTERVAL_MS = 50;
+const CERTIFICATE_FLUSH_INTERVAL_MS = 100;
+const GAP_FILL_DEBOUNCE_MS = 250;
 
 type Status =
     | { kind: 'connecting' }
@@ -113,6 +120,11 @@ interface ObservedRateWindow {
 
 type BlockCertificateByHeight = Record<string, BlockCertificateState>;
 
+interface CertificateUpdate {
+    readonly height: number;
+    readonly certificate: BlockCertificateState;
+}
+
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
     // Cumulative counters across every block we've ever observed on the
@@ -139,6 +151,14 @@ export default function App() {
     const [history, setHistory] = useState<SubmittedTransaction[]>(() => readHistory());
     const [copiedValue, setCopiedValue] = useState('');
     const [copyToast, setCopyToast] = useState('');
+    const pendingBlocksRef = useRef<ObservedBlock[]>([]);
+    const blockFlushTimeoutRef = useRef<number | null>(null);
+    const pendingCertificatesRef = useRef<CertificateUpdate[]>([]);
+    const certificateFlushTimeoutRef = useRef<number | null>(null);
+    const gapFillRef = useRef<{
+        controller: AbortController | null;
+        timeout: number | null;
+    }>({ controller: null, timeout: null });
     const copiedValueTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isWalletBusy =
@@ -147,6 +167,61 @@ export default function App() {
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInPublicKey = wallet?.publicKeyHex ?? null;
+
+    const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
+        if (nextBlocks.length === 0) return;
+
+        pendingBlocksRef.current.push(...nextBlocks);
+        if (blockFlushTimeoutRef.current !== null) return;
+
+        blockFlushTimeoutRef.current = window.setTimeout(() => {
+            blockFlushTimeoutRef.current = null;
+            const flushed = pendingBlocksRef.current;
+            pendingBlocksRef.current = [];
+            if (flushed.length === 0) return;
+
+            enqueueCertificateVerification({
+                storeUrl,
+                simplexVerificationMaterial,
+                heights: uniqueBlockHeights(flushed),
+            });
+            setBlocks((current) => upsertBoundedBatch(flushed, current));
+            setBlocksObserved((current) => current + flushed.length);
+            setTotalTxObserved(
+                (current) =>
+                    current + flushed.reduce((total, block) => total + block.txCount, 0),
+            );
+            setObservedRateWindow((current) => ({
+                firstBlockAt: current.firstBlockAt ?? flushed[0].arrivedAt,
+                latestBlockAt: flushed[flushed.length - 1].arrivedAt,
+            }));
+            setStatus({ kind: 'live' });
+        }, BLOCK_FLUSH_INTERVAL_MS);
+    };
+
+    const queueCertificateUpdate = (update: CertificateUpdate) => {
+        pendingCertificatesRef.current.push(update);
+        if (certificateFlushTimeoutRef.current !== null) return;
+
+        certificateFlushTimeoutRef.current = window.setTimeout(() => {
+            certificateFlushTimeoutRef.current = null;
+            const flushed = pendingCertificatesRef.current;
+            pendingCertificatesRef.current = [];
+            if (flushed.length === 0) return;
+
+            setBlockCertificates((current) =>
+                flushed.reduce(
+                    (certificates, entry) =>
+                        updateObservedBlockCertificate(
+                            entry.height,
+                            entry.certificate,
+                            certificates,
+                        ),
+                    current,
+                ),
+            );
+        }, CERTIFICATE_FLUSH_INTERVAL_MS);
+    };
 
     useEffect(() => {
         const controller = new AbortController();
@@ -161,14 +236,7 @@ export default function App() {
                     onReconnect: () => setStatus({ kind: 'connecting' }),
                 })) {
                     if (cancelled) return;
-                    setBlocks((current) => upsertBounded(block, current));
-                    setBlocksObserved((current) => current + 1);
-                    setTotalTxObserved((current) => current + block.txCount);
-                    setObservedRateWindow((current) => ({
-                        firstBlockAt: current.firstBlockAt ?? block.arrivedAt,
-                        latestBlockAt: block.arrivedAt,
-                    }));
-                    setStatus({ kind: 'live' });
+                    queueObservedBlocks([block]);
                 }
             } catch (error) {
                 if (cancelled || controller.signal.aborted) return;
@@ -186,6 +254,33 @@ export default function App() {
     }, []);
 
     useEffect(() => {
+        const range = visibleGapRange(blocks);
+        if (!range || gapFillRef.current.timeout !== null || gapFillRef.current.controller) {
+            return;
+        }
+
+        gapFillRef.current.timeout = window.setTimeout(() => {
+            gapFillRef.current.timeout = null;
+            const controller = new AbortController();
+            gapFillRef.current.controller = controller;
+            fetchBlocksByHeightRange(indexerUrl, range.fromHeight, range.toHeight, controller.signal)
+                .then(queueObservedBlocks)
+                .catch((error) => {
+                    if (controller.signal.aborted) return;
+                    setStatus({
+                        kind: 'error',
+                        message: error instanceof Error ? error.message : String(error),
+                    });
+                })
+                .finally(() => {
+                    if (gapFillRef.current.controller === controller) {
+                        gapFillRef.current.controller = null;
+                    }
+                });
+        }, GAP_FILL_DEBOUNCE_MS);
+    }, [blocks]);
+
+    useEffect(() => {
         writeHistory(history);
     }, [history]);
 
@@ -194,52 +289,33 @@ export default function App() {
     }, [blocks]);
 
     useEffect(() => {
-        if (hasFetchingObservedBlockCertificate(blockCertificates)) return;
-
-        const block = blocks.find((entry) =>
-            shouldFetchObservedBlockCertificate(entry, blockCertificates),
-        );
-        if (!block) return;
-
-        const height = Number(block.height);
-        setBlockCertificates((current) =>
-            updateObservedBlockCertificate(height, fetchingBlockCertificateState(), current),
-        );
-        fetchAndVerifyBlockCertificate({
-            storeUrl,
-            simplexVerificationMaterial,
-            height,
-        })
-            .then((certificate) => {
-                setBlockCertificates((current) =>
-                    updateObservedBlockCertificate(
-                        Number(certificate.height),
-                        verifiedBlockCertificateState(certificate),
-                        current,
-                    ),
-                );
-            })
-            .catch((error) => {
-                const detail = error instanceof Error ? error.message : String(error);
-                const nextCertificate: BlockCertificateState = isRetryableCertificateError(detail)
-                    ? { status: 'fetching', detail: 'waiting for block certificate' }
-                    : { status: 'error', detail };
-                setBlockCertificates((current) =>
-                    updateObservedBlockCertificate(height, nextCertificate, current),
-                );
-                if (!isRetryableCertificateError(detail)) return;
-
-                window.setTimeout(() => {
-                    setBlockCertificates((current) =>
-                        updateObservedBlockCertificate(
-                            height,
-                            { status: 'waiting', detail: 'waiting for block certificate' },
-                            current,
-                        ),
-                    );
-                }, 1_000);
+        return subscribeCertificateVerification((response) => {
+            if (response.height === 0) return;
+            if (response.kind === 'fetching') {
+                queueCertificateUpdate({
+                    height: response.height,
+                    certificate: fetchingBlockCertificateState(),
+                });
+                return;
+            }
+            if (response.kind === 'verified') {
+                queueCertificateUpdate({
+                    height: response.height,
+                    certificate: {
+                        status: 'verified',
+                        detail: `verified at height ${response.height}`,
+                        height: String(response.height),
+                        view: response.view,
+                    },
+                });
+                return;
+            }
+            queueCertificateUpdate({
+                height: response.height,
+                certificate: { status: 'error', detail: response.detail },
             });
-    }, [blocks, blockCertificates]);
+        });
+    }, []);
 
     useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
@@ -365,6 +441,16 @@ export default function App() {
 
     useEffect(() => {
         return () => {
+            if (blockFlushTimeoutRef.current !== null) {
+                window.clearTimeout(blockFlushTimeoutRef.current);
+            }
+            if (certificateFlushTimeoutRef.current !== null) {
+                window.clearTimeout(certificateFlushTimeoutRef.current);
+            }
+            if (gapFillRef.current.timeout !== null) {
+                window.clearTimeout(gapFillRef.current.timeout);
+            }
+            gapFillRef.current.controller?.abort();
             if (copiedValueTimeoutRef.current !== null) {
                 window.clearTimeout(copiedValueTimeoutRef.current);
             }
@@ -1030,13 +1116,44 @@ function AsciiTooltip({
     );
 }
 
-function upsertBounded(block: ObservedBlock, current: ObservedBlock[]): ObservedBlock[] {
-    const next = [block, ...current.filter((entry) => entry.height !== block.height)];
+function uniqueBlockHeights(blocks: readonly ObservedBlock[]): number[] {
+    return Array.from(new Set(blocks.map((block) => Number(block.height))));
+}
+
+function upsertBoundedBatch(
+    blocks: readonly ObservedBlock[],
+    current: ObservedBlock[],
+): ObservedBlock[] {
+    const byHeight = new Map(current.map((entry) => [entry.height.toString(), entry]));
+    for (const block of blocks) {
+        byHeight.set(block.height.toString(), block);
+    }
+
+    const next = Array.from(byHeight.values());
     next.sort((a, b) => compareBlockHeightDesc(a.height, b.height));
     if (next.length > MAX_ROWS) {
         next.length = MAX_ROWS;
     }
     return next;
+}
+
+function visibleGapRange(
+    blocks: readonly ObservedBlock[],
+): { readonly fromHeight: bigint; readonly toHeight: bigint } | null {
+    if (blocks.length < 2) return null;
+
+    const ordered = [...blocks].sort((a, b) => compareBlockHeightDesc(a.height, b.height));
+    for (let index = 0; index < ordered.length - 1; index++) {
+        const higher = ordered[index].height;
+        const lower = ordered[index + 1].height;
+        if (higher <= lower + 1n) continue;
+
+        return {
+            fromHeight: lower + 1n,
+            toHeight: higher - 1n,
+        };
+    }
+    return null;
 }
 
 function compareBlockHeightDesc(a: bigint, b: bigint): number {
@@ -1062,21 +1179,6 @@ function pruneBlockCertificates(
         return certificates;
     }
     return Object.fromEntries(entries);
-}
-
-function shouldFetchObservedBlockCertificate(
-    block: ObservedBlock,
-    certificates: BlockCertificateByHeight,
-): boolean {
-    const certificate = blockCertificateForHeight(block.height, certificates);
-    return (
-        certificate.status === 'waiting' ||
-        (certificate.status === 'error' && isRetryableCertificateError(certificate.detail))
-    );
-}
-
-function hasFetchingObservedBlockCertificate(certificates: BlockCertificateByHeight): boolean {
-    return Object.values(certificates).some((certificate) => certificate.status === 'fetching');
 }
 
 function updateObservedBlockCertificate(

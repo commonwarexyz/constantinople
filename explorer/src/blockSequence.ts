@@ -14,6 +14,24 @@ export function createBlockSequenceCursor(): BlockSequenceCursor {
     };
 }
 
+export function collectLiveBlocks<T extends HeightedBlock>(
+    cursor: BlockSequenceCursor,
+    blocks: Iterable<T>,
+): T[] {
+    const next: T[] = [];
+    for (const block of blocks) {
+        if (hasSeen(cursor, block.height)) {
+            continue;
+        }
+
+        if (cursor.latestHeight === null || block.height > cursor.latestHeight) {
+            cursor.latestHeight = block.height;
+        }
+        addIfNew(cursor, next, block);
+    }
+    return next;
+}
+
 export async function collectNewBlocks<T extends HeightedBlock>(
     cursor: BlockSequenceCursor,
     blocks: Iterable<T>,

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    collectLiveBlocks,
     collectNewBlocks,
     createBlockSequenceCursor,
     type HeightedBlock,
@@ -45,6 +46,18 @@ test('replayed duplicate heights are ignored', async () => {
 
     assert.deepEqual(first.map((entry) => entry.height), [7n]);
     assert.deepEqual(replay, []);
+});
+
+test('live collection does not wait for missing heights', () => {
+    const cursor = createBlockSequenceCursor();
+
+    const observed = collectLiveBlocks(cursor, [block(7n), block(9n)]);
+
+    assert.deepEqual(
+        observed.map((entry) => entry.height),
+        [7n, 9n],
+    );
+    assert.equal(cursor.latestHeight, 9n);
 });
 
 function block(height: bigint): TestBlock {
