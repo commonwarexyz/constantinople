@@ -7,6 +7,7 @@ import {
     TraversalMode,
 } from '@exowarexyz/sdk';
 import { fromHex } from './codec';
+import { transactionProofTip } from './proofMath';
 import { SimplexClient } from '@exowarexyz/simplex';
 import { verifyFinalization, verifyTransactionProof } from './crypto-wasm/constantinople_explorer_crypto';
 import { loadCrypto } from './wallet';
@@ -78,7 +79,8 @@ export async function fetchAndVerifyTransactionProof({
         throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
     }
 
-    const proof = await fetchOperationProof(qmdbUrl, metadata.location, target.transactionsTip, signal);
+    const tip = transactionProofTip(target.transactionsTip);
+    const proof = await fetchOperationProof(qmdbUrl, metadata.location, tip, signal);
     const verification = verifyTransactionProof(
         target.transactionsRoot,
         proof.proof,
@@ -92,7 +94,7 @@ export async function fetchAndVerifyTransactionProof({
 
     return {
         location: metadata.location,
-        tip: target.transactionsTip,
+        tip,
         height: target.height,
         view: target.view,
         proofSizeBytes: verification.proofSizeBytes,
