@@ -237,7 +237,7 @@ where
     if parallelism <= 1 || transactions.len() <= parallelism {
         return transactions
             .iter()
-            .all(|lazy| lazy.get().is_some())
+            .all(signature_inputs_decode)
             .then_some(transactions);
     }
 
@@ -245,10 +245,21 @@ where
         .fold(
             &transactions,
             || true,
-            |decoded, lazy| decoded && lazy.get().is_some(),
+            |decoded, lazy| decoded && signature_inputs_decode(lazy),
             |left, right| left && right,
         )
         .then_some(transactions)
+}
+
+fn signature_inputs_decode<P, H>(lazy: &Lazy<SignedTransaction<P, H>>) -> bool
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    let Some(transaction) = lazy.get() else {
+        return false;
+    };
+    transaction.value().sender().is_some() && transaction.signature().is_some()
 }
 
 /// Verifies a slice of lazily-encoded signed transactions using batch
@@ -333,11 +344,16 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{Sealable, Sealed, Transaction, signed::Signable};
+    use crate::{Sealable, Sealed, SignedTransaction, Transaction, signed::Signable};
+    use commonware_codec::{
+        DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
+        types::lazy::Lazy,
+    };
     use commonware_cryptography::{
         Hasher, Signer, Verifier, ed25519, secp256r1::recoverable, sha256,
     };
     use commonware_math::algebra::Random;
+    use commonware_parallel::Sequential;
     use commonware_utils::test_rng;
     use core::num::NonZeroU64;
 
@@ -345,6 +361,8 @@ mod test {
 
     #[derive(Debug)]
     struct MockValue([u8; 4]);
+
+    type Ed25519SignedTransaction = SignedTransaction<ed25519::PublicKey, sha256::Sha256>;
 
     impl Sealable for MockValue {
         type SealDigest = sha256::Digest;
@@ -430,5 +448,50 @@ mod test {
                     .expect("signed sender should decode"),
             )
         );
+    }
+
+    #[test]
+    fn preload_transaction_chunks_forces_nested_signature_inputs() {
+        let hasher = &mut sha256::Sha256::default();
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let public_key = private_key.public_key();
+        let signed = Transaction::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&private_key, NAMESPACE, hasher);
+
+        let mut encoded = Vec::with_capacity(signed.encode_size());
+        signed.write(&mut encoded);
+        encoded[..ed25519::PublicKey::SIZE].copy_from_slice(&invalid_public_key_bytes());
+
+        let lazy = Lazy::<Ed25519SignedTransaction>::read(&mut &encoded[..])
+            .expect("outer transaction should decode");
+        assert!(
+            lazy.get().is_some(),
+            "outer transaction decode should defer sender validation"
+        );
+
+        assert!(
+            super::preload_transaction_chunks(&Sequential, vec![lazy]).is_none(),
+            "preload must force the nested sender public key"
+        );
+    }
+
+    fn invalid_public_key_bytes() -> [u8; ed25519::PublicKey::SIZE] {
+        (0u8..=u8::MAX)
+            .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
+            .find_map(|(first, last)| {
+                let mut candidate = [0; ed25519::PublicKey::SIZE];
+                candidate[0] = first;
+                candidate[ed25519::PublicKey::SIZE - 1] = last;
+
+                ed25519::PublicKey::decode(&mut &candidate[..])
+                    .is_err()
+                    .then_some(candidate)
+            })
+            .expect("test should find invalid public key bytes")
     }
 }
