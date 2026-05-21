@@ -1,8 +1,8 @@
 //! QMDB query facade for the shared indexer store.
 //!
 //! `qmdb-indexer` exposes the Store-backed QMDB indexes written by
-//! validators. It serves account state under `/state` and transaction-hash
-//! history under `/transactions`.
+//! validators. It serves the account-state operation log under `/state` and
+//! transaction-hash history under `/transactions`.
 
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};

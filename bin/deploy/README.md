@@ -152,8 +152,8 @@ The printed `mprocs` command list grows by four entries:
 Validators do not upload QMDB data to `qmdb-indexer` directly. The first
 secondary writes QMDB rows into the shared `chain-indexer` store using reserved
 Store prefixes. `qmdb-indexer` reads those rows from the same store and exposes
-account-state QMDB APIs under `/state` and transaction-hash QMDB APIs under
-`/transactions`.
+account-state operation-log APIs under `/state` and transaction-hash
+operation-log APIs under `/transactions`.
 
 If `--relayer` is also enabled, the explorer command receives `VITE_MEMPOOL_URL` pointing at the
 local relayer. Otherwise it uses its default direct mempool URL.
@@ -374,7 +374,7 @@ Topology and defaults:
   metadata service reads from that backing store.
 
 QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
-writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state current/proof APIs are
+writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
 mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
 
 The deployer opens both shared-service ports globally because `commonware-deployer`'s port list is
