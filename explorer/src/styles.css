@@ -11,7 +11,7 @@
     --font-family-mono:
         ui-monospace, 'SF Mono', Menlo, Monaco, 'Cascadia Code', Consolas,
         'Liberation Mono', monospace;
-    --font-size: 14px;
+    --font-size: 21px;
     --line-height: 1.4;
 
     --theme-background: #0e0f10;
@@ -288,7 +288,7 @@ body {
 .histogram {
     width: max-content;
     max-width: 100%;
-    height: clamp(150px, 30vh, 300px);
+    height: clamp(225px, 30vh, 450px);
     margin: 0;
     display: flex;
     flex-direction: column;
@@ -296,7 +296,7 @@ body {
     padding: 0 0 clamp(0.75rem, 1.4vw, 1.5rem);
     border-bottom: 1px solid var(--theme-border);
     font-family: var(--font-family-mono);
-    font-size: 9px;
+    font-size: 14px;
     line-height: 1;
     letter-spacing: 0;
     overflow: hidden;
@@ -740,7 +740,7 @@ body {
     .histogram {
         width: 100%;
         height: 100%;
-        font-size: 5px;
+        font-size: 8px;
         padding-bottom: 0;
         border-bottom: none;
     }
@@ -900,7 +900,7 @@ body {
     }
 
     .histogram {
-        font-size: 4px;
+        font-size: 6px;
     }
 
     .observed-stat__value {
