@@ -292,7 +292,7 @@ fn local_run_commands(
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
             format!(
-                "cargo run --bin constantinople -- --config {} --peers {}",
+                "cargo run --release --bin constantinople -- --config {} --peers {}",
                 path.display(),
                 peers_path.display()
             )
@@ -302,7 +302,7 @@ fn local_run_commands(
     for index in 0..args.secondaries {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
         commands.push(format!(
-            "cargo run --bin constantinople -- --config {} --peers {}",
+            "cargo run --release --bin constantinople -- --config {} --peers {}",
             path.display(),
             peers_path.display()
         ));
@@ -311,7 +311,7 @@ fn local_run_commands(
     if relayer_enabled(args) {
         let path = output_dir.join(RELAYER_CONFIG_FILE);
         commands.push(format!(
-            "cargo run --bin constantinople-relayer -- --config {}",
+            "cargo run --release --bin constantinople-relayer -- --config {}",
             path.display()
         ));
     }
@@ -319,7 +319,7 @@ fn local_run_commands(
     if args.secondaries > 0 {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
         commands.push(format!(
-            "cargo run -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
+            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             data_dir.display(),
@@ -329,12 +329,12 @@ fn local_run_commands(
         // subscribes to this service (not the raw store) for live block
         // metadata.
         commands.push(format!(
-            "cargo run -p constantinople-indexer --bin {} -- \
+            "cargo run --release -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
         ));
         commands.push(format!(
-            "cargo run -p constantinople-indexer --bin {} -- \
+            "cargo run --release -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
