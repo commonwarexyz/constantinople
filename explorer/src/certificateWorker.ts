@@ -7,6 +7,8 @@ import type {
 } from './certificateWorkerTypes';
 
 const STREAM_RETRY_DELAY_MS = 1_000;
+const FINALIZATION_FETCH_RETRY_DELAY_MS = 1_000;
+const FINALIZATION_FETCH_CONCURRENCY = 4;
 const RAW_CACHE_LIMIT = 4_096;
 
 interface CertificateWorkerConfig {
@@ -22,11 +24,14 @@ const wanted = new Map<number, Uint8Array>();
 const verified = new Set<number>();
 const queued = new Set<number>();
 const rawByHeight = new Map<number, Uint8Array>();
+const pendingFetches = new Set<number>();
+const inFlightFetches = new Set<number>();
 const verifyQueue: number[] = [];
 let cryptoReady: Promise<unknown> | null = null;
 let config: CertificateWorkerConfig | null = null;
 let streamController: AbortController | null = null;
 let streamRetryTimer: number | null = null;
+let fetchTimer: number | null = null;
 let verifying = false;
 
 const workerScope = self as unknown as {
@@ -55,6 +60,8 @@ function configure(nextConfig: CertificateWorkerConfig) {
     verified.clear();
     queued.clear();
     rawByHeight.clear();
+    pendingFetches.clear();
+    inFlightFetches.clear();
     verifyQueue.length = 0;
     verifying = false;
 
@@ -63,6 +70,10 @@ function configure(nextConfig: CertificateWorkerConfig) {
     if (streamRetryTimer !== null) {
         workerScope.clearTimeout(streamRetryTimer);
         streamRetryTimer = null;
+    }
+    if (fetchTimer !== null) {
+        workerScope.clearTimeout(fetchTimer);
+        fetchTimer = null;
     }
     startStream(nextConfig);
 }
@@ -75,6 +86,8 @@ function watchBlocks(blocks: readonly WatchedBlockCertificate[]) {
         wanted.set(height, digest);
         if (rawByHeight.has(height)) {
             enqueueVerification(height);
+        } else {
+            scheduleFinalizationFetch(height, 0);
         }
     }
     scheduleVerification();
@@ -99,9 +112,10 @@ async function runStream(activeConfig: CertificateWorkerConfig, signal: AbortSig
                 const height = Number(entry.height);
                 if (!Number.isSafeInteger(height) || height < 0 || verified.has(height)) continue;
                 rememberRawFinalization(height, entry.finalized);
-            if (wanted.has(height)) {
-                enqueueVerification(height);
-            }
+                if (wanted.has(height)) {
+                    pendingFetches.delete(height);
+                    enqueueVerification(height);
+                }
             }
             scheduleVerification();
         }
@@ -137,6 +151,73 @@ function enqueueVerification(height: number) {
     if (verified.has(height) || queued.has(height)) return;
     queued.add(height);
     verifyQueue.push(height);
+}
+
+function scheduleFinalizationFetch(height: number, delayMs: number) {
+    if (verified.has(height) || rawByHeight.has(height) || inFlightFetches.has(height)) return;
+    pendingFetches.add(height);
+    scheduleFetchPump(delayMs);
+}
+
+function scheduleFetchPump(delayMs: number) {
+    if (fetchTimer !== null) return;
+    fetchTimer = workerScope.setTimeout(() => {
+        fetchTimer = null;
+        pumpFinalizationFetches();
+    }, delayMs);
+}
+
+function pumpFinalizationFetches() {
+    const activeConfig = config;
+    if (!activeConfig) return;
+
+    while (
+        inFlightFetches.size < FINALIZATION_FETCH_CONCURRENCY &&
+        pendingFetches.size > 0
+    ) {
+        const height = pendingFetches.values().next().value;
+        if (height === undefined) return;
+        pendingFetches.delete(height);
+        if (!wanted.has(height) || verified.has(height) || rawByHeight.has(height)) continue;
+
+        inFlightFetches.add(height);
+        void fetchFinalizationByHeight(activeConfig, height).finally(() => {
+            inFlightFetches.delete(height);
+            if (pendingFetches.size > 0) {
+                scheduleFetchPump(0);
+            }
+        });
+    }
+}
+
+async function fetchFinalizationByHeight(activeConfig: CertificateWorkerConfig, height: number) {
+    if (config !== activeConfig || !wanted.has(height) || verified.has(height)) return;
+
+    try {
+        const simplex = new SimplexClient(trimTrailingSlash(activeConfig.storeUrl));
+        const finalized = await simplex.getFinalizationByHeightRaw(String(height));
+        if (!finalized) {
+            retryFinalizationFetch(activeConfig, height);
+            return;
+        }
+
+        rememberRawFinalization(height, finalized);
+        enqueueVerification(height);
+        scheduleVerification();
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (isRetryableCertificateError(detail)) {
+            retryFinalizationFetch(activeConfig, height);
+            return;
+        }
+        wanted.delete(height);
+        workerScope.postMessage({ kind: 'error', height, detail });
+    }
+}
+
+function retryFinalizationFetch(activeConfig: CertificateWorkerConfig, height: number) {
+    if (config !== activeConfig || !wanted.has(height) || verified.has(height)) return;
+    scheduleFinalizationFetch(height, FINALIZATION_FETCH_RETRY_DELAY_MS);
 }
 
 function scheduleVerification() {
