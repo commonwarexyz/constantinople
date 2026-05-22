@@ -108,13 +108,7 @@ where
     let execute_started_at = Instant::now();
     let output = executor::propose_prepared(&state, input);
     let execute_ms = execute_started_at.elapsed().as_millis();
-    let transfers = output
-        .valid
-        .iter()
-        .map(executor::prepare_transfer)
-        .collect::<Option<Vec<_>>>()
-        .expect("included proposal transactions were already prepared");
-    let digests = transfer_digests(&transfers);
+    let digests = transfer_digests(&output.transfers);
     let state_batch = apply_changeset(state_batch, &output.changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
     let timings = Timings::before_finalize(0, load_state_ms, execute_ms);

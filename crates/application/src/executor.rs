@@ -70,6 +70,7 @@ where
     pub invalid: Vec<SignedTransaction<P, H>>,
     /// Persistent account writes produced by included transactions.
     pub changeset: Changeset<P>,
+    pub(crate) transfers: Vec<PreparedTransfer<P, H>>,
 }
 
 /// Prepares transactions for proposal-side execution.
@@ -111,10 +112,12 @@ where
 {
     let mut overlay = Overlay::new(state, input.candidates.len());
     let mut valid = Vec::with_capacity(input.candidates.len());
+    let mut transfers = Vec::with_capacity(input.candidates.len());
     let mut invalid = input.invalid;
 
     for candidate in input.candidates {
         if apply_transfer(&mut overlay, &candidate.transfer) {
+            transfers.push(candidate.transfer);
             valid.push(candidate.transaction);
         } else {
             invalid.push(candidate.transaction);
@@ -125,6 +128,7 @@ where
         valid,
         invalid,
         changeset: overlay.into_changeset(),
+        transfers,
     }
 }
 
