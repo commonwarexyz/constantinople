@@ -35,6 +35,7 @@ import {
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
+const BLOCK_LOG_MAX = 10;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
 const HISTOGRAM_HEIGHT = 18;
@@ -510,6 +511,7 @@ export default function App() {
                             observedRateWindow={observedRateWindow}
                             totalTxObserved={totalTxObserved}
                         />
+                        <BlockLog blocks={blocks} />
                     </section>
                 </main>
                 {isWalletOpen && (
@@ -1495,7 +1497,10 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
         };
     }, []);
 
-    const lines = useMemo(() => buildHistogram(blocks, columns, rows), [blocks, columns, rows]);
+    const { lines, placeholderCount } = useMemo(
+        () => buildHistogram(blocks, columns, rows),
+        [blocks, columns, rows],
+    );
     return (
         <div className="histogram-frame" ref={frameRef}>
             <pre className="histogram" aria-label="recent block transaction count histogram">
@@ -1508,7 +1513,12 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
                         key={index}
                         style={histogramLineStyle(index, rows)}
                     >
-                        {line}
+                        {placeholderCount > 0 && (
+                            <span style={HISTOGRAM_PLACEHOLDER_STYLE}>
+                                {line.slice(0, placeholderCount)}
+                            </span>
+                        )}
+                        {line.slice(placeholderCount)}
                     </span>
                 ))}
             </pre>
@@ -1516,26 +1526,86 @@ const Histogram = memo(function Histogram({ blocks }: { blocks: ObservedBlock[] 
     );
 });
 
-function buildHistogram(blocks: ObservedBlock[], width: number, rows: number): string[] {
+const BlockLog = memo(function BlockLog({ blocks }: { blocks: ObservedBlock[] }) {
+    const recent = blocks.slice(0, BLOCK_LOG_MAX);
+    const formatter = useMemo(
+        () =>
+            new Intl.DateTimeFormat(undefined, {
+                hour: '2-digit',
+                minute: '2-digit',
+                second: '2-digit',
+                fractionalSecondDigits: 3,
+            }),
+        [],
+    );
+
+    if (recent.length === 0) return null;
+
+    return (
+        <section className="block-log" aria-label="recent finalized blocks">
+            <div className="block-log__title">finalized blocks</div>
+            <div className="block-log__list">
+                {recent.map((block) => (
+                    <BlockLogRow key={block.height.toString()} block={block} formatter={formatter} />
+                ))}
+            </div>
+        </section>
+    );
+});
+
+const BlockLogRow = memo(function BlockLogRow({
+    block,
+    formatter,
+}: {
+    block: ObservedBlock;
+    formatter: Intl.DateTimeFormat;
+}) {
+    const digestHex = useMemo(() => uint8ArrayToHex(block.digest), [block.digest]);
+    return (
+        <div className="block-row">
+            <span className="block-row__height">#{block.height.toString()}</span>
+            <span className="block-row__digest" title={digestHex}>{shortHex(digestHex)}</span>
+            <span className="block-row__txcount">{block.txCount.toLocaleString()} tx</span>
+            <span className="block-row__time">{formatter.format(block.arrivedAt)}</span>
+        </div>
+    );
+});
+
+function uint8ArrayToHex(bytes: Uint8Array): string {
+    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+const HISTOGRAM_PLACEHOLDER_STYLE: CSSProperties = { color: '#383838' };
+
+function buildHistogram(
+    blocks: ObservedBlock[],
+    width: number,
+    rows: number,
+): { lines: string[]; placeholderCount: number } {
     const recent = blocks.slice(0, width).reverse();
+    const placeholderCount = Math.max(0, width - recent.length);
     let peak = 0;
     for (const block of recent) {
         if (block.txCount > peak) peak = block.txCount;
     }
 
-    if (peak === 0) {
-        const blank = ' '.repeat(width);
-        return Array.from({ length: rows }, () => blank);
-    }
-
     const ramp = BLOCK_GLYPHS.length - 1;
     const stepsPerColumn = rows * ramp;
-    const columnSteps = recent.map((block) => {
-        const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
-        return Math.min(stepsPerColumn, Math.max(1, scaledSteps));
-    });
-    while (columnSteps.length < width) {
-        columnSteps.unshift(0);
+    const placeholderSteps = Math.round(stepsPerColumn * 0.5);
+
+    const columnSteps: number[] = [];
+    for (let i = 0; i < placeholderCount; i++) {
+        columnSteps.push(placeholderSteps);
+    }
+    if (peak === 0) {
+        for (let i = 0; i < recent.length; i++) {
+            columnSteps.push(0);
+        }
+    } else {
+        for (const block of recent) {
+            const scaledSteps = Math.round((block.txCount / peak) * stepsPerColumn);
+            columnSteps.push(Math.min(stepsPerColumn, Math.max(1, scaledSteps)));
+        }
     }
 
     const lines: string[] = [];
@@ -1548,7 +1618,7 @@ function buildHistogram(blocks: ObservedBlock[], width: number, rows: number): s
         }
         lines.push(line);
     }
-    return lines;
+    return { lines, placeholderCount };
 }
 
 function histogramLineStyle(rowIndex: number, rows: number): CSSProperties {
@@ -1557,7 +1627,7 @@ function histogramLineStyle(rowIndex: number, rows: number): CSSProperties {
 }
 
 function histogramLineColor(ratio: number): string {
-    const start = [14, 15, 16];
+    const start = [32, 34, 36];
     const end = [255, 178, 0];
     const mix = Math.max(0, Math.min(1, ratio));
     const channels = start.map((value, index) =>
