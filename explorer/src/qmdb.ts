@@ -7,7 +7,7 @@ import {
     TraversalMode,
 } from '@exowarexyz/sdk';
 import { fromHex } from './codec';
-import { transactionProofTip } from './proofMath';
+import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import { SimplexClient } from '@exowarexyz/simplex';
 import { verifyAccountProof, verifyFinalization, verifyTransactionProof } from './crypto-wasm/constantinople_explorer_crypto';
 import { loadCrypto } from './wallet';
@@ -241,9 +241,7 @@ export async function fetchAndVerifyTransactionRowProof({
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
     await loadCrypto();
-    if (row.qmdLocation < target.transactionsStart || row.qmdLocation >= target.transactionsTip) {
-        throw new Error(`transaction location ${row.qmdLocation} is outside finalized transaction range`);
-    }
+    assertTransactionLocationBeforeTip(row.qmdLocation, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
     const proof = await fetchOperationProof(`${trimTrailingSlash(qmdbUrl)}/transactions`, row.qmdLocation, tip, signal);

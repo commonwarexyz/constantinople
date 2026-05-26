@@ -4,3 +4,13 @@ const RETRYABLE_PROOF_ERROR =
 export function isRetryableProofError(detail: string): boolean {
     return RETRYABLE_PROOF_ERROR.test(detail);
 }
+
+export function isRetryableAccountProofError(detail: string): boolean {
+    return (
+        detail.includes('outside finalized state range') ||
+        detail.includes('[out_of_range]') ||
+        detail.includes('[unavailable]') ||
+        detail.includes('QMDB') ||
+        detail.includes('missing')
+    );
+}

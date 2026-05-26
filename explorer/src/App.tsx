@@ -32,7 +32,7 @@ import {
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
-import { isRetryableProofError } from './proofRetry';
+import { isRetryableAccountProofError, isRetryableProofError } from './proofRetry';
 import {
     clearSession,
     createWallet,
@@ -277,56 +277,67 @@ export default function App() {
 
         const controller = new AbortController();
         setAccountTarget(null);
-        setAccountProof({ status: 'fetching', detail: 'fetching latest finalization' });
+        setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
         setAccountTransactions([]);
         setAccountNextCursor(null);
 
-        fetchLatestProofTarget({
+        const fetchPage = fetchAccountTransactionsPage({
             storeUrl,
-            simplexVerificationMaterial,
-            signal: controller.signal,
-        })
-            .then((target) => {
-                setAccountTarget(target);
-                setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
-                return Promise.all([
-                    fetchAndVerifyAccountProof({
+            account: lookupAccount,
+            cursor: currentAccountCursor,
+        }).then((page) => {
+            if (controller.signal.aborted) return null;
+            setAccountNextCursor(page.nextCursor);
+            setAccountTransactions(page.rows.map((row) => ({
+                row,
+                proof: { status: 'waiting', detail: 'waiting for latest finalization' },
+            })));
+            return page;
+        });
+
+        const fetchTargetAndProof = retryAccountPageStep(async () => {
+            const target = await fetchLatestProofTarget({
+                storeUrl,
+                simplexVerificationMaterial,
+                signal: controller.signal,
+            });
+            const proof = await fetchAndVerifyAccountProof({
                         qmdbUrl,
                         storeUrl,
                         account: lookupAccount,
                         target,
                         signal: controller.signal,
-                    }),
-                    fetchAccountTransactionsPage({
-                        storeUrl,
-                        account: lookupAccount,
-                        cursor: currentAccountCursor,
-                    }),
-                ]).then(([proof, page]) => ({ target, proof, page }));
-            })
-            .then(({ target, proof, page }) => {
+            });
+            return { target, proof };
+        }, controller.signal);
+
+        Promise.all([fetchPage, fetchTargetAndProof])
+            .then(([page, { target, proof }]) => {
+                if (controller.signal.aborted) return;
                 setAccountProof({
                     status: 'verified',
                     detail: `verified at height ${target.height.toString()}`,
                     ...proof,
                 });
-                setAccountNextCursor(page.nextCursor);
+                setAccountTarget(target);
+                if (!page) return [];
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
                     proof: { status: 'fetching', detail: 'fetching transaction proof' },
                 })));
                 return Promise.allSettled(
                     page.rows.map((row) =>
-                        fetchAndVerifyTransactionRowProof({
+                        retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
                             qmdbUrl,
                             row,
                             target,
                             signal: controller.signal,
-                        }),
+                        }), controller.signal),
                     ),
                 );
             })
             .then((results) => {
+                if (!results || controller.signal.aborted) return;
                 setAccountTransactions((current) =>
                     current.map((entry, index) => {
                         const result = results[index];
@@ -1442,6 +1453,29 @@ async function pollTransactionStatus(baseUrl: string, submission: SubmitResponse
         }
         return status;
     }
+}
+
+async function retryAccountPageStep<T>(
+    run: () => Promise<T>,
+    signal: AbortSignal,
+): Promise<T> {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < 12; attempt++) {
+        if (signal.aborted) {
+            throw new Error('account lookup cancelled');
+        }
+        try {
+            return await run();
+        } catch (error) {
+            lastError = error;
+            const detail = error instanceof Error ? error.message : String(error);
+            if (!isRetryableAccountProofError(detail)) {
+                throw error;
+            }
+            await sleep(350 + attempt * 150);
+        }
+    }
+    throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
 function formatTxStatus(status: TxStatus, digest: string): string {
