@@ -4,7 +4,7 @@ use commonware_codec::{Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
     Signer,
     bls12381::{
-        dkg,
+        dkg::feldman_desmedt as dkg,
         primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
     },
     ed25519,
@@ -415,7 +415,7 @@ mod tests {
     use commonware_cryptography::{
         Signer,
         bls12381::{
-            dkg,
+            dkg::feldman_desmedt as dkg,
             primitives::{group::Share, variant::MinSig},
         },
         ed25519,

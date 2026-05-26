@@ -8,7 +8,7 @@ use commonware_codec::Encode;
 use commonware_cryptography::{
     Signer,
     bls12381::{
-        dkg,
+        dkg::feldman_desmedt as dkg,
         primitives::{group::Share, variant::MinSig},
     },
     ed25519,

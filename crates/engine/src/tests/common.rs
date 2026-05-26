@@ -11,7 +11,7 @@ use commonware_consensus::{
 use commonware_cryptography::{
     Digestible, Signer,
     bls12381::{
-        dkg::{Output, deal},
+        dkg::feldman_desmedt::{Output, deal},
         primitives::{group::Share, variant::MinSig},
     },
     ed25519,

@@ -5,7 +5,7 @@ mod properties;
 
 use crate::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
 };
 use common::{
@@ -16,7 +16,7 @@ use commonware_consensus::{Heightable, simplex::elector::RoundRobin, types::codi
 use commonware_cryptography::{
     Signer,
     bls12381::{
-        dkg::Output,
+        dkg::feldman_desmedt::Output,
         primitives::{group::Share, variant::MinSig},
     },
     ed25519::Batch as Ed25519Batch,
@@ -27,7 +27,7 @@ use commonware_glue::{
         engine::{EngineDefinition, InitContext},
         plan::PlanBuilder,
     },
-    stateful::{StartupMode, db::SyncEngineConfig},
+    stateful::db::SyncEngineConfig,
 };
 use commonware_macros::{test_group, test_traced};
 use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};

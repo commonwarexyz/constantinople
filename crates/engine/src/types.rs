@@ -93,22 +93,30 @@ pub type StateDb<E, H, P, T> = fixed::Db<mmr::Family, E, AccountKey<P>, Account,
 
 pub type StateSyncDb<E, H, P, T> = Arc<AsyncRwLock<StateDb<E, H, P, T>>>;
 
-pub(crate) type StateResolverMailbox<E, H, P, T> = commonware_glue::stateful::db::p2p::Mailbox<
-    StateDb<E, H, P, T>,
-    mmr::Family,
-    <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
-    <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
->;
+pub(crate) type StateResolverMailbox<E, H, P, T> =
+    commonware_glue::stateful::db::p2p::standard::Mailbox<
+        StateDb<E, H, P, T>,
+        mmr::Family,
+        <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
+        <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
+    >;
 
 pub(crate) type StateResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, StateDb<E, H, P, T>>;
+    commonware_glue::stateful::db::p2p::standard::Actor<
+        E,
+        P,
+        M,
+        B,
+        mmr::Family,
+        StateDb<E, H, P, T>,
+    >;
 
 pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
 pub type TransactionSyncDb<E, H, T> = Arc<AsyncRwLock<TransactionDb<E, H, T>>>;
 
 pub(crate) type TransactionResolverMailbox<E, H, T> =
-    commonware_glue::stateful::db::compact_p2p::Mailbox<
+    commonware_glue::stateful::db::p2p::compact::Mailbox<
         TransactionDb<E, H, T>,
         mmr::Family,
         TransactionHistoryOperation<H>,
@@ -116,7 +124,7 @@ pub(crate) type TransactionResolverMailbox<E, H, T> =
     >;
 
 pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::compact_p2p::Actor<
+    commonware_glue::stateful::db::p2p::compact::Actor<
         E,
         P,
         M,
@@ -137,12 +145,12 @@ pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, E
 pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
     E,
     App<E, H, P, V, I, B, SigT, HashT>,
-    EngineMarshalMailbox<H, P, V>,
+    ThresholdScheme<P, V>,
+    EngineVariant<H, P>,
     (
         StateResolverMailbox<E, H, P, HashT>,
         TransactionResolverMailbox<E, H, HashT>,
     ),
-    EngineFinalization<P, V>,
 >;
 
 pub(crate) type MarshaledApp<E, H, P, V, I, B, SigT, HashT> = Marshaled<

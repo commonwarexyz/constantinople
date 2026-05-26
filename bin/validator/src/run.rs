@@ -18,7 +18,7 @@ use commonware_cryptography::{
     sha256::Sha256,
 };
 use commonware_formatting::hex;
-use commonware_glue::stateful::{StartupMode, db::SyncEngineConfig};
+use commonware_glue::stateful::db::SyncEngineConfig;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
@@ -30,7 +30,8 @@ use constantinople_application::consensus::FinalizedHookFn;
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper, types::EngineBlock,
+    StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper,
+    types::EngineBlock,
 };
 use constantinople_indexer::{BlockReporter, CertificateReporter, QmdbPublisher, spawn_uploaders};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};

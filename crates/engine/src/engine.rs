@@ -30,13 +30,13 @@ use commonware_consensus::{
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
     bls12381::{
-        dkg::Output,
+        dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
     },
     certificate::{ConstantProvider, Scheme},
 };
 use commonware_glue::stateful::{
-    Config as StatefulConfig, StartupMode, Stateful,
+    Config as StatefulConfig, Stateful, SyncPlan,
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
@@ -82,7 +82,9 @@ const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
 const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
-const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(16);
+// The compact transaction-history database can rewind one finalized commit.
+// Glue requires marshal's ack window to fit the narrowest database rewind window.
+const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(1);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(1_048_576);
@@ -141,6 +143,11 @@ where
 /// `O` is the type of an optional simplex activity observer (e.g. the
 /// indexer's certificate publisher). Pass `None::<NoopActivityReporter<P, V>>`
 /// when no external observer is wired in.
+pub enum StartupMode<B, F> {
+    MarshalSync,
+    StateSync { block: B, finalization: F },
+}
+
 pub struct Config<E, C, M, B, V, SigT, HashT, I, H, O>
 where
     E: Storage + Clock + Metrics,
@@ -295,7 +302,7 @@ where
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
                 context.child("state_resolver"),
-                qmdb_resolver::Config {
+                qmdb_resolver::standard::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -312,7 +319,7 @@ where
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
                 context.child("transaction_resolver"),
-                commonware_glue::stateful::db::compact_p2p::Config {
+                qmdb_resolver::compact::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -359,6 +366,13 @@ where
             };
         let transaction_db_config =
             transaction_db_config(&config.partition_prefix, config.hash_strategy.clone());
+        let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
+        let stateful_startup_context = context.child("stateful_startup");
+        let mut startup_plan = SyncPlan::<EngineFinalization<C::PublicKey, V>>::init(
+            &stateful_startup_context,
+            stateful_partition_prefix.clone(),
+        )
+        .await;
         let (genesis_state_target, genesis_transactions_target, marshal_start, simplex_floor) =
             if let Some(finalization) = recovered_floor {
                 let block_digest =
@@ -428,7 +442,7 @@ where
                         (
                             genesis_state_target,
                             genesis_transactions_target,
-                            marshal::Start::Genesis(coded_block),
+                            startup_plan.marshal_start(coded_block),
                             SimplexFloor::Genesis(commitment),
                         )
                     }
@@ -436,12 +450,64 @@ where
                         block,
                         finalization,
                     } => {
-                        let (state_target, transaction_target) = block_targets(block);
+                        let should_state_sync = startup_plan.may_state_sync();
+                        let (state_target, transaction_target) = if should_state_sync {
+                            startup_plan = startup_plan.with_floor(finalization.clone());
+                            block_targets(block)
+                        } else {
+                            let genesis_state_db = StateDb::<E, H, C::PublicKey, HashT>::init(
+                                context.child("genesis_state"),
+                                state_db_config(
+                                    &config.partition_prefix,
+                                    &storage_page_cache,
+                                    config.hash_strategy.clone(),
+                                ),
+                            )
+                            .await
+                            .expect("state db must initialize for genesis target");
+                            let state_target =
+                                <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(
+                                    &genesis_state_db,
+                                )
+                                .await;
+                            let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
+                                context.child("genesis_transactions"),
+                                transaction_db_config.clone(),
+                            )
+                            .await
+                            .expect("transaction history db must initialize for genesis target");
+                            let transaction_target =
+                                <TransactionDb<E, H, HashT> as ManagedDb<E>>::sync_target(
+                                    &genesis_transaction_db,
+                                )
+                                .await;
+                            (state_target, transaction_target)
+                        };
+                        let genesis_block =
+                            constantinople_application::consensus::genesis_block_with_parent(
+                                &mut H::default(),
+                                config.genesis_leader.clone(),
+                                (commonware_consensus::types::View::zero(), genesis_parent),
+                                0,
+                                state_target.clone(),
+                                transaction_target.clone(),
+                            );
+                        let coded_block = EngineCodedBlock::new(
+                            genesis_block,
+                            coding_config,
+                            &config.hash_strategy,
+                        );
+                        let commitment = coded_block.commitment();
+                        let simplex_floor = if should_state_sync {
+                            SimplexFloor::Finalized(finalization.clone())
+                        } else {
+                            SimplexFloor::Genesis(commitment)
+                        };
                         (
                             state_target,
                             transaction_target,
-                            marshal::Start::Floor(finalization.clone()),
-                            SimplexFloor::Finalized(finalization.clone()),
+                            startup_plan.marshal_start(coded_block),
+                            simplex_floor,
                         )
                     }
                 }
@@ -512,7 +578,7 @@ where
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),
             StatefulConfig {
-                app: application,
+                application,
                 db_config: (
                     state_db_config(
                         &config.partition_prefix,
@@ -523,9 +589,9 @@ where
                 ),
                 input_provider: config.input,
                 marshal: marshal_mailbox.clone(),
-                mailbox_size: MAILBOX_SIZE.get(),
-                partition_prefix: format!("{}_stateful", config.partition_prefix),
-                startup: config.startup,
+                max_pending_acks: MAX_PENDING_ACKS,
+                mailbox_size: MAILBOX_SIZE,
+                plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
             },
@@ -646,9 +712,9 @@ where
 
         let reporters: Reporters<Update<EngineBlock<H, C::PublicKey>>, _, Rep> =
             Reporters::from((self.stateful_mailbox, reporter));
-        let marshal_handle =
-            self.marshal
-                .start(reporters, Some(self.shard_mailbox), marshal_resolver);
+        let marshal_handle = self
+            .marshal
+            .start(reporters, self.shard_mailbox, marshal_resolver);
         let simplex_handle =
             self.simplex
                 .start(channels.votes, channels.certificates, channels.resolver);
