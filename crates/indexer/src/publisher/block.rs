@@ -37,6 +37,8 @@ use std::{
 use tokio::sync::mpsc;
 use tracing::warn;
 
+const TX_BY_SENDER_ROW_BYTES: usize = 32 + 32 + 8 + 8 + 8 + 8 + 4;
+
 /// Cloneable [`Reporter`] over `Update<EngineBlock<H, P>>`.
 ///
 /// Holds one sender per active backing path. Cloning the reporter is cheap;
@@ -157,9 +159,30 @@ where
     block_digest_arr.copy_from_slice(block_digest.as_ref());
     let mut transactions_root = [0u8; 32];
     transactions_root.copy_from_slice(block.header.transactions_root.as_ref());
-    let mut tx_count = 0u64;
+    let materialized_txs = block
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, lazy)| {
+            let Some(tx) = lazy.get() else {
+                warn!(
+                    height,
+                    idx, "indexer: skipping transaction that failed to materialize"
+                );
+                return None;
+            };
+            Some((idx, lazy, tx))
+        })
+        .collect::<Vec<_>>();
+    let tx_count = u64::try_from(materialized_txs.len()).expect("transaction count fits u64");
+    let append_start = block
+        .header
+        .transactions_range
+        .end()
+        .checked_sub(tx_count + 1)
+        .expect("transaction range includes appends plus commit");
 
-    let mut raw = Vec::with_capacity(2 + 2 * body_len);
+    let mut raw = Vec::with_capacity(2 + 3 * body_len);
     raw.push((
         keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
         block.encode(),
@@ -169,21 +192,12 @@ where
         Bytes::copy_from_slice(block_digest.as_ref()),
     ));
 
-    // Per-transaction rows: TX (digest -> encoded tx) and TX_BY_H ((height, idx) -> tx digest).
-    for (idx, lazy) in block.body.iter().enumerate() {
-        let Some(tx) = lazy.get() else {
-            // Marshal must have already verified each tx upstream, so a decode
-            // failure here means we received a malformed block. Skip rather
-            // than abort the whole batch — the block still goes up.
-            warn!(
-                height,
-                idx, "indexer: skipping transaction that failed to materialize"
-            );
-            continue;
-        };
+    // Per-transaction rows: TX, TX_BY_H, and TX_BY_SENDER for account lookup.
+    for (materialized_idx, (idx, lazy, tx)) in materialized_txs.iter().enumerate() {
         let tx_digest = tx.message_digest();
         let tx_bytes = lazy.encode();
-        let idx_u32 = u32::try_from(idx).expect("transaction index fits u32");
+        let idx_u32 = u32::try_from(*idx).expect("transaction index fits u32");
+        let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
 
         raw.push((
             keys::tx(tx_digest.as_ref()).expect("tx digest fits family payload"),
@@ -193,7 +207,21 @@ where
             keys::tx_by_height(height, idx_u32).expect("(height, idx) fits family payload"),
             Bytes::copy_from_slice(tx_digest.as_ref()),
         ));
-        tx_count += 1;
+        if let Some(sender) = tx.value().sender() {
+            raw.push((
+                keys::tx_by_sender(sender.as_ref(), height, idx_u32)
+                    .expect("sender tx index fits family payload"),
+                encode_tx_by_sender_row(
+                    tx_digest.as_ref(),
+                    tx.value().to.as_ref(),
+                    tx.value().value.get(),
+                    tx.value().nonce,
+                    qmdb_location,
+                    height,
+                    idx_u32,
+                ),
+            ));
+        }
     }
 
     // SQL: one block_meta row per finalized block. Per-transaction proof
@@ -213,4 +241,24 @@ where
     });
 
     IndexedBlockRows { raw, sql }
+}
+
+fn encode_tx_by_sender_row(
+    digest: &[u8],
+    to: &[u8],
+    value: u64,
+    nonce: u64,
+    qmdb_location: u64,
+    height: u64,
+    block_index: u32,
+) -> Bytes {
+    let mut row = Vec::with_capacity(TX_BY_SENDER_ROW_BYTES);
+    row.extend_from_slice(digest);
+    row.extend_from_slice(to);
+    row.extend_from_slice(&value.to_be_bytes());
+    row.extend_from_slice(&nonce.to_be_bytes());
+    row.extend_from_slice(&qmdb_location.to_be_bytes());
+    row.extend_from_slice(&height.to_be_bytes());
+    row.extend_from_slice(&block_index.to_be_bytes());
+    Bytes::from(row)
 }

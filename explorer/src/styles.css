@@ -199,6 +199,8 @@ body {
 
 .wallet-trigger,
 .modal__close,
+.account-lookup button,
+.account-page button,
 .wallet button:not(.copyable--plain),
 .transfer button {
     color: var(--theme-background);
@@ -207,6 +209,46 @@ body {
     font: inherit;
     padding: 0.35ch 1ch;
     cursor: pointer;
+}
+
+.account-lookup {
+    min-width: min(52ch, 100%);
+    display: flex;
+    align-items: center;
+    gap: 0.7ch;
+}
+
+.account-lookup label {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.7ch;
+    flex: 1 1 auto;
+}
+
+.account-lookup label span {
+    color: var(--theme-accent);
+    flex: 0 0 auto;
+}
+
+.account-lookup input {
+    width: 100%;
+    min-width: 12ch;
+    color: var(--theme-text);
+    background: var(--theme-row-alt);
+    border: 1px solid var(--theme-border);
+    font: inherit;
+    padding: 0.25ch 0.6ch;
+}
+
+.account-lookup button,
+.account-page button {
+    padding: 0.25ch 0.8ch;
+}
+
+.account-page button:disabled {
+    cursor: default;
+    opacity: 0.45;
 }
 
 .wallet-trigger {
@@ -653,6 +695,117 @@ body {
     color: var(--theme-text);
 }
 
+.account-page {
+    width: min(1180px, 100%);
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+
+.account-page__title,
+.account-page__subhead {
+    color: var(--theme-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.85em;
+    padding-bottom: 0.5ch;
+    border-bottom: 1px solid var(--theme-border);
+    margin-bottom: 0.5ch;
+}
+
+.account-page__line {
+    display: grid;
+    grid-template-columns: 8ch minmax(0, 1fr);
+    gap: 1ch;
+    align-items: center;
+    padding: 0.6ch 0;
+}
+
+.account-page__prompt {
+    color: var(--theme-accent);
+}
+
+.account-proof-grid {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    gap: 1px;
+    border: 1px solid var(--theme-border);
+    background: var(--theme-border);
+    margin: 0.5ch 0 1ch;
+}
+
+.account-proof-grid__cell {
+    min-width: 0;
+    background: var(--theme-background);
+    padding: 0.7ch 1ch;
+    display: flex;
+    flex-direction: column;
+    gap: 0.3ch;
+}
+
+.account-proof-grid__cell span {
+    color: var(--theme-text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    font-size: 0.85em;
+}
+
+.account-proof-grid__cell strong {
+    font-weight: 400;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.account-page__subhead {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 1ch;
+}
+
+.account-page__pager {
+    display: flex;
+    gap: 1ch;
+}
+
+.account-tx-list {
+    display: flex;
+    flex-direction: column;
+}
+
+.account-tx-row {
+    padding: 0.8ch 0;
+    border-bottom: 1px solid var(--theme-border);
+}
+
+.account-tx-row--empty {
+    color: var(--theme-text-dim);
+}
+
+.account-tx-row__main,
+.account-tx-row__meta {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 1ch;
+    overflow: hidden;
+}
+
+.account-tx-row__main .copyable {
+    max-width: 20ch;
+}
+
+.account-tx-row__height {
+    color: var(--theme-accent);
+    flex: 0 0 auto;
+}
+
+.account-tx-row__meta {
+    color: var(--theme-text-dim);
+    flex-wrap: wrap;
+}
+
 /* ── Block log ─────────────────────────────────────────────────────────────── */
 
 .block-log {
@@ -741,6 +894,11 @@ body {
         justify-content: space-between;
     }
 
+    .account-lookup {
+        order: 3;
+        flex: 1 1 100%;
+    }
+
     .app__status {
         flex: 1 1 auto;
     }
@@ -806,6 +964,23 @@ body {
         overflow-y: auto;
         width: 100%;
         padding: 0 1rem 1rem;
+    }
+
+    .account-page {
+        width: 100%;
+        padding: 1rem;
+    }
+
+    .account-proof-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .account-page__line {
+        grid-template-columns: 1fr;
+    }
+
+    .account-tx-row__main {
+        flex-wrap: wrap;
     }
 
     .block-log__title {

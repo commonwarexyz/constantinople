@@ -22,7 +22,14 @@ import {
     type TxStatus,
 } from './mempool';
 import {
+    fetchAccountTransactionsPage,
+    fetchAndVerifyAccountProof,
     fetchAndVerifyTransactionProof,
+    fetchAndVerifyTransactionRowProof,
+    fetchLatestProofTarget,
+    type AccountTransactionRow,
+    type LatestProofTarget,
+    type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
 import { isRetryableProofError } from './proofRetry';
@@ -124,6 +131,20 @@ type TransactionProofState =
       }
     | { readonly status: 'error'; readonly detail: string };
 
+type AccountProofState =
+    | { readonly status: 'waiting'; readonly detail: string }
+    | { readonly status: 'fetching'; readonly detail: string }
+    | ({
+          readonly status: 'verified';
+          readonly detail: string;
+      } & VerifiedAccountProof)
+    | { readonly status: 'error'; readonly detail: string };
+
+interface AccountTxWithProof {
+    readonly row: AccountTransactionRow;
+    readonly proof: TransactionProofState;
+}
+
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
     readonly latestBlockAt: number | null;
@@ -151,6 +172,16 @@ export default function App() {
     const [submitMessage, setSubmitMessage] = useState('');
     const [isSubmitting, setIsSubmitting] = useState(false);
     const [history, setHistory] = useState<SubmittedTransaction[]>(() => readHistory());
+    const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
+    const [accountInput, setAccountInput] = useState(() => accountFromLocation());
+    const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
+    const [accountProof, setAccountProof] = useState<AccountProofState>({
+        status: 'waiting',
+        detail: 'enter an account',
+    });
+    const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
+    const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [copiedValue, setCopiedValue] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
@@ -163,6 +194,7 @@ export default function App() {
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
     const signedInPublicKey = wallet?.publicKeyHex ?? null;
+    const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
@@ -222,6 +254,101 @@ export default function App() {
     useEffect(() => {
         writeHistory(history);
     }, [history]);
+
+    useEffect(() => {
+        const onPopState = () => {
+            const next = accountFromLocation();
+            setLookupAccount(next);
+            setAccountInput(next);
+            setAccountCursorStack([null]);
+        };
+        window.addEventListener('popstate', onPopState);
+        return () => window.removeEventListener('popstate', onPopState);
+    }, []);
+
+    useEffect(() => {
+        if (!lookupAccount) {
+            setAccountTarget(null);
+            setAccountProof({ status: 'waiting', detail: 'enter an account' });
+            setAccountTransactions([]);
+            setAccountNextCursor(null);
+            return;
+        }
+
+        const controller = new AbortController();
+        setAccountTarget(null);
+        setAccountProof({ status: 'fetching', detail: 'fetching latest finalization' });
+        setAccountTransactions([]);
+        setAccountNextCursor(null);
+
+        fetchLatestProofTarget({
+            storeUrl,
+            simplexVerificationMaterial,
+            signal: controller.signal,
+        })
+            .then((target) => {
+                setAccountTarget(target);
+                setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
+                return Promise.all([
+                    fetchAndVerifyAccountProof({
+                        qmdbUrl,
+                        storeUrl,
+                        account: lookupAccount,
+                        target,
+                        signal: controller.signal,
+                    }),
+                    fetchAccountTransactionsPage({
+                        storeUrl,
+                        account: lookupAccount,
+                        cursor: currentAccountCursor,
+                    }),
+                ]).then(([proof, page]) => ({ target, proof, page }));
+            })
+            .then(({ target, proof, page }) => {
+                setAccountProof({
+                    status: 'verified',
+                    detail: `verified at height ${target.height.toString()}`,
+                    ...proof,
+                });
+                setAccountNextCursor(page.nextCursor);
+                setAccountTransactions(page.rows.map((row) => ({
+                    row,
+                    proof: { status: 'fetching', detail: 'fetching transaction proof' },
+                })));
+                return Promise.allSettled(
+                    page.rows.map((row) =>
+                        fetchAndVerifyTransactionRowProof({
+                            qmdbUrl,
+                            row,
+                            target,
+                            signal: controller.signal,
+                        }),
+                    ),
+                );
+            })
+            .then((results) => {
+                setAccountTransactions((current) =>
+                    current.map((entry, index) => {
+                        const result = results[index];
+                        if (!result) return entry;
+                        if (result.status === 'fulfilled') {
+                            return { ...entry, proof: verifiedProofState(result.value) };
+                        }
+                        const detail = result.reason instanceof Error ? result.reason.message : String(result.reason);
+                        return { ...entry, proof: { status: 'error', detail } };
+                    }),
+                );
+            })
+            .catch((error) => {
+                if (controller.signal.aborted) return;
+                setAccountProof({
+                    status: 'error',
+                    detail: error instanceof Error ? error.message : String(error),
+                });
+            });
+
+        return () => controller.abort();
+    }, [lookupAccount, currentAccountCursor]);
 
     useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
@@ -416,6 +543,38 @@ export default function App() {
         }
     };
 
+    const submitAccountLookup = () => {
+        const normalized = normalizeAccountInput(accountInput);
+        if (!normalized) {
+            setAccountProof({ status: 'error', detail: 'expected a 32-byte hex account public key' });
+            return;
+        }
+        setLookupAccount(normalized);
+        setAccountInput(normalized);
+        setAccountCursorStack([null]);
+        const url = new URL(window.location.href);
+        url.searchParams.set('account', normalized);
+        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    };
+
+    const clearAccountLookup = () => {
+        setLookupAccount('');
+        setAccountInput('');
+        setAccountCursorStack([null]);
+        const url = new URL(window.location.href);
+        url.searchParams.delete('account');
+        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+    };
+
+    const nextAccountPage = () => {
+        if (!accountNextCursor) return;
+        setAccountCursorStack((current) => [...current, accountNextCursor]);
+    };
+
+    const previousAccountPage = () => {
+        setAccountCursorStack((current) => current.length <= 1 ? current : current.slice(0, -1));
+    };
+
     const submitTransfer = async () => {
         if (!wallet || isSubmitting) return;
 
@@ -498,6 +657,28 @@ export default function App() {
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
+                        <form
+                            className="account-lookup"
+                            onSubmit={(event) => {
+                                event.preventDefault();
+                                submitAccountLookup();
+                            }}
+                        >
+                            <label>
+                                <span>account&gt;</span>
+                                <input
+                                    value={accountInput}
+                                    onChange={(event) => setAccountInput(event.target.value)}
+                                    placeholder="public key"
+                                    spellCheck={false}
+                                />
+                            </label>
+                            <button type="submit">open</button>
+                            {lookupAccount && <button type="button" onClick={clearAccountLookup}>clear</button>}
+                        </form>
+                        <span className="app__header-separator" aria-hidden="true">
+                            ⬝
+                        </span>
                         <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
                             wallet{wallet && <span className="wallet-trigger__key"> {shortHex(wallet.publicKeyHex)}</span>}
                         </button>
@@ -505,13 +686,31 @@ export default function App() {
                 </header>
                 <main className="app__main app__main--minimal">
                     <section className="explorer-stage" aria-label="live transaction throughput">
-                        <Histogram blocks={blocks} />
-                        <ExplorerStats
-                            blocks={blocks}
-                            observedRateWindow={observedRateWindow}
-                            totalTxObserved={totalTxObserved}
-                        />
-                        <BlockLog blocks={blocks} />
+                        {lookupAccount ? (
+                            <AccountPage
+                                account={lookupAccount}
+                                copiedValue={copiedValue}
+                                onCopy={copyValue}
+                                pageNumber={accountCursorStack.length}
+                                proof={accountProof}
+                                target={accountTarget}
+                                transactions={accountTransactions}
+                                hasPrevious={accountCursorStack.length > 1}
+                                hasNext={accountNextCursor !== null}
+                                onPrevious={previousAccountPage}
+                                onNext={nextAccountPage}
+                            />
+                        ) : (
+                            <>
+                                <Histogram blocks={blocks} />
+                                <ExplorerStats
+                                    blocks={blocks}
+                                    observedRateWindow={observedRateWindow}
+                                    totalTxObserved={totalTxObserved}
+                                />
+                                <BlockLog blocks={blocks} />
+                            </>
+                        )}
                     </section>
                 </main>
                 {isWalletOpen && (
@@ -550,6 +749,96 @@ export default function App() {
             </div>
         </div>
     );
+}
+
+function AccountPage({
+    account,
+    copiedValue,
+    onCopy,
+    pageNumber,
+    proof,
+    target,
+    transactions,
+    hasPrevious,
+    hasNext,
+    onPrevious,
+    onNext,
+}: {
+    account: string;
+    copiedValue: string;
+    onCopy: (value: string) => void;
+    pageNumber: number;
+    proof: AccountProofState;
+    target: LatestProofTarget | null;
+    transactions: AccountTxWithProof[];
+    hasPrevious: boolean;
+    hasNext: boolean;
+    onPrevious: () => void;
+    onNext: () => void;
+}) {
+    return (
+        <section className="account-page" aria-label="account proof">
+            <div className="account-page__title">account</div>
+            <div className="account-page__line">
+                <span className="account-page__prompt">key</span>
+                <CopyableValue copiedValue={copiedValue} value={account} onCopy={onCopy} />
+            </div>
+            <div className="account-proof-grid">
+                <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
+                <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
+                <ProofDatum label="state" value={proof.status === 'verified' ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}` : proof.detail} />
+                <ProofDatum label="state proof" value={proof.status === 'verified' ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b` : proof.status} />
+            </div>
+            <div className="account-page__subhead">
+                <span>sent tx page {pageNumber}</span>
+                <div className="account-page__pager">
+                    <button disabled={!hasPrevious} onClick={onPrevious}>prev</button>
+                    <button disabled={!hasNext} onClick={onNext}>next</button>
+                </div>
+            </div>
+            <div className="account-tx-list">
+                {transactions.length === 0 && (
+                    <div className="account-tx-row account-tx-row--empty">no sent transactions indexed</div>
+                )}
+                {transactions.map(({ row, proof: txProof }) => (
+                    <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
+                        <div className="account-tx-row__main">
+                            <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
+                            <CopyableValue copiedValue={copiedValue} value={row.digest} onCopy={onCopy} />
+                            <span>to</span>
+                            <CopyableValue copiedValue={copiedValue} value={row.to} onCopy={onCopy} />
+                        </div>
+                        <div className="account-tx-row__meta">
+                            <span>value {row.value.toString()}</span>
+                            <span>nonce {row.nonce.toString()}</span>
+                            <span>loc {row.qmdLocation.toString()}</span>
+                            <span>proof</span>
+                            <ProofMark proof={txProof} />
+                        </div>
+                    </div>
+                ))}
+            </div>
+        </section>
+    );
+}
+
+function ProofDatum({ label, value }: { label: string; value: string }) {
+    return (
+        <div className="account-proof-grid__cell">
+            <span>{label}</span>
+            <strong>{value}</strong>
+        </div>
+    );
+}
+
+function ProofMark({ proof }: { proof: TransactionProofState }) {
+    if (proof.status === 'verified') {
+        return <span className="tx-proof-check" title={proof.detail}>✓</span>;
+    }
+    if (proof.status === 'error') {
+        return <span className="tx-proof-error" title={proof.detail}>!</span>;
+    }
+    return <span className="tx-proof-spinner" title={proof.detail} />;
 }
 
 function WalletModal({
@@ -1177,6 +1466,25 @@ function sleep(ms: number): Promise<void> {
 
 function shortHex(value: string): string {
     return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
+}
+
+function bytesToHex(bytes: Uint8Array): string {
+    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+function normalizeAccountInput(value: string): string | null {
+    const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
+    return /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
+}
+
+function accountFromLocation(): string {
+    const url = new URL(window.location.href);
+    const queryAccount = url.searchParams.get('account');
+    const fromQuery = queryAccount ? normalizeAccountInput(queryAccount) : null;
+    if (fromQuery) return fromQuery;
+
+    const pathMatch = /^\/account\/([0-9a-fA-F]{64})$/.exec(url.pathname);
+    return pathMatch ? normalizeAccountInput(pathMatch[1]) ?? '' : '';
 }
 
 function readHistory(): SubmittedTransaction[] {

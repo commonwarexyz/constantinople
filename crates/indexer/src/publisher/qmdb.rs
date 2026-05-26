@@ -100,6 +100,7 @@ where
     height: u64,
     block_rows: IndexedBlockRows,
     state_delta: Vec<StateOperation<P>>,
+    account_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
     transaction_ops: Vec<TransactionOperation<H>>,
 }
 
@@ -180,6 +181,7 @@ where
                 height: block.header.height,
                 block_rows,
                 state_delta: state.delta,
+                account_rows: state.account_rows,
                 transaction_ops: transactions.ops,
             })
             .await
@@ -309,6 +311,8 @@ where
 {
     let height = upload.height;
     let IndexedBlockRows { raw, sql } = upload.block_rows;
+    let mut raw = raw;
+    raw.extend(upload.account_rows);
     let (state, transactions) = tokio::try_join!(
         state_writer.prepare_upload(&upload.state_delta),
         transaction_writer.prepare_upload(&upload.transaction_ops),
@@ -584,6 +588,7 @@ where
     P: PublicKey,
 {
     delta: Vec<StateOperation<P>>,
+    account_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
     next_location: u64,
 }
 
@@ -622,10 +627,40 @@ where
         });
     }
     let delta = load_state_ops::<E, H, P, S>(&state, writer_next, end).await?;
+    let account_rows = account_rows(&delta, writer_next);
     Ok(PendingStateUpload {
         delta,
+        account_rows,
         next_location: end,
     })
+}
+
+fn account_rows<P>(
+    delta: &[StateOperation<P>],
+    start_location: u64,
+) -> Vec<(exoware_sdk::keys::Key, bytes::Bytes)>
+where
+    P: PublicKey,
+{
+    let mut rows = Vec::new();
+    for (offset, operation) in delta.iter().enumerate() {
+        let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
+            continue;
+        };
+        let location = start_location + u64::try_from(offset).expect("state op offset fits u64");
+        rows.push((
+            crate::keys::account(key.as_ref()).expect("account key fits family payload"),
+            encode_account_row(account, location),
+        ));
+    }
+    rows
+}
+
+fn encode_account_row(account: &AccountValue, location: u64) -> bytes::Bytes {
+    let mut row = Vec::with_capacity(Account::SIZE + u64::SIZE);
+    row.extend_from_slice(account.as_ref());
+    row.extend_from_slice(&location.to_be_bytes());
+    bytes::Bytes::from(row)
 }
 
 async fn load_state_ops<E, H, P, S>(

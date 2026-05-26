@@ -1746,6 +1746,7 @@ dependencies = [
 name = "constantinople-explorer-crypto"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",

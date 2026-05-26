@@ -12,6 +12,8 @@
 //! | `NOTARIZED`  | `0x4`  | `view` (u64 BE)                    | encoded `Notarization` |
 //! | `TX`         | `0x5`  | `tx_digest` (32B)                  | encoded `SignedTransaction` |
 //! | `TX_BY_H`    | `0x6`  | `height` (u64 BE) ‖ `index` (u32 BE) | tx digest (32B)    |
+//! | `TX_BY_SENDER` | `0x7` | sender (32B) ‖ descending height/index | tx summary row |
+//! | `ACCOUNT`    | `0xa`  | account key (32B)                  | account proof row |
 //!
 //! Reserved bits: 4. The remaining 4 bits of the first byte hold the family
 //! prefix. The full payload (including any digest or numeric field) starts at
@@ -38,6 +40,10 @@ pub const NOTARIZED: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x4);
 pub const TX: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x5);
 /// Family for `(height, index) -> tx_digest`.
 pub const TX_BY_H: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x6);
+/// Family for `sender -> recent sent transaction summary`.
+pub const TX_BY_SENDER: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x7);
+/// Family for `account key -> latest indexed account state`.
+pub const ACCOUNT: KeyCodec = KeyCodec::new(RESERVED_BITS, 0xa);
 
 /// Encode a `BLOCK` key for the given block digest.
 pub fn block(digest: &[u8]) -> Result<Key, KeyCodecError> {
@@ -72,6 +78,20 @@ pub fn tx_by_height(height: u64, index: u32) -> Result<Key, KeyCodecError> {
     TX_BY_H.encode(&payload)
 }
 
+/// Encode a `TX_BY_SENDER` key sorted by newest transaction first.
+pub fn tx_by_sender(sender: &[u8], height: u64, index: u32) -> Result<Key, KeyCodecError> {
+    let mut payload = Vec::with_capacity(sender.len() + 12);
+    payload.extend_from_slice(sender);
+    payload.extend_from_slice(&(u64::MAX - height).to_be_bytes());
+    payload.extend_from_slice(&(u32::MAX - index).to_be_bytes());
+    TX_BY_SENDER.encode(&payload)
+}
+
+/// Encode an `ACCOUNT` key for the given account public key bytes.
+pub fn account(account: &[u8]) -> Result<Key, KeyCodecError> {
+    ACCOUNT.encode(account)
+}
+
 /// Inclusive `(start, end)` bounds spanning every key under the `BLOCK` family.
 pub fn block_bounds() -> (Key, Key) {
     BLOCK.prefix_bounds()
@@ -102,6 +122,16 @@ pub fn tx_by_height_bounds() -> (Key, Key) {
     TX_BY_H.prefix_bounds()
 }
 
+/// Inclusive `(start, end)` bounds spanning every key under `TX_BY_SENDER`.
+pub fn tx_by_sender_bounds() -> (Key, Key) {
+    TX_BY_SENDER.prefix_bounds()
+}
+
+/// Inclusive `(start, end)` bounds spanning every key under `ACCOUNT`.
+pub fn account_bounds() -> (Key, Key) {
+    ACCOUNT.prefix_bounds()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +146,8 @@ mod tests {
         assert!(NOTARIZED.matches(&notarized(13).unwrap()));
         assert!(TX.matches(&tx(&digest).unwrap()));
         assert!(TX_BY_H.matches(&tx_by_height(17, 0).unwrap()));
+        assert!(TX_BY_SENDER.matches(&tx_by_sender(&digest, 17, 0).unwrap()));
+        assert!(ACCOUNT.matches(&account(&digest).unwrap()));
     }
 
     /// Family prefixes must not overlap; a key from one family must not match
@@ -129,6 +161,8 @@ mod tests {
         assert!(!NOTARIZED.matches(&k));
         assert!(!TX.matches(&k));
         assert!(!TX_BY_H.matches(&k));
+        assert!(!TX_BY_SENDER.matches(&k));
+        assert!(!ACCOUNT.matches(&k));
     }
 
     /// Big-endian numeric encoding must preserve sortable order.
@@ -151,6 +185,18 @@ mod tests {
         assert!(h2_i0 < h2_i5);
     }
 
+    /// `tx_by_sender` keeps each sender grouped and orders newest rows first.
+    #[test]
+    fn tx_by_sender_orders_newest_first_within_sender() {
+        let sender = [0x11u8; 32];
+        let older = tx_by_sender(&sender, 9, 9).unwrap();
+        let newer = tx_by_sender(&sender, 10, 0).unwrap();
+        let same_height_later_index = tx_by_sender(&sender, 10, 2).unwrap();
+
+        assert!(newer < older);
+        assert!(same_height_later_index < newer);
+    }
+
     /// `prefix_bounds` returned by helpers must match the underlying codec's
     /// own bounds, and must contain at least one valid key from that family.
     #[test]
@@ -162,6 +208,8 @@ mod tests {
             (notarized_bounds(), NOTARIZED.prefix_bounds()),
             (tx_bounds(), TX.prefix_bounds()),
             (tx_by_height_bounds(), TX_BY_H.prefix_bounds()),
+            (tx_by_sender_bounds(), TX_BY_SENDER.prefix_bounds()),
+            (account_bounds(), ACCOUNT.prefix_bounds()),
         ];
         for (helper, codec) in pairs {
             assert_eq!(helper, codec);

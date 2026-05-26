@@ -20,10 +20,17 @@ use commonware_parallel::Sequential;
 use commonware_storage::{
     merkle::{self, Location, mmr},
     qmdb::{
-        any::value::FixedEncoding, current::proof::OpsRootWitness, keyless, verify::verify_proof,
+        any::{
+            operation::Operation as AnyOperation,
+            unordered::{Operation as UnorderedOperation, Update as UnorderedUpdate},
+            value::FixedEncoding,
+        },
+        current::proof::OpsRootWitness,
+        keyless,
+        verify::verify_proof,
     },
 };
-use constantinople_primitives::{Block, BlockCfg, Sealed};
+use constantinople_primitives::{Account, AccountKey, Block, BlockCfg, Sealed};
 use core::num::NonZeroU32;
 use js_sys::{Array, BigInt, Object, Reflect, Uint8Array};
 use rand::{SeedableRng as _, rngs::StdRng};
@@ -34,6 +41,8 @@ const CONSENSUS_NAMESPACE: &[u8] = b"constantinople_CONSENSUS";
 const MAX_SIMPLEX_PARTICIPANTS: u32 = 10_000;
 
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<sha256::Digest>>;
+type AccountOperation =
+    UnorderedOperation<mmr::Family, AccountKey<ed25519::PublicKey>, FixedEncoding<Account>>;
 type ConsensusScheme = threshold_standard::Scheme<ed25519::PublicKey, MinSig>;
 type ChainBlock = Sealed<Block<Commitment, ed25519::PublicKey, Sha256>, Sha256>;
 
@@ -150,6 +159,82 @@ pub fn verify_transaction_proof(
     Ok(result.into())
 }
 
+/// Verifies an account-state QMDB range proof.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "wasm-bindgen exports flat parameters"
+)]
+#[wasm_bindgen(js_name = verifyAccountProof)]
+pub fn verify_account_proof(
+    expected_root: &[u8],
+    proof: &[u8],
+    ops_root: &[u8],
+    ops_root_witness: &[u8],
+    start_location: u64,
+    encoded_operations: Array,
+    expected_location: u64,
+    expected_key: &[u8],
+) -> Result<JsValue, JsError> {
+    let expected_root = decode_digest(expected_root, "expected state root")?;
+    let expected_key =
+        AccountKey::<ed25519::PublicKey>::from_bytes(bytes::Bytes::copy_from_slice(expected_key))
+            .ok_or_else(|| JsError::new("expected account key must be 32 bytes"))?;
+    let target_root = historical_target_root(ops_root, ops_root_witness, &expected_root)?;
+    let operations = decode_account_operations(&encoded_operations)?;
+    if operations.is_empty() {
+        return Err(JsError::new("account proof has no operations"));
+    }
+
+    let max_digests = proof.len() / sha256::Digest::SIZE + 1;
+    let proof = merkle::Proof::<mmr::Family, sha256::Digest>::decode_cfg(proof, &max_digests)
+        .map_err(|error| JsError::new(&format!("failed to decode account proof: {error}")))?;
+    let hasher = commonware_storage::qmdb::hasher::<Sha256>();
+    if !verify_proof(
+        &hasher,
+        &proof,
+        Location::new(start_location),
+        &operations,
+        &target_root,
+    ) {
+        return Err(JsError::new("account proof failed MMR verification"));
+    }
+
+    let Some(offset) = expected_location.checked_sub(start_location) else {
+        return Err(JsError::new(
+            "expected account location is before proof range",
+        ));
+    };
+    let offset = usize::try_from(offset)
+        .map_err(|_| JsError::new("expected account location does not fit usize"))?;
+    let Some(operation) = operations.get(offset) else {
+        return Err(JsError::new(
+            "expected account location is outside proof range",
+        ));
+    };
+    let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
+        return Err(JsError::new("expected account location is not an update"));
+    };
+    if key != &expected_key {
+        return Err(JsError::new("account proof update key does not match"));
+    }
+
+    let result = Object::new();
+    set(&result, "location", BigInt::from(expected_location).into())?;
+    set(&result, "balance", BigInt::from(account.balance).into())?;
+    set(&result, "nonce", BigInt::from(account.nonce).into())?;
+    set(
+        &result,
+        "root",
+        Uint8Array::from(expected_root.as_ref()).into(),
+    )?;
+    set(
+        &result,
+        "proofSizeBytes",
+        JsValue::from_f64(proof.encode().len() as f64),
+    )?;
+    Ok(result.into())
+}
+
 /// Verifies a Simplex finalization and returns its certified transaction root.
 #[wasm_bindgen(js_name = verifyFinalization)]
 pub fn verify_finalization(
@@ -211,6 +296,21 @@ pub fn verify_finalization(
         &result,
         "transactionsTip",
         BigInt::from(block.header.transactions_range.end()).into(),
+    )?;
+    set(
+        &result,
+        "stateRoot",
+        Uint8Array::from(block.header.state_root.as_ref()).into(),
+    )?;
+    set(
+        &result,
+        "stateStart",
+        BigInt::from(block.header.state_range.start()).into(),
+    )?;
+    set(
+        &result,
+        "stateTip",
+        BigInt::from(block.header.state_range.end()).into(),
     )?;
     set(
         &result,
@@ -348,6 +448,21 @@ fn decode_operations(encoded_operations: &Array) -> Result<Vec<TransactionOperat
             TransactionOperation::decode_cfg(bytes.as_slice(), &()).map_err(|error| {
                 JsError::new(&format!(
                     "failed to decode transaction proof operation {index}: {error}"
+                ))
+            })
+        })
+        .collect()
+}
+
+fn decode_account_operations(encoded_operations: &Array) -> Result<Vec<AccountOperation>, JsError> {
+    encoded_operations
+        .iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let bytes = Uint8Array::new(&value).to_vec();
+            AccountOperation::decode_cfg(bytes.as_slice(), &()).map_err(|error| {
+                JsError::new(&format!(
+                    "failed to decode account proof operation {index}: {error}"
                 ))
             })
         })
