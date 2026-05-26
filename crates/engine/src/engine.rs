@@ -176,7 +176,7 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    pub bootstrapper: bootstrapper::Mailbox<H, C::PublicKey, V>,
+    pub bootstrapper: Option<bootstrapper::Mailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
     /// [`commonware_consensus::Reporters`] so primaries that pass `None`
@@ -475,7 +475,9 @@ where
             },
         )
         .await;
-        config.bootstrapper.attach(marshal_mailbox.clone()).await;
+        if let Some(bootstrapper) = &config.bootstrapper {
+            bootstrapper.attach(marshal_mailbox.clone()).await;
+        }
 
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),

@@ -203,28 +203,37 @@ impl EngineDefinition for TestEngineDefinition {
             let bootstrapper_network = channels.next().expect("bootstrapper channel must exist");
             assert!(channels.next().is_none(), "unexpected extra channel");
 
-            let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-                context.child("bootstrapper"),
-                bootstrapper::Config {
-                    public_key: public_key.clone(),
-                    peer_provider: manager.clone(),
-                    blocker: blocker.clone(),
-                    scheme: TestScheme::verifier(
-                        &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
-                        output.players().clone(),
-                        output.public().clone(),
-                    ),
-                    mailbox_size: 32,
-                    round_timeout: Duration::from_secs(1),
-                    retry_interval: Duration::from_millis(100),
-                },
-            );
-            let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
+            let (bootstrapper_handle, bootstrapper_mailbox) = if enable_state_sync {
+                let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
+                    context.child("bootstrapper"),
+                    bootstrapper::Config {
+                        public_key: public_key.clone(),
+                        peer_provider: manager.clone(),
+                        blocker: blocker.clone(),
+                        scheme: TestScheme::verifier(
+                            &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
+                            output.players().clone(),
+                            output.public().clone(),
+                        ),
+                        mailbox_size: 32,
+                        round_timeout: Duration::from_secs(1),
+                        retry_interval: Duration::from_millis(100),
+                    },
+                );
+                (
+                    Some(bootstrapper.start(bootstrapper_network)),
+                    Some(bootstrapper_mailbox),
+                )
+            } else {
+                (None, None)
+            };
 
             let (startup, startup_sync_height) = if uses_state_sync
                 && !state_sync_done(&context, &stateful_partition_prefix).await
             {
                 bootstrapper_mailbox
+                    .as_ref()
+                    .expect("state-sync scenario requires bootstrapper")
                     .fetch_initial_target()
                     .await
                     .map(|finalization| {
@@ -319,11 +328,16 @@ impl EngineDefinition for TestEngineDefinition {
             }
 
             let engine_handle = engine.start(channels, Some(reporter));
-            let (bootstrapper_result, engine_result) =
-                futures::join!(bootstrapper_handle, engine_handle);
-            if let Err(error) = bootstrapper_result {
-                warn!(validator = %public_key, ?error, "bootstrapper exited");
-            }
+            let engine_result = if let Some(bootstrapper_handle) = bootstrapper_handle {
+                let (bootstrapper_result, engine_result) =
+                    futures::join!(bootstrapper_handle, engine_handle);
+                if let Err(error) = bootstrapper_result {
+                    warn!(validator = %public_key, ?error, "bootstrapper exited");
+                }
+                engine_result
+            } else {
+                engine_handle.await
+            };
             if let Err(error) = engine_result {
                 warn!(validator = %public_key, ?error, "engine exited");
             }

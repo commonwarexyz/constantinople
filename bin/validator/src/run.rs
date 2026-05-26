@@ -289,26 +289,36 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
             transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
         };
-        let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
-
-        let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-            context.child("bootstrapper"),
-            bootstrapper::Config {
-                public_key: decoded.public_key.clone(),
-                peer_provider: oracle.clone(),
-                blocker: oracle.clone(),
-                scheme:
-                    constantinople_engine::ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
+        let should_bootstrap = matches!(startup, StartupModeConfig::StateSync);
+        let (bootstrapper_handle, bootstrapper_mailbox) = if should_bootstrap {
+            let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
+            let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
+                context.child("bootstrapper"),
+                bootstrapper::Config {
+                    public_key: decoded.public_key.clone(),
+                    peer_provider: oracle.clone(),
+                    blocker: oracle.clone(),
+                    scheme: constantinople_engine::ThresholdScheme::<
+                        ed25519::PublicKey,
+                        MinSig,
+                    >::verifier(
                         &union(b"constantinople", b"_CONSENSUS"),
                         decoded.dkg_output.players().clone(),
                         decoded.dkg_output.public().clone(),
                     ),
-                mailbox_size: 32,
-                round_timeout: Duration::from_secs(1),
-                retry_interval: Duration::from_secs(1),
-            },
-        );
-        let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
+                    mailbox_size: 32,
+                    round_timeout: Duration::from_secs(1),
+                    retry_interval: Duration::from_secs(1),
+                },
+            );
+            let handle = bootstrapper.start(bootstrapper_network);
+            let handle: CriticalTask = Box::pin(async move {
+                let _ = handle.await;
+            });
+            (Some(handle), Some(bootstrapper_mailbox))
+        } else {
+            (None, None)
+        };
         let network_handle = network.start();
 
         let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
@@ -344,8 +354,18 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             Box::pin(std::future::pending())
         };
 
-        let startup =
-            resolve_startup_mode(startup, || bootstrapper_mailbox.fetch_initial_target()).await;
+        let startup = match startup {
+            StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
+            StartupModeConfig::StateSync => {
+                let finalization = bootstrapper_mailbox
+                    .as_ref()
+                    .expect("state-sync startup requires a bootstrapper")
+                    .fetch_initial_target()
+                    .await
+                    .expect("bootstrapper actor exited before selecting a state-sync floor");
+                StartupMode::StateSync { finalization }
+            }
+        };
         let startup_mode = match &startup {
             StartupMode::MarshalSync => "marshal_sync",
             StartupMode::StateSync { .. } => "state_sync",
@@ -441,19 +461,22 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     });
 }
 
-async fn wait_for_critical_task_exit<B, E, M, N>(
-    bootstrapper_handle: B,
+type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+async fn wait_for_critical_task_exit<E, M, N>(
+    bootstrapper_handle: Option<CriticalTask>,
     engine_handle: E,
     mempool_handle: M,
     network_handle: N,
 ) where
-    B: Future,
     E: Future,
     M: Future,
     N: Future,
 {
+    let mut bootstrapper_handle =
+        bootstrapper_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
     tokio::select! {
-        _ = bootstrapper_handle => tracing::warn!("bootstrapper exited"),
+        _ = bootstrapper_handle.as_mut() => tracing::warn!("bootstrapper exited"),
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
         _ = network_handle => tracing::warn!("network exited"),
@@ -470,25 +493,6 @@ const fn production_sync_config() -> SyncEngineConfig {
     }
 }
 
-async fn resolve_startup_mode<Fin, F, Fut>(
-    requested: StartupModeConfig,
-    fetch_initial_target: F,
-) -> StartupMode<Fin>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<Fin>>,
-{
-    match requested {
-        StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
-        StartupModeConfig::StateSync => {
-            let finalization = fetch_initial_target()
-                .await
-                .expect("bootstrapper actor exited before selecting a state-sync floor");
-            StartupMode::StateSync { finalization }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::wait_for_critical_task_exit;
@@ -501,12 +505,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_critical_task_exit(
-                pending::<()>(),
-                pending::<()>(),
-                pending::<()>(),
-                pending::<()>(),
-            ),
+            wait_for_critical_task_exit(None, pending::<()>(), pending::<()>(), pending::<()>()),
         )
         .await;
 
