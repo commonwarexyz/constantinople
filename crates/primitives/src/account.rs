@@ -1,11 +1,11 @@
 //! Account model for the Constantinople chain.
 
+use crate::TransactionPublicKey;
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
-use commonware_cryptography::PublicKey;
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
-use core::{marker::PhantomData, ops::Deref};
+use core::ops::Deref;
 use derive_more::{Debug, Display};
 
 /// Default starting balance for accounts that have not been written yet.
@@ -18,57 +18,40 @@ pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 /// indexing, and lookup on cheap byte comparisons while preserving the public
 /// key's canonical wire representation as the account identifier.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub struct AccountKey<P> {
+pub struct AccountKey {
     bytes: Bytes,
-    _marker: PhantomData<P>,
 }
 
-impl<P> AccountKey<P>
-where
-    P: PublicKey,
-{
+impl AccountKey {
     /// Creates an account key from a decoded public key.
-    pub fn from_public_key(public_key: &P) -> Self {
+    pub fn from_public_key(public_key: &TransactionPublicKey) -> Self {
         Self {
             bytes: Bytes::copy_from_slice(public_key.as_ref()),
-            _marker: PhantomData,
         }
     }
 
     /// Creates an account key from canonical public-key bytes.
     pub fn from_bytes(bytes: Bytes) -> Option<Self> {
-        if bytes.len() != P::SIZE {
+        if bytes.len() != TransactionPublicKey::SIZE {
             return None;
         }
 
-        Some(Self {
-            bytes,
-            _marker: PhantomData,
-        })
+        Some(Self { bytes })
     }
 }
 
-impl<P> FixedSize for AccountKey<P>
-where
-    P: PublicKey,
-{
-    const SIZE: usize = P::SIZE;
+impl FixedSize for AccountKey {
+    const SIZE: usize = TransactionPublicKey::SIZE;
 }
 
-impl<P> Write for AccountKey<P>
-where
-    P: PublicKey,
-{
+impl Write for AccountKey {
     fn write(&self, buf: &mut impl BufMut) {
         debug_assert_eq!(self.bytes.len(), Self::SIZE);
         buf.put_slice(&self.bytes);
     }
 }
 
-impl<P> Read for AccountKey<P>
-where
-    P: PublicKey,
-{
+impl Read for AccountKey {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
@@ -78,24 +61,17 @@ where
 
         Ok(Self {
             bytes: buf.copy_to_bytes(Self::SIZE),
-            _marker: PhantomData,
         })
     }
 }
 
-impl<P> AsRef<[u8]> for AccountKey<P>
-where
-    P: PublicKey,
-{
+impl AsRef<[u8]> for AccountKey {
     fn as_ref(&self) -> &[u8] {
         &self.bytes
     }
 }
 
-impl<P> Deref for AccountKey<P>
-where
-    P: PublicKey,
-{
+impl Deref for AccountKey {
     type Target = [u8];
 
     fn deref(&self) -> &Self::Target {
@@ -103,26 +79,20 @@ where
     }
 }
 
-impl<P> core::fmt::Debug for AccountKey<P>
-where
-    P: PublicKey,
-{
+impl core::fmt::Debug for AccountKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", hex(&self.bytes))
     }
 }
 
-impl<P> core::fmt::Display for AccountKey<P>
-where
-    P: PublicKey,
-{
+impl core::fmt::Display for AccountKey {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "{}", hex(&self.bytes))
     }
 }
 
-impl<P> Span for AccountKey<P> where P: PublicKey {}
-impl<P> Array for AccountKey<P> where P: PublicKey {}
+impl Span for AccountKey {}
+impl Array for AccountKey {}
 
 /// An account, as represented in the state of the chain.
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -176,11 +146,10 @@ mod tests {
 
     #[test]
     fn account_key_roundtrip_does_not_validate_public_key() {
-        let mut raw = vec![0u8; ed25519::PublicKey::SIZE];
+        let mut raw = vec![0u8; TransactionPublicKey::SIZE];
         raw[0] = 1;
 
-        let key = AccountKey::<ed25519::PublicKey>::decode(&mut &raw[..])
-            .expect("account keys are raw public-key bytes");
+        let key = AccountKey::decode(&mut &raw[..]).expect("account keys are raw public-key bytes");
 
         assert_eq!(key.as_ref(), raw.as_slice());
     }
@@ -188,7 +157,7 @@ mod tests {
     #[test]
     fn account_key_from_public_key_uses_public_key_bytes() {
         let private_key = ed25519::PrivateKey::from_seed(1);
-        let public_key = private_key.public_key();
+        let public_key = TransactionPublicKey::ed25519(private_key.public_key());
 
         let key = AccountKey::from_public_key(&public_key);
 

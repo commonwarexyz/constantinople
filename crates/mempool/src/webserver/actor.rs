@@ -7,7 +7,7 @@
 use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
 use commonware_codec::EncodeSize;
 use commonware_consensus::{marshal::Update, types::Round};
-use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
+use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
@@ -27,7 +27,7 @@ const MAX_STATUS_ENTRIES: usize = 1_000_000;
 /// Shared cell that lets the mempool answer account lookups once the
 /// validator's state database is attached. The cell is populated after engine
 /// startup; HTTP handlers return 503 until then.
-pub type AccountReaderCell<P> = Arc<OnceLock<Arc<dyn AccountReader<P>>>>;
+pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
 
 /// Outcome of a submitted batch, delivered when the result is known.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,8 +85,8 @@ pub struct Config<SigSt: Strategy, HashSt: Strategy> {
 }
 
 /// A batch of transactions waiting in the pool.
-struct PoolEntry<P: PublicKey, H: Hasher> {
-    transactions: Vec<VerifiedTransaction<P, H>>,
+struct PoolEntry<H: Hasher> {
+    transactions: Vec<VerifiedTransaction<H>>,
     total_bytes: usize,
 }
 
@@ -364,12 +364,11 @@ fn resolve_batch_if_terminal<D>(
     );
 }
 
-fn new_transactions<P, H>(
-    transactions: Vec<VerifiedTransaction<P, H>>,
+fn new_transactions<H>(
+    transactions: Vec<VerifiedTransaction<H>>,
     known_digests: &mut HashSet<H::Digest>,
-) -> Vec<VerifiedTransaction<P, H>>
+) -> Vec<VerifiedTransaction<H>>
 where
-    P: PublicKey,
     H: Hasher,
     H::Digest: Copy + Eq + Hash,
 {
@@ -383,11 +382,10 @@ where
     accepted
 }
 
-fn remove_known_digests<P, H>(
-    transactions: &[VerifiedTransaction<P, H>],
+fn remove_known_digests<H>(
+    transactions: &[VerifiedTransaction<H>],
     known_digests: &mut HashSet<H::Digest>,
 ) where
-    P: PublicKey,
     H: Hasher,
     H::Digest: Eq + Hash,
 {
@@ -396,9 +394,8 @@ fn remove_known_digests<P, H>(
     }
 }
 
-fn total_bytes_for<P, H>(transactions: &[VerifiedTransaction<P, H>]) -> usize
+fn total_bytes_for<H>(transactions: &[VerifiedTransaction<H>]) -> usize
 where
-    P: PublicKey,
     H: Hasher,
 {
     transactions.iter().map(EncodeSize::encode_size).sum()
@@ -425,7 +422,7 @@ where
     context: ContextCell<E>,
     mailbox: Mailbox<C, P, H>,
     rx: mpsc::Receiver<Message<C, P, H>>,
-    pool: VecDeque<PoolEntry<P, H>>,
+    pool: VecDeque<PoolEntry<H>>,
     pool_bytes: usize,
     max_pool_bytes: usize,
     max_propose_bytes: usize,
@@ -433,7 +430,7 @@ where
     drop_grace_blocks: u64,
     signature_strategy: SigSt,
     hash_strategy: HashSt,
-    account_reader: AccountReaderCell<P>,
+    account_reader: AccountReaderCell,
 }
 
 impl<E, C, P, H, SigSt, HashSt> Actor<E, C, P, H, SigSt, HashSt>
@@ -458,7 +455,7 @@ where
         config: Config<SigSt, HashSt>,
         mailbox: Mailbox<C, P, H>,
         receiver: ActorReceiver<C, P, H>,
-        account_reader: AccountReaderCell<P>,
+        account_reader: AccountReaderCell,
     ) -> Self {
         Self {
             context: ContextCell::new(context),
@@ -478,19 +475,11 @@ where
 
     /// Spawns the actor event loop and HTTP server on the runtime.
     ///
-    /// The `BV` type parameter selects the batch signature verifier used
-    /// by the HTTP handlers (e.g., `ed25519::Batch`).
-    pub fn start<BV>(mut self, listener: tokio::net::TcpListener) -> Handle<()>
-    where
-        BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-    {
-        spawn_cell!(self.context, self.run::<BV>(listener))
+    pub fn start(mut self, listener: tokio::net::TcpListener) -> Handle<()> {
+        spawn_cell!(self.context, self.run(listener))
     }
 
-    async fn run<BV>(self, listener: tokio::net::TcpListener)
-    where
-        BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
-    {
+    async fn run(self, listener: tokio::net::TcpListener) {
         let Self {
             context,
             mailbox,
@@ -514,7 +503,7 @@ where
             hash_strategy,
             account_reader,
         });
-        let app = http::router::<C, P, H, BV, SigSt, HashSt>(app_state);
+        let app = http::router::<C, P, H, SigSt, HashSt>(app_state);
         let _http_handle = context.as_present().child("http").spawn(|_| async {
             let _ = axum::serve(listener, app).await;
         });

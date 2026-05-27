@@ -164,7 +164,7 @@ where
     /// the per-transaction decode + seal-hash cost on the caller's thread.
     /// Materialization is typically driven in parallel at verify time via a
     /// [`commonware_parallel::Strategy`].
-    pub body: Vec<Lazy<SignedTransaction<P, H>>>,
+    pub body: Vec<Lazy<SignedTransaction<H>>>,
 }
 
 /// A sealed canonical block.
@@ -177,10 +177,10 @@ where
     P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
     H: Hasher,
     H::Digest: for<'a> arbitrary::Arbitrary<'a>,
-    SignedTransaction<P, H>: for<'a> arbitrary::Arbitrary<'a>,
+    SignedTransaction<H>: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let body: Vec<SignedTransaction<P, H>> = u.arbitrary()?;
+        let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
             body: body.into_iter().map(Lazy::new).collect(),
@@ -215,7 +215,7 @@ where
     H: Hasher,
 {
     /// Creates a new block from already-decoded transactions.
-    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<P, H>>) -> Self {
+    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
             header,
             body: body.into_iter().map(Lazy::new).collect(),

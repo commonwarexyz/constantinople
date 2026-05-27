@@ -3,7 +3,7 @@
 use super::{
     Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
 };
-use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey, certificate::Scheme};
+use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage};
@@ -24,14 +24,14 @@ where
     S: Scheme<PublicKey = P>,
     P: PublicKey,
     I: TransactionSource<C, P, H> + Sync,
-    B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
+    B: Send + Sync + 'static,
     SigSt: Strategy + Clone + Send + Sync + 'static,
     HashSt: Strategy + Clone + Send + Sync + 'static,
 {
     type SigningScheme = S;
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = Databases<E, H, P, EightCap, HashSt>;
+    type Databases = Databases<E, H, EightCap, HashSt>;
     type InputProvider = I;
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {

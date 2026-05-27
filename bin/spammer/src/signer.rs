@@ -3,11 +3,13 @@
 use crate::accounts::SpamAccount;
 use commonware_cryptography::{Sha256, ed25519};
 use commonware_parallel::Strategy;
-use constantinople_primitives::{Signable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction};
+use constantinople_primitives::{
+    SignedTransaction, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+};
 use core::num::NonZeroU64;
 
 /// Concrete signed transaction type.
-pub type Tx = SignedTransaction<ed25519::PublicKey, Sha256>;
+pub type Tx = SignedTransaction<Sha256>;
 
 /// Signs one transaction for a single sender in the ring.
 fn sign_one(
@@ -16,7 +18,12 @@ fn sign_one(
     value: NonZeroU64,
     nonce: u64,
 ) -> Tx {
-    let tx = Transaction::new(sender.public_key.clone(), recipient.clone(), value, nonce);
+    let tx = Transaction::new(
+        TransactionPublicKey::ed25519(sender.public_key.clone()),
+        TransactionPublicKey::ed25519(recipient.clone()),
+        value,
+        nonce,
+    );
     tx.seal_and_sign(
         &sender.private_key,
         TRANSACTION_NAMESPACE,
@@ -103,7 +110,7 @@ mod tests {
     #[test]
     fn signed_transactions_survive_encode_decode_roundtrip() {
         use commonware_codec::{Decode, Encode, RangeCfg};
-        use commonware_cryptography::{Sha256, ed25519};
+        use commonware_cryptography::Sha256;
         use constantinople_primitives::{TRANSACTION_NAMESPACE, verify_transaction_batch};
 
         let accounts = generate_accounts(5, 1000);
@@ -128,7 +135,7 @@ mod tests {
             .map(commonware_codec::types::lazy::Lazy::new)
             .collect();
         assert!(
-            verify_transaction_batch::<ed25519::PublicKey, Sha256, ed25519::Batch, _>(
+            verify_transaction_batch::<Sha256, _>(
                 &Sequential,
                 TRANSACTION_NAMESPACE,
                 &mut rng,

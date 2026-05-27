@@ -7,7 +7,7 @@
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
 use commonware_codec::FixedSize;
-use commonware_cryptography::{ed25519::PublicKey, sha256::Sha256};
+use commonware_cryptography::sha256::Sha256;
 use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
@@ -29,13 +29,8 @@ use std::{
 use tracing::info;
 
 type AccountValue = FixedBytes<{ Account::SIZE }>;
-type StateClient = UnorderedClient<
-    mmr::Family,
-    Sha256,
-    AccountKey<PublicKey>,
-    AccountValue,
-    FixedEncoding<AccountValue>,
->;
+type StateClient =
+    UnorderedClient<mmr::Family, Sha256, AccountKey, AccountValue, FixedEncoding<AccountValue>>;
 type TransactionClient = KeylessClient<
     mmr::Family,
     Sha256,

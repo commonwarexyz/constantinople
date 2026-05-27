@@ -89,27 +89,20 @@ where
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, P, T> = fixed::Db<mmr::Family, E, AccountKey<P>, Account, H, EightCap, T>;
+pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
 
-pub type StateSyncDb<E, H, P, T> = Arc<AsyncRwLock<StateDb<E, H, P, T>>>;
+pub type StateSyncDb<E, H, T> = Arc<AsyncRwLock<StateDb<E, H, T>>>;
 
-pub(crate) type StateResolverMailbox<E, H, P, T> =
+pub(crate) type StateResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::p2p::standard::Mailbox<
-        StateDb<E, H, P, T>,
+        StateDb<E, H, T>,
         mmr::Family,
-        <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
-        <StateSyncDb<E, H, P, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
+        <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
+        <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
     >;
 
 pub(crate) type StateResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::p2p::standard::Actor<
-        E,
-        P,
-        M,
-        B,
-        mmr::Family,
-        StateDb<E, H, P, T>,
-    >;
+    commonware_glue::stateful::db::p2p::standard::Actor<E, P, M, B, mmr::Family, StateDb<E, H, T>>;
 
 pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
@@ -148,7 +141,7 @@ pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
     ThresholdScheme<P, V>,
     EngineVariant<H, P>,
     (
-        StateResolverMailbox<E, H, P, HashT>,
+        StateResolverMailbox<E, H, HashT>,
         TransactionResolverMailbox<E, H, HashT>,
     ),
 >;

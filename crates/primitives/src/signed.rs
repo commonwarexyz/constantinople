@@ -7,7 +7,7 @@
 //! - [`Signable`] — A convenience trait for types that are [`Sealable`],
 //!   providing a one-step `seal_and_sign` method.
 
-use crate::{Sealable, Sealed, SignedTransaction};
+use crate::{Sealable, Sealed, SignedTransaction, TransactionBatchVerifier};
 use commonware_codec::{Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
 use commonware_cryptography::{BatchVerifier, Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
@@ -189,12 +189,11 @@ impl<T: Sealable> Signable for T {}
 /// Materializes lazily-encoded signed transactions in parallel.
 ///
 /// Returns `None` if any transaction fails to decode.
-pub fn materialize_transaction_chunks<P, H, St>(
+pub fn materialize_transaction_chunks<H, St>(
     strategy: &St,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Option<Vec<SignedTransaction<P, H>>>
+    transactions: Vec<Lazy<SignedTransaction<H>>>,
+) -> Option<Vec<SignedTransaction<H>>>
 where
-    P: PublicKey,
     H: Hasher,
     St: Strategy,
 {
@@ -220,12 +219,11 @@ where
 ///
 /// Returns the original lazy transactions after warming their cached decoded
 /// values, or `None` if any transaction fails to decode.
-pub fn preload_transaction_chunks<P, H, St>(
+pub fn preload_transaction_chunks<H, St>(
     strategy: &St,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Option<Vec<Lazy<SignedTransaction<P, H>>>>
+    transactions: Vec<Lazy<SignedTransaction<H>>>,
+) -> Option<Vec<Lazy<SignedTransaction<H>>>>
 where
-    P: PublicKey,
     H: Hasher,
     St: Strategy,
 {
@@ -251,9 +249,8 @@ where
         .then_some(transactions)
 }
 
-fn signature_inputs_decode<P, H>(lazy: &Lazy<SignedTransaction<P, H>>) -> bool
+fn signature_inputs_decode<H>(lazy: &Lazy<SignedTransaction<H>>) -> bool
 where
-    P: PublicKey,
     H: Hasher,
 {
     let Some(transaction) = lazy.get() else {
@@ -270,19 +267,17 @@ where
 ///
 /// Returns `true` if every transaction decodes and all signatures verify,
 /// `false` otherwise.
-pub fn verify_transaction_batch<P, H, BV, St>(
+pub fn verify_transaction_batch<H, St>(
     signature_strategy: &St,
     namespace: &[u8],
     rng: &mut impl CryptoRngCore,
-    transactions: &[Lazy<SignedTransaction<P, H>>],
+    transactions: &[Lazy<SignedTransaction<H>>],
 ) -> bool
 where
-    P: PublicKey,
     H: Hasher,
-    BV: BatchVerifier<PublicKey = P>,
     St: Strategy,
 {
-    let mut verifier = BV::new();
+    let mut verifier = TransactionBatchVerifier::new();
     for lazy in transactions {
         let Some(transaction) = lazy.get() else {
             return false;
@@ -311,17 +306,15 @@ where
 /// digest. The signature strategy then runs batch signature verification over
 /// the warmed transactions. Returns `None` if any transaction contains an invalid or
 /// undecodable transaction.
-pub fn verify_transaction_chunks<P, H, BV, SigSt, HashSt>(
+pub fn verify_transaction_chunks<H, SigSt, HashSt>(
     signature_strategy: &SigSt,
     hash_strategy: &HashSt,
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Option<Vec<SignedTransaction<P, H>>>
+    transactions: Vec<Lazy<SignedTransaction<H>>>,
+) -> Option<Vec<SignedTransaction<H>>>
 where
-    P: PublicKey,
     H: Hasher,
-    BV: BatchVerifier<PublicKey = P>,
     SigSt: Strategy,
     HashSt: Strategy,
 {
@@ -331,7 +324,7 @@ where
 
     let transactions = preload_transaction_chunks(hash_strategy, transactions)?;
 
-    if !verify_transaction_batch::<P, H, BV, _>(signature_strategy, namespace, rng, &transactions) {
+    if !verify_transaction_batch::<H, _>(signature_strategy, namespace, rng, &transactions) {
         return None;
     }
 
@@ -344,7 +337,9 @@ where
 
 #[cfg(test)]
 mod test {
-    use crate::{Sealable, Sealed, SignedTransaction, Transaction, signed::Signable};
+    use crate::{
+        Sealable, Sealed, SignedTransaction, Transaction, TransactionPublicKey, signed::Signable,
+    };
     use commonware_codec::{
         DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
         types::lazy::Lazy,
@@ -362,7 +357,7 @@ mod test {
     #[derive(Debug)]
     struct MockValue([u8; 4]);
 
-    type Ed25519SignedTransaction = SignedTransaction<ed25519::PublicKey, sha256::Sha256>;
+    type Ed25519SignedTransaction = SignedTransaction<sha256::Sha256>;
 
     impl Sealable for MockValue {
         type SealDigest = sha256::Digest;
@@ -429,7 +424,7 @@ mod test {
     fn signed_transaction_exposes_sender_public_key() {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
-        let public_key = private_key.public_key();
+        let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),
             public_key.clone(),
@@ -454,7 +449,7 @@ mod test {
     fn preload_transaction_chunks_forces_nested_signature_inputs() {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
-        let public_key = private_key.public_key();
+        let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),
             public_key,
@@ -465,7 +460,7 @@ mod test {
 
         let mut encoded = Vec::with_capacity(signed.encode_size());
         signed.write(&mut encoded);
-        encoded[..ed25519::PublicKey::SIZE].copy_from_slice(&invalid_public_key_bytes());
+        encoded[..TransactionPublicKey::SIZE].copy_from_slice(&invalid_public_key_bytes());
 
         let lazy = Lazy::<Ed25519SignedTransaction>::read(&mut &encoded[..])
             .expect("outer transaction should decode");
@@ -480,15 +475,16 @@ mod test {
         );
     }
 
-    fn invalid_public_key_bytes() -> [u8; ed25519::PublicKey::SIZE] {
+    fn invalid_public_key_bytes() -> [u8; TransactionPublicKey::SIZE] {
         (0u8..=u8::MAX)
             .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
             .find_map(|(first, last)| {
-                let mut candidate = [0; ed25519::PublicKey::SIZE];
-                candidate[0] = first;
-                candidate[ed25519::PublicKey::SIZE - 1] = last;
+                let mut candidate = [0; TransactionPublicKey::SIZE];
+                candidate[0] = 0;
+                candidate[1] = first;
+                candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                ed25519::PublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(&mut &candidate[..])
                     .is_err()
                     .then_some(candidate)
             })

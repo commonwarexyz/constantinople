@@ -13,6 +13,9 @@ pub use signed::{
 mod account;
 pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE};
 
+mod auth;
+pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};
+
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};
 

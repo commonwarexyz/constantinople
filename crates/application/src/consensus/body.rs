@@ -5,7 +5,7 @@ use super::{
     SIGNATURE_TASK_CLOSED,
 };
 use commonware_codec::types::lazy::Lazy;
-use commonware_cryptography::{BatchVerifier, Hasher, PublicKey};
+use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner};
 use constantinople_primitives::{
@@ -16,20 +16,18 @@ use rand_core::CryptoRngCore;
 use std::{sync::Arc, time::Instant};
 use tracing::{Instrument, info_span};
 
-pub(super) type PreparedBody<P, H> = Arc<Vec<Lazy<SignedTransaction<P, H>>>>;
+pub(super) type PreparedBody<H> = Arc<Vec<Lazy<SignedTransaction<H>>>>;
 
-pub(super) async fn verify_signatures<E, P, H, B, SigSt, HashSt>(
+pub(super) async fn verify_signatures<E, H, SigSt, HashSt>(
     runtime: E,
     signature_strategy: SigSt,
     hash_strategy: HashSt,
     namespace: &'static [u8],
-    body: PreparedBody<P, H>,
+    body: PreparedBody<H>,
 ) -> Result<u128>
 where
     E: Spawner + CryptoRngCore,
-    P: PublicKey,
     H: Hasher,
-    B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
     SigSt: Strategy + Send + Sync + 'static,
     HashSt: Strategy + Send + Sync + 'static,
 {
@@ -40,7 +38,7 @@ where
             let started_at = Instant::now();
             let result = preload_transaction_chunks(&hash_strategy, body.as_ref().clone())
                 .filter(|transactions| {
-                    verify_transaction_batch::<P, H, B, _>(
+                    verify_transaction_batch::<H, _>(
                         &signature_strategy,
                         namespace,
                         &mut runtime,
@@ -60,14 +58,13 @@ where
     result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
 }
 
-pub(super) async fn materialize_body<E, P, H, HashSt>(
+pub(super) async fn materialize_body<E, H, HashSt>(
     runtime: E,
     hash_strategy: HashSt,
-    transactions: Vec<Lazy<SignedTransaction<P, H>>>,
-) -> Result<Vec<SignedTransaction<P, H>>>
+    transactions: Vec<Lazy<SignedTransaction<H>>>,
+) -> Result<Vec<SignedTransaction<H>>>
 where
     E: Spawner,
-    P: PublicKey,
     H: Hasher,
     HashSt: Strategy + Send + Sync + 'static,
 {

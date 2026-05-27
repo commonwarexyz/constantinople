@@ -41,8 +41,7 @@ const CONSENSUS_NAMESPACE: &[u8] = b"constantinople_CONSENSUS";
 const MAX_SIMPLEX_PARTICIPANTS: u32 = 10_000;
 
 type TransactionOperation = keyless::Operation<mmr::Family, FixedEncoding<sha256::Digest>>;
-type AccountOperation =
-    UnorderedOperation<mmr::Family, AccountKey<ed25519::PublicKey>, FixedEncoding<Account>>;
+type AccountOperation = UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<Account>>;
 type ConsensusScheme = threshold_standard::Scheme<ed25519::PublicKey, MinSig>;
 type ChainBlock = Sealed<Block<Commitment, ed25519::PublicKey, Sha256>, Sha256>;
 
@@ -176,9 +175,8 @@ pub fn verify_account_proof(
     expected_key: &[u8],
 ) -> Result<JsValue, JsError> {
     let expected_root = decode_digest(expected_root, "expected state root")?;
-    let expected_key =
-        AccountKey::<ed25519::PublicKey>::from_bytes(bytes::Bytes::copy_from_slice(expected_key))
-            .ok_or_else(|| JsError::new("expected account key must be 32 bytes"))?;
+    let expected_key = AccountKey::from_bytes(bytes::Bytes::copy_from_slice(expected_key))
+        .ok_or_else(|| JsError::new("expected account key must be 32 bytes"))?;
     let target_root = historical_target_root(ops_root, ops_root_witness, &expected_root)?;
     let operations = decode_account_operations(&encoded_operations)?;
     if operations.is_empty() {

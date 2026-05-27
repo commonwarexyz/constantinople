@@ -33,7 +33,7 @@ where
     Submit {
         batch_id: String,
         digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<P, H>>,
+        transactions: Vec<VerifiedTransaction<H>>,
         total_bytes: usize,
         result: Option<oneshot::Sender<TxStatus>>,
         ingest_result: Option<oneshot::Sender<IngestStatus>>,
@@ -48,7 +48,7 @@ where
     /// Consensus requests transactions for the next proposal.
     Propose {
         height: u64,
-        response: oneshot::Sender<Vec<VerifiedTransaction<P, H>>>,
+        response: oneshot::Sender<Vec<VerifiedTransaction<H>>>,
     },
     /// Consensus reports a finalized or tip block.
     Report(Update<SealedBlock<C, P, H>>),
@@ -106,7 +106,7 @@ where
         &self,
         batch_id: String,
         digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<P, H>>,
+        transactions: Vec<VerifiedTransaction<H>>,
         total_bytes: usize,
     ) -> Option<oneshot::Receiver<TxStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
@@ -131,7 +131,7 @@ where
         &self,
         batch_id: String,
         digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<P, H>>,
+        transactions: Vec<VerifiedTransaction<H>>,
         total_bytes: usize,
     ) -> Option<oneshot::Receiver<IngestStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
@@ -174,7 +174,7 @@ where
         &mut self,
         parent: &Header<C, H::Digest, P>,
         _context: &Context<C, P>,
-    ) -> Vec<VerifiedTransaction<P, H>> {
+    ) -> Vec<VerifiedTransaction<H>> {
         let height = parent.height + 1;
         self.sender
             .request(|response| Message::Propose { height, response })

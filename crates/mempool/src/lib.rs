@@ -19,7 +19,7 @@ where
         &mut self,
         parent: &Header<C, H::Digest, P>,
         context: &Context<C, P>,
-    ) -> impl Future<Output = Vec<VerifiedTransaction<P, H>>> + Send;
+    ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send;
 }
 
 #[cfg(feature = "mocks")]

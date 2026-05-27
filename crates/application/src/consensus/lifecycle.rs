@@ -8,9 +8,7 @@ use super::{
 };
 use crate::executor;
 use commonware_consensus::simplex::types::Context;
-use commonware_cryptography::{
-    BatchVerifier, Digest, Digestible, Hasher, PublicKey, certificate::Scheme,
-};
+use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
     Application as CApplication, Proposed,
     db::{DatabaseSet, Merkleized as _},
@@ -31,6 +29,7 @@ where
     C: Digest,
     H: Hasher,
     P: PublicKey,
+    B: Send + Sync + 'static,
     HashSt: Strategy,
 {
     /// Proposes a child block from an already fetched parent.
@@ -56,7 +55,6 @@ where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
-        B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
@@ -142,7 +140,6 @@ where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
-        B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
@@ -162,7 +159,7 @@ where
 
         let body = Arc::new(body);
         let (state_batch, transaction_batch) = batches;
-        let signatures = verify_signatures::<E, P, H, B, SigSt, HashSt>(
+        let signatures = verify_signatures::<E, H, SigSt, HashSt>(
             runtime.child("verify_signatures"),
             self.signature_strategy.clone(),
             self.hash_strategy.clone(),
@@ -221,7 +218,6 @@ where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
-        B: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {

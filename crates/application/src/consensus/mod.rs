@@ -37,7 +37,7 @@ type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 pub type FinalizedHookFn<E, C, H, P, HashSt> = Arc<
     dyn for<'a> Fn(
             &'a SealedBlock<C, P, H>,
-            &'a Databases<E, H, P, commonware_storage::translator::EightCap, HashSt>,
+            &'a Databases<E, H, commonware_storage::translator::EightCap, HashSt>,
         ) -> FinalizedHookFuture<'a>
         + Send
         + Sync,

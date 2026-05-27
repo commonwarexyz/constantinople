@@ -2,8 +2,8 @@
 
 use super::TxStatus;
 use commonware_codec::Encode;
-use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_primitives::SignedTransaction;
+use commonware_cryptography::Hasher;
+use constantinople_primitives::{SignedTransaction, TransactionPublicKey};
 use derive_more::Display;
 use serde::Deserialize;
 
@@ -62,12 +62,11 @@ impl Client {
     /// The batch is encoded as a commonware-codec length-prefixed vector.
     /// The call blocks until the server reports full finalization, partial
     /// finalization, or drop.
-    pub async fn submit<P, H>(
+    pub async fn submit<H>(
         &self,
-        transactions: &[SignedTransaction<P, H>],
+        transactions: &[SignedTransaction<H>],
     ) -> Result<TxStatus, SubmitError>
     where
-        P: PublicKey,
         H: Hasher,
     {
         let body = transactions.encode();
@@ -96,12 +95,11 @@ impl Client {
     ///
     /// The batch is encoded as a commonware-codec length-prefixed vector and
     /// sent to `POST /transactions/ingest`.
-    pub async fn ingest<P, H>(
+    pub async fn ingest<H>(
         &self,
-        transactions: &[SignedTransaction<P, H>],
+        transactions: &[SignedTransaction<H>],
     ) -> Result<IngestView, SubmitError>
     where
-        P: PublicKey,
         H: Hasher,
     {
         self.ingest_encoded(transactions.encode()).await
@@ -135,10 +133,10 @@ impl Client {
     /// Returns `Ok(Some(account))` when the account has been written, `Ok(None)`
     /// when no record exists yet, and [`SubmitError::ServiceUnavailable`]
     /// while the validator's state database is still attaching.
-    pub async fn fetch_account<P>(&self, public_key: &P) -> Result<Option<AccountView>, SubmitError>
-    where
-        P: PublicKey,
-    {
+    pub async fn fetch_account(
+        &self,
+        public_key: &TransactionPublicKey,
+    ) -> Result<Option<AccountView>, SubmitError> {
         let response = self
             .http
             .get(format!("{}/account/{}", self.url, public_key))

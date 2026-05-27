@@ -161,18 +161,17 @@ impl IndexerClient {
     }
 
     /// Decode and return the transaction for `digest`, or `None` if absent.
-    pub async fn transaction<H, P>(
+    pub async fn transaction<H>(
         &self,
         digest: &H::Digest,
-    ) -> Result<Option<SignedTransaction<P, H>>, ReadError>
+    ) -> Result<Option<SignedTransaction<H>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
     {
         let Some(bytes) = self.transaction_bytes(digest).await? else {
             return Ok(None);
         };
-        Ok(Some(codec::from_bytes::<SignedTransaction<P, H>>(
+        Ok(Some(codec::from_bytes::<SignedTransaction<H>>(
             &bytes,
             &(),
         )?))

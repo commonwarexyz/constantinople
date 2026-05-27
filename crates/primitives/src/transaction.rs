@@ -1,25 +1,24 @@
 //! Constantinople transaction type and transaction wrappers.
 
-use crate::{AccountKey, Sealable, Sealed, Signed};
+use crate::{AccountKey, Sealable, Sealed, Signed, TransactionPublicKey, TransactionSignature};
 use bytes::{Buf, BufMut};
 use commonware_codec::{Encode, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy};
-use commonware_cryptography::{Digest, Hasher, PublicKey, Verifier};
+use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
 
 /// A signed transaction accepted by the canonical block format.
-pub type SignedTransaction<P, H> =
-    Signed<Transaction<<H as Hasher>::Digest, P>, H, <P as Verifier>::Signature>;
+pub type SignedTransaction<H> = Signed<Transaction<<H as Hasher>::Digest>, H, TransactionSignature>;
 
 /// A signed transaction whose signature has been accepted by the caller.
-pub type VerifiedTransaction<P, H> = SignedTransaction<P, H>;
+pub type VerifiedTransaction<H> = SignedTransaction<H>;
 
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct Transaction<D: Digest, P: PublicKey> {
+pub struct Transaction<D: Digest> {
     /// The sender public key, decoded lazily on demand.
-    pub sender: Lazy<P>,
+    pub sender: Lazy<TransactionPublicKey>,
     /// The recipient account key.
-    pub to: AccountKey<P>,
+    pub to: AccountKey,
     /// The value to send with the transaction.
     pub value: NonZeroU64,
     /// The sender nonce.
@@ -28,9 +27,14 @@ pub struct Transaction<D: Digest, P: PublicKey> {
     pub _digest: core::marker::PhantomData<D>,
 }
 
-impl<D: Digest, P: PublicKey> Transaction<D, P> {
+impl<D: Digest> Transaction<D> {
     /// Creates a new transaction.
-    pub fn new(sender: P, to: P, value: NonZeroU64, nonce: u64) -> Self {
+    pub fn new(
+        sender: TransactionPublicKey,
+        to: TransactionPublicKey,
+        value: NonZeroU64,
+        nonce: u64,
+    ) -> Self {
         Self {
             sender: Lazy::new(sender),
             to: AccountKey::from_public_key(&to),
@@ -41,12 +45,12 @@ impl<D: Digest, P: PublicKey> Transaction<D, P> {
     }
 
     /// Returns the decoded sender public key.
-    pub fn sender(&self) -> Option<&P> {
+    pub fn sender(&self) -> Option<&TransactionPublicKey> {
         self.sender.get()
     }
 
     /// Returns the lazily decoded sender public key.
-    pub const fn sender_lazy(&self) -> &Lazy<P> {
+    pub const fn sender_lazy(&self) -> &Lazy<TransactionPublicKey> {
         &self.sender
     }
 
@@ -59,9 +63,26 @@ impl<D: Digest, P: PublicKey> Transaction<D, P> {
         hasher.update(&self.encode());
         hasher.finalize()
     }
+
+    /// Seals and signs this transaction with a supported transaction signer.
+    pub fn seal_and_sign<H, S>(
+        self,
+        signer: &S,
+        namespace: &[u8],
+        hasher: &mut H,
+    ) -> SignedTransaction<H>
+    where
+        H: Hasher<Digest = D>,
+        S: Signer,
+        TransactionSignature: From<S::Signature>,
+    {
+        let sealed = self.seal(hasher);
+        let signature = TransactionSignature::from(signer.sign(namespace, sealed.seal().as_ref()));
+        Signed::new_unchecked(sealed, signature)
+    }
 }
 
-impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
+impl<D: Digest> Write for Transaction<D> {
     fn write(&self, buf: &mut impl BufMut) {
         self.sender.write(buf);
         self.to.write(buf);
@@ -70,16 +91,16 @@ impl<D: Digest, P: PublicKey> Write for Transaction<D, P> {
     }
 }
 
-impl<D: Digest, P: PublicKey> FixedSize for Transaction<D, P> {
-    const SIZE: usize = P::SIZE + AccountKey::<P>::SIZE + u64::SIZE + u64::SIZE;
+impl<D: Digest> FixedSize for Transaction<D> {
+    const SIZE: usize = TransactionPublicKey::SIZE + AccountKey::SIZE + u64::SIZE + u64::SIZE;
 }
 
-impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
+impl<D: Digest> Read for Transaction<D> {
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, Error> {
-        let sender = Lazy::<P>::read(buf)?;
-        let to = AccountKey::<P>::read(buf)?;
+        let sender = Lazy::<TransactionPublicKey>::read(buf)?;
+        let to = AccountKey::read(buf)?;
         let value = u64::read(buf)?;
         let value = NonZeroU64::new(value)
             .ok_or(Error::Invalid("Transaction", "value must be non-zero"))?;
@@ -94,7 +115,7 @@ impl<D: Digest, P: PublicKey> Read for Transaction<D, P> {
     }
 }
 
-impl<D: Digest, P: PublicKey> Sealable for Transaction<D, P> {
+impl<D: Digest> Sealable for Transaction<D> {
     type SealDigest = D;
 
     fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
@@ -104,15 +125,13 @@ impl<D: Digest, P: PublicKey> Sealable for Transaction<D, P> {
 }
 
 #[cfg(any(test, feature = "arbitrary"))]
-impl<D: Digest, P> arbitrary::Arbitrary<'_> for Transaction<D, P>
-where
-    P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
-{
+impl<D: Digest> arbitrary::Arbitrary<'_> for Transaction<D> {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let to = u.arbitrary::<P>()?;
+        let sender = commonware_cryptography::ed25519::PublicKey::arbitrary(u)?;
+        let to = commonware_cryptography::ed25519::PublicKey::arbitrary(u)?;
         Ok(Self {
-            sender: Lazy::new(u.arbitrary()?),
-            to: AccountKey::from_public_key(&to),
+            sender: Lazy::new(TransactionPublicKey::ed25519(sender)),
+            to: AccountKey::from_public_key(&TransactionPublicKey::ed25519(to)),
             value: NonZeroU64::new(u.int_in_range(1..=u64::MAX)?)
                 .expect("arbitrary non-zero value should construct"),
             nonce: u.arbitrary()?,
@@ -131,20 +150,20 @@ mod test {
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
 
-    fn test_sender() -> ed25519::PublicKey {
+    fn test_sender() -> TransactionPublicKey {
         let mut rng = StdRng::from_seed([7u8; 32]);
-        ed25519::PrivateKey::random(&mut rng).public_key()
+        TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key())
     }
 
     #[test]
     fn test_roundtrip_transaction_consensus() {
-        let reference_tx: Transaction<sha256::Digest, ed25519::PublicKey> =
+        let reference_tx: Transaction<sha256::Digest> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
 
         let mut encoded = Vec::with_capacity(reference_tx.encode_size());
         reference_tx.write(&mut encoded);
 
-        let decoded = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &encoded[..])
+        let decoded = Transaction::<sha256::Digest>::decode(&mut &encoded[..])
             .expect("decoding should succeed");
 
         assert_eq!(
@@ -155,7 +174,7 @@ mod test {
 
     #[test]
     fn transaction_hash_slow_deterministic() {
-        let tx: Transaction<sha256::Digest, ed25519::PublicKey> =
+        let tx: Transaction<sha256::Digest> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
         let hasher = &mut sha256::Sha256::default();
 
@@ -168,7 +187,7 @@ mod test {
     fn transaction_seal_matches_hash_slow() {
         use crate::Sealable;
 
-        let tx: Transaction<sha256::Digest, ed25519::PublicKey> =
+        let tx: Transaction<sha256::Digest> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
         let hasher = &mut sha256::Sha256::default();
 
@@ -179,7 +198,7 @@ mod test {
 
     #[test]
     fn transaction_roundtrip() {
-        let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
+        let tx = Transaction::<sha256::Digest>::new(
             test_sender(),
             test_sender(),
             NonZeroU64::new(12_345).expect("test value should be non-zero"),
@@ -189,14 +208,14 @@ mod test {
         let mut buf = Vec::with_capacity(tx.encode_size());
         tx.write(&mut buf);
 
-        let decoded = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
-            .expect("decoding should succeed");
+        let decoded =
+            Transaction::<sha256::Digest>::decode(&mut &buf[..]).expect("decoding should succeed");
         assert_eq!(decoded, tx);
     }
 
     #[test]
     fn transaction_encode_size_matches_written() {
-        let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
+        let tx = Transaction::<sha256::Digest>::new(
             test_sender(),
             test_sender(),
             NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
@@ -212,7 +231,7 @@ mod test {
     #[test]
     fn transaction_zero_value_decode_is_rejected() {
         let sender = test_sender();
-        let tx = Transaction::<sha256::Digest, ed25519::PublicKey>::new(
+        let tx = Transaction::<sha256::Digest>::new(
             sender.clone(),
             test_sender(),
             NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -225,7 +244,7 @@ mod test {
         0u64.write(&mut buf);
         tx.nonce.write(&mut buf);
 
-        let result = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &buf[..]);
+        let result = Transaction::<sha256::Digest>::decode(&mut &buf[..]);
         assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 
@@ -234,11 +253,12 @@ mod test {
         let invalid_sender = (0u8..=u8::MAX)
             .flat_map(|first| (0u8..=u8::MAX).map(move |last| (first, last)))
             .find_map(|(first, last)| {
-                let mut candidate = [0; ed25519::PublicKey::SIZE];
-                candidate[0] = first;
-                candidate[ed25519::PublicKey::SIZE - 1] = last;
+                let mut candidate = [0; TransactionPublicKey::SIZE];
+                candidate[0] = 0;
+                candidate[1] = first;
+                candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                ed25519::PublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(&mut &candidate[..])
                     .is_err()
                     .then_some(candidate)
             })
@@ -250,7 +270,7 @@ mod test {
         1u64.write(&mut buf);
         9u64.write(&mut buf);
 
-        let decoded = Transaction::<sha256::Digest, ed25519::PublicKey>::decode(&mut &buf[..])
+        let decoded = Transaction::<sha256::Digest>::decode(&mut &buf[..])
             .expect("decoding should defer sender validation");
 
         assert!(decoded.sender().is_none());

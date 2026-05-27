@@ -18,25 +18,23 @@ use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, Signed
 use hashbrown::HashSet;
 use std::time::Instant;
 
-pub(super) struct ProposalExecution<E, H, P, S>
+pub(super) struct ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
-    pub(super) block: BlockExecution<E, H, P, S>,
-    pub(super) body: Vec<SignedTransaction<P, H>>,
+    pub(super) block: BlockExecution<E, H, S>,
+    pub(super) body: Vec<SignedTransaction<H>>,
 }
 
-pub(super) struct BlockExecution<E, H, P, S>
+pub(super) struct BlockExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
-    pub(super) state: db::StateMerkleized<E, H, P, EightCap, S>,
+    pub(super) state: db::StateMerkleized<E, H, EightCap, S>,
     pub(super) transactions: db::TransactionMerkleized<E, H, S>,
     pub(super) state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
@@ -44,19 +42,18 @@ where
     pub(super) timings: Timings,
 }
 
-enum LoadedState<P> {
+enum LoadedState {
     Unique(Vec<Account>),
-    Shared(State<P>),
+    Shared(State),
 }
 
-impl<E, H, P, S> BlockExecution<E, H, P, S>
+impl<E, H, S> BlockExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
-    pub(super) fn into_merkleized(self) -> db::MerkleizedDatabases<E, H, P, S> {
+    pub(super) fn into_merkleized(self) -> db::MerkleizedDatabases<E, H, S> {
         (self.state, self.transactions)
     }
 }
@@ -86,12 +83,12 @@ impl Timings {
 }
 
 pub(super) async fn execute_proposal<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
+    state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
-    input: executor::ProposalInput<P, H>,
-    candidate_transfers: &[PreparedTransfer<P, H>],
-) -> ProposalExecution<E, H, P, S>
+    input: executor::ProposalInput<H>,
+    candidate_transfers: &[PreparedTransfer<H>],
+) -> ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -128,11 +125,11 @@ where
 }
 
 pub(super) async fn execute_body<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
+    state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
-    body: PreparedBody<P, H>,
-) -> Result<BlockExecution<E, H, P, S>>
+    body: PreparedBody<H>,
+) -> Result<BlockExecution<E, H, S>>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -173,15 +170,14 @@ where
     .await)
 }
 
-pub(super) async fn apply_prepared_body<E, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
+pub(super) async fn apply_prepared_body<E, H, S>(
+    state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
-    transfers: &[PreparedTransfer<P, H>],
-) -> Result<db::MerkleizedDatabases<E, H, P, S>>
+    transfers: &[PreparedTransfer<H>],
+) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
     E: Storage + Clock + Metrics,
-    P: PublicKey,
     H: Hasher,
     S: Strategy,
 {
@@ -201,7 +197,7 @@ where
 
 pub(super) fn commitments_match<E, C, P, H, S>(
     header: &Header<C, H::Digest, P>,
-    execution: &BlockExecution<E, H, P, S>,
+    execution: &BlockExecution<E, H, S>,
 ) -> bool
 where
     E: Storage + Clock + Metrics,
@@ -230,14 +226,13 @@ where
     true
 }
 
-async fn load_state<E, H, P, S>(
-    batch: &StateBatch<E, H, P, EightCap, S>,
-    transfers: &[PreparedTransfer<P, H>],
-) -> core::result::Result<State<P>, commonware_storage::qmdb::Error<mmr::Family>>
+async fn load_state<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    transfers: &[PreparedTransfer<H>],
+) -> core::result::Result<State, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
     if transfers.is_empty() {
@@ -253,14 +248,13 @@ where
     load_accounts(batch, account_keys.into_iter().collect()).await
 }
 
-async fn load_execution_state<E, H, P, S>(
-    batch: &StateBatch<E, H, P, EightCap, S>,
-    transfers: &[PreparedTransfer<P, H>],
-) -> core::result::Result<LoadedState<P>, commonware_storage::qmdb::Error<mmr::Family>>
+async fn load_execution_state<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    transfers: &[PreparedTransfer<H>],
+) -> core::result::Result<LoadedState, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
     if transfers.is_empty() {
@@ -290,14 +284,13 @@ where
         .map(LoadedState::Shared)
 }
 
-async fn load_accounts<E, H, P, S>(
-    batch: &StateBatch<E, H, P, EightCap, S>,
-    account_keys: Vec<AccountKey<P>>,
-) -> core::result::Result<State<P>, commonware_storage::qmdb::Error<mmr::Family>>
+async fn load_accounts<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    account_keys: Vec<AccountKey>,
+) -> core::result::Result<State, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
-    P: PublicKey,
     S: Strategy,
 {
     if account_keys.is_empty() {
@@ -313,13 +306,12 @@ where
         .collect())
 }
 
-fn execute_loaded<P, H>(
-    state: &LoadedState<P>,
-    transfers: &[PreparedTransfer<P, H>],
-) -> Option<executor::Changeset<P>>
+fn execute_loaded<H>(
+    state: &LoadedState,
+    transfers: &[PreparedTransfer<H>],
+) -> Option<executor::Changeset>
 where
     H: Hasher,
-    P: PublicKey,
 {
     match state {
         LoadedState::Unique(accounts) => executor::execute_unique(transfers, accounts),
@@ -328,13 +320,13 @@ where
 }
 
 async fn finalize_child<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, P, EightCap, S>,
+    state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     transaction_count: usize,
     timings: Timings,
     expect_message: &'static str,
-) -> BlockExecution<E, H, P, S>
+) -> BlockExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -369,10 +361,9 @@ where
     non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
 }
 
-fn transfer_digests<P, H>(transfers: &[PreparedTransfer<P, H>]) -> Vec<H::Digest>
+fn transfer_digests<H>(transfers: &[PreparedTransfer<H>]) -> Vec<H::Digest>
 where
     H: Hasher,
-    P: PublicKey,
 {
     transfers.iter().map(|transfer| transfer.digest).collect()
 }

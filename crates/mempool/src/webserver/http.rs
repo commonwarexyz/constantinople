@@ -12,11 +12,12 @@ use axum::{
     routing::{get, post},
 };
 use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg, types::lazy::Lazy};
-use commonware_cryptography::{BatchVerifier, Digest, Hasher, PublicKey};
+use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, SignedTransaction, VerifiedTransaction, verify_transaction_chunks,
+    Account, SignedTransaction, TransactionPublicKey, TransactionSignature, VerifiedTransaction,
+    verify_transaction_chunks,
 };
 use rand_core::OsRng;
 use std::{fmt::Display, sync::Arc};
@@ -48,22 +49,18 @@ where
     pub max_batch_bytes: usize,
     pub signature_strategy: SigSt,
     pub hash_strategy: HashSt,
-    pub account_reader: AccountReaderCell<P>,
+    pub account_reader: AccountReaderCell,
 }
 
 type SharedState<C, P, H, SigSt, HashSt> = Arc<AppState<C, P, H, SigSt, HashSt>>;
 
 /// Builds the axum [`Router`] for the mempool HTTP API.
-pub(super) fn router<C, P, H, BV, SigSt, HashSt>(
-    state: SharedState<C, P, H, SigSt, HashSt>,
-) -> Router
+pub(super) fn router<C, P, H, SigSt, HashSt>(state: SharedState<C, P, H, SigSt, HashSt>) -> Router
 where
     C: Digest + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Display + Send + Sync,
-    P::Signature: Send + Sync,
-    BV: BatchVerifier<PublicKey = P> + Send + Sync + 'static,
     SigSt: Strategy + Send + Sync + 'static,
     HashSt: Strategy + Send + Sync + 'static,
 {
@@ -76,11 +73,11 @@ where
     Router::new()
         .route(
             "/transactions",
-            post(submit_batch::<C, P, H, BV, SigSt, HashSt>),
+            post(submit_batch::<C, P, H, SigSt, HashSt>),
         )
         .route(
             "/transactions/ingest",
-            post(ingest_batch::<C, P, H, BV, SigSt, HashSt>),
+            post(ingest_batch::<C, P, H, SigSt, HashSt>),
         )
         .route(
             "/transactions/{batch_id}",
@@ -103,19 +100,17 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
-const fn min_signed_transaction_bytes<P>() -> usize
-where
-    P: PublicKey,
-{
-    P::SIZE + P::SIZE + MIN_U64_VARINT_BYTES + MIN_U64_VARINT_BYTES + P::Signature::SIZE
+const fn min_signed_transaction_bytes() -> usize {
+    TransactionPublicKey::SIZE
+        + TransactionPublicKey::SIZE
+        + MIN_U64_VARINT_BYTES
+        + MIN_U64_VARINT_BYTES
+        + TransactionSignature::SIZE
 }
 
-fn max_transaction_count<P>(body_len: usize) -> Option<usize>
-where
-    P: PublicKey,
-{
+fn max_transaction_count(body_len: usize) -> Option<usize> {
     let payload_len = body_len.saturating_sub(MIN_BATCH_LENGTH_PREFIX_BYTES);
-    let max_transactions = payload_len / min_signed_transaction_bytes::<P>();
+    let max_transactions = payload_len / min_signed_transaction_bytes();
     (max_transactions > 0).then_some(max_transactions)
 }
 
@@ -132,7 +127,7 @@ where
 ///   or any signature is invalid.
 /// - `413 Payload Too Large` if the batch exceeds `max_propose_bytes`.
 /// - `503 Service Unavailable` if the pool is full.
-async fn submit_batch<C, P, H, BV, SigSt, HashSt>(
+async fn submit_batch<C, P, H, SigSt, HashSt>(
     State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
     body: Bytes,
 ) -> (StatusCode, String)
@@ -140,12 +135,11 @@ where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    BV: BatchVerifier<PublicKey = P> + Send + 'static,
     SigSt: Strategy,
     HashSt: Strategy,
 {
     let batch_id = H::hash(&body).to_string();
-    let batch = match verify_body::<P, H, BV, _, _>(&state, body).await {
+    let batch = match verify_body::<P, H, _, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
@@ -176,7 +170,7 @@ where
 /// This endpoint is intended for relayers. It uses the same body format and
 /// validation path as [`submit_batch`], but returns as soon as the actor has
 /// accepted the batch for proposal.
-async fn ingest_batch<C, P, H, BV, SigSt, HashSt>(
+async fn ingest_batch<C, P, H, SigSt, HashSt>(
     State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
     body: Bytes,
 ) -> (StatusCode, String)
@@ -184,12 +178,11 @@ where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    BV: BatchVerifier<PublicKey = P> + Send + 'static,
     SigSt: Strategy,
     HashSt: Strategy,
 {
     let batch_id = H::hash(&body).to_string();
-    let batch = match verify_body::<P, H, BV, _, _>(&state, body).await {
+    let batch = match verify_body::<P, H, _, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
@@ -217,24 +210,22 @@ where
     )
 }
 
-struct VerifiedBatch<P, H>
+struct VerifiedBatch<H>
 where
-    P: PublicKey,
     H: Hasher,
 {
-    transactions: Vec<VerifiedTransaction<P, H>>,
+    transactions: Vec<VerifiedTransaction<H>>,
     digests: Vec<H::Digest>,
     total_bytes: usize,
 }
 
-async fn verify_body<P, H, BV, SigSt, HashSt>(
+async fn verify_body<P, H, SigSt, HashSt>(
     state: &AppState<impl Digest, P, H, SigSt, HashSt>,
     body: Bytes,
-) -> Result<VerifiedBatch<P, H>, StatusCode>
+) -> Result<VerifiedBatch<H>, StatusCode>
 where
     P: PublicKey,
     H: Hasher,
-    BV: BatchVerifier<PublicKey = P> + Send + 'static,
     SigSt: Strategy,
     HashSt: Strategy,
 {
@@ -242,11 +233,11 @@ where
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let Some(max_transactions) = max_transaction_count::<P>(body.len()) else {
+    let Some(max_transactions) = max_transaction_count(body.len()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
     let cfg = (RangeCfg::new(1..=max_transactions), ());
-    let signed = Vec::<SignedTransaction<P, H>>::decode_cfg(body.as_ref(), &cfg)
+    let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
 
@@ -259,7 +250,7 @@ where
     let namespace = state.namespace;
     let signed_lazy = signed.into_iter().map(Lazy::new).collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<P, H, BV, _, _>(
+        verify_transaction_chunks::<H, _, _>(
             &signature_strategy,
             &hash_strategy,
             namespace,
@@ -359,10 +350,10 @@ where
     let Some(bytes) = from_hex(&public_key) else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
-    if bytes.len() != P::SIZE {
+    if bytes.len() != TransactionPublicKey::SIZE {
         return (StatusCode::BAD_REQUEST, String::new());
     }
-    let public_key = match P::decode(bytes.as_slice()) {
+    let public_key = match TransactionPublicKey::decode(bytes.as_slice()) {
         Ok(public_key) => public_key,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
     };

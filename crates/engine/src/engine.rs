@@ -262,7 +262,7 @@ where
 
     /// Returns the state database once the stateful actor has initialized it.
     /// Blocks until the database is ready.
-    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, C::PublicKey, HashT> {
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, HashT> {
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
@@ -274,8 +274,7 @@ where
     /// with [`start`](Self::start) (which consumes the engine).
     pub fn subscribe_databases_detached(
         &self,
-    ) -> impl std::future::Future<Output = StateSyncDb<E, H, C::PublicKey, HashT>> + Send + 'static
-    {
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H, HashT>> + Send + 'static {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
     }
@@ -396,7 +395,7 @@ where
                     SimplexFloor::Finalized(finalization),
                 )
             } else {
-                let genesis_state_db = StateDb::<E, H, C::PublicKey, HashT>::init(
+                let genesis_state_db = StateDb::<E, H, HashT>::init(
                     context.child("genesis_state"),
                     state_db_config(
                         &config.partition_prefix,
@@ -407,10 +406,7 @@ where
                 .await
                 .expect("state db must initialize for genesis target");
                 let genesis_state_target =
-                    <StateDb<E, H, C::PublicKey, HashT> as ManagedDb<E>>::sync_target(
-                        &genesis_state_db,
-                    )
-                    .await;
+                    <StateDb<E, H, HashT> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
                 let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
                     context.child("genesis_transactions"),
                     transaction_db_config.clone(),

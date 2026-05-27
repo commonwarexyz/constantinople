@@ -27,7 +27,7 @@ use exoware_qmdb::{
 };
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
-use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, marker::PhantomData, num::NonZeroU64, sync::Arc, time::Duration};
 use tokio::{
     sync::{Mutex, Semaphore, mpsc},
     task::JoinHandle,
@@ -43,11 +43,11 @@ pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u16 = 0x9;
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
 type StateEncoding = FixedEncoding<AccountValue>;
-type LocalStateOperation<P> = UnorderedOperation<QmdbFamily, AccountKey<P>, FixedEncoding<Account>>;
-type StateOperation<P> = UnorderedOperation<QmdbFamily, AccountKey<P>, StateEncoding>;
+type LocalStateOperation = UnorderedOperation<QmdbFamily, AccountKey, FixedEncoding<Account>>;
+type StateOperation = UnorderedOperation<QmdbFamily, AccountKey, StateEncoding>;
 type TransactionEncoding<H> = FixedEncoding<<H as Hasher>::Digest>;
 type TransactionOperation<H> = keyless::Operation<QmdbFamily, TransactionEncoding<H>>;
-type StateWriter<H, P> = UnorderedWriter<QmdbFamily, H, AccountKey<P>, AccountValue, StateEncoding>;
+type StateWriter<H> = UnorderedWriter<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>;
 type TransactionWriter<H> =
     KeylessWriter<QmdbFamily, H, <H as Hasher>::Digest, TransactionEncoding<H>>;
 
@@ -87,19 +87,19 @@ where
 {
     state_next_location: Mutex<u64>,
     transaction_next_location: Mutex<u64>,
-    prepare_tx: mpsc::Sender<PendingQmdbUpload<H, P>>,
+    prepare_tx: mpsc::Sender<PendingQmdbUpload<H>>,
     _prepare_join: JoinHandle<()>,
     _commit_join: JoinHandle<()>,
+    _marker: PhantomData<P>,
 }
 
-struct PendingQmdbUpload<H, P>
+struct PendingQmdbUpload<H>
 where
     H: Hasher,
-    P: PublicKey,
 {
     height: u64,
     block_rows: IndexedBlockRows,
-    state_delta: Vec<StateOperation<P>>,
+    state_delta: Vec<StateOperation>,
     account_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
     transaction_ops: Vec<TransactionOperation<H>>,
 }
@@ -159,6 +159,7 @@ where
             prepare_tx,
             _prepare_join: prepare_join,
             _commit_join: commit_join,
+            _marker: PhantomData,
         })
     }
 
@@ -166,12 +167,11 @@ where
     pub async fn upload_finalized<E, S>(
         &self,
         block: &EngineBlock<H, P>,
-        databases: &Databases<E, H, P, commonware_storage::translator::EightCap, S>,
+        databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
     ) -> Result<(), PublishError>
     where
         E: Storage + Clock + Metrics,
         S: Strategy + Send + Sync + 'static,
-        AccountKey<P>: Send + Sync,
     {
         let block_rows = encode_indexed_block_rows(block);
         let state = self.build_state_upload::<E, S>(block, &databases.0).await?;
@@ -194,12 +194,11 @@ where
     async fn build_state_upload<E, S>(
         &self,
         block: &EngineBlock<H, P>,
-        state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
-    ) -> Result<PendingStateUpload<P>, PublishError>
+        state_db: &StateDatabase<E, H, commonware_storage::translator::EightCap, S>,
+    ) -> Result<PendingStateUpload, PublishError>
     where
         E: Storage + Clock + Metrics,
         S: Strategy + Send + Sync + 'static,
-        AccountKey<P>: Send + Sync,
     {
         let mut next = self.state_next_location.lock().await;
         let pending = build_state_upload::<E, H, P, S>(*next, block, state_db).await?;
@@ -218,16 +217,15 @@ where
     }
 }
 
-async fn run_qmdb_preparer<H, P>(
-    state_writer: Arc<StateWriter<H, P>>,
+async fn run_qmdb_preparer<H>(
+    state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
-    mut rx: mpsc::Receiver<PendingQmdbUpload<H, P>>,
+    mut rx: mpsc::Receiver<PendingQmdbUpload<H>>,
     commit_tx: mpsc::Sender<PreparedQmdbUpload>,
     prepare_limit: Arc<Semaphore>,
 ) where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
 {
     let (done_tx, mut done_rx) = mpsc::channel(prepare_limit.available_permits().max(1));
     let mut completed = BTreeMap::new();
@@ -299,15 +297,14 @@ async fn run_qmdb_preparer<H, P>(
     debug!("indexer qmd preparer task exiting: channel closed");
 }
 
-async fn prepare_qmdb_upload<H, P>(
-    state_writer: Arc<StateWriter<H, P>>,
+async fn prepare_qmdb_upload<H>(
+    state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
-    upload: PendingQmdbUpload<H, P>,
+    upload: PendingQmdbUpload<H>,
 ) -> Result<PreparedQmdbUpload, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
 {
     let height = upload.height;
     let IndexedBlockRows { raw, sql } = upload.block_rows;
@@ -326,16 +323,15 @@ where
     })
 }
 
-async fn run_qmdb_committer<H, P>(
+async fn run_qmdb_committer<H>(
     commit_client: StoreClient,
     mut sql_writer: BatchWriter,
-    state_writer: Arc<StateWriter<H, P>>,
+    state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     mut rx: mpsc::Receiver<PreparedQmdbUpload>,
 ) where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
 {
     while let Some(first) = rx.recv().await {
         let mut uploads = vec![first];
@@ -406,15 +402,14 @@ async fn run_qmdb_committer<H, P>(
     debug!("indexer qmd committer task exiting: channel closed");
 }
 
-async fn flush_qmdb_watermarks<H, P>(
+async fn flush_qmdb_watermarks<H>(
     commit_client: &StoreClient,
-    state_writer: &StateWriter<H, P>,
+    state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
 ) -> Option<u64>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
-    P: PublicKey + Send + Sync + 'static,
 {
     let state = state_writer
         .prepare_flush()
@@ -512,7 +507,7 @@ where
     P: PublicKey + Send + Sync + 'static,
 {
     let reader =
-        UnorderedClient::<QmdbFamily, H, AccountKey<P>, AccountValue, StateEncoding>::from_client(
+        UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::from_client(
             client,
             (),
             ((), ()),
@@ -583,11 +578,8 @@ where
     Ok(WriterState::from_checkpoint::<H>(&checkpoint)?)
 }
 
-struct PendingStateUpload<P>
-where
-    P: PublicKey,
-{
-    delta: Vec<StateOperation<P>>,
+struct PendingStateUpload {
+    delta: Vec<StateOperation>,
     account_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
     next_location: u64,
 }
@@ -603,8 +595,8 @@ where
 async fn build_state_upload<E, H, P, S>(
     writer_next: u64,
     block: &EngineBlock<H, P>,
-    state_db: &StateDatabase<E, H, P, commonware_storage::translator::EightCap, S>,
-) -> Result<PendingStateUpload<P>, PublishError>
+    state_db: &StateDatabase<E, H, commonware_storage::translator::EightCap, S>,
+) -> Result<PendingStateUpload, PublishError>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -635,13 +627,10 @@ where
     })
 }
 
-fn account_rows<P>(
-    delta: &[StateOperation<P>],
+fn account_rows(
+    delta: &[StateOperation],
     start_location: u64,
-) -> Vec<(exoware_sdk::keys::Key, bytes::Bytes)>
-where
-    P: PublicKey,
-{
+) -> Vec<(exoware_sdk::keys::Key, bytes::Bytes)> {
     let mut rows = Vec::new();
     for (offset, operation) in delta.iter().enumerate() {
         let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
@@ -667,7 +656,7 @@ async fn load_state_ops<E, H, P, S>(
     state: &commonware_storage::qmdb::any::unordered::fixed::Db<
         QmdbFamily,
         E,
-        AccountKey<P>,
+        AccountKey,
         Account,
         H,
         commonware_storage::translator::EightCap,
@@ -675,7 +664,7 @@ async fn load_state_ops<E, H, P, S>(
     >,
     start: u64,
     end: u64,
-) -> Result<Vec<StateOperation<P>>, PublishError>
+) -> Result<Vec<StateOperation>, PublishError>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -696,10 +685,7 @@ where
         .collect())
 }
 
-fn encode_account_operation<P>(operation: LocalStateOperation<P>) -> StateOperation<P>
-where
-    P: PublicKey,
-{
+fn encode_account_operation(operation: LocalStateOperation) -> StateOperation {
     match operation {
         AnyOperation::Delete(key) => AnyOperation::Delete(key),
         AnyOperation::Update(UnorderedUpdate(key, account)) => {
