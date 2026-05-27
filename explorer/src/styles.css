@@ -75,17 +75,19 @@ body {
 }
 
 html {
-    min-height: 100%;
+    height: 100%;
+    overflow: hidden;
 }
 
 body {
-    min-height: 100vh;
-    min-height: 100dvh;
+    height: 100vh;
+    height: 100dvh;
+    overflow: hidden;
 }
 
 #root {
-    min-height: 100vh;
-    min-height: 100dvh;
+    height: 100%;
+    min-height: 0;
     display: flex;
     flex-direction: column;
 }
@@ -95,6 +97,7 @@ body {
     flex-direction: column;
     flex: 1 1 auto;
     min-height: 0;
+    height: 100%;
 }
 
 .app__container {
@@ -104,6 +107,7 @@ body {
     flex-direction: column;
     flex: 1 1 auto;
     min-height: 0;
+    height: 100%;
 }
 
 .app__header {
@@ -148,6 +152,39 @@ body {
 .app__live-symbol {
     display: inline-block;
     width: 1ch;
+    animation: live-symbol-pulse 1.1s steps(1, end) infinite;
+}
+
+.app__live-symbol:nth-child(2) {
+    animation-delay: 50ms;
+}
+
+.app__live-symbol:nth-child(3) {
+    animation-delay: 100ms;
+}
+
+.app__live-symbol:nth-child(5) {
+    animation-delay: 150ms;
+}
+
+.app__live-symbol:nth-child(6) {
+    animation-delay: 200ms;
+}
+
+.app__live-symbol:nth-child(7) {
+    animation-delay: 250ms;
+}
+
+@keyframes live-symbol-pulse {
+    0%,
+    10% {
+        opacity: 0;
+    }
+
+    11%,
+    100% {
+        opacity: 1;
+    }
 }
 
 .visually-hidden {
@@ -322,11 +359,11 @@ body {
 }
 
 .app__main--minimal {
-    height: 100%;
+    flex: 1 1 auto;
     display: flex;
     flex-direction: column;
     align-items: center;
-    padding: clamp(0.75rem, 2vh, 2rem) clamp(1.25rem, 4vw, 5rem);
+    padding: 0 clamp(1.25rem, 4vw, 5rem) clamp(0.75rem, 2vh, 2rem);
     overflow: hidden;
 }
 
@@ -351,7 +388,7 @@ body {
 .histogram {
     width: max-content;
     max-width: 100%;
-    height: clamp(225px, 30vh, 450px);
+    height: clamp(90px, 13.5vh, 165px);
     margin: 0;
     display: flex;
     flex-direction: column;
@@ -381,23 +418,30 @@ body {
 }
 
 .observed-stats {
-    width: min(54rem, 100%);
+    width: 100%;
+    margin: 0;
     justify-self: center;
     display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
-    align-items: end;
-    gap: 0.35rem;
-    text-align: center;
+    grid-template-columns: repeat(5, minmax(0, 1fr));
+    align-items: start;
+    gap: 1px;
+    padding: 0;
+    background: var(--theme-border);
+    border: 1px solid var(--theme-border);
 }
 
 .observed-stat {
     min-width: 0;
+    margin: 0;
+    padding: 0.8ch 1ch;
+    background: var(--theme-background);
 }
 
 .observed-stat__value {
     color: var(--theme-text);
-    font-size: 6rem;
-    line-height: 0.9;
+    margin: 0.3ch 0 0;
+    font-size: clamp(1rem, 1.3vw, 1.2rem);
+    line-height: 1.1;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -407,6 +451,8 @@ body {
     color: var(--theme-text-dim);
     text-transform: uppercase;
     letter-spacing: 0.06em;
+    font-size: 0.75em;
+    line-height: 1.2;
 }
 
 .wallet,
@@ -714,6 +760,7 @@ body {
     flex: 1 1 auto;
     min-height: 0;
     overflow: auto;
+    padding-top: clamp(0.75rem, 2vh, 2rem);
 }
 
 .account-page__title,
@@ -832,18 +879,36 @@ body {
 .block-log {
     flex: 1 1 auto;
     min-height: 0;
-    overflow: hidden;
+    overflow: auto;
     width: min(1180px, 100%);
+    --block-log-columns:
+        minmax(7ch, 0.55fr) minmax(18ch, 1.5fr) minmax(8ch, 0.65fr)
+        minmax(18ch, 1fr);
 }
 
-.block-log__title {
+.block-log__header {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: grid;
+    grid-template-columns: var(--block-log-columns);
+    gap: 1.5ch;
+    background: var(--theme-background);
     color: var(--theme-text-dim);
     text-transform: uppercase;
     letter-spacing: 0.06em;
     font-size: 0.85em;
-    padding-bottom: 0.5ch;
+    padding: 0.6ch 0;
     border-bottom: 1px solid var(--theme-border);
-    margin-bottom: 0.25ch;
+}
+
+.block-log__header span:nth-child(3),
+.block-log__header span:nth-child(4) {
+    text-align: right;
+}
+
+.block-log__header span:nth-child(4) {
+    padding-right: 8px;
 }
 
 @keyframes block-row-in {
@@ -858,7 +923,8 @@ body {
 }
 
 .block-row {
-    display: flex;
+    display: grid;
+    grid-template-columns: var(--block-log-columns);
     align-items: center;
     gap: 1.5ch;
     padding: 0.7ch 0;
@@ -872,14 +938,14 @@ body {
 }
 
 .block-row__height {
-    color: var(--theme-accent);
-    flex-shrink: 0;
-    min-width: 9ch;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-.block-row__digest {
+.block-row__hash {
     color: var(--theme-text-dim);
-    flex: 1 1 auto;
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -888,15 +954,18 @@ body {
 
 .block-row__txcount {
     color: var(--theme-text);
-    flex-shrink: 0;
     text-align: right;
-    min-width: 7ch;
+    min-width: 0;
 }
 
 .block-row__time {
     color: var(--theme-text-dim);
-    flex-shrink: 0;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
+    text-align: right;
+    padding-right: 8px;
 }
 
 @media (max-width: 760px) {
@@ -962,15 +1031,21 @@ body {
     .observed-stats {
         flex: 0 0 auto;
         width: 100%;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         align-content: center;
-        gap: 0.5rem 1rem;
-        padding: 0.75rem 1rem;
-        border-bottom: 1px solid var(--theme-border);
+        gap: 1px;
+        padding: 0;
         border-top: 1px solid var(--theme-border);
+        border-right: 0;
+        border-left: 0;
+    }
+
+    .observed-stat {
+        padding: 0.65ch 1rem;
     }
 
     .observed-stat__value {
-        font-size: clamp(1.25rem, 6vw, 2.25rem);
+        font-size: clamp(1rem, 5vw, 1.5rem);
     }
 
     /* Block log fills remaining space on mobile and scrolls */
@@ -1009,7 +1084,7 @@ body {
         flex-wrap: wrap;
     }
 
-    .block-log__title {
+    .block-log__header {
         position: sticky;
         top: 0;
         background: var(--theme-background);
@@ -1085,17 +1160,19 @@ body {
     }
 
     /* Block row slightly smaller on mobile */
+    .block-log {
+        --block-log-columns:
+            minmax(5ch, 0.5fr) minmax(12ch, 1.2fr) minmax(6ch, 0.7fr)
+            minmax(10ch, 1fr);
+    }
+
     .block-row {
         gap: 1ch;
         font-size: 0.9em;
     }
 
-    .block-row__height {
-        min-width: 7ch;
-    }
-
-    .block-row__txcount {
-        min-width: 5ch;
+    .block-log__header {
+        gap: 1ch;
     }
 }
 
@@ -1113,7 +1190,7 @@ body {
     }
 
     .observed-stat__value {
-        font-size: clamp(1rem, 5.5vw, 1.75rem);
+        font-size: 1rem;
     }
 }
 

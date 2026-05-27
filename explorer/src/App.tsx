@@ -43,7 +43,7 @@ import {
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
-const BLOCK_LOG_MAX = 10;
+const BLOCK_LOG_MAX = 80;
 const HISTOGRAM_MIN_COLUMNS = 48;
 const HISTOGRAM_INITIAL_COLUMNS = 120;
 const HISTOGRAM_HEIGHT = 18;
@@ -52,10 +52,8 @@ const HISTOGRAM_MIN_ROWS = 8;
 const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_STATUS_TEXT = '>>> live';
-const LIVE_STATUS_STAGGER_MS = 50;
-const LIVE_STATUS_BLANK_MS = 100;
-const LIVE_STATUS_PAUSE_MS = 550;
-const BLOCK_FLUSH_INTERVAL_MS = 50;
+const LIVE_STATUS_SYMBOLS = [...LIVE_STATUS_TEXT];
+const BLOCK_FLUSH_INTERVAL_MS = 250;
 
 type Status =
     | { kind: 'connecting' }
@@ -156,6 +154,7 @@ export default function App() {
     // independently of `blocks` so the rate keeps climbing when older entries
     // roll off the histogram buffer.
     const [totalTxObserved, setTotalTxObserved] = useState(0);
+    const [totalBlocksObserved, setTotalBlocksObserved] = useState(0);
     const [observedRateWindow, setObservedRateWindow] = useState<ObservedRateWindow>({
         firstBlockAt: null,
         latestBlockAt: null,
@@ -226,11 +225,12 @@ export default function App() {
                 (current) =>
                     current + flushed.reduce((total, block) => total + block.txCount, 0),
             );
+            setTotalBlocksObserved((current) => current + flushed.length);
             setObservedRateWindow((current) => ({
                 firstBlockAt: current.firstBlockAt ?? flushed[0].arrivedAt,
                 latestBlockAt: flushed[flushed.length - 1].arrivedAt,
             }));
-            setStatus({ kind: 'live' });
+            setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
         }, BLOCK_FLUSH_INTERVAL_MS);
     };
 
@@ -725,6 +725,7 @@ export default function App() {
                                 <ExplorerStats
                                     blocks={blocks}
                                     observedRateWindow={observedRateWindow}
+                                    totalBlocksObserved={totalBlocksObserved}
                                     totalTxObserved={totalTxObserved}
                                 />
                                 <BlockLog blocks={blocks} />
@@ -1657,54 +1658,6 @@ function useBrailleSpinner(active: boolean): string {
     return BRAILLE_SPINNER[index];
 }
 
-function useLiveStatusText(active: boolean): string[] {
-    const [symbols, setSymbols] = useState(() => [...LIVE_STATUS_TEXT]);
-
-    useEffect(() => {
-        if (!active) {
-            setSymbols([...LIVE_STATUS_TEXT]);
-            return;
-        }
-
-        const timeouts: number[] = [];
-        const pulseIndexes = [...LIVE_STATUS_TEXT]
-            .map((symbol, index) => (symbol === ' ' ? -1 : index))
-            .filter((index) => index >= 0);
-
-        const pulseSymbol = (index: number) => {
-            setSymbols((current) => current.map((symbol, symbolIndex) => (symbolIndex === index ? ' ' : symbol)));
-            timeouts.push(
-                window.setTimeout(() => {
-                    setSymbols((current) =>
-                        current.map((symbol, symbolIndex) =>
-                            symbolIndex === index ? LIVE_STATUS_TEXT[index] : symbol,
-                        ),
-                    );
-                }, LIVE_STATUS_BLANK_MS),
-            );
-        };
-
-        const animate = () => {
-            for (let groupIndex = 0; groupIndex < pulseIndexes.length; groupIndex++) {
-                const symbolIndex = pulseIndexes[groupIndex];
-                timeouts.push(window.setTimeout(() => pulseSymbol(symbolIndex), groupIndex * LIVE_STATUS_STAGGER_MS));
-            }
-
-            const totalTime = (pulseIndexes.length - 1) * LIVE_STATUS_STAGGER_MS + LIVE_STATUS_BLANK_MS;
-            timeouts.push(window.setTimeout(animate, totalTime + LIVE_STATUS_PAUSE_MS));
-        };
-
-        animate();
-        return () => {
-            for (const timeout of timeouts) {
-                window.clearTimeout(timeout);
-            }
-        };
-    }, [active]);
-
-    return symbols;
-}
-
 function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | null {
     if (typeof value !== 'object' || value === null) {
         return null;
@@ -1805,8 +1758,6 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
 }
 
 function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
-    const liveStatusText = useLiveStatusText(status.kind === 'live');
-
     if (status.kind === 'connecting') {
         return (
             <span className="app__status">
@@ -1828,7 +1779,7 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
     return (
         <span className="app__status live">
             <span className="app__live-text" aria-hidden="true">
-                {liveStatusText.map((symbol, index) => (
+                {LIVE_STATUS_SYMBOLS.map((symbol, index) => (
                     <span className="app__live-symbol" key={index}>
                         {symbol}
                     </span>
@@ -1841,38 +1792,70 @@ function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
 
 const ExplorerStats = memo(function ExplorerStats({
     blocks,
+    totalBlocksObserved,
     totalTxObserved,
     observedRateWindow,
 }: {
     blocks: ObservedBlock[];
+    totalBlocksObserved: number;
     totalTxObserved: number;
     observedRateWindow: ObservedRateWindow;
 }) {
-    const latestHeight = useMemo(() => formatLatestHeight(blocks), [blocks]);
+    const stats = useMemo(
+        () => buildExplorerStats(blocks, totalBlocksObserved, totalTxObserved),
+        [blocks, totalBlocksObserved, totalTxObserved],
+    );
     return (
-        <div className="observed-stats">
-            <div className="observed-stat">
-                <div className="observed-stat__value">{latestHeight}</div>
-                <div className="observed-stat__label">latest height</div>
-            </div>
-            <div className="observed-stat">
-                <div className="observed-stat__value">
-                    {formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
-                </div>
-                <div className="observed-stat__label">observed tx/sec</div>
-            </div>
-        </div>
+        <dl className="observed-stats" aria-label="explorer statistics">
+            <ExplorerStat label="latest height" value={stats.latestHeight} />
+            <ExplorerStat
+                label="observed tx/sec"
+                value={formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
+            />
+            <ExplorerStat label="total txs observed" value={stats.totalTxObserved} />
+            <ExplorerStat label="peak tx/block" value={stats.peakTxPerBlock} />
+            <ExplorerStat label="avg tx/block" value={stats.avgTxPerBlock} />
+        </dl>
     );
 });
 
-function formatLatestHeight(blocks: ObservedBlock[]): string {
+function ExplorerStat({ label, value }: { label: string; value: string }) {
+    return (
+        <div className="observed-stat">
+            <dt className="observed-stat__label">{label}</dt>
+            <dd className="observed-stat__value">{value}</dd>
+        </div>
+    );
+}
+
+function buildExplorerStats(
+    blocks: ObservedBlock[],
+    totalBlocksObserved: number,
+    totalTxObserved: number,
+): {
+    latestHeight: string;
+    totalTxObserved: string;
+    peakTxPerBlock: string;
+    avgTxPerBlock: string;
+} {
     let latest: bigint | null = null;
+    let peak = 0;
     for (const block of blocks) {
         if (latest === null || block.height > latest) {
             latest = block.height;
         }
+        if (block.txCount > peak) {
+            peak = block.txCount;
+        }
     }
-    return latest?.toString() ?? '—';
+
+    const avg = totalBlocksObserved === 0 ? 0 : totalTxObserved / totalBlocksObserved;
+    return {
+        latestHeight: latest?.toString() ?? '—',
+        totalTxObserved: totalTxObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
+        peakTxPerBlock: peak === 0 ? '—' : peak.toLocaleString(),
+        avgTxPerBlock: totalBlocksObserved === 0 ? '—' : Math.round(avg).toLocaleString(),
+    };
 }
 
 function formatObservedTxPerSecond(
@@ -1985,7 +1968,12 @@ const BlockLog = memo(function BlockLog({ blocks }: { blocks: ObservedBlock[] })
 
     return (
         <section className="block-log" aria-label="recent finalized blocks">
-            <div className="block-log__title">finalized blocks</div>
+            <div className="block-log__header" aria-hidden="true">
+                <span>height</span>
+                <span>block hash</span>
+                <span># txs</span>
+                <span>timestamp</span>
+            </div>
             <div className="block-log__list">
                 {recent.map((block) => (
                     <BlockLogRow key={block.height.toString()} block={block} formatter={formatter} />
@@ -2002,20 +1990,18 @@ const BlockLogRow = memo(function BlockLogRow({
     block: ObservedBlock;
     formatter: Intl.DateTimeFormat;
 }) {
-    const digestHex = useMemo(() => uint8ArrayToHex(block.digest), [block.digest]);
+    const hash = useMemo(() => bytesToHex(block.digest), [block.digest]);
     return (
         <div className="block-row">
-            <span className="block-row__height">#{block.height.toString()}</span>
-            <span className="block-row__digest" title={digestHex}>{shortHex(digestHex)}</span>
-            <span className="block-row__txcount">{block.txCount.toLocaleString()} tx</span>
+            <span className="block-row__height">{block.height.toString()}</span>
+            <span className="block-row__hash" title={hash}>
+                {shortHex(hash)}
+            </span>
+            <span className="block-row__txcount">{block.txCount.toLocaleString()}</span>
             <span className="block-row__time">{formatter.format(block.arrivedAt)}</span>
         </div>
     );
 });
-
-function uint8ArrayToHex(bytes: Uint8Array): string {
-    return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
-}
 
 const HISTOGRAM_PLACEHOLDER_STYLE: CSSProperties = { color: '#383838' };
 
