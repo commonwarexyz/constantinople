@@ -43,8 +43,8 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::task::JoinHandle;
-use tracing::info;
+use tokio::{sync::Mutex, task::JoinHandle};
+use tracing::{info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
@@ -59,6 +59,7 @@ const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
 /// out simply pass `simplex_observer: None`.
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
+type EngineQmdbPublisher = QmdbPublisher<Sha256, PublicKey>;
 
 #[derive(Clone)]
 enum SimplexObserver {
@@ -103,9 +104,50 @@ impl Reporter for BlockUpdateReporter {
 struct IndexerHandle {
     block_reporter: Option<BlockReporter<Sha256, PublicKey>>,
     cert_reporter: Option<EngineCertReporter>,
-    qmd_publisher: Option<Arc<QmdbPublisher<Sha256, PublicKey>>>,
+    qmd_publisher: Option<Arc<LazyQmdbPublisher>>,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
     _uploaders: Vec<JoinHandle<()>>,
+}
+
+/// Connects the QMDB publisher only when finalized data is ready to upload.
+struct LazyQmdbPublisher {
+    store_url: String,
+    buffer: usize,
+    publisher: Mutex<Option<Arc<EngineQmdbPublisher>>>,
+}
+
+impl LazyQmdbPublisher {
+    fn new(store_url: String, buffer: usize) -> Self {
+        Self {
+            store_url,
+            buffer,
+            publisher: Mutex::new(None),
+        }
+    }
+
+    async fn publisher(&self) -> Arc<EngineQmdbPublisher> {
+        loop {
+            if let Some(publisher) = self.publisher.lock().await.as_ref().cloned() {
+                return publisher;
+            }
+
+            match EngineQmdbPublisher::connect(&self.store_url, self.buffer).await {
+                Ok(publisher) => {
+                    let publisher = Arc::new(publisher);
+                    *self.publisher.lock().await = Some(publisher.clone());
+                    return publisher;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        chain_indexer_url = %self.store_url,
+                        "qmd publisher connection failed, retrying",
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
 }
 
 /// Build the indexer wiring iff the secondary validator opted in.
@@ -130,11 +172,10 @@ async fn maybe_build_indexer(
                 EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
             let cert_reporter = Some(cert_reporter);
             if cfg.qmdb_upload {
-                let qmd_publisher = Some(Arc::new(
-                    QmdbPublisher::connect(&cfg.chain_indexer_url, cfg.upload_buffer)
-                        .await
-                        .expect("failed to initialize qmd publisher"),
-                ));
+                let qmd_publisher = Some(Arc::new(LazyQmdbPublisher::new(
+                    cfg.chain_indexer_url,
+                    cfg.upload_buffer,
+                )));
                 Some(IndexerHandle {
                     block_reporter: None,
                     cert_reporter,
@@ -189,6 +230,8 @@ fn indexer_finalized_hook(
         Box::pin(async move {
             if let Some(publisher) = publisher {
                 publisher
+                    .publisher()
+                    .await
                     .upload_finalized(block, databases)
                     .await
                     .expect("finalized index upload failed");
@@ -530,7 +573,8 @@ const fn production_sync_config() -> SyncEngineConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::wait_for_critical_task_exit;
+    use super::{maybe_build_indexer, wait_for_critical_task_exit};
+    use crate::config::{IndexerConfig, IndexerMode};
     use std::{future::pending, time::Duration};
 
     #[tokio::test]
@@ -548,5 +592,25 @@ mod tests {
             result.is_err(),
             "completed setup work must not terminate the validator runtime",
         );
+    }
+
+    #[tokio::test]
+    async fn qmdb_indexer_does_not_block_secondary_startup_on_connect_failure() {
+        let indexer = IndexerConfig {
+            mode: IndexerMode::Full,
+            chain_indexer_url: "http://127.0.0.1:1".to_string(),
+            upload_buffer: 1,
+            qmdb_upload: true,
+        };
+
+        let handle = tokio::time::timeout(
+            Duration::from_millis(50),
+            maybe_build_indexer(false, Some(indexer)),
+        )
+        .await
+        .expect("qmd publisher connection should not block startup")
+        .expect("secondary should keep indexer wiring");
+
+        assert!(handle.qmd_publisher.is_some());
     }
 }
