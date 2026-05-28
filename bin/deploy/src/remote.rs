@@ -8,7 +8,7 @@ use crate::{
     STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
     ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
-    write_yaml_config,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -61,6 +61,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         let spammer_config = remote_spammer_config(args, remote, &material);
         write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), &spammer_config);
     }
+    write_simplex_verification_material(&output_dir, &material);
 
     let copied_dashboard = output_dir.join(DASHBOARD_FILE);
     fs::copy(&dashboard, &copied_dashboard).expect("failed to copy dashboard");

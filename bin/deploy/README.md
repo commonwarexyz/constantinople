@@ -357,6 +357,7 @@ The generated bundle now also includes:
 - `chain-indexer.yaml` — deployer config for the shared store instance.
 - `metadata-indexer.yaml` — deployer config for the metadata query/stream service.
 - `qmdb-indexer.yaml` — deployer config for the QMDB query facade.
+- `simplex-verification-material.hex` — explorer verification material derived from DKG output.
 - three extra deployer instances in `config.yaml`: `chain-indexer`, `metadata-indexer`, and
   `qmdb-indexer`.
 
@@ -403,6 +404,32 @@ Those aggregate targets now write:
 - `deploy/chain-indexer`
 - `deploy/metadata-indexer`
 - `deploy/qmdb-indexer`
+
+### Local Explorer Against Remote
+
+After the remote deployment has completed, run the explorer locally against the
+remote shared services:
+
+```sh
+TAG=$(yq -r '.tag' deploy/config.yaml)
+HOSTS=$HOME/.commonware_deployer/$TAG/hosts.yaml
+
+CHAIN_IP=$(yq -r '.hosts[] | select(.name=="chain-indexer") | .ip' "$HOSTS")
+SQL_IP=$(yq -r '.hosts[] | select(.name=="metadata-indexer") | .ip' "$HOSTS")
+QMDB_IP=$(yq -r '.hosts[] | select(.name=="qmdb-indexer") | .ip' "$HOSTS")
+
+RELAYER_NAME=$(for f in deploy/*.yaml; do yq -e '.relayer' "$f" >/dev/null 2>&1 && basename "$f" .yaml; done)
+RELAYER_IP=$(yq -r ".hosts[] | select(.name==\"$RELAYER_NAME\") | .ip" "$HOSTS")
+
+SIMPLEX_VERIFICATION_MATERIAL=$(tr -d '[:space:]' < deploy/simplex-verification-material.hex)
+
+VITE_SQL_URL=http://$SQL_IP:8091 \
+VITE_QMDB_URL=http://$QMDB_IP:8092 \
+VITE_STORE_URL=http://$CHAIN_IP:8090 \
+VITE_MEMPOOL_URL=http://$RELAYER_IP:8080 \
+VITE_SIMPLEX_VERIFICATION_MATERIAL=$SIMPLEX_VERIFICATION_MATERIAL \
+npm --prefix explorer run dev
+```
 
 ## Secondary Validators
 

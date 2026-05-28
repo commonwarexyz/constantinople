@@ -50,6 +50,7 @@ To build the shared indexer binaries for Graviton, run:
 ```sh
 just chain-indexer-graviton-binary
 just metadata-indexer-graviton-binary
+just qmdb-indexer-graviton-binary
 ```
 
 To build the shared indexer binaries for Intel, run:
@@ -57,6 +58,7 @@ To build the shared indexer binaries for Intel, run:
 ```sh
 just chain-indexer-intel-binary
 just metadata-indexer-intel-binary
+just qmdb-indexer-intel-binary
 ```
 
 `just graviton-binaries` and `just intel-binaries` build the full remote-deploy set:
@@ -69,6 +71,8 @@ just metadata-indexer-intel-binary
 * `deploy/chain-indexer-debug`
 * `deploy/metadata-indexer`
 * `deploy/metadata-indexer-debug`
+* `deploy/qmdb-indexer`
+* `deploy/qmdb-indexer-debug`
 
 #### Troubleshooting
 

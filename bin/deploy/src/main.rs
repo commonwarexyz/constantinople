@@ -4,18 +4,18 @@ mod local;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
-use commonware_codec::Encode;
+use commonware_codec::{Encode, Read as CodecRead};
 use commonware_cryptography::{
     Signer,
     bls12381::{
         dkg::feldman_desmedt as dkg,
-        primitives::{group::Share, variant::MinSig},
+        primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
     },
     ed25519,
 };
-use commonware_formatting::hex;
+use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
-use commonware_utils::{N3f1, TryCollect};
+use commonware_utils::{N3f1, NZU32, TryCollect};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -44,6 +44,7 @@ const METADATA_INDEXER_HOST: &str = "metadata-indexer";
 const QMDB_INDEXER_BINARY_FILE: &str = "qmdb-indexer";
 const QMDB_INDEXER_CONFIG_FILE: &str = "qmdb-indexer.yaml";
 const QMDB_INDEXER_HOST: &str = "qmdb-indexer";
+const SIMPLEX_VERIFICATION_MATERIAL_FILE: &str = "simplex-verification-material.hex";
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
@@ -67,7 +68,15 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Generate(GenerateArgs),
+    Generate(Box<GenerateArgs>),
+    SimplexVerificationMaterial(SimplexVerificationMaterialArgs),
+}
+
+#[derive(Debug, Args)]
+struct SimplexVerificationMaterialArgs {
+    /// Generated validator or secondary YAML containing `dkg_output`.
+    #[arg(long)]
+    config: PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -326,6 +335,12 @@ pub(crate) struct PeersConfig {
     pub secondaries: Vec<PeerEntry>,
 }
 
+#[derive(Debug, Deserialize)]
+struct SimplexMaterialConfig {
+    dkg_output: String,
+    num_validators: u32,
+}
+
 pub(crate) struct ClusterMaterial {
     pub signers: Vec<ed25519::PrivateKey>,
     pub public_keys: Vec<ed25519::PublicKey>,
@@ -350,6 +365,10 @@ impl ClusterMaterial {
             .map(|pk| hex(&pk.encode()))
             .collect()
     }
+
+    pub fn simplex_verification_material_hex(&self) -> String {
+        hex(&self.dkg_output.public().public().encode())
+    }
 }
 
 const fn usize_is_zero(value: &usize) -> bool {
@@ -369,6 +388,12 @@ fn main() {
             GenerateTarget::Local(local_args) => local::generate(args, local_args),
             GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
         },
+        Command::SimplexVerificationMaterial(args) => {
+            println!(
+                "{}",
+                simplex_verification_material_from_config(&args.config)
+            );
+        }
     }
 }
 
@@ -470,6 +495,27 @@ pub(crate) fn write_yaml_config<T: Serialize>(path: &Path, config: &T) {
     fs::write(path, raw).expect("failed to write config");
 }
 
+pub(crate) fn write_simplex_verification_material(output_dir: &Path, material: &ClusterMaterial) {
+    fs::write(
+        output_dir.join(SIMPLEX_VERIFICATION_MATERIAL_FILE),
+        material.simplex_verification_material_hex(),
+    )
+    .expect("failed to write simplex verification material");
+}
+
+fn simplex_verification_material_from_config(config_path: &Path) -> String {
+    let raw = fs::read_to_string(config_path).expect("failed to read validator config");
+    let config: SimplexMaterialConfig =
+        serde_yaml::from_str(&raw).expect("failed to parse validator config");
+    let bytes = from_hex(&config.dkg_output).expect("bad dkg_output hex");
+    let dkg_output = dkg::Output::<MinSig, ed25519::PublicKey>::read_cfg(
+        &mut &bytes[..],
+        &(NZU32!(config.num_validators), ModeVersion::v0()),
+    )
+    .expect("failed to decode dkg_output");
+    hex(&dkg_output.public().public().encode())
+}
+
 pub(crate) fn default_bootstrappers(
     public_keys: &[ed25519::PublicKey],
 ) -> Vec<NamedBootstrapperEntry> {
@@ -505,8 +551,19 @@ pub(crate) fn generate_deployer_tag() -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, GenerateTarget};
+    use super::{
+        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
+        generate_local_cluster_material, simplex_verification_material_from_config,
+        write_simplex_verification_material,
+    };
     use clap::Parser;
+    use commonware_codec::Encode;
+    use commonware_formatting::hex;
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn remote_parses_http_cidrs() {
@@ -535,7 +592,10 @@ mod tests {
         ])
         .expect("remote invocation should parse");
 
-        let Command::Generate(generate) = cli.command;
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
         let GenerateTarget::Remote(remote) = generate.target else {
             panic!("expected remote target");
         };
@@ -561,7 +621,10 @@ mod tests {
         ])
         .expect("local invocation should parse");
 
-        let Command::Generate(generate) = cli.command;
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
         assert_eq!(generate.spammer_accounts_jitter, 0.25);
     }
 
@@ -581,5 +644,55 @@ mod tests {
         .expect_err("jitter above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
+    }
+
+    #[test]
+    fn writes_simplex_verification_material() {
+        let material = generate_local_cluster_material(4, 1);
+        let output_dir = unique_temp_dir("simplex-verification-material");
+        fs::create_dir_all(&output_dir).expect("failed to create temp dir");
+
+        write_simplex_verification_material(&output_dir, &material);
+
+        let path = output_dir.join(SIMPLEX_VERIFICATION_MATERIAL_FILE);
+        let written = fs::read_to_string(&path).expect("failed to read material");
+        assert_eq!(written, material.simplex_verification_material_hex());
+
+        fs::remove_file(path).expect("failed to remove material");
+        fs::remove_dir(output_dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn extracts_simplex_verification_material_from_config() {
+        let material = generate_local_cluster_material(4, 1);
+        let output_dir = unique_temp_dir("extract-simplex-verification-material");
+        fs::create_dir_all(&output_dir).expect("failed to create temp dir");
+        let config_path = output_dir.join("validator.yaml");
+        fs::write(
+            &config_path,
+            format!(
+                "dkg_output: {}\nnum_validators: 4\n",
+                hex(&material.dkg_output.encode())
+            ),
+        )
+        .expect("failed to write config");
+
+        let extracted = simplex_verification_material_from_config(&config_path);
+
+        assert_eq!(extracted, material.simplex_verification_material_hex());
+
+        fs::remove_file(config_path).expect("failed to remove config");
+        fs::remove_dir(output_dir).expect("failed to remove temp dir");
+    }
+
+    fn unique_temp_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "constantinople-deploy-{name}-{}-{nanos}",
+            std::process::id()
+        ))
     }
 }

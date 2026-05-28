@@ -4,7 +4,8 @@ use crate::{
     METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
     QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, ValidatorConfig, absolute_path,
     default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -48,13 +49,14 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
         write_yaml_config(&secondary.config_file, &secondary.config);
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
+    write_simplex_verification_material(&output_dir, &material);
 
     print_local_run_commands(
         &output_dir,
         args,
         local,
         &material.primary_hex(),
-        &hex(&material.dkg_output.public().public().encode()),
+        &material.simplex_verification_material_hex(),
     );
 }
 
