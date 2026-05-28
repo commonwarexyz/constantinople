@@ -58,11 +58,9 @@ cargo run --bin constantinople-deploy -- generate \
   --base-http-port 8080
 ```
 
-The spammer waits 10 seconds for validators to start, then continuously submits ring transfers.
-Each validator receives transactions from its own independent set of accounts.
-
-By default, `--spammer` submits directly to primary validator mempool endpoints. Add `--relayer`
-as well if the spammer should submit through the transaction relayer instead.
+The spammer continuously submits ring transfers through the generated relayer.
+Each relayer submitter receives transactions from its own independent set of
+accounts.
 
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
@@ -81,21 +79,21 @@ You can also run the spammer manually against an existing local cluster:
 
 ```sh
 cargo run --release --bin constantinople-spammer -- \
-  --peers ./local/peers.yaml \
+  --relayer-url http://127.0.0.1:8084 \
+  --relayer-submitters 4 \
   --accounts 10 \
   --value 1 \
   --accounts-jitter 0.25
 ```
 
-### Local Deployment with Relayer
+### Local Transaction Relayer
 
-Add `--relayer` to include the transaction relayer in the generated local bundle:
+Every generated local bundle includes a transaction relayer secondary:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./local \
-  --relayer \
   local \
   --base-port 3000 \
   --base-http-port 8080
@@ -106,12 +104,10 @@ This adds one extra secondary validator with a `relayer` section and starts it w
 configured secondaries (`base_http_port + validators + secondaries`), follows consensus directly,
 and forwards normal user batches to the leaders of the next two views.
 
-When both `--spammer` and `--relayer` are set, the generated spammer command uses
-`--relayer-url` and `--relayer-submitters <validators>`, preserving the same number of independent
-nonce-ordered streams as direct mode. Each relayed submitter pins an exact primary validator target
-and requests single-leader routing, so concurrent streams feed different primaries without creating
-stale duplicate nonce copies. Without `--relayer`, the spammer uses `--peers` and submits directly
-to primary validators.
+When `--spammer` is set, the generated spammer command uses `--relayer-url`
+and `--relayer-submitters <validators>`. Each relayed submitter pins an exact
+primary validator target and requests single-leader routing, so concurrent
+streams feed different primaries without creating stale duplicate nonce copies.
 
 ### Local Deployment with Indexer + Explorer
 
@@ -165,8 +161,7 @@ artifacts through `VITE_STORE_URL`, verifies them with
 commitment names the decoded block, and only then uses the block's transaction
 root as the trusted root for the QMDB transaction proof.
 
-If `--relayer` is also enabled, the explorer command receives `VITE_MEMPOOL_URL` pointing at the
-local relayer. Otherwise it uses its default direct mempool URL.
+The explorer command receives `VITE_MEMPOOL_URL` pointing at the local relayer.
 
 End-to-end "spin everything up" with the spammer for live transaction flow:
 
@@ -262,13 +257,12 @@ cargo run --bin constantinople-deploy -- generate \
   --dashboard ./docker/dashboard.json
 ```
 
-This additionally writes `spammer.yaml` and adds a spammer instance to the deployer config.
-By default, the spammer targets primary validator HTTP endpoints discovered from `hosts.yaml`.
-Add `--relayer` to route the spammer through the relayer.
+This additionally writes `spammer.yaml` and adds a spammer instance to the
+deployer config. The spammer submits through the generated relayer.
 
-### Remote Deployment with Relayer
+### Remote Transaction Relayer
 
-Add `--relayer` to include a relayer secondary in the remote deployment:
+Every generated remote bundle includes a relayer secondary:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -276,7 +270,6 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
-  --relayer \
   remote \
   --http-cidr 0.0.0.0/0 \
   --regions us-east-1,us-west-2 \
@@ -289,15 +282,13 @@ cargo run --bin constantinople-deploy -- generate \
 
 This adds one extra secondary validator with a `relayer` section. The relayer listens on the
 configured HTTP port, follows consensus directly, and forwards normal user batches to the leaders
-of the next two views. It is optional; `--spammer` does not create a relayer unless `--relayer` is
-also set.
+of the next two views.
 
-When `--spammer --relayer` are used together, `spammer.yaml` includes
-`relayer_url` pointing at the relayer secondary and `relayer_submitters: <validators>`. With
-`--spammer --relayer`, each relayed submitter pins an exact primary validator target and requests
-single-leader routing, so concurrent streams feed different primaries without creating stale
-duplicate nonce copies. With `--spammer` alone, `relayer_url` is omitted and the spammer submits
-directly to primary validators.
+When `--spammer` is used, `spammer.yaml` includes `relayer_url` pointing at
+the relayer secondary and `relayer_submitters: <validators>`. Each relayed
+submitter pins an exact primary validator target and requests single-leader
+routing, so concurrent streams feed different primaries without creating stale
+duplicate nonce copies.
 
 Build both binaries before creating the deployment. For Graviton instances:
 
@@ -311,8 +302,8 @@ For Intel instances:
 just intel-binaries
 ```
 
-These targets write `deploy/validator`, `deploy/validator-debug`, `deploy/spammer`,
-`deploy/spammer-debug`, `deploy/relayer`, and `deploy/relayer-debug`.
+These targets write `deploy/validator`, `deploy/validator-debug`,
+`deploy/spammer`, and `deploy/spammer-debug`.
 
 Then create the deployment as usual:
 
@@ -409,7 +400,6 @@ Those aggregate targets now write:
 
 - `deploy/validator`
 - `deploy/spammer` when `--spammer` is enabled
-- `deploy/relayer` when `--relayer` is enabled
 - `deploy/chain-indexer`
 - `deploy/metadata-indexer`
 - `deploy/qmdb-indexer`
@@ -441,10 +431,11 @@ cargo run --bin constantinople-deploy -- generate \
   --base-http-port 8080
 ```
 
-This additionally writes `secondary-0.yaml`, `secondary-1.yaml`, ... alongside the primary
-`validator-*.yaml` files. `peers.yaml` gains a `secondaries:` block that every node consumes to
-populate the secondary peer set; the spammer ignores it and only sends transactions to primary
-validators.
+This additionally writes `secondary-0.yaml`, `secondary-1.yaml`, ... alongside
+the primary `validator-*.yaml` files. The generated relayer is an additional
+secondary after the requested secondary count. `peers.yaml` gains a
+`secondaries:` block that every node consumes to populate the secondary peer
+set.
 
 Run a secondary manually (same binary, same flags as a primary):
 
@@ -484,6 +475,6 @@ constantinople --config ./validator.yaml --hosts ./hosts.yaml
 The spammer follows the same pattern:
 
 ```sh
-constantinople-spammer --peers ./peers.yaml --accounts 10 --value 1
+constantinople-spammer --relayer-url http://127.0.0.1:8084 --accounts 10 --value 1
 constantinople-spammer --config ./spammer.yaml --hosts ./hosts.yaml
 ```

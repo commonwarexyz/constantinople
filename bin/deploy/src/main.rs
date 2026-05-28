@@ -94,9 +94,6 @@ pub(crate) struct GenerateArgs {
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
     spammer: bool,
-    /// Include a transaction relayer in the deployment.
-    #[arg(long, default_value_t = false)]
-    relayer: bool,
     /// Number of spam accounts per validator.
     #[arg(long, default_value_t = 10)]
     spammer_accounts: u32,
@@ -189,9 +186,8 @@ pub(crate) struct SpammerConfig {
     pub value: u64,
     pub seed_offset: u64,
     pub http_port: u16,
-    /// Relayer URL used for normal transaction submission.
-    #[serde(default)]
-    pub relayer_url: Option<String>,
+    /// Relayer URL used for transaction submission.
+    pub relayer_url: String,
     /// Independent nonce-ordered streams to run when submitting through a relayer.
     #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub relayer_submitters: usize,
@@ -278,7 +274,7 @@ pub(crate) struct ValidatorConfig {
     /// primaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     indexer: Option<IndexerConfig>,
-    /// Optional relayer wiring for the extra secondary created by `--relayer`.
+    /// Optional relayer wiring for the generated relayer secondary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     relayer: Option<RelayerConfig>,
 }
@@ -354,10 +350,6 @@ impl ClusterMaterial {
             .map(|pk| hex(&pk.encode()))
             .collect()
     }
-}
-
-pub(crate) const fn relayer_enabled(args: &GenerateArgs) -> bool {
-    args.relayer
 }
 
 const fn usize_is_zero(value: &usize) -> bool {

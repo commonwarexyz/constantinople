@@ -52,7 +52,6 @@ cargo run --bin constantinople-deploy -- generate \
   --secondaries 1 \
   --output-dir ./local \
   --spammer --spammer-accounts 4096 --spammer-accounts-jitter 0.1 \
-  --relayer \
   local
 ```
 

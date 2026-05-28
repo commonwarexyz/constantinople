@@ -4,7 +4,7 @@ use crate::{
     METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
     QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, ValidatorConfig, absolute_path,
     default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_local_cluster_material, relayer_enabled, write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -26,9 +26,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
 
-    let relayer_enabled = relayer_enabled(args);
-    let relayer_secondaries = args.secondaries + u32::from(relayer_enabled);
-    let material = generate_local_cluster_material(args.validators, relayer_secondaries);
+    let material = generate_local_cluster_material(args.validators, total_secondaries(args));
     let validators = build_validators(args, local, &output_dir, &material);
     let secondaries = build_secondaries(args, local, &output_dir, &material);
     let peers = PeersConfig {
@@ -136,7 +134,7 @@ fn build_secondaries(
     output_dir: &std::path::Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
-    let total_secondaries = args.secondaries + u32::from(relayer_enabled(args));
+    let total_secondaries = total_secondaries(args);
     let mut secondaries = Vec::with_capacity(total_secondaries as usize);
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
@@ -147,7 +145,7 @@ fn build_secondaries(
 
     for index in 0..total_secondaries {
         let secondary_index = index as usize;
-        let is_relayer = relayer_enabled(args) && index == args.secondaries;
+        let is_relayer = index == args.secondaries;
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
         let offset = primary_span
@@ -286,7 +284,7 @@ fn local_run_commands(
         })
         .collect();
 
-    let total_secondaries = args.secondaries + u32::from(relayer_enabled(args));
+    let total_secondaries = total_secondaries(args);
     for index in 0..total_secondaries {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
         commands.push(format!(
@@ -323,14 +321,10 @@ fn local_run_commands(
         // submitted-transaction proofs.
         // The defaults in `explorer/src/App.tsx` match these ports, but pass
         // both URLs explicitly so non-default deployer ports still work.
-        let relayer_env = if relayer_enabled(args) {
-            format!(
-                " VITE_MEMPOOL_URL=http://127.0.0.1:{}",
-                local.base_http_port + args.validators as u16 + args.secondaries as u16,
-            )
-        } else {
-            String::new()
-        };
+        let relayer_env = format!(
+            " VITE_MEMPOOL_URL=http://127.0.0.1:{}",
+            local.base_http_port + args.validators as u16 + args.secondaries as u16,
+        );
         commands.push(format!(
             "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev",
             local.metadata_indexer_port,
@@ -342,17 +336,13 @@ fn local_run_commands(
     }
 
     if args.spammer {
-        let network_source = if relayer_enabled(args) {
-            let targets = relayer_targets.join(",");
-            format!(
-                "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
-                local.base_http_port + args.validators as u16 + args.secondaries as u16,
-                args.validators,
-                targets,
-            )
-        } else {
-            format!("--peers {}", peers_path.display())
-        };
+        let targets = relayer_targets.join(",");
+        let network_source = format!(
+            "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
+            local.base_http_port + args.validators as u16 + args.secondaries as u16,
+            args.validators,
+            targets,
+        );
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -368,6 +358,10 @@ fn local_run_commands(
     }
 
     commands
+}
+
+const fn total_secondaries(args: &GenerateArgs) -> u32 {
+    args.secondaries + 1
 }
 
 #[cfg(test)]
@@ -391,7 +385,6 @@ mod tests {
             rayon_threads: 2,
             startup: StartupModeConfig::MarshalSync,
             spammer,
-            relayer: false,
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
@@ -431,8 +424,9 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert_eq!(commands.len(), 2);
+        assert_eq!(commands.len(), 3);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
+        assert!(commands[2].contains("secondary-0.yaml"));
     }
 
     #[test]
@@ -446,19 +440,20 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert_eq!(commands.len(), 3);
-        assert!(commands[2].contains("constantinople-spammer"));
-        assert!(commands[2].contains("--peers /tmp/configs/peers.yaml"));
-        assert!(commands[2].contains("--accounts 10"));
-        assert!(commands[2].contains("--value 1"));
-        assert!(commands[2].contains("--seed-offset 1000"));
-        assert!(commands[2].contains("--accounts-jitter 0"));
+        assert_eq!(commands.len(), 4);
+        assert!(commands[2].contains("secondary-0.yaml"));
+        assert!(commands[3].contains("constantinople-spammer"));
+        assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
+        assert!(commands[3].contains("--relayer-submitters 2"));
+        assert!(commands[3].contains("--accounts 10"));
+        assert!(commands[3].contains("--value 1"));
+        assert!(commands[3].contains("--seed-offset 1000"));
+        assert!(commands[3].contains("--accounts-jitter 0"));
     }
 
     #[test]
-    fn local_run_commands_include_optional_relayer_when_enabled() {
-        let mut args = test_args(false);
-        args.relayer = true;
+    fn local_run_commands_include_relayer() {
+        let args = test_args(false);
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -473,9 +468,8 @@ mod tests {
     }
 
     #[test]
-    fn local_spammer_uses_relayer_when_both_are_enabled() {
-        let mut args = test_args(true);
-        args.relayer = true;
+    fn local_spammer_uses_relayer() {
+        let args = test_args(true);
         let targets = vec!["aa".to_string(), "bb".to_string()];
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
@@ -506,7 +500,7 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert!(commands[2].contains("--accounts-jitter 0.25"));
+        assert!(commands[3].contains("--accounts-jitter 0.25"));
     }
 
     #[test]
@@ -521,9 +515,10 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert_eq!(commands.len(), 8);
+        assert_eq!(commands.len(), 9);
         assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("secondary-1.yaml"));
+        assert!(commands[4].contains("secondary-2.yaml"));
     }
 
     #[test]
@@ -568,8 +563,8 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        // 2 validators + 1 secondary + 1 store + 1 sql + 1 qmd + 1 explorer = 7.
-        assert_eq!(commands.len(), 7);
+        // 2 validators + 1 indexer secondary + 1 relayer secondary + store/sql/qmdb + explorer.
+        assert_eq!(commands.len(), 8);
         let indexer_cmd = commands
             .iter()
             .find(|c| c.contains("--bin chain-indexer"))
@@ -675,7 +670,7 @@ mod tests {
         args.secondaries = 1;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
-        let material = generate_local_cluster_material(args.validators, args.secondaries);
+        let material = generate_local_cluster_material(args.validators, args.secondaries + 1);
         let validators = build_validators(
             &args,
             local_args(&args),
@@ -702,6 +697,10 @@ mod tests {
         assert!(indexer.qmdb_upload);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
+        assert!(
+            secondaries[1].config.relayer.is_some(),
+            "last secondary should run relayer"
+        );
     }
 
     #[test]

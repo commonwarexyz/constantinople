@@ -8,7 +8,7 @@ use crate::{
     STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
     ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
-    relayer_enabled, write_yaml_config,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -37,9 +37,7 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     ensure_output_dir_missing(&output_dir);
 
     let dashboard = absolute_path(&remote.dashboard);
-    let relayer_enabled = relayer_enabled(args);
-    let relayer_secondaries = args.secondaries + u32::from(relayer_enabled);
-    let material = generate_remote_cluster_material(args.validators, relayer_secondaries);
+    let material = generate_remote_cluster_material(args.validators, total_secondaries(args));
     let validators = build_validators(args, remote, &output_dir, &material);
     let secondaries = build_secondaries(args, remote, &output_dir, &material);
 
@@ -188,14 +186,14 @@ fn build_secondaries(
     output_dir: &Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
-    let total_secondaries = args.secondaries + u32::from(relayer_enabled(args));
+    let total_secondaries = total_secondaries(args);
     let mut secondaries = Vec::with_capacity(total_secondaries as usize);
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
     for index in 0..total_secondaries {
         let secondary_index = index as usize;
-        let is_relayer = relayer_enabled(args) && index == args.secondaries;
+        let is_relayer = index == args.secondaries;
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
 
@@ -268,19 +266,21 @@ fn remote_spammer_config(
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
         http_port: remote.http_port,
-        relayer_url: relayer_enabled(args).then(|| {
-            let relayer_index = args.secondaries as usize;
-            let public_key = &material.secondary_public_keys[relayer_index];
-            format!("http://{}:{}", hex(&public_key.encode()), remote.http_port)
-        }),
-        relayer_submitters: if relayer_enabled(args) {
-            args.validators as usize
-        } else {
-            0
-        },
+        relayer_url: relayer_url(args, remote, material),
+        relayer_submitters: args.validators as usize,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
     }
+}
+
+fn relayer_url(args: &GenerateArgs, remote: &RemoteArgs, material: &ClusterMaterial) -> String {
+    let relayer_index = args.secondaries as usize;
+    let public_key = &material.secondary_public_keys[relayer_index];
+    format!("http://{}:{}", hex(&public_key.encode()), remote.http_port)
+}
+
+const fn total_secondaries(args: &GenerateArgs) -> u32 {
+    args.secondaries + 1
 }
 
 const fn indexer_enabled(args: &GenerateArgs) -> bool {
@@ -477,7 +477,6 @@ mod tests {
             rayon_threads: 2,
             startup: StartupModeConfig::MarshalSync,
             spammer: false,
-            relayer: false,
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
@@ -572,9 +571,8 @@ mod tests {
     }
 
     #[test]
-    fn remote_deployer_config_runs_relayer_as_secondary_when_enabled() {
-        let mut args = generate_args();
-        args.relayer = true;
+    fn remote_deployer_config_runs_relayer_as_secondary() {
+        let args = generate_args();
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let material = generate_local_cluster_material(args.validators, args.secondaries + 1);
@@ -627,26 +625,17 @@ mod tests {
     }
 
     #[test]
-    fn remote_spammer_config_only_uses_relayer_when_enabled() {
+    fn remote_spammer_config_uses_relayer() {
         let mut args = generate_args();
         args.spammer = true;
         let remote = remote_args();
-        let direct_material = generate_local_cluster_material(args.validators, args.secondaries);
-
-        let direct = remote_spammer_config(&args, &remote, &direct_material);
-        args.relayer = true;
         let relayed_material =
             generate_local_cluster_material(args.validators, args.secondaries + 1);
         let relayed = remote_spammer_config(&args, &remote, &relayed_material);
         let relayer_key =
             hex(&relayed_material.secondary_public_keys[args.secondaries as usize].encode());
 
-        assert_eq!(direct.relayer_url, None);
-        assert_eq!(direct.relayer_submitters, 0);
-        assert_eq!(
-            relayed.relayer_url,
-            Some(format!("http://{relayer_key}:8080"))
-        );
+        assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
     }
 
@@ -703,7 +692,7 @@ mod tests {
         let mut args = generate_args();
         args.secondaries = 1;
         let remote = remote_args();
-        let material = generate_local_cluster_material(args.validators, args.secondaries);
+        let material = generate_local_cluster_material(args.validators, args.secondaries + 1);
 
         let secondaries = build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
 
@@ -715,6 +704,10 @@ mod tests {
         assert_eq!(indexer.mode, IndexerMode::Full);
         assert!(indexer.qmdb_upload);
         assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
+        assert!(
+            secondaries[1].config.relayer.is_some(),
+            "last secondary should run relayer"
+        );
     }
 
     #[test]

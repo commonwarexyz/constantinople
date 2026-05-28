@@ -1,7 +1,7 @@
 //! Constantinople spam bot binary.
 //!
 //! Generates deterministic accounts and submits ring-transfer transactions to
-//! validator mempool endpoints in a continuous loop.
+//! the relayer in a continuous loop.
 //!
 //! Each target gets its own independent set of accounts and runs a sequential
 //! submission loop: sign one batch, submit, wait for full finalization, then
@@ -26,7 +26,7 @@ use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
-use submitter::{RelayerSubmitter, Stats, ValidatorSubmitter};
+use submitter::{RelayerSubmitter, Stats};
 use tracing::info;
 
 fn main() {
@@ -37,7 +37,6 @@ fn main() {
         accounts_count,
         value,
         seed_offset,
-        http_port,
         relayer_url,
         relayer_submitters,
         primary_validators,
@@ -53,8 +52,7 @@ fn main() {
             cfg.accounts,
             cfg.value,
             cfg.seed_offset,
-            cfg.http_port,
-            cfg.relayer_url.or_else(|| cli.relayer_url.clone()),
+            config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
             relayer_submitters,
             if cfg.primary_validators.is_empty() {
                 cli.relayer_targets.clone()
@@ -68,8 +66,9 @@ fn main() {
             cli.accounts,
             cli.value,
             cli.seed_offset,
-            cli.http_port,
-            cli.relayer_url.clone(),
+            cli.relayer_url
+                .clone()
+                .expect("provide --relayer-url or --config"),
             cli.relayer_submitters.max(1),
             cli.relayer_targets.clone(),
             cli.accounts_jitter,
@@ -109,113 +108,16 @@ fn main() {
             .create_strategy(NZUsize!(cli.rayon_threads))
             .expect("failed to create parallel strategy");
 
-        if let Some(relayer_url) = relayer_url {
-            let config = RelayerModeConfig {
-                relayer_url,
-                accounts_count,
-                value,
-                seed_offset,
-                accounts_jitter,
-                relayer_submitters,
-                relayer_targets: primary_validators,
-            };
-            run_relayer_mode(config, strategy).await;
-            return;
-        }
-        assert!(
-            cli.peers.is_some() || cli.hosts.is_some(),
-            "provide --relayer-url, --peers, or --hosts"
-        );
-
-        // Discover validator endpoints for explicit legacy/debug mode.
-        let clients = if let Some(peers_path) = &cli.peers {
-            config::clients_from_peers(peers_path)
-        } else {
-            let hosts_path = cli.hosts.as_ref().expect("clap ensures --peers or --hosts");
-            let allowed: std::collections::HashSet<String> =
-                primary_validators.iter().cloned().collect();
-            config::clients_from_hosts(hosts_path, http_port, &allowed)
-        };
-        let num_validators = clients.len();
-        assert!(num_validators > 0, "no validator endpoints discovered");
-
-        // Generate a separate set of accounts per validator.
-        let accounts_per_validator: Vec<_> = (0..num_validators)
-            .map(|v| {
-                let offset = seed_offset + (v as u64) * u64::from(accounts_count);
-                generate_accounts(accounts_count, offset)
-            })
-            .collect();
-
-        info!(
-            validators = num_validators,
-            accounts_per_validator = accounts_count,
-            value = value.get(),
+        let config = RelayerModeConfig {
+            relayer_url,
+            accounts_count,
+            value,
             seed_offset,
             accounts_jitter,
-            "starting spammer (continuous mode)"
-        );
-
-        // Shared stats for progress reporting.
-        let stats = Arc::new(Stats::new());
-        let start = Instant::now();
-
-        // Spawn per-validator sequential submission loops.
-        for (i, (client, accounts)) in clients.into_iter().zip(accounts_per_validator).enumerate() {
-            let strategy = strategy.clone();
-            let stats = stats.clone();
-            tokio::spawn(async move {
-                let submitter = ValidatorSubmitter::new(client, stats, i);
-                // Per-task xorshift state. Seeded distinctly per validator so
-                // submitters don't lock-step their batch sizes; mixing in
-                // `seed_offset` keeps the jitter stream reproducible across
-                // runs that use the same seed.
-                let mut rng = JitterRng::new(seed_offset.wrapping_add(i as u64).wrapping_add(1));
-                let mut nonces = vec![0; accounts.len()];
-                let mut cursor = 0;
-                loop {
-                    let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
-                    let batch = sign_batch(
-                        &strategy,
-                        &accounts,
-                        value,
-                        &mut nonces,
-                        &mut cursor,
-                        batch_size,
-                    );
-
-                    // Submit and block until every tx is finalized.
-                    submitter.submit_until_finalized(batch).await;
-                }
-            });
-        }
-
-        // Progress reporter runs forever.
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            let finalized = stats.finalized.load(Ordering::Relaxed);
-            let filtered = stats.filtered.load(Ordering::Relaxed);
-            let dropped = stats.dropped.load(Ordering::Relaxed);
-            let retried = stats.retried.load(Ordering::Relaxed);
-            let errors = stats.errors.load(Ordering::Relaxed);
-            let elapsed = start.elapsed().as_secs_f64();
-            let tps = if elapsed > 0.0 {
-                finalized as f64 / elapsed
-            } else {
-                0.0
-            };
-            info!(
-                finalized,
-                filtered,
-                dropped,
-                retried,
-                errors,
-                tps = format!("{tps:.0}"),
-                elapsed_s = format!("{elapsed:.1}"),
-                "progress"
-            );
-        }
+            relayer_submitters,
+            relayer_targets: primary_validators,
+        };
+        run_relayer_mode(config, strategy).await;
     });
 }
 

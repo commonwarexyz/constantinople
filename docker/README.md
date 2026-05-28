@@ -65,8 +65,6 @@ just metadata-indexer-intel-binary
 * `deploy/validator-debug`
 * `deploy/spammer`
 * `deploy/spammer-debug`
-* `deploy/relayer`
-* `deploy/relayer-debug`
 * `deploy/chain-indexer`
 * `deploy/chain-indexer-debug`
 * `deploy/metadata-indexer`
