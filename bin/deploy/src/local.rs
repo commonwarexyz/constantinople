@@ -2,10 +2,9 @@ use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
     DEFAULT_INDEXER_UPLOAD_BUFFER, GenerateArgs, IndexerConfig, IndexerMode, LocalArgs,
     METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
-    QMDB_INDEXER_BINARY_FILE, RELAYER_CONFIG_FILE, RelayerConfig, RelayerLeaderConfig,
-    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
-    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
-    relayer_enabled, write_yaml_config,
+    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, ValidatorConfig, absolute_path,
+    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    ensure_output_dir_missing, generate_local_cluster_material, relayer_enabled, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -49,10 +48,6 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     }
     for secondary in &secondaries {
         write_yaml_config(&secondary.config_file, &secondary.config);
-    }
-    if relayer_enabled {
-        let relayer_config = local_relayer_config(args, local, &material);
-        write_yaml_config(&output_dir.join(RELAYER_CONFIG_FILE), &relayer_config);
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
 
@@ -118,6 +113,7 @@ fn build_validators(
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
             indexer: None,
+            relayer: None,
         };
 
         validators.push(GeneratedValidator {
@@ -140,7 +136,8 @@ fn build_secondaries(
     output_dir: &std::path::Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
-    let mut secondaries = Vec::with_capacity(args.secondaries as usize);
+    let total_secondaries = args.secondaries + u32::from(relayer_enabled(args));
+    let mut secondaries = Vec::with_capacity(total_secondaries as usize);
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
@@ -148,8 +145,9 @@ fn build_secondaries(
     // the same loopback host.
     let primary_span = args.validators as u16;
 
-    for index in 0..args.secondaries {
+    for index in 0..total_secondaries {
         let secondary_index = index as usize;
+        let is_relayer = relayer_enabled(args) && index == args.secondaries;
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
         let offset = primary_span
@@ -187,7 +185,8 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: Some(local_indexer_config(local.chain_indexer_port, index == 0)),
+            indexer: (!is_relayer).then(|| local_indexer_config(local.chain_indexer_port, index == 0)),
+            relayer: is_relayer.then(|| local_relayer_config(args, local, material)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -305,14 +304,6 @@ fn local_run_commands(
             "cargo run --release --bin constantinople -- --config {} --peers {}",
             path.display(),
             peers_path.display()
-        ));
-    }
-
-    if relayer_enabled(args) {
-        let path = output_dir.join(RELAYER_CONFIG_FILE);
-        commands.push(format!(
-            "cargo run --release --bin constantinople-relayer -- --config {}",
-            path.display()
         ));
     }
 

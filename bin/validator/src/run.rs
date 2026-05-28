@@ -31,7 +31,7 @@ use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
     StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper,
-    types::EngineBlock,
+    types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{BlockReporter, CertificateReporter, QmdbPublisher, spawn_uploaders};
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
@@ -59,6 +59,23 @@ const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
 /// out simply pass `simplex_observer: None`.
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
+
+#[derive(Clone)]
+enum SimplexObserver {
+    Indexer(EngineCertReporter),
+    Relayer(crate::relayer::Observer),
+}
+
+impl Reporter for SimplexObserver {
+    type Activity = EngineActivity<PublicKey, MinSig>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        match self {
+            Self::Indexer(reporter) => reporter.report(activity),
+            Self::Relayer(reporter) => reporter.report(activity),
+        }
+    }
+}
 
 /// Concrete type the engine sees in `engine.start(_, reporter)`.
 ///
@@ -206,6 +223,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         json_logs,
         deployer_managed,
         indexer,
+        relayer,
     } = config;
 
     let config_dir = config_path
@@ -321,6 +339,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         };
         let network_handle = network.start();
 
+        let relayer_view = relayer
+            .as_ref()
+            .map(|_| crate::relayer::Observer::new());
+        let relayer_view_clock = relayer_view
+            .as_ref()
+            .map(|(_, view_clock)| view_clock.clone());
+        let relayer_observer = relayer_view.map(|(observer, _)| observer);
+
         let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
         let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
         let mempool_actor = webserver::Actor::new(
@@ -347,6 +373,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             Box::pin(async move {
                 let _ = handle.await;
             })
+        } else if let Some(relayer_config) = relayer.clone() {
+            let view_clock = relayer_view_clock.expect("relayer view clock exists");
+            drop(mempool_actor);
+            info!(%http_listen, "relayer webserver listening");
+            Box::pin(crate::relayer::serve(crate::relayer::ServerConfig {
+                listen: http_listen,
+                relayer: relayer_config,
+                account_reader: account_reader.clone(),
+                view_clock,
+            }))
         } else {
             info!("secondary node: skipping mempool webserver");
             drop(mempool_actor);
@@ -391,7 +427,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             Rayon,
             _,
             Batch,
-            EngineCertReporter,
+            SimplexObserver,
         >::new(
             context.child("engine"),
             EngineConfig {
@@ -413,9 +449,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
                 bootstrapper: bootstrapper_mailbox.clone(),
-                simplex_observer: indexer_handle
-                    .as_ref()
-                    .and_then(|h| h.cert_reporter.clone()),
+                simplex_observer: relayer_observer
+                    .map(SimplexObserver::Relayer)
+                    .or_else(|| {
+                        indexer_handle
+                            .as_ref()
+                            .and_then(|h| h.cert_reporter.clone())
+                            .map(SimplexObserver::Indexer)
+                    }),
                 finalized_hook,
             },
         )

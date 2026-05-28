@@ -32,6 +32,10 @@ pub(crate) const fn default_prune_cadence_blocks() -> u64 {
     1024
 }
 
+pub(crate) const fn default_relayer_retry_views() -> u64 {
+    8
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum IndexerMode {
@@ -104,6 +108,22 @@ pub struct ValidatorConfig {
     /// validators when this section is present.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
+    /// Optional relayer wiring. Honored only for secondary validators.
+    #[serde(default)]
+    pub relayer: Option<RelayerConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayerConfig {
+    #[serde(default = "default_relayer_retry_views")]
+    pub max_retry_views: u64,
+    pub leaders: Vec<RelayerLeaderConfig>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RelayerLeaderConfig {
+    pub public_key: String,
+    pub url: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -156,6 +176,7 @@ pub struct LoadedConfig {
     pub json_logs: bool,
     pub deployer_managed: bool,
     pub indexer: Option<IndexerConfig>,
+    pub relayer: Option<RelayerConfig>,
 }
 
 fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
@@ -235,6 +256,12 @@ fn decode_with_network(
     let public_key = signer.public_key();
     let dkg_output = decode_dkg_output(&config.dkg_output, config.num_validators);
     let share = decode_share_opt(&config.dkg_share);
+    if share.is_some() && config.relayer.is_some() {
+        panic!("relayer config is only valid on secondary validators");
+    }
+    if config.indexer.is_some() && config.relayer.is_some() {
+        panic!("relayer and indexer configs cannot be enabled on the same secondary");
+    }
     let genesis_leader = decode_public_key("genesis_leader", &config.genesis_leader);
     let listen_bind: SocketAddr = format!("0.0.0.0:{}", config.listen_port)
         .parse()
@@ -270,6 +297,7 @@ fn decode_with_network(
         json_logs,
         deployer_managed: json_logs,
         indexer: config.indexer,
+        relayer: config.relayer,
     }
 }
 
@@ -374,6 +402,11 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
     if let Some(indexer) = config.indexer.as_mut() {
         indexer.chain_indexer_url =
             resolve_named_http_url(&indexer.chain_indexer_url, &hosts_by_name);
+    }
+    if let Some(relayer) = config.relayer.as_mut() {
+        for leader in &mut relayer.leaders {
+            leader.url = resolve_named_http_url(&leader.url, &hosts_by_name);
+        }
     }
 
     let self_ip = hosts_by_name
@@ -526,6 +559,7 @@ mod tests {
                 prune_cadence_blocks: default_prune_cadence_blocks(),
                 bootstrappers,
                 indexer: None,
+                relayer: None,
             }
         }
 
@@ -556,6 +590,7 @@ mod tests {
                 prune_cadence_blocks: default_prune_cadence_blocks(),
                 bootstrappers,
                 indexer: None,
+                relayer: None,
             }
         }
     }

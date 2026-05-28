@@ -1944,10 +1944,13 @@ dependencies = [
  "constantinople-primitives",
  "futures",
  "rand_core 0.6.4",
+ "reqwest",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tokio",
  "tower",
+ "tower-http 0.6.10",
  "tracing",
  "tracing-subscriber 0.3.23",
 ]

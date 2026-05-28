@@ -4,9 +4,8 @@ use crate::{
     DEFAULT_INDEXER_UPLOAD_BUFFER, DEPLOYER_CONFIG_FILE, GenerateArgs, IndexerConfig, IndexerMode,
     METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
     QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
-    RELAYER_BINARY_FILE, RELAYER_CONFIG_FILE, RELAYER_HOST, RelayerConfig, RelayerLeaderConfig,
-    RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SpammerConfig,
-    VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
+    RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
+    STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
     default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
     generate_deployer_tag, generate_remote_cluster_material, relayer_enabled, write_yaml_config,
 };
@@ -59,11 +58,6 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     if let Some(config) = qmdb_indexer_config(args, remote) {
         write_yaml_config(&output_dir.join(QMDB_INDEXER_CONFIG_FILE), &config);
     }
-    if relayer_enabled {
-        let relayer_config = remote_relayer_config(remote, &material);
-        write_yaml_config(&output_dir.join(RELAYER_CONFIG_FILE), &relayer_config);
-    }
-
     if args.spammer {
         let spammer_config = remote_spammer_config(args, remote, &material);
         write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), &spammer_config);
@@ -118,9 +112,6 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
                 .to_string(),
         );
     }
-    if relayer_enabled {
-        binaries.push(output_dir.join(RELAYER_BINARY_FILE).display().to_string());
-    }
     if args.spammer {
         binaries.push(output_dir.join(SPAMMER_BINARY_FILE).display().to_string());
     }
@@ -174,6 +165,7 @@ fn build_validators(
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
             indexer: None,
+            relayer: None,
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -195,12 +187,14 @@ fn build_secondaries(
     output_dir: &Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
-    let mut secondaries = Vec::with_capacity(args.secondaries as usize);
+    let total_secondaries = args.secondaries + u32::from(relayer_enabled(args));
+    let mut secondaries = Vec::with_capacity(total_secondaries as usize);
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
-    for index in 0..args.secondaries {
+    for index in 0..total_secondaries {
         let secondary_index = index as usize;
+        let is_relayer = relayer_enabled(args) && index == args.secondaries;
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
 
@@ -223,7 +217,8 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: Some(remote_indexer_config(remote.chain_indexer_port, index == 0)),
+            indexer: (!is_relayer).then(|| remote_indexer_config(remote.chain_indexer_port, index == 0)),
+            relayer: is_relayer.then(|| remote_relayer_config(remote, material)),
         };
 
         let config_name = format!("{public_key_hex}.yaml");
@@ -275,8 +270,11 @@ fn remote_spammer_config(
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
         http_port: remote.http_port,
-        relayer_url: relayer_enabled(args)
-            .then(|| format!("http://{RELAYER_HOST}:{}", remote.http_port)),
+        relayer_url: relayer_enabled(args).then(|| {
+            let relayer_index = args.secondaries as usize;
+            let public_key = &material.secondary_public_keys[relayer_index];
+            format!("http://{}:{}", hex(&public_key.encode()), remote.http_port)
+        }),
         relayer_submitters: if relayer_enabled(args) {
             args.validators as usize
         } else {
@@ -409,19 +407,6 @@ fn build_deployer_config(
         });
     }
 
-    if relayer_enabled(args) {
-        instances.push(aws::InstanceConfig {
-            name: RELAYER_HOST.to_string(),
-            region: regions[0].clone(),
-            instance_type: remote.instance_type.clone(),
-            storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            binary: RELAYER_BINARY_FILE.to_string(),
-            config: RELAYER_CONFIG_FILE.to_string(),
-            profiling: false,
-        });
-    }
-
     aws::Config {
         tag: generate_deployer_tag(),
         monitoring: aws::MonitoringConfig {
@@ -476,9 +461,9 @@ mod tests {
     use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, GenerateArgs, GenerateTarget, IndexerMode, LocalArgs,
-        METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE, RELAYER_BINARY_FILE, RELAYER_HOST,
-        RemoteArgs, SPAMMER_BINARY_FILE, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE,
-        ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE, RemoteArgs, SPAMMER_BINARY_FILE,
+        STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
+        default_max_pool_bytes, default_max_propose_bytes,
         generate_local_cluster_material,
     };
     use std::path::{Path, PathBuf};
@@ -554,6 +539,7 @@ mod tests {
                 max_pool_bytes: default_max_pool_bytes(),
                 bootstrappers: Vec::new(),
                 indexer: None,
+                relayer: None,
             },
         }
     }
@@ -587,28 +573,34 @@ mod tests {
     }
 
     #[test]
-    fn remote_deployer_config_includes_optional_relayer_when_enabled() {
+    fn remote_deployer_config_runs_relayer_as_secondary_when_enabled() {
         let mut args = generate_args();
         args.relayer = true;
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
+        let material = generate_local_cluster_material(args.validators, args.secondaries + 1);
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
         let config = build_deployer_config(
             &args,
             &remote,
             VALIDATOR_BINARY_FILE,
             "dashboard.json",
             &validators,
-            &[],
+            &secondaries,
         );
 
         assert_eq!(config.instances.len(), args.validators as usize + 1);
-        let relayer = config
+        let relayer = secondaries
+            .iter()
+            .find(|secondary| secondary.config.relayer.is_some())
+            .expect("relayer secondary should be present");
+        let instance = config
             .instances
             .iter()
-            .find(|instance| instance.name == RELAYER_HOST)
-            .expect("relayer instance should be present");
-        assert_eq!(relayer.binary, RELAYER_BINARY_FILE);
-        assert_eq!(relayer.config, "relayer.yaml");
+            .find(|instance| instance.name == relayer.public_key_hex)
+            .expect("relayer secondary instance should be present");
+        assert_eq!(instance.binary, VALIDATOR_BINARY_FILE);
+        assert_eq!(instance.config, relayer.config_name);
     }
 
     #[test]
@@ -632,12 +624,6 @@ mod tests {
                 .instances
                 .iter()
                 .any(|instance| instance.binary == SPAMMER_BINARY_FILE),
-        );
-        assert!(
-            config
-                .instances
-                .iter()
-                .all(|instance| instance.name != RELAYER_HOST),
         );
     }
 

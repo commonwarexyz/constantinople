@@ -32,9 +32,6 @@ const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const VALIDATOR_BINARY_FILE: &str = "validator";
-const RELAYER_BINARY_FILE: &str = "relayer";
-const RELAYER_CONFIG_FILE: &str = "relayer.yaml";
-const RELAYER_HOST: &str = "relayer";
 const SPAMMER_BINARY_FILE: &str = "spammer";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
 const CHAIN_INDEXER_BINARY_FILE: &str = "chain-indexer";
@@ -284,6 +281,9 @@ pub(crate) struct ValidatorConfig {
     /// primaries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     indexer: Option<IndexerConfig>,
+    /// Optional relayer wiring for the extra secondary created by `--relayer`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    relayer: Option<RelayerConfig>,
 }
 
 /// Indexer wiring serialized into a secondary validator's YAML.

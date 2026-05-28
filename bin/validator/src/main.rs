@@ -2,6 +2,7 @@
 
 mod cli;
 mod config;
+mod relayer;
 mod run;
 mod state_reader;
 
