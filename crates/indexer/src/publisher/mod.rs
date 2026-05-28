@@ -26,8 +26,8 @@
 //! waiter resolves only after every path has durably accepted its batch.
 //! When QMDB upload is enabled on the single owning secondary,
 //! [`QmdbPublisher`] replaces the block reporter and stages raw KV rows, SQL
-//! rows, account-state QMDB rows, and transaction-hash QMDB rows into one
-//! Store batch per finalized block.
+//! rows, account-state QMDB rows, and transaction-hash QMDB rows into bounded
+//! component Store batches that can commit concurrently.
 //!
 //! [`Reporter`]: commonware_consensus::Reporter
 //! [`StoreClient`]: exoware_sdk::StoreClient

@@ -25,8 +25,9 @@ use commonware_runtime::{
     Quota, Runner as _, Supervisor as _, ThreadPooler as _,
     tokio::telemetry::{self, Logging},
 };
+use commonware_storage::translator::EightCap;
 use commonware_utils::{NZU64, NZUsize, TryCollect, ordered::Set, union};
-use constantinople_application::consensus::FinalizedHookFn;
+use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
     BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
     MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
@@ -43,8 +44,11 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::{sync::Mutex, task::JoinHandle};
-use tracing::{info, warn};
+use tokio::{
+    sync::{Mutex, mpsc},
+    task::JoinHandle,
+};
+use tracing::{error, info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
@@ -60,6 +64,7 @@ const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
 type EngineQmdbPublisher = QmdbPublisher<Sha256, PublicKey>;
+type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
 
 #[derive(Clone)]
 enum SimplexObserver {
@@ -104,9 +109,14 @@ impl Reporter for BlockUpdateReporter {
 struct IndexerHandle {
     block_reporter: Option<BlockReporter<Sha256, PublicKey>>,
     cert_reporter: Option<EngineCertReporter>,
-    qmd_publisher: Option<Arc<LazyQmdbPublisher>>,
+    qmd_finalized_tx: Option<mpsc::Sender<FinalizedIndexUpload>>,
     /// Kept alive so the uploader tasks are not aborted while the validator runs.
     _uploaders: Vec<JoinHandle<()>>,
+}
+
+struct FinalizedIndexUpload {
+    block: EngineBlock<Sha256, PublicKey>,
+    databases: EngineDatabases,
 }
 
 /// Connects the QMDB publisher only when finalized data is ready to upload.
@@ -150,6 +160,40 @@ impl LazyQmdbPublisher {
     }
 }
 
+async fn run_qmdb_finalized_uploader(
+    publisher: Arc<LazyQmdbPublisher>,
+    cert_reporter: Option<EngineCertReporter>,
+    mut rx: mpsc::Receiver<FinalizedIndexUpload>,
+    _max_in_flight: usize,
+) {
+    while let Some(upload) = rx.recv().await {
+        upload_finalized_index(publisher.clone(), cert_reporter.clone(), upload).await;
+    }
+}
+
+async fn upload_finalized_index(
+    publisher: Arc<LazyQmdbPublisher>,
+    cert_reporter: Option<EngineCertReporter>,
+    upload: FinalizedIndexUpload,
+) {
+    if let Err(error) = publisher
+        .publisher()
+        .await
+        .upload_finalized(&upload.block, &upload.databases)
+        .await
+    {
+        warn!(
+            height = upload.block.header.height,
+            error = %error,
+            "finalized index upload failed",
+        );
+    }
+
+    if let Some(cert_reporter) = cert_reporter {
+        cert_reporter.publish_block(&upload.block).await;
+    }
+}
+
 /// Build the indexer wiring iff the secondary validator opted in.
 async fn maybe_build_indexer(
     is_primary: bool,
@@ -172,15 +216,22 @@ async fn maybe_build_indexer(
                 EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
             let cert_reporter = Some(cert_reporter);
             if cfg.qmdb_upload {
-                let qmd_publisher = Some(Arc::new(LazyQmdbPublisher::new(
+                let qmd_publisher = Arc::new(LazyQmdbPublisher::new(
                     cfg.chain_indexer_url,
                     cfg.upload_buffer,
-                )));
+                ));
+                let (qmd_finalized_tx, qmd_finalized_rx) = mpsc::channel(cfg.upload_buffer);
+                let qmd_join = tokio::spawn(run_qmdb_finalized_uploader(
+                    qmd_publisher,
+                    cert_reporter.clone(),
+                    qmd_finalized_rx,
+                    cfg.upload_buffer,
+                ));
                 Some(IndexerHandle {
                     block_reporter: None,
                     cert_reporter,
-                    qmd_publisher,
-                    _uploaders: vec![cert_join],
+                    qmd_finalized_tx: Some(qmd_finalized_tx),
+                    _uploaders: vec![cert_join, qmd_join],
                 })
             } else {
                 let sql_store =
@@ -195,7 +246,7 @@ async fn maybe_build_indexer(
                 Some(IndexerHandle {
                     block_reporter: Some(block_reporter),
                     cert_reporter,
-                    qmd_publisher: None,
+                    qmd_finalized_tx: None,
                     _uploaders: joins,
                 })
             }
@@ -207,7 +258,7 @@ async fn maybe_build_indexer(
             Some(IndexerHandle {
                 block_reporter: Some(BlockReporter::<Sha256, PublicKey>::metadata_only(sql)),
                 cert_reporter: None,
-                qmd_publisher: None,
+                qmd_finalized_tx: None,
                 _uploaders: vec![sql_join],
             })
         }
@@ -219,28 +270,42 @@ fn indexer_finalized_hook(
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
 {
     let indexer = indexer?;
-    let publisher = indexer.qmd_publisher.clone();
+    let qmd_finalized_tx = indexer.qmd_finalized_tx.clone();
     let cert_reporter = indexer.cert_reporter.clone();
-    if publisher.is_none() && cert_reporter.is_none() {
+    if qmd_finalized_tx.is_none() && cert_reporter.is_none() {
         return None;
     }
     Some(Arc::new(move |block, databases| {
-        let publisher = publisher.clone();
+        let qmd_finalized_tx = qmd_finalized_tx.clone();
         let cert_reporter = cert_reporter.clone();
+        let block = block.clone();
+        let databases = databases.clone();
         Box::pin(async move {
-            if let Some(publisher) = publisher {
-                publisher
-                    .publisher()
-                    .await
-                    .upload_finalized(block, databases)
-                    .await
-                    .expect("finalized index upload failed");
+            if let Some(qmd_finalized_tx) = qmd_finalized_tx {
+                let upload = FinalizedIndexUpload { block, databases };
+                if let Err(upload) = enqueue_finalized_upload(&qmd_finalized_tx, upload).await {
+                    error!(
+                        height = upload.block.header.height,
+                        "finalized index uploader stopped; continuing consensus without qmd upload",
+                    );
+                    if let Some(cert_reporter) = cert_reporter {
+                        cert_reporter.publish_block(&upload.block).await;
+                    }
+                }
+                return;
             }
+
             if let Some(cert_reporter) = cert_reporter {
-                cert_reporter.publish_block(block).await;
+                cert_reporter.publish_block(&block).await;
             }
         })
     }))
+}
+
+async fn enqueue_finalized_upload<T>(tx: &mpsc::Sender<T>, upload: T) -> Result<(), T> {
+    tx.send(upload)
+        .await
+        .map_err(|mpsc::error::SendError(upload)| upload)
 }
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
@@ -562,7 +627,7 @@ const fn production_sync_config() -> SyncEngineConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{maybe_build_indexer, wait_for_critical_task_exit};
+    use super::{enqueue_finalized_upload, maybe_build_indexer, wait_for_critical_task_exit};
     use crate::config::{IndexerConfig, IndexerMode};
     use std::{future::pending, time::Duration};
 
@@ -600,6 +665,18 @@ mod tests {
         .expect("qmd publisher connection should not block startup")
         .expect("secondary should keep indexer wiring");
 
-        assert!(handle.qmd_publisher.is_some());
+        assert!(handle.qmd_finalized_tx.is_some());
+    }
+
+    #[tokio::test]
+    async fn finalized_upload_enqueue_returns_payload_when_uploader_stopped() {
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        drop(rx);
+
+        let payload = enqueue_finalized_upload(&tx, 7)
+            .await
+            .expect_err("closed uploader should return the payload");
+
+        assert_eq!(payload, 7);
     }
 }

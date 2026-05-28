@@ -2,9 +2,9 @@ use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
     DEFAULT_INDEXER_UPLOAD_BUFFER, GenerateArgs, IndexerConfig, IndexerMode, LocalArgs,
     METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
-    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, ValidatorConfig, absolute_path,
-    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_local_cluster_material,
+    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_UPLOAD_BUFFER, RelayerConfig, RelayerLeaderConfig,
+    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
+    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
     write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
@@ -233,9 +233,16 @@ fn local_indexer_config(indexer_port: u16, qmdb_upload: bool) -> IndexerConfig {
     IndexerConfig {
         mode: IndexerMode::Full,
         chain_indexer_url: url,
-        upload_buffer: DEFAULT_INDEXER_UPLOAD_BUFFER,
+        upload_buffer: indexer_upload_buffer(qmdb_upload),
         qmdb_upload,
     }
+}
+
+const fn indexer_upload_buffer(qmdb_upload: bool) -> usize {
+    if qmdb_upload {
+        return QMDB_INDEXER_UPLOAD_BUFFER;
+    }
+    DEFAULT_INDEXER_UPLOAD_BUFFER
 }
 
 fn print_local_run_commands(
@@ -697,6 +704,7 @@ mod tests {
             .expect("secondary should have indexer config");
         assert_eq!(indexer.mode, IndexerMode::Full);
         assert!(indexer.qmdb_upload);
+        assert_eq!(indexer.upload_buffer, 8);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
         assert!(

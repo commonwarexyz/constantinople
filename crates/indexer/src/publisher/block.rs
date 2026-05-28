@@ -27,7 +27,7 @@ use bytes::Bytes;
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{Reporter, marshal::Update};
-use commonware_cryptography::{Hasher, PublicKey};
+use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{AccountKey, TransactionPublicKey};
 use exoware_sdk::keys::Key;
@@ -101,7 +101,7 @@ where
                 // are dispatched onto background tasks so this method never
                 // blocks consensus — see `dispatch_batch` for back-pressure
                 // semantics.
-                let IndexedBlockRows { raw, sql } = encode_indexed_block_rows(&block);
+                let IndexedBlockRows { raw, sql, .. } = encode_indexed_block_rows(&block);
 
                 // Clone the ack once per backing path. `Exact::clone`
                 // increments the remaining count, so the marshal waiter only
@@ -129,15 +129,19 @@ where
 }
 
 /// Encoded block rows split by index family.
-pub(crate) struct IndexedBlockRows {
+pub(crate) struct IndexedBlockRows<D: Digest> {
     /// Raw KV rows for the block and contained transactions.
     pub raw: Vec<(Key, Bytes)>,
     /// SQL metadata row for the block.
     pub sql: Vec<SqlRow>,
+    /// Transaction digests in append order.
+    pub transaction_digests: Vec<D>,
 }
 
 /// Build every row for a finalized block, partitioned by destination store.
-pub(crate) fn encode_indexed_block_rows<H, P>(block: &EngineBlock<H, P>) -> IndexedBlockRows
+pub(crate) fn encode_indexed_block_rows<H, P>(
+    block: &EngineBlock<H, P>,
+) -> IndexedBlockRows<H::Digest>
 where
     H: Hasher,
     P: PublicKey,
@@ -172,14 +176,15 @@ where
                 );
                 return None;
             };
-            Some((idx, lazy, tx))
+            let tx_digest = *tx.message_digest();
+            Some((idx, lazy, tx, tx_digest))
         })
         .collect::<Vec<_>>();
     let tx_count = u64::try_from(materialized_txs.len()).expect("transaction count fits u64");
     let (secp256r1_tx_count, ed25519_tx_count) = transaction_scheme_counts(
         materialized_txs
             .iter()
-            .filter_map(|(_, _, tx)| tx.value().sender()),
+            .filter_map(|(_, _, tx, _)| tx.value().sender()),
     );
     let append_start = block
         .header
@@ -199,8 +204,9 @@ where
     ));
 
     // Per-transaction rows: TX, TX_BY_H, and TX_BY_SENDER for account lookup.
-    for (materialized_idx, (idx, lazy, tx)) in materialized_txs.iter().enumerate() {
-        let tx_digest = tx.message_digest();
+    let mut transaction_digests = Vec::with_capacity(materialized_txs.len());
+    for (materialized_idx, (idx, lazy, tx, tx_digest)) in materialized_txs.iter().enumerate() {
+        transaction_digests.push(*tx_digest);
         let tx_bytes = lazy.encode();
         let idx_u32 = u32::try_from(*idx).expect("transaction index fits u32");
         let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
@@ -249,7 +255,11 @@ where
         finalized_ts_micros,
     });
 
-    IndexedBlockRows { raw, sql }
+    IndexedBlockRows {
+        raw,
+        sql,
+        transaction_digests,
+    }
 }
 
 fn transaction_scheme_counts<'a>(

@@ -3,12 +3,12 @@ use crate::{
     CHAIN_INDEXER_HOST, ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE,
     DEFAULT_INDEXER_UPLOAD_BUFFER, DEPLOYER_CONFIG_FILE, GenerateArgs, IndexerConfig, IndexerMode,
     METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
-    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
-    RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
-    STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
-    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
-    write_simplex_verification_material, write_yaml_config,
+    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST,
+    QMDB_INDEXER_UPLOAD_BUFFER, QmdbIndexerConfig, RelayerConfig, RelayerLeaderConfig, RemoteArgs,
+    SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE,
+    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
+    default_max_propose_bytes, ensure_output_dir_missing, generate_deployer_tag,
+    generate_remote_cluster_material, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -239,9 +239,16 @@ fn remote_indexer_config(port: u16, first_secondary: bool) -> IndexerConfig {
     IndexerConfig {
         mode: IndexerMode::Full,
         chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{port}"),
-        upload_buffer: DEFAULT_INDEXER_UPLOAD_BUFFER,
+        upload_buffer: indexer_upload_buffer(first_secondary),
         qmdb_upload: first_secondary,
     }
+}
+
+const fn indexer_upload_buffer(qmdb_upload: bool) -> usize {
+    if qmdb_upload {
+        return QMDB_INDEXER_UPLOAD_BUFFER;
+    }
+    DEFAULT_INDEXER_UPLOAD_BUFFER
 }
 
 fn remote_relayer_config(remote: &RemoteArgs, material: &ClusterMaterial) -> RelayerConfig {
@@ -705,6 +712,7 @@ mod tests {
         assert_eq!(indexer.mode, IndexerMode::Full);
         assert!(indexer.qmdb_upload);
         assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
+        assert_eq!(indexer.upload_buffer, 8);
         assert!(
             secondaries[1].config.relayer.is_some(),
             "last secondary should run relayer"
