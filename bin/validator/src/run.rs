@@ -350,36 +350,27 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
             transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
         };
-        let should_bootstrap = matches!(startup, StartupModeConfig::StateSync);
-        let (bootstrapper_handle, bootstrapper_mailbox) = if should_bootstrap {
-            let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
-            let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-                context.child("bootstrapper"),
-                bootstrapper::Config {
-                    public_key: decoded.public_key.clone(),
-                    peer_provider: oracle.clone(),
-                    blocker: oracle.clone(),
-                    scheme: constantinople_engine::ThresholdScheme::<
-                        ed25519::PublicKey,
-                        MinSig,
-                    >::verifier(
-                        &union(b"constantinople", b"_CONSENSUS"),
-                        decoded.dkg_output.players().clone(),
-                        decoded.dkg_output.public().clone(),
-                    ),
-                    mailbox_size: 32,
-                    round_timeout: Duration::from_secs(1),
-                    retry_interval: Duration::from_secs(1),
-                },
-            );
-            let handle = bootstrapper.start(bootstrapper_network);
-            let handle: CriticalTask = Box::pin(async move {
-                let _ = handle.await;
-            });
-            (Some(handle), Some(bootstrapper_mailbox))
-        } else {
-            (None, None)
-        };
+        let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
+        let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
+            context.child("bootstrapper"),
+            bootstrapper::Config {
+                public_key: decoded.public_key.clone(),
+                peer_provider: oracle.clone(),
+                blocker: oracle.clone(),
+                scheme: ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
+                    &union(b"constantinople", b"_CONSENSUS"),
+                    decoded.dkg_output.players().clone(),
+                    decoded.dkg_output.public().clone(),
+                ),
+                mailbox_size: 32,
+                round_timeout: Duration::from_secs(1),
+                retry_interval: Duration::from_secs(1),
+            },
+        );
+        let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
+        let bootstrapper_handle: CriticalTask = Box::pin(async move {
+            let _ = bootstrapper_handle.await;
+        });
         let network_handle = network.start();
 
         let relayer_view = relayer.as_ref().map(|_| crate::relayer::Observer::new());
@@ -434,8 +425,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
             StartupModeConfig::StateSync => {
                 let finalization = bootstrapper_mailbox
-                    .as_ref()
-                    .expect("state-sync startup requires a bootstrapper")
                     .fetch_initial_target()
                     .await
                     .expect("bootstrapper actor exited before selecting a state-sync floor");
@@ -489,7 +478,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
-                bootstrapper: bootstrapper_mailbox.clone(),
+                bootstrapper: Some(bootstrapper_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
                         .as_ref()
@@ -530,7 +519,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let engine_handle = engine.start(channels, reporter);
 
         wait_for_critical_task_exit(
-            bootstrapper_handle,
+            Some(bootstrapper_handle),
             engine_handle,
             mempool_handle,
             network_handle,
