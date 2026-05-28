@@ -1873,29 +1873,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "constantinople-relayer"
-version = "0.0.0"
-dependencies = [
- "axum",
- "bytes",
- "clap",
- "commonware-codec",
- "commonware-consensus",
- "commonware-cryptography",
- "commonware-formatting",
- "commonware-utils",
- "reqwest",
- "serde",
- "serde_json",
- "serde_yaml",
- "tokio",
- "tower",
- "tower-http 0.6.10",
- "tracing",
- "tracing-subscriber 0.3.23",
-]
-
-[[package]]
 name = "constantinople-spammer"
 version = "0.0.0"
 dependencies = [

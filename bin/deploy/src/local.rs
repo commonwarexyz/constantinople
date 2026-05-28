@@ -185,8 +185,9 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: (!is_relayer).then(|| local_indexer_config(local.chain_indexer_port, index == 0)),
-            relayer: is_relayer.then(|| local_relayer_config(args, local, material)),
+            indexer: (!is_relayer)
+                .then(|| local_indexer_config(local.chain_indexer_port, index == 0)),
+            relayer: is_relayer.then(|| local_relayer_config(local, material)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -203,16 +204,7 @@ fn build_secondaries(
     secondaries
 }
 
-fn local_relayer_config(
-    args: &GenerateArgs,
-    local: &LocalArgs,
-    material: &ClusterMaterial,
-) -> RelayerConfig {
-    let relayer_offset = args.validators as u16 + args.secondaries as u16;
-    let relayer_http_port = local
-        .base_http_port
-        .checked_add(relayer_offset)
-        .expect("relayer http port overflow");
+fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> RelayerConfig {
     let leaders = material
         .primary_hex()
         .into_iter()
@@ -229,11 +221,7 @@ fn local_relayer_config(
         })
         .collect();
 
-    RelayerConfig {
-        listen: format!("0.0.0.0:{relayer_http_port}"),
-        leader_fanout: None,
-        leaders,
-    }
+    RelayerConfig { leaders }
 }
 
 /// Build the indexer wiring written into every secondary's YAML.
@@ -298,7 +286,8 @@ fn local_run_commands(
         })
         .collect();
 
-    for index in 0..args.secondaries {
+    let total_secondaries = args.secondaries + u32::from(relayer_enabled(args));
+    for index in 0..total_secondaries {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
         commands.push(format!(
             "cargo run --release --bin constantinople -- --config {} --peers {}",
@@ -479,7 +468,8 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 3);
-        assert!(commands[2].contains("constantinople-relayer"));
+        assert!(commands[2].contains("constantinople"));
+        assert!(commands[2].contains("secondary-0.yaml"));
     }
 
     #[test]
@@ -496,7 +486,7 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 4);
-        assert!(commands[2].contains("constantinople-relayer"));
+        assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("constantinople-spammer"));
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
         assert!(commands[3].contains("--relayer-submitters 2"));

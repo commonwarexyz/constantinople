@@ -18,10 +18,8 @@ import { submittedTransactionHistoryKey } from './historyKey';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
-    fetchTransactionStatus,
     submitTransactions,
     type AccountView,
-    type SubmitResponse,
     type TxStatus,
 } from './mempool';
 import {
@@ -92,7 +90,7 @@ interface SubmittedTransaction {
     readonly nonce: string;
     readonly submittedAt: number;
     readonly finalizedInMs: number | null;
-    readonly status: 'pending' | 'accepted' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
+    readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
     readonly finalizedHeight: number | null;
     readonly certificate: BlockCertificateState;
@@ -646,23 +644,7 @@ export default function App() {
             setHistory((current) => prependTransaction(pending, current));
             setSubmitMessage('submitting');
 
-            const submitResponse = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
-            let txStatus: TxStatus;
-            if ('batch_id' in submitResponse) {
-                const accepted: TxStatus = { status: 'accepted', digests: submitResponse.digests };
-                setHistory((current) =>
-                    updateTransactionStatus(
-                        encoded.digestHex,
-                        accepted,
-                        'accepted by relayer',
-                        current,
-                    ),
-                );
-                setSubmitMessage('accepted by relayer');
-                txStatus = await pollTransactionStatus(mempoolUrl, submitResponse);
-            } else {
-                txStatus = submitResponse;
-            }
+            const txStatus = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
             const detail = formatTxStatus(txStatus, encoded.digestHex);
             setHistory((current) =>
                 updateTransactionStatus(
@@ -1432,13 +1414,10 @@ function updateTransactionStatus(
             ...tx,
             status: status.status,
             detail,
-            finalizedInMs: status.status === 'accepted' ? null : Date.now() - tx.submittedAt,
+            finalizedInMs: Date.now() - tx.submittedAt,
             finalizedHeight,
-            certificate:
-                finalizedHeight === null
-                    ? nextBlockCertificateState(status, tx.certificate)
-                    : nextBlockCertificateState(status, tx.certificate),
-            proof: nextProofState(status, digest, tx.proof),
+            certificate: nextBlockCertificateState(status),
+            proof: nextProofState(status, digest),
         };
     });
 }
@@ -1498,11 +1477,7 @@ function hasFetchingProof(
     return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
 }
 
-function nextBlockCertificateState(
-    status: TxStatus,
-    current: BlockCertificateState,
-): BlockCertificateState {
-    if (status.status === 'accepted') return current;
+function nextBlockCertificateState(status: TxStatus): BlockCertificateState {
     if (status.status === 'dropped') {
         return { status: 'waiting', detail: 'not finalized' };
     }
@@ -1512,9 +1487,7 @@ function nextBlockCertificateState(
 function nextProofState(
     status: TxStatus,
     digest: string,
-    current: TransactionProofState,
 ): TransactionProofState {
-    if (status.status === 'accepted') return current;
     if (status.status === 'dropped') {
         return { status: 'waiting', detail: 'not finalized' };
     }
@@ -1550,17 +1523,6 @@ function verifiedBlockCertificateState(certificate: {
     };
 }
 
-async function pollTransactionStatus(baseUrl: string, submission: SubmitResponse): Promise<TxStatus> {
-    for (;;) {
-        await sleep(1_000);
-        const status = await fetchTransactionStatus(baseUrl, submission.batch_id);
-        if (status === null || status.status === 'accepted') {
-            continue;
-        }
-        return status;
-    }
-}
-
 async function retryAccountPageStep<T>(
     run: () => Promise<T>,
     signal: AbortSignal,
@@ -1585,9 +1547,6 @@ async function retryAccountPageStep<T>(
 }
 
 function formatTxStatus(status: TxStatus, digest: string): string {
-    if (status.status === 'accepted') {
-        return 'accepted';
-    }
     if (status.status === 'finalized') {
         return `finalized at ${status.height}`;
     }

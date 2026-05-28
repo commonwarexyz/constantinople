@@ -339,9 +339,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         };
         let network_handle = network.start();
 
-        let relayer_view = relayer
-            .as_ref()
-            .map(|_| crate::relayer::Observer::new());
+        let relayer_view = relayer.as_ref().map(|_| crate::relayer::Observer::new());
         let relayer_view_clock = relayer_view
             .as_ref()
             .map(|(_, view_clock)| view_clock.clone());
@@ -449,14 +447,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
                 bootstrapper: bootstrapper_mailbox.clone(),
-                simplex_observer: relayer_observer
-                    .map(SimplexObserver::Relayer)
-                    .or_else(|| {
-                        indexer_handle
-                            .as_ref()
-                            .and_then(|h| h.cert_reporter.clone())
-                            .map(SimplexObserver::Indexer)
-                    }),
+                simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
+                    indexer_handle
+                        .as_ref()
+                        .and_then(|h| h.cert_reporter.clone())
+                        .map(SimplexObserver::Indexer)
+                }),
                 finalized_hook,
             },
         )

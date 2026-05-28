@@ -54,55 +54,35 @@ pub struct RelayerSubmitter {
     url: String,
     http: reqwest::Client,
     stats: Arc<Stats>,
-    target_offset: usize,
     target_leader: Option<String>,
     leader_fanout: usize,
 }
 
 #[derive(Debug, serde::Deserialize)]
-struct RelayerSubmitResponse {
-    batch_id: String,
-    #[allow(dead_code)]
-    digests: Vec<String>,
-    #[allow(dead_code)]
-    acknowledged_leaders: Vec<String>,
-    #[allow(dead_code)]
-    targeted_leaders: Vec<String>,
-}
-
-#[derive(Debug, serde::Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 enum RelayerBatchStatus {
-    Accepted {
-        #[allow(dead_code)]
-        digests: Vec<String>,
-    },
     Finalized {
         height: u64,
-        included: Vec<String>,
     },
     PartiallyFinalized {
         height: u64,
         included: Vec<String>,
         filtered: Vec<String>,
     },
-    Dropped {
-        filtered: Vec<String>,
-    },
+    Dropped,
 }
 
 impl RelayerSubmitter {
     pub fn new(
         url: String,
         stats: Arc<Stats>,
-        target_offset: usize,
+        _target_offset: usize,
         target_leader: Option<String>,
     ) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             stats,
-            target_offset,
             target_leader,
             leader_fanout: 1,
         }
@@ -117,20 +97,18 @@ impl RelayerSubmitter {
         while !pending.is_empty() {
             let body = pending.encode();
             match self.submit_encoded(body.clone()).await {
-                Ok(response) => match self.poll_status(&response.batch_id).await {
-                    Ok(RelayerBatchStatus::Accepted { .. }) => {}
-                    Ok(RelayerBatchStatus::Finalized { height, included }) => {
-                        self.stats
-                            .finalized
-                            .fetch_add(included.len() as u64, Ordering::Relaxed);
-                        debug!(height, count = included.len(), "relayed batch finalized");
+                Ok(status) => match status {
+                    RelayerBatchStatus::Finalized { height } => {
+                        let count = pending.len() as u64;
+                        self.stats.finalized.fetch_add(count, Ordering::Relaxed);
+                        debug!(height, count, "relayed batch finalized");
                         return;
                     }
-                    Ok(RelayerBatchStatus::PartiallyFinalized {
+                    RelayerBatchStatus::PartiallyFinalized {
                         height,
                         included,
                         filtered,
-                    }) => {
+                    } => {
                         self.stats
                             .finalized
                             .fetch_add(included.len() as u64, Ordering::Relaxed);
@@ -146,28 +124,14 @@ impl RelayerSubmitter {
                         pending = extract_filtered(&pending, &filtered);
                         backoff = INITIAL_BACKOFF;
                     }
-                    Ok(RelayerBatchStatus::Dropped { filtered }) => {
+                    RelayerBatchStatus::Dropped => {
                         self.stats
                             .dropped
-                            .fetch_add(filtered.len() as u64, Ordering::Relaxed);
-                        let filtered = extract_filtered(&pending, &filtered);
-                        if !filtered.is_empty() {
-                            pending = filtered;
-                        }
+                            .fetch_add(pending.len() as u64, Ordering::Relaxed);
                         debug!(
                             pending = pending.len(),
                             "relayed batch dropped, resubmitting"
                         );
-                    }
-                    Err(error) => {
-                        self.stats.errors.fetch_add(1, Ordering::Relaxed);
-                        warn!(
-                            error = %error,
-                            backoff_ms = backoff.as_millis(),
-                            "relayer status error, retrying"
-                        );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
                     }
                 },
                 Err(error) => {
@@ -187,7 +151,7 @@ impl RelayerSubmitter {
     async fn submit_encoded(
         &self,
         body: bytes::Bytes,
-    ) -> Result<RelayerSubmitResponse, constantinople_mempool::webserver::client::SubmitError> {
+    ) -> Result<RelayerBatchStatus, constantinople_mempool::webserver::client::SubmitError> {
         use constantinople_mempool::webserver::client::SubmitError;
 
         let mut request = self
@@ -200,16 +164,11 @@ impl RelayerSubmitter {
             );
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
-        } else {
-            request = request.header(
-                "x-constantinople-relayer-target-offset",
-                self.target_offset.to_string(),
-            );
         }
         let response = request.body(body).send().await?;
 
         match response.status().as_u16() {
-            202 => {
+            200 => {
                 let bytes = response.bytes().await?;
                 serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)
             }
@@ -218,40 +177,6 @@ impl RelayerSubmitter {
             500 => Err(SubmitError::InternalServerError),
             503 => Err(SubmitError::ServiceUnavailable),
             other => Err(SubmitError::Unexpected(other)),
-        }
-    }
-
-    async fn poll_status(
-        &self,
-        batch_id: &str,
-    ) -> Result<RelayerBatchStatus, constantinople_mempool::webserver::client::SubmitError> {
-        use constantinople_mempool::webserver::client::SubmitError;
-
-        loop {
-            tokio::time::sleep(Duration::from_millis(250)).await;
-            let response = self
-                .http
-                .get(format!("{}/transactions/{batch_id}", self.url))
-                .send()
-                .await?;
-
-            match response.status().as_u16() {
-                200 => {
-                    let bytes = response.bytes().await?;
-                    let status: RelayerBatchStatus =
-                        serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)?;
-                    if matches!(status, RelayerBatchStatus::Accepted { .. }) {
-                        continue;
-                    }
-                    return Ok(status);
-                }
-                404 => continue,
-                400 => return Err(SubmitError::BadRequest),
-                413 => return Err(SubmitError::PayloadTooLarge),
-                500 => return Err(SubmitError::InternalServerError),
-                503 => continue,
-                other => return Err(SubmitError::Unexpected(other)),
-            }
         }
     }
 }

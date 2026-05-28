@@ -6,7 +6,6 @@ export interface AccountView {
 }
 
 export type TxStatus =
-    | { readonly status: 'accepted'; readonly digests: string[] }
     | { readonly status: 'finalized'; readonly height: number }
     | {
           readonly status: 'partially_finalized';
@@ -14,14 +13,7 @@ export type TxStatus =
           readonly included: string[];
           readonly filtered: string[];
       }
-    | { readonly status: 'dropped'; readonly filtered: string[] };
-
-export interface SubmitResponse {
-    readonly batch_id: string;
-    readonly digests: string[];
-    readonly acknowledged_leaders: string[];
-    readonly targeted_leaders: string[];
-}
+    | { readonly status: 'dropped' };
 
 export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);
@@ -38,7 +30,7 @@ export async function submitTransactions(
     baseUrl: string,
     batch: Uint8Array,
     signal?: AbortSignal,
-): Promise<SubmitResponse | TxStatus> {
+): Promise<TxStatus> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/transactions`, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },

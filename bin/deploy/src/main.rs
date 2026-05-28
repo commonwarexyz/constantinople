@@ -209,12 +209,9 @@ pub(crate) struct SpammerConfig {
     pub accounts_jitter: f64,
 }
 
-/// Relayer configuration, written as YAML by deploy and read by the relayer binary.
+/// Relayer configuration written into the relayer secondary's YAML.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RelayerConfig {
-    pub listen: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub leader_fanout: Option<usize>,
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 

@@ -11,18 +11,18 @@ use axum::{
 use commonware_actor::Feedback;
 use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
 use commonware_consensus::{Reporter, Viewable};
-use commonware_cryptography::{
-    Hasher,
-    bls12381::primitives::variant::MinSig,
-    ed25519, sha256,
-};
+use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed25519, sha256};
 use commonware_formatting::from_hex;
 use constantinople_engine::types::EngineActivity;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
 use constantinople_primitives::{Account, SignedTransaction, TransactionPublicKey};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, net::SocketAddr, sync::{Arc, OnceLock}};
+use std::{
+    collections::HashSet,
+    net::SocketAddr,
+    sync::{Arc, OnceLock},
+};
 use tokio::sync::watch;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
@@ -184,7 +184,9 @@ fn router(state: AppState) -> Router {
         .route("/account/{public_key}", get(account))
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .layer(DefaultBodyLimit::max(max_request_bytes(state.max_batch_bytes)))
+        .layer(DefaultBodyLimit::max(max_request_bytes(
+            state.max_batch_bytes,
+        )))
         .layer(cors)
         .with_state(state)
 }
@@ -226,19 +228,24 @@ async fn submit_to_pinned_leader(
 
     let batch_id = batch_id(body);
     loop {
-        if let Some(status) = fetch_status_from_leader(&state.http, &leader, &batch_id).await {
-            if let Some(status) = tx_status_from_batch(&status, &batch.digests) {
-                return json_response(status);
-            }
+        if let Some(status) = fetch_status_from_leader(&state.http, &leader, &batch_id).await
+            && let Some(status) = tx_status_from_batch(&status, &batch.digests)
+        {
+            return json_response(status);
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
 
 async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCode, String) {
+    if state.leaders.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    }
+
     let mut pending = batch.digests.iter().cloned().collect::<HashSet<_>>();
     let mut included = HashSet::new();
     let mut height = 0;
+    let mut accepted_any = false;
     let mut attempts = Vec::<(String, Leader)>::new();
     let mut views = state.view_clock.current_view.subscribe();
     let mut view = *views.borrow();
@@ -258,6 +265,7 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
         if let Some(status) = result.deterministic {
             return (status, String::new());
         }
+        accepted_any |= result.accepted;
 
         merge_statuses(state, &attempts, &mut included, &mut height).await;
         pending.retain(|digest| !included.contains(digest));
@@ -266,6 +274,9 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
         }
 
         if retry == state.max_retry_views {
+            if !accepted_any {
+                return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+            }
             return json_response(best_effort_status(&batch.digests, &included, height));
         }
 
@@ -276,6 +287,7 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
 }
 
 struct ForwardSummary {
+    accepted: bool,
     deterministic: Option<StatusCode>,
 }
 
@@ -290,10 +302,12 @@ async fn forward_to_targets(
         async move { forward_to_leader(&http, leader, body).await }
     });
 
+    let mut accepted = false;
     let mut deterministic = None;
     for result in join_all(sends).await {
         match result {
             ForwardResult::Accepted { leader } => {
+                accepted = true;
                 debug!(leader = %leader.public_key, "relayer forward accepted");
             }
             ForwardResult::Deterministic(status) => deterministic = Some(status),
@@ -303,7 +317,10 @@ async fn forward_to_targets(
         }
     }
 
-    ForwardSummary { deterministic }
+    ForwardSummary {
+        accepted,
+        deterministic,
+    }
 }
 
 async fn merge_statuses(
@@ -386,7 +403,10 @@ fn tx_status_from_batch(status: &BatchStatus, digests: &[String]) -> Option<TxSt
             filtered: filtered.clone(),
         }),
         BatchStatus::Dropped { filtered } => {
-            if filtered.iter().all(|digest| digests.iter().any(|known| known == digest)) {
+            if filtered
+                .iter()
+                .all(|digest| digests.iter().any(|known| known == digest))
+            {
                 Some(TxStatus::Dropped)
             } else {
                 None
@@ -424,14 +444,15 @@ async fn account(
     let Some(reader) = state.account_reader.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
-    match reader.get(public_key).await {
-        Some(account) => (
-            StatusCode::OK,
-            serde_json::to_string(&AccountResponse::from(account))
-                .expect("account serialization cannot fail"),
-        ),
-        None => (StatusCode::NOT_FOUND, String::new()),
-    }
+    let Some(account) = reader.get(public_key).await else {
+        return (StatusCode::NOT_FOUND, String::new());
+    };
+
+    (
+        StatusCode::OK,
+        serde_json::to_string(&AccountResponse::from(account))
+            .expect("account serialization cannot fail"),
+    )
 }
 
 #[derive(Serialize)]
@@ -545,7 +566,7 @@ fn encode_pending(batch: &DecodedBatch, pending: &HashSet<String>) -> Bytes {
         .encode()
 }
 
-fn max_request_bytes(max_batch_bytes: usize) -> usize {
+const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
@@ -555,7 +576,7 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
     (max_transactions > 0).then_some(max_transactions)
 }
 
-fn min_signed_transaction_bytes() -> usize {
+const fn min_signed_transaction_bytes() -> usize {
     constantinople_primitives::TransactionPublicKey::SIZE
         + constantinople_primitives::TransactionPublicKey::SIZE
         + 1
@@ -620,7 +641,9 @@ fn next_two_leaders(leaders: &[Leader], observed_view: u64) -> Vec<Leader> {
 }
 
 fn leader_by_id<'a>(leaders: &'a [Leader], public_key: &str) -> Option<&'a Leader> {
-    leaders.iter().find(|leader| leader.public_key == public_key)
+    leaders
+        .iter()
+        .find(|leader| leader.public_key == public_key)
 }
 
 #[cfg(test)]

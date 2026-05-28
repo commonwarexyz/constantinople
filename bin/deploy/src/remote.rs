@@ -5,9 +5,10 @@ use crate::{
     METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
     QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
     RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
-    STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_deployer_tag, generate_remote_cluster_material, relayer_enabled, write_yaml_config,
+    STORAGE_CLASS, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
+    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
+    relayer_enabled, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -217,7 +218,8 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: (!is_relayer).then(|| remote_indexer_config(remote.chain_indexer_port, index == 0)),
+            indexer: (!is_relayer)
+                .then(|| remote_indexer_config(remote.chain_indexer_port, index == 0)),
             relayer: is_relayer.then(|| remote_relayer_config(remote, material)),
         };
 
@@ -253,11 +255,7 @@ fn remote_relayer_config(remote: &RemoteArgs, material: &ClusterMaterial) -> Rel
         })
         .collect();
 
-    RelayerConfig {
-        listen: format!("0.0.0.0:{}", remote.http_port),
-        leader_fanout: None,
-        leaders,
-    }
+    RelayerConfig { leaders }
 }
 
 fn remote_spammer_config(
@@ -463,9 +461,10 @@ mod tests {
         CHAIN_INDEXER_BINARY_FILE, GenerateArgs, GenerateTarget, IndexerMode, LocalArgs,
         METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE, RemoteArgs, SPAMMER_BINARY_FILE,
         STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes,
-        generate_local_cluster_material,
+        default_max_pool_bytes, default_max_propose_bytes, generate_local_cluster_material,
     };
+    use commonware_codec::Encode;
+    use commonware_formatting::hex;
     use std::path::{Path, PathBuf};
 
     fn generate_args() -> GenerateArgs {
@@ -632,15 +631,22 @@ mod tests {
         let mut args = generate_args();
         args.spammer = true;
         let remote = remote_args();
-        let material = generate_local_cluster_material(args.validators, args.secondaries);
+        let direct_material = generate_local_cluster_material(args.validators, args.secondaries);
 
-        let direct = remote_spammer_config(&args, &remote, &material);
+        let direct = remote_spammer_config(&args, &remote, &direct_material);
         args.relayer = true;
-        let relayed = remote_spammer_config(&args, &remote, &material);
+        let relayed_material =
+            generate_local_cluster_material(args.validators, args.secondaries + 1);
+        let relayed = remote_spammer_config(&args, &remote, &relayed_material);
+        let relayer_key =
+            hex(&relayed_material.secondary_public_keys[args.secondaries as usize].encode());
 
         assert_eq!(direct.relayer_url, None);
         assert_eq!(direct.relayer_submitters, 0);
-        assert_eq!(relayed.relayer_url, Some("http://relayer:8080".to_string()));
+        assert_eq!(
+            relayed.relayer_url,
+            Some(format!("http://{relayer_key}:8080"))
+        );
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
     }
 

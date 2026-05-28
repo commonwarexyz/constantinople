@@ -18,14 +18,6 @@ spammer-graviton-binary: build-graviton-image
     -e OUTPUT_NAME=spammer \
     constantinople-builder:graviton-local
 
-# Build the ARM64 relayer binary into deploy/
-relayer-graviton-binary: build-graviton-image
-  docker run --rm -v ${PWD}:/constantinople \
-    -e PACKAGE_NAME=constantinople-relayer \
-    -e BINARY_NAME=constantinople-relayer \
-    -e OUTPUT_NAME=relayer \
-    constantinople-builder:graviton-local
-
 # Build the ARM64 chain-indexer binary into deploy/
 chain-indexer-graviton-binary: build-graviton-image
   docker run --rm -v ${PWD}:/constantinople \
@@ -43,7 +35,7 @@ metadata-indexer-graviton-binary: build-graviton-image
     constantinople-builder:graviton-local
 
 # Build all ARM64 binaries into deploy/
-graviton-binaries: validator-graviton-binary spammer-graviton-binary relayer-graviton-binary chain-indexer-graviton-binary metadata-indexer-graviton-binary
+graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-indexer-graviton-binary metadata-indexer-graviton-binary
 
 # Build the Intel/C8i Docker builder image
 build-intel-image:
@@ -65,14 +57,6 @@ spammer-intel-binary: build-intel-image
     -e OUTPUT_NAME=spammer \
     constantinople-builder:intel-local
 
-# Build the Intel relayer binary into deploy/
-relayer-intel-binary: build-intel-image
-  docker run --rm -v ${PWD}:/constantinople \
-    -e PACKAGE_NAME=constantinople-relayer \
-    -e BINARY_NAME=constantinople-relayer \
-    -e OUTPUT_NAME=relayer \
-    constantinople-builder:intel-local
-
 # Build the Intel chain-indexer binary into deploy/
 chain-indexer-intel-binary: build-intel-image
   docker run --rm -v ${PWD}:/constantinople \
@@ -90,4 +74,4 @@ metadata-indexer-intel-binary: build-intel-image
     constantinople-builder:intel-local
 
 # Build all Intel binaries into deploy/
-intel-binaries: validator-intel-binary spammer-intel-binary relayer-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary
+intel-binaries: validator-intel-binary spammer-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary
