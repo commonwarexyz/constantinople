@@ -201,7 +201,7 @@ cargo run --bin constantinople-deploy -- generate \
   --storage-size 75 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --dashboard ./docker/dashboard.json
+  --dashboard ./dashboard.json
 ```
 
 This writes:
@@ -254,7 +254,7 @@ cargo run --bin constantinople-deploy -- generate \
   --storage-size 75 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --dashboard ./docker/dashboard.json
+  --dashboard ./dashboard.json
 ```
 
 This additionally writes `spammer.yaml` and adds a spammer instance to the
@@ -277,7 +277,7 @@ cargo run --bin constantinople-deploy -- generate \
   --storage-size 75 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --dashboard ./docker/dashboard.json
+  --dashboard ./dashboard.json
 ```
 
 This adds one extra secondary validator with a `relayer` section. The relayer listens on the
@@ -345,7 +345,7 @@ cargo run --bin constantinople-deploy -- generate \
   --storage-size 75 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --dashboard ./docker/dashboard.json
+  --dashboard ./dashboard.json
 ```
 
 There are only two remote deployment shapes: validators only when
