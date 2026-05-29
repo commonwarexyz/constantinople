@@ -1808,6 +1808,7 @@ dependencies = [
  "datafusion",
  "exoware-qmdb",
  "exoware-sdk",
+ "exoware-server",
  "exoware-simplex",
  "exoware-simulator",
  "exoware-sql",

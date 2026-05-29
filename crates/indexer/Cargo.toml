@@ -31,6 +31,7 @@ commonware-utils.workspace = true
 # Exoware
 exoware-qmdb.workspace = true
 exoware-sdk.workspace = true
+exoware-server.workspace = true
 exoware-simplex.workspace = true
 exoware-simulator.workspace = true
 exoware-sql.workspace = true
