@@ -4,10 +4,9 @@
     "version": "0.0.0",
     "type": "module",
     "scripts": {
-        "build:wasm": "wasm-pack build ../crates/explorer-crypto --target web --out-dir ../../explorer/src/crypto-wasm",
         "dev": "vite",
         "test": "node --test --experimental-strip-types tests/*.test.ts",
-        "build": "npm run build:wasm && tsc -b && vite build",
+        "build": "tsc -b && vite build",
         "preview": "vite preview"
     },
     "dependencies": {
@@ -15,7 +14,7 @@
         "@connectrpc/connect": "2.1.1",
         "@exowarexyz/qmdb": "file:../../exoware-monorepo-faster-qmdb-uploads/qmdb/ts",
         "@exowarexyz/sdk": "2026.5.0",
-        "@exowarexyz/simplex": "2026.5.0",
+        "@exowarexyz/simplex": "file:../../exoware-monorepo-faster-qmdb-uploads/simplex/ts",
         "@exowarexyz/sql": "2026.5.0",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"

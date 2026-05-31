@@ -1771,22 +1771,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "constantinople-explorer-crypto"
-version = "0.0.0"
-dependencies = [
- "bytes",
- "commonware-codec",
- "commonware-consensus",
- "commonware-cryptography",
- "commonware-parallel",
- "commonware-storage",
- "constantinople-primitives",
- "js-sys",
- "rand 0.8.6",
- "wasm-bindgen",
-]
-
-[[package]]
 name = "constantinople-indexer"
 version = "0.1.0"
 dependencies = [

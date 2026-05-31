@@ -28,7 +28,7 @@ is auto-scaled to the peak in the visible window.
 When the signed-in account submits transactions, the explorer also looks up
 their `tx_meta.qmdb_location`, fetches a transaction operation-log proof from
 `qmdb-indexer` under `/transactions`, verifies it in the browser with the
-WASM verifier in `crates/explorer-crypto`, and shows a checkmark after
+Exoware QMDB and Simplex WASM verifiers, and shows a checkmark after
 verification succeeds.
 
 ### Why SQL, not the raw KV stream?

@@ -14,7 +14,6 @@ resolver = "2"
 members = [
   "crates/application",
   "crates/engine",
-  "crates/explorer-crypto",
   "crates/indexer",
   "crates/mempool",
   "crates/primitives",

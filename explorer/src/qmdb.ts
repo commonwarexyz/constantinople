@@ -3,17 +3,22 @@ import {
     StoreKeyPrefix,
     TraversalMode,
 } from '@exowarexyz/sdk';
-import { fromHex } from './codec';
+import { fromHex, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
-import { SimplexClient } from '@exowarexyz/simplex';
+import {
+    SimplexClient,
+    type VerifiedSimplexCertificate,
+    type SimplexCertificateVerifier,
+} from '@exowarexyz/simplex';
+import { createWasmSimplexVerifier } from '@exowarexyz/simplex/wasm';
 import {
     QmdbOperationLogClient,
     type VerifiedFixedKeylessAppendProof,
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
-import { verifyFinalization } from './crypto-wasm/constantinople_explorer_crypto';
-import { loadCrypto } from './wallet';
 
+const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
+const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
 const TX_BY_HEIGHT_RESERVED_BITS = 4;
 const TX_BY_HEIGHT_PREFIX = 0x6;
 const TX_BY_SENDER_PREFIX = 0x7;
@@ -22,6 +27,8 @@ const MAX_TX_BY_HEIGHT_ROWS = 100_000;
 const ACCOUNT_PAGE_SIZE = 10;
 const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
+const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
+const ED25519_PUBLIC_KEY_BYTES = 32;
 const TX_BY_SENDER_KEY_BYTES = ACCOUNT_KEY_BYTES + 8 + 4;
 const TX_BY_SENDER_ROW_BYTES = DIGEST_BYTES + ACCOUNT_KEY_BYTES + 8 + 8 + 8 + 8 + 4;
 const ACCOUNT_VALUE_BYTES = 16;
@@ -102,7 +109,6 @@ export async function fetchAndVerifyTransactionProof({
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
-    await loadCrypto();
     const target = await finalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
@@ -151,7 +157,6 @@ export async function fetchLatestProofTarget({
     simplexVerificationMaterial: string;
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
-    await loadCrypto();
     return latestProofTarget(storeUrl, simplexVerificationMaterial, signal);
 }
 
@@ -198,7 +203,6 @@ export async function fetchAndVerifyAccountProof({
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
-    await loadCrypto();
     const accountBytes = parseAccountBytes(account);
     const row = await fetchAccountProofRow(storeUrl, accountBytes);
     const stateEnd = target.stateTip;
@@ -242,7 +246,6 @@ export async function fetchAndVerifyTransactionRowProof({
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
-    await loadCrypto();
     assertTransactionLocationBeforeTip(row.qmdLocation, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
@@ -391,15 +394,16 @@ async function fetchFinalizedTransactionTarget(
     height: bigint,
     _signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
-    if (simplexVerificationMaterial.trim().length === 0) {
-        throw new Error('Simplex verification material is not configured');
-    }
-    const simplex = new SimplexClient(trimTrailingSlash(storeUrl));
-    const finalized = await simplex.getFinalizationByHeightRaw(height.toString());
-    if (!finalized) {
+    const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
+    const certificate = await simplex.getFinalizationByHeight(height.toString());
+    if (!certificate) {
         throw new Error(`finalization missing at height ${height}`);
     }
-    return verifyFinalization(fromHex(simplexVerificationMaterial), finalized) as FinalizedTransactionTarget;
+    const target = await finalizedTargetFromCertificate(certificate);
+    if (target.height !== height) {
+        throw new Error(`finalized certificate height ${target.height} does not match requested height ${height}`);
+    }
+    return target;
 }
 
 async function fetchLatestFinalizedTarget(
@@ -407,15 +411,155 @@ async function fetchLatestFinalizedTarget(
     simplexVerificationMaterial: string,
     _signal?: AbortSignal,
 ): Promise<LatestProofTarget> {
+    const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
+    const certificate = await simplex.latestFinalization();
+    if (!certificate) {
+        throw new Error('latest finalization missing');
+    }
+    return finalizedTargetFromCertificate(certificate);
+}
+
+async function verifiedSimplexClient(
+    storeUrl: string,
+    simplexVerificationMaterial: string,
+): Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
     if (simplexVerificationMaterial.trim().length === 0) {
         throw new Error('Simplex verification material is not configured');
     }
-    const simplex = new SimplexClient(trimTrailingSlash(storeUrl));
-    const finalized = await simplex.latestFinalizationRaw();
-    if (!finalized) {
-        throw new Error('latest finalization missing');
+    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(trimTrailingSlash(storeUrl), {
+        verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
+    });
+}
+
+function simplexFinalizationVerifier(
+    simplexVerificationMaterial: string,
+): Promise<SimplexCertificateVerifier<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
+    return createWasmSimplexVerifier({
+        scheme: SIMPLEX_SCHEME,
+        payload: 'coding-commitment',
+        identity: 'ed25519',
+        namespace: CONSENSUS_NAMESPACE,
+        verificationMaterial: fromHex(simplexVerificationMaterial),
+    });
+}
+
+async function finalizedTargetFromCertificate(
+    certificate: VerifiedSimplexCertificate,
+): Promise<FinalizedTransactionTarget> {
+    const certified = certificate.header;
+    if (certificate.payload.length !== COMMITMENT_BYTES) {
+        throw new Error(`certified commitment must be ${COMMITMENT_BYTES} bytes`);
     }
-    return verifyFinalization(fromHex(simplexVerificationMaterial), finalized) as LatestProofTarget;
+    if (certified.length <= COMMITMENT_BYTES) {
+        throw new Error('finalized artifact is missing certified block bytes');
+    }
+    const encodedCommitment = certified.slice(0, COMMITMENT_BYTES);
+    if (!bytesEqual(encodedCommitment, certificate.payload)) {
+        throw new Error('finalized artifact commitment does not match certificate payload');
+    }
+
+    const blockStart = COMMITMENT_BYTES;
+    const header = decodeBlockHeader(certified, blockStart);
+    const headerDigest = new Uint8Array(
+        await crypto.subtle.digest('SHA-256', toArrayBuffer(certified.slice(blockStart, header.endOffset))),
+    );
+    const blockDigest = certificate.payload.slice(0, DIGEST_BYTES);
+    if (!bytesEqual(headerDigest, blockDigest)) {
+        throw new Error('certified commitment does not match finalized block header digest');
+    }
+
+    return {
+        height: header.height,
+        view: certificate.view,
+        transactionsRoot: header.transactionsRoot,
+        transactionsStart: header.transactionsStart,
+        transactionsTip: header.transactionsTip,
+        stateRoot: header.stateRoot,
+        stateStart: header.stateStart,
+        stateTip: header.stateTip,
+        blockDigest,
+    };
+}
+
+interface DecodedBlockHeader {
+    readonly height: bigint;
+    readonly stateRoot: Uint8Array;
+    readonly stateStart: bigint;
+    readonly stateTip: bigint;
+    readonly transactionsRoot: Uint8Array;
+    readonly transactionsStart: bigint;
+    readonly transactionsTip: bigint;
+    readonly endOffset: number;
+}
+
+function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeader {
+    // Header<Commitment, Sha256, Ed25519>: Context, parent digest, height,
+    // timestamp, state target, and transaction target. We keep this parser
+    // narrow and verify the exact encoded header hash before trusting fields.
+    offset = readVarint(bytes, offset).offset; // context.round.epoch
+    offset = readVarint(bytes, offset).offset; // context.round.view
+    offset = skip(bytes, offset, ED25519_PUBLIC_KEY_BYTES); // context.leader
+    offset = readVarint(bytes, offset).offset; // context.parent.view
+    offset = skip(bytes, offset, COMMITMENT_BYTES); // context.parent.digest
+    offset = skip(bytes, offset, DIGEST_BYTES); // header.parent
+    const height = readU64Be(bytes, offset);
+    offset = skip(bytes, offset, 8);
+    offset = skip(bytes, offset, 8); // header.timestamp
+    const stateRoot = readBytes(bytes, offset, DIGEST_BYTES);
+    offset = skip(bytes, offset, DIGEST_BYTES);
+    const stateStart = readU64Be(bytes, offset);
+    offset = skip(bytes, offset, 8);
+    const stateTip = readU64Be(bytes, offset);
+    offset = skip(bytes, offset, 8);
+    const transactionsRoot = readBytes(bytes, offset, DIGEST_BYTES);
+    offset = skip(bytes, offset, DIGEST_BYTES);
+    const transactionsStart = readU64Be(bytes, offset);
+    offset = skip(bytes, offset, 8);
+    const transactionsTip = readU64Be(bytes, offset);
+    offset = skip(bytes, offset, 8);
+    if (stateStart >= stateTip || transactionsStart >= transactionsTip) {
+        throw new Error('finalized block contains an empty QMDB range');
+    }
+    return {
+        height,
+        stateRoot,
+        stateStart,
+        stateTip,
+        transactionsRoot,
+        transactionsStart,
+        transactionsTip,
+        endOffset: offset,
+    };
+}
+
+function readBytes(bytes: Uint8Array, offset: number, length: number): Uint8Array {
+    skip(bytes, offset, length);
+    return bytes.slice(offset, offset + length);
+}
+
+function skip(bytes: Uint8Array, offset: number, length: number): number {
+    const next = offset + length;
+    if (offset < 0 || next > bytes.length) {
+        throw new Error('finalized block header is truncated');
+    }
+    return next;
+}
+
+function readVarint(bytes: Uint8Array, offset: number): { value: bigint; offset: number } {
+    let value = 0n;
+    let shift = 0n;
+    for (let count = 0; count < 10; count++) {
+        if (offset >= bytes.length) {
+            throw new Error('finalized block header is truncated');
+        }
+        const byte = bytes[offset++];
+        value |= BigInt(byte & 0x7f) << shift;
+        if ((byte & 0x80) === 0) {
+            return { value, offset };
+        }
+        shift += 7n;
+    }
+    throw new Error('finalized block header varint is too long');
 }
 
 async function fetchAccountProofRow(storeUrl: string, account: Uint8Array): Promise<AccountProofRow> {
