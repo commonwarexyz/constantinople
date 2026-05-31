@@ -55,10 +55,6 @@ const ESTIMATED_QMDB_STORE_ROW_BYTES: usize = 256;
 /// QMDB prepared uploads are large during catch-up. Keep the pipeline shallow
 /// so slow remote commits backpressure consensus instead of growing memory.
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 8;
-/// Allow remote Store writes to overlap without building an unbounded backlog.
-const MAX_IN_FLIGHT_QMDB_COMMITS: usize = 8;
-/// Coalesce already-prepared finalized blocks without waiting for future ones.
-const MAX_UPLOADS_PER_COMMIT: usize = 8;
 
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
@@ -268,6 +264,7 @@ where
         let (commit_tx, commit_rx) = mpsc::channel(buffer);
         let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
         let prepare_limit = Arc::new(Semaphore::new(buffer));
+        let max_in_flight_commits = buffer;
         let commit_context = context.child("commit");
         let prepare_context = context.child("prepare");
         let commit_join = tokio::spawn(run_qmdb_committer(
@@ -277,6 +274,7 @@ where
             state_writer.clone(),
             transaction_writer.clone(),
             commit_rx,
+            max_in_flight_commits,
         ));
         let prepare_join = tokio::spawn(run_qmdb_preparer(
             prepare_context,
@@ -647,6 +645,7 @@ async fn run_qmdb_committer<Cx, H>(
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     mut rx: mpsc::Receiver<PreparedQmdbUpload>,
+    max_in_flight_commits: usize,
 ) where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
@@ -656,7 +655,7 @@ async fn run_qmdb_committer<Cx, H>(
     let mut rx_closed = false;
     let mut commits = JoinSet::new();
     loop {
-        while commits.len() < MAX_IN_FLIGHT_QMDB_COMMITS {
+        while commits.len() < max_in_flight_commits {
             let first = match next.take() {
                 Some(upload) => upload,
                 None if rx_closed => break,
@@ -698,7 +697,7 @@ async fn run_qmdb_committer<Cx, H>(
         }
 
         tokio::select! {
-            maybe_upload = rx.recv(), if !rx_closed && commits.len() < MAX_IN_FLIGHT_QMDB_COMMITS && next.is_none() => {
+            maybe_upload = rx.recv(), if !rx_closed && commits.len() < max_in_flight_commits && next.is_none() => {
                 match maybe_upload {
                     Some(upload) => next = Some(upload),
                     None => rx_closed = true,
@@ -995,7 +994,7 @@ fn next_commit_uploads<T>(
     let mut bytes = estimated_store_bytes(&first);
     let mut uploads = Vec::new();
     uploads.push(first);
-    while uploads.len() < MAX_UPLOADS_PER_COMMIT && bytes < MAX_COMMIT_STORE_BYTES {
+    while bytes < MAX_COMMIT_STORE_BYTES {
         let Ok(upload) = rx.try_recv() else {
             break;
         };
@@ -1658,17 +1657,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn qmd_commit_group_respects_upload_count_limit() {
-        let (tx, mut rx) = mpsc::channel(16);
-        for _ in 0..MAX_UPLOADS_PER_COMMIT {
+    async fn qmd_commit_group_drains_ready_uploads_until_byte_limit() {
+        let queued = 24usize;
+        let (tx, mut rx) = mpsc::channel(queued);
+        for _ in 0..queued {
             tx.send(1_000usize).await.expect("send queued upload");
         }
 
         let (uploads, deferred) = next_commit_uploads(1_000, &mut rx, |_| 1_000);
 
-        assert_eq!(uploads.len(), MAX_UPLOADS_PER_COMMIT);
+        assert_eq!(uploads.len(), queued + 1);
         assert_eq!(deferred, None);
-        assert_eq!(rx.try_recv().expect("one upload remains queued"), 1_000);
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
