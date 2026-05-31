@@ -64,10 +64,20 @@ single store can host every index without collision.
 
 ## Back-pressure model
 
-The publisher runs after finalized database application and before prune.
-It prepares QMDB rows concurrently, stages raw KV rows and SQL rows beside
-them, commits one Store batch, then marks SQL and QMDB uploads persisted. Flush
-errors retry indefinitely with a capped exponential backoff so a transient
-store outage slows the engine down rather than dropping data.
+The finalized hook runs after finalized database application and before prune.
+It writes a durable finalized upload queue entry before returning to consensus.
+That entry is deliberately the pre-prune boundary: it contains the finalized
+block, finalized timestamp, QMDB writer cursors, and the account-state delta
+that must be read while the local QMDB can still prove the finalized range.
+
+The background uploader derives the rest from that durable entry: raw KV rows,
+SQL `block_meta` rows, transaction-hash QMDB operations, account lookup rows,
+watermarks, and the final Store batch. This keeps SQL and raw-row encoding off
+the durable queue write path while still making recovery independent from local
+database pruning.
+
+Remote Store commits retry indefinitely with a capped exponential backoff using
+the fully staged `StoreWriteBatch`, so a transient store outage stalls queued
+upload progress rather than dropping data.
 
 [`Exact`]: https://docs.rs/commonware-utils/latest/commonware_utils/acknowledgement/struct.Exact.html

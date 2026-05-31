@@ -105,6 +105,15 @@ impl Default for QueuedFinalizedUploadCfg {
 }
 
 /// Finalized-block data that must be captured before application pruning.
+///
+/// The durable queue intentionally stores the narrow pre-prune boundary, not a
+/// fully staged Store upload. The state delta must be read while the local QMDB
+/// can still prove the finalized range. The block, timestamp, and writer
+/// cursors are enough to deterministically derive raw KV rows, SQL metadata,
+/// transaction QMDB operations, and account lookup rows later in the uploader.
+///
+/// Keeping those derived rows out of the queue reduces queue write size and
+/// keeps finalized-block processing independent from remote Store latency.
 #[derive(Clone)]
 pub struct QueuedFinalizedUpload<H, P>
 where
@@ -557,8 +566,13 @@ where
 
     /// Capture the finalized-block upload material that must survive local pruning.
     ///
-    /// This deliberately stops at the durable local payload boundary. Remote Store
-    /// staging and upload are handled later by the queue consumer.
+    /// This deliberately stops at the durable local payload boundary. Remote
+    /// Store staging and upload are handled later by the queue consumer:
+    ///
+    /// - captured here: block, finalized timestamp, QMDB writer cursors, and
+    ///   the state operation delta that can be lost after local pruning;
+    /// - derived later: raw KV rows, SQL metadata rows, transaction QMDB ops,
+    ///   account lookup rows, watermarks, and the final Store batch.
     pub async fn build_queued_finalized_upload_with_context<Cx, E, S>(
         context: Cx,
         state_writer_next: u64,
@@ -871,6 +885,9 @@ where
         transaction_end: _,
         state_delta,
     } = upload;
+    // This is the upload-time half of the durable queue contract: only data
+    // that had to survive prune is persisted in the queue. Everything below is
+    // deterministic from the queued block, timestamp, cursors, and state delta.
     let block_rows = encode_indexed_block_rows_at(&block, finalized_ts_micros);
     let transaction_ops = build_transaction_upload_from_digests(
         &block,
@@ -1162,15 +1179,15 @@ where
             );
             let mut sql = sql;
             if let Some(prepared) = &mut sql {
-                sql_writer.stage_flush_owned(prepared, &mut store_batch)?;
+                sql_writer.stage_flush(prepared, &mut store_batch)?;
             }
             let mut state_uploads = state_uploads;
             for upload in &mut state_uploads {
-                state_writer.stage_upload_owned(upload, &mut store_batch)?;
+                state_writer.stage_upload(upload, &mut store_batch)?;
             }
             let mut transaction_uploads = transaction_uploads;
             for upload in &mut transaction_uploads {
-                transaction_writer.stage_upload_owned(upload, &mut store_batch)?;
+                transaction_writer.stage_upload(upload, &mut store_batch)?;
             }
             if let Some(prepared) = &state_watermark {
                 state_writer.stage_flush(prepared, &mut store_batch)?;

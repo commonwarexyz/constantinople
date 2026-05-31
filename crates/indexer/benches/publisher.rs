@@ -218,13 +218,13 @@ async fn upload_combined(
     sql: Vec<SqlRow>,
 ) {
     insert_sql_rows(writer, &sql);
-    let mut prepared = writer
+    let prepared = writer
         .prepare_flush()
         .expect("sql prepare")
         .expect("sql rows are present");
     let mut batch = StoreWriteBatch::from_physical_entry_groups([raw], prepared.entry_count());
     writer
-        .stage_flush_owned(&mut prepared, &mut batch)
+        .stage_flush(&prepared, &mut batch)
         .expect("sql rows stage");
     let seq = batch.commit(client).await.expect("combined commit");
     writer.mark_flush_persisted(prepared, seq);
