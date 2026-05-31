@@ -108,9 +108,10 @@ impl Default for QueuedFinalizedUploadCfg {
 ///
 /// The durable queue intentionally stores the narrow pre-prune boundary, not a
 /// fully staged Store upload. The state delta must be read while the local QMDB
-/// can still prove the finalized range. The block, timestamp, and writer
+/// can still prove the finalized range. The block, timestamp, and writer start
 /// cursors are enough to deterministically derive raw KV rows, SQL metadata,
-/// transaction QMDB operations, and account lookup rows later in the uploader.
+/// transaction QMDB operations, account lookup rows, and writer end cursors
+/// later in the uploader.
 ///
 /// Keeping those derived rows out of the queue reduces queue write size and
 /// keeps finalized-block processing independent from remote Store latency.
@@ -123,9 +124,7 @@ where
     block: EngineBlock<H, P>,
     finalized_ts_micros: i64,
     state_start: u64,
-    state_end: u64,
     transaction_start: u64,
-    transaction_end: u64,
     state_delta: Vec<StateOperation>,
 }
 
@@ -142,16 +141,17 @@ where
         self.state_start
     }
 
-    pub const fn state_end(&self) -> u64 {
-        self.state_end
+    pub fn state_end(&self) -> u64 {
+        self.block.header.state_range.end()
     }
 
     pub const fn transaction_start(&self) -> u64 {
         self.transaction_start
     }
 
-    pub const fn transaction_end(&self) -> u64 {
-        self.transaction_end
+    pub fn transaction_end(&self) -> u64 {
+        transaction_upload_end(self.transaction_start, &self.block)
+            .expect("queued finalized upload stores a validated transaction cursor")
     }
 
     pub const fn block(&self) -> &EngineBlock<H, P> {
@@ -170,9 +170,7 @@ where
         self.block.encode_size()
             + self.finalized_ts_micros.encode_size()
             + self.state_start.encode_size()
-            + self.state_end.encode_size()
             + self.transaction_start.encode_size()
-            + self.transaction_end.encode_size()
             + self.state_delta.encode_size()
     }
 }
@@ -188,9 +186,7 @@ where
         self.block.write(buf);
         self.finalized_ts_micros.write(buf);
         self.state_start.write(buf);
-        self.state_end.write(buf);
         self.transaction_start.write(buf);
-        self.transaction_end.write(buf);
         self.state_delta.write(buf);
     }
 }
@@ -209,9 +205,7 @@ where
             block: EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?,
             finalized_ts_micros: i64::read(buf)?,
             state_start: u64::read(buf)?,
-            state_end: u64::read(buf)?,
             transaction_start: u64::read(buf)?,
-            transaction_end: u64::read(buf)?,
             state_delta: Vec::<StateOperation>::read_cfg(buf, &(cfg.state_ops, ()))?,
         })
     }
@@ -569,8 +563,8 @@ where
     /// This deliberately stops at the durable local payload boundary. Remote
     /// Store staging and upload are handled later by the queue consumer:
     ///
-    /// - captured here: block, finalized timestamp, QMDB writer cursors, and
-    ///   the state operation delta that can be lost after local pruning;
+    /// - captured here: block, finalized timestamp, QMDB writer start cursors,
+    ///   and the state operation delta that can be lost after local pruning;
     /// - derived later: raw KV rows, SQL metadata rows, transaction QMDB ops,
     ///   account lookup rows, watermarks, and the final Store batch.
     pub async fn build_queued_finalized_upload_with_context<Cx, E, S>(
@@ -587,7 +581,7 @@ where
     {
         let state_end = block.header.state_range.end();
         validate_writer_range(state_writer_next, state_end, block.header.height)?;
-        let transaction_end = transaction_upload_end(transaction_writer_next, block)?;
+        transaction_upload_end(transaction_writer_next, block)?;
         let block = block.clone();
         let state_block = block.clone();
         let state_db = databases.0.clone();
@@ -604,9 +598,7 @@ where
             block,
             finalized_ts_micros: current_time_micros(),
             state_start: state_writer_next,
-            state_end,
             transaction_start: transaction_writer_next,
-            transaction_end,
             state_delta: state.delta,
         })
     }
@@ -619,7 +611,9 @@ where
         let mut state_next = self.state_next_location.lock().await;
         let mut transaction_next = self.transaction_next_location.lock().await;
 
-        if *state_next >= upload.state_end && *transaction_next >= upload.transaction_end {
+        let state_end = upload.state_end();
+        let transaction_end = upload.transaction_end();
+        if *state_next >= state_end && *transaction_next >= transaction_end {
             return Ok(UploadCompletion::completed());
         }
         if *state_next != upload.state_start {
@@ -636,8 +630,6 @@ where
         }
 
         let height = upload.height();
-        let state_end = upload.state_end;
-        let transaction_end = upload.transaction_end;
         let (completion, rx) = oneshot::channel();
         let prepare_tx = self
             .prepare_tx
@@ -880,9 +872,7 @@ where
         block,
         finalized_ts_micros,
         state_start,
-        state_end: _,
         transaction_start,
-        transaction_end: _,
         state_delta,
     } = upload;
     // This is the upload-time half of the durable queue contract: only data

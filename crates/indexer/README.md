@@ -67,8 +67,9 @@ single store can host every index without collision.
 The finalized hook runs after finalized database application and before prune.
 It writes a durable finalized upload queue entry before returning to consensus.
 That entry is deliberately the pre-prune boundary: it contains the finalized
-block, finalized timestamp, QMDB writer cursors, and the account-state delta
+block, finalized timestamp, QMDB writer start cursors, and the account-state delta
 that must be read while the local QMDB can still prove the finalized range.
+The writer end cursors are derived from the block header and start cursors.
 
 The background uploader derives the rest from that durable entry: raw KV rows,
 SQL `block_meta` rows, transaction-hash QMDB operations, account lookup rows,
