@@ -13,9 +13,10 @@
     "dependencies": {
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
-        "@exowarexyz/sdk": "file:vendor/exoware-sdk",
-        "@exowarexyz/simplex": "file:vendor/exoware-simplex",
-        "@exowarexyz/sql": "file:vendor/exoware-sql",
+        "@exowarexyz/qmdb": "file:../../exoware-monorepo-faster-qmdb-uploads/qmdb/ts",
+        "@exowarexyz/sdk": "2026.5.0",
+        "@exowarexyz/simplex": "2026.5.0",
+        "@exowarexyz/sql": "2026.5.0",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"
     },

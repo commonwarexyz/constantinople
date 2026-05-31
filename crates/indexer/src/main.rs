@@ -1,21 +1,18 @@
 //! Shared backing-store binary for the indexer stack.
 //!
-//! `chain-indexer` wraps the exoware simulator store. It supports both
+//! `chain-indexer` serves the exoware simulator store. It supports both
 //! direct local invocations (`--port`, `--data-dir`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
 
 use axum::{Router, routing::get};
-use bytes::Bytes;
 use clap::{ArgGroup, Parser};
-use exoware_server::QueryExtra;
-use exoware_simulator::{AppState, Ingest, Log, Prune, Query, RocksStore, Sequence, connect_stack};
+use exoware_simulator::{AppState, RocksStore, connect_stack};
 use serde::Deserialize;
 use std::{
     fs,
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -83,99 +80,12 @@ fn load_settings(cli: Cli) -> (PathBuf, u16) {
     )
 }
 
-#[derive(Clone)]
-struct OrderedStore<E> {
-    inner: E,
-    put_lock: Arc<Mutex<()>>,
-}
-
-impl<E> OrderedStore<E> {
-    fn new(inner: E) -> Self {
-        Self {
-            inner,
-            put_lock: Arc::new(Mutex::new(())),
-        }
-    }
-}
-
-impl<E> Sequence for OrderedStore<E>
-where
-    E: Sequence,
-{
-    fn current_sequence(&self) -> u64 {
-        self.inner.current_sequence()
-    }
-}
-
-impl<E> Ingest for OrderedStore<E>
-where
-    E: Ingest,
-{
-    async fn put_batch(&self, kvs: Vec<(Bytes, Bytes)>) -> Result<u64, String> {
-        let _permit = self.put_lock.lock().await;
-        self.inner.put_batch(kvs).await
-    }
-}
-
-impl<E> Query for OrderedStore<E>
-where
-    E: Query,
-{
-    type RangeScan = E::RangeScan;
-
-    async fn get(&self, key: Bytes) -> Result<(Option<Vec<u8>>, QueryExtra), String> {
-        self.inner.get(key).await
-    }
-
-    async fn range_scan(
-        &self,
-        start: Bytes,
-        end: Bytes,
-        limit: usize,
-        forward: bool,
-    ) -> Result<Self::RangeScan, String> {
-        self.inner.range_scan(start, end, limit, forward).await
-    }
-
-    async fn get_many(
-        &self,
-        keys: Vec<Bytes>,
-    ) -> Result<(Vec<(Vec<u8>, Option<Vec<u8>>)>, QueryExtra), String> {
-        self.inner.get_many(keys).await
-    }
-}
-
-impl<E> Prune for OrderedStore<E>
-where
-    E: Prune,
-{
-    async fn apply_prune_policies(
-        &self,
-        document: exoware_sdk::prune_policy::PrunePolicyDocument,
-    ) -> Result<(), String> {
-        self.inner.apply_prune_policies(document).await
-    }
-}
-
-impl<E> Log for OrderedStore<E>
-where
-    E: Log,
-{
-    async fn get_batch(&self, sequence_number: u64) -> Result<Option<Vec<(Bytes, Bytes)>>, String> {
-        self.inner.get_batch(sequence_number).await
-    }
-
-    async fn oldest_retained_batch(&self) -> Result<Option<u64>, String> {
-        self.inner.oldest_retained_batch().await
-    }
-}
-
 async fn health() -> &'static str {
     "ok"
 }
 
 async fn run(data_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let engine = Arc::new(OrderedStore::new(RocksStore::open(data_dir)?));
+    let engine = Arc::new(RocksStore::open(data_dir)?);
     let connect = connect_stack(AppState::new(engine));
     let app = Router::new()
         .route("/health", get(health))
@@ -213,20 +123,13 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, OrderedStore, load_settings};
-    use bytes::Bytes;
+    use super::{Cli, load_settings};
     use clap::Parser;
-    use exoware_simulator::{Ingest, Sequence};
     use std::{
         fs,
         path::PathBuf,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
         time::{SystemTime, UNIX_EPOCH},
     };
-    use tokio::time::{Duration, sleep};
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -234,29 +137,6 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         std::env::temp_dir().join(format!("{prefix}-{unique}{suffix}"))
-    }
-
-    #[derive(Clone, Default)]
-    struct ConcurrentPutProbe {
-        active: Arc<AtomicUsize>,
-        max_active: Arc<AtomicUsize>,
-        next_sequence: Arc<AtomicUsize>,
-    }
-
-    impl Sequence for ConcurrentPutProbe {
-        fn current_sequence(&self) -> u64 {
-            self.next_sequence.load(Ordering::SeqCst) as u64
-        }
-    }
-
-    impl Ingest for ConcurrentPutProbe {
-        async fn put_batch(&self, _kvs: Vec<(Bytes, Bytes)>) -> Result<u64, String> {
-            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
-            self.max_active.fetch_max(active, Ordering::SeqCst);
-            sleep(Duration::from_millis(5)).await;
-            self.active.fetch_sub(1, Ordering::SeqCst);
-            Ok(self.next_sequence.fetch_add(1, Ordering::SeqCst) as u64 + 1)
-        }
     }
 
     #[test]
@@ -316,27 +196,5 @@ mod tests {
         );
 
         let _ = fs::remove_file(config_path);
-    }
-
-    #[tokio::test]
-    async fn ordered_store_serializes_backend_puts() {
-        let probe = ConcurrentPutProbe::default();
-        let store = OrderedStore::new(probe.clone());
-        let mut puts = Vec::new();
-
-        for _ in 0..16 {
-            let store = store.clone();
-            puts.push(tokio::spawn(async move {
-                store
-                    .put_batch(vec![(Bytes::from_static(b"k"), Bytes::from_static(b"v"))])
-                    .await
-                    .expect("put should succeed");
-            }));
-        }
-        for put in puts {
-            put.await.expect("put task should not panic");
-        }
-
-        assert_eq!(probe.max_active.load(Ordering::SeqCst), 1);
     }
 }

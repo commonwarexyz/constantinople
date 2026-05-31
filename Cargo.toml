@@ -65,12 +65,12 @@ commonware-consensus = "2026.5.0"
 commonware-cryptography = { version = "2026.5.0", default-features = false }
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "eb7f774ee3a994215853d33903c2f7b522ab0ca6" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "eb7f774ee3a994215853d33903c2f7b522ab0ca6" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "eb7f774ee3a994215853d33903c2f7b522ab0ca6" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "eb7f774ee3a994215853d33903c2f7b522ab0ca6" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "eb7f774ee3a994215853d33903c2f7b522ab0ca6" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "eb7f774ee3a994215853d33903c2f7b522ab0ca6" }
+exoware-sdk = { path = "../exoware-monorepo-faster-qmdb-uploads/sdk/rs" }
+exoware-server = { path = "../exoware-monorepo-faster-qmdb-uploads/server" }
+exoware-qmdb = { path = "../exoware-monorepo-faster-qmdb-uploads/qmdb/rs" }
+exoware-simplex = { path = "../exoware-monorepo-faster-qmdb-uploads/simplex/rs" }
+exoware-simulator = { path = "../exoware-monorepo-faster-qmdb-uploads/examples/simulator" }
+exoware-sql = { path = "../exoware-monorepo-faster-qmdb-uploads/sql/rs" }
 datafusion = "52"
 
 # Other

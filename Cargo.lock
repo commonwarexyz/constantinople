@@ -818,9 +818,9 @@ dependencies = [
 
 [[package]]
 name = "buffa"
-version = "0.3.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df3fea50199859017c80584fef221c61abb882c69ed5b6e30a0bf75864e3c505"
+checksum = "941c714734a660caa93a210c531dec553cc0ef417890409914d24032c94ab840"
 dependencies = [
  "base64",
  "bytes",
@@ -833,9 +833,9 @@ dependencies = [
 
 [[package]]
 name = "buffa-codegen"
-version = "0.3.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f9ddcb25f0dde4d82e0a1128b0c459feba775e24dfa7cb0c3f4a9d61abfa245"
+checksum = "693ea91be01336fb0084b2e7bb071be7393224c72f737c846471e4013e58c327"
 dependencies = [
  "buffa",
  "buffa-descriptor",
@@ -848,20 +848,23 @@ dependencies = [
 
 [[package]]
 name = "buffa-descriptor"
-version = "0.3.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a0794ed1f8a0c6ab168c70258e21cf74ca7b87a7dd888a0a69745b075f2d351"
+checksum = "ad8df83adfcb525621f5a96c88e610f90aff1112ec57522d9b48a943df327394"
 dependencies = [
  "buffa",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "buffa-types"
-version = "0.3.0"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b4d80c9929af9fcc673653b99f81c1d13aa32c2bb329bb1ef02ec533994389c6"
+checksum = "fc84fac1e7efc335e74934a4ebe0534a30411ec2ea6a5a17ed294201c6b3b23c"
 dependencies = [
  "buffa",
+ "bytes",
  "serde",
  "serde_json",
  "thiserror",
@@ -1589,11 +1592,12 @@ checksum = "cc14f565cf027a105f7a44ccf9e5b424348421a1d8952a8fc9d499d313107789"
 
 [[package]]
 name = "connectrpc"
-version = "0.3.3"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e9191b8c90cfc0d27f3df209ea83fa1cb1f9b7e81480bc9d89661be41350778"
+checksum = "1da5e4adde184f69e64ef112c6f8b645afe9ff82466761f8fc348dbd36aaee7e"
 dependencies = [
  "async-compression",
+ "async-trait",
  "axum",
  "base64",
  "buffa",
@@ -1614,14 +1618,15 @@ dependencies = [
  "tokio-util",
  "tower",
  "tracing",
+ "wasm-bindgen-futures",
  "zstd",
 ]
 
 [[package]]
 name = "connectrpc-build"
-version = "0.3.3"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "591bc832b8d3faef060e435f832a1cf10a71c865dfb49f9874247769b60ef816"
+checksum = "ef0a867ba86814d6a8f85e5784e1c89c2f3340c59f95625e0de97a587a4a1e4a"
 dependencies = [
  "anyhow",
  "buffa",
@@ -1632,9 +1637,9 @@ dependencies = [
 
 [[package]]
 name = "connectrpc-codegen"
-version = "0.3.3"
+version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "109a2352193792931d41e5cb3b048985371d5c6505f736f9b9a7ae606d5a0050"
+checksum = "20923a890d45f23df73ad0af5d40b0a0784e7c43993d78a9264a1a1d03983a66"
 dependencies = [
  "anyhow",
  "buffa",
@@ -3006,8 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "exoware-qmdb"
-version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+version = "2026.5.0"
 dependencies = [
  "axum",
  "buffa",
@@ -3036,8 +3040,7 @@ dependencies = [
 
 [[package]]
 name = "exoware-sdk"
-version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+version = "2026.5.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -3063,8 +3066,7 @@ dependencies = [
 
 [[package]]
 name = "exoware-server"
-version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+version = "2026.5.0"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -3079,16 +3081,18 @@ dependencies = [
 
 [[package]]
 name = "exoware-simplex"
-version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+version = "2026.5.0"
 dependencies = [
  "bytes",
  "clap",
+ "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-math",
  "commonware-parallel",
+ "commonware-resolver",
+ "commonware-runtime",
  "commonware-utils",
  "exoware-sdk",
  "futures",
@@ -3102,8 +3106,7 @@ dependencies = [
 
 [[package]]
 name = "exoware-simulator"
-version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+version = "2026.5.0"
 dependencies = [
  "axum",
  "bytes",
@@ -3121,8 +3124,7 @@ dependencies = [
 
 [[package]]
 name = "exoware-sql"
-version = "2026.4.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=eb7f774ee3a994215853d33903c2f7b522ab0ca6#eb7f774ee3a994215853d33903c2f7b522ab0ca6"
+version = "2026.5.0"
 dependencies = [
  "async-trait",
  "axum",

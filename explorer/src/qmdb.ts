@@ -1,7 +1,4 @@
-import { create } from '@bufbuild/protobuf';
-import { createClient } from '@connectrpc/connect';
 import {
-    createTransport,
     Client,
     StoreKeyPrefix,
     TraversalMode,
@@ -9,13 +6,13 @@ import {
 import { fromHex } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import { SimplexClient } from '@exowarexyz/simplex';
-import { verifyAccountProof, verifyFinalization, verifyTransactionProof } from './crypto-wasm/constantinople_explorer_crypto';
-import { loadCrypto } from './wallet';
 import {
-    GetOperationRangeRequestSchema,
-    OperationLogService,
-} from '../vendor/exoware-qmdb/src/generated/proto/qmdb/v1/operation_log_pb';
-import { HistoricalOperationRangeProof } from '../vendor/exoware-qmdb/src/generated/proto/qmdb/v1/proof_pb';
+    QmdbOperationLogClient,
+    type VerifiedFixedKeylessAppendProof,
+    type VerifiedFixedUnorderedUpdateProof,
+} from '@exowarexyz/qmdb';
+import { verifyFinalization } from './crypto-wasm/constantinople_explorer_crypto';
+import { loadCrypto } from './wallet';
 
 const TX_BY_HEIGHT_RESERVED_BITS = 4;
 const TX_BY_HEIGHT_PREFIX = 0x6;
@@ -27,7 +24,8 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const TX_BY_SENDER_KEY_BYTES = ACCOUNT_KEY_BYTES + 8 + 4;
 const TX_BY_SENDER_ROW_BYTES = DIGEST_BYTES + ACCOUNT_KEY_BYTES + 8 + 8 + 8 + 8 + 4;
-const ACCOUNT_ROW_BYTES = 16 + 8;
+const ACCOUNT_VALUE_BYTES = 16;
+const ACCOUNT_ROW_BYTES = ACCOUNT_VALUE_BYTES + 8;
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -121,21 +119,18 @@ export async function fetchAndVerifyTransactionProof({
     }
 
     const tip = transactionProofTip(target.transactionsTip);
-    const proof = await fetchOperationProof(`${trimTrailingSlash(qmdbUrl)}/transactions`, metadata.location, tip, signal);
-    let verification: WasmTransactionProof;
+    let verification: VerifiedFixedKeylessAppendProof;
     try {
-        verification = verifyTransactionProof(
-            target.transactionsRoot,
-            proof.proof,
-            proof.opsRoot,
-            proof.opsRootWitness,
-            proof.startLocation,
-            proof.encodedOperations,
+        verification = await fetchFixedKeylessAppendProof(
+            `${trimTrailingSlash(qmdbUrl)}/transactions`,
             metadata.location,
+            tip,
+            target.transactionsRoot,
             fromHex(digest),
-        ) as WasmTransactionProof;
+            signal,
+        );
     } catch (error) {
-        throw new Error(transactionProofErrorDetail(error, target, metadata, proof));
+        throw new Error(transactionProofErrorDetail(error, target, metadata));
     }
 
     return {
@@ -212,25 +207,24 @@ export async function fetchAndVerifyAccountProof({
     }
 
     const tip = transactionProofTip(stateEnd);
-    const proof = await fetchOperationProof(`${trimTrailingSlash(qmdbUrl)}/state`, row.location, tip, signal);
-    const verification = verifyAccountProof(
-        target.stateRoot,
-        proof.proof,
-        proof.opsRoot,
-        proof.opsRootWitness,
-        proof.startLocation,
-        proof.encodedOperations,
+    const verification = await fetchFixedUnorderedUpdateProof(
+        `${trimTrailingSlash(qmdbUrl)}/state`,
         row.location,
+        tip,
+        target.stateRoot,
         accountBytes,
-    ) as WasmAccountProof;
+        ACCOUNT_VALUE_BYTES,
+        signal,
+    );
+    const accountValue = decodeAccountValue(verification.value);
 
-    if (verification.balance !== row.balance || verification.nonce !== row.nonce) {
+    if (accountValue.balance !== row.balance || accountValue.nonce !== row.nonce) {
         throw new Error('account proof value does not match account index row');
     }
 
     return {
-        balance: verification.balance,
-        nonce: verification.nonce,
+        balance: accountValue.balance,
+        nonce: accountValue.nonce,
         location: row.location,
         tip,
         proofSizeBytes: verification.proofSizeBytes,
@@ -252,17 +246,14 @@ export async function fetchAndVerifyTransactionRowProof({
     assertTransactionLocationBeforeTip(row.qmdLocation, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
-    const proof = await fetchOperationProof(`${trimTrailingSlash(qmdbUrl)}/transactions`, row.qmdLocation, tip, signal);
-    const verification = verifyTransactionProof(
-        target.transactionsRoot,
-        proof.proof,
-        proof.opsRoot,
-        proof.opsRootWitness,
-        proof.startLocation,
-        proof.encodedOperations,
+    const verification = await fetchFixedKeylessAppendProof(
+        `${trimTrailingSlash(qmdbUrl)}/transactions`,
         row.qmdLocation,
+        tip,
+        target.transactionsRoot,
         fromHex(row.digest),
-    ) as WasmTransactionProof;
+        signal,
+    );
 
     return {
         location: row.qmdLocation,
@@ -312,7 +303,6 @@ function transactionProofErrorDetail(
     error: unknown,
     target: FinalizedTransactionTarget,
     metadata: TransactionProofMetadata,
-    proof: HistoricalOperationRangeProof,
 ): string {
     const reason = error instanceof Error ? error.message : String(error);
     return [
@@ -320,32 +310,57 @@ function transactionProofErrorDetail(
         `height ${target.height.toString()}`,
         `location ${metadata.location.toString()}`,
         `tip ${transactionProofTip(target.transactionsTip).toString()}`,
-        `proof start ${proof.startLocation.toString()}`,
-        `ops ${proof.encodedOperations.length}`,
+        `proof start ${metadata.location.toString()}`,
+        'ops 1',
         `block index ${metadata.blockIndex}`,
         `block txs ${metadata.blockTransactionCount}`,
     ].join(' · ');
 }
 
-async function fetchOperationProof(
+async function fetchFixedKeylessAppendProof(
     serviceUrl: string,
     location: bigint,
     tip: bigint,
+    expectedRoot: Uint8Array,
+    expectedValue: Uint8Array,
     signal?: AbortSignal,
 ) {
-    const rpc = createClient(OperationLogService, createTransport(serviceUrl));
-    const response = await rpc.getOperationRange(
-        create(GetOperationRangeRequestSchema, {
+    const client = new QmdbOperationLogClient(serviceUrl);
+    return client.getFixedKeylessAppend(
+        {
             tip,
             startLocation: location,
             maxLocations: 1,
-        }),
+        },
+        expectedRoot,
+        location,
+        expectedValue,
         { signal },
     );
-    if (!response.proof) {
-        throw new Error('QMDB transaction proof response missing proof');
-    }
-    return response.proof;
+}
+
+async function fetchFixedUnorderedUpdateProof(
+    serviceUrl: string,
+    location: bigint,
+    tip: bigint,
+    expectedRoot: Uint8Array,
+    expectedKey: Uint8Array,
+    valueSize: number,
+    signal?: AbortSignal,
+): Promise<VerifiedFixedUnorderedUpdateProof> {
+    const client = new QmdbOperationLogClient(serviceUrl);
+    return client.getFixedUnorderedUpdate(
+        {
+            tip,
+            startLocation: location,
+            maxLocations: 1,
+        },
+        expectedRoot,
+        location,
+        expectedKey,
+        valueSize,
+        { signal },
+    );
 }
 
 function finalizedTransactionTarget(
@@ -469,6 +484,16 @@ function decodeAccountRow(value: Uint8Array): AccountProofRow {
     };
 }
 
+function decodeAccountValue(value: Uint8Array): Pick<AccountProofRow, 'balance' | 'nonce'> {
+    if (value.length !== ACCOUNT_VALUE_BYTES) {
+        throw new Error('malformed account proof value');
+    }
+    return {
+        balance: readU64Be(value, 0),
+        nonce: readU64Be(value, 8),
+    };
+}
+
 function parseAccountBytes(account: string): Uint8Array {
     const normalized = account.trim().replace(/^0x/i, '').toLowerCase();
     if (!/^[0-9a-f]{64}$/.test(normalized)) {
@@ -546,16 +571,6 @@ function toHex(bytes: Uint8Array): string {
 
 function trimTrailingSlash(value: string): string {
     return value.replace(/\/+$/, '');
-}
-
-interface WasmTransactionProof {
-    readonly proofSizeBytes: number;
-}
-
-interface WasmAccountProof {
-    readonly balance: bigint;
-    readonly nonce: bigint;
-    readonly proofSizeBytes: number;
 }
 
 interface AccountProofRow {

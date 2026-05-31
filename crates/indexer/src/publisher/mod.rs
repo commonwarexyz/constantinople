@@ -34,7 +34,7 @@
 
 use bytes::Bytes;
 use commonware_utils::{Acknowledgement, acknowledgement::Exact};
-use exoware_sdk::{ConnectRequestCompression, RetryConfig, StoreClient, keys::Key};
+use exoware_sdk::{RetryConfig, StoreClient, keys::Key};
 use std::time::Duration;
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{debug, error, warn};
@@ -195,7 +195,6 @@ pub fn standard_store_client(url: &str) -> StoreClient {
     StoreClient::builder()
         .url(url)
         .retry_config(RetryConfig::standard())
-        .connect_request_compression(ConnectRequestCompression::Zstd)
         .build()
         .expect("url sets health, ingest, and query URLs")
 }
