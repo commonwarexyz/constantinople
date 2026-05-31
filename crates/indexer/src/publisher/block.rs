@@ -1,32 +1,14 @@
-//! Block reporter that fans a finalized block out to raw KV and SQL metadata.
-//!
-//! Wired into the engine via the existing `marshal` reporter slot. On every
-//! `Update::Block(block, ack)` we:
-//!
-//! 1. Encode two batches:
-//!    - **raw KV**: BLOCK, BLOCK_BY_H, TX, and TX_BY_H rows.
-//!    - **sql metadata** (`block_meta`): one row per block. The
-//!      latest-finalized-height cursor is
-//!      derived from `MAX(height)` on `block_meta`; the KV path no longer
-//!      maintains a redundant META scalar.
-//! 2. Clone the marshal acknowledgement once per backing path. Each path
-//!    fulfills its clone after its own upload succeeds; the marshal waiter only
-//!    resolves after every path has durably accepted its batch.
-//! 3. Forward each batch to its uploader and return immediately so consensus
-//!    is not blocked on the network store — marshal itself back-pressures
-//!    the engine through the still-held ack.
+//! Block row encoding shared by the combined publisher.
 
 use crate::{
     keys,
     publisher::{
-        SqlBatch, SqlRow, UploadBatch, dispatch_batch,
-        sql::{BlockMetaRow, dispatch_sql_batch, encode_sql_rows},
+        SqlRow,
+        sql::{BlockMetaRow, encode_sql_rows},
     },
 };
 use bytes::Bytes;
-use commonware_actor::Feedback;
 use commonware_codec::{Encode, FixedSize};
-use commonware_consensus::{Reporter, marshal::Update};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
@@ -35,101 +17,11 @@ use constantinople_primitives::{
 use exoware_sdk::keys::Key;
 use std::{
     array::TryFromSliceError,
-    marker::PhantomData,
     time::{SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::mpsc;
 use tracing::warn;
 
 const TX_BY_SENDER_ROW_BYTES: usize = 32 + 32 + 8 + 8 + 8 + 8 + 4;
-
-/// Cloneable [`Reporter`] over `Update<EngineBlock<H, P>>`.
-///
-/// Holds one sender per active backing path. Cloning the reporter is cheap;
-/// the senders are reference-counted MPSC channels.
-pub struct BlockReporter<H, P> {
-    raw: Option<mpsc::Sender<UploadBatch>>,
-    sql: mpsc::Sender<SqlBatch>,
-    _marker: PhantomData<fn() -> (H, P)>,
-}
-
-impl<H, P> BlockReporter<H, P> {
-    /// Build a reporter that forwards raw KV and SQL metadata batches.
-    ///
-    /// The raw KV channel carries pre-encoded BLOCK, BLOCK_BY_H, TX, and
-    /// TX_BY_H rows to the existing exoware Store. The SQL channel feeds the
-    /// metadata uploader, which writes typed rows into the `block_meta` table
-    /// declared by [`crate::sql_schema`].
-    pub const fn new(raw: mpsc::Sender<UploadBatch>, sql: mpsc::Sender<SqlBatch>) -> Self {
-        Self {
-            raw: Some(raw),
-            sql,
-            _marker: PhantomData,
-        }
-    }
-
-    /// Build a reporter that uploads only SQL metadata rows.
-    pub const fn metadata_only(sql: mpsc::Sender<SqlBatch>) -> Self {
-        Self {
-            raw: None,
-            sql,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<H, P> Clone for BlockReporter<H, P> {
-    fn clone(&self) -> Self {
-        Self {
-            raw: self.raw.clone(),
-            sql: self.sql.clone(),
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<H, P> Reporter for BlockReporter<H, P>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    type Activity = Update<EngineBlock<H, P>>;
-
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match activity {
-            // Tip-only updates carry no block payload; nothing to upload.
-            Update::Tip(_, _, _) => {}
-            Update::Block(block, ack) => {
-                // Encoding is cheap and synchronous. The actual store writes
-                // are dispatched onto background tasks so this method never
-                // blocks consensus — see `dispatch_batch` for back-pressure
-                // semantics.
-                let IndexedBlockRows { raw, sql, .. } = encode_indexed_block_rows(&block);
-
-                // Clone the ack once per backing path. `Exact::clone`
-                // increments the remaining count, so the marshal waiter only
-                // resolves after each path has acknowledged.
-                if let Some(raw_tx) = &self.raw {
-                    dispatch_batch(
-                        raw_tx,
-                        UploadBatch {
-                            rows: raw,
-                            ack: Some(ack.clone()),
-                        },
-                    );
-                }
-                dispatch_sql_batch(
-                    &self.sql,
-                    SqlBatch {
-                        rows: sql,
-                        ack: Some(ack),
-                    },
-                );
-            }
-        }
-        Feedback::Ok
-    }
-}
 
 /// Encoded block rows split by index family.
 pub(crate) struct IndexedBlockRows<D: Digest> {

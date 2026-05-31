@@ -36,34 +36,21 @@ pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum IndexerMode {
-    #[default]
-    Full,
-    MetadataOnly,
-}
-
 /// Indexer wiring for a secondary validator.
 ///
 /// Primary (voting) validators ignore this section; secondaries with
-/// `mode = full` upload finalized blocks, transactions, and consensus
-/// certificates into the shared `chain-indexer` store. Secondaries with
-/// `mode = metadata_only` upload only the SQL metadata tables (`block_meta`,
-/// `tx_meta`) into that same store.
+/// indexer wiring upload finalized blocks, transactions, consensus
+/// certificates, and QMDB operation logs into the shared `chain-indexer`
+/// store.
 ///
 /// The latest-finalized-height cursor that earlier versions of the
 /// indexer wrote to a separate `META` KV family now lives in
 /// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
-    #[serde(default)]
-    pub mode: IndexerMode,
     pub chain_indexer_url: String,
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
-    #[serde(default)]
-    pub qmdb_upload: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -440,7 +427,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexerConfig, IndexerMode, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
+        IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
         default_prune_cadence_blocks, default_upload_buffer, load_deployer_config,
         load_local_config,
     };
@@ -895,10 +882,8 @@ hosts:
             vec![bootstrapper_entry(primary0_key)],
         );
         config.indexer = Some(IndexerConfig {
-            mode: IndexerMode::MetadataOnly,
             chain_indexer_url: "http://chain-indexer:8090".to_string(),
             upload_buffer: default_upload_buffer(),
-            qmdb_upload: false,
         });
         fs::write(
             &config_path,
@@ -932,7 +917,6 @@ hosts:
         let indexer = loaded
             .indexer
             .expect("secondary should keep indexer config");
-        assert_eq!(indexer.mode, IndexerMode::MetadataOnly);
         assert_eq!(indexer.chain_indexer_url, "http://203.0.113.9:8090");
 
         let _ = fs::remove_file(config_path);

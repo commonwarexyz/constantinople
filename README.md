@@ -43,13 +43,14 @@ Constantinople is a high-throughput account-model blockchain example built on to
 
 ## Demo
 
-Generate a local four-validator network with one secondary, the spammer,
-relayer, metadata indexer, QMDB indexer, and explorer:
+Generate a local four-validator network with the indexer secondary, relayer,
+spammer, metadata indexer, QMDB indexer, and explorer:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
-  --secondaries 1 \
+  --indexer \
+  --relayer \
   --output-dir ./local \
   --spammer --spammer-accounts 4096 --spammer-accounts-jitter 0.1 \
   local

@@ -72,11 +72,11 @@ type TransactionWriter<H> =
     KeylessWriter<QmdbFamily, H, <H as Hasher>::Digest, TransactionEncoding<H>>;
 
 /// Completion signal for a queued finalized-block upload.
-pub struct QmdbUploadCompletion {
+pub struct UploadCompletion {
     rx: oneshot::Receiver<()>,
 }
 
-impl QmdbUploadCompletion {
+impl UploadCompletion {
     /// Waits until the upload has been marked persisted, or until the uploader task exits.
     pub async fn wait(self) {
         let _ = self.rx.await;
@@ -84,7 +84,7 @@ impl QmdbUploadCompletion {
 }
 
 /// Ordered reservation for a finalized-block upload.
-pub struct QmdbUploadPlan {
+pub struct UploadPlan {
     order: u64,
     state_writer_next: u64,
     transaction_writer_next: u64,
@@ -119,7 +119,7 @@ pub enum PublishError {
 
 /// Owns the combined finalized-block index upload path.
 #[derive(Debug)]
-pub struct QmdbPublisher<H, P>
+pub struct Publisher<H, P>
 where
     H: Hasher,
     P: PublicKey,
@@ -235,7 +235,7 @@ impl PreparedQmdbUpload {
     }
 }
 
-impl<H, P> QmdbPublisher<H, P>
+impl<H, P> Publisher<H, P>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
@@ -329,7 +329,7 @@ where
         &self,
         block: &EngineBlock<H, P>,
         databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<QmdbUploadCompletion, PublishError>
+    ) -> Result<UploadCompletion, PublishError>
     where
         E: Storage + Clock + Metrics,
         S: Strategy + Send + Sync + 'static,
@@ -342,7 +342,7 @@ where
     pub async fn plan_finalized(
         &self,
         block: &EngineBlock<H, P>,
-    ) -> Result<QmdbUploadPlan, PublishError> {
+    ) -> Result<UploadPlan, PublishError> {
         let mut state_next = self.state_next_location.lock().await;
         let mut transaction_next = self.transaction_next_location.lock().await;
 
@@ -356,7 +356,7 @@ where
         *state_next = state_end;
         *transaction_next = transaction_end;
         let order = self.next_upload_order.fetch_add(1, Ordering::Relaxed);
-        Ok(QmdbUploadPlan {
+        Ok(UploadPlan {
             order,
             state_writer_next,
             transaction_writer_next,
@@ -366,10 +366,10 @@ where
     /// Build and enqueue a finalized-block upload from an ordered reservation.
     pub async fn enqueue_planned_finalized<E, S>(
         &self,
-        plan: QmdbUploadPlan,
+        plan: UploadPlan,
         block: &EngineBlock<H, P>,
         databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<QmdbUploadCompletion, PublishError>
+    ) -> Result<UploadCompletion, PublishError>
     where
         E: Storage + Clock + Metrics,
         S: Strategy + Send + Sync + 'static,
@@ -385,10 +385,10 @@ where
     pub async fn enqueue_planned_finalized_with_context<Cx, E, S>(
         &self,
         context: Cx,
-        plan: QmdbUploadPlan,
+        plan: UploadPlan,
         block: &EngineBlock<H, P>,
         databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<QmdbUploadCompletion, PublishError>
+    ) -> Result<UploadCompletion, PublishError>
     where
         Cx: Spawner,
         E: Storage + Clock + Metrics,
@@ -409,11 +409,11 @@ where
 
     async fn enqueue_prepared_finalized(
         &self,
-        plan: QmdbUploadPlan,
+        plan: UploadPlan,
         block: &EngineBlock<H, P>,
         block_rows: IndexedBlockRows<H::Digest>,
         state: PendingStateUpload,
-    ) -> Result<QmdbUploadCompletion, PublishError> {
+    ) -> Result<UploadCompletion, PublishError> {
         let transactions = build_transaction_upload_from_digests(
             block,
             plan.transaction_writer_next,
@@ -423,7 +423,7 @@ where
         let prepare_tx = self
             .prepare_tx
             .as_ref()
-            .expect("QMDB publisher send channel is open until shutdown");
+            .expect("publisher send channel is open until shutdown");
         prepare_tx
             .send(PendingQmdbUpload {
                 order: plan.order,
@@ -438,11 +438,11 @@ where
             .map_err(|_| PublishError::CommitterStopped {
                 height: block.header.height,
             })?;
-        Ok(QmdbUploadCompletion { rx })
+        Ok(UploadCompletion { rx })
     }
 }
 
-impl<H, P> Drop for QmdbPublisher<H, P>
+impl<H, P> Drop for Publisher<H, P>
 where
     H: Hasher,
     P: PublicKey,
@@ -1675,12 +1675,12 @@ mod tests {
             let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
                 .await
                 .expect("spawn simulator");
-            let publisher = QmdbPublisher::<
+            let publisher = Publisher::<
                 commonware_cryptography::sha256::Sha256,
                 commonware_cryptography::ed25519::PublicKey,
             >::connect(context.child("qmd_publisher"), &url, 1)
             .await
-            .expect("qmd publisher connects");
+            .expect("publisher connects");
 
             publisher.shutdown().await;
             handle.abort();

@@ -1,11 +1,11 @@
 use crate::{
-    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial,
-    DEFAULT_INDEXER_UPLOAD_BUFFER, GenerateArgs, IndexerConfig, IndexerMode, LocalArgs,
-    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
-    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_UPLOAD_BUFFER, RelayerConfig, RelayerLeaderConfig,
-    ValidatorConfig, absolute_path, default_bootstrappers, default_max_pool_bytes,
-    default_max_propose_bytes, ensure_output_dir_missing, generate_local_cluster_material,
-    write_simplex_verification_material, write_yaml_config,
+    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
+    IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry,
+    PeersConfig, QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_UPLOAD_BUFFER, RelayerConfig,
+    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
+    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
+    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -22,6 +22,7 @@ struct GeneratedValidator {
 }
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
+    validate_generate_args(args);
     assert!(args.validators >= 1, "need at least one validator");
 
     let output_dir = absolute_path(&args.output_dir);
@@ -136,8 +137,8 @@ fn build_secondaries(
     output_dir: &std::path::Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
-    let total_secondaries = total_secondaries(args);
-    let mut secondaries = Vec::with_capacity(total_secondaries as usize);
+    let roles = secondary_roles(args);
+    let mut secondaries = Vec::with_capacity(roles.len());
     let bootstrappers = default_bootstrappers(&material.public_keys);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
@@ -145,9 +146,8 @@ fn build_secondaries(
     // the same loopback host.
     let primary_span = args.validators as u16;
 
-    for index in 0..total_secondaries {
-        let secondary_index = index as usize;
-        let is_relayer = index == args.secondaries;
+    for (secondary_index, role) in roles.into_iter().enumerate() {
+        let index = secondary_index as u32;
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
         let offset = primary_span
@@ -185,9 +185,10 @@ fn build_secondaries(
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
             bootstrappers: bootstrappers.clone(),
-            indexer: (!is_relayer)
-                .then(|| local_indexer_config(local.chain_indexer_port, index == 0)),
-            relayer: is_relayer.then(|| local_relayer_config(local, material)),
+            indexer: matches!(role, SecondaryRole::Indexer)
+                .then(|| local_indexer_config(local.chain_indexer_port)),
+            relayer: matches!(role, SecondaryRole::Relayer)
+                .then(|| local_relayer_config(local, material)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -224,25 +225,16 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
     RelayerConfig { leaders }
 }
 
-/// Build the indexer wiring written into every secondary's YAML.
+/// Build the full indexer wiring written into the owning secondary's YAML.
 ///
 /// All rows go through the shared `chain-indexer` Store URL. Store prefixes
 /// keep raw KV, SQL, and QMDB rows disjoint.
-fn local_indexer_config(indexer_port: u16, qmdb_upload: bool) -> IndexerConfig {
+fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
-        mode: IndexerMode::Full,
         chain_indexer_url: url,
-        upload_buffer: indexer_upload_buffer(qmdb_upload),
-        qmdb_upload,
+        upload_buffer: QMDB_INDEXER_UPLOAD_BUFFER,
     }
-}
-
-const fn indexer_upload_buffer(qmdb_upload: bool) -> usize {
-    if qmdb_upload {
-        return QMDB_INDEXER_UPLOAD_BUFFER;
-    }
-    DEFAULT_INDEXER_UPLOAD_BUFFER
 }
 
 fn print_local_run_commands(
@@ -268,7 +260,8 @@ fn print_local_run_commands(
     info!(
         output_dir = %output_dir.display(),
         validators = args.validators,
-        secondaries = args.secondaries,
+        indexer = args.indexer,
+        relayer = args.relayer,
         "generated local deployment bundle"
     );
     info!(command = %format!("mprocs {mprocs}"), "start local deployment");
@@ -303,7 +296,7 @@ fn local_run_commands(
         ));
     }
 
-    if args.secondaries > 0 {
+    if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
         commands.push(format!(
             "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
@@ -330,10 +323,9 @@ fn local_run_commands(
         // submitted-transaction proofs.
         // The defaults in `explorer/src/App.tsx` match these ports, but pass
         // both URLs explicitly so non-default deployer ports still work.
-        let relayer_env = format!(
-            " VITE_MEMPOOL_URL=http://127.0.0.1:{}",
-            local.base_http_port + args.validators as u16 + args.secondaries as u16,
-        );
+        let relayer_env = relayer_http_port(args, local)
+            .map(|port| format!(" VITE_MEMPOOL_URL=http://127.0.0.1:{port}"))
+            .unwrap_or_default();
         commands.push(format!(
             "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev",
             local.metadata_indexer_port,
@@ -346,11 +338,11 @@ fn local_run_commands(
 
     if args.spammer {
         let targets = relayer_targets.join(",");
+        let relayer_port =
+            relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
-            local.base_http_port + args.validators as u16 + args.secondaries as u16,
-            args.validators,
-            targets,
+            relayer_port, args.validators, targets,
         );
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
@@ -369,16 +361,19 @@ fn local_run_commands(
     commands
 }
 
-const fn total_secondaries(args: &GenerateArgs) -> u32 {
-    args.secondaries + 1
+fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
+    args.relayer.then(|| {
+        let relayer_index = u16::from(args.indexer);
+        local.base_http_port + args.validators as u16 + relayer_index
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, IndexerMode, LocalArgs, StartupModeConfig,
-        generate_local_cluster_material,
+        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig,
+        generate_local_cluster_material, total_secondaries,
     };
     use std::path::{Path, PathBuf};
 
@@ -387,7 +382,8 @@ mod tests {
     fn test_args(spammer: bool) -> GenerateArgs {
         GenerateArgs {
             validators: 2,
-            secondaries: 0,
+            indexer: false,
+            relayer: false,
             output_dir: PathBuf::from("/tmp/configs"),
             log_level: "info".to_string(),
             worker_threads: 2,
@@ -433,14 +429,14 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert_eq!(commands.len(), 3);
+        assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
-        assert!(commands[2].contains("secondary-0.yaml"));
     }
 
     #[test]
     fn local_run_commands_include_spammer_when_enabled() {
-        let args = test_args(true);
+        let mut args = test_args(true);
+        args.relayer = true;
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -462,7 +458,8 @@ mod tests {
 
     #[test]
     fn local_run_commands_include_relayer() {
-        let args = test_args(false);
+        let mut args = test_args(false);
+        args.relayer = true;
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -478,7 +475,8 @@ mod tests {
 
     #[test]
     fn local_spammer_uses_relayer() {
-        let args = test_args(true);
+        let mut args = test_args(true);
+        args.relayer = true;
         let targets = vec!["aa".to_string(), "bb".to_string()];
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
@@ -500,6 +498,7 @@ mod tests {
     #[test]
     fn local_run_commands_propagate_accounts_jitter_to_spammer() {
         let mut args = test_args(true);
+        args.relayer = true;
         args.spammer_accounts_jitter = 0.25;
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
@@ -513,9 +512,10 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_secondaries_and_indexer_stack() {
+    fn local_run_commands_include_indexer_and_relayer_stack() {
         let mut args = test_args(false);
-        args.secondaries = 2;
+        args.indexer = true;
+        args.relayer = true;
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -524,16 +524,15 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert_eq!(commands.len(), 9);
+        assert_eq!(commands.len(), 8);
         assert!(commands[2].contains("secondary-0.yaml"));
         assert!(commands[3].contains("secondary-1.yaml"));
-        assert!(commands[4].contains("secondary-2.yaml"));
     }
 
     #[test]
     fn local_run_commands_do_not_sleep() {
         let mut args = test_args(true);
-        args.secondaries = 1;
+        args.relayer = true;
 
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
@@ -559,9 +558,10 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_indexer_when_secondaries_exist() {
+    fn local_run_commands_include_indexer_stack() {
         let mut args = test_args(false);
-        args.secondaries = 1;
+        args.indexer = true;
+        args.relayer = true;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
         let commands = local_run_commands(
@@ -583,9 +583,9 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_metadata_indexer_when_secondaries_exist() {
+    fn local_run_commands_include_metadata_indexer_when_indexer_enabled() {
         let mut args = test_args(false);
-        args.secondaries = 1;
+        args.indexer = true;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
         let commands = local_run_commands(
@@ -606,9 +606,9 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_qmdb_indexer_when_secondaries_exist() {
+    fn local_run_commands_include_qmdb_indexer_when_indexer_enabled() {
         let mut args = test_args(false);
-        args.secondaries = 1;
+        args.indexer = true;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
         let commands = local_run_commands(
@@ -628,9 +628,9 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_include_explorer_when_secondaries_exist() {
+    fn local_run_commands_include_explorer_when_indexer_enabled() {
         let mut args = test_args(false);
-        args.secondaries = 1;
+        args.indexer = true;
         set_local_ports(&mut args, 18_090, 18_091, 18_092);
 
         let commands = local_run_commands(
@@ -654,7 +654,7 @@ mod tests {
     }
 
     #[test]
-    fn local_run_commands_omit_explorer_without_secondaries() {
+    fn local_run_commands_omit_explorer_without_indexer() {
         let args = test_args(false);
 
         let commands = local_run_commands(
@@ -669,17 +669,18 @@ mod tests {
             commands
                 .iter()
                 .all(|c| !c.contains("npm --prefix explorer")),
-            "explorer must only launch when secondaries exist: {commands:?}"
+            "explorer must only launch when indexer is enabled: {commands:?}"
         );
     }
 
     #[test]
     fn secondary_yaml_gets_full_indexer() {
         let mut args = test_args(false);
-        args.secondaries = 1;
+        args.indexer = true;
+        args.relayer = true;
         set_local_ports(&mut args, 8090, 8091, 8092);
 
-        let material = generate_local_cluster_material(args.validators, args.secondaries + 1);
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
         let validators = build_validators(
             &args,
             local_args(&args),
@@ -702,11 +703,13 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert_eq!(indexer.mode, IndexerMode::Full);
-        assert!(indexer.qmdb_upload);
         assert_eq!(indexer.upload_buffer, 8);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
+        assert!(
+            secondaries[1].config.indexer.is_none(),
+            "relayer secondary should not have indexer config"
+        );
         assert!(
             secondaries[1].config.relayer.is_some(),
             "last secondary should run relayer"
@@ -717,7 +720,7 @@ mod tests {
     fn validators_only_has_no_indexer_configs() {
         let args = test_args(false);
 
-        let material = generate_local_cluster_material(args.validators, args.secondaries);
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
         let validators = build_validators(
             &args,
             local_args(&args),

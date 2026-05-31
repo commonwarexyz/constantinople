@@ -50,6 +50,7 @@ Add `--spammer` to include a spam bot in the `mprocs` command:
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
   --output-dir ./local \
+  --relayer \
   --spammer \
   --spammer-accounts 10 \
   --spammer-value 1 \
@@ -70,7 +71,7 @@ visibly varying throughput stream:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 --secondaries 1 --output-dir ./local \
+  --validators 4 --indexer --relayer --output-dir ./local \
   --spammer --spammer-accounts-jitter 0.25 \
   local
 ```
@@ -88,11 +89,12 @@ cargo run --release --bin constantinople-spammer -- \
 
 ### Local Transaction Relayer
 
-Every generated local bundle includes a transaction relayer secondary:
+Add `--relayer` to include a transaction relayer secondary:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
+  --relayer \
   --output-dir ./local \
   local \
   --base-port 3000 \
@@ -101,8 +103,8 @@ cargo run --bin constantinople-deploy -- generate \
 
 This adds one extra secondary validator with a `relayer` section and starts it with the normal
 `constantinople` binary. The relayer listens on the next local HTTP port after validators and
-configured secondaries (`base_http_port + validators + secondaries`), follows consensus directly,
-and forwards normal user batches to the leaders of the next two views.
+the optional indexer secondary, follows consensus directly, and forwards normal user batches to
+the leaders of the next two views.
 
 When `--spammer` is set, the generated spammer command uses `--relayer-url`
 and `--relayer-submitters <validators>`. Each relayed submitter pins an exact
@@ -111,25 +113,24 @@ streams feed different primaries without creating stale duplicate nonce copies.
 
 ### Local Deployment with Indexer + Explorer
 
-Set `--secondaries` to a non-zero value to spin up the shared `chain-indexer`
-store, the `metadata-indexer` query/stream service, the `qmdb-indexer` query
-facade, and the React explorer dev server alongside the validators:
+Add `--indexer` to spin up the shared `chain-indexer` store, the
+`metadata-indexer` query/stream service, the `qmdb-indexer` query facade, and
+the React explorer dev server alongside the validators:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
-  --secondaries 1 \
+  --indexer \
+  --relayer \
   --output-dir ./local \
   --spammer \
   local
 ```
 
-There are only two local deployment shapes: validators only when
-`--secondaries 0`, or validators plus secondaries, explorer, and the full
-indexer stack when `--secondaries > 0`. Primaries leave their `indexer:` block
-unset. The first secondary owns the QMDB upload path; other secondaries still
-upload KV and SQL indexer data but leave QMDB disabled so the QMDB writer
-contract has a single writer.
+Primaries leave their `indexer:` block unset. The indexer secondary owns the
+full upload path for raw KV, SQL metadata, simplex, and QMDB writes. When both
+`--indexer` and `--relayer` are set, the indexer is `secondary-0` and the
+relayer is `secondary-1`.
 
 The printed `mprocs` command list grows by four entries:
 
@@ -148,7 +149,7 @@ The printed `mprocs` command list grows by four entries:
   Add `VITE_VERIFY_CERTIFICATES=false` to disable block-list certificate
   verification during streaming-performance experiments.
 
-Validators do not upload QMDB data to `qmdb-indexer` directly. The first
+Validators do not upload QMDB data to `qmdb-indexer` directly. The indexer
 secondary writes QMDB rows into the shared `chain-indexer` store using reserved
 Store prefixes. `qmdb-indexer` reads those rows from the same store and exposes
 account-state operation-log APIs under `/state` and transaction-hash
@@ -171,7 +172,7 @@ npm --prefix explorer install
 
 # 2. generate the bundle and run the printed mprocs command
 cargo run --bin constantinople-deploy -- generate \
-  --validators 4 --secondaries 1 \
+  --validators 4 --indexer --relayer \
   --output-dir ./local \
   --spammer \
   local
@@ -236,7 +237,7 @@ deployer aws create --config config.yaml
 
 ### Remote Deployment with Spammer
 
-Add `--spammer` to include a spammer instance in the remote deployment:
+Add `--spammer` with `--relayer` to include a spammer instance in the remote deployment:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -244,6 +245,7 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
+  --relayer \
   --spammer \
   --spammer-accounts 10 \
   --spammer-value 1 \
@@ -262,11 +264,12 @@ deployer config. The spammer submits through the generated relayer.
 
 ### Remote Transaction Relayer
 
-Every generated remote bundle includes a relayer secondary:
+Add `--relayer` to include a relayer secondary:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 20 \
+  --relayer \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
@@ -323,6 +326,7 @@ validator instance type):
 cargo run --bin constantinople-deploy -- generate \
   --validators 20 \
   --output-dir ./deploy \
+  --relayer \
   --spammer \
   remote \
   --instance-type c8g.2xlarge \
@@ -332,12 +336,12 @@ cargo run --bin constantinople-deploy -- generate \
 
 ### Remote Deployment with Indexer Stack
 
-Set `--secondaries` to a non-zero value to launch the shared remote indexer stack:
+Add `--indexer` to launch the shared remote indexer stack:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 20 \
-  --secondaries 2 \
+  --indexer \
   --output-dir ./deploy \
   remote \
   --regions us-east-1,us-west-2 \
@@ -348,9 +352,9 @@ cargo run --bin constantinople-deploy -- generate \
   --dashboard ./dashboard.json
 ```
 
-There are only two remote deployment shapes: validators only when
-`--secondaries 0`, or validators plus secondaries and the full shared indexer
-stack when `--secondaries > 0`. Primaries still omit their `indexer:` block.
+Primaries omit their `indexer:` block. The indexer secondary owns the full
+upload path, and the shared read services are colocated in the first remote
+region.
 
 The generated bundle now also includes:
 
@@ -372,8 +376,7 @@ Topology and defaults:
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
 - `qmdb-indexer` listens on port `8092` by default.
-- QMDB uploads are enabled on only the first secondary. All other secondaries leave
-  QMDB disabled to preserve the QMDB single-writer contract.
+- Full indexer uploads are enabled on only the indexer secondary.
 
 QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
 writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
@@ -441,28 +444,23 @@ every node (primary and secondary) tracks identically.
 Secondaries do **not** run the mempool HTTP webserver — since they cannot propose blocks, they
 have no need to ingest transactions. Submit transactions to a primary validator instead.
 
-Use cases:
-
-- Passive observers / monitoring nodes
-- Block propagation redundancy
-
-Add `--secondaries N` to include `N` secondary nodes in either local or remote bundles:
+Use `--indexer` and `--relayer` to include the supported secondary roles in
+either local or remote bundles:
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
   --validators 4 \
-  --secondaries 2 \
+  --indexer \
+  --relayer \
   --output-dir ./local \
   local \
   --base-port 3000 \
   --base-http-port 8080
 ```
 
-This additionally writes `secondary-0.yaml`, `secondary-1.yaml`, ... alongside
-the primary `validator-*.yaml` files. The generated relayer is an additional
-secondary after the requested secondary count. `peers.yaml` gains a
-`secondaries:` block that every node consumes to populate the secondary peer
-set.
+This writes `secondary-0.yaml` and/or `secondary-1.yaml` alongside the primary
+`validator-*.yaml` files. `peers.yaml` gains a `secondaries:` block that every
+node consumes to populate the secondary peer set.
 
 Run a secondary manually (same binary, same flags as a primary):
 
@@ -473,9 +471,10 @@ cargo run --bin constantinople -- \
 ```
 
 Local secondaries listen on loopback P2P ports starting at `base_port + validators`, and metrics
-ports starting at `base_metrics_port + validators`. HTTP ports are allocated but unused (no
-mempool webserver is bound). Remote secondaries reuse `--instance-type` and `--storage-size` —
-there are no secondary-specific sizing flags.
+ports starting at `base_metrics_port + validators`. The relayer binds its HTTP server on its
+allocated secondary HTTP port; the indexer secondary does not bind a mempool HTTP server. Remote
+secondaries reuse `--instance-type` and `--storage-size`; there are no secondary-specific sizing
+flags.
 
 Notes:
 

@@ -72,14 +72,14 @@ point a secondary validator at the simulator and start the spammer:
 
 ```sh
 cargo run -p constantinople-deploy -- generate \
-    --validators 4 --secondaries 1 --output-dir local --spammer \
-    local --indexer
+    --validators 4 --indexer --relayer --output-dir local --spammer \
+    local
 mprocs ...   # the deploy job prints the full mprocs invocation
 ```
 
-`local --indexer` automatically appends the shared store (`chain-indexer` bin),
-the metadata service (`metadata-indexer` bin from `constantinople-indexer`), and this dev
-server to the printed mprocs command list (see
+`--indexer` automatically appends the shared store (`chain-indexer` bin), the
+metadata service (`metadata-indexer` bin from `constantinople-indexer`), the
+QMDB facade (`qmdb-indexer` bin), and this dev server to the printed mprocs command list (see
 [`bin/deploy/src/local.rs`](../bin/deploy/src/local.rs)).
 
 ## Build

@@ -22,11 +22,10 @@ that fits.
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex artifacts** | `exoware-simplex` header and finalization indexes in the shared Store | The explorer and proof clients that need a browser-verifiable finalization certificate for a block. |
 
-All paths share the same exoware [`StoreClient`] under the hood. In non-QMDB
-mode, raw KV and SQL uploads run as separate background uploaders. In QMDB
-mode, the owning secondary stages raw KV rows, SQL rows, and both QMDB row
-families into one Store batch before acknowledging the finalized block.
-The active KV families are namespaced under
+All paths share the same exoware [`StoreClient`] under the hood. The owning
+secondary stages raw KV rows, SQL rows, and both QMDB row families into one
+Store batch from the finalized hook; simplex artifacts are published from the
+same finalized path after data upload. The active KV families are namespaced under
 `reserved_bits=4, prefix=0x1,0x2,0x5,0x6` (see [`src/keys.rs`](src/keys.rs));
 the SQL tables use a disjoint prefix range
 (`0x00..=0x0F`, declared in [`exoware-sql`'s `KvSchema`][kvschema]) so a
@@ -43,14 +42,11 @@ single store can host every index without collision.
   source of truth for the live `block_meta` table layout and the legacy
   queryable `tx_meta` table. The explorer's column-name strings live here too,
   so a schema change is a one-place edit.
-- A [`BlockReporter`](src/publisher/block.rs) that taps marshal
-  `Update::Block` events and fans each finalized block out across raw KV and
-  SQL uploaders when QMDB upload is disabled.
 - A [`CertificateReporter`](src/publisher/certificate.rs) that taps
   simplex `Activity` events, pairs certificates with finalized blocks, and
   uploads `exoware-simplex` artifacts to the shared Store.
-- A [`QmdbPublisher`](src/publisher/qmdb.rs) that runs from the finalized hook
-  on the single QMDB-owning secondary and commits raw KV, SQL, account-state
+- A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
+  on the single owning secondary and commits raw KV, SQL, account-state
   QMDB, and transaction-hash QMDB rows in one Store batch.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over the two KV
   `StoreClient`s. The latest-finalized-height cursor is now derived from
@@ -68,13 +64,7 @@ single store can host every index without collision.
 
 ## Back-pressure model
 
-Non-QMDB publishers offload network I/O to background tokio tasks. Marshal
-back-pressures the engine on the still-held [`Exact`] acknowledgement: each
-reporter clones the ack once per uploader, every uploader fulfills its clone
-after its own put / flush succeeds, and the marshal waiter only resolves once
-all clones have acknowledged.
-
-The QMDB publisher runs after finalized database application and before prune.
+The publisher runs after finalized database application and before prune.
 It prepares QMDB rows concurrently, stages raw KV rows and SQL rows beside
 them, commits one Store batch, then marks SQL and QMDB uploads persisted. Flush
 errors retry indefinitely with a capped exponential backoff so a transient

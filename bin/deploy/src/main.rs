@@ -49,7 +49,6 @@ const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
-const DEFAULT_INDEXER_UPLOAD_BUFFER: usize = 1024;
 const QMDB_INDEXER_UPLOAD_BUFFER: usize = 8;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -84,12 +83,12 @@ struct SimplexVerificationMaterialArgs {
 pub(crate) struct GenerateArgs {
     #[arg(long)]
     validators: u32,
-    /// Number of secondary (non-voting) validators to include in the deployment.
-    ///
-    /// Secondaries receive an ed25519 identity and run the validator binary but
-    /// do not hold a DKG share; they bootstrap through the primary validators.
-    #[arg(long, default_value_t = 0)]
-    secondaries: u32,
+    /// Include the full indexer secondary and shared indexer services.
+    #[arg(long, default_value_t = false)]
+    indexer: bool,
+    /// Include a transaction relayer secondary.
+    #[arg(long, default_value_t = false)]
+    relayer: bool,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, default_value = "info")]
@@ -138,14 +137,14 @@ pub(crate) struct LocalArgs {
     base_http_port: u16,
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
-    /// Port for the local `chain-indexer` store launched when secondaries exist.
+    /// Local `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
-    /// Port for the local `metadata-indexer` service launched when secondaries exist.
+    /// Local `metadata-indexer` read-service port.
     /// The explorer reads from this port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
-    /// Port for the local `qmdb-indexer` service launched when secondaries exist.
+    /// Local `qmdb-indexer` read-service port.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
 }
@@ -170,13 +169,13 @@ pub(crate) struct RemoteArgs {
     http_port: u16,
     #[arg(long = "http-cidr", value_delimiter = ',')]
     http_cidrs: Vec<String>,
-    /// Port for the shared `chain-indexer` store.
+    /// Shared `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
-    /// Port for the shared `metadata-indexer` query/stream service.
+    /// Shared `metadata-indexer` query/stream port.
     #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
-    /// Port for the shared `qmdb-indexer` query facade.
+    /// Shared `qmdb-indexer` query facade port.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
     #[arg(long, default_value_t = false)]
@@ -237,14 +236,6 @@ fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum IndexerMode {
-    #[default]
-    Full,
-    MetadataOnly,
-}
-
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NamedBootstrapperEntry {
     public_key: String,
@@ -292,16 +283,12 @@ pub(crate) struct ValidatorConfig {
 /// Indexer wiring serialized into a secondary validator's YAML.
 ///
 /// Mirrors the schema in `bin/validator/src/config.rs::IndexerConfig`. The
-/// shared `chain-indexer` store backs both full-data KV uploads and SQL
-/// metadata uploads; `mode` decides whether a secondary emits all indexed data
-/// or just the metadata tables.
+/// shared `chain-indexer` store backs raw KV rows, SQL metadata rows, QMDB
+/// operation logs, and simplex artifacts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
-    pub mode: IndexerMode,
     pub chain_indexer_url: String,
     pub upload_buffer: usize,
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub qmdb_upload: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -376,10 +363,6 @@ const fn usize_is_zero(value: &usize) -> bool {
     *value == 0
 }
 
-const fn is_false(value: &bool) -> bool {
-    !*value
-}
-
 fn main() {
     init_tracing();
     let cli = Cli::parse();
@@ -425,6 +408,38 @@ pub(crate) fn ensure_output_dir_missing(output_dir: &Path) {
     if fs::metadata(output_dir).is_ok() {
         panic!("output directory already exists: {}", output_dir.display());
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SecondaryRole {
+    Indexer,
+    Relayer,
+}
+
+pub(crate) fn secondary_roles(args: &GenerateArgs) -> Vec<SecondaryRole> {
+    let mut roles = Vec::with_capacity(args.indexer as usize + args.relayer as usize);
+    if args.indexer {
+        roles.push(SecondaryRole::Indexer);
+    }
+    if args.relayer {
+        roles.push(SecondaryRole::Relayer);
+    }
+    roles
+}
+
+pub(crate) fn total_secondaries(args: &GenerateArgs) -> u32 {
+    secondary_roles(args).len() as u32
+}
+
+pub(crate) const fn indexer_enabled(args: &GenerateArgs) -> bool {
+    args.indexer
+}
+
+pub(crate) fn validate_generate_args(args: &GenerateArgs) {
+    assert!(
+        !args.spammer || args.relayer,
+        "--spammer requires --relayer"
+    );
 }
 
 pub(crate) fn generate_local_cluster_material(
