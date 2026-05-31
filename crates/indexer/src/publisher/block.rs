@@ -51,18 +51,24 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    let block_digest = block.seal();
-    let height = block.header.height;
-    let body_len = block.body.len();
-    // Wall-clock at the moment marshal delivered this block; microseconds
-    // since the Unix epoch (matches `Timestamp(TimeUnit::Microsecond, None)`
-    // declared by `sql_schema::build_meta_schema`). A clock-skewed validator
-    // simply records its own view of the time — the SQL store does not rely
-    // on it for ordering (height is the primary key).
     let finalized_ts_micros = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
+    encode_indexed_block_rows_at(block, finalized_ts_micros)
+}
+
+pub(crate) fn encode_indexed_block_rows_at<H, P>(
+    block: &EngineBlock<H, P>,
+    finalized_ts_micros: i64,
+) -> IndexedBlockRows<H::Digest>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let block_digest = block.seal();
+    let height = block.header.height;
+    let body_len = block.body.len();
     // SQL `block_meta.digest` is `FixedSizeBinary(32)` — copy it into a
     // `[u8; 32]` for the typed CellValue path.
     let mut block_digest_arr = [0u8; 32];

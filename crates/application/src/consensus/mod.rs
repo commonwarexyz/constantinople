@@ -67,6 +67,7 @@ where
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     prune_cadence_blocks: NonZeroU64,
+    previous_prune_cadence_state_end: u64,
     finalized_pruner: FinalizedPruneFn,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
     proposed_transactions: Counter,
@@ -93,6 +94,7 @@ where
             genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             prune_cadence_blocks: self.prune_cadence_blocks,
+            previous_prune_cadence_state_end: self.previous_prune_cadence_state_end,
             finalized_pruner: self.finalized_pruner.clone(),
             finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
@@ -131,6 +133,7 @@ where
             "proposed_transactions",
             "The number of transactions proposed into blocks",
         );
+        let previous_prune_cadence_state_end = *genesis_state_target.range.end();
 
         Self {
             signature_strategy,
@@ -141,6 +144,7 @@ where
             genesis_state_target,
             genesis_transactions_target,
             prune_cadence_blocks,
+            previous_prune_cadence_state_end,
             finalized_pruner,
             finalized_hook,
             proposed_transactions,

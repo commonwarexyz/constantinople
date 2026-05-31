@@ -1,15 +1,15 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
     CHAIN_INDEXER_HOST, ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE,
-    GenerateArgs, IndexerConfig, METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE,
-    MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST,
-    QMDB_INDEXER_UPLOAD_BUFFER, QmdbIndexerConfig, RelayerConfig, RelayerLeaderConfig, RemoteArgs,
-    SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SecondaryRole, SpammerConfig,
-    VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_deployer_tag, generate_remote_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    GenerateArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
+    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
+    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
+    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
+    SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
+    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
+    indexer_enabled, secondary_roles, total_secondaries, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -241,7 +241,7 @@ fn build_secondaries(
 fn remote_indexer_config(port: u16) -> IndexerConfig {
     IndexerConfig {
         chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{port}"),
-        upload_buffer: QMDB_INDEXER_UPLOAD_BUFFER,
+        upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
 }
 
@@ -692,7 +692,7 @@ mod tests {
             .as_ref()
             .expect("secondary should have indexer wiring");
         assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
-        assert_eq!(indexer.upload_buffer, 8);
+        assert_eq!(indexer.upload_buffer, 64);
         assert!(
             secondaries[1].config.indexer.is_none(),
             "relayer secondary should not have indexer wiring"

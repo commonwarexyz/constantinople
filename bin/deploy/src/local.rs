@@ -1,7 +1,7 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
-    IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry,
-    PeersConfig, QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_UPLOAD_BUFFER, RelayerConfig,
+    INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
+    PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
     default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
     generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
@@ -233,7 +233,7 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         chain_indexer_url: url,
-        upload_buffer: QMDB_INDEXER_UPLOAD_BUFFER,
+        upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
 }
 
@@ -703,7 +703,7 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert_eq!(indexer.upload_buffer, 8);
+        assert_eq!(indexer.upload_buffer, 64);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
         assert!(

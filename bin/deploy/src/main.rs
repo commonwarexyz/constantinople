@@ -49,7 +49,7 @@ const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
-const QMDB_INDEXER_UPLOAD_BUFFER: usize = 8;
+const INDEXER_UPLOAD_BUFFER: usize = 64;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
