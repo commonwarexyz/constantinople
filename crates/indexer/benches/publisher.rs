@@ -65,7 +65,7 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
                             next_height += 1;
                             let raw = raw_rows(height, tx_count);
                             let sql = sql_rows(height, tx_count);
-                            upload_combined(&store.client, &mut writer, &raw, &sql).await;
+                            upload_combined(&store.client, &mut writer, raw, sql).await;
                         }
                         start.elapsed()
                     })
@@ -214,20 +214,18 @@ async fn upload_sql(writer: &mut BatchWriter, rows: &[SqlRow]) {
 async fn upload_combined(
     client: &StoreClient,
     writer: &mut BatchWriter,
-    raw: &[(Key, Bytes)],
-    sql: &[SqlRow],
+    raw: Vec<(Key, Bytes)>,
+    sql: Vec<SqlRow>,
 ) {
-    insert_sql_rows(writer, sql);
-    let prepared = writer
+    insert_sql_rows(writer, &sql);
+    let mut prepared = writer
         .prepare_flush()
         .expect("sql prepare")
         .expect("sql rows are present");
-    let mut batch = StoreWriteBatch::new();
-    for (key, value) in raw {
-        batch.push(client, key, value).expect("raw row stages");
-    }
+    let mut batch = StoreWriteBatch::from_physical_entries(raw);
+    batch.reserve(prepared.entry_count());
     writer
-        .stage_flush(&prepared, &mut batch)
+        .stage_flush_owned(&mut prepared, &mut batch)
         .expect("sql rows stage");
     let seq = batch.commit(client).await.expect("combined commit");
     writer.mark_flush_persisted(prepared, seq);
@@ -247,7 +245,7 @@ async fn upload_combined_blocks(
         raw.extend(raw_rows(height, tx_count));
         sql.extend(sql_rows(height, tx_count));
     }
-    upload_combined(client, writer, &raw, &sql).await;
+    upload_combined(client, writer, raw, sql).await;
 }
 
 fn insert_sql_rows(writer: &mut BatchWriter, rows: &[SqlRow]) {

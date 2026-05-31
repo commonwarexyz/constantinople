@@ -178,7 +178,6 @@ struct CommitBatchStage<H>
 where
     H: Hasher,
 {
-    commit_client: StoreClient,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -676,7 +675,6 @@ async fn run_qmdb_committer<Cx, H>(
             let inline_watermarks = commits.is_empty();
             let prepared = prepare_commit_batch_blocking(
                 context.child("stage_commit_batch"),
-                commit_client.clone(),
                 sql_writer,
                 state_writer.clone(),
                 transaction_writer.clone(),
@@ -727,7 +725,6 @@ async fn run_qmdb_committer<Cx, H>(
 
 async fn prepare_commit_batch_blocking<Cx, H>(
     context: Cx,
-    commit_client: StoreClient,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -771,7 +768,6 @@ where
     let staged = stage_commit_batch_blocking(
         context.child("stage_store_batch"),
         CommitBatchStage {
-            commit_client,
             sql_writer,
             state_writer,
             transaction_writer,
@@ -841,7 +837,6 @@ where
         .shared(true)
         .spawn(move |_| async move {
             let CommitBatchStage {
-                commit_client,
                 mut sql_writer,
                 state_writer,
                 transaction_writer,
@@ -851,19 +846,26 @@ where
                 state_watermark,
                 transaction_watermark,
             } = stage;
-            let mut store_batch = StoreWriteBatch::new();
-            for upload in &raw_sql_uploads {
-                stage_raw_rows(&commit_client, &mut store_batch, &upload.raw_rows)?;
-            }
             let sql = prepare_raw_sql_upload(&mut sql_writer, &mut raw_sql_uploads)?;
-            if let Some(prepared) = &sql {
-                sql_writer.stage_flush(prepared, &mut store_batch)?;
+            let mut store_batch = stage_raw_rows(raw_sql_uploads);
+            store_batch.reserve(estimated_additional_staged_row_count(
+                sql.as_ref(),
+                &state_uploads,
+                &transaction_uploads,
+                state_watermark.as_ref(),
+                transaction_watermark.as_ref(),
+            ));
+            let mut sql = sql;
+            if let Some(prepared) = &mut sql {
+                sql_writer.stage_flush_owned(prepared, &mut store_batch)?;
             }
-            for upload in &state_uploads {
-                state_writer.stage_upload(upload, &mut store_batch)?;
+            let mut state_uploads = state_uploads;
+            for upload in &mut state_uploads {
+                state_writer.stage_upload_owned(upload, &mut store_batch)?;
             }
-            for upload in &transaction_uploads {
-                transaction_writer.stage_upload(upload, &mut store_batch)?;
+            let mut transaction_uploads = transaction_uploads;
+            for upload in &mut transaction_uploads {
+                transaction_writer.stage_upload_owned(upload, &mut store_batch)?;
             }
             if let Some(prepared) = &state_watermark {
                 state_writer.stage_flush(prepared, &mut store_batch)?;
@@ -1061,15 +1063,40 @@ where
     Some(seq)
 }
 
-fn stage_raw_rows(
-    client: &StoreClient,
-    batch: &mut StoreWriteBatch,
-    rows: &[(exoware_sdk::keys::Key, bytes::Bytes)],
-) -> Result<(), PublishError> {
-    for (key, value) in rows {
-        batch.push(client, key, value)?;
+fn stage_raw_rows(raw_sql_uploads: Vec<RawSqlUpload>) -> StoreWriteBatch {
+    let mut uploads = raw_sql_uploads.into_iter();
+    let Some(first) = uploads.next() else {
+        return StoreWriteBatch::new();
+    };
+    let mut batch = StoreWriteBatch::from_physical_entries(first.raw_rows);
+    for upload in uploads {
+        batch.extend_physical_entries(upload.raw_rows);
     }
-    Ok(())
+    batch
+}
+
+fn estimated_additional_staged_row_count(
+    sql: Option<&PreparedBatch>,
+    state_uploads: &[PreparedUpload<QmdbFamily>],
+    transaction_uploads: &[PreparedUpload<QmdbFamily>],
+    state_watermark: Option<&PreparedWatermark<QmdbFamily>>,
+    transaction_watermark: Option<&PreparedWatermark<QmdbFamily>>,
+) -> usize {
+    sql.map_or(0, PreparedBatch::entry_count)
+        .saturating_add(
+            state_uploads
+                .iter()
+                .map(PreparedUpload::row_count)
+                .sum::<usize>(),
+        )
+        .saturating_add(
+            transaction_uploads
+                .iter()
+                .map(PreparedUpload::row_count)
+                .sum::<usize>(),
+        )
+        .saturating_add(usize::from(state_watermark.is_some()))
+        .saturating_add(usize::from(transaction_watermark.is_some()))
 }
 
 fn prepare_raw_sql_upload(
@@ -1479,12 +1506,14 @@ mod tests {
     #[test]
     fn raw_and_sql_rows_stage_into_one_store_batch() {
         let client = StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
-        let mut batch = StoreWriteBatch::new();
         let raw = vec![(
             crate::keys::block(&[7u8; 32]).expect("block key"),
             Bytes::from_static(b"block"),
         )];
-        stage_raw_rows(&client, &mut batch, &raw).expect("raw rows stage");
+        let mut batch = stage_raw_rows(vec![RawSqlUpload {
+            raw_rows: raw,
+            sql_rows: Vec::new(),
+        }]);
 
         let schema = build_meta_schema(client.clone()).expect("schema");
         let mut writer = schema.batch_writer();
@@ -1581,7 +1610,6 @@ mod tests {
 
             let (_sql_writer, batch) = prepare_commit_batch_blocking(
                 context,
-                client,
                 sql_writer,
                 state_writer,
                 transaction_writer,
