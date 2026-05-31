@@ -222,8 +222,7 @@ async fn upload_combined(
         .prepare_flush()
         .expect("sql prepare")
         .expect("sql rows are present");
-    let mut batch = StoreWriteBatch::from_physical_entries(raw);
-    batch.reserve(prepared.entry_count());
+    let mut batch = StoreWriteBatch::from_physical_entry_groups([raw], prepared.entry_count());
     writer
         .stage_flush_owned(&mut prepared, &mut batch)
         .expect("sql rows stage");

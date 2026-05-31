@@ -847,14 +847,17 @@ where
                 transaction_watermark,
             } = stage;
             let sql = prepare_raw_sql_upload(&mut sql_writer, &mut raw_sql_uploads)?;
-            let mut store_batch = stage_raw_rows(raw_sql_uploads);
-            store_batch.reserve(estimated_additional_staged_row_count(
+            let additional_staged_row_count = estimated_additional_staged_row_count(
                 sql.as_ref(),
                 &state_uploads,
                 &transaction_uploads,
                 state_watermark.as_ref(),
                 transaction_watermark.as_ref(),
-            ));
+            );
+            let mut store_batch = StoreWriteBatch::from_physical_entry_groups(
+                raw_sql_uploads.into_iter().map(|upload| upload.raw_rows),
+                additional_staged_row_count,
+            );
             let mut sql = sql;
             if let Some(prepared) = &mut sql {
                 sql_writer.stage_flush_owned(prepared, &mut store_batch)?;
@@ -1061,18 +1064,6 @@ where
         transaction_writer.mark_flush_persisted(prepared, seq).await;
     }
     Some(seq)
-}
-
-fn stage_raw_rows(raw_sql_uploads: Vec<RawSqlUpload>) -> StoreWriteBatch {
-    let mut uploads = raw_sql_uploads.into_iter();
-    let Some(first) = uploads.next() else {
-        return StoreWriteBatch::new();
-    };
-    let mut batch = StoreWriteBatch::from_physical_entries(first.raw_rows);
-    for upload in uploads {
-        batch.extend_physical_entries(upload.raw_rows);
-    }
-    batch
 }
 
 fn estimated_additional_staged_row_count(
@@ -1510,10 +1501,7 @@ mod tests {
             crate::keys::block(&[7u8; 32]).expect("block key"),
             Bytes::from_static(b"block"),
         )];
-        let mut batch = stage_raw_rows(vec![RawSqlUpload {
-            raw_rows: raw,
-            sql_rows: Vec::new(),
-        }]);
+        let mut batch = StoreWriteBatch::from_physical_entry_groups([raw], 0);
 
         let schema = build_meta_schema(client.clone()).expect("schema");
         let mut writer = schema.batch_writer();
