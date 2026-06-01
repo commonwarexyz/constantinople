@@ -326,6 +326,7 @@ struct CommitBatchStage<H>
 where
     H: Hasher,
 {
+    commit_client: StoreClient,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -1014,6 +1015,7 @@ where
 {
     let prepared = prepare_commit_batch_blocking(
         context.child("stage_commit_batch"),
+        commit_client.clone(),
         sql_writer,
         state_writer.clone(),
         transaction_writer.clone(),
@@ -1035,6 +1037,7 @@ where
 
 async fn prepare_commit_batch_blocking<Cx, H>(
     context: Cx,
+    commit_client: StoreClient,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -1069,6 +1072,7 @@ where
     let staged = stage_commit_batch_blocking(
         context.child("stage_store_batch"),
         CommitBatchStage {
+            commit_client,
             sql_writer,
             state_writer,
             transaction_writer,
@@ -1118,8 +1122,16 @@ struct RawSqlUpload {
     sql_rows: Vec<super::SqlRow>,
 }
 
-fn stage_raw_rows(batch: &mut StoreWriteBatch, upload: RawSqlUpload) {
-    batch.extend_physical_entries(upload.raw_rows);
+fn stage_raw_rows(
+    client: &StoreClient,
+    batch: &mut StoreWriteBatch,
+    upload: RawSqlUpload,
+) -> Result<(), ClientError> {
+    batch.reserve(upload.raw_rows.len());
+    for (key, value) in upload.raw_rows {
+        batch.push(client, &key, value)?;
+    }
+    Ok(())
 }
 
 async fn stage_commit_batch_blocking<Cx, H>(
@@ -1135,6 +1147,7 @@ where
         .shared(true)
         .spawn(move |_| async move {
             let CommitBatchStage {
+                commit_client,
                 mut sql_writer,
                 state_writer,
                 transaction_writer,
@@ -1146,8 +1159,7 @@ where
             } = stage;
             let sql = prepare_raw_sql_upload(&mut sql_writer, &mut raw_sql_upload)?;
             let mut store_batch = StoreWriteBatch::new();
-            store_batch.reserve(raw_sql_upload.raw_rows.len());
-            stage_raw_rows(&mut store_batch, raw_sql_upload);
+            stage_raw_rows(&commit_client, &mut store_batch, raw_sql_upload)?;
             let mut sql = sql;
             if let Some(prepared) = &mut sql {
                 sql_writer.stage_flush(prepared, &mut store_batch)?;
@@ -1825,6 +1837,7 @@ mod tests {
 
             let (_sql_writer, batch) = prepare_commit_batch_blocking(
                 context,
+                client,
                 sql_writer,
                 state_writer,
                 transaction_writer,

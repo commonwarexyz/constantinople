@@ -746,8 +746,11 @@ async fn upload_sql(writer: &mut BatchWriter, rows: &[SqlRow]) {
     writer.flush().await.expect("sql flush");
 }
 
-fn stage_raw_rows(batch: &mut StoreWriteBatch, rows: Vec<(Key, Bytes)>) {
-    batch.extend_physical_entries(rows);
+fn stage_raw_rows(client: &StoreClient, batch: &mut StoreWriteBatch, rows: Vec<(Key, Bytes)>) {
+    batch.reserve(rows.len());
+    for (key, value) in rows {
+        batch.push(client, &key, value).expect("raw row stages");
+    }
 }
 
 async fn upload_combined(
@@ -763,7 +766,7 @@ async fn upload_combined(
         .expect("sql rows are present");
     let mut batch = StoreWriteBatch::new();
     batch.reserve(raw.len().saturating_add(prepared.entry_count()));
-    stage_raw_rows(&mut batch, raw);
+    stage_raw_rows(client, &mut batch, raw);
     writer
         .stage_flush(&prepared, &mut batch)
         .expect("sql rows stage");
@@ -832,7 +835,7 @@ async fn upload_synthetic_full(
         .expect("transaction watermark prepares");
     let mut batch = StoreWriteBatch::new();
     batch.reserve(raw.len().saturating_add(prepared_sql.entry_count()));
-    stage_raw_rows(&mut batch, raw);
+    stage_raw_rows(client, &mut batch, raw);
     writer
         .stage_flush(&prepared_sql, &mut batch)
         .expect("sql rows stage");
