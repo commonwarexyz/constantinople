@@ -1,6 +1,6 @@
 //! Combined publisher for finalized raw KV, SQL metadata, and QMDB rows.
 
-use super::block::{IndexedBlockRows, encode_indexed_block_rows, encode_indexed_block_rows_at};
+use super::block::{IndexedBlockRows, encode_indexed_block_rows_at};
 use crate::sql_schema::build_meta_schema;
 use commonware_codec::{
     Codec, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
@@ -244,32 +244,10 @@ where
     state_next_location: Mutex<u64>,
     transaction_next_location: Mutex<u64>,
     next_upload_order: AtomicU64,
-    prepare_tx: Option<mpsc::Sender<PendingQmdbUpload<H, P>>>,
+    prepare_tx: Option<mpsc::Sender<PendingQueuedFinalizedUpload<H, P>>>,
     prepare_join: Option<JoinHandle<()>>,
     commit_join: Option<JoinHandle<()>>,
     _marker: PhantomData<P>,
-}
-
-enum PendingQmdbUpload<H, P>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    Prepared(PendingPreparedQmdbUpload<H>),
-    Queued(PendingQueuedFinalizedUpload<H, P>),
-}
-
-impl<H, P> PendingQmdbUpload<H, P>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    const fn height(&self) -> u64 {
-        match self {
-            Self::Prepared(upload) => upload.height,
-            Self::Queued(upload) => upload.height,
-        }
-    }
 }
 
 struct PendingPreparedQmdbUpload<H>
@@ -335,6 +313,16 @@ where
     transaction_upload: PreparedUpload<QmdbFamily>,
     state_watermark: Option<PreparedWatermark<QmdbFamily>>,
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
+}
+
+struct CommitPipeline<'a, H>
+where
+    H: Hasher,
+{
+    commits: &'a mut JoinSet<CommittedQmdbBatch>,
+    commit_client: &'a StoreClient,
+    state_writer: &'a Arc<StateWriter<H>>,
+    transaction_writer: &'a Arc<TransactionWriter<H>>,
 }
 
 struct StagedCommitBatch {
@@ -441,91 +429,6 @@ where
         )
     }
 
-    /// Queue all finalized-block index rows for upload.
-    pub async fn upload_finalized<E, S>(
-        &self,
-        block: &EngineBlock<H, P>,
-        databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<(), PublishError>
-    where
-        E: Storage + Clock + Metrics,
-        S: Strategy + Send + Sync + 'static,
-    {
-        let _ = self.enqueue_finalized(block, databases).await?;
-        Ok(())
-    }
-
-    /// Queue all finalized-block index rows and return a completion signal.
-    pub async fn enqueue_finalized<E, S>(
-        &self,
-        block: &EngineBlock<H, P>,
-        databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<UploadCompletion, PublishError>
-    where
-        E: Storage + Clock + Metrics,
-        S: Strategy + Send + Sync + 'static,
-    {
-        let mut state_next = self.state_next_location.lock().await;
-        let mut transaction_next = self.transaction_next_location.lock().await;
-
-        let state_writer_next = *state_next;
-        let state_end = block.header.state_range.end();
-        validate_writer_range(state_writer_next, state_end, block.header.height)?;
-
-        let transaction_writer_next = *transaction_next;
-        let transaction_end = transaction_upload_end(transaction_writer_next, block)?;
-
-        let block_rows = encode_indexed_block_rows(block);
-        let state =
-            build_state_upload::<E, H, P, S>(state_writer_next, block, &databases.0).await?;
-        let completion = self
-            .enqueue_ordered_finalized(block, block_rows, state, transaction_writer_next)
-            .await?;
-        *state_next = state_end;
-        *transaction_next = transaction_end;
-        Ok(completion)
-    }
-
-    /// Queue all finalized-block index rows and return a completion signal.
-    ///
-    /// Row encoding is offloaded to the supplied context.
-    pub async fn enqueue_finalized_with_context<Cx, E, S>(
-        &self,
-        context: Cx,
-        block: &EngineBlock<H, P>,
-        databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<UploadCompletion, PublishError>
-    where
-        Cx: Spawner,
-        E: Storage + Clock + Metrics,
-        S: Strategy + Send + Sync + 'static,
-    {
-        let mut state_next = self.state_next_location.lock().await;
-        let mut transaction_next = self.transaction_next_location.lock().await;
-
-        let state_writer_next = *state_next;
-        let state_end = block.header.state_range.end();
-        validate_writer_range(state_writer_next, state_end, block.header.height)?;
-
-        let transaction_writer_next = *transaction_next;
-        let transaction_end = transaction_upload_end(transaction_writer_next, block)?;
-
-        let rows_block = block.clone();
-        let rows = context
-            .child("encode_rows")
-            .shared(true)
-            .spawn(move |_| async move { encode_indexed_block_rows(&rows_block) });
-        let state = build_state_upload::<E, H, P, S>(state_writer_next, block, &databases.0).await;
-        let block_rows = rows.await.expect("QMDB row encoding task exited");
-        let state = state?;
-        let completion = self
-            .enqueue_ordered_finalized(block, block_rows, state, transaction_writer_next)
-            .await?;
-        *state_next = state_end;
-        *transaction_next = transaction_end;
-        Ok(completion)
-    }
-
     /// Capture the finalized-block upload material that must survive local pruning.
     ///
     /// This deliberately stops at the durable local payload boundary. Remote
@@ -553,11 +456,11 @@ where
         let block = block.clone();
         let state_block = block.clone();
         let state_db = databases.0.clone();
-        let state = context
+        let state_delta = context
             .child("state_delta")
             .shared(true)
             .spawn(move |_| async move {
-                build_state_upload::<E, H, P, S>(state_writer_next, &state_block, &state_db).await
+                build_state_delta::<E, H, P, S>(state_writer_next, &state_block, &state_db).await
             })
             .await
             .expect("QMDB state queue task exited")?;
@@ -567,7 +470,7 @@ where
             finalized_ts_micros: current_time_micros(),
             state_start: state_writer_next,
             transaction_start: transaction_writer_next,
-            state_delta: state.delta,
+            state_delta,
         })
     }
 
@@ -605,51 +508,16 @@ where
             .expect("publisher send channel is open until shutdown");
         let order = self.next_upload_order.fetch_add(1, Ordering::Relaxed);
         prepare_tx
-            .send(PendingQmdbUpload::Queued(PendingQueuedFinalizedUpload {
+            .send(PendingQueuedFinalizedUpload {
                 order,
                 height,
                 upload,
                 completion,
-            }))
+            })
             .await
             .map_err(|_| PublishError::CommitterStopped { height })?;
         *state_next = state_end;
         *transaction_next = transaction_end;
-        Ok(UploadCompletion { rx })
-    }
-
-    async fn enqueue_ordered_finalized(
-        &self,
-        block: &EngineBlock<H, P>,
-        block_rows: IndexedBlockRows<H::Digest>,
-        state: PendingStateUpload,
-        transaction_writer_next: u64,
-    ) -> Result<UploadCompletion, PublishError> {
-        let transactions = build_transaction_upload_from_digests(
-            block,
-            transaction_writer_next,
-            &block_rows.transaction_digests,
-        )?;
-        let (completion, rx) = oneshot::channel();
-        let prepare_tx = self
-            .prepare_tx
-            .as_ref()
-            .expect("publisher send channel is open until shutdown");
-        let order = self.next_upload_order.fetch_add(1, Ordering::Relaxed);
-        prepare_tx
-            .send(PendingQmdbUpload::Prepared(PendingPreparedQmdbUpload {
-                order,
-                height: block.header.height,
-                block_rows,
-                state_delta: state.delta,
-                account_rows: state.account_rows,
-                transaction_ops: transactions.ops,
-                completion,
-            }))
-            .await
-            .map_err(|_| PublishError::CommitterStopped {
-                height: block.header.height,
-            })?;
         Ok(UploadCompletion { rx })
     }
 }
@@ -723,7 +591,7 @@ async fn run_qmdb_preparer<Cx, H, P>(
     context: Cx,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
-    mut rx: mpsc::Receiver<PendingQmdbUpload<H, P>>,
+    mut rx: mpsc::Receiver<PendingQueuedFinalizedUpload<H, P>>,
     commit_tx: mpsc::Sender<PreparedQmdbUpload>,
     prepare_limit: Arc<Semaphore>,
 ) where
@@ -754,9 +622,13 @@ async fn run_qmdb_preparer<Cx, H, P>(
                 let state_writer = state_writer.clone();
                 let transaction_writer = transaction_writer.clone();
                 let done_tx = done_tx.clone();
-                let _handle = context.child("prepare_upload").shared(true).spawn(move |context| async move {
+                let height = upload.height;
+                let _handle = context
+                    .child("prepare_upload")
+                    .with_attribute("height", height)
+                    .shared(true)
+                    .spawn(move |context| async move {
                     let _permit = permit;
-                    let height = upload.height();
                     let result = prepare_qmdb_upload(context, state_writer, transaction_writer, upload)
                         .await
                         .map_err(|error| (height, error));
@@ -807,7 +679,7 @@ async fn prepare_qmdb_upload<Cx, H, P>(
     context: Cx,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
-    upload: PendingQmdbUpload<H, P>,
+    upload: PendingQueuedFinalizedUpload<H, P>,
 ) -> Result<PreparedQmdbUpload, PublishError>
 where
     Cx: Spawner,
@@ -815,10 +687,7 @@ where
     H::Digest: Codec + Send + Sync,
     P: PublicKey,
 {
-    let prepared = match upload {
-        PendingQmdbUpload::Prepared(upload) => upload,
-        PendingQmdbUpload::Queued(upload) => expand_queued_finalized_upload(upload)?,
-    };
+    let prepared = expand_queued_finalized_upload(upload)?;
     prepare_prepared_qmdb_upload(context, state_writer, transaction_writer, prepared).await
 }
 
@@ -946,11 +815,13 @@ async fn run_qmdb_committer<Cx, H>(
                 context
                     .child("upload")
                     .with_attribute("height", upload.height),
-                &mut commits,
-                &commit_client,
+                CommitPipeline {
+                    commits: &mut commits,
+                    commit_client: &commit_client,
+                    state_writer: &state_writer,
+                    transaction_writer: &transaction_writer,
+                },
                 sql_writer,
-                &state_writer,
-                &transaction_writer,
                 upload,
                 inline_watermarks,
             )
@@ -970,11 +841,13 @@ async fn run_qmdb_committer<Cx, H>(
                             context
                                 .child("upload")
                                 .with_attribute("height", upload.height),
-                            &mut commits,
-                            &commit_client,
+                            CommitPipeline {
+                                commits: &mut commits,
+                                commit_client: &commit_client,
+                                state_writer: &state_writer,
+                                transaction_writer: &transaction_writer,
+                            },
                             sql_writer,
-                            &state_writer,
-                            &transaction_writer,
                             upload,
                             inline_watermarks,
                         )
@@ -1006,11 +879,8 @@ async fn run_qmdb_committer<Cx, H>(
 
 async fn stage_and_spawn_commit<Cx, H>(
     context: Cx,
-    commits: &mut JoinSet<CommittedQmdbBatch>,
-    commit_client: &StoreClient,
+    pipeline: CommitPipeline<'_, H>,
     sql_writer: BatchWriter,
-    state_writer: &Arc<StateWriter<H>>,
-    transaction_writer: &Arc<TransactionWriter<H>>,
     upload: PreparedQmdbUpload,
     inline_watermarks: bool,
 ) -> BatchWriter
@@ -1021,10 +891,10 @@ where
 {
     let prepared = prepare_commit_batch_blocking(
         context.child("stage_commit_batch"),
-        commit_client.clone(),
+        pipeline.commit_client.clone(),
         sql_writer,
-        state_writer.clone(),
-        transaction_writer.clone(),
+        pipeline.state_writer.clone(),
+        pipeline.transaction_writer.clone(),
         upload,
         inline_watermarks,
     )
@@ -1033,9 +903,9 @@ where
     let sql_writer = prepared.0;
     let batch = prepared.1;
     spawn_commit(
-        commits,
+        pipeline.commits,
         context.child("store_commit"),
-        commit_client.clone(),
+        pipeline.commit_client.clone(),
         batch,
     );
     sql_writer
@@ -1461,11 +1331,6 @@ where
     Ok(WriterState::from_checkpoint::<H>(&checkpoint)?)
 }
 
-struct PendingStateUpload {
-    delta: Vec<StateOperation>,
-    account_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
-}
-
 struct PendingTransactionUpload<H>
 where
     H: Hasher,
@@ -1473,11 +1338,11 @@ where
     ops: Vec<TransactionOperation<H>>,
 }
 
-async fn build_state_upload<E, H, P, S>(
+async fn build_state_delta<E, H, P, S>(
     writer_next: u64,
     block: &EngineBlock<H, P>,
     state_db: &StateDatabase<E, H, commonware_storage::translator::EightCap, S>,
-) -> Result<PendingStateUpload, PublishError>
+) -> Result<Vec<StateOperation>, PublishError>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -1492,12 +1357,7 @@ where
 
     let state = state_db.read().await;
     let end = block.header.state_range.end();
-    let delta = load_state_ops::<E, H, S>(&state, writer_next, end).await?;
-    let account_rows = account_rows(&delta, writer_next);
-    Ok(PendingStateUpload {
-        delta,
-        account_rows,
-    })
+    load_state_ops::<E, H, S>(&state, writer_next, end).await
 }
 
 const fn validate_writer_range(
@@ -1720,8 +1580,17 @@ mod tests {
     use super::*;
     use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
     use bytes::Bytes;
-    use commonware_cryptography::sha256::Sha256;
+    use commonware_consensus::{
+        simplex::types::Context as SimplexContext,
+        types::{Round, View, coding::Commitment},
+    };
+    use commonware_cryptography::{
+        Digest as _, Signer as _, ed25519,
+        sha256::{Digest as Sha256Digest, Sha256},
+    };
     use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_utils::non_empty_range;
+    use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
 
@@ -1873,6 +1742,32 @@ mod tests {
     }
 
     #[test]
+    fn queued_upload_completes_through_publisher() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+                .await
+                .expect("spawn simulator");
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("qmdb_publisher"),
+                &url,
+                2,
+            )
+            .await
+            .expect("publisher connects");
+
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload())
+                .await
+                .expect("queued upload accepted");
+            assert!(completion.wait().await);
+
+            publisher.shutdown().await;
+            handle.abort();
+        });
+    }
+
+    #[test]
     fn qmdb_publisher_shutdown_joins_background_workers() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1889,5 +1784,44 @@ mod tests {
             publisher.shutdown().await;
             handle.abort();
         });
+    }
+
+    fn test_queued_upload() -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {
+        let leader = ed25519::PrivateKey::from_seed(7).public_key();
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), Commitment::EMPTY),
+            },
+            parent: Sha256Digest::EMPTY,
+            height: 1,
+            timestamp: 0,
+            state_root: Sha256Digest::EMPTY,
+            state_range: non_empty_range!(0, 2),
+            transactions_root: Sha256Digest::EMPTY,
+            transactions_range: non_empty_range!(0, 2),
+        };
+        let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+            .seal(&mut Sha256::default());
+        let account_key = AccountKey::from_bytes(Bytes::from(vec![1u8; AccountKey::SIZE])).unwrap();
+        let state_delta = vec![
+            StateOperation::Update(UnorderedUpdate(
+                account_key,
+                encode_account(Account {
+                    balance: 1,
+                    nonce: 0,
+                }),
+            )),
+            StateOperation::CommitFloor(None, Location::new(0)),
+        ];
+
+        QueuedFinalizedUpload {
+            block,
+            finalized_ts_micros: 1_000,
+            state_start: 0,
+            transaction_start: 0,
+            state_delta,
+        }
     }
 }

@@ -15,10 +15,7 @@ use constantinople_primitives::{
     AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
 };
 use exoware_sdk::keys::Key;
-use std::{
-    array::TryFromSliceError,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::array::TryFromSliceError;
 use tracing::warn;
 
 const TX_BY_SENDER_ROW_BYTES: usize = 32 + 32 + 8 + 8 + 8 + 8 + 4;
@@ -44,6 +41,7 @@ struct IndexedTransaction<D: Digest> {
 }
 
 /// Build every row for a finalized block, partitioned by destination store.
+#[cfg(test)]
 pub(crate) fn encode_indexed_block_rows<H, P>(
     block: &EngineBlock<H, P>,
 ) -> IndexedBlockRows<H::Digest>
@@ -51,8 +49,8 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    let finalized_ts_micros = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
+    let finalized_ts_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
         .unwrap_or(0);
     encode_indexed_block_rows_at(block, finalized_ts_micros)

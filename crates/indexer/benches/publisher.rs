@@ -356,10 +356,12 @@ fn bench_synthetic_full_upload_commit(c: &mut Criterion) {
                             upload_synthetic_full(
                                 &client,
                                 &mut writer,
-                                &state_client,
-                                &transaction_client,
-                                state_ops.clone(),
-                                transaction_ops.clone(),
+                                SyntheticQmdbInputs {
+                                    state_client: &state_client,
+                                    transaction_client: &transaction_client,
+                                    state_ops: state_ops.clone(),
+                                    transaction_ops: transaction_ops.clone(),
+                                },
                                 height,
                                 tx_count,
                             )
@@ -794,15 +796,14 @@ async fn upload_combined_blocks(
 async fn upload_synthetic_full(
     client: &StoreClient,
     writer: &mut BatchWriter,
-    state_client: &StoreClient,
-    transaction_client: &StoreClient,
-    state_ops: Arc<Vec<BenchStateOperation>>,
-    transaction_ops: Arc<Vec<BenchTransactionOperation>>,
+    qmdb: SyntheticQmdbInputs<'_>,
     height: u64,
     tx_count: usize,
 ) {
-    let state_writer = Arc::new(BenchStateWriter::empty(state_client.clone()));
-    let transaction_writer = Arc::new(BenchTransactionWriter::empty(transaction_client.clone()));
+    let state_writer = Arc::new(BenchStateWriter::empty(qmdb.state_client.clone()));
+    let transaction_writer = Arc::new(BenchTransactionWriter::empty(
+        qmdb.transaction_client.clone(),
+    ));
     let raw = raw_rows(height, tx_count);
     let sql = sql_rows(height, tx_count);
     insert_sql_rows(writer, &sql);
@@ -812,10 +813,12 @@ async fn upload_synthetic_full(
         .expect("sql rows are present");
     let state_prepare = tokio::spawn({
         let state_writer = state_writer.clone();
+        let state_ops = qmdb.state_ops.clone();
         async move { state_writer.prepare_upload(&state_ops).await }
     });
     let transaction_prepare = tokio::spawn({
         let transaction_writer = transaction_writer.clone();
+        let transaction_ops = qmdb.transaction_ops.clone();
         async move { transaction_writer.prepare_upload(&transaction_ops).await }
     });
     let (state_upload, transaction_upload) = tokio::join!(state_prepare, transaction_prepare);
@@ -869,6 +872,13 @@ async fn upload_synthetic_full(
         transaction_writer.mark_flush_persisted(prepared, seq).await;
     }
     black_box(seq);
+}
+
+struct SyntheticQmdbInputs<'a> {
+    state_client: &'a StoreClient,
+    transaction_client: &'a StoreClient,
+    state_ops: Arc<Vec<BenchStateOperation>>,
+    transaction_ops: Arc<Vec<BenchTransactionOperation>>,
 }
 
 fn insert_sql_rows(writer: &mut BatchWriter, rows: &[SqlRow]) {
