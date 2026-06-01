@@ -373,6 +373,8 @@ Topology and defaults:
 - Simplex finalization artifacts are stored in `chain-indexer` and read
   directly by proof-verifying clients through the Store API.
 - all shared indexer services land in the first remote region.
+- `chain-indexer` uses a 500 GiB `io2` volume by default; override it with
+  `--chain-indexer-storage-size`.
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
 - `qmdb-indexer` listens on port `8092` by default.

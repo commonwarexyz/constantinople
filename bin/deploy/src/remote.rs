@@ -367,7 +367,7 @@ fn build_deployer_config(
             region: shared_indexer_region.clone(),
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
-            storage_size: remote.storage_size,
+            storage_size: remote.chain_indexer_storage_size,
             storage_class: CHAIN_INDEXER_STORAGE_CLASS.to_string(),
             storage_iops: Some(CHAIN_INDEXER_STORAGE_IOPS),
             storage_throughput: None,
@@ -478,11 +478,11 @@ mod tests {
     use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS, CHAIN_INDEXER_STORAGE_IOPS,
-        EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs, GenerateTarget, LocalArgs,
-        METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS,
-        StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
-        default_max_propose_bytes, generate_local_cluster_material, total_secondaries,
-        validate_generate_args,
+        DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
+        GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
+        RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
+        default_max_pool_bytes, default_max_propose_bytes, generate_local_cluster_material,
+        total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -519,6 +519,7 @@ mod tests {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
             storage_size: 25,
+            chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
             monitoring_instance_type: "c8g.2xlarge".to_string(),
             monitoring_storage_size: 100,
             dashboard: PathBuf::from("dashboard.json"),
@@ -779,6 +780,10 @@ mod tests {
         assert_eq!(
             config.instances[5].storage_class,
             CHAIN_INDEXER_STORAGE_CLASS
+        );
+        assert_eq!(
+            config.instances[5].storage_size,
+            DEFAULT_CHAIN_INDEXER_STORAGE_SIZE
         );
         assert_eq!(
             config.instances[5].storage_iops,
