@@ -61,8 +61,10 @@ use exoware_sql::{BatchWriter, CellValue};
 use std::{
     hint::black_box,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
-    sync::Arc,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tempfile::TempDir;

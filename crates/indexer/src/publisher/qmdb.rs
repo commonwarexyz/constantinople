@@ -30,7 +30,7 @@ use exoware_qmdb::{
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, VecDeque},
     marker::PhantomData,
     num::NonZeroU64,
     sync::{
@@ -342,6 +342,12 @@ struct CommittedQmdbBatch {
     state_watermark: Option<PreparedWatermark<QmdbFamily>>,
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
     store_seq: u64,
+}
+
+struct PendingUploadCompletion {
+    state_latest: Location<QmdbFamily>,
+    transaction_latest: Location<QmdbFamily>,
+    completion: oneshot::Sender<()>,
 }
 
 impl<H, P> Publisher<H, P>
@@ -800,6 +806,7 @@ async fn run_qmdb_committer<Cx, H>(
 {
     let mut rx_closed = false;
     let mut commits = JoinSet::new();
+    let mut pending_completions = VecDeque::new();
     loop {
         while commits.len() < max_in_flight_commits {
             let upload = match rx.try_recv() {
@@ -829,6 +836,18 @@ async fn run_qmdb_committer<Cx, H>(
         }
 
         if rx_closed && commits.is_empty() {
+            flush_and_complete_published_uploads(
+                context.child("watermarks"),
+                &mut pending_completions,
+                &commit_client,
+                &state_writer,
+                &transaction_writer,
+            )
+            .await;
+            assert!(
+                pending_completions.is_empty(),
+                "QMDB uploads persisted without a publishable watermark"
+            );
             break;
         }
 
@@ -860,15 +879,31 @@ async fn run_qmdb_committer<Cx, H>(
                 let batch = maybe_done
                     .expect("QMDB commit set not empty")
                     .expect("QMDB commit task panicked");
-                mark_committed_batch(
-                    context
-                        .child("commit_result")
-                        .with_attribute("height", batch.upload.height),
+                let completion = mark_committed_batch(
                     batch,
                     &mut sql_writer,
                     &state_writer,
                     &transaction_writer,
+                )
+                .await;
+                pending_completions.push_back(completion);
+                while let Some(batch) = commits.try_join_next() {
+                    let batch = batch.expect("QMDB commit task panicked");
+                    let completion = mark_committed_batch(
+                        batch,
+                        &mut sql_writer,
+                        &state_writer,
+                        &transaction_writer,
+                    )
+                    .await;
+                    pending_completions.push_back(completion);
+                }
+                flush_and_complete_published_uploads(
+                    context.child("watermarks"),
+                    &mut pending_completions,
                     &commit_client,
+                    &state_writer,
+                    &transaction_writer,
                 )
                 .await;
             }
@@ -1094,15 +1129,13 @@ fn spawn_commit<Cx>(
     });
 }
 
-async fn mark_committed_batch<Cx, H>(
-    context: Cx,
+async fn mark_committed_batch<H>(
     batch: CommittedQmdbBatch,
     sql_writer: &mut BatchWriter,
     state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
-    commit_client: &StoreClient,
-) where
-    Cx: Spawner,
+) -> PendingUploadCompletion
+where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
@@ -1117,6 +1150,8 @@ async fn mark_committed_batch<Cx, H>(
     }
     let upload = batch.upload;
     let height = upload.height;
+    let state_latest = upload.state.latest_location();
+    let transaction_latest = upload.transactions.latest_location();
     let state_receipt = state_writer
         .mark_upload_persisted(upload.state, batch.store_seq)
         .await;
@@ -1140,21 +1175,17 @@ async fn mark_committed_batch<Cx, H>(
             .mark_flush_persisted(prepared, batch.store_seq)
             .await;
     }
-    let watermark_seq = flush_qmdb_watermarks(
-        context.child("watermarks"),
-        commit_client,
-        state_writer,
-        transaction_writer,
-    )
-    .await;
-    let _ = upload.completion.send(());
     debug!(
         height,
         rows = batch.rows,
         store_sequence = batch.store_seq,
-        watermark_sequence = watermark_seq,
-        "indexer uploaded finalized index"
+        "indexer uploaded finalized index data"
     );
+    PendingUploadCompletion {
+        state_latest,
+        transaction_latest,
+        completion: upload.completion,
+    }
 }
 
 async fn flush_qmdb_watermarks<Cx, H>(
@@ -1205,6 +1236,70 @@ where
         transaction_writer.mark_flush_persisted(prepared, seq).await;
     }
     Some(seq)
+}
+
+async fn flush_and_complete_published_uploads<Cx, H>(
+    context: Cx,
+    pending: &mut VecDeque<PendingUploadCompletion>,
+    commit_client: &StoreClient,
+    state_writer: &StateWriter<H>,
+    transaction_writer: &TransactionWriter<H>,
+) where
+    Cx: Spawner,
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+{
+    let already_published =
+        complete_published_uploads(pending, state_writer, transaction_writer).await;
+    if pending.is_empty() {
+        if already_published > 0 {
+            debug!(
+                completed_uploads = already_published,
+                "indexer completed finalized uploads with in-band QMDB watermarks"
+            );
+        }
+        return;
+    }
+
+    let watermark_seq =
+        flush_qmdb_watermarks(context, commit_client, state_writer, transaction_writer).await;
+    let completed = complete_published_uploads(pending, state_writer, transaction_writer).await;
+    if completed > 0 || watermark_seq.is_some() {
+        debug!(
+            completed_uploads = completed,
+            watermark_sequence = watermark_seq,
+            pending_uploads = pending.len(),
+            "indexer published QMDB watermark"
+        );
+    }
+}
+
+async fn complete_published_uploads<H>(
+    pending: &mut VecDeque<PendingUploadCompletion>,
+    state_writer: &StateWriter<H>,
+    transaction_writer: &TransactionWriter<H>,
+) -> usize
+where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+{
+    let state = state_writer.latest_published_watermark().await;
+    let transactions = transaction_writer.latest_published_watermark().await;
+    let mut completed = 0usize;
+    let mut retained = VecDeque::with_capacity(pending.len());
+    while let Some(upload) = pending.pop_front() {
+        let state_ready = state.is_some_and(|watermark| watermark >= upload.state_latest);
+        let transactions_ready =
+            transactions.is_some_and(|watermark| watermark >= upload.transaction_latest);
+        if state_ready && transactions_ready {
+            let _ = upload.completion.send(());
+            completed += 1;
+        } else {
+            retained.push_back(upload);
+        }
+    }
+    *pending = retained;
+    completed
 }
 
 fn prepare_raw_sql_upload(
@@ -1263,7 +1358,6 @@ where
         UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::from_client(
             client,
             (),
-            ((), ()),
         );
     recover_writer_state::<H, _, _>(
         reader.writer_location_watermark().await?,
@@ -1742,6 +1836,120 @@ mod tests {
     }
 
     #[test]
+    fn grouped_watermark_flush_completes_multiple_uploads() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+                .await
+                .expect("spawn simulator");
+            let client = StoreClient::new(&url);
+            let state_writer =
+                StateWriter::<Sha256>::empty(state_qmdb_client(&client).expect("state client"));
+            let transaction_writer = TransactionWriter::<Sha256>::empty(
+                transactions_qmdb_client(&client).expect("transaction client"),
+            );
+
+            let mut first_state = state_writer
+                .prepare_upload(&state_ops(1))
+                .await
+                .expect("first state upload");
+            let first_state_latest = first_state.latest_location();
+            let mut first_transactions = transaction_writer
+                .prepare_upload(&transaction_ops(1))
+                .await
+                .expect("first transaction upload");
+            let first_transaction_latest = first_transactions.latest_location();
+            let mut second_state = state_writer
+                .prepare_upload(&state_ops(2))
+                .await
+                .expect("second state upload");
+            let second_state_latest = second_state.latest_location();
+            let mut second_transactions = transaction_writer
+                .prepare_upload(&transaction_ops(2))
+                .await
+                .expect("second transaction upload");
+            let second_transaction_latest = second_transactions.latest_location();
+
+            let first_seq = commit_staged_upload_pair(
+                &client,
+                &state_writer,
+                &transaction_writer,
+                &mut first_state,
+                &mut first_transactions,
+            )
+            .await;
+            let second_seq = commit_staged_upload_pair(
+                &client,
+                &state_writer,
+                &transaction_writer,
+                &mut second_state,
+                &mut second_transactions,
+            )
+            .await;
+
+            state_writer
+                .mark_upload_persisted(first_state, first_seq)
+                .await;
+            transaction_writer
+                .mark_upload_persisted(first_transactions, first_seq)
+                .await;
+            state_writer
+                .mark_upload_persisted(second_state, second_seq)
+                .await;
+            transaction_writer
+                .mark_upload_persisted(second_transactions, second_seq)
+                .await;
+
+            let (first_completion, first_rx) = oneshot::channel();
+            let (second_completion, mut second_rx) = oneshot::channel();
+            let mut pending = VecDeque::from([
+                PendingUploadCompletion {
+                    state_latest: first_state_latest,
+                    transaction_latest: first_transaction_latest,
+                    completion: first_completion,
+                },
+                PendingUploadCompletion {
+                    state_latest: second_state_latest,
+                    transaction_latest: second_transaction_latest,
+                    completion: second_completion,
+                },
+            ]);
+
+            assert_eq!(
+                complete_published_uploads(&mut pending, &state_writer, &transaction_writer).await,
+                1,
+                "the in-band first watermark should complete only the first upload",
+            );
+            first_rx.await.expect("first upload completed");
+            assert!(
+                second_rx.try_recv().is_err(),
+                "second upload must wait for the grouped catch-up watermark",
+            );
+
+            flush_and_complete_published_uploads(
+                context.child("grouped_watermark"),
+                &mut pending,
+                &client,
+                &state_writer,
+                &transaction_writer,
+            )
+            .await;
+
+            assert!(pending.is_empty());
+            second_rx.await.expect("second upload completed");
+            assert_eq!(
+                state_writer.latest_published_watermark().await,
+                Some(second_state_latest),
+            );
+            assert_eq!(
+                transaction_writer.latest_published_watermark().await,
+                Some(second_transaction_latest),
+            );
+            handle.abort();
+        });
+    }
+
+    #[test]
     fn queued_upload_completes_through_publisher() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1784,6 +1992,44 @@ mod tests {
             publisher.shutdown().await;
             handle.abort();
         });
+    }
+
+    async fn commit_staged_upload_pair(
+        client: &StoreClient,
+        state_writer: &StateWriter<Sha256>,
+        transaction_writer: &TransactionWriter<Sha256>,
+        state: &mut PreparedUpload<QmdbFamily>,
+        transactions: &mut PreparedUpload<QmdbFamily>,
+    ) -> u64 {
+        let mut batch = StoreWriteBatch::new();
+        state_writer
+            .stage_upload(state, &mut batch)
+            .expect("state rows stage");
+        transaction_writer
+            .stage_upload(transactions, &mut batch)
+            .expect("transaction rows stage");
+        batch.commit(client).await.expect("upload batch commits")
+    }
+
+    fn state_ops(seed: u8) -> Vec<StateOperation> {
+        let key = AccountKey::from_bytes(Bytes::from(vec![seed; AccountKey::SIZE])).unwrap();
+        vec![
+            StateOperation::Update(UnorderedUpdate(
+                key,
+                encode_account(Account {
+                    balance: u64::from(seed),
+                    nonce: 0,
+                }),
+            )),
+            StateOperation::CommitFloor(None, Location::new(0)),
+        ]
+    }
+
+    fn transaction_ops(seed: u8) -> Vec<TransactionOperation<Sha256>> {
+        vec![
+            TransactionOperation::<Sha256>::Append(Sha256::hash(&[seed])),
+            TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
+        ]
     }
 
     fn test_queued_upload() -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {

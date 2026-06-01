@@ -61,8 +61,6 @@ use tracing::{info, warn};
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
-const MAX_POOL_BYTES: usize = 256 * 1024 * 1024;
-const MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
@@ -622,6 +620,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         rayon_threads,
         http_listen,
         metrics_listen,
+        max_propose_bytes,
+        max_pool_bytes,
         prune_cadence_blocks,
         json_logs,
         deployer_managed,
@@ -744,8 +744,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let mempool_actor = webserver::Actor::new(
             context.child("mempool"),
             webserver::Config {
-                max_pool_bytes: MAX_POOL_BYTES,
-                max_propose_bytes: MAX_PROPOSE_BYTES,
+                max_pool_bytes,
+                max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: 3,
                 signature_strategy: signature_strategy.clone(),

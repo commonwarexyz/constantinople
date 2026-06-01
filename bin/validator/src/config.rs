@@ -28,6 +28,14 @@ pub(crate) const fn default_upload_buffer() -> usize {
     64
 }
 
+pub(crate) const fn default_max_propose_bytes() -> usize {
+    4 * 1024 * 1024
+}
+
+pub(crate) const fn default_max_pool_bytes() -> usize {
+    64 * 1024 * 1024
+}
+
 pub(crate) const fn default_prune_cadence_blocks() -> u64 {
     1024
 }
@@ -88,6 +96,10 @@ pub struct ValidatorConfig {
     pub http_port: u16,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    #[serde(default = "default_max_propose_bytes")]
+    pub max_propose_bytes: usize,
+    #[serde(default = "default_max_pool_bytes")]
+    pub max_pool_bytes: usize,
     #[serde(default = "default_prune_cadence_blocks")]
     pub prune_cadence_blocks: u64,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
@@ -159,6 +171,8 @@ pub struct LoadedConfig {
     pub rayon_threads: usize,
     pub http_listen: SocketAddr,
     pub metrics_listen: SocketAddr,
+    pub max_propose_bytes: usize,
+    pub max_pool_bytes: usize,
     pub prune_cadence_blocks: u64,
     pub json_logs: bool,
     pub deployer_managed: bool,
@@ -280,6 +294,8 @@ fn decode_with_network(
         rayon_threads: config.rayon_threads,
         http_listen,
         metrics_listen,
+        max_propose_bytes: config.max_propose_bytes,
+        max_pool_bytes: config.max_pool_bytes,
         prune_cadence_blocks: config.prune_cadence_blocks,
         json_logs,
         deployer_managed: json_logs,
@@ -428,8 +444,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_prune_cadence_blocks, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        default_max_pool_bytes, default_max_propose_bytes, default_prune_cadence_blocks,
+        default_upload_buffer, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -547,6 +563,8 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                max_propose_bytes: default_max_propose_bytes(),
+                max_pool_bytes: default_max_pool_bytes(),
                 prune_cadence_blocks: default_prune_cadence_blocks(),
                 bootstrappers,
                 indexer: None,
@@ -578,6 +596,8 @@ mod tests {
                 rayon_threads: 2,
                 http_port: 8080,
                 metrics_port: 9090,
+                max_propose_bytes: default_max_propose_bytes(),
+                max_pool_bytes: default_max_pool_bytes(),
                 prune_cadence_blocks: default_prune_cadence_blocks(),
                 bootstrappers,
                 indexer: None,
@@ -602,11 +622,13 @@ mod tests {
         let config_path = temp_path("validator-config", ".yaml");
         let peers_path = temp_path("validator-peers", ".yaml");
 
-        let config = cluster.primary_config(
+        let mut config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
             vec![bootstrapper_entry(peer_key)],
         );
+        config.max_propose_bytes = 1_234_567;
+        config.max_pool_bytes = 9_876_543;
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -636,6 +658,8 @@ mod tests {
         assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
+        assert_eq!(loaded.max_propose_bytes, 1_234_567);
+        assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,
@@ -665,11 +689,13 @@ mod tests {
         let config_path = temp_path("validator-config", ".yaml");
         let hosts_path = temp_path("validator-hosts", ".yaml");
 
-        let config = cluster.primary_config(
+        let mut config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
             vec![bootstrapper_entry(peer_key)],
         );
+        config.max_propose_bytes = 1_234_567;
+        config.max_pool_bytes = 9_876_543;
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -698,6 +724,8 @@ hosts:
         assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
+        assert_eq!(loaded.max_propose_bytes, 1_234_567);
+        assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,
