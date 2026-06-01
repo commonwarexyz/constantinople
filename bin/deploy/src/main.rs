@@ -28,9 +28,10 @@ use tracing::Level;
 use tracing_subscriber::fmt;
 
 const STORAGE_CLASS: &str = "gp3";
+const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
-const CHAIN_INDEXER_STORAGE_IOPS: i32 = 10_000;
+const DEFAULT_CHAIN_INDEXER_STORAGE_IOPS: i32 = 64_000;
 const EXOWARE_AVAILABILITY_ZONE_GROUP: &str = "exoware";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
@@ -161,9 +162,15 @@ pub(crate) struct RemoteArgs {
     instance_type: String,
     #[arg(long)]
     storage_size: i32,
+    /// Instance type for the shared chain-indexer instance.
+    #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
+    chain_indexer_instance_type: String,
     /// Storage size (GiB) for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-storage-size", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_SIZE)]
     chain_indexer_storage_size: i32,
+    /// Provisioned IOPS for the shared chain-indexer io2 volume.
+    #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
+    chain_indexer_storage_iops: i32,
     #[arg(long)]
     monitoring_instance_type: String,
     #[arg(long)]

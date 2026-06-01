@@ -1,13 +1,13 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
-    CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, CHAIN_INDEXER_STORAGE_IOPS,
-    ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE,
-    EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig,
-    METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
-    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
-    RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
-    STORAGE_CLASS, SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-    absolute_path, default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
+    DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
+    INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
+    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
+    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
+    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
+    SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
+    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
     ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
     indexer_enabled, secondary_roles, total_secondaries, validate_generate_args,
     write_simplex_verification_material, write_yaml_config,
@@ -366,10 +366,10 @@ fn build_deployer_config(
             name: CHAIN_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
-            instance_type: remote.instance_type.clone(),
+            instance_type: remote.chain_indexer_instance_type.clone(),
             storage_size: remote.chain_indexer_storage_size,
             storage_class: CHAIN_INDEXER_STORAGE_CLASS.to_string(),
-            storage_iops: Some(CHAIN_INDEXER_STORAGE_IOPS),
+            storage_iops: Some(remote.chain_indexer_storage_iops),
             storage_throughput: None,
             binary: CHAIN_INDEXER_BINARY_FILE.to_string(),
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
@@ -477,7 +477,8 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 mod tests {
     use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
     use crate::{
-        CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS, CHAIN_INDEXER_STORAGE_IOPS,
+        CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
+        DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
@@ -519,7 +520,9 @@ mod tests {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
             storage_size: 25,
+            chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
             chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
+            chain_indexer_storage_iops: DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
             monitoring_instance_type: "c8g.2xlarge".to_string(),
             monitoring_storage_size: 100,
             dashboard: PathBuf::from("dashboard.json"),
@@ -774,6 +777,10 @@ mod tests {
         assert_eq!(config.instances[5].name, "chain-indexer");
         assert_eq!(config.instances[5].binary, CHAIN_INDEXER_BINARY_FILE);
         assert_eq!(
+            config.instances[5].instance_type,
+            DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE
+        );
+        assert_eq!(
             config.instances[5].availability_zone_group.as_deref(),
             Some(EXOWARE_AVAILABILITY_ZONE_GROUP)
         );
@@ -787,7 +794,7 @@ mod tests {
         );
         assert_eq!(
             config.instances[5].storage_iops,
-            Some(CHAIN_INDEXER_STORAGE_IOPS)
+            Some(DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)
         );
         assert_eq!(config.instances[6].name, "metadata-indexer");
         assert_eq!(config.instances[6].binary, METADATA_INDEXER_BINARY_FILE);
