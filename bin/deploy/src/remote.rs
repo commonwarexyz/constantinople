@@ -1,12 +1,13 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
-    CHAIN_INDEXER_HOST, ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE,
-    GenerateArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
-    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
-    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
-    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
-    SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
+    CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, CHAIN_INDEXER_STORAGE_IOPS,
+    ChainIndexerConfig, ClusterMaterial, DASHBOARD_FILE, DEPLOYER_CONFIG_FILE,
+    EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig,
+    METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
+    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
+    RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
+    STORAGE_CLASS, SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
+    absolute_path, default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
     ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
     indexer_enabled, secondary_roles, total_secondaries, validate_generate_args,
     write_simplex_verification_material, write_yaml_config,
@@ -322,9 +323,12 @@ fn build_deployer_config(
         .map(|(index, validator)| aws::InstanceConfig {
             name: validator.public_key_hex.clone(),
             region: regions[index % regions.len()].clone(),
+            availability_zone_group: None,
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             binary: validator_binary.to_string(),
             config: validator.config_name.clone(),
             profiling: remote.profiling,
@@ -341,9 +345,16 @@ fn build_deployer_config(
         instances.push(aws::InstanceConfig {
             name: secondary.public_key_hex.clone(),
             region,
+            availability_zone_group: secondary
+                .config
+                .indexer
+                .is_some()
+                .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             binary: validator_binary.to_string(),
             config: secondary.config_name.clone(),
             profiling: remote.profiling,
@@ -354,9 +365,12 @@ fn build_deployer_config(
         instances.push(aws::InstanceConfig {
             name: CHAIN_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
+            availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: CHAIN_INDEXER_STORAGE_CLASS.to_string(),
+            storage_iops: Some(CHAIN_INDEXER_STORAGE_IOPS),
+            storage_throughput: None,
             binary: CHAIN_INDEXER_BINARY_FILE.to_string(),
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -364,9 +378,12 @@ fn build_deployer_config(
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
+            availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             binary: METADATA_INDEXER_BINARY_FILE.to_string(),
             config: METADATA_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -374,9 +391,12 @@ fn build_deployer_config(
         instances.push(aws::InstanceConfig {
             name: QMDB_INDEXER_HOST.to_string(),
             region: shared_indexer_region,
+            availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             binary: QMDB_INDEXER_BINARY_FILE.to_string(),
             config: QMDB_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -387,12 +407,15 @@ fn build_deployer_config(
         instances.push(aws::InstanceConfig {
             name: "spammer".to_string(),
             region: regions[0].clone(),
+            availability_zone_group: None,
             instance_type: remote
                 .spammer_instance_type
                 .clone()
                 .unwrap_or_else(|| remote.instance_type.clone()),
             storage_size: remote.spammer_storage_size,
             storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             binary: SPAMMER_BINARY_FILE.to_string(),
             config: SPAMMER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -405,6 +428,8 @@ fn build_deployer_config(
             instance_type: remote.monitoring_instance_type.clone(),
             storage_size: remote.monitoring_storage_size,
             storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             dashboard: dashboard.to_string(),
         },
         instances,
@@ -452,7 +477,8 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 mod tests {
     use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
     use crate::{
-        CHAIN_INDEXER_BINARY_FILE, GenerateArgs, GenerateTarget, LocalArgs,
+        CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS, CHAIN_INDEXER_STORAGE_IOPS,
+        EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs, GenerateTarget, LocalArgs,
         METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS,
         StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
         default_max_propose_bytes, generate_local_cluster_material, total_secondaries,
@@ -558,8 +584,11 @@ mod tests {
         assert_eq!(config.instances[1].region, "us-west-2");
         assert_eq!(config.instances[2].region, "us-east-1");
         assert_eq!(config.instances[0].storage_class, STORAGE_CLASS);
+        assert_eq!(config.instances[0].availability_zone_group, None);
+        assert_eq!(config.instances[0].storage_iops, None);
         assert_eq!(config.instances[0].binary, VALIDATOR_BINARY_FILE);
         assert_eq!(config.instances[0].config, "validator-0.yaml");
+        assert_eq!(config.monitoring.storage_iops, None);
         assert_eq!(config.monitoring.dashboard, "dashboard.json");
         assert_eq!(config.ports[0].port, 9000);
         assert_eq!(config.ports[1].port, 8080);
@@ -634,12 +663,15 @@ mod tests {
         args.relayer = true;
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
+        let mut indexer_secondary_config = validator(0).config;
+        indexer_secondary_config.indexer =
+            Some(super::remote_indexer_config(remote.chain_indexer_port));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),
                 config_name: "secondary-0.yaml".to_string(),
                 config_file: PathBuf::from("/tmp/secondary-0.yaml"),
-                config: validator(0).config,
+                config: indexer_secondary_config,
             },
             super::GeneratedValidator {
                 public_key_hex: "secondary-1".to_string(),
@@ -710,12 +742,15 @@ mod tests {
         args.relayer = true;
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
+        let mut indexer_secondary_config = validator(0).config;
+        indexer_secondary_config.indexer =
+            Some(super::remote_indexer_config(remote.chain_indexer_port));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),
                 config_name: "secondary-0.yaml".to_string(),
                 config_file: PathBuf::from("/tmp/secondary-0.yaml"),
-                config: validator(0).config,
+                config: indexer_secondary_config,
             },
             super::GeneratedValidator {
                 public_key_hex: "secondary-1".to_string(),
@@ -737,14 +772,39 @@ mod tests {
         assert_eq!(config.instances.len(), 8);
         assert_eq!(config.instances[5].name, "chain-indexer");
         assert_eq!(config.instances[5].binary, CHAIN_INDEXER_BINARY_FILE);
+        assert_eq!(
+            config.instances[5].availability_zone_group.as_deref(),
+            Some(EXOWARE_AVAILABILITY_ZONE_GROUP)
+        );
+        assert_eq!(
+            config.instances[5].storage_class,
+            CHAIN_INDEXER_STORAGE_CLASS
+        );
+        assert_eq!(
+            config.instances[5].storage_iops,
+            Some(CHAIN_INDEXER_STORAGE_IOPS)
+        );
         assert_eq!(config.instances[6].name, "metadata-indexer");
         assert_eq!(config.instances[6].binary, METADATA_INDEXER_BINARY_FILE);
+        assert_eq!(
+            config.instances[6].availability_zone_group.as_deref(),
+            Some(EXOWARE_AVAILABILITY_ZONE_GROUP)
+        );
         assert_eq!(config.instances[7].name, "qmdb-indexer");
         assert_eq!(config.instances[7].binary, QMDB_INDEXER_BINARY_FILE);
+        assert_eq!(
+            config.instances[7].availability_zone_group.as_deref(),
+            Some(EXOWARE_AVAILABILITY_ZONE_GROUP)
+        );
         assert_eq!(config.instances[3].region, config.instances[5].region);
         assert_eq!(config.instances[4].region, config.instances[5].region);
         assert_eq!(config.instances[6].region, config.instances[5].region);
         assert_eq!(config.instances[7].region, config.instances[5].region);
+        assert_eq!(
+            config.instances[3].availability_zone_group.as_deref(),
+            Some(EXOWARE_AVAILABILITY_ZONE_GROUP)
+        );
+        assert_eq!(config.instances[4].availability_zone_group, None);
         assert!(config.ports.iter().any(|port| port.port == 8090));
         assert!(config.ports.iter().any(|port| port.port == 8091));
         assert!(config.ports.iter().any(|port| port.port == 8092));
