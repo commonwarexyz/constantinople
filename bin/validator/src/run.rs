@@ -181,13 +181,17 @@ impl FinalizedUploadCursor {
             .get(&CURSOR_TRANSACTION_KEY)
             .cloned()
             .map(u64::from);
-        if state_next.is_none() && transaction_next.is_none() {
-            return None;
+        Self::from_parts(state_next, transaction_next)
+    }
+
+    const fn from_parts(state_next: Option<u64>, transaction_next: Option<u64>) -> Option<Self> {
+        match (state_next, transaction_next) {
+            (Some(state_next), Some(transaction_next)) => Some(Self {
+                state_next,
+                transaction_next,
+            }),
+            _ => None,
         }
-        Some(Self {
-            state_next: state_next.unwrap_or(0),
-            transaction_next: transaction_next.unwrap_or(0),
-        })
     }
 
     fn from_upload(upload: &EngineQueuedUpload) -> Self {
@@ -197,6 +201,11 @@ impl FinalizedUploadCursor {
         }
     }
 
+    /// Return the later finalized-upload frontier as a whole cursor pair.
+    ///
+    /// Do not max fields independently: `state_next` and `transaction_next`
+    /// are captured from one finalized block, so mixing halves from different
+    /// sources can create a frontier that never existed.
     const fn max(self, other: Self) -> Self {
         if other.state_next > self.state_next
             || (other.state_next == self.state_next
@@ -207,6 +216,13 @@ impl FinalizedUploadCursor {
             self
         }
     }
+}
+
+fn recovered_finalized_upload_cursor(
+    metadata: Option<FinalizedUploadCursor>,
+    queue: Option<FinalizedUploadCursor>,
+) -> FinalizedUploadCursor {
+    metadata.unwrap_or_default().max(queue.unwrap_or_default())
 }
 
 impl FinalizedUploadProducer {
@@ -531,9 +547,7 @@ async fn maybe_build_indexer(
     .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
     let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader).await;
-    let cursor = metadata_cursor
-        .unwrap_or_default()
-        .max(queue_cursor.unwrap_or_default());
+    let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
@@ -909,10 +923,40 @@ const fn production_sync_config() -> SyncEngineConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{maybe_build_indexer, wait_for_critical_task_exit};
+    use super::{
+        EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
+        FinalizedQueueWriter, FinalizedUploadCursor, maybe_build_indexer,
+        recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        wait_for_critical_task_exit,
+    };
     use crate::config::IndexerConfig;
-    use commonware_runtime::Runner as _;
+    use commonware_codec::{FixedSize as _, Read as _, Write as _};
+    use commonware_consensus::{
+        marshal::coding::types::coding_config_for_participants,
+        simplex::types::Context as SimplexContext,
+        types::{Round, View, coding::Commitment},
+    };
+    use commonware_cryptography::{
+        Digest as _, Signer as _,
+        ed25519::PrivateKey,
+        sha256::{Digest as Sha256Digest, Sha256},
+    };
+    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_storage::{
+        merkle::mmr,
+        qmdb::any::{unordered::Operation as UnorderedOperation, value::FixedEncoding},
+        queue,
+    };
+    use commonware_utils::{non_empty_range, sequence::FixedBytes};
+    use constantinople_primitives::{
+        Account, AccountKey, Block, Header, Sealable, SignedTransaction,
+    };
     use std::{future::pending, time::Duration};
+
+    type TestAccountValue = FixedBytes<{ Account::SIZE }>;
+    type TestStateOperation =
+        UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
 
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {
@@ -942,7 +986,7 @@ mod tests {
             };
 
             let handle = tokio::time::timeout(
-                Duration::from_millis(500),
+                Duration::from_secs(2),
                 maybe_build_indexer(context, false, Some(indexer), "test"),
             )
             .await
@@ -951,5 +995,163 @@ mod tests {
 
             assert_eq!(handle._uploaders.len(), 2);
         });
+    }
+
+    #[test]
+    fn finalized_upload_cursor_keeps_furthest_recovery_position() {
+        let older = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 20,
+        };
+        let newer_state = FinalizedUploadCursor {
+            state_next: 11,
+            transaction_next: 1,
+        };
+        let newer_transaction = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 21,
+        };
+
+        assert_eq!(older.max(newer_state), newer_state);
+        assert_eq!(older.max(newer_transaction), newer_transaction);
+        assert_eq!(newer_state.max(older), newer_state);
+        assert_eq!(newer_transaction.max(older), newer_transaction);
+    }
+
+    #[test]
+    fn recovered_finalized_upload_cursor_uses_furthest_whole_frontier() {
+        let metadata = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 20,
+        };
+        let queue = FinalizedUploadCursor {
+            state_next: 11,
+            transaction_next: 1,
+        };
+
+        assert_eq!(
+            recovered_finalized_upload_cursor(None, None),
+            Default::default()
+        );
+        assert_eq!(
+            recovered_finalized_upload_cursor(Some(metadata), None),
+            metadata
+        );
+        assert_eq!(recovered_finalized_upload_cursor(None, Some(queue)), queue);
+        assert_eq!(
+            recovered_finalized_upload_cursor(Some(metadata), Some(queue)),
+            queue
+        );
+        assert_eq!(
+            recovered_finalized_upload_cursor(Some(queue), Some(metadata)),
+            queue
+        );
+    }
+
+    #[test]
+    fn finalized_upload_cursor_ignores_partial_metadata_pairs() {
+        assert_eq!(FinalizedUploadCursor::from_parts(None, None), None);
+        assert_eq!(FinalizedUploadCursor::from_parts(Some(10), None), None);
+        assert_eq!(FinalizedUploadCursor::from_parts(None, Some(20)), None);
+        assert_eq!(
+            FinalizedUploadCursor::from_parts(Some(10), Some(20)),
+            Some(FinalizedUploadCursor {
+                state_next: 10,
+                transaction_next: 20,
+            }),
+        );
+    }
+
+    #[test]
+    fn finalized_queue_scan_recovers_last_cursor_and_resets_reader() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
+                &context,
+                FINALIZED_QUEUE_PAGE_SIZE,
+                FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+            );
+            let (writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
+                queue::shared::init(
+                    context.child("finalized_queue"),
+                    queue::Config {
+                        partition: "finalized-queue-scan-recovers-last-cursor".to_string(),
+                        items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+                        compression: None,
+                        codec_config: super::QueuedFinalizedUploadCfg::default(),
+                        page_cache,
+                        write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+                    },
+                )
+                .await
+                .expect("queue initializes");
+            let first = queued_upload(1, 0, 2, 0, 2);
+            let second = queued_upload(2, 2, 5, 2, 3);
+            writer.enqueue(first.clone()).await.expect("enqueue first");
+            writer
+                .enqueue(second.clone())
+                .await
+                .expect("enqueue second");
+
+            assert_eq!(
+                scan_finalized_queue_cursor(&mut reader).await,
+                Some(FinalizedUploadCursor::from_upload(&second))
+            );
+
+            let (_position, upload) = reader
+                .try_recv()
+                .await
+                .expect("read after scan")
+                .expect("scan reset leaves first item readable");
+            assert_eq!(
+                FinalizedUploadCursor::from_upload(&upload),
+                FinalizedUploadCursor::from_upload(&first)
+            );
+        });
+    }
+
+    fn queued_upload(
+        height: u64,
+        state_start: u64,
+        state_end: u64,
+        transaction_start: u64,
+        transaction_end: u64,
+    ) -> EngineQueuedUpload {
+        let leader = PrivateKey::from_seed(height).public_key();
+        let parent_commitment = Commitment::from((
+            Sha256Digest::EMPTY,
+            Sha256Digest::EMPTY,
+            Sha256Digest::EMPTY,
+            coding_config_for_participants(4),
+        ));
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), parent_commitment),
+            },
+            parent: Sha256Digest::EMPTY,
+            height,
+            timestamp: 0,
+            state_root: Sha256Digest::EMPTY,
+            state_range: non_empty_range!(state_start, state_end),
+            transactions_root: Sha256Digest::EMPTY,
+            transactions_range: non_empty_range!(transaction_start, transaction_end),
+        };
+        let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+            .seal(&mut Sha256::default());
+        let state_delta: Vec<TestStateOperation> = vec![TestStateOperation::CommitFloor(
+            None,
+            mmr::Location::new(state_start),
+        )];
+        let mut encoded = bytes::BytesMut::new();
+        block.write(&mut encoded);
+        0i64.write(&mut encoded);
+        state_start.write(&mut encoded);
+        transaction_start.write(&mut encoded);
+        state_delta.write(&mut encoded);
+
+        let mut encoded = encoded.freeze();
+        EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())
+            .expect("queued upload decodes")
     }
 }

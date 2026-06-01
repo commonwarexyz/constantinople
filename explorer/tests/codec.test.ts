@@ -11,9 +11,9 @@ test('ed25519 transaction public keys map to legacy account bytes', async () => 
 
 test('secp256r1 transaction public keys map to hashed account bytes', async () => {
     const publicKey = fromHex(`01${'22'.repeat(33)}`);
-    const expected = new Uint8Array(
-        await crypto.subtle.digest('SHA-256', publicKey.buffer.slice(0)),
-    );
+    const digestInput = new Uint8Array(new ArrayBuffer(publicKey.byteLength));
+    digestInput.set(publicKey);
+    const expected = new Uint8Array(await crypto.subtle.digest('SHA-256', digestInput));
 
     assert.equal(toHex(await accountKeyFromPublicKey(publicKey)), toHex(expected));
 });

@@ -7,8 +7,8 @@
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `raw` (KV)       | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`            |
 //! | `sql` (metadata) | `block_meta`                                                 |
-//! | `qmd` (state)    | Account-state operation log                                  |
-//! | `qmd` (tx hash)  | Transaction-hash operation log                                |
+//! | `qmdb` (state)   | Account-state operation log                                  |
+//! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!
 //! Simplex certificates are uploaded separately through [`CertificateReporter`]
 //! using `exoware-simplex` indexes in the same Store.

@@ -74,7 +74,7 @@ export interface AccountTransactionRow {
     readonly to: string;
     readonly value: bigint;
     readonly nonce: bigint;
-    readonly qmdLocation: bigint;
+    readonly qmdbLocation: bigint;
     readonly height: bigint;
     readonly blockIndex: number;
 }
@@ -246,12 +246,12 @@ export async function fetchAndVerifyTransactionRowProof({
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
-    assertTransactionLocationBeforeTip(row.qmdLocation, target.transactionsTip);
+    assertTransactionLocationBeforeTip(row.qmdbLocation, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
         `${trimTrailingSlash(qmdbUrl)}/transactions`,
-        row.qmdLocation,
+        row.qmdbLocation,
         tip,
         target.transactionsRoot,
         fromHex(row.digest),
@@ -259,7 +259,7 @@ export async function fetchAndVerifyTransactionRowProof({
     );
 
     return {
-        location: row.qmdLocation,
+        location: row.qmdbLocation,
         tip,
         height: target.height,
         view: target.view,
@@ -611,7 +611,7 @@ function decodeTxBySenderRow(key: Uint8Array, value: Uint8Array): AccountTransac
         to: toHex(value.slice(32, 32 + ACCOUNT_KEY_BYTES)),
         value: readU64Be(value, 32 + ACCOUNT_KEY_BYTES),
         nonce: readU64Be(value, 40 + ACCOUNT_KEY_BYTES),
-        qmdLocation: readU64Be(value, 48 + ACCOUNT_KEY_BYTES),
+        qmdbLocation: readU64Be(value, 48 + ACCOUNT_KEY_BYTES),
         height: readU64Be(value, 56 + ACCOUNT_KEY_BYTES),
         blockIndex: readU32Be(value, 64 + ACCOUNT_KEY_BYTES),
     };

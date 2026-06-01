@@ -25,7 +25,7 @@ pub(crate) const fn default_metrics_port() -> u16 {
 }
 
 pub(crate) const fn default_upload_buffer() -> usize {
-    1024
+    64
 }
 
 pub(crate) const fn default_prune_cadence_blocks() -> u64 {
