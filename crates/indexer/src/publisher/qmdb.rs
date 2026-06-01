@@ -943,7 +943,9 @@ async fn run_qmdb_committer<Cx, H>(
             };
             let inline_watermarks = commits.is_empty();
             sql_writer = stage_and_spawn_commit(
-                &context,
+                context
+                    .child("upload")
+                    .with_attribute("height", upload.height),
                 &mut commits,
                 &commit_client,
                 sql_writer,
@@ -965,7 +967,9 @@ async fn run_qmdb_committer<Cx, H>(
                     Some(upload) => {
                         let inline_watermarks = commits.is_empty();
                         sql_writer = stage_and_spawn_commit(
-                            &context,
+                            context
+                                .child("upload")
+                                .with_attribute("height", upload.height),
                             &mut commits,
                             &commit_client,
                             sql_writer,
@@ -984,7 +988,9 @@ async fn run_qmdb_committer<Cx, H>(
                     .expect("QMDB commit set not empty")
                     .expect("QMDB commit task panicked");
                 mark_committed_batch(
-                    &context,
+                    context
+                        .child("commit_result")
+                        .with_attribute("height", batch.upload.height),
                     batch,
                     &mut sql_writer,
                     &state_writer,
@@ -999,7 +1005,7 @@ async fn run_qmdb_committer<Cx, H>(
 }
 
 async fn stage_and_spawn_commit<Cx, H>(
-    context: &Cx,
+    context: Cx,
     commits: &mut JoinSet<CommittedQmdbBatch>,
     commit_client: &StoreClient,
     sql_writer: BatchWriter,
@@ -1219,7 +1225,7 @@ fn spawn_commit<Cx>(
 }
 
 async fn mark_committed_batch<Cx, H>(
-    context: &Cx,
+    context: Cx,
     batch: CommittedQmdbBatch,
     sql_writer: &mut BatchWriter,
     state_writer: &StateWriter<H>,
@@ -1264,8 +1270,13 @@ async fn mark_committed_batch<Cx, H>(
             .mark_flush_persisted(prepared, batch.store_seq)
             .await;
     }
-    let watermark_seq =
-        flush_qmdb_watermarks(context, commit_client, state_writer, transaction_writer).await;
+    let watermark_seq = flush_qmdb_watermarks(
+        context.child("watermarks"),
+        commit_client,
+        state_writer,
+        transaction_writer,
+    )
+    .await;
     let _ = upload.completion.send(());
     debug!(
         height,
@@ -1277,7 +1288,7 @@ async fn mark_committed_batch<Cx, H>(
 }
 
 async fn flush_qmdb_watermarks<Cx, H>(
-    context: &Cx,
+    context: Cx,
     commit_client: &StoreClient,
     state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
