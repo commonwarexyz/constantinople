@@ -1,10 +1,15 @@
+# Mount Constantinople plus its sibling Exoware checkout. Cargo resolves
+# `../exoware-monorepo-faster-qmdb-uploads` from `/constantinople` to
+# `/exoware-monorepo-faster-qmdb-uploads` inside the builder container.
+source-mounts := "-v ${PWD}:/constantinople -v ${PWD}/../exoware-monorepo-faster-qmdb-uploads:/exoware-monorepo-faster-qmdb-uploads:ro"
+
 # Build the Graviton Docker builder image
 build-graviton-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl graviton
 
 # Build the ARM64 validator binary into deploy/
 validator-graviton-binary: build-graviton-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-validator \
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
@@ -12,7 +17,7 @@ validator-graviton-binary: build-graviton-image
 
 # Build the ARM64 spammer binary into deploy/
 spammer-graviton-binary: build-graviton-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-spammer \
     -e BINARY_NAME=constantinople-spammer \
     -e OUTPUT_NAME=spammer \
@@ -20,7 +25,7 @@ spammer-graviton-binary: build-graviton-image
 
 # Build the ARM64 chain-indexer binary into deploy/
 chain-indexer-graviton-binary: build-graviton-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
@@ -28,7 +33,7 @@ chain-indexer-graviton-binary: build-graviton-image
 
 # Build the ARM64 metadata-indexer binary into deploy/
 metadata-indexer-graviton-binary: build-graviton-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=metadata-indexer \
     -e OUTPUT_NAME=metadata-indexer \
@@ -36,7 +41,7 @@ metadata-indexer-graviton-binary: build-graviton-image
 
 # Build the ARM64 qmdb-indexer binary into deploy/
 qmdb-indexer-graviton-binary: build-graviton-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=qmdb-indexer \
     -e OUTPUT_NAME=qmdb-indexer \
@@ -51,7 +56,7 @@ build-intel-image:
 
 # Build the Intel validator binary into deploy/
 validator-intel-binary: build-intel-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-validator \
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
@@ -59,7 +64,7 @@ validator-intel-binary: build-intel-image
 
 # Build the Intel spammer binary into deploy/
 spammer-intel-binary: build-intel-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-spammer \
     -e BINARY_NAME=constantinople-spammer \
     -e OUTPUT_NAME=spammer \
@@ -67,7 +72,7 @@ spammer-intel-binary: build-intel-image
 
 # Build the Intel chain-indexer binary into deploy/
 chain-indexer-intel-binary: build-intel-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
@@ -75,7 +80,7 @@ chain-indexer-intel-binary: build-intel-image
 
 # Build the Intel metadata-indexer binary into deploy/
 metadata-indexer-intel-binary: build-intel-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=metadata-indexer \
     -e OUTPUT_NAME=metadata-indexer \
@@ -83,7 +88,7 @@ metadata-indexer-intel-binary: build-intel-image
 
 # Build the Intel qmdb-indexer binary into deploy/
 qmdb-indexer-intel-binary: build-intel-image
-  docker run --rm -v ${PWD}:/constantinople \
+  docker run --rm {{source-mounts}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=qmdb-indexer \
     -e OUTPUT_NAME=qmdb-indexer \
