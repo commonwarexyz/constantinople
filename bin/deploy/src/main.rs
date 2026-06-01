@@ -27,7 +27,7 @@ use std::{
 use tracing::Level;
 use tracing_subscriber::fmt;
 
-const STORAGE_CLASS: &str = "io2";
+const STORAGE_CLASS: &str = "gp3";
 const DASHBOARD_FILE: &str = "dashboard.json";
 const DEPLOYER_CONFIG_FILE: &str = "config.yaml";
 const PEERS_CONFIG_FILE: &str = "peers.yaml";

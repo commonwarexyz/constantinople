@@ -1,47 +1,51 @@
 # Mount Constantinople plus its sibling Exoware checkout. Cargo resolves
 # `../exoware-monorepo-faster-qmdb-uploads` from `/constantinople` to
 # `/exoware-monorepo-faster-qmdb-uploads` inside the builder container.
-source-mounts := "-v ${PWD}:/constantinople -v ${PWD}/../exoware-monorepo-faster-qmdb-uploads:/exoware-monorepo-faster-qmdb-uploads:ro"
+source-mounts := "-v ${PWD}:/constantinople -v ${PWD}/../exoware-monorepo-faster-qmdb-uploads:/exoware-monorepo-faster-qmdb-uploads:ro -v ${PWD}/.docker-cache/cargo:/cargo-home -v ${PWD}/.docker-cache/target:/constantinople/target"
+cache-env := "-e CARGO_HOME=/cargo-home"
+
+prepare-docker-cache:
+  mkdir -p .docker-cache/cargo .docker-cache/target
 
 # Build the Graviton Docker builder image
 build-graviton-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl graviton
 
 # Build the ARM64 validator binary into deploy/
-validator-graviton-binary: build-graviton-image
-  docker run --rm {{source-mounts}} \
+validator-graviton-binary: build-graviton-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-validator \
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
     constantinople-builder:graviton-local
 
 # Build the ARM64 spammer binary into deploy/
-spammer-graviton-binary: build-graviton-image
-  docker run --rm {{source-mounts}} \
+spammer-graviton-binary: build-graviton-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-spammer \
     -e BINARY_NAME=constantinople-spammer \
     -e OUTPUT_NAME=spammer \
     constantinople-builder:graviton-local
 
 # Build the ARM64 chain-indexer binary into deploy/
-chain-indexer-graviton-binary: build-graviton-image
-  docker run --rm {{source-mounts}} \
+chain-indexer-graviton-binary: build-graviton-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:graviton-local
 
 # Build the ARM64 metadata-indexer binary into deploy/
-metadata-indexer-graviton-binary: build-graviton-image
-  docker run --rm {{source-mounts}} \
+metadata-indexer-graviton-binary: build-graviton-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=metadata-indexer \
     -e OUTPUT_NAME=metadata-indexer \
     constantinople-builder:graviton-local
 
 # Build the ARM64 qmdb-indexer binary into deploy/
-qmdb-indexer-graviton-binary: build-graviton-image
-  docker run --rm {{source-mounts}} \
+qmdb-indexer-graviton-binary: build-graviton-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=qmdb-indexer \
     -e OUTPUT_NAME=qmdb-indexer \
@@ -55,40 +59,40 @@ build-intel-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl intel
 
 # Build the Intel validator binary into deploy/
-validator-intel-binary: build-intel-image
-  docker run --rm {{source-mounts}} \
+validator-intel-binary: build-intel-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-validator \
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
     constantinople-builder:intel-local
 
 # Build the Intel spammer binary into deploy/
-spammer-intel-binary: build-intel-image
-  docker run --rm {{source-mounts}} \
+spammer-intel-binary: build-intel-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-spammer \
     -e BINARY_NAME=constantinople-spammer \
     -e OUTPUT_NAME=spammer \
     constantinople-builder:intel-local
 
 # Build the Intel chain-indexer binary into deploy/
-chain-indexer-intel-binary: build-intel-image
-  docker run --rm {{source-mounts}} \
+chain-indexer-intel-binary: build-intel-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:intel-local
 
 # Build the Intel metadata-indexer binary into deploy/
-metadata-indexer-intel-binary: build-intel-image
-  docker run --rm {{source-mounts}} \
+metadata-indexer-intel-binary: build-intel-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=metadata-indexer \
     -e OUTPUT_NAME=metadata-indexer \
     constantinople-builder:intel-local
 
 # Build the Intel qmdb-indexer binary into deploy/
-qmdb-indexer-intel-binary: build-intel-image
-  docker run --rm {{source-mounts}} \
+qmdb-indexer-intel-binary: build-intel-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
     -e BINARY_NAME=qmdb-indexer \
     -e OUTPUT_NAME=qmdb-indexer \
