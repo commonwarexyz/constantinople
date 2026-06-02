@@ -557,7 +557,7 @@ async fn maybe_build_indexer(
     let metadata = Arc::new(Mutex::new(metadata));
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
-        metadata: metadata.clone(),
+        metadata,
         cursor: Arc::new(Mutex::new(cursor)),
         publisher: publisher.clone(),
     };

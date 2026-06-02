@@ -30,17 +30,14 @@ use exoware_qmdb::{
 use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::VecDeque,
     marker::PhantomData,
     num::NonZeroU64,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
-    sync::{Mutex, Semaphore, mpsc, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
     time::sleep,
 };
@@ -243,7 +240,6 @@ where
 {
     state_next_location: Mutex<u64>,
     transaction_next_location: Mutex<u64>,
-    next_upload_order: AtomicU64,
     prepare_tx: Option<mpsc::Sender<PendingQueuedFinalizedUpload<H, P>>>,
     prepare_join: Option<JoinHandle<()>>,
     commit_join: Option<JoinHandle<()>>,
@@ -254,7 +250,6 @@ struct PendingPreparedQmdbUpload<H>
 where
     H: Hasher,
 {
-    order: u64,
     height: u64,
     block_rows: IndexedBlockRows<H::Digest>,
     state_delta: Vec<StateOperation>,
@@ -268,14 +263,12 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    order: u64,
     height: u64,
     upload: QueuedFinalizedUpload<H, P>,
     completion: oneshot::Sender<()>,
 }
 
 struct PreparedQmdbUpload {
-    order: u64,
     height: u64,
     raw_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
     sql_rows: Vec<super::SqlRow>,
@@ -383,7 +376,6 @@ where
         let buffer = buffer.clamp(1, MAX_BUFFERED_QMDB_UPLOADS);
         let (commit_tx, commit_rx) = mpsc::channel(buffer);
         let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
-        let prepare_limit = Arc::new(Semaphore::new(buffer));
         let max_in_flight_commits = buffer;
         let commit_context = context.child("commit");
         let prepare_context = context.child("prepare");
@@ -402,13 +394,11 @@ where
             transaction_writer.clone(),
             prepare_rx,
             commit_tx,
-            prepare_limit,
         ));
 
         Ok(Self {
             state_next_location: Mutex::new(state_next_location),
             transaction_next_location: Mutex::new(transaction_next_location),
-            next_upload_order: AtomicU64::new(0),
             prepare_tx: Some(prepare_tx),
             prepare_join: Some(prepare_join),
             commit_join: Some(commit_join),
@@ -512,10 +502,8 @@ where
             .prepare_tx
             .as_ref()
             .expect("publisher send channel is open until shutdown");
-        let order = self.next_upload_order.fetch_add(1, Ordering::Relaxed);
         prepare_tx
             .send(PendingQueuedFinalizedUpload {
-                order,
                 height,
                 upload,
                 completion,
@@ -599,84 +587,31 @@ async fn run_qmdb_preparer<Cx, H, P>(
     transaction_writer: Arc<TransactionWriter<H>>,
     mut rx: mpsc::Receiver<PendingQueuedFinalizedUpload<H, P>>,
     commit_tx: mpsc::Sender<PreparedQmdbUpload>,
-    prepare_limit: Arc<Semaphore>,
 ) where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
     P: PublicKey + Send + Sync + 'static,
 {
-    let (done_tx, mut done_rx) = mpsc::channel(prepare_limit.available_permits().max(1));
-    let mut completed = BTreeMap::new();
-    let mut next_order = 0u64;
-    let mut in_flight = 0usize;
-    let mut rx_closed = false;
-
-    loop {
-        tokio::select! {
-            maybe_upload = rx.recv(), if !rx_closed && prepare_limit.available_permits() > 0 => {
-                let Some(upload) = maybe_upload else {
-                    rx_closed = true;
-                    continue;
-                };
-                let permit = prepare_limit
-                    .clone()
-                    .acquire_owned()
-                    .await
-                    .expect("QMDB prepare semaphore is never closed");
-                in_flight += 1;
-                let state_writer = state_writer.clone();
-                let transaction_writer = transaction_writer.clone();
-                let done_tx = done_tx.clone();
-                let height = upload.height;
-                let _handle = context
-                    .child("prepare_upload")
-                    .with_attribute("height", height)
-                    .shared(true)
-                    .spawn(move |context| async move {
-                    let _permit = permit;
-                    let result = prepare_qmdb_upload(context, state_writer, transaction_writer, upload)
-                        .await
-                        .map_err(|error| (height, error));
-                    let _ = done_tx.send(result).await;
-                });
-            }
-            maybe_result = done_rx.recv(), if in_flight > 0 => {
-                in_flight -= 1;
-                match maybe_result {
-                    Some(Ok(upload)) => {
-                        completed.insert(upload.order, upload);
-                    }
-                    Some(Err((height, error))) => {
-                        panic!("QMDB prepare worker failed at height {height}: {error}");
-                    }
-                    None => {
-                        panic!("QMDB prepare worker result channel closed with {in_flight} uploads in flight");
-                    }
-                }
-            }
-            else => break,
-        }
-
-        loop {
-            let Some(upload) = completed.remove(&next_order) else {
-                break;
-            };
-            next_order = next_order
-                .checked_add(1)
-                .expect("QMDB upload order does not overflow");
-            commit_tx
-                .send(upload)
-                .await
-                .map_err(|upload| PublishError::CommitterStopped {
-                    height: upload.0.height,
-                })
-                .expect("QMDB committer stopped");
-        }
-
-        if rx_closed && in_flight == 0 && completed.is_empty() {
-            break;
-        }
+    while let Some(upload) = rx.recv().await {
+        let height = upload.height;
+        let prepared = prepare_qmdb_upload(
+            context
+                .child("prepare_upload")
+                .with_attribute("height", height),
+            state_writer.clone(),
+            transaction_writer.clone(),
+            upload,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("QMDB prepare worker failed at height {height}: {error}"));
+        commit_tx
+            .send(prepared)
+            .await
+            .map_err(|upload| PublishError::CommitterStopped {
+                height: upload.0.height,
+            })
+            .expect("QMDB committer stopped");
     }
     debug!("indexer QMDB preparer task exiting: channel closed");
 }
@@ -706,7 +641,6 @@ where
     P: PublicKey,
 {
     let PendingQueuedFinalizedUpload {
-        order,
         height,
         upload,
         completion,
@@ -730,7 +664,6 @@ where
     .ops;
     let account_rows = account_rows(&state_delta, state_start);
     Ok(PendingPreparedQmdbUpload {
-        order,
         height,
         block_rows,
         state_delta,
@@ -752,7 +685,6 @@ where
     H::Digest: Codec + Send + Sync,
 {
     let PendingPreparedQmdbUpload {
-        order,
         height,
         block_rows,
         state_delta,
@@ -781,7 +713,6 @@ where
     let transactions = transactions.expect("QMDB transaction prepare task exited")?;
 
     Ok(PreparedQmdbUpload {
-        order,
         height,
         raw_rows: raw,
         sql_rows: sql,
@@ -1698,7 +1629,12 @@ mod tests {
     };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
-    use std::num::NonZeroU64 as StdNonZeroU64;
+    use std::{
+        future::Future,
+        num::NonZeroU64 as StdNonZeroU64,
+        sync::atomic::{AtomicBool, Ordering},
+    };
+    use tokio::sync::Notify;
 
     const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
     const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
@@ -1817,7 +1753,6 @@ mod tests {
             let expected_state_watermark = Some(state.latest_location());
             let expected_transaction_watermark = Some(transactions.latest_location());
             let upload = PreparedQmdbUpload {
-                order: u64::from(seed),
                 height: u64::from(seed),
                 raw_rows: Vec::new(),
                 sql_rows: Vec::new(),
@@ -2079,6 +2014,312 @@ mod tests {
         });
     }
 
+    #[derive(Clone)]
+    struct DelayedPrepareContext<C> {
+        inner: C,
+        gate: Arc<PrepareSpawnGate>,
+    }
+
+    impl<C> DelayedPrepareContext<C> {
+        fn new(inner: C, gate: Arc<PrepareSpawnGate>) -> Self {
+            Self { inner, gate }
+        }
+    }
+
+    struct PrepareSpawnGate {
+        delayed_height: u64,
+        release_height: u64,
+        release_done: AtomicBool,
+        release_notify: Notify,
+    }
+
+    enum PrepareSpawnAction {
+        Delay,
+        Release,
+        None,
+    }
+
+    impl PrepareSpawnGate {
+        fn new(delayed_height: u64, release_height: u64) -> Self {
+            Self {
+                delayed_height,
+                release_height,
+                release_done: AtomicBool::new(false),
+                release_notify: Notify::new(),
+            }
+        }
+
+        fn action(&self, name: &commonware_runtime::Name) -> PrepareSpawnAction {
+            if !name.label.ends_with("prepare_upload") {
+                return PrepareSpawnAction::None;
+            }
+            let height = name
+                .attributes
+                .iter()
+                .find_map(|(key, value)| (key == "height").then(|| value.parse::<u64>().ok()))
+                .flatten();
+            match height {
+                Some(height) if height == self.delayed_height => PrepareSpawnAction::Delay,
+                Some(height) if height == self.release_height => PrepareSpawnAction::Release,
+                _ => PrepareSpawnAction::None,
+            }
+        }
+
+        async fn wait_for_release(&self) {
+            if self.release_done.load(Ordering::SeqCst) {
+                return;
+            }
+            let notified = self.release_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.release_done.load(Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::timeout(Duration::from_secs(1), notified)
+                .await
+                .expect("release upload should finish before delayed upload resumes");
+        }
+
+        fn release(&self) {
+            self.release_done.store(true, Ordering::SeqCst);
+            self.release_notify.notify_waiters();
+        }
+    }
+
+    impl<C> commonware_runtime::Supervisor for DelayedPrepareContext<C>
+    where
+        C: commonware_runtime::Supervisor,
+    {
+        fn name(&self) -> commonware_runtime::Name {
+            self.inner.name()
+        }
+
+        fn child(&self, label: &'static str) -> Self {
+            Self {
+                inner: self.inner.child(label),
+                gate: self.gate.clone(),
+            }
+        }
+
+        fn with_attribute(self, key: &'static str, value: impl std::fmt::Display) -> Self {
+            Self {
+                inner: self.inner.with_attribute(key, value),
+                gate: self.gate,
+            }
+        }
+    }
+
+    impl<C> commonware_runtime::Spawner for DelayedPrepareContext<C>
+    where
+        C: commonware_runtime::Spawner,
+    {
+        fn shared(self, blocking: bool) -> Self {
+            Self {
+                inner: self.inner.shared(blocking),
+                gate: self.gate,
+            }
+        }
+
+        fn dedicated(self) -> Self {
+            Self {
+                inner: self.inner.dedicated(),
+                gate: self.gate,
+            }
+        }
+
+        fn spawn<F, Fut, T>(self, f: F) -> commonware_runtime::Handle<T>
+        where
+            Self: Sized,
+            F: FnOnce(Self) -> Fut + Send + 'static,
+            Fut: Future<Output = T> + Send + 'static,
+            T: Send + 'static,
+        {
+            let name = self.inner.name();
+            let action = self.gate.action(&name);
+            let gate = self.gate;
+            self.inner.spawn(move |inner| {
+                let context = Self {
+                    inner,
+                    gate: gate.clone(),
+                };
+                async move {
+                    match action {
+                        PrepareSpawnAction::Delay => {
+                            gate.wait_for_release().await;
+                            f(context).await
+                        }
+                        PrepareSpawnAction::Release => {
+                            let result = f(context).await;
+                            gate.release();
+                            result
+                        }
+                        PrepareSpawnAction::None => f(context).await,
+                    }
+                }
+            })
+        }
+
+        fn stop(
+            self,
+            value: i32,
+            timeout: Option<Duration>,
+        ) -> impl Future<Output = Result<(), commonware_runtime::Error>> + Send {
+            self.inner.stop(value, timeout)
+        }
+
+        fn stopped(&self) -> commonware_runtime::signal::Signal {
+            self.inner.stopped()
+        }
+    }
+
+    #[test]
+    fn queued_preparer_preserves_transaction_locations_when_first_prepare_is_slow() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+                .await
+                .expect("spawn simulator");
+            let client = StoreClient::new(&url);
+            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
+                state_qmdb_client(&client).expect("state client"),
+            ));
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
+                transactions_qmdb_client(&client).expect("transaction client"),
+            ));
+            let sql_writer = build_meta_schema(client.clone())
+                .expect("schema")
+                .batch_writer();
+            let (commit_tx, commit_rx) = mpsc::channel(2);
+            let (prepare_tx, prepare_rx) = mpsc::channel(2);
+            let commit_join = tokio::spawn(run_qmdb_committer(
+                context.child("commit"),
+                client.clone(),
+                sql_writer,
+                state_writer.clone(),
+                transaction_writer.clone(),
+                commit_rx,
+                2,
+            ));
+            let prepare_join = tokio::spawn(run_qmdb_preparer(
+                DelayedPrepareContext::new(
+                    context.child("prepare"),
+                    Arc::new(PrepareSpawnGate::new(1, 2)),
+                ),
+                state_writer,
+                transaction_writer,
+                prepare_rx,
+                commit_tx,
+            ));
+            let databases =
+                test_application_databases(context.child("application"), "slow-prepare").await;
+
+            let first = build_and_commit_application_block(
+                &databases,
+                None,
+                1,
+                vec![
+                    (
+                        account_key(1),
+                        Account {
+                            balance: 10,
+                            nonce: 0,
+                        },
+                    ),
+                    (
+                        account_key(2),
+                        Account {
+                            balance: 20,
+                            nonce: 0,
+                        },
+                    ),
+                ],
+                vec![signed_transaction(1, 0), signed_transaction(2, 0)],
+            )
+            .await;
+            let first_upload = Publisher::build_queued_finalized_upload_with_context(
+                context.child("first_upload"),
+                0,
+                0,
+                &first,
+                &databases,
+            )
+            .await
+            .expect("first queued upload builds");
+            let second_state_start = first_upload.state_end();
+            let second_transaction_start = first_upload.transaction_end();
+            let second = build_and_commit_application_block(
+                &databases,
+                Some(&first),
+                2,
+                vec![
+                    (
+                        account_key(1),
+                        Account {
+                            balance: 9,
+                            nonce: 1,
+                        },
+                    ),
+                    (
+                        account_key(3),
+                        Account {
+                            balance: 30,
+                            nonce: 0,
+                        },
+                    ),
+                ],
+                vec![signed_transaction(3, 1)],
+            )
+            .await;
+            let second_upload = Publisher::build_queued_finalized_upload_with_context(
+                context.child("second_upload"),
+                second_state_start,
+                second_transaction_start,
+                &second,
+                &databases,
+            )
+            .await
+            .expect("second queued upload builds");
+
+            let (first_done, first_rx) = oneshot::channel();
+            let (second_done, second_rx) = oneshot::channel();
+            prepare_tx
+                .send(PendingQueuedFinalizedUpload {
+                    height: first_upload.height(),
+                    upload: first_upload,
+                    completion: first_done,
+                })
+                .await
+                .expect("send first upload");
+            prepare_tx
+                .send(PendingQueuedFinalizedUpload {
+                    height: second_upload.height(),
+                    upload: second_upload,
+                    completion: second_done,
+                })
+                .await
+                .expect("send second upload");
+
+            first_rx.await.expect("first upload completed");
+            second_rx.await.expect("second upload completed");
+            drop(prepare_tx);
+            prepare_join.await.expect("preparer task exits");
+            commit_join.await.expect("committer task exits");
+
+            let transaction_reader = KeylessClient::<
+                QmdbFamily,
+                Sha256,
+                Sha256Digest,
+                TransactionEncoding<Sha256>,
+            >::from_client(
+                transactions_qmdb_client(&client).expect("transaction client"),
+                (),
+            );
+            assert_transaction_append_locations_match_block(&transaction_reader, &first).await;
+            assert_transaction_append_locations_match_block(&transaction_reader, &second).await;
+            handle.abort();
+        });
+    }
+
     #[test]
     fn qmdb_publisher_shutdown_joins_background_workers() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
@@ -2299,6 +2540,36 @@ mod tests {
             );
             assert_eq!(proof.start_location, Location::new(location));
             assert_eq!(proof.operations.len(), 1);
+        }
+    }
+
+    async fn assert_transaction_append_locations_match_block(
+        reader: &KeylessClient<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>,
+        block: &EngineBlock<Sha256, ed25519::PublicKey>,
+    ) {
+        let rows = encode_indexed_block_rows_at(block, 0);
+        let tx_count =
+            u64::try_from(rows.transaction_digests.len()).expect("transaction count fits u64");
+        let append_start = block
+            .header
+            .transactions_range
+            .end()
+            .checked_sub(tx_count + 1)
+            .expect("transaction range includes append operations plus commit");
+        let tip = Location::new(block.header.transactions_range.end() - 1);
+
+        for (offset, digest) in rows.transaction_digests.into_iter().enumerate() {
+            let location =
+                append_start + u64::try_from(offset).expect("transaction index fits u64");
+            let proof = reader
+                .operation_range_proof(tip, Location::new(location), 1)
+                .await
+                .expect("transaction operation proof");
+            assert_eq!(
+                proof.operations,
+                vec![TransactionOperation::<Sha256>::Append(digest)],
+                "transaction row location {location} must prove its own digest",
+            );
         }
     }
 
