@@ -11,6 +11,15 @@ test('raw tx-by-height misses are retried while the indexer catches up', () => {
     );
 });
 
+test('QMDB transaction root mismatches are terminal', () => {
+    assert.equal(
+        isRetryableProofError(
+            'historical ops root did not match expected root · height 337 · location 4865826 · tip 4865827 · proof start 4865826 · ops 1 · block index 17845 · block txs 17846',
+        ),
+        false,
+    );
+});
+
 test('non-indexer proof errors are not retried forever', () => {
     assert.equal(isRetryableProofError('transaction location 3 is outside finalized block range'), false);
 });
@@ -39,4 +48,8 @@ test('account proof index catch-up errors are retried', () => {
         isRetryableAccountProofError('[out_of_range] requested proof tip is not published yet'),
         true,
     );
+});
+
+test('QMDB account root mismatches are terminal', () => {
+    assert.equal(isRetryableAccountProofError('historical ops root did not match expected root'), false);
 });

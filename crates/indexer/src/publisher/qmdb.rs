@@ -1679,14 +1679,31 @@ mod tests {
         types::{Round, View, coding::Commitment},
     };
     use commonware_cryptography::{
-        Digest as _, Signer as _, ed25519,
+        Digest as _, Digestible as _, Signer as _, ed25519,
         sha256::{Digest as Sha256Digest, Sha256},
     };
-    use commonware_runtime::{Runner as _, Supervisor as _};
-    use commonware_utils::non_empty_range;
-    use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
+    use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{BufferPooler, Runner as _, Supervisor, buffer::paged::CacheRef};
+    use commonware_storage::{
+        journal::contiguous::fixed::Config as FixedJournalConfig,
+        merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
+        qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
+        translator::EightCap,
+    };
+    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
+    use constantinople_primitives::{
+        Block, Header, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
+        TransactionPublicKey,
+    };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
+    use std::num::NonZeroU64 as StdNonZeroU64;
+
+    const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
+    const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
+    const TEST_PAGE_CACHE_PAGE_SIZE: std::num::NonZeroU16 = NZU16!(4096);
+    const TEST_PAGE_CACHE_CAPACITY: std::num::NonZero<usize> = NZUsize!(1024);
 
     #[test]
     fn qmdb_store_prefixes_are_reserved_and_distinct() {
@@ -1976,6 +1993,93 @@ mod tests {
     }
 
     #[test]
+    fn queued_upload_roots_match_application_roots() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+                .await
+                .expect("spawn simulator");
+            let client = StoreClient::new(&url);
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("qmdb_publisher"),
+                &url,
+                2,
+            )
+            .await
+            .expect("publisher connects");
+            let databases =
+                test_application_databases(context.child("application"), "root-match").await;
+
+            let first = build_and_commit_application_block(
+                &databases,
+                None,
+                1,
+                vec![
+                    (
+                        account_key(1),
+                        Account {
+                            balance: 10,
+                            nonce: 0,
+                        },
+                    ),
+                    (
+                        account_key(2),
+                        Account {
+                            balance: 20,
+                            nonce: 0,
+                        },
+                    ),
+                ],
+                vec![signed_transaction(1, 0), signed_transaction(2, 0)],
+            )
+            .await;
+            publish_block_and_assert_roots(
+                context.child("first"),
+                &publisher,
+                &client,
+                &databases,
+                &first,
+            )
+            .await;
+
+            let second = build_and_commit_application_block(
+                &databases,
+                Some(&first),
+                2,
+                vec![
+                    (
+                        account_key(1),
+                        Account {
+                            balance: 9,
+                            nonce: 1,
+                        },
+                    ),
+                    (
+                        account_key(3),
+                        Account {
+                            balance: 30,
+                            nonce: 0,
+                        },
+                    ),
+                ],
+                vec![signed_transaction(3, 1)],
+            )
+            .await;
+            publish_block_and_assert_roots(
+                context.child("second"),
+                &publisher,
+                &client,
+                &databases,
+                &second,
+            )
+            .await;
+
+            publisher.shutdown().await;
+            handle.abort();
+        });
+    }
+
+    #[test]
     fn qmdb_publisher_shutdown_joins_background_workers() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1992,6 +2096,240 @@ mod tests {
             publisher.shutdown().await;
             handle.abort();
         });
+    }
+
+    async fn test_application_databases<E>(
+        context: E,
+        prefix: &str,
+    ) -> Databases<E, Sha256, EightCap, Sequential>
+    where
+        E: BufferPooler + Clock + Metrics + Storage + Supervisor + Send + Sync + 'static,
+    {
+        let config = (
+            test_state_db_config(&context, prefix),
+            test_transaction_db_config(prefix),
+        );
+        Databases::init(context, config).await
+    }
+
+    fn test_state_db_config<E>(context: &E, prefix: &str) -> FixedConfig<EightCap, Sequential>
+    where
+        E: BufferPooler + Supervisor,
+    {
+        let page_cache = CacheRef::from_pooler(
+            &context.child("state_page_cache"),
+            TEST_PAGE_CACHE_PAGE_SIZE,
+            TEST_PAGE_CACHE_CAPACITY,
+        );
+
+        FixedConfig {
+            merkle_config: MmrConfig {
+                journal_partition: format!("{prefix}-state-journal"),
+                metadata_partition: format!("{prefix}-state-metadata"),
+                items_per_blob: TEST_ITEMS_PER_BLOB,
+                write_buffer: TEST_WRITE_BUFFER,
+                strategy: Sequential,
+                page_cache: page_cache.clone(),
+            },
+            journal_config: FixedJournalConfig {
+                partition: format!("{prefix}-state-log"),
+                items_per_blob: TEST_ITEMS_PER_BLOB,
+                page_cache,
+                write_buffer: TEST_WRITE_BUFFER,
+            },
+            translator: EightCap,
+        }
+    }
+
+    fn test_transaction_db_config(prefix: &str) -> keyless_fixed::CompactConfig<Sequential> {
+        keyless_fixed::CompactConfig {
+            merkle: CompactMerkleConfig {
+                partition: format!("{prefix}-transactions-merkle"),
+                strategy: Sequential,
+            },
+            commit_codec_config: (),
+        }
+    }
+
+    async fn build_and_commit_application_block<E>(
+        databases: &Databases<E, Sha256, EightCap, Sequential>,
+        parent: Option<&EngineBlock<Sha256, ed25519::PublicKey>>,
+        height: u64,
+        state_updates: Vec<(AccountKey, Account)>,
+        transactions: Vec<SignedTransaction<Sha256>>,
+    ) -> EngineBlock<Sha256, ed25519::PublicKey>
+    where
+        E: Storage + Clock + Metrics + Send + Sync + 'static,
+    {
+        let (state_batch, transaction_batch) = databases.new_batches().await;
+        let state_batch = state_updates
+            .into_iter()
+            .fold(state_batch, |batch, (key, account)| {
+                batch.write(key, Some(account))
+            });
+        let transaction_batch = transactions
+            .iter()
+            .fold(transaction_batch, |batch, transaction| {
+                batch.append(*transaction.message_digest())
+            });
+        let transaction_batch = match parent {
+            Some(parent) => {
+                transaction_batch.with_inactivity_floor(parent_transaction_floor(parent))
+            }
+            None => transaction_batch,
+        };
+        let (state, transaction_history) =
+            futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
+        let state = state.expect("state merkleization should succeed");
+        let transaction_history =
+            transaction_history.expect("transaction merkleization should succeed");
+        let state_root = state.root();
+        let state_range =
+            non_empty_range!(*state.bounds().inactivity_floor, state.bounds().total_size);
+        let transactions_root = transaction_history.root();
+        let transactions_range = non_empty_range!(
+            *transaction_history.bounds().inactivity_floor,
+            transaction_history.bounds().total_size
+        );
+        databases.finalize((state, transaction_history)).await;
+
+        let leader = ed25519::PrivateKey::from_seed(height).public_key();
+        let parent_digest = parent.map_or(Sha256Digest::EMPTY, |block| block.digest());
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), Commitment::EMPTY),
+            },
+            parent: parent_digest,
+            height,
+            timestamp: height,
+            state_root,
+            state_range,
+            transactions_root,
+            transactions_range,
+        };
+        Block::new(header, transactions).seal(&mut Sha256::default())
+    }
+
+    async fn publish_block_and_assert_roots<E, Cx>(
+        context: Cx,
+        publisher: &Publisher<Sha256, ed25519::PublicKey>,
+        client: &StoreClient,
+        databases: &Databases<E, Sha256, EightCap, Sequential>,
+        block: &EngineBlock<Sha256, ed25519::PublicKey>,
+    ) where
+        Cx: Spawner,
+        E: Storage + Clock + Metrics + Send + Sync + 'static,
+    {
+        let (state_next, transaction_next) = publisher.next_locations().await;
+        let upload = Publisher::build_queued_finalized_upload_with_context(
+            context,
+            state_next,
+            transaction_next,
+            block,
+            databases,
+        )
+        .await
+        .expect("queued upload builds");
+        let state_start = upload.state_start();
+        let transaction_start = upload.transaction_start();
+        let completion = publisher
+            .enqueue_queued_finalized(upload)
+            .await
+            .expect("queued upload accepted");
+        assert!(completion.wait().await, "queued upload completed");
+
+        let state_reader = UnorderedClient::<
+            QmdbFamily,
+            Sha256,
+            AccountKey,
+            AccountValue,
+            StateEncoding,
+        >::from_client(
+            state_qmdb_client(client).expect("state client"), ()
+        );
+        let transaction_reader = KeylessClient::<
+            QmdbFamily,
+            Sha256,
+            Sha256Digest,
+            TransactionEncoding<Sha256>,
+        >::from_client(
+            transactions_qmdb_client(client).expect("transaction client"),
+            (),
+        );
+        let state_tip = Location::new(block.header.state_range.end() - 1);
+        let transaction_tip = Location::new(block.header.transactions_range.end() - 1);
+
+        assert_eq!(
+            state_reader.root_at(state_tip).await.expect("state root"),
+            block.header.state_root,
+            "published state QMDB root must match certified application root"
+        );
+        assert_eq!(
+            transaction_reader
+                .root_at(transaction_tip)
+                .await
+                .expect("transaction root"),
+            block.header.transactions_root,
+            "published transaction QMDB root must match certified application root"
+        );
+
+        for location in state_start..block.header.state_range.end() {
+            let proof = state_reader
+                .operation_range_proof(state_tip, Location::new(location), 1)
+                .await
+                .expect("state operation proof");
+            assert_eq!(
+                proof.root, block.header.state_root,
+                "state operation proof root at {location} must match certified application root"
+            );
+            assert_eq!(proof.start_location, Location::new(location));
+            assert_eq!(proof.operations.len(), 1);
+        }
+
+        for location in transaction_start..block.header.transactions_range.end() {
+            let proof = transaction_reader
+                .operation_range_proof(transaction_tip, Location::new(location), 1)
+                .await
+                .expect("transaction operation proof");
+            assert_eq!(
+                proof.root, block.header.transactions_root,
+                "transaction operation proof root at {location} must match certified application root"
+            );
+            assert_eq!(proof.start_location, Location::new(location));
+            assert_eq!(proof.operations.len(), 1);
+        }
+    }
+
+    fn parent_transaction_floor(
+        parent: &EngineBlock<Sha256, ed25519::PublicKey>,
+    ) -> Location<QmdbFamily> {
+        let parent_body_len = u64::try_from(parent.body.len()).expect("transaction count fits u64");
+        let floor = parent
+            .header
+            .transactions_range
+            .end()
+            .checked_sub(parent_body_len)
+            .and_then(|end| end.checked_sub(1))
+            .expect("parent transaction range includes commit");
+        Location::new(floor)
+    }
+
+    fn account_key(seed: u64) -> AccountKey {
+        AccountKey::from_bytes(Bytes::from(vec![seed as u8; AccountKey::SIZE])).unwrap()
+    }
+
+    fn signed_transaction(seed: u64, nonce: u64) -> SignedTransaction<Sha256> {
+        let sender = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 100).public_key();
+        Transaction::new(
+            TransactionPublicKey::ed25519(sender.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            StdNonZeroU64::new(1).expect("test value is non-zero"),
+            nonce,
+        )
+        .seal_and_sign(&sender, TRANSACTION_NAMESPACE, &mut Sha256::default())
     }
 
     async fn commit_staged_upload_pair(
