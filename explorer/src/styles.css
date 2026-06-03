@@ -132,6 +132,21 @@ body {
     color: var(--theme-accent);
 }
 
+.app__title-link {
+    color: inherit;
+    background: transparent;
+    border: 0;
+    font: inherit;
+    letter-spacing: inherit;
+    padding: 0;
+    cursor: pointer;
+}
+
+.app__title-link:hover,
+.app__title-link:focus-visible {
+    color: var(--theme-accent);
+}
+
 .app__header-actions {
     min-width: 0;
     display: flex;

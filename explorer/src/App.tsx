@@ -189,11 +189,9 @@ export default function App() {
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
-    const [copiedValue, setCopiedValue] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
-    const copiedValueTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
@@ -509,9 +507,6 @@ export default function App() {
             if (blockFlushTimeoutRef.current !== null) {
                 window.clearTimeout(blockFlushTimeoutRef.current);
             }
-            if (copiedValueTimeoutRef.current !== null) {
-                window.clearTimeout(copiedValueTimeoutRef.current);
-            }
             if (copyToastTimeoutRef.current !== null) {
                 window.clearTimeout(copyToastTimeoutRef.current);
             }
@@ -597,19 +592,11 @@ export default function App() {
     const copyValue = async (value: string) => {
         try {
             await navigator.clipboard.writeText(value);
-            if (copiedValueTimeoutRef.current !== null) {
-                window.clearTimeout(copiedValueTimeoutRef.current);
-            }
             if (copyToastTimeoutRef.current !== null) {
                 window.clearTimeout(copyToastTimeoutRef.current);
             }
 
-            setCopiedValue(value);
             setCopyToast(`copied "${value}" to clipboard`);
-            copiedValueTimeoutRef.current = window.setTimeout(() => {
-                setCopiedValue((current) => (current === value ? '' : current));
-                copiedValueTimeoutRef.current = null;
-            }, 1_000);
             copyToastTimeoutRef.current = window.setTimeout(() => {
                 setCopyToast('');
                 copyToastTimeoutRef.current = null;
@@ -649,7 +636,10 @@ export default function App() {
         setSearchMessage('');
         const url = new URL(window.location.href);
         url.searchParams.delete('account');
-        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+        const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+        if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+            window.history.pushState(null, '', nextLocation);
+        }
     };
 
     const nextAccountPage = () => {
@@ -738,7 +728,14 @@ export default function App() {
             <div className="app__container">
                 <header className="app__header">
                     <h1 className="app__title">
-                        <span className="accent">constantinople</span> / explorer
+                        <span className="accent">constantinople</span> /{' '}
+                        <button
+                            className="app__title-link"
+                            onClick={clearAccountLookup}
+                            type="button"
+                        >
+                            explorer
+                        </button>
                     </h1>
                     <div className="app__header-actions">
                         <StatusBadge status={status} spinner={spinner} />
@@ -761,7 +758,6 @@ export default function App() {
                         {lookupAccount ? (
                             <AccountPage
                                 account={lookupAccount}
-                                copiedValue={copiedValue}
                                 onCopy={copyValue}
                                 pageNumber={accountCursorStack.length}
                                 proof={accountProof}
@@ -774,7 +770,6 @@ export default function App() {
                                 onActivityModeChange={changeAccountActivityMode}
                                 onPrevious={previousAccountPage}
                                 onNext={nextAccountPage}
-                                onBack={clearAccountLookup}
                             />
                         ) : (
                             <>
@@ -805,7 +800,6 @@ export default function App() {
                             isSubmitting={isSubmitting}
                             canClearSubmittedTransactions={history.length > 0}
                             spinner={spinner}
-                            copiedValue={copiedValue}
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
@@ -819,7 +813,6 @@ export default function App() {
                         <TransactionHistory
                             transactions={history}
                             signedInAccountKey={signedInAccountKey}
-                            copiedValue={copiedValue}
                             onCopy={copyValue}
                             verifyCertificates={verifyCertificates}
                         />
@@ -846,7 +839,6 @@ export default function App() {
 
 function AccountPage({
     account,
-    copiedValue,
     onCopy,
     pageNumber,
     proof,
@@ -859,10 +851,8 @@ function AccountPage({
     onActivityModeChange,
     onPrevious,
     onNext,
-    onBack,
 }: {
     account: string;
-    copiedValue: string;
     onCopy: (value: string) => void;
     pageNumber: number;
     proof: AccountProofState;
@@ -875,17 +865,15 @@ function AccountPage({
     onActivityModeChange: (mode: AccountActivityMode) => void;
     onPrevious: () => void;
     onNext: () => void;
-    onBack: () => void;
 }) {
     return (
         <section className="account-page" aria-label="account proof">
             <div className="account-page__title">
                 <span>account</span>
-                <button onClick={onBack}>back</button>
             </div>
             <div className="account-page__line">
                 <span className="account-page__prompt">address</span>
-                <CopyableValue copiedValue={copiedValue} value={account} onCopy={onCopy} />
+                <CopyableValue value={account} onCopy={onCopy} />
             </div>
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
@@ -925,16 +913,14 @@ function AccountPage({
                     <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
-                            <CopyableValue copiedValue={copiedValue} value={row.digest} onCopy={onCopy} />
+                            <CopyableValue value={row.digest} onCopy={onCopy} />
                             <span>from</span>
                             <CopyableValue
-                                copiedValue={copiedValue}
                                 value={row.direction === 'sent' ? account : row.counterparty}
                                 onCopy={onCopy}
                             />
                             <span>to</span>
                             <CopyableValue
-                                copiedValue={copiedValue}
                                 value={row.direction === 'sent' ? row.counterparty : account}
                                 onCopy={onCopy}
                             />
@@ -1096,7 +1082,6 @@ function WalletPanel({
     isSubmitting,
     canClearSubmittedTransactions,
     spinner,
-    copiedValue,
     onCreateWallet,
     onSignIn,
     onSignOut,
@@ -1119,7 +1104,6 @@ function WalletPanel({
     isSubmitting: boolean;
     canClearSubmittedTransactions: boolean;
     spinner: string;
-    copiedValue: string;
     onCreateWallet: () => void;
     onSignIn: () => void;
     onSignOut: () => void;
@@ -1167,7 +1151,6 @@ function WalletPanel({
                     <CopyableValue
                         disabled={!walletAccountKey}
                         plain
-                        copiedValue={copiedValue}
                         value={walletAccountKey ?? 'not authenticated'}
                         onCopy={onCopy}
                     />
@@ -1226,14 +1209,12 @@ function CopyableValue({
     disabled = false,
     flashOnCopy = true,
     plain = false,
-    copiedValue,
     value,
     onCopy,
 }: {
     disabled?: boolean;
     flashOnCopy?: boolean;
     plain?: boolean;
-    copiedValue: string;
     value: string;
     onCopy: (value: string) => void;
 }) {
@@ -1251,7 +1232,7 @@ function CopyableValue({
         }, 800);
     };
 
-    const isCopied = flashing || (flashOnCopy && copiedValue === value);
+    const isCopied = flashing;
     const className = [
         'copyable',
         plain ? 'copyable--plain' : '',
@@ -1304,13 +1285,11 @@ function SpinnerText({
 function TransactionHistory({
     transactions,
     signedInAccountKey,
-    copiedValue,
     onCopy,
     verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
     signedInAccountKey: string | null;
-    copiedValue: string;
     onCopy: (value: string) => void;
     verifyCertificates: boolean;
 }) {
@@ -1335,7 +1314,6 @@ function TransactionHistory({
                 {transactions.map((tx) => (
                     <TransactionRecord
                         key={tx.digest}
-                        copiedValue={copiedValue}
                         formatter={formatter}
                         onCopy={onCopy}
                         signedInAccountKey={signedInAccountKey}
@@ -1349,14 +1327,12 @@ function TransactionHistory({
 }
 
 function TransactionRecord({
-    copiedValue,
     formatter,
     onCopy,
     signedInAccountKey,
     tx,
     verifyCertificates,
 }: {
-    copiedValue: string;
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
     signedInAccountKey: string | null;
@@ -1368,12 +1344,12 @@ function TransactionRecord({
         <div className="tx-record">
             <div className="tx-record__primary">
                 <span className="tx-record__label">tx</span>
-                <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
+                <CopyableValue value={tx.digest} onCopy={onCopy} />
                 <span className="tx-record__label">from</span>
-                <CopyableValue copiedValue={copiedValue} value={tx.sender} onCopy={onCopy} />
+                <CopyableValue value={tx.sender} onCopy={onCopy} />
                 <span className="tx-record__arrow" aria-hidden="true">→</span>
                 <span className="tx-record__label">to</span>
-                <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
+                <CopyableValue value={tx.to} onCopy={onCopy} />
                 <span className="tx-record__nonce">value {tx.value}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
