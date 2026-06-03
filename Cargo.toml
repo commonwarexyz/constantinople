@@ -64,12 +64,12 @@ commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", 
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "07d417ea34ec393015e7bc335327b6dae231d296", default-features = false }
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "f6fff69f2e315db5d0c33c51ead71e6e6fed611e" }
 datafusion = "52"
 
 # Other
