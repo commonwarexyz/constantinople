@@ -35,6 +35,19 @@ export function clearSession() {
     window.localStorage.removeItem(SESSION_STORAGE_KEY);
 }
 
+export function restoreWalletSession(): ActiveWallet | null {
+    const publicKeyHex = readSession();
+    if (publicKeyHex === null) return null;
+
+    const profile = readProfiles().find((candidate) => candidate.publicKeyHex === publicKeyHex);
+    if (!profile) {
+        clearSession();
+        return null;
+    }
+
+    return activeWallet(profile);
+}
+
 export async function createWallet(): Promise<ActiveWallet> {
     assertWalletSupport();
 

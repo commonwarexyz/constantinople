@@ -38,6 +38,7 @@ import { isRetryableAccountProofError, isRetryableProofError } from './proofRetr
 import {
     clearSession,
     createWallet,
+    restoreWalletSession,
     signInWithPasskey,
     type ActiveWallet,
 } from './wallet';
@@ -237,6 +238,13 @@ export default function App() {
             setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
         }, BLOCK_FLUSH_INTERVAL_MS);
     };
+
+    useEffect(() => {
+        const restoredWallet = restoreWalletSession();
+        if (!restoredWallet) return;
+        setWallet(restoredWallet);
+        setWalletMessage('signed in');
+    }, []);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -659,6 +667,13 @@ export default function App() {
         setAccountNextCursor(null);
     };
 
+    const clearSubmittedTransactionHistory = () => {
+        setHistory([]);
+        if (historyKey !== null) {
+            clearHistory(historyKey);
+        }
+    };
+
     const submitTransfer = async () => {
         if (!wallet || isSubmitting) return;
         if (!walletAccountKey) {
@@ -787,12 +802,14 @@ export default function App() {
                             nonce={nonce}
                             submitMessage={submitMessage}
                             isSubmitting={isSubmitting}
+                            canClearSubmittedTransactions={history.length > 0}
                             spinner={spinner}
                             copiedValue={copiedValue}
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
                             onRefreshAccount={refreshAccount}
+                            onClearSubmittedTransactions={clearSubmittedTransactionHistory}
                             onCopy={copyValue}
                             onToKeyChange={setToKey}
                             onValueChange={setValue}
@@ -1076,12 +1093,14 @@ function WalletPanel({
     nonce,
     submitMessage,
     isSubmitting,
+    canClearSubmittedTransactions,
     spinner,
     copiedValue,
     onCreateWallet,
     onSignIn,
     onSignOut,
     onRefreshAccount,
+    onClearSubmittedTransactions,
     onCopy,
     onToKeyChange,
     onValueChange,
@@ -1097,12 +1116,14 @@ function WalletPanel({
     nonce: string;
     submitMessage: string;
     isSubmitting: boolean;
+    canClearSubmittedTransactions: boolean;
     spinner: string;
     copiedValue: string;
     onCreateWallet: () => void;
     onSignIn: () => void;
     onSignOut: () => void;
     onRefreshAccount: () => void;
+    onClearSubmittedTransactions: () => void;
     onCopy: (value: string) => void;
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
@@ -1132,6 +1153,9 @@ function WalletPanel({
                                 refresh
                             </SpinnerText>
                         </button>
+                    )}
+                    {wallet && canClearSubmittedTransactions && (
+                        <button onClick={onClearSubmittedTransactions}>reset</button>
                     )}
                     {wallet && <button onClick={onSignOut}>sign out</button>}
                 </div>
@@ -1186,9 +1210,9 @@ function WalletPanel({
                     submit
                 </button>
             </form>
-            {submitMessage && (
+            {isSubmitting && submitMessage && (
                 <div className="wallet__status">
-                    <SpinnerText active={isSubmitting} spinner={spinner}>
+                    <SpinnerText active spinner={spinner}>
                         {submitMessage}
                     </SpinnerText>
                 </div>
@@ -1708,6 +1732,10 @@ function readHistory(key: string): SubmittedTransaction[] {
 
 function writeHistory(key: string, history: SubmittedTransaction[]) {
     window.localStorage.setItem(key, JSON.stringify(history));
+}
+
+function clearHistory(key: string) {
+    window.localStorage.removeItem(key);
 }
 
 function useBrailleSpinner(active: boolean): string {
