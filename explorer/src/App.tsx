@@ -723,11 +723,12 @@ export default function App() {
                     current,
                 ),
             );
-            setSubmitMessage(detail);
+            setSubmitMessage('');
             await refreshAccount();
         } catch (error) {
             setSubmitMessage(error instanceof Error ? error.message : String(error));
         } finally {
+            setSubmitMessage('');
             setIsSubmitting(false);
         }
     };
