@@ -159,6 +159,7 @@ impl EngineDefinition for TestEngineDefinition {
             channels,
             participants: _,
             monitor,
+            ..
         } = ctx;
         let public_key = public_key.clone();
         let signer = self.signers[index].clone();
