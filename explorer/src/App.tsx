@@ -183,6 +183,7 @@ export default function App() {
         detail: 'enter an account',
     });
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountActivityError, setAccountActivityError] = useState('');
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
@@ -316,33 +317,14 @@ export default function App() {
         if (!lookupAccount) {
             setAccountTarget(null);
             setAccountProof({ status: 'waiting', detail: 'enter an account' });
-            setAccountTransactions([]);
-            setAccountNextCursor(null);
             return;
         }
 
         const controller = new AbortController();
         setAccountTarget(null);
         setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
-        setAccountTransactions([]);
-        setAccountNextCursor(null);
 
-        const fetchPage = fetchAccountTransactionsPage({
-            sqlUrl: indexerUrl,
-            account: lookupAccount,
-            cursor: currentAccountCursor,
-            mode: accountActivityMode,
-        }).then((page) => {
-            if (controller.signal.aborted) return null;
-            setAccountNextCursor(page.nextCursor);
-            setAccountTransactions(page.rows.map((row) => ({
-                row,
-                proof: { status: 'waiting', detail: 'waiting for latest finalization' },
-            })));
-            return page;
-        });
-
-        const fetchTargetAndProof = retryAccountPageStep(async () => {
+        retryAccountPageStep(async () => {
             const target = await fetchLatestProofTarget({
                 storeUrl,
                 simplexVerificationMaterial,
@@ -356,10 +338,8 @@ export default function App() {
                 signal: controller.signal,
             });
             return { target, proof };
-        }, controller.signal);
-
-        Promise.all([fetchPage, fetchTargetAndProof])
-            .then(([page, { target, proof }]) => {
+        }, controller.signal)
+            .then(({ target, proof }) => {
                 if (controller.signal.aborted) return;
                 setAccountProof({
                     status: 'verified',
@@ -367,24 +347,61 @@ export default function App() {
                     ...proof,
                 });
                 setAccountTarget(target);
-                if (!page) return [];
+            })
+            .catch((error) => {
+                if (controller.signal.aborted) return;
+                setAccountProof({
+                    status: 'error',
+                    detail: error instanceof Error ? error.message : String(error),
+                });
+            });
+
+        return () => controller.abort();
+    }, [lookupAccount]);
+
+    useEffect(() => {
+        if (!lookupAccount) {
+            setAccountTransactions([]);
+            setAccountNextCursor(null);
+            setAccountActivityError('');
+            return;
+        }
+
+        const controller = new AbortController();
+        setAccountTransactions([]);
+        setAccountNextCursor(null);
+        setAccountActivityError('');
+
+        fetchAccountTransactionsPage({
+            sqlUrl: indexerUrl,
+            account: lookupAccount,
+            cursor: currentAccountCursor,
+            mode: accountActivityMode,
+        })
+            .then(async (page) => {
+                if (controller.signal.aborted) return;
+                setAccountNextCursor(page.nextCursor);
+                setAccountTransactions(page.rows.map((row) => ({
+                    row,
+                    proof: { status: 'waiting', detail: 'waiting for latest finalization' },
+                })));
+                if (!accountTarget) return;
+
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
                     proof: { status: 'fetching', detail: 'fetching transaction proof' },
                 })));
-                return Promise.allSettled(
+                const results = await Promise.allSettled(
                     page.rows.map((row) =>
                         retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
                             qmdbUrl,
                             row,
-                            target,
+                            target: accountTarget,
                             signal: controller.signal,
                         }), controller.signal),
                     ),
                 );
-            })
-            .then((results) => {
-                if (!results || controller.signal.aborted) return;
+                if (controller.signal.aborted) return;
                 setAccountTransactions((current) =>
                     current.map((entry, index) => {
                         const result = results[index];
@@ -399,14 +416,13 @@ export default function App() {
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
-                setAccountProof({
-                    status: 'error',
-                    detail: error instanceof Error ? error.message : String(error),
-                });
+                setAccountTransactions([]);
+                setAccountNextCursor(null);
+                setAccountActivityError(error instanceof Error ? error.message : String(error));
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
 
     useEffect(() => {
         const signedInSender = signedInAccountKey;
@@ -735,6 +751,7 @@ export default function App() {
                                 proof={accountProof}
                                 target={accountTarget}
                                 transactions={accountTransactions}
+                                activityError={accountActivityError}
                                 activityMode={accountActivityMode}
                                 hasPrevious={accountCursorStack.length > 1}
                                 hasNext={accountNextCursor !== null}
@@ -817,6 +834,7 @@ function AccountPage({
     proof,
     target,
     transactions,
+    activityError,
     activityMode,
     hasPrevious,
     hasNext,
@@ -832,6 +850,7 @@ function AccountPage({
     proof: AccountProofState;
     target: LatestProofTarget | null;
     transactions: AccountTxWithProof[];
+    activityError: string;
     activityMode: AccountActivityMode;
     hasPrevious: boolean;
     hasNext: boolean;
@@ -878,7 +897,10 @@ function AccountPage({
                 </div>
             </div>
             <div className="account-tx-list">
-                {transactions.length === 0 && (
+                {activityError && (
+                    <div className="account-tx-row account-tx-row--empty">{activityError}</div>
+                )}
+                {!activityError && transactions.length === 0 && (
                     <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
                 )}
                 {transactions.map(({ row, proof: txProof }) => (
