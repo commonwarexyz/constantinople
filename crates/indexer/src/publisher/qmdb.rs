@@ -1629,12 +1629,7 @@ mod tests {
     };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
-    use std::{
-        future::Future,
-        num::NonZeroU64 as StdNonZeroU64,
-        sync::atomic::{AtomicBool, Ordering},
-    };
-    use tokio::sync::Notify;
+    use std::num::NonZeroU64 as StdNonZeroU64;
 
     const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
     const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
@@ -1902,6 +1897,132 @@ mod tests {
     }
 
     #[test]
+    fn out_of_order_store_commits_do_not_publish_past_prefix_holes() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let dir = tempfile::TempDir::new().expect("tempdir");
+            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+                .await
+                .expect("spawn simulator");
+            let client = StoreClient::new(&url);
+            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
+                state_qmdb_client(&client).expect("state client"),
+            ));
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
+                transactions_qmdb_client(&client).expect("transaction client"),
+            ));
+            let schema = build_meta_schema(client.clone()).expect("schema");
+            let mut sql_writer = schema.batch_writer();
+
+            let (first_completion, mut first_rx) = oneshot::channel();
+            let first_upload = PreparedQmdbUpload {
+                height: 1,
+                raw_rows: Vec::new(),
+                sql_rows: Vec::new(),
+                state: state_writer
+                    .prepare_upload(&state_ops(1))
+                    .await
+                    .expect("first state upload"),
+                transactions: transaction_writer
+                    .prepare_upload(&transaction_ops(1))
+                    .await
+                    .expect("first transaction upload"),
+                completion: first_completion,
+            };
+            let (next_sql_writer, first_batch) = prepare_commit_batch_blocking(
+                context.child("first"),
+                client.clone(),
+                sql_writer,
+                state_writer.clone(),
+                transaction_writer.clone(),
+                first_upload,
+                true,
+            )
+            .await
+            .expect("first batch stages");
+            sql_writer = next_sql_writer;
+
+            let (second_completion, mut second_rx) = oneshot::channel();
+            let second_upload = PreparedQmdbUpload {
+                height: 2,
+                raw_rows: Vec::new(),
+                sql_rows: Vec::new(),
+                state: state_writer
+                    .prepare_upload(&state_ops(2))
+                    .await
+                    .expect("second state upload"),
+                transactions: transaction_writer
+                    .prepare_upload(&transaction_ops(2))
+                    .await
+                    .expect("second transaction upload"),
+                completion: second_completion,
+            };
+            let (next_sql_writer, second_batch) = prepare_commit_batch_blocking(
+                context.child("second"),
+                client.clone(),
+                sql_writer,
+                state_writer.clone(),
+                transaction_writer.clone(),
+                second_upload,
+                false,
+            )
+            .await
+            .expect("second batch stages");
+            sql_writer = next_sql_writer;
+            let second_seq = second_batch
+                .store_batch
+                .commit(&client)
+                .await
+                .expect("second batch commits");
+            let first_seq = first_batch
+                .store_batch
+                .commit(&client)
+                .await
+                .expect("first batch commits");
+
+            let mut pending = VecDeque::new();
+            pending.push_back(
+                mark_committed_batch(
+                    committed_batch(second_batch, second_seq),
+                    &mut sql_writer,
+                    &state_writer,
+                    &transaction_writer,
+                )
+                .await,
+            );
+            assert_eq!(
+                complete_published_uploads(&mut pending, &state_writer, &transaction_writer).await,
+                0,
+                "a later commit cannot publish while the first batch is still unacked",
+            );
+            assert!(first_rx.try_recv().is_err());
+            assert!(second_rx.try_recv().is_err());
+
+            pending.push_back(
+                mark_committed_batch(
+                    committed_batch(first_batch, first_seq),
+                    &mut sql_writer,
+                    &state_writer,
+                    &transaction_writer,
+                )
+                .await,
+            );
+            flush_and_complete_published_uploads(
+                context.child("watermarks"),
+                &mut pending,
+                &client,
+                &state_writer,
+                &transaction_writer,
+            )
+            .await;
+
+            assert!(pending.is_empty());
+            first_rx.try_recv().expect("first upload completed");
+            second_rx.try_recv().expect("second upload completed");
+            handle.abort();
+        });
+    }
+
+    #[test]
     fn queued_upload_completes_through_publisher() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let dir = tempfile::TempDir::new().expect("tempdir");
@@ -1976,6 +2097,7 @@ mod tests {
                 &first,
             )
             .await;
+            assert_transaction_append_locations_match_block(&client, &first).await;
 
             let second = build_and_commit_application_block(
                 &databases,
@@ -2008,314 +2130,9 @@ mod tests {
                 &second,
             )
             .await;
+            assert_transaction_append_locations_match_block(&client, &second).await;
 
             publisher.shutdown().await;
-            handle.abort();
-        });
-    }
-
-    #[derive(Clone)]
-    struct DelayedPrepareContext<C> {
-        inner: C,
-        gate: Arc<PrepareSpawnGate>,
-    }
-
-    impl<C> DelayedPrepareContext<C> {
-        fn new(inner: C, gate: Arc<PrepareSpawnGate>) -> Self {
-            Self { inner, gate }
-        }
-    }
-
-    struct PrepareSpawnGate {
-        delayed_height: u64,
-        release_height: u64,
-        release_done: AtomicBool,
-        release_notify: Notify,
-    }
-
-    enum PrepareSpawnAction {
-        Delay,
-        Release,
-        None,
-    }
-
-    impl PrepareSpawnGate {
-        fn new(delayed_height: u64, release_height: u64) -> Self {
-            Self {
-                delayed_height,
-                release_height,
-                release_done: AtomicBool::new(false),
-                release_notify: Notify::new(),
-            }
-        }
-
-        fn action(&self, name: &commonware_runtime::Name) -> PrepareSpawnAction {
-            if !name.label.ends_with("prepare_upload") {
-                return PrepareSpawnAction::None;
-            }
-            let height = name
-                .attributes
-                .iter()
-                .find_map(|(key, value)| (key == "height").then(|| value.parse::<u64>().ok()))
-                .flatten();
-            match height {
-                Some(height) if height == self.delayed_height => PrepareSpawnAction::Delay,
-                Some(height) if height == self.release_height => PrepareSpawnAction::Release,
-                _ => PrepareSpawnAction::None,
-            }
-        }
-
-        async fn wait_for_release(&self) {
-            if self.release_done.load(Ordering::SeqCst) {
-                return;
-            }
-            let notified = self.release_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if self.release_done.load(Ordering::SeqCst) {
-                return;
-            }
-            tokio::time::timeout(Duration::from_secs(1), notified)
-                .await
-                .expect("release upload should finish before delayed upload resumes");
-        }
-
-        fn release(&self) {
-            self.release_done.store(true, Ordering::SeqCst);
-            self.release_notify.notify_waiters();
-        }
-    }
-
-    impl<C> commonware_runtime::Supervisor for DelayedPrepareContext<C>
-    where
-        C: commonware_runtime::Supervisor,
-    {
-        fn name(&self) -> commonware_runtime::Name {
-            self.inner.name()
-        }
-
-        fn child(&self, label: &'static str) -> Self {
-            Self {
-                inner: self.inner.child(label),
-                gate: self.gate.clone(),
-            }
-        }
-
-        fn with_attribute(self, key: &'static str, value: impl std::fmt::Display) -> Self {
-            Self {
-                inner: self.inner.with_attribute(key, value),
-                gate: self.gate,
-            }
-        }
-    }
-
-    impl<C> commonware_runtime::Spawner for DelayedPrepareContext<C>
-    where
-        C: commonware_runtime::Spawner,
-    {
-        fn shared(self, blocking: bool) -> Self {
-            Self {
-                inner: self.inner.shared(blocking),
-                gate: self.gate,
-            }
-        }
-
-        fn dedicated(self) -> Self {
-            Self {
-                inner: self.inner.dedicated(),
-                gate: self.gate,
-            }
-        }
-
-        fn spawn<F, Fut, T>(self, f: F) -> commonware_runtime::Handle<T>
-        where
-            Self: Sized,
-            F: FnOnce(Self) -> Fut + Send + 'static,
-            Fut: Future<Output = T> + Send + 'static,
-            T: Send + 'static,
-        {
-            let name = self.inner.name();
-            let action = self.gate.action(&name);
-            let gate = self.gate;
-            self.inner.spawn(move |inner| {
-                let context = Self {
-                    inner,
-                    gate: gate.clone(),
-                };
-                async move {
-                    match action {
-                        PrepareSpawnAction::Delay => {
-                            gate.wait_for_release().await;
-                            f(context).await
-                        }
-                        PrepareSpawnAction::Release => {
-                            let result = f(context).await;
-                            gate.release();
-                            result
-                        }
-                        PrepareSpawnAction::None => f(context).await,
-                    }
-                }
-            })
-        }
-
-        fn stop(
-            self,
-            value: i32,
-            timeout: Option<Duration>,
-        ) -> impl Future<Output = Result<(), commonware_runtime::Error>> + Send {
-            self.inner.stop(value, timeout)
-        }
-
-        fn stopped(&self) -> commonware_runtime::signal::Signal {
-            self.inner.stopped()
-        }
-    }
-
-    #[test]
-    fn queued_preparer_preserves_transaction_locations_when_first_prepare_is_slow() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
-                .await
-                .expect("spawn simulator");
-            let client = StoreClient::new(&url);
-            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
-                state_qmdb_client(&client).expect("state client"),
-            ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
-                transactions_qmdb_client(&client).expect("transaction client"),
-            ));
-            let sql_writer = build_meta_schema(client.clone())
-                .expect("schema")
-                .batch_writer();
-            let (commit_tx, commit_rx) = mpsc::channel(2);
-            let (prepare_tx, prepare_rx) = mpsc::channel(2);
-            let commit_join = tokio::spawn(run_qmdb_committer(
-                context.child("commit"),
-                client.clone(),
-                sql_writer,
-                state_writer.clone(),
-                transaction_writer.clone(),
-                commit_rx,
-                2,
-            ));
-            let prepare_join = tokio::spawn(run_qmdb_preparer(
-                DelayedPrepareContext::new(
-                    context.child("prepare"),
-                    Arc::new(PrepareSpawnGate::new(1, 2)),
-                ),
-                state_writer,
-                transaction_writer,
-                prepare_rx,
-                commit_tx,
-            ));
-            let databases =
-                test_application_databases(context.child("application"), "slow-prepare").await;
-
-            let first = build_and_commit_application_block(
-                &databases,
-                None,
-                1,
-                vec![
-                    (
-                        account_key(1),
-                        Account {
-                            balance: 10,
-                            nonce: 0,
-                        },
-                    ),
-                    (
-                        account_key(2),
-                        Account {
-                            balance: 20,
-                            nonce: 0,
-                        },
-                    ),
-                ],
-                vec![signed_transaction(1, 0), signed_transaction(2, 0)],
-            )
-            .await;
-            let first_upload = Publisher::build_queued_finalized_upload_with_context(
-                context.child("first_upload"),
-                0,
-                0,
-                &first,
-                &databases,
-            )
-            .await
-            .expect("first queued upload builds");
-            let second_state_start = first_upload.state_end();
-            let second_transaction_start = first_upload.transaction_end();
-            let second = build_and_commit_application_block(
-                &databases,
-                Some(&first),
-                2,
-                vec![
-                    (
-                        account_key(1),
-                        Account {
-                            balance: 9,
-                            nonce: 1,
-                        },
-                    ),
-                    (
-                        account_key(3),
-                        Account {
-                            balance: 30,
-                            nonce: 0,
-                        },
-                    ),
-                ],
-                vec![signed_transaction(3, 1)],
-            )
-            .await;
-            let second_upload = Publisher::build_queued_finalized_upload_with_context(
-                context.child("second_upload"),
-                second_state_start,
-                second_transaction_start,
-                &second,
-                &databases,
-            )
-            .await
-            .expect("second queued upload builds");
-
-            let (first_done, first_rx) = oneshot::channel();
-            let (second_done, second_rx) = oneshot::channel();
-            prepare_tx
-                .send(PendingQueuedFinalizedUpload {
-                    height: first_upload.height(),
-                    upload: first_upload,
-                    completion: first_done,
-                })
-                .await
-                .expect("send first upload");
-            prepare_tx
-                .send(PendingQueuedFinalizedUpload {
-                    height: second_upload.height(),
-                    upload: second_upload,
-                    completion: second_done,
-                })
-                .await
-                .expect("send second upload");
-
-            first_rx.await.expect("first upload completed");
-            second_rx.await.expect("second upload completed");
-            drop(prepare_tx);
-            prepare_join.await.expect("preparer task exits");
-            commit_join.await.expect("committer task exits");
-
-            let transaction_reader = KeylessClient::<
-                QmdbFamily,
-                Sha256,
-                Sha256Digest,
-                TransactionEncoding<Sha256>,
-            >::from_client(
-                transactions_qmdb_client(&client).expect("transaction client"),
-                (),
-            );
-            assert_transaction_append_locations_match_block(&transaction_reader, &first).await;
-            assert_transaction_append_locations_match_block(&transaction_reader, &second).await;
             handle.abort();
         });
     }
@@ -2544,9 +2361,18 @@ mod tests {
     }
 
     async fn assert_transaction_append_locations_match_block(
-        reader: &KeylessClient<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>,
+        client: &StoreClient,
         block: &EngineBlock<Sha256, ed25519::PublicKey>,
     ) {
+        let reader = KeylessClient::<
+            QmdbFamily,
+            Sha256,
+            Sha256Digest,
+            TransactionEncoding<Sha256>,
+        >::from_client(
+            transactions_qmdb_client(client).expect("transaction client"),
+            (),
+        );
         let rows = encode_indexed_block_rows_at(block, 0);
         let tx_count =
             u64::try_from(rows.transaction_digests.len()).expect("transaction count fits u64");
@@ -2618,6 +2444,17 @@ mod tests {
             .stage_upload(transactions, &mut batch)
             .expect("transaction rows stage");
         batch.commit(client).await.expect("upload batch commits")
+    }
+
+    fn committed_batch(batch: QmdbCommitBatch, store_seq: u64) -> CommittedQmdbBatch {
+        CommittedQmdbBatch {
+            upload: batch.upload,
+            sql: batch.sql,
+            rows: batch.rows,
+            state_watermark: batch.state_watermark,
+            transaction_watermark: batch.transaction_watermark,
+            store_seq,
+        }
     }
 
     fn state_ops(seed: u8) -> Vec<StateOperation> {

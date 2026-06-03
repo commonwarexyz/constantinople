@@ -21,6 +21,10 @@ This writes:
 
 - `validator-0.yaml`, `validator-1.yaml`, ...
 - `peers.yaml`
+- `simplex-verification-material.hex`
+
+When secondary roles are enabled, this also writes `secondary-0.yaml`,
+`secondary-1.yaml`, ...
 
 It also prints an `mprocs` command that starts the whole local cluster.
 
@@ -79,9 +83,11 @@ cargo run --bin constantinople-deploy -- generate \
 You can also run the spammer manually against an existing local cluster:
 
 ```sh
-cargo run --release --bin constantinople-spammer -- \
+PRIMARY_TARGETS=$(yq -r '.validators[].name' ./local/peers.yaml | paste -sd, -)
+cargo run --bin constantinople-spammer -- \
   --relayer-url http://127.0.0.1:8084 \
   --relayer-submitters 4 \
+  --relayer-targets "$PRIMARY_TARGETS" \
   --accounts 10 \
   --value 1 \
   --accounts-jitter 0.25
@@ -106,10 +112,11 @@ This adds one extra secondary validator with a `relayer` section and starts it w
 the optional indexer secondary, follows consensus directly, and forwards normal user batches to
 the leaders of the next two views.
 
-When `--spammer` is set, the generated spammer command uses `--relayer-url`
-and `--relayer-submitters <validators>`. Each relayed submitter pins an exact
-primary validator target and requests single-leader routing, so concurrent
-streams feed different primaries without creating stale duplicate nonce copies.
+When `--spammer` is set, the generated spammer command uses `--relayer-url`,
+`--relayer-submitters <validators>`, and `--relayer-targets <primary-keys>`.
+Each relayed submitter pins an exact primary validator target and requests
+single-leader routing, so concurrent streams feed different primaries without
+creating stale duplicate nonce copies.
 
 ### Local Deployment with Indexer + Explorer
 
@@ -134,11 +141,11 @@ relayer is `secondary-1`.
 
 The printed `mprocs` command list grows by four entries:
 
-- `cargo run -p constantinople-indexer --bin chain-indexer -- --port 8090 --data-dir ./local/chain-indexer`
+- `cargo run --release -p constantinople-indexer --bin chain-indexer -- --port 8090 --data-dir ./local/chain-indexer`
   — the simulator-backed shared store. `--chain-indexer-port` overrides the port.
-- `cargo run -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
+- `cargo run --release -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
   — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
-- `cargo run -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
+- `cargo run --release -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
   — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
   overrides the port.
 - `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev`
@@ -162,7 +169,8 @@ artifacts through `VITE_STORE_URL`, verifies them with
 commitment names the decoded block, and only then uses the block's transaction
 root as the trusted root for the QMDB transaction proof.
 
-The explorer command receives `VITE_MEMPOOL_URL` pointing at the local relayer.
+When `--relayer` is also set, the explorer command receives
+`VITE_MEMPOOL_URL` pointing at the local relayer.
 
 End-to-end "spin everything up" with the spammer for live transaction flow:
 
@@ -181,6 +189,14 @@ mprocs ...   # paste the line printed by `generate`
 
 Then open <http://localhost:5173> in your browser to watch transactions
 arrive in real time.
+
+To recover explorer verification material from an existing generated node
+config:
+
+```sh
+cargo run --bin constantinople-deploy -- simplex-verification-material \
+  --config ./local/validator-0.yaml
+```
 
 ## Remote Deployment
 
@@ -210,6 +226,7 @@ This writes:
 - one validator YAML config per validator
 - `config.yaml` for `commonware-deployer`
 - `dashboard.json`
+- `simplex-verification-material.hex`
 
 Build the deployable validator binary into `./deploy`:
 
@@ -293,7 +310,9 @@ submitter pins an exact primary validator target and requests single-leader
 routing, so concurrent streams feed different primaries without creating stale
 duplicate nonce copies.
 
-Build both binaries before creating the deployment. For Graviton instances:
+Build the deployable binaries before creating the deployment. The aggregate
+targets are the usual deploy path and include the validator, spammer, and
+indexer binaries. For Graviton instances:
 
 ```sh
 just graviton-binaries
@@ -305,8 +324,8 @@ For Intel instances:
 just intel-binaries
 ```
 
-These targets write `deploy/validator`, `deploy/validator-debug`,
-`deploy/spammer`, and `deploy/spammer-debug`.
+For a spammer-only remote bundle, the minimum required targets are
+`validator-*-binary` and `spammer-*-binary`.
 
 Then create the deployment as usual:
 
@@ -368,13 +387,14 @@ The generated bundle now also includes:
 Topology and defaults:
 
 - `chain-indexer` is a single shared simulator-backed store instance.
+- `chain-indexer` runs a Constantinople-specific write-heavy RocksDB profile.
 - `metadata-indexer` is a single shared SQL query/stream service layered on that store.
 - `qmdb-indexer` is a single shared QMDB Connect facade layered on that store.
 - Simplex finalization artifacts are stored in `chain-indexer` and read
   directly by proof-verifying clients through the Store API.
 - all shared indexer services land in the first remote region.
 - `chain-indexer` uses a `c8gb.4xlarge` instance and a 500 GiB `io2` volume with
-  64,000 IOPS by default; override these with `--chain-indexer-instance-type`,
+  32,000 IOPS by default; override these with `--chain-indexer-instance-type`,
   `--chain-indexer-storage-size`, and `--chain-indexer-storage-iops`.
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
@@ -403,10 +423,10 @@ For Intel instances:
 just intel-binaries
 ```
 
-Those aggregate targets now write:
+Those aggregate targets write:
 
 - `deploy/validator`
-- `deploy/spammer` when `--spammer` is enabled
+- `deploy/spammer`
 - `deploy/chain-indexer`
 - `deploy/metadata-indexer`
 - `deploy/qmdb-indexer`
@@ -424,15 +444,27 @@ CHAIN_IP=$(yq -r '.hosts[] | select(.name=="chain-indexer") | .ip' "$HOSTS")
 SQL_IP=$(yq -r '.hosts[] | select(.name=="metadata-indexer") | .ip' "$HOSTS")
 QMDB_IP=$(yq -r '.hosts[] | select(.name=="qmdb-indexer") | .ip' "$HOSTS")
 
-RELAYER_NAME=$(for f in deploy/*.yaml; do yq -e '.relayer' "$f" >/dev/null 2>&1 && basename "$f" .yaml; done)
-RELAYER_IP=$(yq -r ".hosts[] | select(.name==\"$RELAYER_NAME\") | .ip" "$HOSTS")
-
 SIMPLEX_VERIFICATION_MATERIAL=$(tr -d '[:space:]' < deploy/simplex-verification-material.hex)
 
 VITE_SQL_URL=http://$SQL_IP:8091 \
 VITE_QMDB_URL=http://$QMDB_IP:8092 \
 VITE_STORE_URL=http://$CHAIN_IP:8090 \
+VITE_SIMPLEX_VERIFICATION_MATERIAL=$SIMPLEX_VERIFICATION_MATERIAL \
+npm --prefix explorer run dev
+```
+
+The generated local `mprocs` command sets `VITE_MEMPOOL_URL` automatically when
+`--relayer` is enabled. For a local explorer pointed at a remote deployment,
+set it manually if you want local submissions to go through the remote relayer:
+
+```sh
+RELAYER_NAME=$(for f in deploy/*.yaml; do yq -e '.relayer' "$f" >/dev/null 2>&1 && basename "$f" .yaml; done)
+RELAYER_IP=$(yq -r ".hosts[] | select(.name==\"$RELAYER_NAME\") | .ip" "$HOSTS")
+
 VITE_MEMPOOL_URL=http://$RELAYER_IP:8080 \
+VITE_SQL_URL=http://$SQL_IP:8091 \
+VITE_QMDB_URL=http://$QMDB_IP:8092 \
+VITE_STORE_URL=http://$CHAIN_IP:8090 \
 VITE_SIMPLEX_VERIFICATION_MATERIAL=$SIMPLEX_VERIFICATION_MATERIAL \
 npm --prefix explorer run dev
 ```
