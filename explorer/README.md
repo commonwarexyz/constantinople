@@ -36,10 +36,13 @@ verification succeeds.
 The indexer publishes every finalized block to complementary surfaces
 (see [`crates/indexer/README.md`](../crates/indexer/README.md)):
 
-- **Full storage (KV)** — `BLOCK`, `TX`, `BLOCK_BY_H`, `TX_BY_H`,
-  `FINALIZED`, `NOTARIZED`. Tools that need the full
-  `SignedTransaction` body fetch by digest through the `StoreClient`. The
-  explorer does not consume this path.
+- **Simplex block/certificate storage** — certified headers, full blocks by
+  digest, and finalization indexes. The explorer uses this for browser-side
+  certificate/header verification and only fetches full block bodies when a
+  workflow needs them.
+- **Raw transaction storage (KV)** — `TX`, `TX_BY_H`, and `TX_BY_SENDER`.
+  Tools that need full `SignedTransaction` bodies fetch them by digest through
+  the `StoreClient`.
 - **Metadata stream (SQL)** — `block_meta` / `tx_meta` tables on top
   of the same store. Cheap to subscribe to from the browser and
   already deduplicated to one row per block.
@@ -52,7 +55,7 @@ The indexer publishes every finalized block to complementary surfaces
 | ------- | ------- | ----- |
 | `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
 | `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service. Matches the local-deploy `--qmdb-indexer-port` default. |
-| `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for raw blocks and Simplex artifacts. |
+| `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for raw transaction rows and Simplex artifacts. |
 | `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction submission/status endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
 | `VITE_VERIFY_CERTIFICATES` | `true` | Set to `false` to disable block-list certificate verification while profiling live block streaming. |

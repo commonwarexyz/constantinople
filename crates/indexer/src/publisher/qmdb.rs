@@ -1645,12 +1645,10 @@ mod tests {
         assert_eq!(state.prefix(), STATE_QMDB_PREFIX_VALUE);
         assert_eq!(transactions.prefix(), TRANSACTIONS_QMDB_PREFIX_VALUE);
         for prefix in [
-            crate::keys::BLOCK.prefix(),
-            crate::keys::BLOCK_BY_H.prefix(),
-            crate::keys::FINALIZED.prefix(),
-            crate::keys::NOTARIZED.prefix(),
             crate::keys::TX.prefix(),
             crate::keys::TX_BY_H.prefix(),
+            crate::keys::TX_BY_SENDER.prefix(),
+            crate::keys::ACCOUNT.prefix(),
         ] {
             assert_ne!(STATE_QMDB_PREFIX_VALUE, prefix);
             assert_ne!(TRANSACTIONS_QMDB_PREFIX_VALUE, prefix);
@@ -1661,8 +1659,8 @@ mod tests {
     fn raw_and_sql_rows_stage_into_one_store_batch() {
         let client = StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
         let raw = vec![(
-            crate::keys::block(&[7u8; 32]).expect("block key"),
-            Bytes::from_static(b"block"),
+            crate::keys::tx(&[7u8; 32]).expect("transaction key"),
+            Bytes::from_static(b"transaction"),
         )];
         let mut batch = StoreWriteBatch::new();
         for (key, value) in raw {

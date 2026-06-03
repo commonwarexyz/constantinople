@@ -20,9 +20,9 @@ import {
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
 const TX_BY_HEIGHT_RESERVED_BITS = 4;
-const TX_BY_HEIGHT_PREFIX = 0x6;
-const TX_BY_SENDER_PREFIX = 0x7;
-const ACCOUNT_PREFIX = 0xa;
+const TX_BY_HEIGHT_PREFIX = 0x2;
+const TX_BY_SENDER_PREFIX = 0x3;
+const ACCOUNT_PREFIX = 0x4;
 const MAX_TX_BY_HEIGHT_ROWS = 100_000;
 const ACCOUNT_PAGE_SIZE = 10;
 const ACCOUNT_KEY_BYTES = 32;
@@ -451,7 +451,7 @@ async function finalizedTargetFromCertificate(
         throw new Error(`certified commitment must be ${COMMITMENT_BYTES} bytes`);
     }
     if (certified.length <= COMMITMENT_BYTES) {
-        throw new Error('finalized artifact is missing certified block bytes');
+        throw new Error('finalized artifact is missing certified header bytes');
     }
     const encodedCommitment = certified.slice(0, COMMITMENT_BYTES);
     if (!bytesEqual(encodedCommitment, certificate.payload)) {

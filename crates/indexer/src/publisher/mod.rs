@@ -5,14 +5,14 @@
 //!
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
-//! | `raw` (KV)       | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H`            |
+//! | `simplex`        | certified headers, full blocks by digest, certificates       |
+//! | `raw` (KV)       | `TX`, `TX_BY_H`, `TX_BY_SENDER`, account proof rows          |
 //! | `sql` (metadata) | `block_meta`                                                 |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!
-//! Simplex certificates are uploaded separately through [`CertificateReporter`]
-//! using `exoware-simplex` indexes in the same Store. Those proof artifacts are
-//! not the canonical block or transaction storage path.
+//! Simplex block and certificate artifacts are uploaded separately through
+//! [`CertificateReporter`] using `exoware-simplex` indexes in the same Store.
 //!
 //! [`StoreClient`]: exoware_sdk::StoreClient
 

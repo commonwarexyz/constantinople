@@ -17,45 +17,47 @@ that fits.
 
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
-| **Full storage** (KV) | `BLOCK`, `BLOCK_BY_H`, `TX`, `TX_BY_H` | Tools that need full `SignedTransaction` bodies through [`IndexerClient`](src/client.rs). |
+| **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
+| **Raw transaction storage** (KV) | `TX`, `TX_BY_H`, `TX_BY_SENDER` | Tools that need full `SignedTransaction` bodies or transaction lookup indexes through [`IndexerClient`](src/client.rs). |
 | **Metadata stream** (SQL) | `block_meta(height, digest, tx_count, transactions_root, transactions_tip, view, finalized_ts)` | The explorer ([`explorer/`](../../explorer)), and any other consumer that wants a column-oriented finalized-block feed without paying the full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
-| **Simplex artifacts** | `exoware-simplex` header and finalization indexes in the shared Store | The explorer and proof clients that need a browser-verifiable finalization certificate for a block. Full block and transaction reads still come from the KV path through [`IndexerClient`](src/client.rs). |
+| **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 
 All paths share the same exoware [`StoreClient`] under the hood. The owning
-secondary stages raw KV rows, SQL rows, and both QMDB row families into one
-Store batch from the finalized hook; simplex artifacts are published from the
-same finalized path after data upload. The active KV families are namespaced under
-`reserved_bits=4, prefix=0x1,0x2,0x5,0x6` (see [`src/keys.rs`](src/keys.rs));
+secondary stages raw transaction KV rows, SQL rows, and both QMDB row families
+into one Store batch from the finalized hook; simplex block and certificate
+artifacts are published from the same finalized path after data upload. The
+active raw KV families are namespaced under
+`reserved_bits=4, prefix=0x1,0x2,0x3,0x4` (see [`src/keys.rs`](src/keys.rs));
 the SQL tables use a disjoint prefix range
 (`0x00..=0x0F`, declared in [`exoware-sql`'s `KvSchema`][kvschema]) so a
 single store can host every index without collision.
 
-Simplex artifacts carry certified block payloads for proof verification, but
-they are not the canonical block or transaction store and are not read by
-[`IndexerClient`](src/client.rs).
+Simplex is the canonical block/header store. Blocks are available by digest
+without requiring a height certificate; height/latest reads start from a
+finalization certificate, verify the commitment/header relationship, and fetch
+the full body only when requested.
 
 [`StoreClient`]: https://docs.rs/exoware-sdk/latest/exoware_sdk/struct.StoreClient.html
 [kvschema]: https://docs.rs/exoware-sql/latest/exoware_sql/struct.KvSchema.html
 
 ## Crate contents
 
-- `KeyCodec` wrappers for the raw KV artifact families (blocks,
-  transactions, and height/digest indexes).
+- `KeyCodec` wrappers for the raw transaction/account KV families.
 - [`sql_schema::build_meta_schema`](src/sql_schema.rs) — the canonical
   source of truth for the live `block_meta` table layout and the legacy
   queryable `tx_meta` table. The explorer's column-name strings live here too,
   so a schema change is a one-place edit.
 - A [`CertificateReporter`](src/publisher/certificate.rs) that taps
-  simplex `Activity` events, pairs certificates with finalized blocks, and
-  uploads `exoware-simplex` proof artifacts to the shared Store.
+  simplex `Activity` events, uploads full blocks by digest, pairs certificates
+  with finalized headers, and uploads `exoware-simplex` proof artifacts to the
+  shared Store.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
-  on the single owning secondary and commits raw KV, SQL, account-state
-  QMDB, and transaction-hash QMDB rows in one Store batch.
-- [`IndexerClient`](src/client.rs) — typed read wrapper over the two KV
-  `StoreClient`s. The latest-finalized-height cursor is now derived from
-  a backward range scan of `BLOCK_BY_H` (formerly stored in a redundant
-  KV `META` family).
+  on the single owning secondary and commits raw transaction KV, SQL,
+  account-state QMDB, and transaction-hash QMDB rows in one Store batch.
+- [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
+  storage and raw transaction KV. Latest-finalized-height is derived from the
+  Simplex finalization height index.
 - `[[bin]] chain-indexer` — thin wrapper around `exoware_simulator::server::run`
   for local development and deployer-managed remote bundles.
 - `[[bin]] metadata-indexer` — thin wrapper that registers

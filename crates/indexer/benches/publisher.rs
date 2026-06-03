@@ -892,16 +892,7 @@ fn insert_sql_rows(writer: &mut BatchWriter, rows: &[SqlRow]) {
 }
 
 fn raw_rows(height: u64, tx_count: usize) -> Vec<(Key, Bytes)> {
-    let block_digest = digest(height);
-    let mut rows = Vec::with_capacity(2 + 2 * tx_count);
-    rows.push((
-        keys::block(&block_digest).expect("block key"),
-        Bytes::from(block_digest.to_vec()),
-    ));
-    rows.push((
-        keys::block_by_height(height).expect("block height key"),
-        Bytes::copy_from_slice(&block_digest),
-    ));
+    let mut rows = Vec::with_capacity(2 * tx_count);
     for idx in 0..tx_count {
         let tx_digest = digest(height ^ (idx as u64).rotate_left(17));
         rows.push((

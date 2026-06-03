@@ -1,27 +1,18 @@
-//! Indexer key layout.
+//! Raw indexer key layout.
+//!
+//! Full blocks and consensus certificates live in `exoware-simplex`. This
+//! module only defines the raw KV families that remain outside Simplex:
+//! transaction lookup/index rows and account proof rows.
 //!
 //! All keys live under a single 4-bit family prefix. Big-endian encoding is
-//! used for every numeric field so the natural byte order matches the
-//! sortable order of `view`/`height`/`index`.
+//! used for every numeric field so natural byte order matches sortable order.
 //!
-//! | Family       | Prefix | Payload                            | Stored value         |
-//! | ------------ | ------ | ---------------------------------- | -------------------- |
-//! | `BLOCK`      | `0x1`  | `digest` (32B)                     | encoded `EngineBlock` |
-//! | `BLOCK_BY_H` | `0x2`  | `height` (u64 BE)                  | block digest (32B)   |
-//! | `FINALIZED`  | `0x3`  | `view` (u64 BE)                    | encoded `Finalization` |
-//! | `NOTARIZED`  | `0x4`  | `view` (u64 BE)                    | encoded `Notarization` |
-//! | `TX`         | `0x5`  | `tx_digest` (32B)                  | encoded `SignedTransaction` |
-//! | `TX_BY_H`    | `0x6`  | `height` (u64 BE) ‖ `index` (u32 BE) | tx digest (32B)    |
-//! | `TX_BY_SENDER` | `0x7` | sender (32B) ‖ descending height/index | tx summary row |
-//! | `ACCOUNT`    | `0xa`  | account key (32B)                  | account proof row |
-//!
-//! Reserved bits: 4. The remaining 4 bits of the first byte hold the family
-//! prefix. The full payload (including any digest or numeric field) starts at
-//! the second byte.
-//!
-//! The `latest_finalized_height` cursor and any other indexer metadata live
-//! exclusively in the SQL `block_meta` table (see [`crate::sql_schema`]);
-//! the KV path no longer carries a redundant `META` family.
+//! | Family       | Prefix | Payload                              | Stored value |
+//! | ------------ | ------ | ------------------------------------ | ------------ |
+//! | `TX`         | `0x1`  | `tx_digest` (32B)                    | encoded `SignedTransaction` |
+//! | `TX_BY_H`    | `0x2`  | `height` (u64 BE) ‖ `index` (u32 BE) | tx digest (32B) |
+//! | `TX_BY_SENDER` | `0x3` | sender (32B) ‖ descending height/index | tx summary row |
+//! | `ACCOUNT`    | `0x4`  | account key (32B)                    | account proof row |
 
 use bytes::Bytes;
 use exoware_sdk::keys::{Key, KeyCodec, KeyCodecError};
@@ -29,42 +20,14 @@ use exoware_sdk::keys::{Key, KeyCodec, KeyCodecError};
 /// Number of high bits reserved for the family prefix.
 pub const RESERVED_BITS: u8 = 4;
 
-/// Family for `digest -> Block`.
-pub const BLOCK: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x1);
-/// Family for `height -> block_digest`.
-pub const BLOCK_BY_H: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x2);
-/// Family for `view -> Finalization`.
-pub const FINALIZED: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x3);
-/// Family for `view -> Notarization`.
-pub const NOTARIZED: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x4);
 /// Family for `tx_digest -> SignedTransaction`.
-pub const TX: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x5);
+pub const TX: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x1);
 /// Family for `(height, index) -> tx_digest`.
-pub const TX_BY_H: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x6);
+pub const TX_BY_H: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x2);
 /// Family for `sender -> recent sent transaction summary`.
-pub const TX_BY_SENDER: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x7);
+pub const TX_BY_SENDER: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x3);
 /// Family for `account key -> latest indexed account state`.
-pub const ACCOUNT: KeyCodec = KeyCodec::new(RESERVED_BITS, 0xa);
-
-/// Encode a `BLOCK` key for the given block digest.
-pub fn block(digest: &[u8]) -> Result<Key, KeyCodecError> {
-    encode_indexer_key(BLOCK.prefix(), digest)
-}
-
-/// Encode a `BLOCK_BY_H` key for the given block height.
-pub fn block_by_height(height: u64) -> Result<Key, KeyCodecError> {
-    encode_indexer_key(BLOCK_BY_H.prefix(), &height.to_be_bytes())
-}
-
-/// Encode a `FINALIZED` key for the given consensus view.
-pub fn finalized(view: u64) -> Result<Key, KeyCodecError> {
-    encode_indexer_key(FINALIZED.prefix(), &view.to_be_bytes())
-}
-
-/// Encode a `NOTARIZED` key for the given consensus view.
-pub fn notarized(view: u64) -> Result<Key, KeyCodecError> {
-    encode_indexer_key(NOTARIZED.prefix(), &view.to_be_bytes())
-}
+pub const ACCOUNT: KeyCodec = KeyCodec::new(RESERVED_BITS, 0x4);
 
 /// Encode a `TX` key for the given transaction digest.
 pub fn tx(digest: &[u8]) -> Result<Key, KeyCodecError> {
@@ -94,7 +57,7 @@ pub fn account(account: &[u8]) -> Result<Key, KeyCodecError> {
 }
 
 fn encode_indexer_key(prefix: u16, payload: &[u8]) -> Result<Key, KeyCodecError> {
-    let max_payload_len = BLOCK.max_payload_capacity_bytes();
+    let max_payload_len = TX.max_payload_capacity_bytes();
     if payload.len() > max_payload_len {
         return Err(KeyCodecError::PayloadTooLarge {
             payload_len: payload.len(),
@@ -117,26 +80,6 @@ fn encode_indexer_key(prefix: u16, payload: &[u8]) -> Result<Key, KeyCodecError>
     }
     key.push(payload[payload.len() - 1] << 4);
     Ok(Bytes::from(key))
-}
-
-/// Inclusive `(start, end)` bounds spanning every key under the `BLOCK` family.
-pub fn block_bounds() -> (Key, Key) {
-    BLOCK.prefix_bounds()
-}
-
-/// Inclusive `(start, end)` bounds spanning every key under `BLOCK_BY_H`.
-pub fn block_by_height_bounds() -> (Key, Key) {
-    BLOCK_BY_H.prefix_bounds()
-}
-
-/// Inclusive `(start, end)` bounds spanning every key under `FINALIZED`.
-pub fn finalized_bounds() -> (Key, Key) {
-    FINALIZED.prefix_bounds()
-}
-
-/// Inclusive `(start, end)` bounds spanning every key under `NOTARIZED`.
-pub fn notarized_bounds() -> (Key, Key) {
-    NOTARIZED.prefix_bounds()
 }
 
 /// Inclusive `(start, end)` bounds spanning every key under `TX`.
@@ -163,14 +106,10 @@ pub fn account_bounds() -> (Key, Key) {
 mod tests {
     use super::*;
 
-    /// Each family must round-trip through `KeyCodec::matches`.
+    /// Each active family must round-trip through `KeyCodec::matches`.
     #[test]
     fn family_keys_match_their_codec() {
         let digest = [0xABu8; 32];
-        assert!(BLOCK.matches(&block(&digest).unwrap()));
-        assert!(BLOCK_BY_H.matches(&block_by_height(7).unwrap()));
-        assert!(FINALIZED.matches(&finalized(11).unwrap()));
-        assert!(NOTARIZED.matches(&notarized(13).unwrap()));
         assert!(TX.matches(&tx(&digest).unwrap()));
         assert!(TX_BY_H.matches(&tx_by_height(17, 0).unwrap()));
         assert!(TX_BY_SENDER.matches(&tx_by_sender(&digest, 17, 0).unwrap()));
@@ -182,24 +121,10 @@ mod tests {
     #[test]
     fn family_prefixes_are_disjoint() {
         let digest = [0u8; 32];
-        let k = block(&digest).unwrap();
-        assert!(!BLOCK_BY_H.matches(&k));
-        assert!(!FINALIZED.matches(&k));
-        assert!(!NOTARIZED.matches(&k));
-        assert!(!TX.matches(&k));
+        let k = tx(&digest).unwrap();
         assert!(!TX_BY_H.matches(&k));
         assert!(!TX_BY_SENDER.matches(&k));
         assert!(!ACCOUNT.matches(&k));
-    }
-
-    /// Big-endian numeric encoding must preserve sortable order.
-    #[test]
-    fn block_by_height_keys_are_sortable() {
-        let lo = block_by_height(1).unwrap();
-        let mid = block_by_height(1_000).unwrap();
-        let hi = block_by_height(u64::MAX).unwrap();
-        assert!(lo < mid);
-        assert!(mid < hi);
     }
 
     /// `tx_by_height` orders first by height, then by index within a block.
@@ -229,10 +154,6 @@ mod tests {
     #[test]
     fn prefix_bounds_helpers_match_codec_bounds() {
         let pairs = [
-            (block_bounds(), BLOCK.prefix_bounds()),
-            (block_by_height_bounds(), BLOCK_BY_H.prefix_bounds()),
-            (finalized_bounds(), FINALIZED.prefix_bounds()),
-            (notarized_bounds(), NOTARIZED.prefix_bounds()),
             (tx_bounds(), TX.prefix_bounds()),
             (tx_by_height_bounds(), TX_BY_H.prefix_bounds()),
             (tx_by_sender_bounds(), TX_BY_SENDER.prefix_bounds()),
@@ -242,8 +163,8 @@ mod tests {
             assert_eq!(helper, codec);
         }
 
-        let k = block_by_height(42).unwrap();
-        let (lo, hi) = block_by_height_bounds();
+        let k = tx_by_height(42, 0).unwrap();
+        let (lo, hi) = tx_by_height_bounds();
         assert!(lo <= k && k <= hi);
     }
 }

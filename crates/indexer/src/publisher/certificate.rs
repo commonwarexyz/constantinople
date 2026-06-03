@@ -1,10 +1,10 @@
 //! Simplex certificate reporter backed by the chain Store.
 //!
 //! Consensus finalizes marshal commitments. Each commitment embeds the digest
-//! of the Constantinople block it certifies, so this reporter waits until it
-//! has both the certificate and the finalized block before writing a Simplex
-//! artifact. The browser can then verify the certificate, decode the block,
-//! and check that the commitment points at that block digest.
+//! of the Constantinople block header it certifies. This reporter writes full
+//! block `{ header, body }` data by header digest for body reads, and writes
+//! certificate artifacts with only the commitment-tagged header so height/latest
+//! verification does not fetch the full body.
 
 use bytes::Buf;
 use commonware_actor::Feedback;
@@ -15,8 +15,7 @@ use commonware_consensus::{
     types::{Height, coding::Commitment},
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
-use constantinople_engine::types::EngineBlock;
-use constantinople_primitives::BlockCfg;
+use constantinople_engine::types::{EngineBlock, EngineHeader};
 use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::{collections::HashMap, time::Duration};
@@ -54,7 +53,8 @@ where
         (Self { tx }, join)
     }
 
-    /// Queue a finalized block so certificates can be paired with it.
+    /// Queue a finalized block for digest-addressed block upload and later
+    /// certificate pairing.
     pub async fn publish_block(&self, block: &EngineBlock<H, P>)
     where
         H: Hasher,
@@ -166,7 +166,10 @@ where
         let key = input.block_digest_key();
         let entry = pending.entry(key.clone()).or_default();
         match input {
-            SimplexInput::Block(block) => entry.block = Some(block),
+            SimplexInput::Block(block) => {
+                upload_block_by_digest(&client, &block).await;
+                entry.block = Some(block);
+            }
             SimplexInput::Notarization(notarization) => entry.notarization = Some(notarization),
             SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
         }
@@ -198,6 +201,27 @@ where
     }
 }
 
+async fn upload_block_by_digest<H, P>(client: &SimplexClient, block: &EngineBlock<H, P>)
+where
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+{
+    let (header, body) = crate::simplex_block::encode_simplex_block_parts(block);
+    let prepared = client.prepare_block(&header, body);
+    let mut batch = StoreWriteBatch::new();
+    client
+        .stage_upload(&prepared, &mut batch)
+        .expect("prepared simplex block upload must stage");
+    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let receipt = client.mark_upload_persisted(prepared, seq).await;
+    debug!(
+        headers = receipt.summary.headers,
+        blocks = receipt.summary.blocks,
+        store_sequence = receipt.store_sequence_number,
+        "indexer uploaded simplex block batch"
+    );
+}
+
 fn block_digest_key<H>(commitment: &Commitment) -> Vec<u8>
 where
     H: Hasher,
@@ -221,9 +245,9 @@ where
     let mut prepared = PreparedUpload::new();
 
     if let Some(notarization) = entry.notarization.take() {
-        let certified = CertifiedBlock::new(notarization.proposal.payload, block.clone());
+        let certified = CertifiedHeader::new(notarization.proposal.payload, block.clone());
         let notarized =
-            Notarized::new(notarization, certified).expect("notarization matches certified block");
+            Notarized::new(notarization, certified).expect("notarization matches certified header");
         prepared.extend(
             client
                 .prepare_notarized(&notarized)
@@ -234,9 +258,9 @@ where
     let mut uploaded_finalization = false;
     if let Some(finalization) = entry.finalization.take() {
         uploaded_finalization = true;
-        let certified = CertifiedBlock::new(finalization.proposal.payload, block);
+        let certified = CertifiedHeader::new(finalization.proposal.payload, block);
         let finalized =
-            Finalized::new(finalization, certified).expect("finalization matches certified block");
+            Finalized::new(finalization, certified).expect("finalization matches certified header");
         prepared.extend(
             client
                 .prepare_finalized(&finalized)
@@ -259,7 +283,7 @@ where
         notarizations = receipt.summary.notarizations,
         finalizations = receipt.summary.finalizations,
         store_sequence = receipt.store_sequence_number,
-        "indexer uploaded simplex certificate batch"
+        "indexer uploaded simplex header certificate batch"
     );
     uploaded_finalization
 }
@@ -290,44 +314,50 @@ fn retry_backoff(attempt: u32) -> Duration {
     INITIAL.saturating_mul(factor).min(MAX)
 }
 
-/// A finalized block tagged with the marshal commitment certified by Simplex.
+/// A finalized header tagged with the marshal commitment certified by Simplex.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CertifiedBlock<H, P>
+pub struct CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
     commitment: Commitment,
-    block: EngineBlock<H, P>,
+    header: EngineHeader<H, P>,
 }
 
-impl<H, P> CertifiedBlock<H, P>
+impl<H, P> CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
     fn new(commitment: Commitment, block: EngineBlock<H, P>) -> Self {
         debug_assert_eq!(commitment.block::<H::Digest>(), *block.seal());
-        Self { commitment, block }
+        let header = EngineHeader::<H, P>::new_unchecked(block.header.clone(), *block.seal());
+        Self { commitment, header }
     }
 
-    /// Return the certified Constantinople block.
-    pub const fn block(&self) -> &EngineBlock<H, P> {
-        &self.block
+    /// Return the certified Constantinople block header.
+    pub const fn header(&self) -> &EngineHeader<H, P> {
+        &self.header
+    }
+
+    /// Return the certified block digest embedded in the marshal commitment.
+    pub fn block_digest(&self) -> H::Digest {
+        self.commitment.block::<H::Digest>()
     }
 }
 
-impl<H, P> Heightable for CertifiedBlock<H, P>
+impl<H, P> Heightable for CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
     fn height(&self) -> Height {
-        self.block.height()
+        self.header.height()
     }
 }
 
-impl<H, P> Digestible for CertifiedBlock<H, P>
+impl<H, P> Digestible for CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
@@ -339,53 +369,53 @@ where
     }
 }
 
-impl<H, P> Block for CertifiedBlock<H, P>
+impl<H, P> Block for CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
     fn parent(&self) -> Self::Digest {
-        self.block.header.context.parent.1
+        self.header.context.parent.1
     }
 }
 
-impl<H, P> EncodeSize for CertifiedBlock<H, P>
+impl<H, P> EncodeSize for CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
     fn encode_size(&self) -> usize {
-        self.commitment.encode_size() + self.block.encode_size()
+        self.commitment.encode_size() + self.header.encode_size()
     }
 }
 
-impl<H, P> Write for CertifiedBlock<H, P>
+impl<H, P> Write for CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.commitment.write(buf);
-        self.block.write(buf);
+        self.header.write(buf);
     }
 }
 
-impl<H, P> Read for CertifiedBlock<H, P>
+impl<H, P> Read for CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
-    type Cfg = BlockCfg;
+    type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let commitment = Commitment::read(buf)?;
-        let block = EngineBlock::<H, P>::read_cfg(buf, cfg)?;
-        if commitment.block::<H::Digest>() != *block.seal() {
+        let header = EngineHeader::<H, P>::read(buf)?;
+        if commitment.block::<H::Digest>() != *header.seal() {
             return Err(CodecError::Invalid(
-                "CertifiedBlock",
-                "commitment block digest does not match block",
+                "CertifiedHeader",
+                "commitment block digest does not match header",
             ));
         }
-        Ok(Self { commitment, block })
+        Ok(Self { commitment, header })
     }
 }

@@ -87,15 +87,7 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    let mut raw = Vec::with_capacity(2 + 3 * body_len);
-    raw.push((
-        keys::block(block_digest.as_ref()).expect("block digest fits family payload"),
-        block.encode(),
-    ));
-    raw.push((
-        keys::block_by_height(height).expect("u64 height fits family payload"),
-        Bytes::copy_from_slice(block_digest.as_ref()),
-    ));
+    let mut raw = Vec::with_capacity(3 * body_len);
 
     // Per-transaction rows: TX, TX_BY_H, and TX_BY_SENDER for account lookup.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());

@@ -1,8 +1,13 @@
 //! Metadata-store schema for the SQL streaming path.
 //!
-//! Constantinople fans every finalized block out across two storage paths:
+//! Constantinople fans every finalized block out across complementary storage
+//! paths:
 //!
-//! - **Full storage (KV)** — `BLOCK`, `BLOCK_BY_H`, `TX`, and `TX_BY_H`
+//! - **Simplex block/certificate storage** — certified headers, full
+//!   `{ header, body }` block envelopes by digest, and finalization indexes.
+//!   Height/latest block reads start with a certified header and only fetch the
+//!   body when needed.
+//! - **Raw transaction storage (KV)** — `TX`, `TX_BY_H`, and `TX_BY_SENDER`
 //!   rows in the existing exoware Store. Tools can fetch full
 //!   `SignedTransaction` bodies by digest from this path.
 //! - **Metadata streaming (SQL)** — two columnar tables registered onto
@@ -11,10 +16,6 @@
 //!   `Subscribe` RPC. The `tx_meta` table remains in the schema for
 //!   compatibility, but the publisher no longer writes per-transaction SQL
 //!   rows on the live path.
-//! - **Simplex artifacts** — finalization certificates are written through
-//!   `exoware-simplex` beside the raw and SQL rows. These proof artifacts can
-//!   carry certified block payloads, but they are not the canonical full-storage
-//!   path.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the

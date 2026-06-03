@@ -1,61 +1,61 @@
-//! Typed read-only wrapper around the indexer's raw KV [`StoreClient`]s.
+//! Typed read-only wrapper over Simplex block storage and raw transaction KV.
 //!
-//! Constantinople writes full-storage KV data to one raw exoware Store.
-//! `IndexerClient` accepts separate handles for block and transaction families
-//! so older tests can still model split stores, but production wiring passes
-//! the same [`StoreClient`] for both handles.
-//! Block-level metadata lives in the SQL `block_meta` table — see
-//! [`crate::sql_schema`] — and is not served by this client.
-//!
-//! The struct does not own any sockets beyond the underlying [`StoreClient`]s,
-//! so it is cheap to clone.
+//! Full blocks are stored in `exoware-simplex` as `{ header, body }` rows
+//! keyed by the certified block-header digest. Height/latest reads go through
+//! Simplex finalization indexes first, so callers can use the verified header
+//! path without fetching the full body. Transaction bodies and secondary
+//! transaction indexes remain in the raw KV families.
 
-use crate::{codec, keys};
+use crate::{codec, keys, publisher::certificate::CertifiedHeader};
 use bytes::Bytes;
 use commonware_codec::Read;
-use commonware_consensus::simplex::types::{Finalization, Notarization};
+use commonware_consensus::{
+    Heightable,
+    types::{Height, View, coding::Commitment},
+};
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
-use constantinople_engine::types::EngineBlock;
+use constantinople_engine::types::{EngineBlock, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction};
-use exoware_sdk::{ClientError, RangeMode, StoreClient, keys::Key};
+use exoware_sdk::{ClientError, StoreClient};
+use exoware_simplex::{Finalized, Notarized, SimplexClient, SimplexError};
 
 /// Errors returned when reading typed artifacts back out of the store.
 #[derive(Debug, thiserror::Error)]
 pub enum ReadError {
-    /// The underlying RPC failed.
+    /// The underlying raw Store RPC failed.
     #[error("store error: {0}")]
     Store(#[from] ClientError),
+    /// The underlying Simplex client failed.
+    #[error("simplex error: {0}")]
+    Simplex(#[from] SimplexError),
     /// Decoding failed.
     #[error("decode error: {0}")]
     Codec(#[from] commonware_codec::Error),
-    /// Stored value did not match the family's expected size.
-    #[error("malformed value: expected {expected} bytes, got {got}")]
-    Malformed { expected: usize, got: usize },
 }
 
-/// Typed read client over the exoware [`StoreClient`]s that back KV reads.
+/// Typed read client over Simplex block rows and raw transaction KV rows.
 ///
-/// | Field          | Families served                                |
-/// | -------------- | ---------------------------------------------- |
-/// | `blocks`       | BLOCK, BLOCK_BY_H, legacy FINALIZED/NOTARIZED |
-/// | `transactions` | TX, TX_BY_H                                    |
+/// | Field          | Families served                                  |
+/// | -------------- | ------------------------------------------------ |
+/// | `blocks`       | Simplex headers, blocks, notarizations, finals   |
+/// | `transactions` | `TX`, `TX_BY_H`, `TX_BY_SENDER`                  |
 #[derive(Clone, Debug)]
 pub struct IndexerClient {
-    blocks: StoreClient,
+    blocks: SimplexClient,
     transactions: StoreClient,
 }
 
 impl IndexerClient {
     /// Wrap existing [`StoreClient`]s for block and transaction families.
-    pub const fn new(blocks: StoreClient, transactions: StoreClient) -> Self {
+    pub fn new(blocks: StoreClient, transactions: StoreClient) -> Self {
         Self {
-            blocks,
+            blocks: SimplexClient::from_client(blocks),
             transactions,
         }
     }
 
-    /// Borrow the block-family [`StoreClient`] for raw access.
-    pub const fn blocks(&self) -> &StoreClient {
+    /// Borrow the Simplex block client.
+    pub const fn blocks(&self) -> &SimplexClient {
         &self.blocks
     }
 
@@ -64,91 +64,166 @@ impl IndexerClient {
         &self.transactions
     }
 
-    /// Fetch the encoded block for `digest`, or `None` if absent.
+    /// Fetch the encoded Simplex `{ header, body }` envelope for `digest`.
     pub async fn block_bytes_by_digest<D: Digest>(
         &self,
         digest: &D,
     ) -> Result<Option<Bytes>, ReadError> {
-        let key = keys::block(digest.as_ref()).expect("block digest fits family payload");
-        Ok(self.blocks.query().get(&key).await?)
+        Ok(self.blocks.get_block_raw(digest).await?)
     }
 
-    /// Decode and return the block for `digest`, or `None` if absent.
-    pub async fn block_by_digest<H, P, D>(
+    /// Fetch and decode the certified block header for `digest`.
+    pub async fn header_by_digest<H, P>(
         &self,
-        digest: &D,
+        digest: &H::Digest,
+    ) -> Result<Option<EngineHeader<H, P>>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+    {
+        Ok(self.blocks.get_header(digest, &()).await?)
+    }
+
+    /// Decode and return the full block for `digest`.
+    ///
+    /// This is the body-fetching path. Header-only callers should use
+    /// [`Self::header_by_digest`] or the certified height/latest helpers.
+    pub async fn block_by_digest<H, P>(
+        &self,
+        digest: &H::Digest,
         cfg: &BlockCfg,
     ) -> Result<Option<EngineBlock<H, P>>, ReadError>
     where
         H: Hasher,
         P: PublicKey,
-        D: Digest,
     {
-        let Some(bytes) = self.block_bytes_by_digest(digest).await? else {
+        let Some(data) = self
+            .blocks
+            .get_block::<EngineHeader<H, P>, H::Digest>(digest, &())
+            .await?
+        else {
             return Ok(None);
         };
-        Ok(Some(codec::from_bytes::<EngineBlock<H, P>>(&bytes, cfg)?))
+        Ok(Some(crate::simplex_block::decode_simplex_block_parts(
+            data.header,
+            data.body,
+            cfg,
+        )?))
     }
 
-    /// Fetch the block digest at `height`, or `None` if absent.
-    pub async fn digest_by_height<D: Digest>(&self, height: u64) -> Result<Option<D>, ReadError> {
-        let key = keys::block_by_height(height).expect("u64 height fits family payload");
-        let Some(bytes) = self.blocks.query().get(&key).await? else {
-            return Ok(None);
-        };
-        Ok(Some(decode_digest::<D>(&bytes)?))
-    }
-
-    /// Decode and return the block at `height`, or `None` if absent.
-    pub async fn block_by_height<H, P>(
+    /// Decode the certified header at `height`.
+    pub async fn certified_header_by_height<H, P, S>(
         &self,
         height: u64,
-        cfg: &BlockCfg,
-    ) -> Result<Option<EngineBlock<H, P>>, ReadError>
+        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<CertifiedHeader<H, P>>, ReadError>
     where
         H: Hasher,
         P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
     {
-        let Some(digest) = self.digest_by_height::<H::Digest>(height).await? else {
-            return Ok(None);
-        };
-        self.block_by_digest::<H, P, _>(&digest, cfg).await
-    }
-
-    /// Latest finalized block height, derived from a backward scan of the
-    /// `BLOCK_BY_H` family.
-    ///
-    /// The previous implementation read a `META` `latest_finalized_height`
-    /// cursor written alongside every block. That cursor is gone — the SQL
-    /// `block_meta` table now serves the same role for streaming consumers
-    /// — so we ask the KV store directly for the highest indexed height by
-    /// taking the last key under [`keys::BLOCK_BY_H`].
-    pub async fn latest_height(&self) -> Result<Option<u64>, ReadError> {
-        let (lo, hi) = keys::block_by_height_bounds();
-        let rows = self
+        Ok(self
             .blocks
-            .query()
-            .range_with_mode(&lo, &hi, 1, RangeMode::Reverse)
-            .await?;
-        let Some((key, _)) = rows.into_iter().next() else {
-            return Ok(None);
-        };
-        Ok(Some(decode_height(&key)?))
+            .get_finalized_by_height::<CertifiedHeader<H, P>, S, Commitment>(
+                Height::new(height),
+                cfg,
+            )
+            .await?
+            .map(|finalized| finalized.header))
     }
 
-    /// Latest indexed block, decoded.
-    pub async fn latest_block<H, P>(
+    /// Fetch the certified block-header digest at `height`.
+    pub async fn digest_by_height<H, P, S>(
         &self,
-        cfg: &BlockCfg,
+        height: u64,
+        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<H::Digest>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
+    {
+        Ok(self
+            .certified_header_by_height::<H, P, S>(height, cfg)
+            .await?
+            .map(|header| header.block_digest()))
+    }
+
+    /// Decode and return the certified full block at `height`.
+    pub async fn block_by_height<H, P, S>(
+        &self,
+        height: u64,
+        block_cfg: &BlockCfg,
+        cert_cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
     ) -> Result<Option<EngineBlock<H, P>>, ReadError>
     where
         H: Hasher,
         P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
     {
-        let Some(height) = self.latest_height().await? else {
+        let Some(digest) = self.digest_by_height::<H, P, S>(height, cert_cfg).await? else {
             return Ok(None);
         };
-        self.block_by_height::<H, P>(height, cfg).await
+        self.block_by_digest::<H, P>(&digest, block_cfg).await
+    }
+
+    /// Latest finalized block header, decoded from the Simplex finalization
+    /// height index without fetching the block body.
+    pub async fn latest_certified_header<H, P, S>(
+        &self,
+        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<CertifiedHeader<H, P>>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
+    {
+        Ok(self
+            .blocks
+            .latest_finalized::<CertifiedHeader<H, P>, S, Commitment>(cfg)
+            .await?
+            .map(|finalized| finalized.header))
+    }
+
+    /// Latest finalized height from the certified Simplex finalization index.
+    pub async fn latest_height<H, P, S>(
+        &self,
+        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<u64>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
+    {
+        Ok(self
+            .latest_certified_header::<H, P, S>(cfg)
+            .await?
+            .map(|header| header.height().get()))
+    }
+
+    /// Latest finalized full block. This fetches the body by digest after
+    /// decoding the latest certified header.
+    pub async fn latest_block<H, P, S>(
+        &self,
+        block_cfg: &BlockCfg,
+        cert_cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<EngineBlock<H, P>>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
+    {
+        let Some(header) = self.latest_certified_header::<H, P, S>(cert_cfg).await? else {
+            return Ok(None);
+        };
+        self.block_by_digest::<H, P>(&header.block_digest(), block_cfg)
+            .await
     }
 
     /// Fetch the encoded transaction for `digest`, or `None` if absent.
@@ -177,94 +252,52 @@ impl IndexerClient {
         )?))
     }
 
-    /// Fetch the encoded finalization certificate for `view`, or `None` if absent.
+    /// Fetch the encoded Simplex finalization artifact for `view`.
     pub async fn finalization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
-        let key = keys::finalized(view).expect("u64 view fits family payload");
-        Ok(self.blocks.query().get(&key).await?)
-    }
-
-    /// Decode and return the finalization certificate for `view`.
-    pub async fn finalization<S, D>(
-        &self,
-        view: u64,
-        cfg: &<Finalization<S, D> as Read>::Cfg,
-    ) -> Result<Option<Finalization<S, D>>, ReadError>
-    where
-        S: Scheme,
-        D: Digest,
-    {
-        let Some(bytes) = self.finalization_bytes(view).await? else {
-            return Ok(None);
-        };
-        Ok(Some(codec::from_bytes::<Finalization<S, D>>(&bytes, cfg)?))
-    }
-
-    /// Fetch the encoded notarization certificate for `view`, or `None` if absent.
-    pub async fn notarization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
-        let key = keys::notarized(view).expect("u64 view fits family payload");
-        Ok(self.blocks.query().get(&key).await?)
-    }
-
-    /// Decode and return the notarization certificate for `view`.
-    pub async fn notarization<S, D>(
-        &self,
-        view: u64,
-        cfg: &<Notarization<S, D> as Read>::Cfg,
-    ) -> Result<Option<Notarization<S, D>>, ReadError>
-    where
-        S: Scheme,
-        D: Digest,
-    {
-        let Some(bytes) = self.notarization_bytes(view).await? else {
-            return Ok(None);
-        };
-        Ok(Some(codec::from_bytes::<Notarization<S, D>>(&bytes, cfg)?))
-    }
-
-    /// Stream every block stored under the `BLOCK_BY_H` family in ascending
-    /// height order, returning `(height, digest)` pairs. Useful for backfill.
-    pub async fn list_block_heights<D: Digest>(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(u64, D)>, ReadError> {
-        let (lo, hi) = keys::block_by_height_bounds();
-        let rows = self
+        Ok(self
             .blocks
-            .query()
-            .range_with_mode(&lo, &hi, limit, RangeMode::Forward)
-            .await?;
-        let mut out = Vec::with_capacity(rows.len());
-        for (key, value) in rows {
-            let height = decode_height(&key)?;
-            let digest = decode_digest::<D>(&value)?;
-            out.push((height, digest));
-        }
-        Ok(out)
+            .get_finalized_by_view_raw(View::new(view))
+            .await?)
     }
-}
 
-/// Decode an `H::Digest` from a stored 32-byte (or `D::SIZE`-byte) value.
-fn decode_digest<D: Digest>(bytes: &[u8]) -> Result<D, ReadError> {
-    let mut buf = bytes;
-    D::read_cfg(&mut buf, &()).map_err(ReadError::from)
-}
-
-/// Decode the height from a `BLOCK_BY_H` key. The high bits hold the family
-/// prefix, so we only look at the trailing 8 bytes of the key payload.
-fn decode_height(key: &Key) -> Result<u64, ReadError> {
-    let payload = keys::BLOCK_BY_H
-        .decode(key, 8)
-        .map_err(|_| ReadError::Malformed {
-            expected: 8,
-            got: key.len(),
-        })?;
-    if payload.len() != 8 {
-        return Err(ReadError::Malformed {
-            expected: 8,
-            got: payload.len(),
-        });
+    /// Decode the Simplex finalization artifact for `view`.
+    pub async fn finalization_by_view<H, P, S>(
+        &self,
+        view: u64,
+        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<Finalized<CertifiedHeader<H, P>, S, Commitment>>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
+    {
+        Ok(self
+            .blocks
+            .get_finalized_by_view::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
+            .await?)
     }
-    let mut buf = [0u8; 8];
-    buf.copy_from_slice(&payload);
-    Ok(u64::from_be_bytes(buf))
+
+    /// Fetch the encoded Simplex notarization artifact for `view`.
+    pub async fn notarization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
+        Ok(self.blocks.get_notarized_raw(View::new(view)).await?)
+    }
+
+    /// Decode the Simplex notarization artifact for `view`.
+    pub async fn notarization_by_view<H, P, S>(
+        &self,
+        view: u64,
+        cfg: &<Notarized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<Notarized<CertifiedHeader<H, P>, S, Commitment>>, ReadError>
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+        <S::Certificate as Read>::Cfg: Clone,
+    {
+        Ok(self
+            .blocks
+            .get_notarized::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
+            .await?)
+    }
 }
