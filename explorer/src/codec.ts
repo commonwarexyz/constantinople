@@ -6,7 +6,7 @@ const MAX_U64 = (1n << 64n) - 1n;
 
 export interface TransactionDraft {
     readonly senderPublicKey: Uint8Array;
-    readonly toPublicKey: Uint8Array;
+    readonly toAccountKey: Uint8Array;
     readonly value: bigint;
     readonly nonce: bigint;
 }
@@ -16,10 +16,10 @@ export interface EncodedTransaction {
     readonly bytes: Uint8Array;
 }
 
-export function parsePublicKeyHex(value: string): Uint8Array {
+export function parseAccountKeyHex(value: string): Uint8Array {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]{68}$/.test(normalized)) {
-        throw new Error('expected a 34-byte hex public key');
+    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+        throw new Error('expected a 32-byte account key');
     }
     return fromHex(normalized);
 }
@@ -78,12 +78,11 @@ export function fromHex(value: string): Uint8Array {
 
 async function encodeTransactionBody(draft: TransactionDraft): Promise<Uint8Array> {
     assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
-    assertByteLength(draft.toPublicKey, PUBLIC_KEY_BYTES, 'recipient public key');
-    const accountKey = await accountKeyFromPublicKey(draft.toPublicKey);
+    assertByteLength(draft.toAccountKey, ACCOUNT_KEY_BYTES, 'recipient account key');
 
     return bytesConcat(
         draft.senderPublicKey,
-        accountKey,
+        draft.toAccountKey,
         encodeU64(draft.value),
         encodeU64(draft.nonce),
     );

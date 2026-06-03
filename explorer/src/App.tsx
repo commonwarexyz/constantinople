@@ -10,7 +10,7 @@ import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
     encodeTransactionBatch,
-    parsePublicKeyHex,
+    parseAccountKeyHex,
     parseU64,
     toHex,
 } from './codec';
@@ -84,7 +84,7 @@ function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
 }
 
 interface SubmittedTransaction {
-    readonly sender: string | null;
+    readonly sender: string;
     readonly digest: string;
     readonly to: string;
     readonly value: string;
@@ -164,6 +164,7 @@ export default function App() {
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
+    const [walletAccountKey, setWalletAccountKey] = useState<string | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
@@ -197,7 +198,7 @@ export default function App() {
         accountMessage === 'loading account metadata' ||
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
-    const signedInPublicKey = wallet?.publicKeyHex ?? null;
+    const signedInAccountKey = walletAccountKey;
     const historyKey = submittedTransactionHistoryKey(
         {
             indexerUrl,
@@ -206,7 +207,7 @@ export default function App() {
             mempoolUrl,
             simplexVerificationMaterial,
         },
-        signedInPublicKey,
+        signedInAccountKey,
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
@@ -270,6 +271,29 @@ export default function App() {
         setHistory(historyKey === null ? [] : readHistory(historyKey));
         setLoadedHistoryKey(historyKey);
     }, [historyKey]);
+
+    useEffect(() => {
+        if (!wallet) {
+            setWalletAccountKey(null);
+            return;
+        }
+
+        let cancelled = false;
+        accountKeyFromPublicKey(wallet.publicKey)
+            .then((accountKey) => {
+                if (cancelled) return;
+                setWalletAccountKey(toHex(accountKey));
+            })
+            .catch((error) => {
+                if (cancelled) return;
+                setWalletAccountKey(null);
+                setWalletMessage(error instanceof Error ? error.message : String(error));
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [wallet]);
 
     useEffect(() => {
         if (historyKey === null) return;
@@ -385,7 +409,7 @@ export default function App() {
     }, [lookupAccount, currentAccountCursor, accountActivityMode]);
 
     useEffect(() => {
-        const signedInSender = wallet?.publicKeyHex ?? null;
+        const signedInSender = signedInAccountKey;
         if (hasFetchingProof(history, signedInSender)) return;
 
         const tx = history.find((entry) => shouldFetchTransactionProof(entry, signedInSender));
@@ -454,7 +478,7 @@ export default function App() {
                     ),
                 );
             });
-    }, [history, wallet]);
+    }, [history, signedInAccountKey]);
 
     useEffect(() => {
         return () => {
@@ -578,10 +602,10 @@ export default function App() {
         }
     };
 
-    const submitAccountLookup = async () => {
-        const normalized = await normalizeAccountInput(accountInput);
+    const submitAccountLookup = () => {
+        const normalized = normalizeAccountInput(accountInput);
         if (!normalized) {
-            setSearchMessage('expected a 32-byte account key or 34-byte transaction public key');
+            setSearchMessage('expected a 32-byte account key');
             return;
         }
         setSearchMessage('');
@@ -621,26 +645,30 @@ export default function App() {
 
     const submitTransfer = async () => {
         if (!wallet || isSubmitting) return;
+        if (!walletAccountKey) {
+            setSubmitMessage('loading account address');
+            return;
+        }
 
         setIsSubmitting(true);
         setSubmitMessage('forming transaction');
         try {
-            const parsedToKey = parsePublicKeyHex(toKey);
+            const parsedToKey = parseAccountKeyHex(toKey);
             const parsedValue = parseU64(value, 'value');
             const parsedNonce = parseU64(nonce, 'nonce');
             const encoded = await encodeSignedTransaction(
                 {
                     senderPublicKey: wallet.publicKey,
-                    toPublicKey: parsedToKey,
+                    toAccountKey: parsedToKey,
                     value: parsedValue,
                     nonce: parsedNonce,
                 },
                 wallet.sign,
             );
             const pending: SubmittedTransaction = {
-                sender: wallet.publicKeyHex,
+                sender: walletAccountKey,
                 digest: encoded.digestHex,
-                to: toKey.trim().replace(/^0x/i, '').toLowerCase(),
+                to: toHex(parsedToKey),
                 value: parsedValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
@@ -692,7 +720,7 @@ export default function App() {
                             ⬝
                         </span>
                         <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
-                            wallet{wallet && <span className="wallet-trigger__key"> {shortHex(wallet.publicKeyHex)}</span>}
+                            wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
                         </button>
                     </div>
                 </header>
@@ -733,6 +761,7 @@ export default function App() {
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
                         <WalletPanel
                             wallet={wallet}
+                            walletAccountKey={walletAccountKey}
                             walletMessage={walletMessage}
                             account={account}
                             accountMessage={accountMessage}
@@ -754,7 +783,7 @@ export default function App() {
                         />
                         <TransactionHistory
                             transactions={history}
-                            signedInPublicKey={signedInPublicKey}
+                            signedInAccountKey={signedInAccountKey}
                             copiedValue={copiedValue}
                             onCopy={copyValue}
                             verifyCertificates={verifyCertificates}
@@ -818,7 +847,7 @@ function AccountPage({
                 <button onClick={onBack}>back</button>
             </div>
             <div className="account-page__line">
-                <span className="account-page__prompt">key</span>
+                <span className="account-page__prompt">address</span>
                 <CopyableValue copiedValue={copiedValue} value={account} onCopy={onCopy} />
             </div>
             <div className="account-proof-grid">
@@ -857,8 +886,18 @@ function AccountPage({
                         <div className="account-tx-row__main">
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue copiedValue={copiedValue} value={row.digest} onCopy={onCopy} />
-                            <span>{row.direction === 'sent' ? 'to' : 'from'}</span>
-                            <CopyableValue copiedValue={copiedValue} value={row.counterparty} onCopy={onCopy} />
+                            <span>from</span>
+                            <CopyableValue
+                                copiedValue={copiedValue}
+                                value={row.direction === 'sent' ? account : row.counterparty}
+                                onCopy={onCopy}
+                            />
+                            <span>to</span>
+                            <CopyableValue
+                                copiedValue={copiedValue}
+                                value={row.direction === 'sent' ? row.counterparty : account}
+                                onCopy={onCopy}
+                            />
                         </div>
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>
@@ -956,7 +995,7 @@ function AccountSearchPanel({
                         autoFocus
                         value={accountInput}
                         onChange={(event) => onAccountInputChange(event.target.value)}
-                        placeholder="public key"
+                        placeholder="account key"
                         spellCheck={false}
                     />
                 </label>
@@ -1006,6 +1045,7 @@ function WalletModal({
 
 function WalletPanel({
     wallet,
+    walletAccountKey,
     walletMessage,
     account,
     accountMessage,
@@ -1026,6 +1066,7 @@ function WalletPanel({
     onSubmit,
 }: {
     wallet: ActiveWallet | null;
+    walletAccountKey: string | null;
     walletMessage: string;
     account: AccountView | null;
     accountMessage: string;
@@ -1077,10 +1118,10 @@ function WalletPanel({
                 <div className="wallet__cell">
                     <span>account</span>
                     <CopyableValue
-                        disabled={!wallet}
+                        disabled={!walletAccountKey}
                         plain
                         copiedValue={copiedValue}
-                        value={wallet?.publicKeyHex ?? 'not authenticated'}
+                        value={walletAccountKey ?? 'not authenticated'}
                         onCopy={onCopy}
                     />
                 </div>
@@ -1105,7 +1146,7 @@ function WalletPanel({
                     <input
                         value={toKey}
                         onChange={(event) => onToKeyChange(event.target.value)}
-                        placeholder="Public key of recipient"
+                        placeholder="Recipient address"
                         spellCheck={false}
                         disabled={!wallet || isSubmitting}
                     />
@@ -1215,13 +1256,13 @@ function SpinnerText({
 
 function TransactionHistory({
     transactions,
-    signedInPublicKey,
+    signedInAccountKey,
     copiedValue,
     onCopy,
     verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
-    signedInPublicKey: string | null;
+    signedInAccountKey: string | null;
     copiedValue: string;
     onCopy: (value: string) => void;
     verifyCertificates: boolean;
@@ -1250,7 +1291,7 @@ function TransactionHistory({
                         copiedValue={copiedValue}
                         formatter={formatter}
                         onCopy={onCopy}
-                        signedInPublicKey={signedInPublicKey}
+                        signedInAccountKey={signedInAccountKey}
                         tx={tx}
                         verifyCertificates={verifyCertificates}
                     />
@@ -1264,23 +1305,27 @@ function TransactionRecord({
     copiedValue,
     formatter,
     onCopy,
-    signedInPublicKey,
+    signedInAccountKey,
     tx,
     verifyCertificates,
 }: {
     copiedValue: string;
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
-    signedInPublicKey: string | null;
+    signedInAccountKey: string | null;
     tx: SubmittedTransaction;
     verifyCertificates: boolean;
 }) {
-    const ownsTx = tx.sender !== null && tx.sender === signedInPublicKey;
+    const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
     return (
         <div className="tx-record">
             <div className="tx-record__primary">
+                <span className="tx-record__label">tx</span>
                 <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
+                <span className="tx-record__label">from</span>
+                <CopyableValue copiedValue={copiedValue} value={tx.sender} onCopy={onCopy} />
                 <span className="tx-record__arrow" aria-hidden="true">→</span>
+                <span className="tx-record__label">to</span>
                 <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
                 <span className="tx-record__nonce">value {tx.value}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
@@ -1504,7 +1549,9 @@ function hasFetchingProof(
     signedInSender: string | null,
 ): boolean {
     if (signedInSender === null) return false;
-    return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
+    return transactions.some(
+        (tx) => tx.sender === signedInSender && tx.proof.status === 'fetching',
+    );
 }
 
 function nextBlockCertificateState(status: TxStatus): BlockCertificateState {
@@ -1601,23 +1648,19 @@ function bytesToHex(bytes: Uint8Array): string {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function normalizeAccountInput(value: string): Promise<string | null> {
+function normalizeAccountInput(value: string): string | null {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (/^[0-9a-f]{64}$/.test(normalized)) {
+    if (isAccountKeyHex(normalized)) {
         return normalized;
     }
-    if (!/^[0-9a-f]{68}$/.test(normalized)) {
-        return null;
-    }
-
-    return toHex(await accountKeyFromPublicKey(parsePublicKeyHex(normalized)));
+    return null;
 }
 
 function accountFromLocation(): string {
     const url = new URL(window.location.href);
     const queryAccount = url.searchParams.get('account');
     const fromQuery = queryAccount?.trim().replace(/^0x/i, '').toLowerCase();
-    if (fromQuery && /^[0-9a-f]{64}$/.test(fromQuery)) return fromQuery;
+    if (fromQuery && isAccountKeyHex(fromQuery)) return fromQuery;
 
     const pathMatch = /^\/account\/([0-9a-fA-F]{64})$/.exec(url.pathname);
     return pathMatch ? pathMatch[1].toLowerCase() : '';
@@ -1666,8 +1709,11 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
 
     const transaction = value as Record<string, unknown>;
     if (
+        typeof transaction.sender !== 'string' ||
+        !isAccountKeyHex(transaction.sender) ||
         typeof transaction.digest !== 'string' ||
         typeof transaction.to !== 'string' ||
+        !isAccountKeyHex(transaction.to) ||
         typeof transaction.value !== 'string' ||
         typeof transaction.nonce !== 'string' ||
         typeof transaction.submittedAt !== 'number' ||
@@ -1684,7 +1730,7 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
 
     return {
         digest: transaction.digest,
-        sender: typeof transaction.sender === 'string' ? transaction.sender : null,
+        sender: transaction.sender,
         to: transaction.to,
         value: transaction.value,
         nonce: transaction.nonce,
@@ -1696,6 +1742,10 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
         proof: normalizeTransactionProof(transaction.proof),
     };
+}
+
+function isAccountKeyHex(value: string): boolean {
+    return /^[0-9a-f]{64}$/.test(value);
 }
 
 function normalizeBlockCertificate(

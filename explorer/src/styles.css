@@ -642,10 +642,10 @@ body {
 
 .tx-record__primary {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 1ch;
     min-width: 0;
-    overflow: hidden;
 }
 
 .tx-record__primary .copyable {
@@ -654,7 +654,8 @@ body {
     min-width: 0;
 }
 
-.tx-record__arrow {
+.tx-record__arrow,
+.tx-record__label {
     color: var(--theme-text-dim);
     flex-shrink: 0;
 }
@@ -788,7 +789,7 @@ body {
 
 .account-page__line {
     display: grid;
-    grid-template-columns: 8ch minmax(0, 1fr);
+    grid-template-columns: 12ch minmax(0, 1fr);
     gap: 1ch;
     align-items: center;
     padding: 0.6ch 0;
@@ -846,13 +847,14 @@ body {
     background: var(--theme-border);
 }
 
-.account-page__mode {
+.account-page .account-page__mode {
     border: 0;
+    color: var(--theme-text-dim);
     background: var(--theme-background);
     min-height: 2rem;
 }
 
-.account-page__mode--active {
+.account-page .account-page__mode--active {
     color: var(--theme-background);
     background: var(--theme-text);
 }
