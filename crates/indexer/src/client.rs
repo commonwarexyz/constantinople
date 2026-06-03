@@ -1,12 +1,12 @@
-//! Typed read-only wrapper over Simplex block storage and raw transaction KV.
+//! Typed read-only wrapper over Simplex block storage and SQL transaction rows.
 //!
 //! Full blocks are stored in `exoware-simplex` as `{ header, body }` rows
 //! keyed by the certified block-header digest. Height/latest reads go through
 //! Simplex finalization indexes first, so callers can use the verified header
-//! path without fetching the full body. Transaction bodies and secondary
-//! transaction indexes remain in the raw KV families.
+//! path without fetching the full body. Transaction bodies and lookup metadata
+//! are stored in SQL `tx_meta` rows.
 
-use crate::{codec, keys, publisher::certificate::CertifiedHeader};
+use crate::{codec, publisher::certificate::CertifiedHeader, sql_schema::build_meta_schema};
 use bytes::Bytes;
 use commonware_codec::Read;
 use commonware_consensus::{
@@ -16,6 +16,10 @@ use commonware_consensus::{
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction};
+use datafusion::{
+    arrow::array::{Array, StringArray},
+    prelude::SessionContext,
+};
 use exoware_sdk::{ClientError, StoreClient};
 use exoware_simplex::{Finalized, Notarized, SimplexClient, SimplexError};
 
@@ -28,30 +32,60 @@ pub enum ReadError {
     /// The underlying Simplex client failed.
     #[error("simplex error: {0}")]
     Simplex(#[from] SimplexError),
+    /// SQL metadata schema registration failed.
+    #[error("failed to configure SQL metadata schema: {0}")]
+    SqlSchema(String),
+    /// The underlying SQL/DataFusion query failed.
+    #[error("SQL query error: {0}")]
+    Sql(#[from] datafusion::error::DataFusionError),
+    /// A SQL row did not match the expected `tx_meta` layout.
+    #[error("SQL row shape error: {0}")]
+    SqlRow(String),
+    /// A hex-encoded SQL payload was malformed.
+    #[error("malformed hex payload: {0}")]
+    Hex(String),
     /// Decoding failed.
     #[error("decode error: {0}")]
     Codec(#[from] commonware_codec::Error),
 }
 
-/// Typed read client over Simplex block rows and raw transaction KV rows.
+/// Typed read client over Simplex block rows and SQL transaction rows.
 ///
 /// | Field          | Families served                                  |
 /// | -------------- | ------------------------------------------------ |
 /// | `blocks`       | Simplex headers, blocks, notarizations, finals   |
-/// | `transactions` | `TX`, `TX_BY_H`, `TX_BY_SENDER`                  |
-#[derive(Clone, Debug)]
+/// | `sql`          | `tx_meta` transaction bodies and lookup metadata |
+#[derive(Clone)]
 pub struct IndexerClient {
     blocks: SimplexClient,
-    transactions: StoreClient,
+    sql: SessionContext,
+}
+
+impl std::fmt::Debug for IndexerClient {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IndexerClient")
+            .field("blocks", &self.blocks)
+            .field("sql", &"SessionContext")
+            .finish()
+    }
 }
 
 impl IndexerClient {
-    /// Wrap existing [`StoreClient`]s for block and transaction families.
-    pub fn new(blocks: StoreClient, transactions: StoreClient) -> Self {
-        Self {
+    /// Wrap existing [`StoreClient`]s for block and SQL metadata families.
+    pub fn new(blocks: StoreClient, metadata: StoreClient) -> Self {
+        Self::try_new(blocks, metadata).expect("metadata SQL schema should register")
+    }
+
+    /// Wrap existing [`StoreClient`]s for block and SQL metadata families.
+    pub fn try_new(blocks: StoreClient, metadata: StoreClient) -> Result<Self, ReadError> {
+        let sql = SessionContext::new();
+        build_meta_schema(metadata)
+            .map_err(ReadError::SqlSchema)?
+            .register_all(&sql)?;
+        Ok(Self {
             blocks: SimplexClient::from_client(blocks),
-            transactions,
-        }
+            sql,
+        })
     }
 
     /// Borrow the Simplex block client.
@@ -59,9 +93,9 @@ impl IndexerClient {
         &self.blocks
     }
 
-    /// Borrow the transaction-family [`StoreClient`] for raw access.
-    pub const fn transactions(&self) -> &StoreClient {
-        &self.transactions
+    /// Borrow the SQL metadata context used for transaction lookups.
+    pub const fn sql(&self) -> &SessionContext {
+        &self.sql
     }
 
     /// Fetch the encoded Simplex `{ header, body }` envelope for `digest`.
@@ -231,8 +265,28 @@ impl IndexerClient {
         &self,
         digest: &D,
     ) -> Result<Option<Bytes>, ReadError> {
-        let key = keys::tx(digest.as_ref()).expect("tx digest fits family payload");
-        Ok(self.transactions.query().get(&key).await?)
+        let sql = format!(
+            "SELECT body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
+            hex_lower(digest.as_ref())
+        );
+        let batches = self.sql.sql(&sql).await?.collect().await?;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let body_hex = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| ReadError::SqlRow("tx_meta.body_hex must be Utf8".to_string()))?;
+            if body_hex.is_null(0) {
+                return Err(ReadError::SqlRow(
+                    "tx_meta.body_hex must not be null".to_string(),
+                ));
+            }
+            return Ok(Some(Bytes::from(decode_hex(body_hex.value(0))?)));
+        }
+        Ok(None)
     }
 
     /// Decode and return the transaction for `digest`, or `None` if absent.
@@ -299,5 +353,40 @@ impl IndexerClient {
             .blocks
             .get_notarized::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
             .await?)
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
+}
+
+fn decode_hex(value: &str) -> Result<Vec<u8>, ReadError> {
+    let bytes = value.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return Err(ReadError::Hex("odd number of hex characters".to_string()));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks_exact(2) {
+        let high = decode_hex_nibble(pair[0])?;
+        let low = decode_hex_nibble(pair[1])?;
+        out.push((high << 4) | low);
+    }
+    Ok(out)
+}
+
+fn decode_hex_nibble(byte: u8) -> Result<u8, ReadError> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(ReadError::Hex(format!(
+            "invalid hex character 0x{byte:02x}"
+        ))),
     }
 }

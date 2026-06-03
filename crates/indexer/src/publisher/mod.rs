@@ -6,8 +6,7 @@
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `simplex`        | certified headers, full blocks by digest, certificates       |
-//! | `raw` (KV)       | `TX`, `TX_BY_H`, `TX_BY_SENDER`, account proof rows          |
-//! | `sql` (metadata) | `block_meta`                                                 |
+//! | `sql` (metadata) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`       |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!

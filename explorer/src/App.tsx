@@ -28,6 +28,7 @@ import {
     fetchAndVerifyTransactionProof,
     fetchAndVerifyTransactionRowProof,
     fetchLatestProofTarget,
+    type AccountActivityMode,
     type AccountTransactionRow,
     type LatestProofTarget,
     type VerifiedAccountProof,
@@ -181,6 +182,7 @@ export default function App() {
         detail: 'enter an account',
     });
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
@@ -302,9 +304,10 @@ export default function App() {
         setAccountNextCursor(null);
 
         const fetchPage = fetchAccountTransactionsPage({
-            storeUrl,
+            sqlUrl: indexerUrl,
             account: lookupAccount,
             cursor: currentAccountCursor,
+            mode: accountActivityMode,
         }).then((page) => {
             if (controller.signal.aborted) return null;
             setAccountNextCursor(page.nextCursor);
@@ -322,11 +325,11 @@ export default function App() {
                 signal: controller.signal,
             });
             const proof = await fetchAndVerifyAccountProof({
-                        qmdbUrl,
-                        storeUrl,
-                        account: lookupAccount,
-                        target,
-                        signal: controller.signal,
+                qmdbUrl,
+                sqlUrl: indexerUrl,
+                account: lookupAccount,
+                target,
+                signal: controller.signal,
             });
             return { target, proof };
         }, controller.signal);
@@ -379,7 +382,7 @@ export default function App() {
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode]);
 
     useEffect(() => {
         const signedInSender = wallet?.publicKeyHex ?? null;
@@ -398,6 +401,7 @@ export default function App() {
         fetchAndVerifyTransactionProof({
             qmdbUrl,
             storeUrl,
+            sqlUrl: indexerUrl,
             simplexVerificationMaterial,
             digest: tx.digest,
             height: tx.finalizedHeight,
@@ -609,6 +613,12 @@ export default function App() {
         setAccountCursorStack((current) => current.length <= 1 ? current : current.slice(0, -1));
     };
 
+    const changeAccountActivityMode = (mode: AccountActivityMode) => {
+        setAccountActivityMode(mode);
+        setAccountCursorStack([null]);
+        setAccountNextCursor(null);
+    };
+
     const submitTransfer = async () => {
         if (!wallet || isSubmitting) return;
 
@@ -697,8 +707,10 @@ export default function App() {
                                 proof={accountProof}
                                 target={accountTarget}
                                 transactions={accountTransactions}
+                                activityMode={accountActivityMode}
                                 hasPrevious={accountCursorStack.length > 1}
                                 hasNext={accountNextCursor !== null}
+                                onActivityModeChange={changeAccountActivityMode}
                                 onPrevious={previousAccountPage}
                                 onNext={nextAccountPage}
                                 onBack={clearAccountLookup}
@@ -776,8 +788,10 @@ function AccountPage({
     proof,
     target,
     transactions,
+    activityMode,
     hasPrevious,
     hasNext,
+    onActivityModeChange,
     onPrevious,
     onNext,
     onBack,
@@ -789,8 +803,10 @@ function AccountPage({
     proof: AccountProofState;
     target: LatestProofTarget | null;
     transactions: AccountTxWithProof[];
+    activityMode: AccountActivityMode;
     hasPrevious: boolean;
     hasNext: boolean;
+    onActivityModeChange: (mode: AccountActivityMode) => void;
     onPrevious: () => void;
     onNext: () => void;
     onBack: () => void;
@@ -812,7 +828,21 @@ function AccountPage({
                 <ProofDatum label="state proof" value={proof.status === 'verified' ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b` : proof.status} />
             </div>
             <div className="account-page__subhead">
-                <span>sent tx page {pageNumber}</span>
+                <span>{activityMode} tx page {pageNumber}</span>
+                <div className="account-page__modes" role="tablist" aria-label="account transaction filter">
+                    {(['all', 'sent', 'received'] as const).map((mode) => (
+                        <button
+                            key={mode}
+                            className={mode === activityMode ? 'account-page__mode account-page__mode--active' : 'account-page__mode'}
+                            role="tab"
+                            aria-selected={mode === activityMode}
+                            onClick={() => onActivityModeChange(mode)}
+                            type="button"
+                        >
+                            {mode}
+                        </button>
+                    ))}
+                </div>
                 <div className="account-page__pager">
                     <button disabled={!hasPrevious} onClick={onPrevious}>prev</button>
                     <button disabled={!hasNext} onClick={onNext}>next</button>
@@ -820,15 +850,15 @@ function AccountPage({
             </div>
             <div className="account-tx-list">
                 {transactions.length === 0 && (
-                    <div className="account-tx-row account-tx-row--empty">no sent transactions indexed</div>
+                    <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
                 )}
                 {transactions.map(({ row, proof: txProof }) => (
                     <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue copiedValue={copiedValue} value={row.digest} onCopy={onCopy} />
-                            <span>to</span>
-                            <CopyableValue copiedValue={copiedValue} value={row.to} onCopy={onCopy} />
+                            <span>{row.direction === 'sent' ? 'to' : 'from'}</span>
+                            <CopyableValue copiedValue={copiedValue} value={row.counterparty} onCopy={onCopy} />
                         </div>
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>

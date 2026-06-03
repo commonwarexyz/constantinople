@@ -4,7 +4,7 @@ import test from 'node:test';
 import { isRetryableAccountProofError, isRetryableProofError } from '../src/proofRetry.ts';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from '../src/proofMath.ts';
 
-test('raw tx-by-height misses are retried while the indexer catches up', () => {
+test('SQL tx metadata misses are retried while the indexer catches up', () => {
     assert.equal(
         isRetryableProofError('tx digest 1adb68d9800...a2a15bb3 missing at height 127'),
         true,

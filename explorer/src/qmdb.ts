@@ -1,10 +1,11 @@
-import {
-    Client,
-    StoreKeyPrefix,
-    TraversalMode,
-} from '@exowarexyz/sdk';
 import { fromHex, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
+import {
+    SqlClient,
+    type CellValue,
+    type DecodedQueryResult,
+    type DecodedRow,
+} from '@exowarexyz/sql';
 import {
     SimplexClient,
     type VerifiedSimplexCertificate,
@@ -19,20 +20,40 @@ import {
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
-const TX_BY_HEIGHT_RESERVED_BITS = 4;
-const TX_BY_HEIGHT_PREFIX = 0x2;
-const TX_BY_SENDER_PREFIX = 0x3;
-const ACCOUNT_PREFIX = 0x4;
-const MAX_TX_BY_HEIGHT_ROWS = 100_000;
 const ACCOUNT_PAGE_SIZE = 10;
 const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const TX_BY_SENDER_KEY_BYTES = ACCOUNT_KEY_BYTES + 8 + 4;
-const TX_BY_SENDER_ROW_BYTES = DIGEST_BYTES + ACCOUNT_KEY_BYTES + 8 + 8 + 8 + 8 + 4;
 const ACCOUNT_VALUE_BYTES = 16;
-const ACCOUNT_ROW_BYTES = ACCOUNT_VALUE_BYTES + 8;
+const ACCOUNT_CURSOR_BYTES = 24;
+
+const TX_META_TABLE = 'tx_meta';
+const TX_META_HEIGHT = 'height';
+const TX_META_INDEX = 'index';
+const TX_META_DIGEST = 'tx_digest';
+const TX_META_QMDB_LOCATION = 'qmdb_location';
+
+const TX_ACTIVITY_TABLE = 'tx_activity';
+const TX_ACTIVITY_ACCOUNT = 'account';
+const TX_ACTIVITY_SORT_HEIGHT = 'sort_height';
+const TX_ACTIVITY_SORT_INDEX = 'sort_index';
+const TX_ACTIVITY_ROLE = 'role';
+const TX_ACTIVITY_HEIGHT = 'height';
+const TX_ACTIVITY_INDEX = 'index';
+const TX_ACTIVITY_DIGEST = 'tx_digest';
+const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
+const TX_ACTIVITY_VALUE = 'value';
+const TX_ACTIVITY_NONCE = 'nonce';
+const TX_ACTIVITY_QMDB_LOCATION = 'qmdb_location';
+const TX_ACTIVITY_ROLE_SENDER = 0n;
+const TX_ACTIVITY_ROLE_RECEIVER = 1n;
+
+const ACCOUNT_META_TABLE = 'account_meta';
+const ACCOUNT_META_ACCOUNT = 'account';
+const ACCOUNT_META_BALANCE = 'balance';
+const ACCOUNT_META_NONCE = 'nonce';
+const ACCOUNT_META_QMDB_LOCATION = 'qmdb_location';
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -68,10 +89,12 @@ interface FinalizedTransactionTarget {
 
 export interface LatestProofTarget extends FinalizedTransactionTarget {}
 
+export type AccountActivityMode = 'all' | 'sent' | 'received';
+
 export interface AccountTransactionRow {
-    readonly key: Uint8Array;
     readonly digest: string;
-    readonly to: string;
+    readonly direction: 'sent' | 'received';
+    readonly counterparty: string;
     readonly value: bigint;
     readonly nonce: bigint;
     readonly qmdbLocation: bigint;
@@ -95,6 +118,7 @@ export interface VerifiedAccountProof {
 export async function fetchAndVerifyTransactionProof({
     qmdbUrl,
     storeUrl,
+    sqlUrl,
     simplexVerificationMaterial,
     digest,
     height,
@@ -103,6 +127,7 @@ export async function fetchAndVerifyTransactionProof({
 }: {
     qmdbUrl: string;
     storeUrl: string;
+    sqlUrl: string;
     simplexVerificationMaterial: string;
     digest: string;
     height: number;
@@ -116,7 +141,7 @@ export async function fetchAndVerifyTransactionProof({
         signal,
     );
     onFinalizationVerified?.(target);
-    const metadata = await fetchTransactionProofMetadata(storeUrl, digest, target);
+    const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, target, signal);
     if (target.height !== metadata.height) {
         throw new Error(`finalized certificate height ${target.height} does not match tx height ${metadata.height}`);
     }
@@ -161,50 +186,41 @@ export async function fetchLatestProofTarget({
 }
 
 export async function fetchAccountTransactionsPage({
-    storeUrl,
+    sqlUrl,
     account,
     cursor,
+    mode = 'all',
 }: {
-    storeUrl: string;
+    sqlUrl: string;
     account: string;
     cursor?: Uint8Array | null;
+    mode?: AccountActivityMode;
 }): Promise<AccountTransactionPage> {
     const accountBytes = parseAccountBytes(account);
-    const store = new Client(trimTrailingSlash(storeUrl)).store(
-        new StoreKeyPrefix(TX_BY_HEIGHT_RESERVED_BITS, TX_BY_SENDER_PREFIX),
-    );
-    const start = cursor ?? txBySenderStart(accountBytes);
-    const rows = await store.query(
-        start,
-        txBySenderEnd(accountBytes),
-        ACCOUNT_PAGE_SIZE + 1,
-        4096,
-        TraversalMode.FORWARD,
-        undefined,
-    );
-    const visible = rows.results.slice(0, ACCOUNT_PAGE_SIZE);
+    const rows = await fetchAccountActivityRows(sqlUrl, accountBytes, cursor ?? null, mode);
+    const visible = rows.slice(0, ACCOUNT_PAGE_SIZE);
     const last = visible[visible.length - 1];
     return {
-        rows: visible.map((row) => decodeTxBySenderRow(row.key, row.value)),
-        nextCursor: rows.results.length > ACCOUNT_PAGE_SIZE && last ? nextLexicographicKey(last.key) : null,
+        rows: visible.map(decodeAccountActivityRow),
+        nextCursor: rows.length > ACCOUNT_PAGE_SIZE && last ? encodeActivityCursor(last) : null,
     };
 }
 
 export async function fetchAndVerifyAccountProof({
     qmdbUrl,
-    storeUrl,
+    sqlUrl,
     account,
     target,
     signal,
 }: {
     qmdbUrl: string;
-    storeUrl: string;
+    sqlUrl: string;
     account: string;
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
     const accountBytes = parseAccountBytes(account);
-    const row = await fetchAccountProofRow(storeUrl, accountBytes);
+    const row = await fetchAccountProofRow(sqlUrl, accountBytes, signal);
     const stateEnd = target.stateTip;
     if (row.location < target.stateStart || row.location >= stateEnd) {
         throw new Error(`account location ${row.location} is outside finalized state range`);
@@ -268,37 +284,38 @@ export async function fetchAndVerifyTransactionRowProof({
 }
 
 async function fetchTransactionProofMetadata(
-    storeUrl: string,
+    sqlUrl: string,
     digest: string,
     target: FinalizedTransactionTarget,
+    signal?: AbortSignal,
 ): Promise<TransactionProofMetadata> {
     const digestBytes = fromHex(digest);
-    const store = new Client(trimTrailingSlash(storeUrl)).store(
-        new StoreKeyPrefix(TX_BY_HEIGHT_RESERVED_BITS, TX_BY_HEIGHT_PREFIX),
+    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${TX_META_HEIGHT}, ${TX_META_INDEX}, ${TX_META_QMDB_LOCATION}
+            FROM ${TX_META_TABLE}
+            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
+            LIMIT 1
+        `,
+        signal,
     );
-    const rows = await store.query(
-        txByHeightKeyPrefix(target.height, 0),
-        txByHeightKeyPrefix(target.height, 0xff_ff_ff_ff),
-        MAX_TX_BY_HEIGHT_ROWS,
-        4096,
-        TraversalMode.FORWARD,
-        undefined,
-    );
-    const match = rows.results.find((row) => bytesEqual(row.value, digestBytes));
-    if (!match) {
+    const row = result.rows[0];
+    if (!row) {
         throw new Error(`tx digest ${shortHex(digest)} missing at height ${target.height}`);
     }
 
-    const txCount = BigInt(rows.results.length);
-    const blockIndex = txIndexFromKey(match.key);
-    const appendStart = target.transactionsTip - (txCount + 1n);
-    const location = appendStart + BigInt(blockIndex);
+    const height = expectBigint(row.values[TX_META_HEIGHT], TX_META_HEIGHT);
+    const blockIndex = expectSafeNumber(row.values[TX_META_INDEX], TX_META_INDEX);
+    const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
+    const blockTransactionCount = target.transactionsTip - target.transactionsStart - 1n;
 
     return {
         location,
-        height: target.height,
+        height,
         blockIndex,
-        blockTransactionCount: rows.results.length,
+        blockTransactionCount: expectSafeNumber(blockTransactionCount, 'block transaction count'),
     };
 }
 
@@ -562,70 +579,184 @@ function readVarint(bytes: Uint8Array, offset: number): { value: bigint; offset:
     throw new Error('finalized block header varint is too long');
 }
 
-async function fetchAccountProofRow(storeUrl: string, account: Uint8Array): Promise<AccountProofRow> {
-    const store = new Client(trimTrailingSlash(storeUrl)).store(
-        new StoreKeyPrefix(TX_BY_HEIGHT_RESERVED_BITS, ACCOUNT_PREFIX),
+async function fetchAccountActivityRows(
+    sqlUrl: string,
+    account: Uint8Array,
+    cursor: Uint8Array | null,
+    mode: AccountActivityMode,
+): Promise<DecodedRow[]> {
+    const predicates = [
+        `${TX_ACTIVITY_ACCOUNT} = ${fixedBinaryLiteral(account)}`,
+    ];
+    const role = activityModeRole(mode);
+    if (role !== null) {
+        predicates.push(`${TX_ACTIVITY_ROLE} = ${role.toString()}`);
+    }
+    if (cursor) {
+        predicates.push(activityCursorPredicate(decodeActivityCursor(cursor)));
+    }
+
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT
+                ${TX_ACTIVITY_SORT_HEIGHT},
+                ${TX_ACTIVITY_SORT_INDEX},
+                ${TX_ACTIVITY_ROLE},
+                ${TX_ACTIVITY_HEIGHT},
+                ${TX_ACTIVITY_INDEX},
+                ${TX_ACTIVITY_DIGEST},
+                ${TX_ACTIVITY_COUNTERPARTY},
+                ${TX_ACTIVITY_VALUE},
+                ${TX_ACTIVITY_NONCE},
+                ${TX_ACTIVITY_QMDB_LOCATION}
+            FROM ${TX_ACTIVITY_TABLE}
+            WHERE ${predicates.join(' AND ')}
+            ORDER BY ${TX_ACTIVITY_SORT_HEIGHT} ASC,
+                     ${TX_ACTIVITY_SORT_INDEX} ASC,
+                     ${TX_ACTIVITY_ROLE} ASC
+            LIMIT ${ACCOUNT_PAGE_SIZE + 1}
+        `,
     );
-    const rows = await store.query(account, account, 1, 4096, TraversalMode.FORWARD, undefined);
-    const row = rows.results.find((entry) => bytesEqual(entry.key, account));
+    return result.rows;
+}
+
+function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
+    const role = expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE);
+    const digest = expectBytes(row.values[TX_ACTIVITY_DIGEST], TX_ACTIVITY_DIGEST, DIGEST_BYTES);
+    const counterparty = expectBytes(
+        row.values[TX_ACTIVITY_COUNTERPARTY],
+        TX_ACTIVITY_COUNTERPARTY,
+        ACCOUNT_KEY_BYTES,
+    );
+    return {
+        digest: toHex(digest),
+        direction: role === TX_ACTIVITY_ROLE_RECEIVER ? 'received' : 'sent',
+        counterparty: toHex(counterparty),
+        value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
+        nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
+        qmdbLocation: expectBigint(row.values[TX_ACTIVITY_QMDB_LOCATION], TX_ACTIVITY_QMDB_LOCATION),
+        height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
+        blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
+    };
+}
+
+async function fetchAccountProofRow(
+    sqlUrl: string,
+    account: Uint8Array,
+    signal?: AbortSignal,
+): Promise<AccountProofRow> {
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${ACCOUNT_META_BALANCE}, ${ACCOUNT_META_NONCE}, ${ACCOUNT_META_QMDB_LOCATION}
+            FROM ${ACCOUNT_META_TABLE}
+            WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
     if (!row) {
         throw new Error(`account ${shortHex(toHex(account))} is not indexed`);
     }
-    return decodeAccountRow(row.value);
+    return {
+        balance: expectBigint(row.values[ACCOUNT_META_BALANCE], ACCOUNT_META_BALANCE),
+        nonce: expectBigint(row.values[ACCOUNT_META_NONCE], ACCOUNT_META_NONCE),
+        location: expectBigint(row.values[ACCOUNT_META_QMDB_LOCATION], ACCOUNT_META_QMDB_LOCATION),
+    };
 }
 
 function shortHex(value: string): string {
     return value.length <= 18 ? value : `${value.slice(0, 10)}...${value.slice(-8)}`;
 }
 
-function txByHeightKeyPrefix(height: bigint, index: number): Uint8Array {
-    const key = new Uint8Array(12);
-    writeU64Be(key, 0, height);
-    writeU32Be(key, 8, index);
-    return key;
+async function sqlQuery(
+    sqlUrl: string,
+    query: string,
+    signal?: AbortSignal,
+): Promise<DecodedQueryResult> {
+    const sql = new SqlClient(trimTrailingSlash(sqlUrl));
+    return sql.query(query.replace(/\s+/g, ' ').trim(), { signal });
 }
 
-function txBySenderStart(account: Uint8Array): Uint8Array {
-    const key = new Uint8Array(TX_BY_SENDER_KEY_BYTES);
-    key.set(account, 0);
-    return key;
+function fixedBinaryLiteral(bytes: Uint8Array): string {
+    return `X'${toHex(bytes)}'`;
 }
 
-function txBySenderEnd(account: Uint8Array): Uint8Array {
-    const key = new Uint8Array(TX_BY_SENDER_KEY_BYTES);
-    key.set(account, 0);
-    key.fill(0xff, ACCOUNT_KEY_BYTES);
-    return key;
+function activityModeRole(mode: AccountActivityMode): bigint | null {
+    if (mode === 'sent') return TX_ACTIVITY_ROLE_SENDER;
+    if (mode === 'received') return TX_ACTIVITY_ROLE_RECEIVER;
+    return null;
 }
 
-function decodeTxBySenderRow(key: Uint8Array, value: Uint8Array): AccountTransactionRow {
-    if (key.length !== TX_BY_SENDER_KEY_BYTES) {
-        throw new Error('malformed TX_BY_SENDER key');
-    }
-    if (value.length !== TX_BY_SENDER_ROW_BYTES) {
-        throw new Error('malformed TX_BY_SENDER row');
+interface ActivityCursor {
+    readonly sortHeight: bigint;
+    readonly sortIndex: bigint;
+    readonly role: bigint;
+}
+
+function activityCursorPredicate(cursor: ActivityCursor): string {
+    const sortHeight = cursor.sortHeight.toString();
+    const sortIndex = cursor.sortIndex.toString();
+    const role = cursor.role.toString();
+    return `(
+        ${TX_ACTIVITY_SORT_HEIGHT} > ${sortHeight}
+        OR (${TX_ACTIVITY_SORT_HEIGHT} = ${sortHeight} AND ${TX_ACTIVITY_SORT_INDEX} > ${sortIndex})
+        OR (
+            ${TX_ACTIVITY_SORT_HEIGHT} = ${sortHeight}
+            AND ${TX_ACTIVITY_SORT_INDEX} = ${sortIndex}
+            AND ${TX_ACTIVITY_ROLE} > ${role}
+        )
+    )`;
+}
+
+function encodeActivityCursor(row: DecodedRow): Uint8Array {
+    const cursor = new Uint8Array(ACCOUNT_CURSOR_BYTES);
+    writeU64Be(cursor, 0, expectBigint(row.values[TX_ACTIVITY_SORT_HEIGHT], TX_ACTIVITY_SORT_HEIGHT));
+    writeU64Be(cursor, 8, expectBigint(row.values[TX_ACTIVITY_SORT_INDEX], TX_ACTIVITY_SORT_INDEX));
+    writeU64Be(cursor, 16, expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE));
+    return cursor;
+}
+
+function decodeActivityCursor(cursor: Uint8Array): ActivityCursor {
+    if (cursor.length !== ACCOUNT_CURSOR_BYTES) {
+        throw new Error('malformed account activity cursor');
     }
     return {
-        key,
-        digest: toHex(value.slice(0, 32)),
-        to: toHex(value.slice(32, 32 + ACCOUNT_KEY_BYTES)),
-        value: readU64Be(value, 32 + ACCOUNT_KEY_BYTES),
-        nonce: readU64Be(value, 40 + ACCOUNT_KEY_BYTES),
-        qmdbLocation: readU64Be(value, 48 + ACCOUNT_KEY_BYTES),
-        height: readU64Be(value, 56 + ACCOUNT_KEY_BYTES),
-        blockIndex: readU32Be(value, 64 + ACCOUNT_KEY_BYTES),
+        sortHeight: readU64Be(cursor, 0),
+        sortIndex: readU64Be(cursor, 8),
+        role: readU64Be(cursor, 16),
     };
 }
 
-function decodeAccountRow(value: Uint8Array): AccountProofRow {
-    if (value.length !== ACCOUNT_ROW_BYTES) {
-        throw new Error('malformed account proof row');
+function expectBigint(value: CellValue, column: string): bigint {
+    if (typeof value !== 'bigint') {
+        throw new Error(`SQL column ${column} must be UInt64`);
     }
-    return {
-        balance: readU64Be(value, 0),
-        nonce: readU64Be(value, 8),
-        location: readU64Be(value, 16),
-    };
+    return value;
+}
+
+function expectSafeNumber(value: CellValue | bigint, column: string): number {
+    const bigint = expectBigint(value, column);
+    if (bigint > BigInt(Number.MAX_SAFE_INTEGER)) {
+        throw new Error(`SQL column ${column} exceeds Number.MAX_SAFE_INTEGER`);
+    }
+    return Number(bigint);
+}
+
+function expectBytes(value: CellValue, column: string, length: number): Uint8Array {
+    if (!(value instanceof Uint8Array)) {
+        throw new Error(`SQL column ${column} must be FixedSizeBinary(${length})`);
+    }
+    assertByteLength(value, length, column);
+    return value;
+}
+
+function assertByteLength(bytes: Uint8Array, length: number, field: string) {
+    if (bytes.length !== length) {
+        throw new Error(`${field} must be ${length} bytes`);
+    }
 }
 
 function decodeAccountValue(value: Uint8Array): Pick<AccountProofRow, 'balance' | 'nonce'> {
@@ -654,51 +785,12 @@ function readU64Be(bytes: Uint8Array, offset: number): bigint {
     return value;
 }
 
-function readU32Be(bytes: Uint8Array, offset: number): number {
-    return (
-        bytes[offset] * 0x1_00_00_00 +
-        bytes[offset + 1] * 0x1_00_00 +
-        bytes[offset + 2] * 0x1_00 +
-        bytes[offset + 3]
-    );
-}
-
-function nextLexicographicKey(key: Uint8Array): Uint8Array | null {
-    const next = new Uint8Array(key);
-    for (let i = next.length - 1; i >= 0; i--) {
-        if (next[i] === 0xff) continue;
-        next[i] += 1;
-        next.fill(0, i + 1);
-        return next;
-    }
-    return null;
-}
-
-function txIndexFromKey(key: Uint8Array): number {
-    if (key.length < 12) {
-        throw new Error('malformed TX_BY_H key');
-    }
-    return (
-        key[8] * 0x1_00_00_00 +
-        key[9] * 0x1_00_00 +
-        key[10] * 0x1_00 +
-        key[11]
-    );
-}
-
 function writeU64Be(bytes: Uint8Array, offset: number, value: bigint) {
     let remaining = value;
     for (let index = 7; index >= 0; index--) {
         bytes[offset + index] = Number(remaining & 0xffn);
         remaining >>= 8n;
     }
-}
-
-function writeU32Be(bytes: Uint8Array, offset: number, value: number) {
-    bytes[offset] = (value >>> 24) & 0xff;
-    bytes[offset + 1] = (value >>> 16) & 0xff;
-    bytes[offset + 2] = (value >>> 8) & 0xff;
-    bytes[offset + 3] = value & 0xff;
 }
 
 function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {

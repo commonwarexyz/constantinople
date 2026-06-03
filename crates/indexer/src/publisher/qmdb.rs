@@ -1,6 +1,9 @@
-//! Combined publisher for finalized raw KV, SQL metadata, and QMDB rows.
+//! Combined publisher for finalized SQL metadata and QMDB rows.
 
-use super::block::{IndexedBlockRows, encode_indexed_block_rows_at};
+use super::{
+    block::{IndexedBlockRows, encode_indexed_block_rows_at},
+    sql::{AccountMetaRow, encode_account_meta_row},
+};
 use crate::sql_schema::build_meta_schema;
 use commonware_codec::{
     Codec, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
@@ -43,10 +46,12 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-/// Store prefix reserved for QMDB account-state rows.
+/// Store namespace for QMDB account-state rows.
 pub const STATE_QMDB_PREFIX_VALUE: u16 = 0x8;
-/// Store prefix reserved for QMDB transaction-hash rows.
+/// Store namespace for QMDB transaction-hash rows.
 pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u16 = 0x9;
+/// Number of high-order Store key bits used for QMDB operation-log namespaces.
+pub const STORE_PREFIX_RESERVED_BITS: u8 = 4;
 /// Durable queued uploads are self-contained and comparatively cheap to admit.
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
 
@@ -102,8 +107,8 @@ impl Default for QueuedFinalizedUploadCfg {
 /// The durable queue intentionally stores the narrow pre-prune boundary, not a
 /// fully staged Store upload. The state delta must be read while the local QMDB
 /// can still prove the finalized range. The block, timestamp, and writer start
-/// cursors are enough to deterministically derive raw KV rows, SQL metadata,
-/// transaction QMDB operations, account lookup rows, and writer end cursors
+/// cursors are enough to deterministically derive SQL metadata, transaction
+/// QMDB operations, account metadata SQL rows, and writer end cursors
 /// later in the uploader.
 ///
 /// Keeping those derived rows out of the queue reduces queue write size and
@@ -253,7 +258,7 @@ where
     height: u64,
     block_rows: IndexedBlockRows<H::Digest>,
     state_delta: Vec<StateOperation>,
-    account_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
+    account_rows: Vec<super::SqlRow>,
     transaction_ops: Vec<TransactionOperation<H>>,
     completion: oneshot::Sender<()>,
 }
@@ -270,7 +275,6 @@ where
 
 struct PreparedQmdbUpload {
     height: u64,
-    raw_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
     sql_rows: Vec<super::SqlRow>,
     state: PreparedUpload<QmdbFamily>,
     transactions: PreparedUpload<QmdbFamily>,
@@ -297,11 +301,10 @@ struct CommitBatchStage<H>
 where
     H: Hasher,
 {
-    commit_client: StoreClient,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
-    raw_sql_upload: RawSqlUpload,
+    sql_upload: SqlUpload,
     state_upload: PreparedUpload<QmdbFamily>,
     transaction_upload: PreparedUpload<QmdbFamily>,
     state_watermark: Option<PreparedWatermark<QmdbFamily>>,
@@ -349,7 +352,7 @@ where
     H::Digest: Codec + Send + Sync,
     P: PublicKey + Send + Sync + 'static,
 {
-    /// Construct writers over the two reserved QMDB Store prefixes.
+    /// Construct writers over the two QMDB Store namespaces.
     pub async fn connect<Cx>(
         context: Cx,
         store_url: &str,
@@ -432,8 +435,8 @@ where
     ///
     /// - captured here: block, finalized timestamp, QMDB writer start cursors,
     ///   and the state operation delta that can be lost after local pruning;
-    /// - derived later: raw KV rows, SQL metadata rows, transaction QMDB ops,
-    ///   account lookup rows, watermarks, and the final Store batch.
+    /// - derived later: SQL metadata rows, transaction QMDB ops, account SQL
+    ///   rows, watermarks, and the final Store batch.
     pub async fn build_queued_finalized_upload_with_context<Cx, E, S>(
         context: Cx,
         state_writer_next: u64,
@@ -693,12 +696,11 @@ where
         completion,
     } = upload;
     let IndexedBlockRows {
-        raw,
         sql,
         transaction_digests: _,
     } = block_rows;
-    let mut raw = raw;
-    raw.extend(account_rows);
+    let mut sql = sql;
+    sql.extend(account_rows);
 
     let state_prepare = context
         .child("state")
@@ -714,7 +716,6 @@ where
 
     Ok(PreparedQmdbUpload {
         height,
-        raw_rows: raw,
         sql_rows: sql,
         state,
         transactions,
@@ -857,7 +858,6 @@ where
 {
     let prepared = prepare_commit_batch_blocking(
         context.child("stage_commit_batch"),
-        pipeline.commit_client.clone(),
         sql_writer,
         pipeline.state_writer.clone(),
         pipeline.transaction_writer.clone(),
@@ -879,7 +879,6 @@ where
 
 async fn prepare_commit_batch_blocking<Cx, H>(
     context: Cx,
-    commit_client: StoreClient,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -895,8 +894,7 @@ where
         height: upload.height,
         completion: upload.completion,
     };
-    let raw_sql_upload = RawSqlUpload {
-        raw_rows: upload.raw_rows,
+    let sql_upload = SqlUpload {
         sql_rows: upload.sql_rows,
     };
     let state_upload = upload.state;
@@ -914,11 +912,10 @@ where
     let staged = stage_commit_batch_blocking(
         context.child("stage_store_batch"),
         CommitBatchStage {
-            commit_client,
             sql_writer,
             state_writer,
             transaction_writer,
-            raw_sql_upload,
+            sql_upload,
             state_upload,
             transaction_upload,
             state_watermark,
@@ -959,21 +956,8 @@ struct StagedQmdbUploadMetadata {
     completion: oneshot::Sender<()>,
 }
 
-struct RawSqlUpload {
-    raw_rows: Vec<(exoware_sdk::keys::Key, bytes::Bytes)>,
+struct SqlUpload {
     sql_rows: Vec<super::SqlRow>,
-}
-
-fn stage_raw_rows(
-    client: &StoreClient,
-    batch: &mut StoreWriteBatch,
-    upload: RawSqlUpload,
-) -> Result<(), ClientError> {
-    batch.reserve(upload.raw_rows.len());
-    for (key, value) in upload.raw_rows {
-        batch.push(client, &key, value)?;
-    }
-    Ok(())
 }
 
 async fn stage_commit_batch_blocking<Cx, H>(
@@ -989,19 +973,17 @@ where
         .shared(true)
         .spawn(move |_| async move {
             let CommitBatchStage {
-                commit_client,
                 mut sql_writer,
                 state_writer,
                 transaction_writer,
-                mut raw_sql_upload,
+                mut sql_upload,
                 state_upload,
                 transaction_upload,
                 state_watermark,
                 transaction_watermark,
             } = stage;
-            let sql = prepare_raw_sql_upload(&mut sql_writer, &mut raw_sql_upload)?;
+            let sql = prepare_sql_upload(&mut sql_writer, &mut sql_upload)?;
             let mut store_batch = StoreWriteBatch::new();
-            stage_raw_rows(&commit_client, &mut store_batch, raw_sql_upload)?;
             let mut sql = sql;
             if let Some(prepared) = &mut sql {
                 sql_writer.stage_flush(prepared, &mut store_batch)?;
@@ -1233,9 +1215,9 @@ where
     completed
 }
 
-fn prepare_raw_sql_upload(
+fn prepare_sql_upload(
     writer: &mut BatchWriter,
-    upload: &mut RawSqlUpload,
+    upload: &mut SqlUpload,
 ) -> Result<Option<PreparedBatch>, PublishError> {
     for row in upload.sql_rows.drain(..) {
         writer
@@ -1258,14 +1240,14 @@ fn prepare_sql_rows<'a>(
     Ok(writer.prepare_flush()?)
 }
 
-/// Store prefix for account-state QMDB rows.
+/// Store namespace prefix for account-state QMDB rows.
 pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, exoware_sdk::StoreKeyPrefixError> {
-    StoreKeyPrefix::new(crate::keys::RESERVED_BITS, STATE_QMDB_PREFIX_VALUE)
+    StoreKeyPrefix::new(STORE_PREFIX_RESERVED_BITS, STATE_QMDB_PREFIX_VALUE)
 }
 
-/// Store prefix for transaction-history QMDB rows.
+/// Store namespace prefix for transaction-history QMDB rows.
 pub fn transactions_qmdb_prefix() -> Result<StoreKeyPrefix, exoware_sdk::StoreKeyPrefixError> {
-    StoreKeyPrefix::new(crate::keys::RESERVED_BITS, TRANSACTIONS_QMDB_PREFIX_VALUE)
+    StoreKeyPrefix::new(STORE_PREFIX_RESERVED_BITS, TRANSACTIONS_QMDB_PREFIX_VALUE)
 }
 
 /// Clone `client` into the account-state QMDB namespace.
@@ -1402,29 +1384,41 @@ const fn validate_writer_range(
     Ok(())
 }
 
-fn account_rows(
-    delta: &[StateOperation],
-    start_location: u64,
-) -> Vec<(exoware_sdk::keys::Key, bytes::Bytes)> {
+fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::SqlRow> {
     let mut rows = Vec::new();
     for (offset, operation) in delta.iter().enumerate() {
         let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
             continue;
         };
         let location = start_location + u64::try_from(offset).expect("state op offset fits u64");
-        rows.push((
-            crate::keys::account(key.as_ref()).expect("account key fits family payload"),
-            encode_account_row(account, location),
-        ));
+        rows.push(encode_account_meta_row(AccountMetaRow {
+            account: account_key_array(key),
+            balance: account_value_balance(account),
+            nonce: account_value_nonce(account),
+            qmdb_location: location,
+        }));
     }
     rows
 }
 
-fn encode_account_row(account: &AccountValue, location: u64) -> bytes::Bytes {
-    let mut row = Vec::with_capacity(Account::SIZE + u64::SIZE);
-    row.extend_from_slice(account.as_ref());
-    row.extend_from_slice(&location.to_be_bytes());
-    bytes::Bytes::from(row)
+fn account_key_array(key: &AccountKey) -> [u8; AccountKey::SIZE] {
+    key.as_ref()
+        .try_into()
+        .expect("account key has fixed width")
+}
+
+fn account_value_balance(account: &AccountValue) -> u64 {
+    let bytes: [u8; 8] = account.as_ref()[..8]
+        .try_into()
+        .expect("account balance has fixed width");
+    u64::from_be_bytes(bytes)
+}
+
+fn account_value_nonce(account: &AccountValue) -> u64 {
+    let bytes: [u8; 8] = account.as_ref()[8..16]
+        .try_into()
+        .expect("account nonce has fixed width");
+    u64::from_be_bytes(bytes)
 }
 
 async fn load_state_ops<E, H, S>(
@@ -1637,37 +1631,23 @@ mod tests {
     const TEST_PAGE_CACHE_CAPACITY: std::num::NonZero<usize> = NZUsize!(1024);
 
     #[test]
-    fn qmdb_store_prefixes_are_reserved_and_distinct() {
+    fn qmdb_operation_logs_use_distinct_store_namespaces() {
         let state = state_qmdb_prefix().expect("state prefix");
         let transactions = transactions_qmdb_prefix().expect("transaction prefix");
 
-        assert_eq!(state.reserved_bits(), crate::keys::RESERVED_BITS);
+        assert_eq!(state.reserved_bits(), STORE_PREFIX_RESERVED_BITS);
         assert_eq!(state.prefix(), STATE_QMDB_PREFIX_VALUE);
+        assert_eq!(transactions.reserved_bits(), STORE_PREFIX_RESERVED_BITS);
         assert_eq!(transactions.prefix(), TRANSACTIONS_QMDB_PREFIX_VALUE);
-        for prefix in [
-            crate::keys::TX.prefix(),
-            crate::keys::TX_BY_H.prefix(),
-            crate::keys::TX_BY_SENDER.prefix(),
-            crate::keys::ACCOUNT.prefix(),
-        ] {
-            assert_ne!(STATE_QMDB_PREFIX_VALUE, prefix);
-            assert_ne!(TRANSACTIONS_QMDB_PREFIX_VALUE, prefix);
-        }
+        assert_ne!(state.prefix(), transactions.prefix());
     }
 
     #[test]
-    fn raw_and_sql_rows_stage_into_one_store_batch() {
+    fn sql_rows_stage_into_store_batch() {
         let client = StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
-        let raw = vec![(
-            crate::keys::tx(&[7u8; 32]).expect("transaction key"),
-            Bytes::from_static(b"transaction"),
-        )];
         let mut batch = StoreWriteBatch::new();
-        for (key, value) in raw {
-            batch.push(&client, &key, value).expect("raw row stage");
-        }
 
-        let schema = build_meta_schema(client.clone()).expect("schema");
+        let schema = build_meta_schema(client).expect("schema");
         let mut writer = schema.batch_writer();
         let rows = [
             super::super::SqlRow {
@@ -1688,7 +1668,12 @@ mod tests {
                     CellValue::UInt64(1),
                     CellValue::UInt64(0),
                     CellValue::FixedBinary(vec![3u8; 32]),
+                    CellValue::FixedBinary(vec![4u8; 32]),
+                    CellValue::FixedBinary(vec![5u8; 32]),
+                    CellValue::UInt64(7),
+                    CellValue::UInt64(8),
                     CellValue::UInt64(1),
+                    CellValue::Utf8("010203".to_string()),
                 ],
             },
         ];
@@ -1699,8 +1684,8 @@ mod tests {
             .stage_flush(&prepared, &mut batch)
             .expect("sql rows stage");
 
-        // One raw row, one block_meta row, and tx_meta base + digest index rows.
-        assert_eq!(batch.len(), 4);
+        // One block_meta row and tx_meta base + digest index rows.
+        assert_eq!(batch.len(), 3);
         assert_eq!(prepared.entry_count(), 3);
     }
 
@@ -1747,7 +1732,6 @@ mod tests {
             let expected_transaction_watermark = Some(transactions.latest_location());
             let upload = PreparedQmdbUpload {
                 height: u64::from(seed),
-                raw_rows: Vec::new(),
                 sql_rows: Vec::new(),
                 state,
                 transactions,
@@ -1756,7 +1740,6 @@ mod tests {
 
             let (_sql_writer, batch) = prepare_commit_batch_blocking(
                 context,
-                client,
                 sql_writer,
                 state_writer,
                 transaction_writer,
@@ -1914,7 +1897,6 @@ mod tests {
             let (first_completion, mut first_rx) = oneshot::channel();
             let first_upload = PreparedQmdbUpload {
                 height: 1,
-                raw_rows: Vec::new(),
                 sql_rows: Vec::new(),
                 state: state_writer
                     .prepare_upload(&state_ops(1))
@@ -1928,7 +1910,6 @@ mod tests {
             };
             let (next_sql_writer, first_batch) = prepare_commit_batch_blocking(
                 context.child("first"),
-                client.clone(),
                 sql_writer,
                 state_writer.clone(),
                 transaction_writer.clone(),
@@ -1942,7 +1923,6 @@ mod tests {
             let (second_completion, mut second_rx) = oneshot::channel();
             let second_upload = PreparedQmdbUpload {
                 height: 2,
-                raw_rows: Vec::new(),
                 sql_rows: Vec::new(),
                 state: state_writer
                     .prepare_upload(&state_ops(2))
@@ -1956,7 +1936,6 @@ mod tests {
             };
             let (next_sql_writer, second_batch) = prepare_commit_batch_blocking(
                 context.child("second"),
-                client.clone(),
                 sql_writer,
                 state_writer.clone(),
                 transaction_writer.clone(),
