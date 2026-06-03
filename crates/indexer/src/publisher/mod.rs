@@ -11,11 +11,10 @@
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!
 //! Simplex certificates are uploaded separately through [`CertificateReporter`]
-//! using `exoware-simplex` indexes in the same Store.
+//! using `exoware-simplex` indexes in the same Store. Those proof artifacts are
+//! not the canonical block or transaction storage path.
 //!
 //! [`StoreClient`]: exoware_sdk::StoreClient
-
-use exoware_sdk::{RetryConfig, StoreClient};
 
 pub(crate) mod block;
 pub mod certificate;
@@ -25,12 +24,3 @@ pub mod sql;
 pub use certificate::CertificateReporter;
 pub use qmdb::Publisher;
 pub use sql::SqlRow;
-
-/// Build a [`StoreClient`] with the SDK's standard retry policy.
-pub(crate) fn standard_store_client(url: &str) -> StoreClient {
-    StoreClient::builder()
-        .url(url)
-        .retry_config(RetryConfig::standard())
-        .build()
-        .expect("url sets health, ingest, and query URLs")
-}

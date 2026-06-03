@@ -358,7 +358,7 @@ where
     where
         Cx: Spawner,
     {
-        let commit_client = super::standard_store_client(store_url);
+        let commit_client = StoreClient::new(store_url);
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
         let sql_writer = build_meta_schema(commit_client.clone())

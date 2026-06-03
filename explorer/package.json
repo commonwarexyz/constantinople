@@ -12,10 +12,10 @@
     "dependencies": {
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
-        "@exowarexyz/qmdb": "file:../../exoware-monorepo-faster-qmdb-uploads/qmdb/ts",
-        "@exowarexyz/sdk": "2026.5.0",
-        "@exowarexyz/simplex": "file:../../exoware-monorepo-faster-qmdb-uploads/simplex/ts",
-        "@exowarexyz/sql": "2026.5.0",
+        "@exowarexyz/qmdb": "file:vendor/exoware/exowarexyz-qmdb-2026.5.0.tgz",
+        "@exowarexyz/sdk": "file:vendor/exoware/exowarexyz-sdk-2026.5.0.tgz",
+        "@exowarexyz/simplex": "file:vendor/exoware/exowarexyz-simplex-2026.5.0.tgz",
+        "@exowarexyz/sql": "file:vendor/exoware/exowarexyz-sql-2026.5.0.tgz",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"
     },

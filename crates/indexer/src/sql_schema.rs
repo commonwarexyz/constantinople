@@ -12,7 +12,9 @@
 //!   compatibility, but the publisher no longer writes per-transaction SQL
 //!   rows on the live path.
 //! - **Simplex artifacts** — finalization certificates are written through
-//!   `exoware-simplex` beside the raw and SQL rows.
+//!   `exoware-simplex` beside the raw and SQL rows. These proof artifacts can
+//!   carry certified block payloads, but they are not the canonical full-storage
+//!   path.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the
