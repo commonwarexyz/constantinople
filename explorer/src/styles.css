@@ -562,10 +562,6 @@ body {
     padding: 0;
 }
 
-.wallet__cell .copyable--plain.is-copied {
-    color: var(--theme-accent);
-}
-
 .copyable__value {
     display: block;
     min-width: 0;
@@ -578,10 +574,6 @@ body {
     display: inline;
     overflow-wrap: anywhere;
     white-space: normal;
-}
-
-.copyable.is-copied {
-    color: var(--theme-accent);
 }
 
 .terminal-toast {
