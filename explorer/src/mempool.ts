@@ -3,6 +3,7 @@ import { toArrayBuffer } from './codec';
 export interface AccountView {
     readonly balance: number;
     readonly nonce: number;
+    readonly nonce_bitmap: number;
 }
 
 export type TxStatus =

@@ -174,15 +174,13 @@ where
 
     for (transfer, accounts) in transfers.iter().zip(accounts.chunks_exact(2)) {
         let mut sender = accounts[0];
-        if sender.nonce != transfer.nonce || sender.balance < transfer.value {
+        if sender.balance < transfer.value || !sender.use_nonce(transfer.nonce) {
             return None;
         }
-        let next_nonce = sender.nonce.checked_add(1)?;
 
         let mut recipient = accounts[1];
         let recipient_balance = recipient.balance.checked_add(transfer.value)?;
 
-        sender.nonce = next_nonce;
         sender.balance -= transfer.value;
         recipient.balance = recipient_balance;
         changeset.push((transfer.sender.clone(), sender));
@@ -241,14 +239,10 @@ where
     let Some(mut sender) = state.get(&transfer.sender) else {
         return false;
     };
-    if sender.nonce != transfer.nonce || sender.balance < transfer.value {
+    if sender.balance < transfer.value || !sender.use_nonce(transfer.nonce) {
         return false;
     }
-    let Some(next_nonce) = sender.nonce.checked_add(1) else {
-        return false;
-    };
 
-    sender.nonce = next_nonce;
     if transfer.sender == transfer.recipient {
         state.set(transfer.sender.clone(), sender);
         return true;

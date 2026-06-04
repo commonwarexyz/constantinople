@@ -30,7 +30,7 @@ const TRANSACTION_VALUE_BYTES = 8;
 const TRANSACTION_NONCE_BYTES = 8;
 const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
-const ACCOUNT_VALUE_BYTES = 16;
+const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
 
 const TX_META_TABLE = 'tx_meta';
@@ -54,6 +54,7 @@ const ACCOUNT_META_TABLE = 'account_meta';
 const ACCOUNT_META_ACCOUNT = 'account';
 const ACCOUNT_META_BALANCE = 'balance';
 const ACCOUNT_META_NONCE = 'nonce';
+const ACCOUNT_META_NONCE_BITMAP = 'nonce_bitmap';
 const ACCOUNT_META_QMDB_LOCATION = 'qmdb_location';
 
 export interface VerifiedTransactionProof {
@@ -107,6 +108,7 @@ export interface AccountTransactionPage {
 export interface VerifiedAccountProof {
     readonly balance: bigint;
     readonly nonce: bigint;
+    readonly nonceBitmap: bigint;
     readonly location: bigint;
     readonly tip: bigint;
     readonly proofSizeBytes: number;
@@ -232,13 +234,18 @@ export async function fetchAndVerifyAccountProof({
     );
     const accountValue = decodeAccountValue(verification.value);
 
-    if (accountValue.balance !== row.balance || accountValue.nonce !== row.nonce) {
+    if (
+        accountValue.balance !== row.balance ||
+        accountValue.nonce !== row.nonce ||
+        accountValue.nonceBitmap !== row.nonceBitmap
+    ) {
         throw new Error('account proof value does not match account index row');
     }
 
     return {
         balance: accountValue.balance,
         nonce: accountValue.nonce,
+        nonceBitmap: accountValue.nonceBitmap,
         location: row.location,
         tip,
         proofSizeBytes: verification.proofSizeBytes,
@@ -669,7 +676,11 @@ async function fetchAccountProofRow(
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${ACCOUNT_META_BALANCE}, ${ACCOUNT_META_NONCE}, ${ACCOUNT_META_QMDB_LOCATION}
+            SELECT
+                ${ACCOUNT_META_BALANCE},
+                ${ACCOUNT_META_NONCE},
+                ${ACCOUNT_META_NONCE_BITMAP},
+                ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
             LIMIT 1
@@ -683,6 +694,10 @@ async function fetchAccountProofRow(
     return {
         balance: expectBigint(row.values[ACCOUNT_META_BALANCE], ACCOUNT_META_BALANCE),
         nonce: expectBigint(row.values[ACCOUNT_META_NONCE], ACCOUNT_META_NONCE),
+        nonceBitmap: expectBigint(
+            row.values[ACCOUNT_META_NONCE_BITMAP],
+            ACCOUNT_META_NONCE_BITMAP,
+        ),
         location: expectBigint(row.values[ACCOUNT_META_QMDB_LOCATION], ACCOUNT_META_QMDB_LOCATION),
     };
 }
@@ -790,13 +805,16 @@ function assertByteLength(bytes: Uint8Array, length: number, field: string) {
     }
 }
 
-function decodeAccountValue(value: Uint8Array): Pick<AccountProofRow, 'balance' | 'nonce'> {
+function decodeAccountValue(
+    value: Uint8Array,
+): Pick<AccountProofRow, 'balance' | 'nonce' | 'nonceBitmap'> {
     if (value.length !== ACCOUNT_VALUE_BYTES) {
         throw new Error('malformed account proof value');
     }
     return {
         balance: readU64Be(value, 0),
         nonce: readU64Be(value, 8),
+        nonceBitmap: readU64Be(value, 16),
     };
 }
 
@@ -843,5 +861,6 @@ function trimTrailingSlash(value: string): string {
 interface AccountProofRow {
     readonly balance: bigint;
     readonly nonce: bigint;
+    readonly nonceBitmap: bigint;
     readonly location: bigint;
 }

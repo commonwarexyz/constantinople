@@ -879,7 +879,14 @@ function AccountPage({
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
                 <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
-                <ProofDatum label="state" value={proof.status === 'verified' ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}` : proof.detail} />
+                <ProofDatum
+                    label="state"
+                    value={
+                        proof.status === 'verified'
+                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()} / bitmap ${proof.nonceBitmap.toString()}`
+                            : proof.detail
+                    }
+                />
                 <ProofDatum label="state proof" value={proof.status === 'verified' ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b` : proof.status} />
             </div>
             <div className="account-page__subhead">
@@ -1116,6 +1123,7 @@ function WalletPanel({
     onSubmit: () => void;
 }) {
     const balance = account?.balance ?? 100;
+    const nonceBitmap = account?.nonce_bitmap ?? 0;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
     const isAccountLoading = accountMessage === 'loading account metadata';
 
@@ -1163,6 +1171,10 @@ function WalletPanel({
                 <div className="wallet__cell">
                     <span>nonce</span>
                     <strong>{nonce}</strong>
+                </div>
+                <div className="wallet__cell">
+                    <span>nonce bitmap</span>
+                    <strong>{nonceBitmap.toLocaleString()}</strong>
                 </div>
             </div>
             <form

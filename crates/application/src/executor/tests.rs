@@ -1,7 +1,8 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, Transaction, TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Transaction,
+    TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 
@@ -36,7 +37,11 @@ impl TestSigner {
 }
 
 fn account(balance: u64, nonce: u64) -> Account {
-    Account { balance, nonce }
+    Account {
+        balance,
+        nonce,
+        nonce_bitmap: 0,
+    }
 }
 
 fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
@@ -73,6 +78,77 @@ fn proposal_tracks_pending_nonce_and_balance() {
     assert_eq!(proposal.valid[0].value().nonce, 0);
     assert_eq!(proposal.valid[1].value().nonce, 1);
     assert_eq!(proposal.invalid[0].value().value.get(), 7);
+}
+
+#[test]
+fn proposal_accepts_nonce_inside_run_ahead_window() {
+    let signer = TestSigner::from_seed(2);
+    let recipient = TestSigner::from_seed(3);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), Account::default());
+
+    let transactions = vec![
+        signer.sign(recipient.public_key.clone(), 3, 2),
+        signer.sign(recipient.public_key.clone(), 4, 0),
+        signer.sign(recipient.public_key.clone(), 2, 1),
+    ];
+    let proposal = propose(&accounts, transactions);
+    let sender = changeset_account(&proposal.changeset, signer.public_key)
+        .expect("sender should be updated");
+    let recipient = changeset_account(&proposal.changeset, recipient.public_key)
+        .expect("recipient should be updated");
+
+    assert_eq!(proposal.valid.len(), 3);
+    assert!(proposal.invalid.is_empty());
+    assert_eq!(sender.balance, 1);
+    assert_eq!(sender.nonce, 3);
+    assert_eq!(recipient.balance, DEFAULT_ACCOUNT_BALANCE + 9);
+}
+
+#[test]
+fn proposal_rejects_duplicate_run_ahead_nonce() {
+    let signer = TestSigner::from_seed(4);
+    let recipient = TestSigner::from_seed(5);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), Account::default());
+
+    let transactions = vec![
+        signer.sign(recipient.public_key.clone(), 3, 2),
+        signer.sign(recipient.public_key, 4, 2),
+    ];
+    let proposal = propose(&accounts, transactions);
+    let sender = changeset_account(&proposal.changeset, signer.public_key)
+        .expect("sender should be updated");
+
+    assert_eq!(proposal.valid.len(), 1);
+    assert_eq!(proposal.invalid.len(), 1);
+    assert_eq!(sender.balance, 7);
+    assert_eq!(sender.nonce, 0);
+}
+
+#[test]
+fn proposal_accepts_far_ahead_nonce_and_rejects_duplicate() {
+    let signer = TestSigner::from_seed(6);
+    let recipient = TestSigner::from_seed(7);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), Account::default());
+
+    let nonce = NONCE_BITMAP_CAPACITY + 1;
+    let transactions = vec![
+        signer.sign(recipient.public_key.clone(), 3, nonce),
+        signer.sign(recipient.public_key, 4, nonce),
+    ];
+    let proposal = propose(&accounts, transactions);
+    let sender = changeset_account(&proposal.changeset, signer.public_key)
+        .expect("sender should be updated");
+
+    assert_eq!(proposal.valid.len(), 1);
+    assert_eq!(proposal.invalid.len(), 1);
+    assert_eq!(sender.balance, 7);
+    assert_eq!(sender.nonce, NONCE_BITMAP_CAPACITY + 2);
 }
 
 #[test]

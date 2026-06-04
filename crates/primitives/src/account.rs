@@ -15,6 +15,9 @@ use derive_more::{Debug, Display};
 /// Default starting balance for accounts that have not been written yet.
 pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 
+/// Number of future nonce uses tracked on each account.
+pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
+
 /// Fixed-width account identifier derived from a transaction public key.
 ///
 /// Unlike [`commonware_cryptography::PublicKey`] implementations, decoding an
@@ -117,14 +120,41 @@ impl Array for AccountKey {}
 /// An account, as represented in the state of the chain.
 #[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
-#[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
+#[display(
+    "Account {{ balance: {}, nonce: {}, nonce_bitmap: {} }}",
+    balance,
+    nonce,
+    nonce_bitmap
+)]
 pub struct Account {
     /// The balance of the account, which is the amount of tokens that the
     /// account holds.
     pub balance: u64,
-    /// The nonce of the account, which is incremented every time a
-    /// transaction is sent from the account.
+    /// The next nonce that has not been consumed by this account.
     pub nonce: u64,
+    /// Used future nonces relative to [`Self::nonce`].
+    ///
+    /// Bit 0 records `nonce + 1`, and bit 63 records `nonce + 64`.
+    pub nonce_bitmap: u64,
+}
+
+impl Account {
+    /// Records a transaction nonce if it has not already been consumed.
+    ///
+    /// Nonces below [`Self::nonce`] are stale. Nonces inside the run-ahead
+    /// window set a bitmap bit. Nonces beyond the window clear the bitmap and
+    /// advance [`Self::nonce`] beyond the consumed transaction.
+    pub fn use_nonce(&mut self, nonce: u64) -> bool {
+        let Some((next_nonce, next_bitmap)) =
+            next_nonce_state(self.nonce, self.nonce_bitmap, nonce)
+        else {
+            return false;
+        };
+
+        self.nonce = next_nonce;
+        self.nonce_bitmap = next_bitmap;
+        true
+    }
 }
 
 impl Default for Account {
@@ -132,18 +162,20 @@ impl Default for Account {
         Self {
             balance: DEFAULT_ACCOUNT_BALANCE,
             nonce: 0,
+            nonce_bitmap: 0,
         }
     }
 }
 
 impl FixedSize for Account {
-    const SIZE: usize = u64::SIZE + u64::SIZE;
+    const SIZE: usize = u64::SIZE + u64::SIZE + u64::SIZE;
 }
 
 impl Write for Account {
     fn write(&self, buf: &mut impl BufMut) {
         self.balance.write(buf);
         self.nonce.write(buf);
+        self.nonce_bitmap.write(buf);
     }
 }
 
@@ -154,8 +186,52 @@ impl Read for Account {
         Ok(Self {
             balance: u64::read(buf)?,
             nonce: u64::read(buf)?,
+            nonce_bitmap: u64::read(buf)?,
         })
     }
+}
+
+fn next_nonce_state(base: u64, bitmap: u64, nonce: u64) -> Option<(u64, u64)> {
+    let next_used_nonce = nonce.checked_add(1)?;
+
+    if nonce < base {
+        return None;
+    }
+
+    let delta = nonce - base;
+    if delta == 0 {
+        return consume_current_nonce(base, bitmap);
+    }
+
+    if delta > NONCE_BITMAP_CAPACITY {
+        return Some((next_used_nonce, 0));
+    }
+
+    let bit = 1u64 << (delta - 1);
+    if bitmap & bit != 0 {
+        return None;
+    }
+
+    Some((base, bitmap | bit))
+}
+
+fn consume_current_nonce(base: u64, bitmap: u64) -> Option<(u64, u64)> {
+    let mut advance = 1;
+    while advance <= NONCE_BITMAP_CAPACITY {
+        let bit = 1u64 << (advance - 1);
+        if bitmap & bit == 0 {
+            break;
+        }
+        advance += 1;
+    }
+
+    let nonce = base.checked_add(advance)?;
+    let bitmap = if advance >= NONCE_BITMAP_CAPACITY {
+        0
+    } else {
+        bitmap >> advance
+    };
+    Some((nonce, bitmap))
 }
 
 #[cfg(test)]
@@ -204,6 +280,7 @@ mod tests {
         let account = Account {
             balance: 42,
             nonce: 7,
+            nonce_bitmap: 3,
         };
 
         let mut buf = Vec::with_capacity(Account::SIZE);
@@ -221,7 +298,65 @@ mod tests {
             Account {
                 balance: DEFAULT_ACCOUNT_BALANCE,
                 nonce: 0,
+                nonce_bitmap: 0,
             }
         );
+    }
+
+    #[test]
+    fn account_use_nonce_records_run_ahead_nonce() {
+        let mut account = Account::default();
+
+        assert!(account.use_nonce(2));
+        assert_eq!(account.nonce, 0);
+        assert_eq!(account.nonce_bitmap, 0b10);
+    }
+
+    #[test]
+    fn account_use_nonce_compacts_contiguous_run_ahead() {
+        let mut account = Account::default();
+
+        assert!(account.use_nonce(2));
+        assert!(account.use_nonce(0));
+        assert_eq!(account.nonce, 1);
+        assert_eq!(account.nonce_bitmap, 0b1);
+
+        assert!(account.use_nonce(1));
+        assert_eq!(account.nonce, 3);
+        assert_eq!(account.nonce_bitmap, 0);
+    }
+
+    #[test]
+    fn account_use_nonce_rejects_duplicate_run_ahead() {
+        let mut account = Account::default();
+
+        assert!(account.use_nonce(2));
+        assert!(!account.use_nonce(2));
+        assert_eq!(account.nonce, 0);
+        assert_eq!(account.nonce_bitmap, 0b10);
+    }
+
+    #[test]
+    fn account_use_nonce_rejects_run_ahead_nonce_that_cannot_advance() {
+        let mut account = Account {
+            balance: 0,
+            nonce: u64::MAX - 1,
+            nonce_bitmap: 0,
+        };
+
+        assert!(!account.use_nonce(u64::MAX));
+        assert_eq!(account.nonce, u64::MAX - 1);
+        assert_eq!(account.nonce_bitmap, 0);
+    }
+
+    #[test]
+    fn account_use_nonce_clears_bitmap_after_far_jump() {
+        let mut account = Account::default();
+
+        assert!(account.use_nonce(2));
+        assert!(account.use_nonce(NONCE_BITMAP_CAPACITY + 1));
+        assert_eq!(account.nonce, NONCE_BITMAP_CAPACITY + 2);
+        assert_eq!(account.nonce_bitmap, 0);
+        assert!(!account.use_nonce(NONCE_BITMAP_CAPACITY + 1));
     }
 }

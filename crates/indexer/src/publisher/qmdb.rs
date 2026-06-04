@@ -1395,6 +1395,7 @@ fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::Sql
             account: account_key_array(key),
             balance: account_value_balance(account),
             nonce: account_value_nonce(account),
+            nonce_bitmap: account_value_nonce_bitmap(account),
             qmdb_location: location,
         }));
     }
@@ -1418,6 +1419,13 @@ fn account_value_nonce(account: &AccountValue) -> u64 {
     let bytes: [u8; 8] = account.as_ref()[8..16]
         .try_into()
         .expect("account nonce has fixed width");
+    u64::from_be_bytes(bytes)
+}
+
+fn account_value_nonce_bitmap(account: &AccountValue) -> u64 {
+    let bytes: [u8; 8] = account.as_ref()[16..24]
+        .try_into()
+        .expect("account nonce bitmap has fixed width");
     u64::from_be_bytes(bytes)
 }
 
@@ -1705,6 +1713,7 @@ mod tests {
                     encode_account(Account {
                         balance: u64::from(seed),
                         nonce: 0,
+                        nonce_bitmap: 0,
                     }),
                 )),
                 StateOperation::CommitFloor(None, Location::new(0)),
@@ -2047,6 +2056,7 @@ mod tests {
                         Account {
                             balance: 10,
                             nonce: 0,
+                            nonce_bitmap: 0,
                         },
                     ),
                     (
@@ -2054,6 +2064,7 @@ mod tests {
                         Account {
                             balance: 20,
                             nonce: 0,
+                            nonce_bitmap: 0,
                         },
                     ),
                 ],
@@ -2080,6 +2091,7 @@ mod tests {
                         Account {
                             balance: 9,
                             nonce: 1,
+                            nonce_bitmap: 0,
                         },
                     ),
                     (
@@ -2087,6 +2099,7 @@ mod tests {
                         Account {
                             balance: 30,
                             nonce: 0,
+                            nonce_bitmap: 0,
                         },
                     ),
                 ],
@@ -2436,6 +2449,7 @@ mod tests {
                 encode_account(Account {
                     balance: u64::from(seed),
                     nonce: 0,
+                    nonce_bitmap: 0,
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),
@@ -2474,6 +2488,7 @@ mod tests {
                 encode_account(Account {
                     balance: 1,
                     nonce: 0,
+                    nonce_bitmap: 0,
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),

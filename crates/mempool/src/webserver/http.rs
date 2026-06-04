@@ -334,7 +334,7 @@ where
 /// Returns the committed account for the hex-encoded public key.
 ///
 /// Responds with:
-/// - `200 OK` and `{"balance": u64, "nonce": u64}` if the account exists.
+/// - `200 OK` and account JSON if the account exists.
 /// - `404 Not Found` if the account has not been written.
 /// - `400 Bad Request` if the path is not a valid public key hex string.
 /// - `503 Service Unavailable` if the state database has not been attached yet.
@@ -380,6 +380,7 @@ where
 struct AccountResponse {
     balance: u64,
     nonce: u64,
+    nonce_bitmap: u64,
 }
 
 impl From<Account> for AccountResponse {
@@ -387,6 +388,7 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: account.nonce,
+            nonce_bitmap: account.nonce_bitmap,
         }
     }
 }

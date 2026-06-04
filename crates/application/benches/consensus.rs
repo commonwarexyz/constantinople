@@ -472,6 +472,7 @@ impl GeneratedTransactions {
                 Account {
                     balance: 1,
                     nonce: 0,
+                    nonce_bitmap: 0,
                 },
             ));
             accounts.push((

@@ -422,6 +422,7 @@ async fn account(
 struct AccountResponse {
     balance: u64,
     nonce: u64,
+    nonce_bitmap: u64,
 }
 
 impl From<Account> for AccountResponse {
@@ -429,6 +430,7 @@ impl From<Account> for AccountResponse {
         Self {
             balance: account.balance,
             nonce: account.nonce,
+            nonce_bitmap: account.nonce_bitmap,
         }
     }
 }

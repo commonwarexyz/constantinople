@@ -164,6 +164,7 @@ impl Client {
 pub struct AccountView {
     pub balance: u64,
     pub nonce: u64,
+    pub nonce_bitmap: u64,
 }
 
 /// Fast-ingest acknowledgement returned by validators.
