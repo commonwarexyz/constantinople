@@ -139,7 +139,7 @@ struct RelayerModeConfig {
 
 async fn run_relayer_mode(
     config: RelayerModeConfig,
-    strategy: impl commonware_parallel::Strategy + Send + 'static,
+    strategy: impl commonware_parallel::Strategy + 'static,
 ) {
     let RelayerModeConfig {
         relayer_url,
