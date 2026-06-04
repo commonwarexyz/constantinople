@@ -1394,7 +1394,7 @@ fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::Sql
         rows.push(encode_account_meta_row(AccountMetaRow {
             account: account_key_array(key),
             balance: account_value_balance(account),
-            nonce: account_value_nonce(account),
+            nonce_base: account_value_nonce_base(account),
             nonce_bitmap: account_value_nonce_bitmap(account),
             qmdb_location: location,
         }));
@@ -1415,10 +1415,10 @@ fn account_value_balance(account: &AccountValue) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-fn account_value_nonce(account: &AccountValue) -> u64 {
+fn account_value_nonce_base(account: &AccountValue) -> u64 {
     let bytes: [u8; 8] = account.as_ref()[8..16]
         .try_into()
-        .expect("account nonce has fixed width");
+        .expect("account nonce base has fixed width");
     u64::from_be_bytes(bytes)
 }
 

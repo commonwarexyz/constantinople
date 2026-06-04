@@ -163,11 +163,11 @@ impl Client {
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct AccountView {
     pub balance: u64,
-    pub nonce: AccountNonceView,
+    pub nonce: NonceView,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize)]
-pub struct AccountNonceView {
+pub struct NonceView {
     pub base: u64,
     pub bitmap: u64,
 }

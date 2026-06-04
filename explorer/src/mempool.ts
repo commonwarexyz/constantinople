@@ -2,10 +2,10 @@ import { toArrayBuffer } from './codec';
 
 export interface AccountView {
     readonly balance: number;
-    readonly nonce: AccountNonceView;
+    readonly nonce: NonceView;
 }
 
-export interface AccountNonceView {
+export interface NonceView {
     readonly base: number;
     readonly bitmap: number;
 }

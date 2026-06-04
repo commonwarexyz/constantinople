@@ -84,8 +84,8 @@ pub const TX_ACTIVITY_NONCE: &str = "nonce";
 pub const ACCOUNT_META_ACCOUNT: &str = "account";
 /// `account_meta`: indexed account balance.
 pub const ACCOUNT_META_BALANCE: &str = "balance";
-/// `account_meta`: indexed account nonce.
-pub const ACCOUNT_META_NONCE: &str = "nonce";
+/// `account_meta`: indexed account nonce base.
+pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 /// `account_meta`: indexed account run-ahead nonce bitmap.
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
 /// `account_meta`: account-state QMDB operation location.
@@ -183,7 +183,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                         false,
                     ),
                     TableColumnConfig::new(ACCOUNT_META_BALANCE, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_NONCE, DataType::UInt64, false),
+                    TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
                 ],
@@ -260,7 +260,7 @@ mod tests {
         assert_eq!(TX_ACTIVITY_NONCE, "nonce");
         assert_eq!(ACCOUNT_META_ACCOUNT, "account");
         assert_eq!(ACCOUNT_META_BALANCE, "balance");
-        assert_eq!(ACCOUNT_META_NONCE, "nonce");
+        assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");
         assert_eq!(ACCOUNT_META_NONCE_BITMAP, "nonce_bitmap");
         assert_eq!(ACCOUNT_META_QMDB_LOCATION, "qmdb_location");
     }

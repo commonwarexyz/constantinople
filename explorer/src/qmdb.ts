@@ -53,7 +53,7 @@ const TX_ACTIVITY_ROLE_RECEIVER = 1n;
 const ACCOUNT_META_TABLE = 'account_meta';
 const ACCOUNT_META_ACCOUNT = 'account';
 const ACCOUNT_META_BALANCE = 'balance';
-const ACCOUNT_META_NONCE = 'nonce';
+const ACCOUNT_META_NONCE_BASE = 'nonce_base';
 const ACCOUNT_META_NONCE_BITMAP = 'nonce_bitmap';
 const ACCOUNT_META_QMDB_LOCATION = 'qmdb_location';
 
@@ -678,7 +678,7 @@ async function fetchAccountProofRow(
         `
             SELECT
                 ${ACCOUNT_META_BALANCE},
-                ${ACCOUNT_META_NONCE},
+                ${ACCOUNT_META_NONCE_BASE},
                 ${ACCOUNT_META_NONCE_BITMAP},
                 ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
@@ -693,7 +693,7 @@ async function fetchAccountProofRow(
     }
     return {
         balance: expectBigint(row.values[ACCOUNT_META_BALANCE], ACCOUNT_META_BALANCE),
-        nonce: expectBigint(row.values[ACCOUNT_META_NONCE], ACCOUNT_META_NONCE),
+        nonce: expectBigint(row.values[ACCOUNT_META_NONCE_BASE], ACCOUNT_META_NONCE_BASE),
         nonceBitmap: expectBigint(
             row.values[ACCOUNT_META_NONCE_BITMAP],
             ACCOUNT_META_NONCE_BITMAP,
