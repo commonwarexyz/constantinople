@@ -110,8 +110,8 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
         table: TX_ACTIVITY_TABLE,
         values: vec![
             CellValue::FixedBinary(tx.account.to_vec()),
-            CellValue::UInt64(u64::MAX - tx.height),
-            CellValue::UInt64(u64::MAX - u64::from(tx.index)),
+            CellValue::UInt64(tx.height),
+            CellValue::UInt64(u64::from(tx.index)),
             CellValue::UInt64(tx.role.as_u64()),
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::FixedBinary(tx.counterparty.to_vec()),

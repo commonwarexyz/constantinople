@@ -886,35 +886,13 @@ fn sql_rows(height: u64, tx_count: usize) -> Vec<SqlRow> {
         rows.push(SqlRow {
             table: TX_META_TABLE,
             values: vec![
-                CellValue::UInt64(height),
-                CellValue::UInt64(idx as u64),
                 CellValue::FixedBinary(tx_digest.to_vec()),
-                CellValue::FixedBinary(sender.to_vec()),
-                CellValue::FixedBinary(receiver.to_vec()),
-                CellValue::UInt64(idx as u64 + 1),
-                CellValue::UInt64(idx as u64),
                 CellValue::UInt64(qmdb_location),
                 CellValue::Utf8(hex_lower(&tx_digest)),
             ],
         });
-        rows.push(activity_row(
-            sender,
-            0,
-            height,
-            idx,
-            tx_digest,
-            receiver,
-            qmdb_location,
-        ));
-        rows.push(activity_row(
-            receiver,
-            1,
-            height,
-            idx,
-            tx_digest,
-            sender,
-            qmdb_location,
-        ));
+        rows.push(activity_row(sender, 0, height, idx, tx_digest, receiver));
+        rows.push(activity_row(receiver, 1, height, idx, tx_digest, sender));
     }
     rows
 }
@@ -926,22 +904,18 @@ fn activity_row(
     idx: usize,
     tx_digest: [u8; 32],
     counterparty: [u8; 32],
-    qmdb_location: u64,
 ) -> SqlRow {
     SqlRow {
         table: TX_ACTIVITY_TABLE,
         values: vec![
             CellValue::FixedBinary(account.to_vec()),
-            CellValue::UInt64(u64::MAX - height),
-            CellValue::UInt64(u64::MAX - idx as u64),
-            CellValue::UInt64(role),
             CellValue::UInt64(height),
             CellValue::UInt64(idx as u64),
+            CellValue::UInt64(role),
             CellValue::FixedBinary(tx_digest.to_vec()),
             CellValue::FixedBinary(counterparty.to_vec()),
             CellValue::UInt64(idx as u64 + 1),
             CellValue::UInt64(idx as u64),
-            CellValue::UInt64(qmdb_location),
         ],
     }
 }

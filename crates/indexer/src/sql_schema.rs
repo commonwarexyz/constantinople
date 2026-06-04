@@ -63,10 +63,10 @@ pub const TX_META_BODY_HEX: &str = "body_hex";
 
 /// `tx_activity`: active account key (primary key first column).
 pub const TX_ACTIVITY_ACCOUNT: &str = "account";
-/// `tx_activity`: reverse-sort height (`u64::MAX - height`) for newest-first order.
-pub const TX_ACTIVITY_SORT_HEIGHT: &str = "sort_height";
-/// `tx_activity`: reverse-sort block index (`u64::MAX - index`) for newest-first order.
-pub const TX_ACTIVITY_SORT_INDEX: &str = "sort_index";
+/// `tx_activity`: finalized block height.
+pub const TX_ACTIVITY_HEIGHT: &str = "height";
+/// `tx_activity`: transaction index within the finalized block.
+pub const TX_ACTIVITY_INDEX: &str = "index";
 /// `tx_activity`: role of this account in the transaction (`0` sender, `1` receiver).
 pub const TX_ACTIVITY_ROLE: &str = "role";
 /// `tx_activity`: 32-byte transaction digest, fixed-size binary.
@@ -146,8 +146,8 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                         DataType::FixedSizeBinary(32),
                         false,
                     ),
-                    TableColumnConfig::new(TX_ACTIVITY_SORT_HEIGHT, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_SORT_INDEX, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_HEIGHT, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_INDEX, DataType::UInt64, false),
                     TableColumnConfig::new(TX_ACTIVITY_ROLE, DataType::UInt64, false),
                     TableColumnConfig::new(
                         TX_ACTIVITY_DIGEST,
@@ -164,8 +164,8 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 ],
                 vec![
                     TX_ACTIVITY_ACCOUNT.to_string(),
-                    TX_ACTIVITY_SORT_HEIGHT.to_string(),
-                    TX_ACTIVITY_SORT_INDEX.to_string(),
+                    TX_ACTIVITY_HEIGHT.to_string(),
+                    TX_ACTIVITY_INDEX.to_string(),
                     TX_ACTIVITY_ROLE.to_string(),
                 ],
                 vec![],
@@ -248,8 +248,8 @@ mod tests {
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_META_BODY_HEX, "body_hex");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
-        assert_eq!(TX_ACTIVITY_SORT_HEIGHT, "sort_height");
-        assert_eq!(TX_ACTIVITY_SORT_INDEX, "sort_index");
+        assert_eq!(TX_ACTIVITY_HEIGHT, "height");
+        assert_eq!(TX_ACTIVITY_INDEX, "index");
         assert_eq!(TX_ACTIVITY_ROLE, "role");
         assert_eq!(TX_ACTIVITY_DIGEST, "tx_digest");
         assert_eq!(TX_ACTIVITY_COUNTERPARTY, "counterparty");

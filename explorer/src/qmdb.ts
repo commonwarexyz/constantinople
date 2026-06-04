@@ -32,7 +32,6 @@ const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 16;
 const ACCOUNT_CURSOR_BYTES = 24;
-const U64_MAX = (1n << 64n) - 1n;
 
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
@@ -41,8 +40,8 @@ const TX_META_BODY_HEX = 'body_hex';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
-const TX_ACTIVITY_SORT_HEIGHT = 'sort_height';
-const TX_ACTIVITY_SORT_INDEX = 'sort_index';
+const TX_ACTIVITY_HEIGHT = 'height';
+const TX_ACTIVITY_INDEX = 'index';
 const TX_ACTIVITY_ROLE = 'role';
 const TX_ACTIVITY_DIGEST = 'tx_digest';
 const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
@@ -625,8 +624,8 @@ async function fetchAccountActivityRows(
         sqlUrl,
         `
             SELECT
-                ${TX_ACTIVITY_SORT_HEIGHT},
-                ${TX_ACTIVITY_SORT_INDEX},
+                ${TX_ACTIVITY_HEIGHT},
+                ${TX_ACTIVITY_INDEX},
                 ${TX_ACTIVITY_ROLE},
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
@@ -634,9 +633,9 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_NONCE}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
-            ORDER BY ${TX_ACTIVITY_SORT_HEIGHT} ASC,
-                     ${TX_ACTIVITY_SORT_INDEX} ASC,
-                     ${TX_ACTIVITY_ROLE} ASC
+            ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
+                     ${TX_ACTIVITY_INDEX} DESC,
+                     ${TX_ACTIVITY_ROLE} DESC
             LIMIT ${ACCOUNT_PAGE_SIZE + 1}
         `,
     );
@@ -644,8 +643,6 @@ async function fetchAccountActivityRows(
 }
 
 function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
-    const sortHeight = expectBigint(row.values[TX_ACTIVITY_SORT_HEIGHT], TX_ACTIVITY_SORT_HEIGHT);
-    const sortIndex = expectBigint(row.values[TX_ACTIVITY_SORT_INDEX], TX_ACTIVITY_SORT_INDEX);
     const role = expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE);
     const digest = expectBytes(row.values[TX_ACTIVITY_DIGEST], TX_ACTIVITY_DIGEST, DIGEST_BYTES);
     const counterparty = expectBytes(
@@ -659,8 +656,8 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         counterparty: toHex(counterparty),
         value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
         nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
-        height: U64_MAX - sortHeight,
-        blockIndex: expectSafeNumber(U64_MAX - sortIndex, TX_ACTIVITY_SORT_INDEX),
+        height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
+        blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
     };
 }
 
@@ -714,30 +711,30 @@ function activityModeRole(mode: AccountActivityMode): bigint | null {
 }
 
 interface ActivityCursor {
-    readonly sortHeight: bigint;
-    readonly sortIndex: bigint;
+    readonly height: bigint;
+    readonly index: bigint;
     readonly role: bigint;
 }
 
 function activityCursorPredicate(cursor: ActivityCursor): string {
-    const sortHeight = cursor.sortHeight.toString();
-    const sortIndex = cursor.sortIndex.toString();
+    const height = cursor.height.toString();
+    const index = cursor.index.toString();
     const role = cursor.role.toString();
     return `(
-        ${TX_ACTIVITY_SORT_HEIGHT} > ${sortHeight}
-        OR (${TX_ACTIVITY_SORT_HEIGHT} = ${sortHeight} AND ${TX_ACTIVITY_SORT_INDEX} > ${sortIndex})
+        ${TX_ACTIVITY_HEIGHT} < ${height}
+        OR (${TX_ACTIVITY_HEIGHT} = ${height} AND ${TX_ACTIVITY_INDEX} < ${index})
         OR (
-            ${TX_ACTIVITY_SORT_HEIGHT} = ${sortHeight}
-            AND ${TX_ACTIVITY_SORT_INDEX} = ${sortIndex}
-            AND ${TX_ACTIVITY_ROLE} > ${role}
+            ${TX_ACTIVITY_HEIGHT} = ${height}
+            AND ${TX_ACTIVITY_INDEX} = ${index}
+            AND ${TX_ACTIVITY_ROLE} < ${role}
         )
     )`;
 }
 
 function encodeActivityCursor(row: DecodedRow): Uint8Array {
     const cursor = new Uint8Array(ACCOUNT_CURSOR_BYTES);
-    writeU64Be(cursor, 0, expectBigint(row.values[TX_ACTIVITY_SORT_HEIGHT], TX_ACTIVITY_SORT_HEIGHT));
-    writeU64Be(cursor, 8, expectBigint(row.values[TX_ACTIVITY_SORT_INDEX], TX_ACTIVITY_SORT_INDEX));
+    writeU64Be(cursor, 0, expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT));
+    writeU64Be(cursor, 8, expectBigint(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX));
     writeU64Be(cursor, 16, expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE));
     return cursor;
 }
@@ -747,8 +744,8 @@ function decodeActivityCursor(cursor: Uint8Array): ActivityCursor {
         throw new Error('malformed account activity cursor');
     }
     return {
-        sortHeight: readU64Be(cursor, 0),
-        sortIndex: readU64Be(cursor, 8),
+        height: readU64Be(cursor, 0),
+        index: readU64Be(cursor, 8),
         role: readU64Be(cursor, 16),
     };
 }
