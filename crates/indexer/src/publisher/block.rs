@@ -7,7 +7,7 @@ use crate::publisher::{
         encode_tx_activity_row, encode_tx_meta_row,
     },
 };
-use commonware_codec::{Encode, FixedSize};
+use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
@@ -95,13 +95,9 @@ where
         sender.copy_from_slice(tx.sender.as_ref());
         let receiver = tx.to;
         sql.push(encode_tx_meta_row(TxMetaRow {
+            digest,
             height,
             index: idx_u32,
-            digest,
-            sender,
-            receiver,
-            value: tx.value,
-            nonce: tx.nonce,
             qmdb_location,
             body: tx.bytes,
         }));
@@ -210,7 +206,7 @@ where
     Some(IndexedTransaction {
         block_index,
         digest: hasher.finalize(),
-        bytes: transaction.encode().to_vec(),
+        bytes: signed_bytes.to_vec(),
         sender,
         to,
         value,
@@ -225,7 +221,7 @@ fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::TX_ACTIVITY_TABLE;
+    use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
@@ -313,6 +309,7 @@ mod tests {
         let rows = encode_indexed_block_rows(&block);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
+        assert_tx_meta_body(&rows.sql, &transaction);
     }
 
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {
@@ -327,6 +324,27 @@ mod tests {
             panic!("sender activity account should be fixed binary");
         };
         assert_eq!(account.as_slice(), expected_account);
+    }
+
+    fn assert_tx_meta_body(rows: &[SqlRow], expected_body: &[u8]) {
+        let meta = rows
+            .iter()
+            .find(|row| row.table == TX_META_TABLE)
+            .expect("tx_meta row should be indexed");
+        let Some(CellValue::Utf8(body_hex)) = meta.values.get(4) else {
+            panic!("tx_meta body should be hex");
+        };
+        assert_eq!(body_hex, &hex_lower(expected_body));
+    }
+
+    fn hex_lower(bytes: &[u8]) -> String {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut out = String::with_capacity(bytes.len() * 2);
+        for &byte in bytes {
+            out.push(HEX[(byte >> 4) as usize] as char);
+            out.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        out
     }
 
     fn test_header(

@@ -25,6 +25,11 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
+const TRANSACTION_PUBLIC_KEY_BYTES = 34;
+const TRANSACTION_VALUE_BYTES = 8;
+const TRANSACTION_NONCE_BYTES = 8;
+const TRANSACTION_BODY_BYTES =
+    TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 16;
 const ACCOUNT_CURSOR_BYTES = 24;
 
@@ -33,6 +38,7 @@ const TX_META_HEIGHT = 'height';
 const TX_META_INDEX = 'index';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
+const TX_META_BODY_HEX = 'body_hex';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -253,16 +259,21 @@ export async function fetchAndVerifyAccountProof({
 
 export async function fetchAndVerifyTransactionRowProof({
     qmdbUrl,
+    sqlUrl,
     row,
     target,
     signal,
 }: {
     qmdbUrl: string;
+    sqlUrl: string;
     row: AccountTransactionRow;
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
     assertTransactionLocationBeforeTip(row.qmdbLocation, target.transactionsTip);
+    const digestBytes = fromHex(row.digest);
+    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
+    await assertSqlTransactionBodyDigest(sqlUrl, digestBytes, signal);
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
@@ -270,7 +281,7 @@ export async function fetchAndVerifyTransactionRowProof({
         row.qmdbLocation,
         tip,
         target.transactionsRoot,
-        fromHex(row.digest),
+        digestBytes,
         signal,
     );
 
@@ -281,6 +292,37 @@ export async function fetchAndVerifyTransactionRowProof({
         view: target.view,
         proofSizeBytes: verification.proofSizeBytes,
     };
+}
+
+async function assertSqlTransactionBodyDigest(
+    sqlUrl: string,
+    digest: Uint8Array,
+    signal?: AbortSignal,
+): Promise<void> {
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${TX_META_BODY_HEX}
+            FROM ${TX_META_TABLE}
+            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) {
+        throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
+    }
+
+    const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
+    if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
+        throw new Error('SQL transaction body is truncated');
+    }
+    const transactionBody = signedTransaction.slice(0, TRANSACTION_BODY_BYTES);
+    const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(transactionBody)));
+    if (!bytesEqual(actual, digest)) {
+        throw new Error('SQL transaction body does not match transaction digest');
+    }
 }
 
 async function fetchTransactionProofMetadata(
@@ -751,6 +793,17 @@ function expectBytes(value: CellValue, column: string, length: number): Uint8Arr
     }
     assertByteLength(value, length, column);
     return value;
+}
+
+function expectHexBytes(value: CellValue, column: string): Uint8Array {
+    if (typeof value !== 'string') {
+        throw new Error(`SQL column ${column} must be Utf8 hex`);
+    }
+    const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
+    if (!/^[0-9a-f]*$/.test(normalized) || normalized.length % 2 !== 0) {
+        throw new Error(`SQL column ${column} must be even-length hex`);
+    }
+    return fromHex(normalized);
 }
 
 function assertByteLength(bytes: Uint8Array, length: number, field: string) {

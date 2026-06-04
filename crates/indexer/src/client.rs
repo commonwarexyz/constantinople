@@ -8,14 +8,14 @@
 
 use crate::{codec, publisher::certificate::CertifiedHeader, sql_schema::build_meta_schema};
 use bytes::Bytes;
-use commonware_codec::Read;
+use commonware_codec::{FixedSize as _, Read};
 use commonware_consensus::{
     Heightable,
     types::{Height, View, coding::Commitment},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use constantinople_primitives::{BlockCfg, SignedTransaction};
+use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
 use datafusion::{
     arrow::array::{Array, StringArray},
     prelude::SessionContext,
@@ -260,11 +260,14 @@ impl IndexerClient {
             .await
     }
 
-    /// Fetch the encoded transaction for `digest`, or `None` if absent.
-    pub async fn transaction_bytes<D: Digest>(
-        &self,
-        digest: &D,
-    ) -> Result<Option<Bytes>, ReadError> {
+    /// Fetch the encoded signed transaction for `digest`, or `None` if absent.
+    ///
+    /// SQL bytes are accepted only if the fixed transaction body prefix hashes
+    /// back to `digest`.
+    pub async fn transaction_bytes<H>(&self, digest: &H::Digest) -> Result<Option<Bytes>, ReadError>
+    where
+        H: Hasher,
+    {
         let sql = format!(
             "SELECT body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
             hex_lower(digest.as_ref())
@@ -284,7 +287,9 @@ impl IndexerClient {
                     "tx_meta.body_hex must not be null".to_string(),
                 ));
             }
-            return Ok(Some(Bytes::from(decode_hex(body_hex.value(0))?)));
+            let bytes = decode_hex(body_hex.value(0))?;
+            verify_signed_transaction_digest::<H>(&bytes, digest)?;
+            return Ok(Some(Bytes::from(bytes)));
         }
         Ok(None)
     }
@@ -297,7 +302,7 @@ impl IndexerClient {
     where
         H: Hasher,
     {
-        let Some(bytes) = self.transaction_bytes(digest).await? else {
+        let Some(bytes) = self.transaction_bytes::<H>(digest).await? else {
             return Ok(None);
         };
         Ok(Some(codec::from_bytes::<SignedTransaction<H>>(
@@ -388,5 +393,64 @@ fn decode_hex_nibble(byte: u8) -> Result<u8, ReadError> {
         _ => Err(ReadError::Hex(format!(
             "invalid hex character 0x{byte:02x}"
         ))),
+    }
+}
+
+fn verify_signed_transaction_digest<H>(bytes: &[u8], digest: &H::Digest) -> Result<(), ReadError>
+where
+    H: Hasher,
+{
+    let body_len = Transaction::<H::Digest>::SIZE;
+    if bytes.len() < body_len {
+        return Err(ReadError::SqlRow(format!(
+            "tx_meta.body_hex signed transaction is {} bytes, shorter than {body_len}-byte transaction body",
+            bytes.len()
+        )));
+    }
+
+    let mut hasher = H::new();
+    hasher.update(&bytes[..body_len]);
+    let actual = hasher.finalize();
+    if actual.as_ref() != digest.as_ref() {
+        return Err(ReadError::SqlRow(
+            "tx_meta.body_hex transaction body does not match tx_digest".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_cryptography::{sha256, sha256::Sha256};
+
+    #[test]
+    fn verifies_signed_transaction_bytes_against_digest() {
+        let mut bytes = vec![7u8; Transaction::<sha256::Digest>::SIZE + 1];
+        let digest = digest_transaction_body(&bytes);
+
+        verify_signed_transaction_digest::<Sha256>(&bytes, &digest).expect("digest matches");
+
+        bytes[0] ^= 1;
+        let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
+            .expect_err("mutated body should be rejected");
+        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("does not match")));
+    }
+
+    #[test]
+    fn rejects_signed_transaction_bytes_without_full_body() {
+        let bytes = vec![0u8; Transaction::<sha256::Digest>::SIZE - 1];
+        let digest = digest_transaction_body(&bytes);
+
+        let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
+            .expect_err("truncated body should be rejected");
+        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("shorter")));
+    }
+
+    fn digest_transaction_body(bytes: &[u8]) -> sha256::Digest {
+        let body_len = Transaction::<sha256::Digest>::SIZE.min(bytes.len());
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes[..body_len]);
+        hasher.finalize()
     }
 }

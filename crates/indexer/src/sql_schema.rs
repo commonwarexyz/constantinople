@@ -21,7 +21,7 @@
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::StoreClient;
-use exoware_sql::{IndexSpec, KvSchema, TableColumnConfig};
+use exoware_sql::{KvSchema, TableColumnConfig};
 
 /// Name of the SQL table that the explorer subscribes to.
 pub const BLOCK_META_TABLE: &str = "block_meta";
@@ -52,26 +52,16 @@ pub const BLOCK_META_FINALIZED_TS: &str = "finalized_ts";
 
 // ---------- tx_meta columns ----------
 
-/// `tx_meta`: containing block height (composite primary key, first column).
-pub const TX_META_HEIGHT: &str = "height";
-/// `tx_meta`: per-block transaction index (composite primary key, second column).
-pub const TX_META_INDEX: &str = "index";
 /// `tx_meta`: 32-byte transaction digest, fixed-size binary.
 pub const TX_META_DIGEST: &str = "tx_digest";
-/// `tx_meta`: sender account key, fixed-size binary.
-pub const TX_META_SENDER: &str = "sender";
-/// `tx_meta`: receiver account key, fixed-size binary.
-pub const TX_META_RECEIVER: &str = "receiver";
-/// `tx_meta`: transfer value.
-pub const TX_META_VALUE: &str = "value";
-/// `tx_meta`: sender nonce.
-pub const TX_META_NONCE: &str = "nonce";
+/// `tx_meta`: containing block height.
+pub const TX_META_HEIGHT: &str = "height";
+/// `tx_meta`: per-block transaction index.
+pub const TX_META_INDEX: &str = "index";
 /// `tx_meta`: transaction-hash QMDB operation location for this digest.
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
-/// `tx_meta`: encoded `SignedTransaction` bytes as lowercase hex.
+/// `tx_meta`: encoded signed transaction bytes as lowercase hex.
 pub const TX_META_BODY_HEX: &str = "body_hex";
-/// `tx_meta`: secondary index used to resolve proof metadata by digest.
-pub const TX_META_DIGEST_INDEX: &str = "tx_meta_by_digest";
 
 // ---------- tx_activity columns ----------
 
@@ -97,8 +87,6 @@ pub const TX_ACTIVITY_VALUE: &str = "value";
 pub const TX_ACTIVITY_NONCE: &str = "nonce";
 /// `tx_activity`: transaction-hash QMDB operation location for this digest.
 pub const TX_ACTIVITY_QMDB_LOCATION: &str = "qmdb_location";
-/// `tx_activity`: secondary index used for sender-only or receiver-only pages.
-pub const TX_ACTIVITY_ROLE_INDEX: &str = "tx_activity_by_role";
 
 // ---------- account_meta columns ----------
 
@@ -113,9 +101,8 @@ pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
-/// The returned schema declares both [`BLOCK_META_TABLE`] and
-/// [`TX_META_TABLE`] on top of the supplied [`StoreClient`]. Callers can
-/// either:
+/// The returned schema declares all metadata tables on top of the supplied
+/// [`StoreClient`]. Callers can either:
 ///
 /// - Hand the schema to a fresh [`SessionContext`] via
 ///   [`KvSchema::register_all`] (the `exoware-sql` SQL server does this),
@@ -153,21 +140,14 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
         .table(
             TX_META_TABLE,
             vec![
+                TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(TX_META_HEIGHT, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_INDEX, DataType::UInt64, false),
-                TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
-                TableColumnConfig::new(TX_META_SENDER, DataType::FixedSizeBinary(32), false),
-                TableColumnConfig::new(TX_META_RECEIVER, DataType::FixedSizeBinary(32), false),
-                TableColumnConfig::new(TX_META_VALUE, DataType::UInt64, false),
-                TableColumnConfig::new(TX_META_NONCE, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_BODY_HEX, DataType::Utf8, false),
             ],
-            vec![TX_META_HEIGHT.to_string(), TX_META_INDEX.to_string()],
-            vec![
-                IndexSpec::lexicographic(TX_META_DIGEST_INDEX, vec![TX_META_DIGEST.to_string()])?
-                    .with_cover_columns(vec![TX_META_QMDB_LOCATION.to_string()]),
-            ],
+            vec![TX_META_DIGEST.to_string()],
+            vec![],
         )
         .and_then(|schema| {
             schema.table(
@@ -203,26 +183,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                     TX_ACTIVITY_SORT_INDEX.to_string(),
                     TX_ACTIVITY_ROLE.to_string(),
                 ],
-                vec![
-                    IndexSpec::lexicographic(
-                        TX_ACTIVITY_ROLE_INDEX,
-                        vec![
-                            TX_ACTIVITY_ACCOUNT.to_string(),
-                            TX_ACTIVITY_ROLE.to_string(),
-                            TX_ACTIVITY_SORT_HEIGHT.to_string(),
-                            TX_ACTIVITY_SORT_INDEX.to_string(),
-                        ],
-                    )?
-                    .with_cover_columns(vec![
-                        TX_ACTIVITY_HEIGHT.to_string(),
-                        TX_ACTIVITY_INDEX.to_string(),
-                        TX_ACTIVITY_DIGEST.to_string(),
-                        TX_ACTIVITY_COUNTERPARTY.to_string(),
-                        TX_ACTIVITY_VALUE.to_string(),
-                        TX_ACTIVITY_NONCE.to_string(),
-                        TX_ACTIVITY_QMDB_LOCATION.to_string(),
-                    ]),
-                ],
+                vec![],
             )
         })
         .and_then(|schema| {
@@ -249,7 +210,7 @@ mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
 
-    /// `build_meta_schema` must register both tables onto a fresh
+    /// `build_meta_schema` must register all metadata tables onto a fresh
     /// `SessionContext` without error.
     #[tokio::test]
     async fn schema_registers_into_session_context() {
@@ -258,7 +219,7 @@ mod tests {
         let ctx = SessionContext::new();
         schema.register_all(&ctx).expect("register");
 
-        // Both tables must be visible to the catalog after registration.
+        // All tables must be visible to the catalog after registration.
         let tables = ctx
             .catalog("datafusion")
             .expect("default catalog")
@@ -298,16 +259,11 @@ mod tests {
         assert_eq!(BLOCK_META_TRANSACTIONS_TIP, "transactions_tip");
         assert_eq!(BLOCK_META_VIEW, "view");
         assert_eq!(BLOCK_META_FINALIZED_TS, "finalized_ts");
+        assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_HEIGHT, "height");
         assert_eq!(TX_META_INDEX, "index");
-        assert_eq!(TX_META_DIGEST, "tx_digest");
-        assert_eq!(TX_META_SENDER, "sender");
-        assert_eq!(TX_META_RECEIVER, "receiver");
-        assert_eq!(TX_META_VALUE, "value");
-        assert_eq!(TX_META_NONCE, "nonce");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_META_BODY_HEX, "body_hex");
-        assert_eq!(TX_META_DIGEST_INDEX, "tx_meta_by_digest");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
         assert_eq!(TX_ACTIVITY_SORT_HEIGHT, "sort_height");
         assert_eq!(TX_ACTIVITY_SORT_INDEX, "sort_index");
@@ -319,7 +275,6 @@ mod tests {
         assert_eq!(TX_ACTIVITY_VALUE, "value");
         assert_eq!(TX_ACTIVITY_NONCE, "nonce");
         assert_eq!(TX_ACTIVITY_QMDB_LOCATION, "qmdb_location");
-        assert_eq!(TX_ACTIVITY_ROLE_INDEX, "tx_activity_by_role");
         assert_eq!(ACCOUNT_META_ACCOUNT, "account");
         assert_eq!(ACCOUNT_META_BALANCE, "balance");
         assert_eq!(ACCOUNT_META_NONCE, "nonce");

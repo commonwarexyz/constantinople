@@ -32,14 +32,13 @@ The current SQL table-prefix allocation is:
 | SQL table | Table prefix | Secondary indexes |
 | --------- | ------------ | ----------------- |
 | `block_meta` | `0x0` | none |
-| `tx_meta` | `0x1` | `tx_meta_by_digest` |
-| `tx_activity` | `0x2` | `tx_activity_by_role` |
+| `tx_meta` | `0x1` | none |
+| `tx_activity` | `0x2` | none |
 | `account_meta` | `0x3` | none |
 
-`exoware-sql` expands those table prefixes into its Store key layout: primary
-rows reserve 5 high-order key bits (`table_prefix << 1`), while secondary index
-rows reserve 9 high-order key bits (`table_prefix`, index-kind bit, and index
-slot).
+`exoware-sql` expands those table prefixes into its Store key layout. There are
+currently no secondary SQL index rows, so finalized-block SQL writes only add
+primary table rows.
 
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate; height/latest reads start from a

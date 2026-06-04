@@ -401,6 +401,7 @@ export default function App() {
                     page.rows.map((row) =>
                         retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
                             qmdbUrl,
+                            sqlUrl: indexerUrl,
                             row,
                             target: accountTarget,
                             signal: controller.signal,

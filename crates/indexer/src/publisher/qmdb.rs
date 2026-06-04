@@ -1665,13 +1665,9 @@ mod tests {
             super::super::SqlRow {
                 table: TX_META_TABLE,
                 values: vec![
+                    CellValue::FixedBinary(vec![3u8; 32]),
                     CellValue::UInt64(1),
                     CellValue::UInt64(0),
-                    CellValue::FixedBinary(vec![3u8; 32]),
-                    CellValue::FixedBinary(vec![4u8; 32]),
-                    CellValue::FixedBinary(vec![5u8; 32]),
-                    CellValue::UInt64(7),
-                    CellValue::UInt64(8),
                     CellValue::UInt64(1),
                     CellValue::Utf8("010203".to_string()),
                 ],
@@ -1684,9 +1680,9 @@ mod tests {
             .stage_flush(&prepared, &mut batch)
             .expect("sql rows stage");
 
-        // One block_meta row and tx_meta base + digest index rows.
-        assert_eq!(batch.len(), 3);
-        assert_eq!(prepared.entry_count(), 3);
+        // One block_meta row and one digest-keyed tx_meta row.
+        assert_eq!(batch.len(), 2);
+        assert_eq!(prepared.entry_count(), 2);
     }
 
     #[test]
