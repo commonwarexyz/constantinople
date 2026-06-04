@@ -40,7 +40,6 @@ use commonware_utils::{
 };
 use constantinople_application::consensus::TransactionHistoryDb;
 use constantinople_indexer::{
-    keys,
     publisher::{
         SqlRow,
         qmdb::{
@@ -48,7 +47,7 @@ use constantinople_indexer::{
             transactions_qmdb_client,
         },
     },
-    sql_schema::{BLOCK_META_TABLE, build_meta_schema},
+    sql_schema::{BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE, build_meta_schema},
 };
 use constantinople_primitives::{
     Account, AccountKey, Block, Header, Sealable, SealedBlock, SignedTransaction,
@@ -56,7 +55,7 @@ use constantinople_primitives::{
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use exoware_qmdb::{KeylessWriter, UnorderedWriter};
-use exoware_sdk::{RetryConfig, StoreClient, StoreWriteBatch, keys::Key};
+use exoware_sdk::{RetryConfig, StoreClient, StoreWriteBatch};
 use exoware_sql::{BatchWriter, CellValue};
 use std::{
     hint::black_box,
@@ -110,16 +109,16 @@ type BenchApplicationBlock = SealedBlock<Commitment, ed25519::PublicKey, Sha256>
 type BenchQueuedUpload = QueuedFinalizedUpload<Sha256, ed25519::PublicKey>;
 type BenchCursorMetadata = Metadata<RuntimeContext, U64, U64>;
 
-fn bench_raw_sql_upload(c: &mut Criterion) {
+fn bench_sql_metadata_upload(c: &mut Criterion) {
     let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
     let store = runtime.block_on(spawn_store());
-    let mut group = c.benchmark_group("indexer/raw_sql_upload");
+    let mut group = c.benchmark_group("indexer/sql_metadata_upload");
 
     for tx_count in TX_COUNTS {
         group.throughput(Throughput::Elements(tx_count as u64));
 
         group.bench_with_input(
-            BenchmarkId::new("separate_commits", tx_count),
+            BenchmarkId::new("flush", tx_count),
             &tx_count,
             |bencher, &tx_count| {
                 let mut next_height = 1u64;
@@ -130,9 +129,7 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
                         for _ in 0..iterations {
                             let height = next_height;
                             next_height += 1;
-                            let raw = raw_rows(height, tx_count);
                             let sql = sql_rows(height, tx_count);
-                            upload_raw(&store.client, &raw).await;
                             upload_sql(&mut writer, &sql).await;
                         }
                         start.elapsed()
@@ -142,7 +139,7 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
         );
 
         group.bench_with_input(
-            BenchmarkId::new("combined_store_batch", tx_count),
+            BenchmarkId::new("staged_store_batch", tx_count),
             &tx_count,
             |bencher, &tx_count| {
                 let mut next_height = 1_000_000u64;
@@ -153,9 +150,8 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
                         for _ in 0..iterations {
                             let height = next_height;
                             next_height += 1;
-                            let raw = raw_rows(height, tx_count);
                             let sql = sql_rows(height, tx_count);
-                            upload_combined(&store.client, &mut writer, raw, sql).await;
+                            upload_combined(&store.client, &mut writer, sql).await;
                         }
                         start.elapsed()
                     })
@@ -169,7 +165,7 @@ fn bench_raw_sql_upload(c: &mut Criterion) {
                 .expect("benchmark throughput fits usize") as u64,
         ));
         group.bench_with_input(
-            BenchmarkId::new("combined_store_batch_8_blocks", tx_count),
+            BenchmarkId::new("staged_store_batch_8_blocks", tx_count),
             &tx_count,
             |bencher, &tx_count| {
                 let mut next_height = 2_000_000u64;
@@ -737,40 +733,19 @@ fn build_writer(client: &StoreClient) -> BatchWriter {
         .batch_writer()
 }
 
-async fn upload_raw(client: &StoreClient, rows: &[(Key, Bytes)]) {
-    let kvs: Vec<(&Key, &[u8])> = rows
-        .iter()
-        .map(|(key, value)| (key, value.as_ref()))
-        .collect();
-    client.ingest().put(&kvs).await.expect("raw upload");
-}
-
 async fn upload_sql(writer: &mut BatchWriter, rows: &[SqlRow]) {
     insert_sql_rows(writer, rows);
     writer.flush().await.expect("sql flush");
 }
 
-fn stage_raw_rows(client: &StoreClient, batch: &mut StoreWriteBatch, rows: Vec<(Key, Bytes)>) {
-    batch.reserve(rows.len());
-    for (key, value) in rows {
-        batch.push(client, &key, value).expect("raw row stages");
-    }
-}
-
-async fn upload_combined(
-    client: &StoreClient,
-    writer: &mut BatchWriter,
-    raw: Vec<(Key, Bytes)>,
-    sql: Vec<SqlRow>,
-) {
+async fn upload_combined(client: &StoreClient, writer: &mut BatchWriter, sql: Vec<SqlRow>) {
     insert_sql_rows(writer, &sql);
     let prepared = writer
         .prepare_flush()
         .expect("sql prepare")
         .expect("sql rows are present");
     let mut batch = StoreWriteBatch::new();
-    batch.reserve(raw.len().saturating_add(prepared.entry_count()));
-    stage_raw_rows(client, &mut batch, raw);
+    batch.reserve(prepared.entry_count());
     writer
         .stage_flush(&prepared, &mut batch)
         .expect("sql rows stage");
@@ -785,14 +760,12 @@ async fn upload_combined_blocks(
     tx_count: usize,
     block_count: usize,
 ) {
-    let mut raw = Vec::with_capacity(block_count * (2 + 2 * tx_count));
-    let mut sql = Vec::with_capacity(block_count * (1 + tx_count));
+    let mut sql = Vec::with_capacity(block_count * (1 + 3 * tx_count));
     for offset in 0..block_count {
         let height = start_height + offset as u64;
-        raw.extend(raw_rows(height, tx_count));
         sql.extend(sql_rows(height, tx_count));
     }
-    upload_combined(client, writer, raw, sql).await;
+    upload_combined(client, writer, sql).await;
 }
 
 async fn upload_synthetic_full(
@@ -806,7 +779,6 @@ async fn upload_synthetic_full(
     let transaction_writer = Arc::new(BenchTransactionWriter::empty(
         qmdb.transaction_client.clone(),
     ));
-    let raw = raw_rows(height, tx_count);
     let sql = sql_rows(height, tx_count);
     insert_sql_rows(writer, &sql);
     let prepared_sql = writer
@@ -839,8 +811,7 @@ async fn upload_synthetic_full(
         .await
         .expect("transaction watermark prepares");
     let mut batch = StoreWriteBatch::new();
-    batch.reserve(raw.len().saturating_add(prepared_sql.entry_count()));
-    stage_raw_rows(client, &mut batch, raw);
+    batch.reserve(prepared_sql.entry_count());
     writer
         .stage_flush(&prepared_sql, &mut batch)
         .expect("sql rows stage");
@@ -891,33 +862,9 @@ fn insert_sql_rows(writer: &mut BatchWriter, rows: &[SqlRow]) {
     }
 }
 
-fn raw_rows(height: u64, tx_count: usize) -> Vec<(Key, Bytes)> {
-    let block_digest = digest(height);
-    let mut rows = Vec::with_capacity(2 + 2 * tx_count);
-    rows.push((
-        keys::block(&block_digest).expect("block key"),
-        Bytes::from(block_digest.to_vec()),
-    ));
-    rows.push((
-        keys::block_by_height(height).expect("block height key"),
-        Bytes::copy_from_slice(&block_digest),
-    ));
-    for idx in 0..tx_count {
-        let tx_digest = digest(height ^ (idx as u64).rotate_left(17));
-        rows.push((
-            keys::tx(&tx_digest).expect("tx key"),
-            Bytes::copy_from_slice(&tx_digest),
-        ));
-        rows.push((
-            keys::tx_by_height(height, idx as u32).expect("tx height key"),
-            Bytes::copy_from_slice(&tx_digest),
-        ));
-    }
-    rows
-}
-
 fn sql_rows(height: u64, tx_count: usize) -> Vec<SqlRow> {
-    vec![SqlRow {
+    let mut rows = Vec::with_capacity(1 + 3 * tx_count);
+    rows.push(SqlRow {
         table: BLOCK_META_TABLE,
         values: vec![
             CellValue::UInt64(height),
@@ -928,7 +875,85 @@ fn sql_rows(height: u64, tx_count: usize) -> Vec<SqlRow> {
             CellValue::UInt64(0),
             CellValue::Timestamp(height as i64),
         ],
-    }]
+    });
+    for idx in 0..tx_count {
+        let tx_digest = digest(height ^ (idx as u64).rotate_left(17));
+        let sender = digest((idx as u64).rotate_left(7));
+        let receiver = digest((idx as u64).rotate_left(11) ^ 0xA5);
+        let qmdb_location = height
+            .saturating_mul(tx_count as u64 + 1)
+            .saturating_add(idx as u64);
+        rows.push(SqlRow {
+            table: TX_META_TABLE,
+            values: vec![
+                CellValue::UInt64(height),
+                CellValue::UInt64(idx as u64),
+                CellValue::FixedBinary(tx_digest.to_vec()),
+                CellValue::FixedBinary(sender.to_vec()),
+                CellValue::FixedBinary(receiver.to_vec()),
+                CellValue::UInt64(idx as u64 + 1),
+                CellValue::UInt64(idx as u64),
+                CellValue::UInt64(qmdb_location),
+                CellValue::Utf8(hex_lower(&tx_digest)),
+            ],
+        });
+        rows.push(activity_row(
+            sender,
+            0,
+            height,
+            idx,
+            tx_digest,
+            receiver,
+            qmdb_location,
+        ));
+        rows.push(activity_row(
+            receiver,
+            1,
+            height,
+            idx,
+            tx_digest,
+            sender,
+            qmdb_location,
+        ));
+    }
+    rows
+}
+
+fn activity_row(
+    account: [u8; 32],
+    role: u64,
+    height: u64,
+    idx: usize,
+    tx_digest: [u8; 32],
+    counterparty: [u8; 32],
+    qmdb_location: u64,
+) -> SqlRow {
+    SqlRow {
+        table: TX_ACTIVITY_TABLE,
+        values: vec![
+            CellValue::FixedBinary(account.to_vec()),
+            CellValue::UInt64(u64::MAX - height),
+            CellValue::UInt64(u64::MAX - idx as u64),
+            CellValue::UInt64(role),
+            CellValue::UInt64(height),
+            CellValue::UInt64(idx as u64),
+            CellValue::FixedBinary(tx_digest.to_vec()),
+            CellValue::FixedBinary(counterparty.to_vec()),
+            CellValue::UInt64(idx as u64 + 1),
+            CellValue::UInt64(idx as u64),
+            CellValue::UInt64(qmdb_location),
+        ],
+    }
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 fn digest(seed: u64) -> [u8; 32] {
@@ -986,6 +1011,6 @@ criterion_group! {
     config = Criterion::default()
         .sample_size(10)
         .measurement_time(Duration::from_secs(3));
-    targets = bench_raw_sql_upload, bench_finalized_upload_admission, bench_qmdb_writer_upload, bench_synthetic_full_upload_commit, bench_finalized_state_capture
+    targets = bench_sql_metadata_upload, bench_finalized_upload_admission, bench_qmdb_writer_upload, bench_synthetic_full_upload_commit, bench_finalized_state_capture
 }
 criterion_main!(benches);

@@ -20,7 +20,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, coding::Commitment},
 };
 use commonware_cryptography::{
-    PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
+    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
 };
 use commonware_glue::stateful::Stateful;
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
@@ -28,11 +28,14 @@ use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
     Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
-use constantinople_primitives::{Account, AccountKey, Block, Sealed};
+use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
 use std::{marker::PhantomData, sync::Arc};
 
 /// A finalized block with its seal (commitment-based).
 pub type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
+
+/// The digestible execution header portion of an [`EngineBlock`].
+pub type EngineHeader<H, P> = Sealed<Header<Commitment, <H as Hasher>::Digest, P>, H>;
 
 /// The erasure-coding variant used by the marshal for block availability.
 pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;

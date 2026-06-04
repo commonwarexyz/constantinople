@@ -52,6 +52,23 @@ where
     }
 }
 
+impl<C, D, P> Sealable for Header<C, D, P>
+where
+    C: Digest,
+    D: Digest,
+    P: PublicKey,
+{
+    type SealDigest = D;
+
+    fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H>
+    where
+        Self: Sized,
+    {
+        let digest = self.hash_slow(hasher);
+        Sealed::new_unchecked(self, digest)
+    }
+}
+
 impl<C, D, P> EncodeSize for Header<C, D, P>
 where
     C: Digest,
@@ -290,6 +307,17 @@ where
     }
 }
 
+impl<C, P, H> Heightable for Sealed<Header<C, H::Digest, P>, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fn height(&self) -> Height {
+        Height::new(self.height)
+    }
+}
+
 impl<C, P, H> ConsensusBlock for Sealed<Block<C, P, H>, H>
 where
     C: Digest,
@@ -298,6 +326,17 @@ where
 {
     fn parent(&self) -> Self::Digest {
         self.header.parent
+    }
+}
+
+impl<C, P, H> ConsensusBlock for Sealed<Header<C, H::Digest, P>, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fn parent(&self) -> Self::Digest {
+        self.parent
     }
 }
 
@@ -311,6 +350,19 @@ where
 
     fn context(&self) -> Self::Context {
         self.header.context.clone()
+    }
+}
+
+impl<C, P, H> CertifiableBlock for Sealed<Header<C, H::Digest, P>, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    type Context = Context<C, P>;
+
+    fn context(&self) -> Self::Context {
+        self.context.clone()
     }
 }
 

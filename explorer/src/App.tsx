@@ -10,7 +10,7 @@ import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
     encodeTransactionBatch,
-    parsePublicKeyHex,
+    parseAccountKeyHex,
     parseU64,
     toHex,
 } from './codec';
@@ -28,6 +28,7 @@ import {
     fetchAndVerifyTransactionProof,
     fetchAndVerifyTransactionRowProof,
     fetchLatestProofTarget,
+    type AccountActivityMode,
     type AccountTransactionRow,
     type LatestProofTarget,
     type VerifiedAccountProof,
@@ -37,6 +38,7 @@ import { isRetryableAccountProofError, isRetryableProofError } from './proofRetr
 import {
     clearSession,
     createWallet,
+    restoreWalletSession,
     signInWithPasskey,
     type ActiveWallet,
 } from './wallet';
@@ -83,7 +85,7 @@ function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
 }
 
 interface SubmittedTransaction {
-    readonly sender: string | null;
+    readonly sender: string;
     readonly digest: string;
     readonly to: string;
     readonly value: string;
@@ -163,6 +165,7 @@ export default function App() {
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
+    const [walletAccountKey, setWalletAccountKey] = useState<string | null>(null);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
@@ -181,21 +184,21 @@ export default function App() {
         detail: 'enter an account',
     });
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountActivityError, setAccountActivityError] = useState('');
+    const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
-    const [copiedValue, setCopiedValue] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
-    const copiedValueTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
         accountMessage === 'loading account metadata' ||
         isSubmitting;
     const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
-    const signedInPublicKey = wallet?.publicKeyHex ?? null;
+    const signedInAccountKey = walletAccountKey;
     const historyKey = submittedTransactionHistoryKey(
         {
             indexerUrl,
@@ -204,7 +207,7 @@ export default function App() {
             mempoolUrl,
             simplexVerificationMaterial,
         },
-        signedInPublicKey,
+        signedInAccountKey,
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
@@ -233,6 +236,13 @@ export default function App() {
             setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
         }, BLOCK_FLUSH_INTERVAL_MS);
     };
+
+    useEffect(() => {
+        const restoredWallet = restoreWalletSession();
+        if (!restoredWallet) return;
+        setWallet(restoredWallet);
+        setWalletMessage('signed in');
+    }, []);
 
     useEffect(() => {
         const controller = new AbortController();
@@ -270,6 +280,29 @@ export default function App() {
     }, [historyKey]);
 
     useEffect(() => {
+        if (!wallet) {
+            setWalletAccountKey(null);
+            return;
+        }
+
+        let cancelled = false;
+        accountKeyFromPublicKey(wallet.publicKey)
+            .then((accountKey) => {
+                if (cancelled) return;
+                setWalletAccountKey(toHex(accountKey));
+            })
+            .catch((error) => {
+                if (cancelled) return;
+                setWalletAccountKey(null);
+                setWalletMessage(error instanceof Error ? error.message : String(error));
+            });
+
+        return () => {
+            cancelled = true;
+        };
+    }, [wallet]);
+
+    useEffect(() => {
         if (historyKey === null) return;
         if (loadedHistoryKey !== historyKey) return;
         writeHistory(historyKey, history);
@@ -290,49 +323,29 @@ export default function App() {
         if (!lookupAccount) {
             setAccountTarget(null);
             setAccountProof({ status: 'waiting', detail: 'enter an account' });
-            setAccountTransactions([]);
-            setAccountNextCursor(null);
             return;
         }
 
         const controller = new AbortController();
         setAccountTarget(null);
         setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
-        setAccountTransactions([]);
-        setAccountNextCursor(null);
 
-        const fetchPage = fetchAccountTransactionsPage({
-            storeUrl,
-            account: lookupAccount,
-            cursor: currentAccountCursor,
-        }).then((page) => {
-            if (controller.signal.aborted) return null;
-            setAccountNextCursor(page.nextCursor);
-            setAccountTransactions(page.rows.map((row) => ({
-                row,
-                proof: { status: 'waiting', detail: 'waiting for latest finalization' },
-            })));
-            return page;
-        });
-
-        const fetchTargetAndProof = retryAccountPageStep(async () => {
+        retryAccountPageStep(async () => {
             const target = await fetchLatestProofTarget({
                 storeUrl,
                 simplexVerificationMaterial,
                 signal: controller.signal,
             });
             const proof = await fetchAndVerifyAccountProof({
-                        qmdbUrl,
-                        storeUrl,
-                        account: lookupAccount,
-                        target,
-                        signal: controller.signal,
+                qmdbUrl,
+                sqlUrl: indexerUrl,
+                account: lookupAccount,
+                target,
+                signal: controller.signal,
             });
             return { target, proof };
-        }, controller.signal);
-
-        Promise.all([fetchPage, fetchTargetAndProof])
-            .then(([page, { target, proof }]) => {
+        }, controller.signal)
+            .then(({ target, proof }) => {
                 if (controller.signal.aborted) return;
                 setAccountProof({
                     status: 'verified',
@@ -340,24 +353,61 @@ export default function App() {
                     ...proof,
                 });
                 setAccountTarget(target);
-                if (!page) return [];
+            })
+            .catch((error) => {
+                if (controller.signal.aborted) return;
+                setAccountProof({
+                    status: 'error',
+                    detail: error instanceof Error ? error.message : String(error),
+                });
+            });
+
+        return () => controller.abort();
+    }, [lookupAccount]);
+
+    useEffect(() => {
+        if (!lookupAccount) {
+            setAccountTransactions([]);
+            setAccountNextCursor(null);
+            setAccountActivityError('');
+            return;
+        }
+
+        const controller = new AbortController();
+        setAccountTransactions([]);
+        setAccountNextCursor(null);
+        setAccountActivityError('');
+
+        fetchAccountTransactionsPage({
+            sqlUrl: indexerUrl,
+            account: lookupAccount,
+            cursor: currentAccountCursor,
+            mode: accountActivityMode,
+        })
+            .then(async (page) => {
+                if (controller.signal.aborted) return;
+                setAccountNextCursor(page.nextCursor);
+                setAccountTransactions(page.rows.map((row) => ({
+                    row,
+                    proof: { status: 'waiting', detail: 'waiting for latest finalization' },
+                })));
+                if (!accountTarget) return;
+
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
                     proof: { status: 'fetching', detail: 'fetching transaction proof' },
                 })));
-                return Promise.allSettled(
+                const results = await Promise.allSettled(
                     page.rows.map((row) =>
                         retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
                             qmdbUrl,
                             row,
-                            target,
+                            target: accountTarget,
                             signal: controller.signal,
                         }), controller.signal),
                     ),
                 );
-            })
-            .then((results) => {
-                if (!results || controller.signal.aborted) return;
+                if (controller.signal.aborted) return;
                 setAccountTransactions((current) =>
                     current.map((entry, index) => {
                         const result = results[index];
@@ -372,17 +422,16 @@ export default function App() {
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
-                setAccountProof({
-                    status: 'error',
-                    detail: error instanceof Error ? error.message : String(error),
-                });
+                setAccountTransactions([]);
+                setAccountNextCursor(null);
+                setAccountActivityError(error instanceof Error ? error.message : String(error));
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
 
     useEffect(() => {
-        const signedInSender = wallet?.publicKeyHex ?? null;
+        const signedInSender = signedInAccountKey;
         if (hasFetchingProof(history, signedInSender)) return;
 
         const tx = history.find((entry) => shouldFetchTransactionProof(entry, signedInSender));
@@ -398,6 +447,7 @@ export default function App() {
         fetchAndVerifyTransactionProof({
             qmdbUrl,
             storeUrl,
+            sqlUrl: indexerUrl,
             simplexVerificationMaterial,
             digest: tx.digest,
             height: tx.finalizedHeight,
@@ -450,15 +500,12 @@ export default function App() {
                     ),
                 );
             });
-    }, [history, wallet]);
+    }, [history, signedInAccountKey]);
 
     useEffect(() => {
         return () => {
             if (blockFlushTimeoutRef.current !== null) {
                 window.clearTimeout(blockFlushTimeoutRef.current);
-            }
-            if (copiedValueTimeoutRef.current !== null) {
-                window.clearTimeout(copiedValueTimeoutRef.current);
             }
             if (copyToastTimeoutRef.current !== null) {
                 window.clearTimeout(copyToastTimeoutRef.current);
@@ -545,19 +592,11 @@ export default function App() {
     const copyValue = async (value: string) => {
         try {
             await navigator.clipboard.writeText(value);
-            if (copiedValueTimeoutRef.current !== null) {
-                window.clearTimeout(copiedValueTimeoutRef.current);
-            }
             if (copyToastTimeoutRef.current !== null) {
                 window.clearTimeout(copyToastTimeoutRef.current);
             }
 
-            setCopiedValue(value);
             setCopyToast(`copied "${value}" to clipboard`);
-            copiedValueTimeoutRef.current = window.setTimeout(() => {
-                setCopiedValue((current) => (current === value ? '' : current));
-                copiedValueTimeoutRef.current = null;
-            }, 1_000);
             copyToastTimeoutRef.current = window.setTimeout(() => {
                 setCopyToast('');
                 copyToastTimeoutRef.current = null;
@@ -574,10 +613,10 @@ export default function App() {
         }
     };
 
-    const submitAccountLookup = async () => {
-        const normalized = await normalizeAccountInput(accountInput);
+    const submitAccountLookup = () => {
+        const normalized = normalizeAccountInput(accountInput);
         if (!normalized) {
-            setSearchMessage('expected a 32-byte account key or 34-byte transaction public key');
+            setSearchMessage('expected a 32-byte account key');
             return;
         }
         setSearchMessage('');
@@ -597,7 +636,10 @@ export default function App() {
         setSearchMessage('');
         const url = new URL(window.location.href);
         url.searchParams.delete('account');
-        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+        const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+        if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+            window.history.pushState(null, '', nextLocation);
+        }
     };
 
     const nextAccountPage = () => {
@@ -609,28 +651,45 @@ export default function App() {
         setAccountCursorStack((current) => current.length <= 1 ? current : current.slice(0, -1));
     };
 
+    const changeAccountActivityMode = (mode: AccountActivityMode) => {
+        setAccountActivityMode(mode);
+        setAccountCursorStack([null]);
+        setAccountNextCursor(null);
+    };
+
+    const clearSubmittedTransactionHistory = () => {
+        setHistory([]);
+        if (historyKey !== null) {
+            clearHistory(historyKey);
+        }
+    };
+
     const submitTransfer = async () => {
         if (!wallet || isSubmitting) return;
+        if (!walletAccountKey) {
+            setSubmitMessage('loading account address');
+            return;
+        }
 
         setIsSubmitting(true);
         setSubmitMessage('forming transaction');
         try {
-            const parsedToKey = parsePublicKeyHex(toKey);
+            const parsedToKey = parseAccountKeyHex(toKey);
             const parsedValue = parseU64(value, 'value');
             const parsedNonce = parseU64(nonce, 'nonce');
             const encoded = await encodeSignedTransaction(
                 {
                     senderPublicKey: wallet.publicKey,
-                    toPublicKey: parsedToKey,
+                    toAccountKey: parsedToKey,
                     value: parsedValue,
                     nonce: parsedNonce,
                 },
                 wallet.sign,
             );
             const pending: SubmittedTransaction = {
-                sender: wallet.publicKeyHex,
+                sender: walletAccountKey,
                 digest: encoded.digestHex,
-                to: toKey.trim().replace(/^0x/i, '').toLowerCase(),
+                to: toHex(parsedToKey),
                 value: parsedValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
@@ -654,11 +713,12 @@ export default function App() {
                     current,
                 ),
             );
-            setSubmitMessage(detail);
+            setSubmitMessage('');
             await refreshAccount();
         } catch (error) {
             setSubmitMessage(error instanceof Error ? error.message : String(error));
         } finally {
+            setSubmitMessage('');
             setIsSubmitting(false);
         }
     };
@@ -668,7 +728,14 @@ export default function App() {
             <div className="app__container">
                 <header className="app__header">
                     <h1 className="app__title">
-                        <span className="accent">constantinople</span> / explorer
+                        <span className="accent">constantinople</span> /{' '}
+                        <button
+                            className="app__title-link"
+                            onClick={clearAccountLookup}
+                            type="button"
+                        >
+                            explorer
+                        </button>
                     </h1>
                     <div className="app__header-actions">
                         <StatusBadge status={status} spinner={spinner} />
@@ -682,7 +749,7 @@ export default function App() {
                             ⬝
                         </span>
                         <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
-                            wallet{wallet && <span className="wallet-trigger__key"> {shortHex(wallet.publicKeyHex)}</span>}
+                            wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
                         </button>
                     </div>
                 </header>
@@ -691,17 +758,18 @@ export default function App() {
                         {lookupAccount ? (
                             <AccountPage
                                 account={lookupAccount}
-                                copiedValue={copiedValue}
                                 onCopy={copyValue}
                                 pageNumber={accountCursorStack.length}
                                 proof={accountProof}
                                 target={accountTarget}
                                 transactions={accountTransactions}
+                                activityError={accountActivityError}
+                                activityMode={accountActivityMode}
                                 hasPrevious={accountCursorStack.length > 1}
                                 hasNext={accountNextCursor !== null}
+                                onActivityModeChange={changeAccountActivityMode}
                                 onPrevious={previousAccountPage}
                                 onNext={nextAccountPage}
-                                onBack={clearAccountLookup}
                             />
                         ) : (
                             <>
@@ -721,6 +789,7 @@ export default function App() {
                     <WalletModal onClose={() => setIsWalletOpen(false)}>
                         <WalletPanel
                             wallet={wallet}
+                            walletAccountKey={walletAccountKey}
                             walletMessage={walletMessage}
                             account={account}
                             accountMessage={accountMessage}
@@ -729,12 +798,13 @@ export default function App() {
                             nonce={nonce}
                             submitMessage={submitMessage}
                             isSubmitting={isSubmitting}
+                            canClearSubmittedTransactions={history.length > 0}
                             spinner={spinner}
-                            copiedValue={copiedValue}
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
                             onRefreshAccount={refreshAccount}
+                            onClearSubmittedTransactions={clearSubmittedTransactionHistory}
                             onCopy={copyValue}
                             onToKeyChange={setToKey}
                             onValueChange={setValue}
@@ -742,8 +812,7 @@ export default function App() {
                         />
                         <TransactionHistory
                             transactions={history}
-                            signedInPublicKey={signedInPublicKey}
-                            copiedValue={copiedValue}
+                            signedInAccountKey={signedInAccountKey}
                             onCopy={copyValue}
                             verifyCertificates={verifyCertificates}
                         />
@@ -770,40 +839,41 @@ export default function App() {
 
 function AccountPage({
     account,
-    copiedValue,
     onCopy,
     pageNumber,
     proof,
     target,
     transactions,
+    activityError,
+    activityMode,
     hasPrevious,
     hasNext,
+    onActivityModeChange,
     onPrevious,
     onNext,
-    onBack,
 }: {
     account: string;
-    copiedValue: string;
     onCopy: (value: string) => void;
     pageNumber: number;
     proof: AccountProofState;
     target: LatestProofTarget | null;
     transactions: AccountTxWithProof[];
+    activityError: string;
+    activityMode: AccountActivityMode;
     hasPrevious: boolean;
     hasNext: boolean;
+    onActivityModeChange: (mode: AccountActivityMode) => void;
     onPrevious: () => void;
     onNext: () => void;
-    onBack: () => void;
 }) {
     return (
         <section className="account-page" aria-label="account proof">
             <div className="account-page__title">
                 <span>account</span>
-                <button onClick={onBack}>back</button>
             </div>
             <div className="account-page__line">
-                <span className="account-page__prompt">key</span>
-                <CopyableValue copiedValue={copiedValue} value={account} onCopy={onCopy} />
+                <span className="account-page__prompt">address</span>
+                <CopyableValue value={account} onCopy={onCopy} />
             </div>
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
@@ -812,23 +882,48 @@ function AccountPage({
                 <ProofDatum label="state proof" value={proof.status === 'verified' ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b` : proof.status} />
             </div>
             <div className="account-page__subhead">
-                <span>sent tx page {pageNumber}</span>
+                <span>{activityMode} tx page {pageNumber}</span>
+                <div className="account-page__modes" role="tablist" aria-label="account transaction filter">
+                    {(['all', 'sent', 'received'] as const).map((mode) => (
+                        <button
+                            key={mode}
+                            className={mode === activityMode ? 'account-page__mode account-page__mode--active' : 'account-page__mode'}
+                            role="tab"
+                            aria-selected={mode === activityMode}
+                            onClick={() => onActivityModeChange(mode)}
+                            type="button"
+                        >
+                            {mode}
+                        </button>
+                    ))}
+                </div>
                 <div className="account-page__pager">
                     <button disabled={!hasPrevious} onClick={onPrevious}>prev</button>
                     <button disabled={!hasNext} onClick={onNext}>next</button>
                 </div>
             </div>
             <div className="account-tx-list">
-                {transactions.length === 0 && (
-                    <div className="account-tx-row account-tx-row--empty">no sent transactions indexed</div>
+                {activityError && (
+                    <div className="account-tx-row account-tx-row--empty">{activityError}</div>
+                )}
+                {!activityError && transactions.length === 0 && (
+                    <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
                 )}
                 {transactions.map(({ row, proof: txProof }) => (
                     <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
-                            <CopyableValue copiedValue={copiedValue} value={row.digest} onCopy={onCopy} />
+                            <CopyableValue value={row.digest} onCopy={onCopy} />
+                            <span>from</span>
+                            <CopyableValue
+                                value={row.direction === 'sent' ? account : row.counterparty}
+                                onCopy={onCopy}
+                            />
                             <span>to</span>
-                            <CopyableValue copiedValue={copiedValue} value={row.to} onCopy={onCopy} />
+                            <CopyableValue
+                                value={row.direction === 'sent' ? row.counterparty : account}
+                                onCopy={onCopy}
+                            />
                         </div>
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>
@@ -926,7 +1021,7 @@ function AccountSearchPanel({
                         autoFocus
                         value={accountInput}
                         onChange={(event) => onAccountInputChange(event.target.value)}
-                        placeholder="public key"
+                        placeholder="account key"
                         spellCheck={false}
                     />
                 </label>
@@ -976,6 +1071,7 @@ function WalletModal({
 
 function WalletPanel({
     wallet,
+    walletAccountKey,
     walletMessage,
     account,
     accountMessage,
@@ -984,18 +1080,20 @@ function WalletPanel({
     nonce,
     submitMessage,
     isSubmitting,
+    canClearSubmittedTransactions,
     spinner,
-    copiedValue,
     onCreateWallet,
     onSignIn,
     onSignOut,
     onRefreshAccount,
+    onClearSubmittedTransactions,
     onCopy,
     onToKeyChange,
     onValueChange,
     onSubmit,
 }: {
     wallet: ActiveWallet | null;
+    walletAccountKey: string | null;
     walletMessage: string;
     account: AccountView | null;
     accountMessage: string;
@@ -1004,12 +1102,13 @@ function WalletPanel({
     nonce: string;
     submitMessage: string;
     isSubmitting: boolean;
+    canClearSubmittedTransactions: boolean;
     spinner: string;
-    copiedValue: string;
     onCreateWallet: () => void;
     onSignIn: () => void;
     onSignOut: () => void;
     onRefreshAccount: () => void;
+    onClearSubmittedTransactions: () => void;
     onCopy: (value: string) => void;
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
@@ -1040,6 +1139,9 @@ function WalletPanel({
                             </SpinnerText>
                         </button>
                     )}
+                    {wallet && canClearSubmittedTransactions && (
+                        <button onClick={onClearSubmittedTransactions}>reset</button>
+                    )}
                     {wallet && <button onClick={onSignOut}>sign out</button>}
                 </div>
             </div>
@@ -1047,10 +1149,9 @@ function WalletPanel({
                 <div className="wallet__cell">
                     <span>account</span>
                     <CopyableValue
-                        disabled={!wallet}
+                        disabled={!walletAccountKey}
                         plain
-                        copiedValue={copiedValue}
-                        value={wallet?.publicKeyHex ?? 'not authenticated'}
+                        value={walletAccountKey ?? 'not authenticated'}
                         onCopy={onCopy}
                     />
                 </div>
@@ -1075,7 +1176,7 @@ function WalletPanel({
                     <input
                         value={toKey}
                         onChange={(event) => onToKeyChange(event.target.value)}
-                        placeholder="Public key of recipient"
+                        placeholder="Recipient address"
                         spellCheck={false}
                         disabled={!wallet || isSubmitting}
                     />
@@ -1093,9 +1194,9 @@ function WalletPanel({
                     submit
                 </button>
             </form>
-            {submitMessage && (
+            {isSubmitting && submitMessage && (
                 <div className="wallet__status">
-                    <SpinnerText active={isSubmitting} spinner={spinner}>
+                    <SpinnerText active spinner={spinner}>
                         {submitMessage}
                     </SpinnerText>
                 </div>
@@ -1108,14 +1209,12 @@ function CopyableValue({
     disabled = false,
     flashOnCopy = true,
     plain = false,
-    copiedValue,
     value,
     onCopy,
 }: {
     disabled?: boolean;
     flashOnCopy?: boolean;
     plain?: boolean;
-    copiedValue: string;
     value: string;
     onCopy: (value: string) => void;
 }) {
@@ -1133,7 +1232,7 @@ function CopyableValue({
         }, 800);
     };
 
-    const isCopied = flashing || (flashOnCopy && copiedValue === value);
+    const isCopied = flashing;
     const className = [
         'copyable',
         plain ? 'copyable--plain' : '',
@@ -1185,14 +1284,12 @@ function SpinnerText({
 
 function TransactionHistory({
     transactions,
-    signedInPublicKey,
-    copiedValue,
+    signedInAccountKey,
     onCopy,
     verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
-    signedInPublicKey: string | null;
-    copiedValue: string;
+    signedInAccountKey: string | null;
     onCopy: (value: string) => void;
     verifyCertificates: boolean;
 }) {
@@ -1217,10 +1314,9 @@ function TransactionHistory({
                 {transactions.map((tx) => (
                     <TransactionRecord
                         key={tx.digest}
-                        copiedValue={copiedValue}
                         formatter={formatter}
                         onCopy={onCopy}
-                        signedInPublicKey={signedInPublicKey}
+                        signedInAccountKey={signedInAccountKey}
                         tx={tx}
                         verifyCertificates={verifyCertificates}
                     />
@@ -1231,27 +1327,29 @@ function TransactionHistory({
 }
 
 function TransactionRecord({
-    copiedValue,
     formatter,
     onCopy,
-    signedInPublicKey,
+    signedInAccountKey,
     tx,
     verifyCertificates,
 }: {
-    copiedValue: string;
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
-    signedInPublicKey: string | null;
+    signedInAccountKey: string | null;
     tx: SubmittedTransaction;
     verifyCertificates: boolean;
 }) {
-    const ownsTx = tx.sender !== null && tx.sender === signedInPublicKey;
+    const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
     return (
         <div className="tx-record">
             <div className="tx-record__primary">
-                <CopyableValue copiedValue={copiedValue} value={tx.digest} onCopy={onCopy} />
+                <span className="tx-record__label">tx</span>
+                <CopyableValue value={tx.digest} onCopy={onCopy} />
+                <span className="tx-record__label">from</span>
+                <CopyableValue value={tx.sender} onCopy={onCopy} />
                 <span className="tx-record__arrow" aria-hidden="true">→</span>
-                <CopyableValue copiedValue={copiedValue} value={tx.to} onCopy={onCopy} />
+                <span className="tx-record__label">to</span>
+                <CopyableValue value={tx.to} onCopy={onCopy} />
                 <span className="tx-record__nonce">value {tx.value}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
@@ -1474,7 +1572,9 @@ function hasFetchingProof(
     signedInSender: string | null,
 ): boolean {
     if (signedInSender === null) return false;
-    return transactions.some((tx) => tx.sender === signedInSender && tx.proof.status === 'fetching');
+    return transactions.some(
+        (tx) => tx.sender === signedInSender && tx.proof.status === 'fetching',
+    );
 }
 
 function nextBlockCertificateState(status: TxStatus): BlockCertificateState {
@@ -1571,23 +1671,19 @@ function bytesToHex(bytes: Uint8Array): string {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-async function normalizeAccountInput(value: string): Promise<string | null> {
+function normalizeAccountInput(value: string): string | null {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (/^[0-9a-f]{64}$/.test(normalized)) {
+    if (isAccountKeyHex(normalized)) {
         return normalized;
     }
-    if (!/^[0-9a-f]{68}$/.test(normalized)) {
-        return null;
-    }
-
-    return toHex(await accountKeyFromPublicKey(parsePublicKeyHex(normalized)));
+    return null;
 }
 
 function accountFromLocation(): string {
     const url = new URL(window.location.href);
     const queryAccount = url.searchParams.get('account');
     const fromQuery = queryAccount?.trim().replace(/^0x/i, '').toLowerCase();
-    if (fromQuery && /^[0-9a-f]{64}$/.test(fromQuery)) return fromQuery;
+    if (fromQuery && isAccountKeyHex(fromQuery)) return fromQuery;
 
     const pathMatch = /^\/account\/([0-9a-fA-F]{64})$/.exec(url.pathname);
     return pathMatch ? pathMatch[1].toLowerCase() : '';
@@ -1615,6 +1711,10 @@ function writeHistory(key: string, history: SubmittedTransaction[]) {
     window.localStorage.setItem(key, JSON.stringify(history));
 }
 
+function clearHistory(key: string) {
+    window.localStorage.removeItem(key);
+}
+
 function useBrailleSpinner(active: boolean): string {
     const [index, setIndex] = useState(0);
 
@@ -1636,8 +1736,11 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
 
     const transaction = value as Record<string, unknown>;
     if (
+        typeof transaction.sender !== 'string' ||
+        !isAccountKeyHex(transaction.sender) ||
         typeof transaction.digest !== 'string' ||
         typeof transaction.to !== 'string' ||
+        !isAccountKeyHex(transaction.to) ||
         typeof transaction.value !== 'string' ||
         typeof transaction.nonce !== 'string' ||
         typeof transaction.submittedAt !== 'number' ||
@@ -1654,7 +1757,7 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
 
     return {
         digest: transaction.digest,
-        sender: typeof transaction.sender === 'string' ? transaction.sender : null,
+        sender: transaction.sender,
         to: transaction.to,
         value: transaction.value,
         nonce: transaction.nonce,
@@ -1666,6 +1769,10 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
         proof: normalizeTransactionProof(transaction.proof),
     };
+}
+
+function isAccountKeyHex(value: string): boolean {
+    return /^[0-9a-f]{64}$/.test(value);
 }
 
 function normalizeBlockCertificate(

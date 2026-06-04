@@ -132,6 +132,21 @@ body {
     color: var(--theme-accent);
 }
 
+.app__title-link {
+    color: inherit;
+    background: transparent;
+    border: 0;
+    font: inherit;
+    letter-spacing: inherit;
+    padding: 0;
+    cursor: pointer;
+}
+
+.app__title-link:hover,
+.app__title-link:focus-visible {
+    color: var(--theme-accent);
+}
+
 .app__header-actions {
     min-width: 0;
     display: flex;
@@ -642,10 +657,10 @@ body {
 
 .tx-record__primary {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 1ch;
     min-width: 0;
-    overflow: hidden;
 }
 
 .tx-record__primary .copyable {
@@ -654,7 +669,8 @@ body {
     min-width: 0;
 }
 
-.tx-record__arrow {
+.tx-record__arrow,
+.tx-record__label {
     color: var(--theme-text-dim);
     flex-shrink: 0;
 }
@@ -788,7 +804,7 @@ body {
 
 .account-page__line {
     display: grid;
-    grid-template-columns: 8ch minmax(0, 1fr);
+    grid-template-columns: 12ch minmax(0, 1fr);
     gap: 1ch;
     align-items: center;
     padding: 0.6ch 0;
@@ -835,6 +851,27 @@ body {
     justify-content: space-between;
     align-items: center;
     gap: 1ch;
+    flex-wrap: wrap;
+}
+
+.account-page__modes {
+    display: inline-grid;
+    grid-template-columns: repeat(3, minmax(7ch, 1fr));
+    gap: 1px;
+    border: 1px solid var(--theme-border);
+    background: var(--theme-border);
+}
+
+.account-page .account-page__mode {
+    border: 0;
+    color: var(--theme-text-dim);
+    background: var(--theme-background);
+    min-height: 2rem;
+}
+
+.account-page .account-page__mode--active {
+    color: var(--theme-background);
+    background: var(--theme-text);
 }
 
 .account-page__pager {
@@ -1091,6 +1128,15 @@ body {
 
     .account-tx-row__main {
         flex-wrap: wrap;
+    }
+
+    .account-page__modes,
+    .account-page__pager {
+        width: 100%;
+    }
+
+    .account-page__pager {
+        justify-content: space-between;
     }
 
     .block-log__header {

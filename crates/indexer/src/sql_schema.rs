@@ -1,20 +1,19 @@
 //! Metadata-store schema for the SQL streaming path.
 //!
-//! Constantinople fans every finalized block out across two storage paths:
+//! Constantinople fans every finalized block out across complementary storage
+//! paths:
 //!
-//! - **Full storage (KV)** — `BLOCK`, `BLOCK_BY_H`, `TX`, and `TX_BY_H`
-//!   rows in the existing exoware Store. Tools can fetch full
-//!   `SignedTransaction` bodies by digest from this path.
-//! - **Metadata streaming (SQL)** — two columnar tables registered onto
-//!   the same `StoreClient` via [`KvSchema`]. The `block_meta` table is
-//!   what the explorer subscribes to over the `store.sql.v1.Service`
-//!   `Subscribe` RPC. The `tx_meta` table remains in the schema for
-//!   compatibility, but the publisher no longer writes per-transaction SQL
-//!   rows on the live path.
-//! - **Simplex artifacts** — finalization certificates are written through
-//!   `exoware-simplex` beside the raw and SQL rows. These proof artifacts can
-//!   carry certified block payloads, but they are not the canonical full-storage
-//!   path.
+//! - **Simplex block/certificate storage** — certified headers, full
+//!   `{ header, body }` block envelopes by digest, and finalization indexes.
+//!   Height/latest block reads start with a certified header and only fetch the
+//!   body when needed.
+//! - **Metadata and lookup storage (SQL)** — columnar tables registered onto
+//!   the same `StoreClient` via [`KvSchema`]. The `block_meta` table is what
+//!   the explorer subscribes to over the `store.sql.v1.Service` `Subscribe`
+//!   RPC. `tx_meta` stores one row per finalized transaction with proof and
+//!   body data. `tx_activity` stores one account-ordered row for each sender
+//!   and receiver side of a transaction. `account_meta` stores the latest
+//!   indexed account state plus its QMDB operation location.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the
@@ -29,6 +28,10 @@ pub const BLOCK_META_TABLE: &str = "block_meta";
 
 /// Name of the SQL table that records one row per finalized transaction.
 pub const TX_META_TABLE: &str = "tx_meta";
+/// Name of the SQL table that indexes account transaction activity.
+pub const TX_ACTIVITY_TABLE: &str = "tx_activity";
+/// Name of the SQL table that records the latest indexed account state.
+pub const ACCOUNT_META_TABLE: &str = "account_meta";
 
 // ---------- block_meta columns ----------
 
@@ -55,10 +58,58 @@ pub const TX_META_HEIGHT: &str = "height";
 pub const TX_META_INDEX: &str = "index";
 /// `tx_meta`: 32-byte transaction digest, fixed-size binary.
 pub const TX_META_DIGEST: &str = "tx_digest";
+/// `tx_meta`: sender account key, fixed-size binary.
+pub const TX_META_SENDER: &str = "sender";
+/// `tx_meta`: receiver account key, fixed-size binary.
+pub const TX_META_RECEIVER: &str = "receiver";
+/// `tx_meta`: transfer value.
+pub const TX_META_VALUE: &str = "value";
+/// `tx_meta`: sender nonce.
+pub const TX_META_NONCE: &str = "nonce";
 /// `tx_meta`: transaction-hash QMDB operation location for this digest.
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
+/// `tx_meta`: encoded `SignedTransaction` bytes as lowercase hex.
+pub const TX_META_BODY_HEX: &str = "body_hex";
 /// `tx_meta`: secondary index used to resolve proof metadata by digest.
 pub const TX_META_DIGEST_INDEX: &str = "tx_meta_by_digest";
+
+// ---------- tx_activity columns ----------
+
+/// `tx_activity`: active account key (primary key first column).
+pub const TX_ACTIVITY_ACCOUNT: &str = "account";
+/// `tx_activity`: reverse-sort height (`u64::MAX - height`) for newest-first order.
+pub const TX_ACTIVITY_SORT_HEIGHT: &str = "sort_height";
+/// `tx_activity`: reverse-sort block index (`u64::MAX - index`) for newest-first order.
+pub const TX_ACTIVITY_SORT_INDEX: &str = "sort_index";
+/// `tx_activity`: role of this account in the transaction (`0` sender, `1` receiver).
+pub const TX_ACTIVITY_ROLE: &str = "role";
+/// `tx_activity`: containing block height.
+pub const TX_ACTIVITY_HEIGHT: &str = "height";
+/// `tx_activity`: per-block transaction index.
+pub const TX_ACTIVITY_INDEX: &str = "index";
+/// `tx_activity`: 32-byte transaction digest, fixed-size binary.
+pub const TX_ACTIVITY_DIGEST: &str = "tx_digest";
+/// `tx_activity`: other account involved in the transfer.
+pub const TX_ACTIVITY_COUNTERPARTY: &str = "counterparty";
+/// `tx_activity`: transfer value.
+pub const TX_ACTIVITY_VALUE: &str = "value";
+/// `tx_activity`: sender nonce.
+pub const TX_ACTIVITY_NONCE: &str = "nonce";
+/// `tx_activity`: transaction-hash QMDB operation location for this digest.
+pub const TX_ACTIVITY_QMDB_LOCATION: &str = "qmdb_location";
+/// `tx_activity`: secondary index used for sender-only or receiver-only pages.
+pub const TX_ACTIVITY_ROLE_INDEX: &str = "tx_activity_by_role";
+
+// ---------- account_meta columns ----------
+
+/// `account_meta`: account key (primary key), fixed-size binary.
+pub const ACCOUNT_META_ACCOUNT: &str = "account";
+/// `account_meta`: indexed account balance.
+pub const ACCOUNT_META_BALANCE: &str = "balance";
+/// `account_meta`: indexed account nonce.
+pub const ACCOUNT_META_NONCE: &str = "nonce";
+/// `account_meta`: account-state QMDB operation location.
+pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
@@ -105,7 +156,12 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 TableColumnConfig::new(TX_META_HEIGHT, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_INDEX, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(TX_META_SENDER, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(TX_META_RECEIVER, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(TX_META_VALUE, DataType::UInt64, false),
+                TableColumnConfig::new(TX_META_NONCE, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
+                TableColumnConfig::new(TX_META_BODY_HEX, DataType::Utf8, false),
             ],
             vec![TX_META_HEIGHT.to_string(), TX_META_INDEX.to_string()],
             vec![
@@ -113,6 +169,79 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                     .with_cover_columns(vec![TX_META_QMDB_LOCATION.to_string()]),
             ],
         )
+        .and_then(|schema| {
+            schema.table(
+                TX_ACTIVITY_TABLE,
+                vec![
+                    TableColumnConfig::new(
+                        TX_ACTIVITY_ACCOUNT,
+                        DataType::FixedSizeBinary(32),
+                        false,
+                    ),
+                    TableColumnConfig::new(TX_ACTIVITY_SORT_HEIGHT, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_SORT_INDEX, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_ROLE, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_HEIGHT, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_INDEX, DataType::UInt64, false),
+                    TableColumnConfig::new(
+                        TX_ACTIVITY_DIGEST,
+                        DataType::FixedSizeBinary(32),
+                        false,
+                    ),
+                    TableColumnConfig::new(
+                        TX_ACTIVITY_COUNTERPARTY,
+                        DataType::FixedSizeBinary(32),
+                        false,
+                    ),
+                    TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_QMDB_LOCATION, DataType::UInt64, false),
+                ],
+                vec![
+                    TX_ACTIVITY_ACCOUNT.to_string(),
+                    TX_ACTIVITY_SORT_HEIGHT.to_string(),
+                    TX_ACTIVITY_SORT_INDEX.to_string(),
+                    TX_ACTIVITY_ROLE.to_string(),
+                ],
+                vec![
+                    IndexSpec::lexicographic(
+                        TX_ACTIVITY_ROLE_INDEX,
+                        vec![
+                            TX_ACTIVITY_ACCOUNT.to_string(),
+                            TX_ACTIVITY_ROLE.to_string(),
+                            TX_ACTIVITY_SORT_HEIGHT.to_string(),
+                            TX_ACTIVITY_SORT_INDEX.to_string(),
+                        ],
+                    )?
+                    .with_cover_columns(vec![
+                        TX_ACTIVITY_HEIGHT.to_string(),
+                        TX_ACTIVITY_INDEX.to_string(),
+                        TX_ACTIVITY_DIGEST.to_string(),
+                        TX_ACTIVITY_COUNTERPARTY.to_string(),
+                        TX_ACTIVITY_VALUE.to_string(),
+                        TX_ACTIVITY_NONCE.to_string(),
+                        TX_ACTIVITY_QMDB_LOCATION.to_string(),
+                    ]),
+                ],
+            )
+        })
+        .and_then(|schema| {
+            schema.table(
+                ACCOUNT_META_TABLE,
+                vec![
+                    TableColumnConfig::new(
+                        ACCOUNT_META_ACCOUNT,
+                        DataType::FixedSizeBinary(32),
+                        false,
+                    ),
+                    TableColumnConfig::new(ACCOUNT_META_BALANCE, DataType::UInt64, false),
+                    TableColumnConfig::new(ACCOUNT_META_NONCE, DataType::UInt64, false),
+                    TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
+                ],
+                vec![ACCOUNT_META_ACCOUNT.to_string()],
+                vec![],
+            )
+        })
 }
 
 #[cfg(test)]
@@ -144,6 +273,14 @@ mod tests {
             tables.iter().any(|t| t == TX_META_TABLE),
             "tx_meta missing: {tables:?}"
         );
+        assert!(
+            tables.iter().any(|t| t == TX_ACTIVITY_TABLE),
+            "tx_activity missing: {tables:?}"
+        );
+        assert!(
+            tables.iter().any(|t| t == ACCOUNT_META_TABLE),
+            "account_meta missing: {tables:?}"
+        );
     }
 
     /// The string constants must remain stable so the explorer can rely on
@@ -152,6 +289,8 @@ mod tests {
     fn table_and_column_names_are_stable() {
         assert_eq!(BLOCK_META_TABLE, "block_meta");
         assert_eq!(TX_META_TABLE, "tx_meta");
+        assert_eq!(TX_ACTIVITY_TABLE, "tx_activity");
+        assert_eq!(ACCOUNT_META_TABLE, "account_meta");
         assert_eq!(BLOCK_META_HEIGHT, "height");
         assert_eq!(BLOCK_META_DIGEST, "digest");
         assert_eq!(BLOCK_META_TX_COUNT, "tx_count");
@@ -162,7 +301,28 @@ mod tests {
         assert_eq!(TX_META_HEIGHT, "height");
         assert_eq!(TX_META_INDEX, "index");
         assert_eq!(TX_META_DIGEST, "tx_digest");
+        assert_eq!(TX_META_SENDER, "sender");
+        assert_eq!(TX_META_RECEIVER, "receiver");
+        assert_eq!(TX_META_VALUE, "value");
+        assert_eq!(TX_META_NONCE, "nonce");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
+        assert_eq!(TX_META_BODY_HEX, "body_hex");
         assert_eq!(TX_META_DIGEST_INDEX, "tx_meta_by_digest");
+        assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
+        assert_eq!(TX_ACTIVITY_SORT_HEIGHT, "sort_height");
+        assert_eq!(TX_ACTIVITY_SORT_INDEX, "sort_index");
+        assert_eq!(TX_ACTIVITY_ROLE, "role");
+        assert_eq!(TX_ACTIVITY_HEIGHT, "height");
+        assert_eq!(TX_ACTIVITY_INDEX, "index");
+        assert_eq!(TX_ACTIVITY_DIGEST, "tx_digest");
+        assert_eq!(TX_ACTIVITY_COUNTERPARTY, "counterparty");
+        assert_eq!(TX_ACTIVITY_VALUE, "value");
+        assert_eq!(TX_ACTIVITY_NONCE, "nonce");
+        assert_eq!(TX_ACTIVITY_QMDB_LOCATION, "qmdb_location");
+        assert_eq!(TX_ACTIVITY_ROLE_INDEX, "tx_activity_by_role");
+        assert_eq!(ACCOUNT_META_ACCOUNT, "account");
+        assert_eq!(ACCOUNT_META_BALANCE, "balance");
+        assert_eq!(ACCOUNT_META_NONCE, "nonce");
+        assert_eq!(ACCOUNT_META_QMDB_LOCATION, "qmdb_location");
     }
 }

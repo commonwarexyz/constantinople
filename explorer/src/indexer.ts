@@ -5,8 +5,8 @@
 // rows from one atomic ingest batch, and at the indexer's "one flush per
 // finalized block" cadence that is exactly one row per finalized block.
 //
-// This client only talks to the metadata stream. Full transaction bodies are
-// also published through raw KV; submitted-transaction proofs use the QMDB and
+// This client only talks to the block metadata stream. Transaction/account
+// lookup queries use SQL too; submitted-transaction proofs use the QMDB and
 // Simplex clients in `qmdb.ts`.
 //
 // Column names mirror `crates/indexer/src/sql_schema.rs` and must stay in

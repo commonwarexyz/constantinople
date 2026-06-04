@@ -6,13 +6,13 @@ export interface HistoryScope {
     readonly simplexVerificationMaterial: string;
 }
 
-const HISTORY_KEY_PREFIX = 'constantinople.submitted-transactions.v2';
+const HISTORY_KEY_PREFIX = 'constantinople.submitted-transactions.v3';
 
 export function submittedTransactionHistoryKey(
     scope: HistoryScope,
-    walletPublicKeyHex: string | null,
+    walletAccountKeyHex: string | null,
 ): string | null {
-    if (walletPublicKeyHex === null) return null;
+    if (walletAccountKeyHex === null) return null;
 
     return [
         HISTORY_KEY_PREFIX,
@@ -21,7 +21,7 @@ export function submittedTransactionHistoryKey(
         normalizeScopeValue(scope.storeUrl),
         normalizeScopeValue(scope.mempoolUrl),
         normalizeScopeValue(scope.simplexVerificationMaterial),
-        normalizeScopeValue(walletPublicKeyHex),
+        normalizeScopeValue(walletAccountKeyHex),
     ].join(':');
 }
 

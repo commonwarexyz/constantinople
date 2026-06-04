@@ -3,8 +3,8 @@
 
 pub mod client;
 pub mod codec;
-pub mod keys;
 pub mod publisher;
+mod simplex_block;
 pub mod sql_schema;
 
 pub use client::{IndexerClient, ReadError};
