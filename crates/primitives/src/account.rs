@@ -118,7 +118,7 @@ impl Span for AccountKey {}
 impl Array for AccountKey {}
 
 /// Account nonce state.
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Debug, Display, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
 #[display("Nonce {{ base: {}, bitmap: {} }}", base, bitmap)]
 pub struct Nonce {
@@ -148,12 +148,6 @@ impl Nonce {
 
         *self = next;
         true
-    }
-}
-
-impl Default for Nonce {
-    fn default() -> Self {
-        Self { base: 0, bitmap: 0 }
     }
 }
 
