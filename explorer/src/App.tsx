@@ -909,7 +909,7 @@ function AccountPage({
                     label="state"
                     value={
                         proof.status === 'verified'
-                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()} / bitmap ${proof.nonceBitmap.toString()}`
+                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
                             : proof.detail
                     }
                 />
@@ -1149,7 +1149,6 @@ function WalletPanel({
     onSubmit: () => void;
 }) {
     const balance = account?.balance ?? 100;
-    const nonceBitmap = account?.nonce_bitmap ?? 0;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
     const isAccountLoading = accountMessage === 'loading account metadata';
 
@@ -1197,10 +1196,6 @@ function WalletPanel({
                 <div className="wallet__cell">
                     <span>nonce</span>
                     <strong>{nonce}</strong>
-                </div>
-                <div className="wallet__cell">
-                    <span>nonce bitmap</span>
-                    <strong>{nonceBitmap.toLocaleString()}</strong>
                 </div>
             </div>
             <form
