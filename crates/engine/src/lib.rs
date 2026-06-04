@@ -15,15 +15,14 @@
 //! them. Tests can drive the same engine under the deterministic runtime and
 //! simulated networking.
 
-pub mod bootstrapper;
 pub mod types;
 
 mod engine;
 
 #[doc(inline)]
 pub use engine::{
-    BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, CHANNELS, Channels, Config, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    CERTIFICATE_CHANNEL, CHANNELS, Channels, Config, Engine, MARSHAL_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
 };
 
