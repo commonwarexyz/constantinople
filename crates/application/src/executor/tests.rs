@@ -1,7 +1,7 @@
 use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Transaction,
+    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
     TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
@@ -39,8 +39,7 @@ impl TestSigner {
 fn account(balance: u64, nonce: u64) -> Account {
     Account {
         balance,
-        nonce,
-        nonce_bitmap: 0,
+        nonce: Nonce::new(nonce, 0),
     }
 }
 
@@ -102,7 +101,7 @@ fn proposal_accepts_nonce_inside_run_ahead_window() {
     assert_eq!(proposal.valid.len(), 3);
     assert!(proposal.invalid.is_empty());
     assert_eq!(sender.balance, 1);
-    assert_eq!(sender.nonce, 3);
+    assert_eq!(sender.nonce.base, 3);
     assert_eq!(recipient.balance, DEFAULT_ACCOUNT_BALANCE + 9);
 }
 
@@ -125,7 +124,7 @@ fn proposal_rejects_duplicate_run_ahead_nonce() {
     assert_eq!(proposal.valid.len(), 1);
     assert_eq!(proposal.invalid.len(), 1);
     assert_eq!(sender.balance, 7);
-    assert_eq!(sender.nonce, 0);
+    assert_eq!(sender.nonce.base, 0);
 }
 
 #[test]
@@ -148,7 +147,7 @@ fn proposal_accepts_far_ahead_nonce_and_rejects_duplicate() {
     assert_eq!(proposal.valid.len(), 1);
     assert_eq!(proposal.invalid.len(), 1);
     assert_eq!(sender.balance, 7);
-    assert_eq!(sender.nonce, NONCE_BITMAP_CAPACITY + 2);
+    assert_eq!(sender.nonce.base, NONCE_BITMAP_CAPACITY + 2);
 }
 
 #[test]

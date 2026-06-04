@@ -174,7 +174,7 @@ where
 
     for (transfer, accounts) in transfers.iter().zip(accounts.chunks_exact(2)) {
         let mut sender = accounts[0];
-        if sender.balance < transfer.value || !sender.use_nonce(transfer.nonce) {
+        if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
             return None;
         }
 
@@ -239,7 +239,7 @@ where
     let Some(mut sender) = state.get(&transfer.sender) else {
         return false;
     };
-    if sender.balance < transfer.value || !sender.use_nonce(transfer.nonce) {
+    if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
         return false;
     }
 

@@ -34,6 +34,14 @@ import {
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
+import {
+    consumeNonce,
+    emptyNonceState,
+    mergeNonceStates,
+    nextAvailableNonce,
+    nonceStatesEqual,
+    type NonceState,
+} from './nonce';
 import { isRetryableAccountProofError, isRetryableProofError } from './proofRetry';
 import {
     clearSession,
@@ -69,7 +77,6 @@ const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
 const DEFAULT_STORE_URL = 'http://127.0.0.1:8090';
 const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
-const MAX_U64 = (1n << 64n) - 1n;
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
 const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
@@ -191,7 +198,7 @@ export default function App() {
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
-    const nextNonceRef = useRef(0n);
+    const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
@@ -214,17 +221,13 @@ export default function App() {
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
-    const setLocalNonce = (nextNonce: bigint) => {
+    const setLocalNonceState = (nextNonce: NonceState) => {
         nextNonceRef.current = nextNonce;
-        setNonce(nextNonce.toString());
+        setNonce(nextAvailableNonce(nextNonce).toString());
     };
 
-    const advanceLocalNonceAtLeast = (nextNonce: bigint) => {
-        if (nextNonce > nextNonceRef.current) {
-            setLocalNonce(nextNonce);
-            return;
-        }
-        setNonce(nextNonceRef.current.toString());
+    const mergeLocalNonceState = (nextNonce: NonceState) => {
+        setLocalNonceState(mergeNonceStates(nextNonceRef.current, nextNonce));
     };
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
@@ -533,7 +536,7 @@ export default function App() {
     useEffect(() => {
         if (!wallet) {
             setAccount(null);
-            setLocalNonce(0n);
+            setLocalNonceState(emptyNonceState());
             setAccountMessage('account metadata unavailable');
             return;
         }
@@ -545,7 +548,7 @@ export default function App() {
             .then((nextAccount) => {
                 if (cancelled) return;
                 setAccount(nextAccount);
-                advanceLocalNonceAtLeast(BigInt(nextAccount?.nonce ?? 0));
+                mergeLocalNonceState(accountNonceState(nextAccount));
                 setAccountMessage(
                     nextAccount
                         ? 'committed account loaded'
@@ -569,7 +572,7 @@ export default function App() {
         try {
             const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
             setAccount(nextAccount);
-            advanceLocalNonceAtLeast(BigInt(nextAccount?.nonce ?? 0));
+            mergeLocalNonceState(accountNonceState(nextAccount));
             setAccountMessage(
                 nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
             );
@@ -690,17 +693,18 @@ export default function App() {
 
         setPendingSubmissionCount((count) => count + 1);
         setSubmitMessage('forming transaction');
-        let reservedNonce: bigint | null = null;
+        let reservation: { previous: NonceState; next: NonceState } | null = null;
         try {
             const parsedToKey = parseAccountKeyHex(toKey);
             const parsedValue = parseU64(value, 'value');
-            const parsedNonce = nextNonceRef.current;
-            const nextNonce = parsedNonce + 1n;
-            if (nextNonce > MAX_U64) {
+            const previousNonce = nextNonceRef.current;
+            const parsedNonce = nextAvailableNonce(previousNonce);
+            const nextNonce = consumeNonce(previousNonce, parsedNonce);
+            if (nextNonce === null) {
                 throw new Error('nonce must fit in u64');
             }
-            setLocalNonce(nextNonce);
-            reservedNonce = parsedNonce;
+            setLocalNonceState(nextNonce);
+            reservation = { previous: previousNonce, next: nextNonce };
 
             const encoded = await encodeSignedTransaction(
                 {
@@ -741,8 +745,8 @@ export default function App() {
             setSubmitMessage('');
             await refreshAccount();
         } catch (error) {
-            if (reservedNonce !== null && nextNonceRef.current === reservedNonce + 1n) {
-                setLocalNonce(reservedNonce);
+            if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
+                setLocalNonceState(reservation.previous);
             }
             setSubmitMessage(error instanceof Error ? error.message : String(error));
         } finally {
@@ -1711,6 +1715,17 @@ function normalizeAccountInput(value: string): string | null {
         return normalized;
     }
     return null;
+}
+
+function accountNonceState(account: AccountView | null): NonceState {
+    if (account === null) {
+        return emptyNonceState();
+    }
+
+    return {
+        base: BigInt(account.nonce.base),
+        bitmap: BigInt(account.nonce.bitmap),
+    };
 }
 
 function accountFromLocation(): string {

@@ -1626,7 +1626,7 @@ mod tests {
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
     use constantinople_primitives::{
-        Block, Header, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
+        Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
     };
     use exoware_sdk::RetryConfig;
@@ -1712,8 +1712,7 @@ mod tests {
                     key,
                     encode_account(Account {
                         balance: u64::from(seed),
-                        nonce: 0,
-                        nonce_bitmap: 0,
+                        nonce: Nonce::default(),
                     }),
                 )),
                 StateOperation::CommitFloor(None, Location::new(0)),
@@ -2055,16 +2054,14 @@ mod tests {
                         account_key(1),
                         Account {
                             balance: 10,
-                            nonce: 0,
-                            nonce_bitmap: 0,
+                            nonce: Nonce::default(),
                         },
                     ),
                     (
                         account_key(2),
                         Account {
                             balance: 20,
-                            nonce: 0,
-                            nonce_bitmap: 0,
+                            nonce: Nonce::default(),
                         },
                     ),
                 ],
@@ -2090,16 +2087,14 @@ mod tests {
                         account_key(1),
                         Account {
                             balance: 9,
-                            nonce: 1,
-                            nonce_bitmap: 0,
+                            nonce: Nonce::new(1, 0),
                         },
                     ),
                     (
                         account_key(3),
                         Account {
                             balance: 30,
-                            nonce: 0,
-                            nonce_bitmap: 0,
+                            nonce: Nonce::default(),
                         },
                     ),
                 ],
@@ -2448,8 +2443,7 @@ mod tests {
                 key,
                 encode_account(Account {
                     balance: u64::from(seed),
-                    nonce: 0,
-                    nonce_bitmap: 0,
+                    nonce: Nonce::default(),
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),
@@ -2487,8 +2481,7 @@ mod tests {
                 account_key,
                 encode_account(Account {
                     balance: 1,
-                    nonce: 0,
-                    nonce_bitmap: 0,
+                    nonce: Nonce::default(),
                 }),
             )),
             StateOperation::CommitFloor(None, Location::new(0)),
