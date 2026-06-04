@@ -34,7 +34,19 @@ import {
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
-import { isRetryableAccountProofError, isRetryableProofError } from './proofRetry';
+import {
+    consumeNonce,
+    emptyNonceState,
+    mergeNonceStates,
+    nextAvailableNonce,
+    nonceStatesEqual,
+    type NonceState,
+} from './nonce';
+import {
+    isMissingAccountProofError,
+    isRetryableAccountProofError,
+    isRetryableProofError,
+} from './proofRetry';
 import {
     clearSession,
     createWallet,
@@ -134,6 +146,7 @@ type TransactionProofState =
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
     | { readonly status: 'fetching'; readonly detail: string }
+    | { readonly status: 'missing'; readonly detail: string }
     | ({
           readonly status: 'verified';
           readonly detail: string;
@@ -173,7 +186,7 @@ export default function App() {
     const [value, setValue] = useState('1');
     const [nonce, setNonce] = useState('0');
     const [submitMessage, setSubmitMessage] = useState('');
-    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [pendingSubmissionCount, setPendingSubmissionCount] = useState(0);
     const [history, setHistory] = useState<SubmittedTransaction[]>([]);
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
@@ -190,9 +203,11 @@ export default function App() {
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
+    const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
+    const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
         accountMessage === 'loading account metadata' ||
@@ -210,6 +225,15 @@ export default function App() {
         signedInAccountKey,
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
+
+    const setLocalNonceState = (nextNonce: NonceState) => {
+        nextNonceRef.current = nextNonce;
+        setNonce(nextAvailableNonce(nextNonce).toString());
+    };
+
+    const mergeLocalNonceState = (nextNonce: NonceState) => {
+        setLocalNonceState(mergeNonceStates(nextNonceRef.current, nextNonce));
+    };
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
@@ -336,17 +360,30 @@ export default function App() {
                 simplexVerificationMaterial,
                 signal: controller.signal,
             });
-            const proof = await fetchAndVerifyAccountProof({
-                qmdbUrl,
-                sqlUrl: indexerUrl,
-                account: lookupAccount,
-                target,
-                signal: controller.signal,
-            });
-            return { target, proof };
+            try {
+                const proof = await fetchAndVerifyAccountProof({
+                    qmdbUrl,
+                    sqlUrl: indexerUrl,
+                    account: lookupAccount,
+                    target,
+                    signal: controller.signal,
+                });
+                return { target, proof };
+            } catch (error) {
+                const detail = error instanceof Error ? error.message : String(error);
+                if (isMissingAccountProofError(detail)) {
+                    return { target, proof: null };
+                }
+                throw error;
+            }
         }, controller.signal)
             .then(({ target, proof }) => {
                 if (controller.signal.aborted) return;
+                if (proof === null) {
+                    setAccountProof({ status: 'missing', detail: 'not yet exists' });
+                    setAccountTarget(target);
+                    return;
+                }
                 setAccountProof({
                     status: 'verified',
                     detail: `verified at height ${target.height.toString()}`,
@@ -517,6 +554,7 @@ export default function App() {
     useEffect(() => {
         if (!wallet) {
             setAccount(null);
+            setLocalNonceState(emptyNonceState());
             setAccountMessage('account metadata unavailable');
             return;
         }
@@ -528,8 +566,7 @@ export default function App() {
             .then((nextAccount) => {
                 if (cancelled) return;
                 setAccount(nextAccount);
-                const nextNonce = nextAccount?.nonce ?? 0;
-                setNonce(String(nextNonce));
+                mergeLocalNonceState(accountNonceState(nextAccount));
                 setAccountMessage(
                     nextAccount
                         ? 'committed account loaded'
@@ -553,7 +590,7 @@ export default function App() {
         try {
             const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
             setAccount(nextAccount);
-            setNonce(String(nextAccount?.nonce ?? 0));
+            mergeLocalNonceState(accountNonceState(nextAccount));
             setAccountMessage(
                 nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
             );
@@ -614,20 +651,28 @@ export default function App() {
         }
     };
 
-    const submitAccountLookup = () => {
-        const normalized = normalizeAccountInput(accountInput);
-        if (!normalized) {
-            setSearchMessage('expected a 32-byte address');
-            return;
-        }
+    const openAccountPage = (value: string): boolean => {
+        const normalized = normalizeAccountInput(value);
+        if (!normalized) return false;
+
         setSearchMessage('');
         setLookupAccount(normalized);
         setAccountInput(normalized);
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
         url.searchParams.set('account', normalized);
-        window.history.pushState(null, '', `${url.pathname}${url.search}${url.hash}`);
+        const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+        if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+            window.history.pushState(null, '', nextLocation);
+        }
+        setIsWalletOpen(false);
         setIsSearchOpen(false);
+        return true;
+    };
+
+    const submitAccountLookup = () => {
+        if (openAccountPage(accountInput)) return;
+        setSearchMessage('expected a 32-byte address');
     };
 
     const clearAccountLookup = () => {
@@ -666,18 +711,27 @@ export default function App() {
     };
 
     const submitTransfer = async () => {
-        if (!wallet || isSubmitting) return;
+        if (!wallet) return;
         if (!walletAccountKey) {
             setSubmitMessage('loading account address');
             return;
         }
 
-        setIsSubmitting(true);
+        setPendingSubmissionCount((count) => count + 1);
         setSubmitMessage('forming transaction');
+        let reservation: { previous: NonceState; next: NonceState } | null = null;
         try {
             const parsedToKey = parseAccountKeyHex(toKey);
             const parsedValue = parseU64(value, 'value');
-            const parsedNonce = parseU64(nonce, 'nonce');
+            const previousNonce = nextNonceRef.current;
+            const parsedNonce = nextAvailableNonce(previousNonce);
+            const nextNonce = consumeNonce(previousNonce, parsedNonce);
+            if (nextNonce === null) {
+                throw new Error('nonce must fit in u64');
+            }
+            setLocalNonceState(nextNonce);
+            reservation = { previous: previousNonce, next: nextNonce };
+
             const encoded = await encodeSignedTransaction(
                 {
                     senderPublicKey: wallet.publicKey,
@@ -717,10 +771,12 @@ export default function App() {
             setSubmitMessage('');
             await refreshAccount();
         } catch (error) {
+            if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
+                setLocalNonceState(reservation.previous);
+            }
             setSubmitMessage(error instanceof Error ? error.message : String(error));
         } finally {
-            setSubmitMessage('');
-            setIsSubmitting(false);
+            setPendingSubmissionCount((count) => Math.max(0, count - 1));
         }
     };
 
@@ -760,6 +816,7 @@ export default function App() {
                             <AccountPage
                                 account={lookupAccount}
                                 onCopy={copyValue}
+                                onOpenAddress={openAccountPage}
                                 pageNumber={accountCursorStack.length}
                                 proof={accountProof}
                                 target={accountTarget}
@@ -815,6 +872,7 @@ export default function App() {
                             transactions={history}
                             signedInAccountKey={signedInAccountKey}
                             onCopy={copyValue}
+                            onOpenAddress={openAccountPage}
                             verifyCertificates={verifyCertificates}
                         />
                     </WalletModal>
@@ -841,6 +899,7 @@ export default function App() {
 function AccountPage({
     account,
     onCopy,
+    onOpenAddress,
     pageNumber,
     proof,
     target,
@@ -855,6 +914,7 @@ function AccountPage({
 }: {
     account: string;
     onCopy: (value: string) => void;
+    onOpenAddress: (value: string) => void;
     pageNumber: number;
     proof: AccountProofState;
     target: LatestProofTarget | null;
@@ -879,8 +939,24 @@ function AccountPage({
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
                 <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
-                <ProofDatum label="state" value={proof.status === 'verified' ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}` : proof.detail} />
-                <ProofDatum label="state proof" value={proof.status === 'verified' ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b` : proof.status} />
+                <ProofDatum
+                    label="state"
+                    value={
+                        proof.status === 'verified'
+                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
+                            : proof.detail
+                    }
+                />
+                <ProofDatum
+                    label="state proof"
+                    value={
+                        proof.status === 'verified'
+                            ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b`
+                            : proof.status === 'missing'
+                                ? proof.detail
+                                : proof.status
+                    }
+                />
             </div>
             <div className="account-page__subhead">
                 <span>{activityMode} tx page {pageNumber}</span>
@@ -916,14 +992,18 @@ function AccountPage({
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue value={row.digest} onCopy={onCopy} />
                             <span>from</span>
-                            <CopyableValue
+                            <AccountPageAddressValue
+                                account={account}
                                 value={row.direction === 'sent' ? account : row.counterparty}
                                 onCopy={onCopy}
+                                onOpenAddress={onOpenAddress}
                             />
                             <span>to</span>
-                            <CopyableValue
+                            <AccountPageAddressValue
+                                account={account}
                                 value={row.direction === 'sent' ? row.counterparty : account}
                                 onCopy={onCopy}
+                                onOpenAddress={onOpenAddress}
                             />
                         </div>
                         <div className="account-tx-row__meta">
@@ -1118,6 +1198,7 @@ function WalletPanel({
     const balance = account?.balance ?? 100;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
     const isAccountLoading = accountMessage === 'loading account metadata';
+    const walletAccountDisplay = walletAccountKey?.toLowerCase() ?? 'not authenticated';
 
     return (
         <section className="wallet">
@@ -1148,11 +1229,11 @@ function WalletPanel({
             </div>
             <div className="wallet__grid">
                 <div className="wallet__cell">
-                    <span>account</span>
+                    <span>address</span>
                     <CopyableValue
                         disabled={!walletAccountKey}
                         plain
-                        value={walletAccountKey ?? 'not authenticated'}
+                        value={walletAccountDisplay}
                         onCopy={onCopy}
                     />
                 </div>
@@ -1179,7 +1260,7 @@ function WalletPanel({
                         onChange={(event) => onToKeyChange(event.target.value)}
                         placeholder="Recipient address"
                         spellCheck={false}
-                        disabled={!wallet || isSubmitting}
+                        disabled={!wallet}
                     />
                 </label>
                 <label>
@@ -1188,10 +1269,10 @@ function WalletPanel({
                         value={value}
                         onChange={(event) => onValueChange(event.target.value)}
                         inputMode="numeric"
-                        disabled={!wallet || isSubmitting}
+                        disabled={!wallet}
                     />
                 </label>
-                <button className="transfer__submit" disabled={!wallet || isSubmitting} type="submit">
+                <button className="transfer__submit" disabled={!wallet} type="submit">
                     submit
                 </button>
             </form>
@@ -1208,36 +1289,22 @@ function WalletPanel({
 
 function CopyableValue({
     disabled = false,
-    flashOnCopy = true,
     plain = false,
     value,
     onCopy,
 }: {
     disabled?: boolean;
-    flashOnCopy?: boolean;
     plain?: boolean;
     value: string;
     onCopy: (value: string) => void;
 }) {
-    const [flashing, setFlashing] = useState(false);
-    const flashTimeoutRef = useRef<number | null>(null);
-
     const handleClick = () => {
         onCopy(value);
-        if (!flashOnCopy) return;
-        if (flashTimeoutRef.current !== null) clearTimeout(flashTimeoutRef.current);
-        setFlashing(true);
-        flashTimeoutRef.current = window.setTimeout(() => {
-            setFlashing(false);
-            flashTimeoutRef.current = null;
-        }, 800);
     };
 
-    const isCopied = flashing;
     const className = [
         'copyable',
         plain ? 'copyable--plain' : '',
-        isCopied ? 'is-copied' : '',
     ]
         .filter(Boolean)
         .join(' ');
@@ -1252,6 +1319,56 @@ function CopyableValue({
             <span className="copyable__value">{value}</span>
         </button>
     );
+}
+
+function AddressValue({
+    disabled = false,
+    plain = false,
+    value,
+    onOpenAddress,
+}: {
+    disabled?: boolean;
+    plain?: boolean;
+    value: string;
+    onOpenAddress: (value: string) => void;
+}) {
+    const className = [
+        'copyable',
+        'copyable--address',
+        plain ? 'copyable--plain' : '',
+    ]
+        .filter(Boolean)
+        .join(' ');
+
+    return (
+        <button
+            aria-label={`open address ${value}`}
+            className={className}
+            disabled={disabled}
+            onClick={() => onOpenAddress(value)}
+            title="open address"
+            type="button"
+        >
+            <span className="copyable__value">{value}</span>
+        </button>
+    );
+}
+
+function AccountPageAddressValue({
+    account,
+    value,
+    onCopy,
+    onOpenAddress,
+}: {
+    account: string;
+    value: string;
+    onCopy: (value: string) => void;
+    onOpenAddress: (value: string) => void;
+}) {
+    if (normalizeAccountInput(value) === account) {
+        return <CopyableValue value={value} onCopy={onCopy} />;
+    }
+    return <AddressValue value={value} onOpenAddress={onOpenAddress} />;
 }
 
 function TerminalToast({ message }: { message: string }) {
@@ -1287,11 +1404,13 @@ function TransactionHistory({
     transactions,
     signedInAccountKey,
     onCopy,
+    onOpenAddress,
     verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
     signedInAccountKey: string | null;
     onCopy: (value: string) => void;
+    onOpenAddress: (value: string) => void;
     verifyCertificates: boolean;
 }) {
     const formatter = useMemo(
@@ -1317,6 +1436,7 @@ function TransactionHistory({
                         key={tx.digest}
                         formatter={formatter}
                         onCopy={onCopy}
+                        onOpenAddress={onOpenAddress}
                         signedInAccountKey={signedInAccountKey}
                         tx={tx}
                         verifyCertificates={verifyCertificates}
@@ -1330,12 +1450,14 @@ function TransactionHistory({
 function TransactionRecord({
     formatter,
     onCopy,
+    onOpenAddress,
     signedInAccountKey,
     tx,
     verifyCertificates,
 }: {
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
+    onOpenAddress: (value: string) => void;
     signedInAccountKey: string | null;
     tx: SubmittedTransaction;
     verifyCertificates: boolean;
@@ -1347,10 +1469,16 @@ function TransactionRecord({
                 <span className="tx-record__label">tx</span>
                 <CopyableValue value={tx.digest} onCopy={onCopy} />
                 <span className="tx-record__label">from</span>
-                <CopyableValue value={tx.sender} onCopy={onCopy} />
+                <AddressValue
+                    value={tx.sender}
+                    onOpenAddress={onOpenAddress}
+                />
                 <span className="tx-record__arrow" aria-hidden="true">→</span>
                 <span className="tx-record__label">to</span>
-                <CopyableValue value={tx.to} onCopy={onCopy} />
+                <AddressValue
+                    value={tx.to}
+                    onOpenAddress={onOpenAddress}
+                />
                 <span className="tx-record__nonce">value {tx.value}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
@@ -1678,6 +1806,17 @@ function normalizeAccountInput(value: string): string | null {
         return normalized;
     }
     return null;
+}
+
+function accountNonceState(account: AccountView | null): NonceState {
+    if (account === null) {
+        return emptyNonceState();
+    }
+
+    return {
+        base: BigInt(account.nonce.base),
+        bitmap: BigInt(account.nonce.bitmap),
+    };
 }
 
 function accountFromLocation(): string {

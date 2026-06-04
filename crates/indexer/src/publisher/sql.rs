@@ -63,7 +63,8 @@ pub(crate) struct TxActivityRow {
 pub(crate) struct AccountMetaRow {
     pub account: [u8; 32],
     pub balance: u64,
-    pub nonce: u64,
+    pub nonce_base: u64,
+    pub nonce_bitmap: u64,
     pub qmdb_location: u64,
 }
 
@@ -128,7 +129,8 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
         values: vec![
             CellValue::FixedBinary(account.account.to_vec()),
             CellValue::UInt64(account.balance),
-            CellValue::UInt64(account.nonce),
+            CellValue::UInt64(account.nonce_base),
+            CellValue::UInt64(account.nonce_bitmap),
             CellValue::UInt64(account.qmdb_location),
         ],
     }

@@ -33,8 +33,8 @@ use commonware_utils::{
 use constantinople_application::consensus::{Application, TransactionHistoryDb};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
-    Account, AccountKey, Block, BlockCfg, Header, Sealable, SealedBlock, TRANSACTION_NAMESPACE,
-    Transaction, TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, Block, BlockCfg, Header, Nonce, Sealable, SealedBlock,
+    TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::{
@@ -471,7 +471,7 @@ impl GeneratedTransactions {
                 AccountKey::from_public_key(&sender_public_key),
                 Account {
                     balance: 1,
-                    nonce: 0,
+                    nonce: Nonce::default(),
                 },
             ));
             accounts.push((

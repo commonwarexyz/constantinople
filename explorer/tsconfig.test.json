@@ -20,6 +20,7 @@
         "src/blockSequence.ts",
         "src/codec.ts",
         "src/historyKey.ts",
+        "src/nonce.ts",
         "src/proofMath.ts",
         "src/proofRetry.ts"
     ]

@@ -163,7 +163,13 @@ impl Client {
 #[derive(Debug, Clone, Copy, Deserialize)]
 pub struct AccountView {
     pub balance: u64,
-    pub nonce: u64,
+    pub nonce: NonceView,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+pub struct NonceView {
+    pub base: u64,
+    pub bitmap: u64,
 }
 
 /// Fast-ingest acknowledgement returned by validators.

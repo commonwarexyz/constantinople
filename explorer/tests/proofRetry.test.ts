@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { isRetryableAccountProofError, isRetryableProofError } from '../src/proofRetry.ts';
+import {
+    isMissingAccountProofError,
+    isRetryableAccountProofError,
+    isRetryableProofError,
+} from '../src/proofRetry.ts';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from '../src/proofMath.ts';
 
 test('SQL tx metadata misses are retried while the indexer catches up', () => {
@@ -48,6 +52,12 @@ test('account proof index catch-up errors are retried', () => {
         isRetryableAccountProofError('[out_of_range] requested proof tip is not published yet'),
         true,
     );
+});
+
+test('missing account proof rows are not retried as index catch-up', () => {
+    const detail = 'account a0bf226776...6068e27a is not indexed';
+    assert.equal(isMissingAccountProofError(detail), true);
+    assert.equal(isRetryableAccountProofError(detail), false);
 });
 
 test('QMDB account root mismatches are terminal', () => {

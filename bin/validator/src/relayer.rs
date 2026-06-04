@@ -15,7 +15,7 @@ use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed2
 use commonware_formatting::from_hex;
 use constantinople_engine::types::EngineActivity;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
-use constantinople_primitives::{Account, SignedTransaction, TransactionPublicKey};
+use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -421,14 +421,29 @@ async fn account(
 #[derive(Serialize)]
 struct AccountResponse {
     balance: u64,
-    nonce: u64,
+    nonce: NonceResponse,
+}
+
+#[derive(Serialize)]
+struct NonceResponse {
+    base: u64,
+    bitmap: u64,
 }
 
 impl From<Account> for AccountResponse {
     fn from(account: Account) -> Self {
         Self {
             balance: account.balance,
-            nonce: account.nonce,
+            nonce: NonceResponse::from(account.nonce),
+        }
+    }
+}
+
+impl From<Nonce> for NonceResponse {
+    fn from(nonce: Nonce) -> Self {
+        Self {
+            base: nonce.base,
+            bitmap: nonce.bitmap,
         }
     }
 }

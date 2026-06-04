@@ -16,8 +16,8 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, SignedTransaction, TransactionPublicKey, TransactionSignature,
-    VerifiedTransaction, verify_transaction_chunks,
+    Account, LazySignedTransaction, Nonce, SignedTransaction, TransactionPublicKey,
+    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
 use std::{fmt::Display, sync::Arc};
@@ -334,7 +334,7 @@ where
 /// Returns the committed account for the hex-encoded public key.
 ///
 /// Responds with:
-/// - `200 OK` and `{"balance": u64, "nonce": u64}` if the account exists.
+/// - `200 OK` and account JSON if the account exists.
 /// - `404 Not Found` if the account has not been written.
 /// - `400 Bad Request` if the path is not a valid public key hex string.
 /// - `503 Service Unavailable` if the state database has not been attached yet.
@@ -379,14 +379,29 @@ where
 #[derive(serde::Serialize)]
 struct AccountResponse {
     balance: u64,
-    nonce: u64,
+    nonce: NonceResponse,
+}
+
+#[derive(serde::Serialize)]
+struct NonceResponse {
+    base: u64,
+    bitmap: u64,
 }
 
 impl From<Account> for AccountResponse {
     fn from(account: Account) -> Self {
         Self {
             balance: account.balance,
-            nonce: account.nonce,
+            nonce: NonceResponse::from(account.nonce),
+        }
+    }
+}
+
+impl From<Nonce> for NonceResponse {
+    fn from(nonce: Nonce) -> Self {
+        Self {
+            base: nonce.base,
+            bitmap: nonce.bitmap,
         }
     }
 }
