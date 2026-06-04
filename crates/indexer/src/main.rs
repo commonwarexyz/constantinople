@@ -39,8 +39,7 @@ const ROCKS_MIN_BLOB_SIZE: u64 = 16 * 1024;
 const ROCKS_BLOB_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const ROCKS_BLOCK_CACHE_SIZE: usize = 1024 * 1024 * 1024;
 const ROCKS_BLOB_CACHE_SIZE: usize = 4 * 1024 * 1024 * 1024;
-const ROCKS_WRITE_MAX_COALESCED_REQUESTS: usize = 256;
-const ROCKS_WRITE_BUILDERS: usize = 4;
+const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -164,10 +163,8 @@ fn chain_indexer_rocks_config() -> RocksConfig {
         meta_cf_options: Options::default(),
         log_cf_options: write_heavy_options(&block_cache, &blob_cache),
         write_pipeline: RocksWritePipelineConfig {
-            max_coalesced_requests: NonZeroUsize::new(ROCKS_WRITE_MAX_COALESCED_REQUESTS)
-                .expect("rocks write coalescing width must be nonzero"),
-            builder_threads: NonZeroUsize::new(ROCKS_WRITE_BUILDERS)
-                .expect("rocks write builder count must be nonzero"),
+            max_commit_batch_bytes: NonZeroUsize::new(ROCKS_MAX_COMMIT_BATCH_BYTES)
+                .expect("rocks write commit batch byte limit must be nonzero"),
         },
     }
 }
