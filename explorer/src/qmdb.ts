@@ -32,10 +32,9 @@ const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 16;
 const ACCOUNT_CURSOR_BYTES = 24;
+const U64_MAX = (1n << 64n) - 1n;
 
 const TX_META_TABLE = 'tx_meta';
-const TX_META_HEIGHT = 'height';
-const TX_META_INDEX = 'index';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
 const TX_META_BODY_HEX = 'body_hex';
@@ -45,13 +44,10 @@ const TX_ACTIVITY_ACCOUNT = 'account';
 const TX_ACTIVITY_SORT_HEIGHT = 'sort_height';
 const TX_ACTIVITY_SORT_INDEX = 'sort_index';
 const TX_ACTIVITY_ROLE = 'role';
-const TX_ACTIVITY_HEIGHT = 'height';
-const TX_ACTIVITY_INDEX = 'index';
 const TX_ACTIVITY_DIGEST = 'tx_digest';
 const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
 const TX_ACTIVITY_VALUE = 'value';
 const TX_ACTIVITY_NONCE = 'nonce';
-const TX_ACTIVITY_QMDB_LOCATION = 'qmdb_location';
 const TX_ACTIVITY_ROLE_SENDER = 0n;
 const TX_ACTIVITY_ROLE_RECEIVER = 1n;
 
@@ -76,9 +72,6 @@ export interface VerifiedFinalizationTarget {
 
 interface TransactionProofMetadata {
     readonly location: bigint;
-    readonly height: bigint;
-    readonly blockIndex: number;
-    readonly blockTransactionCount: number;
 }
 
 interface FinalizedTransactionTarget {
@@ -103,7 +96,6 @@ export interface AccountTransactionRow {
     readonly counterparty: string;
     readonly value: bigint;
     readonly nonce: bigint;
-    readonly qmdbLocation: bigint;
     readonly height: bigint;
     readonly blockIndex: number;
 }
@@ -148,9 +140,6 @@ export async function fetchAndVerifyTransactionProof({
     );
     onFinalizationVerified?.(target);
     const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, target, signal);
-    if (target.height !== metadata.height) {
-        throw new Error(`finalized certificate height ${target.height} does not match tx height ${metadata.height}`);
-    }
     if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
         throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
     }
@@ -270,15 +259,15 @@ export async function fetchAndVerifyTransactionRowProof({
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
-    assertTransactionLocationBeforeTip(row.qmdbLocation, target.transactionsTip);
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    await assertSqlTransactionBodyDigest(sqlUrl, digestBytes, signal);
+    const metadata = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+    assertTransactionLocationBeforeTip(metadata.location, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
         `${trimTrailingSlash(qmdbUrl)}/transactions`,
-        row.qmdbLocation,
+        metadata.location,
         tip,
         target.transactionsRoot,
         digestBytes,
@@ -286,7 +275,7 @@ export async function fetchAndVerifyTransactionRowProof({
     );
 
     return {
-        location: row.qmdbLocation,
+        location: metadata.location,
         tip,
         height: target.height,
         view: target.view,
@@ -294,15 +283,15 @@ export async function fetchAndVerifyTransactionRowProof({
     };
 }
 
-async function assertSqlTransactionBodyDigest(
+async function fetchVerifiedSqlTransactionMetadata(
     sqlUrl: string,
     digest: Uint8Array,
     signal?: AbortSignal,
-): Promise<void> {
+): Promise<TransactionProofMetadata> {
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_BODY_HEX}
+            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY_HEX}
             FROM ${TX_META_TABLE}
             WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
             LIMIT 1
@@ -314,6 +303,7 @@ async function assertSqlTransactionBodyDigest(
         throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
     }
 
+    const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
     const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
     if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
         throw new Error('SQL transaction body is truncated');
@@ -323,6 +313,7 @@ async function assertSqlTransactionBodyDigest(
     if (!bytesEqual(actual, digest)) {
         throw new Error('SQL transaction body does not match transaction digest');
     }
+    return { location };
 }
 
 async function fetchTransactionProofMetadata(
@@ -336,7 +327,7 @@ async function fetchTransactionProofMetadata(
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_HEIGHT}, ${TX_META_INDEX}, ${TX_META_QMDB_LOCATION}
+            SELECT ${TX_META_QMDB_LOCATION}
             FROM ${TX_META_TABLE}
             WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
             LIMIT 1
@@ -348,16 +339,10 @@ async function fetchTransactionProofMetadata(
         throw new Error(`tx digest ${shortHex(digest)} missing at height ${target.height}`);
     }
 
-    const height = expectBigint(row.values[TX_META_HEIGHT], TX_META_HEIGHT);
-    const blockIndex = expectSafeNumber(row.values[TX_META_INDEX], TX_META_INDEX);
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
-    const blockTransactionCount = target.transactionsTip - target.transactionsStart - 1n;
 
     return {
         location,
-        height,
-        blockIndex,
-        blockTransactionCount: expectSafeNumber(blockTransactionCount, 'block transaction count'),
     };
 }
 
@@ -374,8 +359,6 @@ function transactionProofErrorDetail(
         `tip ${transactionProofTip(target.transactionsTip).toString()}`,
         `proof start ${metadata.location.toString()}`,
         'ops 1',
-        `block index ${metadata.blockIndex}`,
-        `block txs ${metadata.blockTransactionCount}`,
     ].join(' · ');
 }
 
@@ -645,13 +628,10 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_SORT_HEIGHT},
                 ${TX_ACTIVITY_SORT_INDEX},
                 ${TX_ACTIVITY_ROLE},
-                ${TX_ACTIVITY_HEIGHT},
-                ${TX_ACTIVITY_INDEX},
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE},
-                ${TX_ACTIVITY_QMDB_LOCATION}
+                ${TX_ACTIVITY_NONCE}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
             ORDER BY ${TX_ACTIVITY_SORT_HEIGHT} ASC,
@@ -664,6 +644,8 @@ async function fetchAccountActivityRows(
 }
 
 function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
+    const sortHeight = expectBigint(row.values[TX_ACTIVITY_SORT_HEIGHT], TX_ACTIVITY_SORT_HEIGHT);
+    const sortIndex = expectBigint(row.values[TX_ACTIVITY_SORT_INDEX], TX_ACTIVITY_SORT_INDEX);
     const role = expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE);
     const digest = expectBytes(row.values[TX_ACTIVITY_DIGEST], TX_ACTIVITY_DIGEST, DIGEST_BYTES);
     const counterparty = expectBytes(
@@ -677,9 +659,8 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         counterparty: toHex(counterparty),
         value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
         nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
-        qmdbLocation: expectBigint(row.values[TX_ACTIVITY_QMDB_LOCATION], TX_ACTIVITY_QMDB_LOCATION),
-        height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
-        blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
+        height: U64_MAX - sortHeight,
+        blockIndex: expectSafeNumber(U64_MAX - sortIndex, TX_ACTIVITY_SORT_INDEX),
     };
 }
 

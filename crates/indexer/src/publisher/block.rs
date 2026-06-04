@@ -96,8 +96,6 @@ where
         let receiver = tx.to;
         sql.push(encode_tx_meta_row(TxMetaRow {
             digest,
-            height,
-            index: idx_u32,
             qmdb_location,
             body: tx.bytes,
         }));
@@ -110,7 +108,6 @@ where
             counterparty: receiver,
             value: tx.value,
             nonce: tx.nonce,
-            qmdb_location,
         }));
         if receiver != sender {
             sql.push(encode_tx_activity_row(TxActivityRow {
@@ -122,7 +119,6 @@ where
                 counterparty: sender,
                 value: tx.value,
                 nonce: tx.nonce,
-                qmdb_location,
             }));
         }
     }
@@ -331,7 +327,7 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        let Some(CellValue::Utf8(body_hex)) = meta.values.get(4) else {
+        let Some(CellValue::Utf8(body_hex)) = meta.values.get(2) else {
             panic!("tx_meta body should be hex");
         };
         assert_eq!(body_hex, &hex_lower(expected_body));

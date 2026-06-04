@@ -25,11 +25,11 @@ histogram showing tx-count-per-block over the last ~80 blocks so the
 operator can see throughput scale at a glance. The histogram's y-axis
 is auto-scaled to the peak in the visible window.
 
-When the signed-in account submits transactions, the explorer also looks up
-their `tx_meta.qmdb_location`, fetches a transaction operation-log proof from
-`qmdb-indexer` under `/transactions`, verifies it in the browser with the
-Exoware QMDB and Simplex WASM verifiers, and shows a checkmark after
-verification succeeds.
+When the signed-in account submits transactions, the explorer uses the account
+activity digest to look up `tx_meta.qmdb_location` plus the raw signed
+transaction bytes, verifies the SQL bytes hash to that digest, fetches a
+transaction operation-log proof from `qmdb-indexer` under `/transactions`, and
+shows a checkmark after browser-side QMDB and Simplex verification succeeds.
 
 ### Why SQL?
 

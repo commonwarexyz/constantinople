@@ -929,7 +929,7 @@ function AccountPage({
                         <div className="account-tx-row__meta">
                             <span>value {row.value.toString()}</span>
                             <span>nonce {row.nonce.toString()}</span>
-                            <span>loc {row.qmdbLocation.toString()}</span>
+                            <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
                             <span>proof</span>
                             <ProofMark proof={txProof} />
                         </div>
