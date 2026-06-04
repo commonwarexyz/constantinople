@@ -162,19 +162,45 @@ pub(crate) struct RemoteArgs {
     instance_type: String,
     #[arg(long)]
     storage_size: i32,
+    /// EBS storage class for validators, secondaries, and shared non-chain-indexer services.
+    #[arg(long, default_value = STORAGE_CLASS)]
+    storage_class: String,
+    /// Provisioned IOPS for validators, secondaries, and shared non-chain-indexer services.
+    #[arg(long)]
+    storage_iops: Option<i32>,
+    /// Provisioned throughput (MiB/s) for validators, secondaries, and shared non-chain-indexer services.
+    #[arg(long)]
+    storage_throughput: Option<i32>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,
     /// Storage size (GiB) for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-storage-size", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_SIZE)]
     chain_indexer_storage_size: i32,
-    /// Provisioned IOPS for the shared chain-indexer io2 volume.
-    #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
-    chain_indexer_storage_iops: i32,
+    /// EBS storage class for the shared chain-indexer instance.
+    #[arg(long = "chain-indexer-storage-class", default_value = CHAIN_INDEXER_STORAGE_CLASS)]
+    chain_indexer_storage_class: String,
+    /// Provisioned IOPS for the shared chain-indexer volume.
+    ///
+    /// Defaults to 16,000 only when the chain-indexer storage class remains `io2`.
+    #[arg(long = "chain-indexer-storage-iops")]
+    chain_indexer_storage_iops: Option<i32>,
+    /// Provisioned throughput (MiB/s) for the shared chain-indexer volume.
+    #[arg(long = "chain-indexer-storage-throughput")]
+    chain_indexer_storage_throughput: Option<i32>,
     #[arg(long)]
     monitoring_instance_type: String,
     #[arg(long)]
     monitoring_storage_size: i32,
+    /// EBS storage class for the monitoring instance.
+    #[arg(long = "monitoring-storage-class", default_value = STORAGE_CLASS)]
+    monitoring_storage_class: String,
+    /// Provisioned IOPS for the monitoring instance.
+    #[arg(long = "monitoring-storage-iops")]
+    monitoring_storage_iops: Option<i32>,
+    /// Provisioned throughput (MiB/s) for the monitoring instance.
+    #[arg(long = "monitoring-storage-throughput")]
+    monitoring_storage_throughput: Option<i32>,
     #[arg(long)]
     dashboard: PathBuf,
     #[arg(long, default_value_t = 9000)]
@@ -634,6 +660,69 @@ mod tests {
             remote.http_cidrs,
             vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
         );
+    }
+
+    #[test]
+    fn remote_parses_storage_options() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "remote",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8gd.4xlarge",
+            "--storage-size",
+            "75",
+            "--storage-class",
+            "gp3",
+            "--storage-iops",
+            "4000",
+            "--storage-throughput",
+            "250",
+            "--chain-indexer-instance-type",
+            "c8gd.4xlarge",
+            "--chain-indexer-storage-size",
+            "8",
+            "--chain-indexer-storage-class",
+            "gp3",
+            "--monitoring-instance-type",
+            "c8g.4xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--monitoring-storage-class",
+            "gp3",
+            "--monitoring-storage-iops",
+            "4000",
+            "--monitoring-storage-throughput",
+            "250",
+            "--dashboard",
+            "dashboard.json",
+        ])
+        .expect("remote invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("expected remote target");
+        };
+
+        assert_eq!(remote.storage_class, "gp3");
+        assert_eq!(remote.storage_iops, Some(4000));
+        assert_eq!(remote.storage_throughput, Some(250));
+        assert_eq!(remote.chain_indexer_instance_type, "c8gd.4xlarge");
+        assert_eq!(remote.chain_indexer_storage_size, 8);
+        assert_eq!(remote.chain_indexer_storage_class, "gp3");
+        assert_eq!(remote.chain_indexer_storage_iops, None);
+        assert_eq!(remote.monitoring_storage_class, "gp3");
+        assert_eq!(remote.monitoring_storage_iops, Some(4000));
+        assert_eq!(remote.monitoring_storage_throughput, Some(250));
     }
 
     #[test]

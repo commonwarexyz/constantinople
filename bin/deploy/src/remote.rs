@@ -1,11 +1,11 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
     CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
-    DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
-    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
-    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
-    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
+    DASHBOARD_FILE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS, DEPLOYER_CONFIG_FILE,
+    EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig,
+    METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
+    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
+    RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, default_max_pool_bytes, default_max_propose_bytes,
     ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
@@ -306,6 +306,15 @@ fn qmdb_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<QmdbI
     })
 }
 
+fn chain_indexer_storage_iops(remote: &RemoteArgs) -> Option<i32> {
+    remote.chain_indexer_storage_iops.or_else(|| {
+        remote
+            .chain_indexer_storage_class
+            .eq_ignore_ascii_case(CHAIN_INDEXER_STORAGE_CLASS)
+            .then_some(DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)
+    })
+}
+
 fn build_deployer_config(
     args: &GenerateArgs,
     remote: &RemoteArgs,
@@ -326,9 +335,9 @@ fn build_deployer_config(
             availability_zone_group: None,
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_class: remote.storage_class.clone(),
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: validator_binary.to_string(),
             config: validator.config_name.clone(),
             profiling: remote.profiling,
@@ -352,9 +361,9 @@ fn build_deployer_config(
                 .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_class: remote.storage_class.clone(),
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: validator_binary.to_string(),
             config: secondary.config_name.clone(),
             profiling: remote.profiling,
@@ -368,9 +377,9 @@ fn build_deployer_config(
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.chain_indexer_instance_type.clone(),
             storage_size: remote.chain_indexer_storage_size,
-            storage_class: CHAIN_INDEXER_STORAGE_CLASS.to_string(),
-            storage_iops: Some(remote.chain_indexer_storage_iops),
-            storage_throughput: None,
+            storage_class: remote.chain_indexer_storage_class.clone(),
+            storage_iops: chain_indexer_storage_iops(remote),
+            storage_throughput: remote.chain_indexer_storage_throughput,
             binary: CHAIN_INDEXER_BINARY_FILE.to_string(),
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -381,9 +390,9 @@ fn build_deployer_config(
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_class: remote.storage_class.clone(),
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: METADATA_INDEXER_BINARY_FILE.to_string(),
             config: METADATA_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -394,9 +403,9 @@ fn build_deployer_config(
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_class: remote.storage_class.clone(),
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: QMDB_INDEXER_BINARY_FILE.to_string(),
             config: QMDB_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -413,9 +422,9 @@ fn build_deployer_config(
                 .clone()
                 .unwrap_or_else(|| remote.instance_type.clone()),
             storage_size: remote.spammer_storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_class: remote.storage_class.clone(),
+            storage_iops: remote.storage_iops,
+            storage_throughput: remote.storage_throughput,
             binary: SPAMMER_BINARY_FILE.to_string(),
             config: SPAMMER_CONFIG_FILE.to_string(),
             profiling: false,
@@ -427,9 +436,9 @@ fn build_deployer_config(
         monitoring: aws::MonitoringConfig {
             instance_type: remote.monitoring_instance_type.clone(),
             storage_size: remote.monitoring_storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
-            storage_iops: None,
-            storage_throughput: None,
+            storage_class: remote.monitoring_storage_class.clone(),
+            storage_iops: remote.monitoring_storage_iops,
+            storage_throughput: remote.monitoring_storage_throughput,
             dashboard: dashboard.to_string(),
         },
         instances,
@@ -477,7 +486,7 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 mod tests {
     use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
     use crate::{
-        CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
+        CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
@@ -520,11 +529,19 @@ mod tests {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
             storage_size: 25,
+            storage_class: STORAGE_CLASS.to_string(),
+            storage_iops: None,
+            storage_throughput: None,
             chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
             chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
-            chain_indexer_storage_iops: DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
+            chain_indexer_storage_class: CHAIN_INDEXER_STORAGE_CLASS.to_string(),
+            chain_indexer_storage_iops: None,
+            chain_indexer_storage_throughput: None,
             monitoring_instance_type: "c8g.2xlarge".to_string(),
             monitoring_storage_size: 100,
+            monitoring_storage_class: STORAGE_CLASS.to_string(),
+            monitoring_storage_iops: None,
+            monitoring_storage_throughput: None,
             dashboard: PathBuf::from("dashboard.json"),
             listen_port: 9000,
             http_port: 8080,
@@ -597,6 +614,33 @@ mod tests {
         assert_eq!(config.ports[0].port, 9000);
         assert_eq!(config.ports[1].port, 8080);
         assert_eq!(config.ports[1].cidr, "198.51.100.4/32");
+    }
+
+    #[test]
+    fn remote_deployer_config_uses_custom_shared_storage_options() {
+        let args = generate_args();
+        let mut remote = remote_args();
+        remote.storage_class = "io2".to_string();
+        remote.storage_iops = Some(12_000);
+        remote.monitoring_storage_class = "gp3".to_string();
+        remote.monitoring_storage_iops = Some(4_000);
+        remote.monitoring_storage_throughput = Some(250);
+        let validators = vec![validator(0), validator(1), validator(2)];
+
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &[],
+        );
+
+        assert_eq!(config.instances[0].storage_class, "io2");
+        assert_eq!(config.instances[0].storage_iops, Some(12_000));
+        assert_eq!(config.monitoring.storage_class, "gp3");
+        assert_eq!(config.monitoring.storage_iops, Some(4_000));
+        assert_eq!(config.monitoring.storage_throughput, Some(250));
     }
 
     #[test]
@@ -820,5 +864,35 @@ mod tests {
         assert!(config.ports.iter().any(|port| port.port == 8090));
         assert!(config.ports.iter().any(|port| port.port == 8091));
         assert!(config.ports.iter().any(|port| port.port == 8092));
+    }
+
+    #[test]
+    fn remote_deployer_config_allows_gp3_chain_indexer_storage_without_iops() {
+        let mut args = generate_args();
+        args.indexer = true;
+        let mut remote = remote_args();
+        remote.chain_indexer_instance_type = "c8gd.4xlarge".to_string();
+        remote.chain_indexer_storage_size = 8;
+        remote.chain_indexer_storage_class = "gp3".to_string();
+        let validators = vec![validator(0), validator(1), validator(2)];
+
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &[],
+        );
+        let chain_indexer = config
+            .instances
+            .iter()
+            .find(|instance| instance.name == CHAIN_INDEXER_HOST)
+            .expect("chain-indexer instance should be present");
+
+        assert_eq!(chain_indexer.instance_type, "c8gd.4xlarge");
+        assert_eq!(chain_indexer.storage_size, 8);
+        assert_eq!(chain_indexer.storage_class, "gp3");
+        assert_eq!(chain_indexer.storage_iops, None);
     }
 }

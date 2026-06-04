@@ -251,6 +251,9 @@ deployer aws create --config config.yaml
 ```
 
 `--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments.
+Use `--storage-class`, `--storage-iops`, and `--storage-throughput` to tune EBS
+volumes for validators, secondaries, the spammer, and shared non-chain-indexer
+services. Use the `--monitoring-storage-*` flags for the monitoring instance.
 
 ### Remote Deployment with Spammer
 
@@ -395,11 +398,42 @@ Topology and defaults:
 - all shared indexer services land in the first remote region.
 - `chain-indexer` uses a `c8gb.4xlarge` instance and a 500 GiB `io2` volume with
   16,000 IOPS by default; override these with `--chain-indexer-instance-type`,
-  `--chain-indexer-storage-size`, and `--chain-indexer-storage-iops`.
+  `--chain-indexer-storage-size`, `--chain-indexer-storage-class`,
+  `--chain-indexer-storage-iops`, and `--chain-indexer-storage-throughput`.
 - `chain-indexer` listens on port `8090` by default.
 - `metadata-indexer` listens on port `8091` by default.
 - `qmdb-indexer` listens on port `8092` by default.
 - Full indexer uploads are enabled on only the indexer secondary.
+
+For NVMe instance-store deployments, use an NVMe-enabled instance family for
+`--instance-type` and `--chain-indexer-instance-type`. With a deployer that
+mounts EC2 NVMe instance storage at the binary working directory, keep the EBS
+volumes small and non-provisioned. Monitoring is launched separately by
+deployer and remains EBS-backed:
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 50 \
+  --indexer \
+  --relayer \
+  --spammer \
+  --spammer-accounts 16384 \
+  --spammer-accounts-jitter 0.1 \
+  --output-dir ./deploy \
+  --worker-threads 4 \
+  --rayon-threads 12 \
+  remote \
+  --http-cidr 0.0.0.0/0 \
+  --regions us-east-1,us-west-2 \
+  --instance-type c8gd.4xlarge \
+  --storage-size 75 \
+  --chain-indexer-instance-type c8gd.4xlarge \
+  --chain-indexer-storage-size 8 \
+  --chain-indexer-storage-class gp3 \
+  --monitoring-instance-type c8g.4xlarge \
+  --monitoring-storage-size 100 \
+  --dashboard ./dashboard.json
+```
 
 QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
 writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
