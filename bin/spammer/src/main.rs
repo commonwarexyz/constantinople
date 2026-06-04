@@ -3,10 +3,9 @@
 //! Generates deterministic accounts and submits ring-transfer transactions to
 //! the relayer in a continuous loop.
 //!
-//! Each target gets its own independent set of accounts and runs a sequential
-//! submission loop: sign one batch, submit, wait for full finalization, then
-//! sign and submit the next batch. This guarantees nonce ordering and
-//! eliminates cascading failures.
+//! Each target gets its own independent account set. A local signer keeps one
+//! batch ready while the submitter has one batch in flight, hiding signing
+//! latency without queueing multiple batches at a proposer.
 
 mod accounts;
 mod cli;
@@ -14,19 +13,20 @@ mod config;
 mod signer;
 mod submitter;
 
-use accounts::generate_accounts;
+use accounts::{SpamAccount, generate_accounts};
 use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
-use signer::sign_batch;
+use signer::{Tx, sign_batch};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
 };
 use submitter::{RelayerSubmitter, Stats};
+use tokio::sync::mpsc;
 use tracing::info;
 
 fn main() {
@@ -39,6 +39,7 @@ fn main() {
         seed_offset,
         relayer_url,
         relayer_submitters,
+        presigned_batches,
         primary_validators,
         accounts_jitter,
     ) = if let Some(config_path) = &cli.config {
@@ -54,6 +55,7 @@ fn main() {
             cfg.seed_offset,
             config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
             relayer_submitters,
+            cfg.presigned_batches,
             if cfg.primary_validators.is_empty() {
                 cli.relayer_targets.clone()
             } else {
@@ -70,6 +72,7 @@ fn main() {
                 .clone()
                 .expect("provide --relayer-url or --config"),
             cli.relayer_submitters.max(1),
+            cli.presigned_batches,
             cli.relayer_targets.clone(),
             cli.accounts_jitter,
         )
@@ -78,6 +81,7 @@ fn main() {
         (0.0..=1.0).contains(&accounts_jitter),
         "--accounts-jitter must be between 0 and 1"
     );
+    assert!(presigned_batches > 0, "--presigned-batches must be > 0");
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -115,6 +119,7 @@ fn main() {
             seed_offset,
             accounts_jitter,
             relayer_submitters,
+            presigned_batches,
             relayer_targets: primary_validators,
         };
         run_relayer_mode(config, strategy).await;
@@ -128,12 +133,13 @@ struct RelayerModeConfig {
     seed_offset: u64,
     accounts_jitter: f64,
     relayer_submitters: usize,
+    presigned_batches: usize,
     relayer_targets: Vec<String>,
 }
 
 async fn run_relayer_mode(
     config: RelayerModeConfig,
-    strategy: impl commonware_parallel::Strategy + 'static,
+    strategy: impl commonware_parallel::Strategy + Send + 'static,
 ) {
     let RelayerModeConfig {
         relayer_url,
@@ -142,6 +148,7 @@ async fn run_relayer_mode(
         seed_offset,
         accounts_jitter,
         relayer_submitters,
+        presigned_batches,
         relayer_targets,
     } = config;
 
@@ -152,6 +159,7 @@ async fn run_relayer_mode(
         seed_offset,
         accounts_jitter,
         %relayer_url,
+        presigned_batches,
         "starting spammer relayer mode"
     );
 
@@ -164,23 +172,15 @@ async fn run_relayer_mode(
         let target = relayer_target_for(&relayer_targets, index);
         let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
         let strategy = strategy.clone();
-        tokio::spawn(async move {
-            let mut rng = JitterRng::new(account_offset.wrapping_add(1));
-            let mut nonces = vec![0; accounts.len()];
-            let mut cursor = 0;
-            loop {
-                let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
-                let batch = sign_batch(
-                    &strategy,
-                    &accounts,
-                    value,
-                    &mut nonces,
-                    &mut cursor,
-                    batch_size,
-                );
-                submitter.submit_until_finalized(batch).await;
-            }
-        });
+        let batches = spawn_presigner(
+            strategy,
+            accounts,
+            value,
+            accounts_jitter,
+            account_offset,
+            presigned_batches,
+        );
+        tokio::spawn(submit_presigned_batches(submitter, batches));
     }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -205,6 +205,50 @@ async fn run_relayer_mode(
             elapsed_s = format!("{elapsed:.1}"),
             "progress"
         );
+    }
+}
+
+fn spawn_presigner<St>(
+    strategy: St,
+    accounts: Vec<SpamAccount>,
+    value: NonZeroU64,
+    accounts_jitter: f64,
+    account_offset: u64,
+    presigned_batches: usize,
+) -> mpsc::Receiver<Vec<Tx>>
+where
+    St: commonware_parallel::Strategy + Send + 'static,
+{
+    let (sender, receiver) = mpsc::channel(presigned_batches);
+    tokio::spawn(async move {
+        let mut rng = JitterRng::new(account_offset.wrapping_add(1));
+        let mut nonces = vec![0; accounts.len()];
+        let mut cursor = 0;
+
+        loop {
+            let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
+            let batch = sign_batch(
+                &strategy,
+                &accounts,
+                value,
+                &mut nonces,
+                &mut cursor,
+                batch_size,
+            );
+            if sender.send(batch).await.is_err() {
+                return;
+            }
+        }
+    });
+    receiver
+}
+
+async fn submit_presigned_batches(
+    submitter: RelayerSubmitter,
+    mut batches: mpsc::Receiver<Vec<Tx>>,
+) {
+    while let Some(batch) = batches.recv().await {
+        submitter.submit_until_finalized(batch).await;
     }
 }
 
@@ -267,7 +311,13 @@ impl JitterRng {
 
 #[cfg(test)]
 mod tests {
-    use super::{JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for};
+    use super::{
+        JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for, spawn_presigner,
+    };
+    use crate::accounts::generate_accounts;
+    use commonware_parallel::Sequential;
+    use core::num::NonZeroU64;
+    use std::time::Duration;
 
     /// `range` must hit both endpoints over enough draws and never escape them.
     #[test]
@@ -344,5 +394,46 @@ mod tests {
             Some("primary-0")
         );
         assert!(relayer_target_for(&[], 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn presigner_keeps_one_batch_ready_without_unbounded_local_queue() {
+        let accounts = generate_accounts(3, 1000);
+        let value = NonZeroU64::new(1).expect("non-zero value");
+        let presigned_batches = 4;
+        let mut batches =
+            spawn_presigner(Sequential, accounts, value, 0.0, 1000, presigned_batches);
+
+        let first = batches.recv().await.expect("first batch should be signed");
+        assert_eq!(batch_nonces(&first), vec![0, 0, 0]);
+
+        wait_for_presigned_batches(&batches, presigned_batches).await;
+        assert_eq!(batches.len(), presigned_batches);
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(batches.len(), presigned_batches);
+
+        let second = batches.recv().await.expect("second batch should be ready");
+        assert_eq!(batch_nonces(&second), vec![1, 1, 1]);
+    }
+
+    async fn wait_for_presigned_batches(
+        batches: &tokio::sync::mpsc::Receiver<Vec<super::Tx>>,
+        expected: usize,
+    ) {
+        for _ in 0..50 {
+            if batches.len() == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("presigner did not fill the local queue");
+    }
+
+    fn batch_nonces(batch: &[super::Tx]) -> Vec<u64> {
+        batch
+            .iter()
+            .map(|transaction| transaction.value().nonce)
+            .collect()
     }
 }

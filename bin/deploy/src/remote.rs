@@ -271,6 +271,7 @@ fn remote_spammer_config(
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
         relayer_submitters: args.validators as usize,
+        presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
     }
@@ -504,6 +505,7 @@ mod tests {
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_accounts_jitter: 0.0,
+            spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -658,6 +660,10 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert_eq!(
+            relayed.presigned_batches,
+            crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Async submission engine with retry logic.
 //!
-//! Each relayer stream submits one batch at a time and blocks until every
-//! transaction in the batch is finalized. This guarantees nonce ordering.
+//! Each relayer stream submits one batch at a time and blocks until that batch
+//! resolves. Callers may keep later batches pre-signed locally.
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
@@ -37,8 +37,7 @@ impl Stats {
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 
-/// Submits batches through a relayer and waits for finalization before
-/// advancing nonces.
+/// Submits batches through a relayer and waits for each batch to resolve.
 pub struct RelayerSubmitter {
     url: String,
     http: reqwest::Client,

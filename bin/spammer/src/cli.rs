@@ -17,9 +17,13 @@ pub struct Cli {
     #[arg(long)]
     pub relayer_url: Option<String>,
 
-    /// Independent nonce-ordered streams to run in relayer mode.
+    /// Independent target-leader streams to run in relayer mode.
     #[arg(long, default_value_t = 1)]
     pub relayer_submitters: usize,
+
+    /// Fully signed local batches to keep ready per submitter.
+    #[arg(long, default_value_t = crate::config::DEFAULT_PRESIGNED_BATCHES)]
+    pub presigned_batches: usize,
 
     /// Hex-encoded primary validator keys used as exact relayer targets.
     #[arg(long, value_delimiter = ',')]
@@ -76,8 +80,26 @@ mod tests {
 
         assert_eq!(cli.relayer_url, Some("http://127.0.0.1:8084".to_string()));
         assert_eq!(cli.relayer_submitters, 1);
+        assert_eq!(
+            cli.presigned_batches,
+            crate::config::DEFAULT_PRESIGNED_BATCHES
+        );
         assert!(cli.relayer_targets.is_empty());
         assert!(cli.hosts.is_none());
+    }
+
+    #[test]
+    fn parses_presigned_batches() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--presigned-batches",
+            "32",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.presigned_batches, 32);
     }
 
     #[test]

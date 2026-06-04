@@ -55,6 +55,7 @@ const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
+const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -123,6 +124,9 @@ pub(crate) struct GenerateArgs {
     /// txs per batch.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
+    /// Fully signed local batches to keep ready per spammer submitter.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
+    spammer_presigned_batches: usize,
 
     #[command(subcommand)]
     target: GenerateTarget,
@@ -211,9 +215,12 @@ pub(crate) struct SpammerConfig {
     pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
-    /// Independent nonce-ordered streams to run when submitting through a relayer.
+    /// Independent target-leader streams to run when submitting through a relayer.
     #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub relayer_submitters: usize,
+    /// Fully signed local batches to keep ready per submitter.
+    #[serde(default = "default_spammer_presigned_batches")]
+    pub presigned_batches: usize,
     /// Hex-encoded ed25519 public keys of primary (voting) validators.
     ///
     /// In `--hosts` mode the spammer cannot distinguish primaries from
@@ -375,6 +382,10 @@ impl ClusterMaterial {
 
 const fn usize_is_zero(value: &usize) -> bool {
     *value == 0
+}
+
+const fn default_spammer_presigned_batches() -> usize {
+    DEFAULT_SPAMMER_PRESIGNED_BATCHES
 }
 
 fn main() {
@@ -656,6 +667,28 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_accounts_jitter, 0.25);
+    }
+
+    #[test]
+    fn parses_spammer_presigned_batches() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-presigned-batches",
+            "32",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_presigned_batches, 32);
     }
 
     #[test]

@@ -350,11 +350,13 @@ fn local_run_commands(
              --accounts {} \
              --value {} \
              --seed-offset {} \
-             --accounts-jitter {}",
+             --accounts-jitter {} \
+             --presigned-batches {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_accounts_jitter,
+            args.spammer_presigned_batches,
         ));
     }
 
@@ -394,6 +396,7 @@ mod tests {
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_accounts_jitter: 0.0,
+            spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -492,6 +495,7 @@ mod tests {
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
         assert!(commands[3].contains("--relayer-submitters 2"));
         assert!(commands[3].contains("--relayer-targets aa,bb"));
+        assert!(commands[3].contains("--presigned-batches 16"));
         assert!(!commands[3].contains("--peers"));
     }
 
@@ -509,6 +513,22 @@ mod tests {
         );
 
         assert!(commands[3].contains("--accounts-jitter 0.25"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_presigned_batches_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_presigned_batches = 32;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--presigned-batches 32"));
     }
 
     #[test]
