@@ -69,6 +69,7 @@ const DEFAULT_SQL_URL = 'http://127.0.0.1:8091';
 const DEFAULT_QMDB_URL = 'http://127.0.0.1:8092';
 const DEFAULT_STORE_URL = 'http://127.0.0.1:8090';
 const DEFAULT_MEMPOOL_URL = 'http://127.0.0.1:8080';
+const MAX_U64 = (1n << 64n) - 1n;
 
 const indexerUrl = import.meta.env.VITE_SQL_URL ?? DEFAULT_SQL_URL;
 const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
@@ -173,7 +174,7 @@ export default function App() {
     const [value, setValue] = useState('1');
     const [nonce, setNonce] = useState('0');
     const [submitMessage, setSubmitMessage] = useState('');
-    const [isSubmitting, setIsSubmitting] = useState(false);
+    const [pendingSubmissionCount, setPendingSubmissionCount] = useState(0);
     const [history, setHistory] = useState<SubmittedTransaction[]>([]);
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
@@ -190,9 +191,11 @@ export default function App() {
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
+    const nextNonceRef = useRef(0n);
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
+    const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
         accountMessage === 'loading account metadata' ||
@@ -210,6 +213,19 @@ export default function App() {
         signedInAccountKey,
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
+
+    const setLocalNonce = (nextNonce: bigint) => {
+        nextNonceRef.current = nextNonce;
+        setNonce(nextNonce.toString());
+    };
+
+    const advanceLocalNonceAtLeast = (nextNonce: bigint) => {
+        if (nextNonce > nextNonceRef.current) {
+            setLocalNonce(nextNonce);
+            return;
+        }
+        setNonce(nextNonceRef.current.toString());
+    };
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
@@ -517,6 +533,7 @@ export default function App() {
     useEffect(() => {
         if (!wallet) {
             setAccount(null);
+            setLocalNonce(0n);
             setAccountMessage('account metadata unavailable');
             return;
         }
@@ -528,8 +545,7 @@ export default function App() {
             .then((nextAccount) => {
                 if (cancelled) return;
                 setAccount(nextAccount);
-                const nextNonce = nextAccount?.nonce ?? 0;
-                setNonce(String(nextNonce));
+                advanceLocalNonceAtLeast(BigInt(nextAccount?.nonce ?? 0));
                 setAccountMessage(
                     nextAccount
                         ? 'committed account loaded'
@@ -553,7 +569,7 @@ export default function App() {
         try {
             const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
             setAccount(nextAccount);
-            setNonce(String(nextAccount?.nonce ?? 0));
+            advanceLocalNonceAtLeast(BigInt(nextAccount?.nonce ?? 0));
             setAccountMessage(
                 nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
             );
@@ -666,18 +682,26 @@ export default function App() {
     };
 
     const submitTransfer = async () => {
-        if (!wallet || isSubmitting) return;
+        if (!wallet) return;
         if (!walletAccountKey) {
             setSubmitMessage('loading account address');
             return;
         }
 
-        setIsSubmitting(true);
+        setPendingSubmissionCount((count) => count + 1);
         setSubmitMessage('forming transaction');
+        let reservedNonce: bigint | null = null;
         try {
             const parsedToKey = parseAccountKeyHex(toKey);
             const parsedValue = parseU64(value, 'value');
-            const parsedNonce = parseU64(nonce, 'nonce');
+            const parsedNonce = nextNonceRef.current;
+            const nextNonce = parsedNonce + 1n;
+            if (nextNonce > MAX_U64) {
+                throw new Error('nonce must fit in u64');
+            }
+            setLocalNonce(nextNonce);
+            reservedNonce = parsedNonce;
+
             const encoded = await encodeSignedTransaction(
                 {
                     senderPublicKey: wallet.publicKey,
@@ -717,10 +741,12 @@ export default function App() {
             setSubmitMessage('');
             await refreshAccount();
         } catch (error) {
+            if (reservedNonce !== null && nextNonceRef.current === reservedNonce + 1n) {
+                setLocalNonce(reservedNonce);
+            }
             setSubmitMessage(error instanceof Error ? error.message : String(error));
         } finally {
-            setSubmitMessage('');
-            setIsSubmitting(false);
+            setPendingSubmissionCount((count) => Math.max(0, count - 1));
         }
     };
 
@@ -1191,7 +1217,7 @@ function WalletPanel({
                         onChange={(event) => onToKeyChange(event.target.value)}
                         placeholder="Recipient address"
                         spellCheck={false}
-                        disabled={!wallet || isSubmitting}
+                        disabled={!wallet}
                     />
                 </label>
                 <label>
@@ -1200,10 +1226,10 @@ function WalletPanel({
                         value={value}
                         onChange={(event) => onValueChange(event.target.value)}
                         inputMode="numeric"
-                        disabled={!wallet || isSubmitting}
+                        disabled={!wallet}
                     />
                 </label>
-                <button className="transfer__submit" disabled={!wallet || isSubmitting} type="submit">
+                <button className="transfer__submit" disabled={!wallet} type="submit">
                     submit
                 </button>
             </form>
