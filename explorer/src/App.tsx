@@ -617,7 +617,7 @@ export default function App() {
     const submitAccountLookup = () => {
         const normalized = normalizeAccountInput(accountInput);
         if (!normalized) {
-            setSearchMessage('expected a 32-byte account key');
+            setSearchMessage('expected a 32-byte address');
             return;
         }
         setSearchMessage('');
@@ -1022,7 +1022,7 @@ function AccountSearchPanel({
                         autoFocus
                         value={accountInput}
                         onChange={(event) => onAccountInputChange(event.target.value)}
-                        placeholder="account key"
+                        placeholder="address"
                         spellCheck={false}
                     />
                 </label>
