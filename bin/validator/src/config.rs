@@ -9,12 +9,15 @@ use commonware_cryptography::{
     },
     ed25519,
 };
-use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::Path};
+use std::{
+    collections::HashMap,
+    net::{IpAddr, SocketAddr},
+    path::Path,
+};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
@@ -42,6 +45,17 @@ pub(crate) const fn default_prune_cadence_blocks() -> u64 {
 
 pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployerHost {
+    name: String,
+    ip: IpAddr,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployerHosts {
+    hosts: Vec<DeployerHost>,
 }
 
 /// Indexer wiring for a secondary validator.
@@ -388,7 +402,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
     let self_public_key = signer.public_key();
     let self_name = hex(&self_public_key.encode());
     let raw_hosts = std::fs::read_to_string(hosts_path).expect("failed to read hosts file");
-    let hosts: Hosts = serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
+    let hosts: DeployerHosts =
+        serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
 
     let (primary_participants, secondary_participants) = decode_participants(
         &config.primary_validators,
@@ -736,6 +751,59 @@ hosts:
         assert!(loaded.decoded.primary_participants.contains(self_key));
         assert!(loaded.decoded.primary_participants.contains(peer_key));
         assert!(loaded.decoded.secondary_participants.is_empty());
+        assert_eq!(
+            loaded.decoded.bootstrappers[0].1,
+            commonware_p2p::Ingress::Socket("203.0.113.2:9000".parse().unwrap())
+        );
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(hosts_path);
+    }
+
+    #[test]
+    fn deployer_config_accepts_monitoring_ip_pair_hosts_file() {
+        let cluster = Cluster::new(2, 0);
+        let self_key = &cluster.primary_keys[0];
+        let peer_key = &cluster.primary_keys[1];
+        let self_name = hex(&self_key.encode());
+        let peer_name = hex(&peer_key.encode());
+        let config_path = temp_path("validator-config", ".yaml");
+        let hosts_path = temp_path("validator-hosts", ".yaml");
+
+        let config = cluster.primary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            vec![bootstrapper_entry(peer_key)],
+        );
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &hosts_path,
+            format!(
+                r#"monitoring:
+  public: 198.51.100.10
+  private: 10.0.0.10
+hosts:
+  - name: "{self_name}"
+    region: us-east-1
+    ip: 203.0.113.1
+  - name: "{peer_name}"
+    region: us-west-2
+    ip: 203.0.113.2
+"#,
+            ),
+        )
+        .expect("hosts should write");
+
+        let loaded = load_deployer_config(&hosts_path, &config_path);
+
+        assert_eq!(
+            loaded.decoded.listen_advertise,
+            "203.0.113.1:9000".parse::<SocketAddr>().unwrap()
+        );
         assert_eq!(
             loaded.decoded.bootstrappers[0].1,
             commonware_p2p::Ingress::Socket("203.0.113.2:9000".parse().unwrap())

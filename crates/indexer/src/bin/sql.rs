@@ -8,7 +8,6 @@
 
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
-use commonware_deployer::aws::Hosts;
 use constantinople_indexer::sql_schema::build_meta_schema;
 use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
@@ -21,6 +20,17 @@ use std::{
     sync::Arc,
 };
 use tracing::info;
+
+#[derive(Debug, Deserialize)]
+struct DeployerHost {
+    name: String,
+    ip: IpAddr,
+}
+
+#[derive(Debug, Deserialize)]
+struct DeployerHosts {
+    hosts: Vec<DeployerHost>,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -91,7 +101,8 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
             .hosts
             .expect("clap should require --hosts with --config");
         let raw_hosts = fs::read_to_string(hosts_path).expect("failed to read hosts file");
-        let hosts: Hosts = serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
+        let hosts: DeployerHosts =
+            serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
         let hosts_by_name = hosts
             .hosts
             .iter()
@@ -226,6 +237,39 @@ mod tests {
         fs::write(
             &hosts_path,
             "monitoring: 10.0.0.1\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n",
+        )
+        .expect("hosts should write");
+
+        let cli = Cli::try_parse_from([
+            "metadata-indexer",
+            "--hosts",
+            hosts_path.to_str().expect("utf-8 path"),
+            "--config",
+            config_path.to_str().expect("utf-8 path"),
+        ])
+        .expect("deployer invocation should parse");
+
+        let (store_url, _host, port) = load_settings(cli);
+
+        assert_eq!(store_url, "http://203.0.113.9:8090");
+        assert_eq!(port, 18_091);
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(hosts_path);
+    }
+
+    #[test]
+    fn deployer_mode_accepts_monitoring_ip_pair_hosts_file() {
+        let config_path = temp_path("metadata-indexer", ".yaml");
+        let hosts_path = temp_path("metadata-indexer-hosts", ".yaml");
+        fs::write(
+            &config_path,
+            "port: 18091\nchain_indexer_url: http://chain-indexer:8090\n",
+        )
+        .expect("config should write");
+        fs::write(
+            &hosts_path,
+            "monitoring:\n  public: 198.51.100.10\n  private: 10.0.0.10\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n",
         )
         .expect("hosts should write");
 
