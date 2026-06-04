@@ -4,21 +4,25 @@ mod common;
 mod properties;
 
 use crate::{
-    BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, bootstrapper,
+    CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
+    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
     HeightMonitorReporter, NoopReporter, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
     TestPrivateKey, TestPublicKey, TestScheme, ValidatorState, state_sync_done, validator_fixture,
 };
-use commonware_consensus::{simplex::elector::RoundRobin, types::coding::Commitment};
+use commonware_consensus::{
+    simplex::elector::RoundRobin,
+    types::{Epoch, coding::Commitment},
+};
 use commonware_cryptography::{
     Signer,
     bls12381::{
         dkg::feldman_desmedt::Output,
         primitives::{group::Share, variant::MinSig},
     },
+    certificate::ConstantProvider,
     ed25519::Batch as Ed25519Batch,
 };
 use commonware_glue::{
@@ -27,14 +31,17 @@ use commonware_glue::{
         engine::{EngineDefinition, InitContext},
         plan::PlanBuilder,
     },
-    stateful::db::SyncEngineConfig,
+    stateful::{
+        db::SyncEngineConfig,
+        probe::{Config as ProbeConfig, Probe},
+    },
 };
 use commonware_macros::{test_group, test_traced};
 use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Handle, Quota, Spawner, Supervisor};
 use commonware_utils::{
-    NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
+    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
 use properties::{
@@ -46,7 +53,7 @@ use tracing::{info, warn};
 
 const NUM_VALIDATORS: u32 = 4;
 const ENGINE_NAMESPACE: &[u8] = b"constantinople-engine-test";
-const MAX_BOOTSTRAP_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
+const MAX_PROBE_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
 
 const fn default_link() -> Link {
     Link {
@@ -146,7 +153,7 @@ impl EngineDefinition for TestEngineDefinition {
             (MARSHAL_RESOLVER_CHANNEL, TEST_QUOTA),
             (STATE_RESOLVER_CHANNEL, TEST_QUOTA),
             (TRANSACTION_RESOLVER_CHANNEL, TEST_QUOTA),
-            (BOOTSTRAPPER_CHANNEL, TEST_QUOTA),
+            (PROBE_CHANNEL, TEST_QUOTA),
         ]
     }
 
@@ -201,30 +208,25 @@ impl EngineDefinition for TestEngineDefinition {
             let transaction_resolver = channels
                 .next()
                 .expect("transaction resolver channel must exist");
-            let bootstrapper_network = channels.next().expect("bootstrapper channel must exist");
+            let probe_network = channels.next().expect("probe channel must exist");
             assert!(channels.next().is_none(), "unexpected extra channel");
 
-            let (bootstrapper_handle, bootstrapper_mailbox) = if enable_state_sync {
-                let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-                    context.child("bootstrapper"),
-                    bootstrapper::Config {
-                        public_key: public_key.clone(),
-                        peer_provider: manager.clone(),
-                        blocker: blocker.clone(),
-                        scheme: TestScheme::verifier(
-                            &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
-                            output.players().clone(),
-                            output.public().clone(),
-                        ),
-                        mailbox_size: 32,
-                        round_timeout: Duration::from_secs(1),
-                        retry_interval: Duration::from_millis(100),
-                    },
-                );
-                (
-                    Some(bootstrapper.start(bootstrapper_network)),
-                    Some(bootstrapper_mailbox),
-                )
+            let (probe_handle, probe_mailbox) = if enable_state_sync {
+                let provider = ConstantProvider::new(TestScheme::verifier(
+                    &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
+                    output.players().clone(),
+                    output.public().clone(),
+                ));
+                let (probe, probe_mailbox) = Probe::new(ProbeConfig {
+                    context: context.child("probe"),
+                    provider,
+                    strategy: Sequential,
+                    capacity: NZUsize!(32),
+                    blocker: blocker.clone(),
+                    minimum_epoch: Epoch::zero(),
+                    retry_timeout: NZDuration!(Duration::from_millis(100)),
+                });
+                (Some(probe.start(probe_network)), Some(probe_mailbox))
             } else {
                 (None, None)
             };
@@ -232,17 +234,17 @@ impl EngineDefinition for TestEngineDefinition {
             let (startup, startup_sync_height) = if uses_state_sync
                 && !state_sync_done(&context, &stateful_partition_prefix).await
             {
-                bootstrapper_mailbox
+                probe_mailbox
                     .as_ref()
-                    .expect("state-sync scenario requires bootstrapper")
-                    .fetch_initial_target()
+                    .expect("state-sync scenario requires probe")
+                    .subscribe()
                     .await
                     .map(|finalization| {
                         let height = finalization.proposal.round.view().get();
                         sync_heights.lock().insert(public_key.clone(), height);
                         (StartupMode::StateSync { finalization }, Some(height))
                     })
-                    .expect("bootstrapper actor exited before selecting a state-sync floor")
+                    .expect("probe actor exited before selecting a state-sync floor")
             } else {
                 let prior = sync_heights.lock().get(&public_key).copied();
                 (StartupMode::MarshalSync, prior)
@@ -309,7 +311,7 @@ impl EngineDefinition for TestEngineDefinition {
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
-                    bootstrapper: bootstrapper_mailbox.clone(),
+                    probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
                 },
@@ -329,11 +331,10 @@ impl EngineDefinition for TestEngineDefinition {
             }
 
             let engine_handle = engine.start(channels, Some(reporter));
-            let engine_result = if let Some(bootstrapper_handle) = bootstrapper_handle {
-                let (bootstrapper_result, engine_result) =
-                    futures::join!(bootstrapper_handle, engine_handle);
-                if let Err(error) = bootstrapper_result {
-                    warn!(validator = %public_key, ?error, "bootstrapper exited");
+            let engine_result = if let Some(probe_handle) = probe_handle {
+                let (probe_result, engine_result) = futures::join!(probe_handle, engine_handle);
+                if let Err(error) = probe_result {
+                    warn!(validator = %public_key, ?error, "probe exited");
                 }
                 engine_result
             } else {
@@ -424,7 +425,7 @@ fn run_delayed_start(engine: TestEngineDefinition) {
 fn run_state_sync(engine: TestEngineDefinition) {
     PlanBuilder::new(engine)
         .link(default_link())
-        .max_message_size(MAX_BOOTSTRAP_MESSAGE_SIZE)
+        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(Crash::Delay {
             count: 1,
@@ -441,7 +442,7 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
     let seeds = 0..2;
     let first = PlanBuilder::new(engine.clone())
         .link(default_link())
-        .max_message_size(MAX_BOOTSTRAP_MESSAGE_SIZE)
+        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
         .crash(Crash::Delay {
             count: 1,
@@ -454,7 +455,7 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
         .unwrap();
     let second = PlanBuilder::new(engine)
         .link(default_link())
-        .max_message_size(MAX_BOOTSTRAP_MESSAGE_SIZE)
+        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
         .crash(Crash::Delay {
             count: 1,
@@ -477,7 +478,7 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
 fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
     PlanBuilder::new(engine)
         .link(default_link())
-        .max_message_size(MAX_BOOTSTRAP_MESSAGE_SIZE)
+        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(Crash::Delay {
             count: 1,
@@ -498,7 +499,7 @@ fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
 fn run_state_sync_lossy(engine: TestEngineDefinition) {
     PlanBuilder::new(engine)
         .link(lossy_link())
-        .max_message_size(MAX_BOOTSTRAP_MESSAGE_SIZE)
+        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(Crash::Delay {
             count: 1,
@@ -574,7 +575,7 @@ fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
 
     PlanBuilder::new(engine)
         .link(default_link())
-        .max_message_size(MAX_BOOTSTRAP_MESSAGE_SIZE)
+        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
         .crash(Crash::Delay {
             count: 1,

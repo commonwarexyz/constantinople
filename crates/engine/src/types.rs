@@ -1,8 +1,8 @@
 //! Shared type aliases for the engine crate.
 //!
 //! These canonical aliases give a single definition to the core block,
-//! coding, marshal, and finalization types that appear throughout the
-//! engine, bootstrapper, and test modules.
+//! coding, marshal, probe, and finalization types that appear throughout the
+//! engine and test modules.
 
 use crate::ThresholdScheme;
 use commonware_actor::Feedback;
@@ -45,6 +45,10 @@ pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, ReedSolomon<H>, 
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
 pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
+
+/// Probe mailbox parameterized over the engine's threshold scheme.
+pub type EngineProbeMailbox<H, P, V> =
+    commonware_glue::stateful::probe::Mailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
 
 /// A finalization certificate over the engine's threshold scheme.
 pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;

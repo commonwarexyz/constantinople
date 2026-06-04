@@ -8,14 +8,22 @@ use crate::{
 };
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
-use commonware_consensus::{Reporter, simplex::elector::RoundRobin, types::coding::Commitment};
+use commonware_consensus::{
+    Reporter,
+    simplex::elector::RoundRobin,
+    types::{Epoch, coding::Commitment},
+};
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
+    certificate::ConstantProvider,
     ed25519::{self, Batch, PublicKey},
     sha256::Sha256,
 };
 use commonware_formatting::hex;
-use commonware_glue::stateful::db::SyncEngineConfig;
+use commonware_glue::stateful::{
+    db::SyncEngineConfig,
+    probe::{Config as ProbeConfig, Probe},
+};
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
@@ -31,12 +39,14 @@ use commonware_storage::{
     queue,
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union};
+use commonware_utils::{
+    NZDuration, NZU16, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+};
 use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
-    BOOTSTRAPPER_CHANNEL, CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine,
-    MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL,
-    StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL, bootstrapper,
+    CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
@@ -710,26 +720,25 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
             transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
         };
-        let bootstrapper_network = network.register(BOOTSTRAPPER_CHANNEL, quota, backlog);
-        let (bootstrapper, bootstrapper_mailbox) = bootstrapper::Actor::new(
-            context.child("bootstrapper"),
-            bootstrapper::Config {
-                public_key: decoded.public_key.clone(),
-                peer_provider: oracle.clone(),
-                blocker: oracle.clone(),
-                scheme: ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
-                    &union(b"constantinople", b"_CONSENSUS"),
-                    decoded.dkg_output.players().clone(),
-                    decoded.dkg_output.public().clone(),
-                ),
-                mailbox_size: 32,
-                round_timeout: Duration::from_secs(1),
-                retry_interval: Duration::from_secs(1),
-            },
-        );
-        let bootstrapper_handle = bootstrapper.start(bootstrapper_network);
-        let bootstrapper_handle: CriticalTask = Box::pin(async move {
-            let _ = bootstrapper_handle.await;
+        let probe_network = network.register(PROBE_CHANNEL, quota, backlog);
+        let provider =
+            ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
+                &union(b"constantinople", b"_CONSENSUS"),
+                decoded.dkg_output.players().clone(),
+                decoded.dkg_output.public().clone(),
+            ));
+        let (probe, probe_mailbox) = Probe::new(ProbeConfig {
+            context: context.child("probe"),
+            provider,
+            strategy: signature_strategy.clone(),
+            capacity: NZUsize!(32),
+            blocker: oracle.clone(),
+            minimum_epoch: Epoch::zero(),
+            retry_timeout: NZDuration!(Duration::from_secs(1)),
+        });
+        let probe_handle = probe.start(probe_network);
+        let probe_handle: CriticalTask = Box::pin(async move {
+            let _ = probe_handle.await;
         });
         let network_handle = network.start();
 
@@ -784,10 +793,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let startup = match startup {
             StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
             StartupModeConfig::StateSync => {
-                let finalization = bootstrapper_mailbox
-                    .fetch_initial_target()
+                let finalization = probe_mailbox
+                    .subscribe()
                     .await
-                    .expect("bootstrapper actor exited before selecting a state-sync floor");
+                    .expect("probe actor exited before selecting a state-sync floor");
                 StartupMode::StateSync { finalization }
             }
         };
@@ -844,7 +853,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
-                bootstrapper: Some(bootstrapper_mailbox.clone()),
+                probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
                         .as_ref()
@@ -880,7 +889,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let engine_handle = engine.start(channels, reporter);
 
         wait_for_critical_task_exit(
-            Some(bootstrapper_handle),
+            Some(probe_handle),
             engine_handle,
             mempool_handle,
             network_handle,
@@ -892,7 +901,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 async fn wait_for_critical_task_exit<E, M, N>(
-    bootstrapper_handle: Option<CriticalTask>,
+    probe_handle: Option<CriticalTask>,
     engine_handle: E,
     mempool_handle: M,
     network_handle: N,
@@ -901,10 +910,9 @@ async fn wait_for_critical_task_exit<E, M, N>(
     M: Future,
     N: Future,
 {
-    let mut bootstrapper_handle =
-        bootstrapper_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
+    let mut probe_handle = probe_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
     tokio::select! {
-        _ = bootstrapper_handle.as_mut() => tracing::warn!("bootstrapper exited"),
+        _ = probe_handle.as_mut() => tracing::warn!("probe exited"),
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
         _ = network_handle => tracing::warn!("network exited"),

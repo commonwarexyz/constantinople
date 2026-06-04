@@ -11,7 +11,7 @@
 //! threshold scheme are fixed at startup from the supplied threshold output and
 //! optional local share.
 
-use crate::{bootstrapper, types::*};
+use crate::types::*;
 use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporter, Reporters,
@@ -106,10 +106,10 @@ pub const MARSHAL_RESOLVER_CHANNEL: u64 = 4;
 pub const STATE_RESOLVER_CHANNEL: u64 = 5;
 /// Transaction history database sync resolver channel id.
 pub const TRANSACTION_RESOLVER_CHANNEL: u64 = 6;
-/// Bootstrapper channel id.
-pub const BOOTSTRAPPER_CHANNEL: u64 = 7;
+/// State-sync probe channel id.
+pub const PROBE_CHANNEL: u64 = 7;
 
-/// All channel ids used by the engine, including the bootstrapper.
+/// All channel ids used by the engine, including the state-sync probe.
 pub const CHANNELS: [u64; 8] = [
     VOTE_CHANNEL,
     CERTIFICATE_CHANNEL,
@@ -118,7 +118,7 @@ pub const CHANNELS: [u64; 8] = [
     MARSHAL_RESOLVER_CHANNEL,
     STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL,
-    BOOTSTRAPPER_CHANNEL,
+    PROBE_CHANNEL,
 ];
 
 /// Registered physical channels required by the engine.
@@ -176,7 +176,7 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    pub bootstrapper: Option<bootstrapper::Mailbox<H, C::PublicKey, V>>,
+    pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
     /// [`commonware_consensus::Reporters`] so primaries that pass `None`
@@ -472,8 +472,8 @@ where
             },
         )
         .await;
-        if let Some(bootstrapper) = &config.bootstrapper {
-            bootstrapper.attach(marshal_mailbox.clone()).await;
+        if let Some(probe) = &config.probe {
+            probe.attach(marshal_mailbox.clone());
         }
 
         let (shards, shard_mailbox) = shards::Engine::new(
