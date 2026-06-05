@@ -36,7 +36,7 @@ use commonware_cryptography::{
     certificate::{ConstantProvider, Verifier},
 };
 use commonware_glue::stateful::{
-    Config as StatefulConfig, Stateful, SyncPlan,
+    Config as StatefulConfig, MaintenanceConfig, Stateful, SyncPlan,
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
@@ -55,7 +55,7 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
-    Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::BlockCfg;
@@ -63,7 +63,6 @@ use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
     num::{NonZero, NonZeroU16},
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -148,9 +147,8 @@ pub enum StartupMode<F> {
     StateSync { finalization: F },
 }
 
-pub struct Config<E, C, M, B, V, SigT, HashT, I, H, O>
+pub struct Config<C, M, B, V, SigT, HashT, I, H, O>
 where
-    E: Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -182,9 +180,6 @@ where
     /// [`commonware_consensus::Reporters`] so primaries that pass `None`
     /// behave exactly as before.
     pub simplex_observer: Option<O>,
-    /// Optional hook that observes finalized blocks after local database
-    /// application and before state pruning.
-    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, HashT>>,
 }
 
 /// Fully assembled validator engine.
@@ -279,8 +274,17 @@ where
         async move { mailbox.subscribe_databases().await.0 }
     }
 
+    /// Returns a standalone future that resolves to all application databases
+    /// once the stateful actor has initialized them.
+    pub fn subscribe_all_databases_detached(
+        &self,
+    ) -> impl std::future::Future<Output = EngineDatabases<E, H, HashT>> + Send + 'static {
+        let mailbox = self.stateful_mailbox.clone();
+        async move { mailbox.subscribe_databases().await }
+    }
+
     /// Initializes the full engine stack.
-    pub async fn new(context: E, config: Config<E, C, M, B, V, SigT, HashT, I, H, O>) -> Self {
+    pub async fn new(context: E, config: Config<C, M, B, V, SigT, HashT, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
@@ -501,17 +505,6 @@ where
             config.transaction_namespace,
             genesis_state_target,
             genesis_transactions_target,
-            config.prune_cadence_blocks,
-            Arc::new({
-                let marshal = marshal_mailbox.clone();
-                move |height| {
-                    let marshal = marshal.clone();
-                    Box::pin(async move {
-                        marshal.prune(height);
-                    })
-                }
-            }),
-            config.finalized_hook,
         );
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),
@@ -532,6 +525,17 @@ where
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
+                maintenance: MaintenanceConfig {
+                    interval: std::num::NonZeroUsize::new(
+                        config
+                            .prune_cadence_blocks
+                            .get()
+                            .try_into()
+                            .expect("prune_cadence_blocks must fit in usize"),
+                    )
+                    .expect("prune_cadence_blocks must be non-zero"),
+                    prune: true,
+                },
             },
         );
 
@@ -613,7 +617,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey> + Send + 'static,
         Rx: Receiver<PublicKey = C::PublicKey> + Send + 'static,
-        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>> + Send + 'static,
     {
         spawn_cell!(self.context, self.run(channels, reporter))
     }
@@ -622,7 +626,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey>,
         Rx: Receiver<PublicKey = C::PublicKey>,
-        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>> + Send + 'static,
     {
         let resolver_context = self.context.into_present();
         let marshal_resolver = marshal_resolver::init(

@@ -232,6 +232,14 @@ pub enum PublishError {
         "QMDB writer is at operation {writer_next}, but finalized block starts at {block_start}"
     )]
     WriterOutOfSync { writer_next: u64, block_start: u64 },
+    #[error(
+        "finalized block {height} transaction range ends at {range_end}, before required batch length {op_count}"
+    )]
+    TransactionRangeTooShort {
+        height: u64,
+        range_end: u64,
+        op_count: u64,
+    },
     #[error("QMDB commit worker stopped before accepting height {height}")]
     CommitterStopped { height: u64 },
 }
@@ -566,12 +574,14 @@ where
             .checked_add(1)
             .expect("genesis transaction operation count does not overflow");
     }
-    let block_start = block
-        .header
-        .transactions_range
-        .end()
-        .checked_sub(op_count)
-        .expect("block transaction range must include this batch");
+    let range_end = block.header.transactions_range.end();
+    let Some(block_start) = range_end.checked_sub(op_count) else {
+        return Err(PublishError::TransactionRangeTooShort {
+            height: block.header.height,
+            range_end,
+            op_count,
+        });
+    };
     if writer_next != block_start {
         return Err(PublishError::WriterOutOfSync {
             writer_next,

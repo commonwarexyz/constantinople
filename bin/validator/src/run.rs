@@ -10,6 +10,7 @@ use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
     Reporter,
+    marshal::Update,
     simplex::elector::RoundRobin,
     types::{Epoch, coding::Commitment},
 };
@@ -40,9 +41,10 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+    Acknowledgement, NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set,
+    sequence::U64, union,
 };
-use constantinople_application::consensus::{Databases, FinalizedHookFn};
+use constantinople_application::consensus::Databases;
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
     MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
@@ -63,7 +65,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, OnceCell},
     task::{JoinHandle, JoinSet},
 };
 use tracing::{info, warn};
@@ -150,6 +152,70 @@ impl Reporter for SimplexObserver {
             Self::Relayer(reporter) => reporter.report(activity),
         }
     }
+}
+
+#[derive(Clone)]
+enum MarshalReporter {
+    Indexer {
+        databases: Arc<OnceCell<EngineDatabases>>,
+        finalized_producer: FinalizedUploadProducer,
+        publisher: Arc<LazyPublisher>,
+    },
+    Mempool(Mailbox<Commitment, PublicKey, Sha256>),
+}
+
+impl Reporter for MarshalReporter {
+    type Activity = Update<EngineBlock<Sha256, PublicKey>>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        match self {
+            Self::Indexer {
+                databases,
+                finalized_producer,
+                publisher,
+            } => report_finalized_to_indexer(
+                databases.clone(),
+                finalized_producer.clone(),
+                publisher.clone(),
+                activity,
+            ),
+            Self::Mempool(reporter) => reporter.report(activity),
+        }
+    }
+}
+
+fn report_finalized_to_indexer(
+    databases: Arc<OnceCell<EngineDatabases>>,
+    finalized_producer: FinalizedUploadProducer,
+    publisher: Arc<LazyPublisher>,
+    activity: Update<EngineBlock<Sha256, PublicKey>>,
+) -> Feedback {
+    let Update::Block(block, acknowledgement) = activity else {
+        return Feedback::Ok;
+    };
+    if block.header.height == 0 {
+        acknowledgement.acknowledge();
+        return Feedback::Ok;
+    }
+
+    tokio::spawn(async move {
+        let databases = loop {
+            if let Some(databases) = databases.get() {
+                break databases.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        finalized_producer
+            .enqueue(
+                publisher.context.child("finalized_queue"),
+                &block,
+                &databases,
+            )
+            .await;
+        acknowledgement.acknowledge();
+    });
+
+    Feedback::Ok
 }
 
 /// Bundle of indexer state that needs to outlive engine startup.
@@ -629,30 +695,6 @@ async fn maybe_build_indexer(
     })
 }
 
-fn indexer_finalized_hook(
-    indexer: Option<&IndexerHandle>,
-) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
-{
-    let indexer = indexer?;
-    let publisher = indexer.publisher.clone();
-    let finalized_producer = indexer.finalized_producer.clone();
-    Some(Arc::new(move |block, databases| {
-        let publisher = publisher.clone();
-        let finalized_producer = finalized_producer.clone();
-        let block = block.clone();
-        let databases = databases.clone();
-        Box::pin(async move {
-            finalized_producer
-                .enqueue(
-                    publisher.context.child("finalized_queue"),
-                    &block,
-                    &databases,
-                )
-                .await;
-        })
-    }))
-}
-
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
     let loaded = load_local_config(&peers_path, &config_path);
     run_with_config(loaded, config_path);
@@ -799,6 +841,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
         let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
+        let indexer_databases = Arc::new(OnceCell::new());
         let mempool_actor = webserver::Actor::new(
             context.child("mempool"),
             webserver::Config {
@@ -866,8 +909,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             &indexer_partition_prefix,
         )
         .await;
-        let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
-
         info!("initializing engine");
         let engine = Engine::<
             _,
@@ -909,7 +950,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                         .map(|h| h.cert_reporter.clone())
                         .map(SimplexObserver::Indexer)
                 }),
-                finalized_hook,
             },
         )
         .await;
@@ -918,22 +958,31 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // its databases. Runs concurrently with engine.start so the HTTP
         // listener can come up immediately; account lookups return 503 until
         // the cell is populated.
-        let subscribe_fut = engine.subscribe_databases_detached();
+        let subscribe_fut = engine.subscribe_all_databases_detached();
         let account_reader_setter = account_reader.clone();
+        let indexer_databases_setter = indexer_databases.clone();
         let _account_reader_setup = tokio::spawn(async move {
-            let db = subscribe_fut.await;
-            let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(db));
+            let databases = subscribe_fut.await;
+            let state_db = databases.0.clone();
+            let _ = indexer_databases_setter.set(databases);
+            let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(state_db));
             let _ = account_reader_setter.set(reader);
             info!("account reader attached");
         });
 
         info!("starting engine");
-        // Primaries report to the local mempool. Secondaries upload index data
-        // from the finalized hook and do not need marshal updates here.
-        let reporter: Option<Mailbox<Commitment, PublicKey, Sha256>> = if is_primary {
-            Some(mempool_mailbox.clone())
+        // Primaries report to the local mempool. Secondaries with indexer
+        // wiring queue finalized upload material from ordered marshal blocks.
+        let reporter = if is_primary {
+            Some(MarshalReporter::Mempool(mempool_mailbox.clone()))
         } else {
-            None
+            indexer_handle
+                .as_ref()
+                .map(|indexer| MarshalReporter::Indexer {
+                    databases: indexer_databases,
+                    finalized_producer: indexer.finalized_producer.clone(),
+                    publisher: indexer.publisher.clone(),
+                })
         };
         let engine_handle = engine.start(channels, reporter);
 

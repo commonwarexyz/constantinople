@@ -313,7 +313,6 @@ impl EngineDefinition for TestEngineDefinition {
                     block_codec: Default::default(),
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
-                    finalized_hook: None,
                 },
             )
             .await;

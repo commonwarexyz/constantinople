@@ -569,9 +569,6 @@ async fn new_application(
         TRANSACTION_NAMESPACE,
         state_target,
         genesis_transactions_target,
-        NZU64!(1024),
-        Arc::new(|_| Box::pin(async {})),
-        None,
     )
 }
 

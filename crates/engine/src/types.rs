@@ -26,7 +26,7 @@ use commonware_glue::stateful::Stateful;
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
 use commonware_utils::sync::AsyncRwLock;
 use constantinople_application::consensus::{
-    Application, TransactionHistoryDb, TransactionHistoryOperation,
+    Application, Databases, TransactionHistoryDb, TransactionHistoryOperation,
 };
 use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
 use std::{marker::PhantomData, sync::Arc};
@@ -99,6 +99,8 @@ pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolo
 pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
 
 pub type StateSyncDb<E, H, T> = Arc<AsyncRwLock<StateDb<E, H, T>>>;
+
+pub type EngineDatabases<E, H, T> = Databases<E, H, EightCap, T>;
 
 pub(crate) type StateResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::p2p::standard::Mailbox<
