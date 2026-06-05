@@ -79,6 +79,19 @@ const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 
+/// Returns the default finalized-block window before a proposed mempool batch
+/// is marked dropped.
+///
+/// The window covers one full primary-validator rotation plus one extra block,
+/// so a batch is not dropped just because finalization advanced through the
+/// other primaries before the original proposer gets another chance.
+fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
+    u64::try_from(num_validators)
+        .expect("validator count must fit in u64")
+        .checked_add(1)
+        .expect("mempool drop grace block count overflowed")
+}
+
 /// Concrete type the engine sees in the `simplex_observer` slot.
 ///
 /// We always pin `O` to the indexer's certificate publisher so the engine type
@@ -696,6 +709,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (mut network, mut oracle) = discovery::Network::new(context.child("p2p"), p2p_config);
 
+        let mempool_drop_grace_blocks =
+            default_mempool_drop_grace_blocks(decoded.primary_participants.len());
         let primary: Set<ed25519::PublicKey> = decoded
             .primary_participants
             .into_iter()
@@ -756,7 +771,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_pool_bytes,
                 max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                drop_grace_blocks: 3,
+                drop_grace_blocks: mempool_drop_grace_blocks,
                 signature_strategy: signature_strategy.clone(),
                 hash_strategy: hash_strategy.clone(),
             },
@@ -934,8 +949,8 @@ mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, maybe_build_indexer,
-        recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        FinalizedQueueWriter, FinalizedUploadCursor, default_mempool_drop_grace_blocks,
+        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
         wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
@@ -965,6 +980,13 @@ mod tests {
     type TestAccountValue = FixedBytes<{ Account::SIZE }>;
     type TestStateOperation =
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
+
+    #[test]
+    fn mempool_drop_grace_defaults_to_validator_count_plus_one() {
+        assert_eq!(default_mempool_drop_grace_blocks(1), 2);
+        assert_eq!(default_mempool_drop_grace_blocks(4), 5);
+        assert_eq!(default_mempool_drop_grace_blocks(50), 51);
+    }
 
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {
