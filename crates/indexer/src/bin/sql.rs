@@ -225,7 +225,7 @@ mod tests {
         .expect("config should write");
         fs::write(
             &hosts_path,
-            "monitoring: 10.0.0.1\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n",
+            "monitoring:\n  public: 10.0.0.1\n  private: 10.0.0.2\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n",
         )
         .expect("hosts should write");
 

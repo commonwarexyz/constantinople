@@ -33,7 +33,7 @@ use commonware_cryptography::{
         dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
     },
-    certificate::{ConstantProvider, Scheme},
+    certificate::{ConstantProvider, Verifier},
 };
 use commonware_glue::stateful::{
     Config as StatefulConfig, Stateful, SyncPlan,

@@ -119,7 +119,9 @@ mod tests {
     fn named_relayer_url_resolves_from_hosts_file() {
         let relayer_name = "relayer-node";
         let hosts_yaml = format!(
-            r#"monitoring: 10.0.0.1
+            r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{relayer_name}"
     region: us-east-1

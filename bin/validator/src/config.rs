@@ -704,7 +704,9 @@ mod tests {
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{self_name}"
     region: us-east-1
@@ -770,7 +772,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{self_name}"
     region: us-east-1
@@ -826,7 +830,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{self_name}"
     region: us-east-1
@@ -925,7 +931,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
@@ -981,7 +989,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
@@ -1047,7 +1057,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
@@ -1122,7 +1134,9 @@ hosts:
         fs::write(
             &hosts_path,
             format!(
-                r#"monitoring: 10.0.0.1
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
 hosts:
   - name: "{primary0_name}"
     region: us-east-1
