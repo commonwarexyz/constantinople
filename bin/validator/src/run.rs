@@ -82,13 +82,13 @@ const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 /// Returns the default finalized-block window before a proposed mempool batch
 /// is marked dropped.
 ///
-/// The window covers one full primary-validator rotation plus one extra block,
-/// so a batch is not dropped just because finalization advanced through the
-/// other primaries before the original proposer gets another chance.
+/// The window covers two full primary-validator rotations after the batch's
+/// proposed height. This gives late-finalizing proposals time to land before
+/// the submitting client retries the batch.
 fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
     u64::try_from(num_validators)
         .expect("validator count must fit in u64")
-        .checked_add(1)
+        .checked_mul(2)
         .expect("mempool drop grace block count overflowed")
 }
 
@@ -982,10 +982,10 @@ mod tests {
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
 
     #[test]
-    fn mempool_drop_grace_defaults_to_validator_count_plus_one() {
+    fn mempool_drop_grace_defaults_to_twice_validator_count() {
         assert_eq!(default_mempool_drop_grace_blocks(1), 2);
-        assert_eq!(default_mempool_drop_grace_blocks(4), 5);
-        assert_eq!(default_mempool_drop_grace_blocks(50), 51);
+        assert_eq!(default_mempool_drop_grace_blocks(4), 8);
+        assert_eq!(default_mempool_drop_grace_blocks(50), 100);
     }
 
     #[tokio::test]
