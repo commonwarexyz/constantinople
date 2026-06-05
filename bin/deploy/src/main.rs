@@ -28,7 +28,7 @@ use tracing::Level;
 use tracing_subscriber::fmt;
 
 const STORAGE_CLASS: &str = "gp3";
-const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8g.4xlarge";
+const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
 const DEFAULT_CHAIN_INDEXER_STORAGE_IOPS: i32 = 16_000;
