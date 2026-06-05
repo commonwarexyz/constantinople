@@ -76,6 +76,7 @@ const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const BUFFER_POOL_BUDGET_BYTES: NonZeroUsize = NZUsize!(2 * 1024 * 1024 * 1024);
+const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
@@ -107,6 +108,7 @@ fn buffer_pool_configs(
 
     let network_cfg = BufferPoolConfig::for_network()
         .with_parallelism(network_parallelism)
+        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
         .with_budget_bytes(BUFFER_POOL_BUDGET_BYTES);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
