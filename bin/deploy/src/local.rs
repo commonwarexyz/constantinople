@@ -350,11 +350,13 @@ fn local_run_commands(
              --accounts {} \
              --value {} \
              --seed-offset {} \
+             --rayon-threads {} \
              --accounts-jitter {} \
              --presigned-batches {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
+            args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
         ));
@@ -395,6 +397,7 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
+            spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(test_local_args()),
@@ -456,6 +459,7 @@ mod tests {
         assert!(commands[3].contains("--accounts 10"));
         assert!(commands[3].contains("--value 1"));
         assert!(commands[3].contains("--seed-offset 1000"));
+        assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
     }
 
@@ -529,6 +533,22 @@ mod tests {
         );
 
         assert!(commands[3].contains("--presigned-batches 32"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_rayon_threads_to_spammer() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_rayon_threads = 6;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--rayon-threads 6"));
     }
 
     #[test]

@@ -42,7 +42,7 @@ pub struct Cli {
     pub seed_offset: u64,
 
     /// Number of rayon threads for parallel signing.
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = crate::config::DEFAULT_RAYON_THREADS)]
     pub rayon_threads: usize,
 
     /// Fractional account-count jitter per submitted batch.

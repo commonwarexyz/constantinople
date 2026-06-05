@@ -56,6 +56,7 @@ const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
+const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -118,6 +119,9 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
+    /// Number of rayon threads for spammer parallel signing.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
+    spammer_rayon_threads: usize,
     /// Fractional account-count jitter per spammer batch.
     ///
     /// `0.2` submits `spammer_accounts + rand(0..=floor(spammer_accounts * 0.2))`
@@ -212,6 +216,9 @@ pub(crate) struct SpammerConfig {
     pub accounts: u32,
     pub value: u64,
     pub seed_offset: u64,
+    /// Number of rayon threads used for parallel signing.
+    #[serde(default = "default_spammer_rayon_threads")]
+    pub rayon_threads: usize,
     pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
@@ -386,6 +393,10 @@ const fn usize_is_zero(value: &usize) -> bool {
 
 const fn default_spammer_presigned_batches() -> usize {
     DEFAULT_SPAMMER_PRESIGNED_BATCHES
+}
+
+const fn default_spammer_rayon_threads() -> usize {
+    DEFAULT_SPAMMER_RAYON_THREADS
 }
 
 fn main() {
@@ -689,6 +700,28 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_presigned_batches, 32);
+    }
+
+    #[test]
+    fn parses_spammer_rayon_threads() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-rayon-threads",
+            "6",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_rayon_threads, 6);
     }
 
     #[test]
