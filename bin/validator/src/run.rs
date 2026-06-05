@@ -27,7 +27,7 @@ use commonware_glue::stateful::{
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Quota, Runner as _, Supervisor as _, ThreadPooler as _,
+    BufferPoolConfig, Quota, Runner as _, Supervisor as _, ThreadPooler as _,
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
@@ -75,6 +75,7 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
+const BUFFER_POOL_BUDGET_BYTES: NonZeroUsize = NZUsize!(2 * 1024 * 1024 * 1024);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
@@ -90,6 +91,31 @@ fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
         .expect("validator count must fit in u64")
         .checked_mul(2)
         .expect("mempool drop grace block count overflowed")
+}
+
+fn buffer_pool_configs(
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) -> (BufferPoolConfig, BufferPoolConfig) {
+    let storage_parallelism = worker_threads
+        .checked_add(max_blocking_threads)
+        .expect("storage buffer pool parallelism overflowed");
+    let network_parallelism =
+        NonZeroUsize::new(worker_threads).expect("network buffer pool parallelism is zero");
+    let storage_parallelism =
+        NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
+
+    let network_cfg = BufferPoolConfig::for_network()
+        .with_parallelism(network_parallelism)
+        .with_budget_bytes(BUFFER_POOL_BUDGET_BYTES);
+    // Storage I/O can run on Tokio's blocking pool. Include those threads so
+    // the pool's automatic TLS cache sizing does not strand scarce storage
+    // buffers outside the global freelist under load.
+    let storage_cfg = BufferPoolConfig::for_storage()
+        .with_parallelism(storage_parallelism)
+        .with_budget_bytes(BUFFER_POOL_BUDGET_BYTES);
+
+    (network_cfg, storage_cfg)
 }
 
 /// Concrete type the engine sees in the `simplex_observer` slot.
@@ -659,6 +685,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
         .with_worker_threads(worker_threads);
+    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) =
+        buffer_pool_configs(worker_threads, runtime_cfg.max_blocking_threads());
+    let runtime_cfg = runtime_cfg
+        .with_network_buffer_pool_config(network_buffer_pool_cfg)
+        .with_storage_buffer_pool_config(storage_buffer_pool_cfg);
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
