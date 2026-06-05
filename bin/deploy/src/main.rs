@@ -28,7 +28,7 @@ use tracing::Level;
 use tracing_subscriber::fmt;
 
 const STORAGE_CLASS: &str = "gp3";
-const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8g.4xlarge";
+const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
 const DEFAULT_CHAIN_INDEXER_STORAGE_IOPS: i32 = 16_000;
@@ -56,6 +56,7 @@ const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
+const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -109,7 +110,7 @@ pub(crate) struct GenerateArgs {
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
     spammer: bool,
-    /// Number of spam accounts per validator.
+    /// Number of spam accounts per relayer submitter.
     #[arg(long, default_value_t = 10)]
     spammer_accounts: u32,
     /// Transfer value per spam transaction.
@@ -118,6 +119,9 @@ pub(crate) struct GenerateArgs {
     /// Seed offset for spam account keys.
     #[arg(long, default_value_t = 1000)]
     spammer_seed_offset: u64,
+    /// Number of rayon threads for spammer parallel signing.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
+    spammer_rayon_threads: usize,
     /// Fractional account-count jitter per spammer batch.
     ///
     /// `0.2` submits `spammer_accounts + rand(0..=floor(spammer_accounts * 0.2))`
@@ -212,6 +216,9 @@ pub(crate) struct SpammerConfig {
     pub accounts: u32,
     pub value: u64,
     pub seed_offset: u64,
+    /// Number of rayon threads used for parallel signing.
+    #[serde(default = "default_spammer_rayon_threads")]
+    pub rayon_threads: usize,
     pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
@@ -386,6 +393,10 @@ const fn usize_is_zero(value: &usize) -> bool {
 
 const fn default_spammer_presigned_batches() -> usize {
     DEFAULT_SPAMMER_PRESIGNED_BATCHES
+}
+
+const fn default_spammer_rayon_threads() -> usize {
+    DEFAULT_SPAMMER_RAYON_THREADS
 }
 
 fn main() {
@@ -574,7 +585,7 @@ pub(crate) fn default_bootstrappers(
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
-    4 * 1024 * 1024
+    8 * 1024 * 1024
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
@@ -689,6 +700,28 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_presigned_batches, 32);
+    }
+
+    #[test]
+    fn parses_spammer_rayon_threads() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-rayon-threads",
+            "6",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_rayon_threads, 6);
     }
 
     #[test]

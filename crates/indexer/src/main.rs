@@ -142,7 +142,6 @@ fn write_heavy_options(block_cache: &Cache, blob_cache: &Cache) -> Options {
     opts.set_level_zero_stop_writes_trigger(ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER);
     opts.set_bytes_per_sync(ROCKS_SYNC_BYTES);
     opts.set_wal_bytes_per_sync(ROCKS_SYNC_BYTES);
-    opts.set_use_direct_io_for_flush_and_compaction(true);
     opts.set_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE);
     opts.set_enable_blob_files(true);
     opts.set_min_blob_size(ROCKS_MIN_BLOB_SIZE);

@@ -27,7 +27,7 @@ use commonware_glue::stateful::{
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Quota, Runner as _, Supervisor as _, ThreadPooler as _,
+    BufferPoolConfig, Quota, Runner as _, Supervisor as _, ThreadPooler as _,
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
@@ -40,7 +40,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU16, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+    NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
 };
 use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
@@ -56,7 +56,7 @@ use constantinople_indexer::{
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
-    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -75,9 +75,51 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
+const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
+const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(8_192);
+const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
+
+/// Returns the default finalized-block window before a proposed mempool batch
+/// is marked dropped.
+///
+/// The window covers two full primary-validator rotations after the batch's
+/// proposed height. This gives late-finalizing proposals time to land before
+/// the submitting client retries the batch.
+fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
+    u64::try_from(num_validators)
+        .expect("validator count must fit in u64")
+        .checked_mul(2)
+        .expect("mempool drop grace block count overflowed")
+}
+
+fn buffer_pool_configs(
+    worker_threads: usize,
+    max_blocking_threads: usize,
+) -> (BufferPoolConfig, BufferPoolConfig) {
+    let storage_parallelism = worker_threads
+        .checked_add(max_blocking_threads)
+        .expect("storage buffer pool parallelism overflowed");
+    let network_parallelism =
+        NonZeroUsize::new(worker_threads).expect("network buffer pool parallelism is zero");
+    let storage_parallelism =
+        NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
+
+    let network_cfg = BufferPoolConfig::for_network()
+        .with_parallelism(network_parallelism)
+        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
+        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
+    // Storage I/O can run on Tokio's blocking pool. Include those threads so
+    // the pool's automatic TLS cache sizing does not strand scarce storage
+    // buffers outside the global freelist under load.
+    let storage_cfg = BufferPoolConfig::for_storage()
+        .with_parallelism(storage_parallelism)
+        .with_max_per_class(STORAGE_BUFFER_POOL_MAX_PER_CLASS);
+
+    (network_cfg, storage_cfg)
+}
 
 /// Concrete type the engine sees in the `simplex_observer` slot.
 ///
@@ -646,6 +688,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
         .with_worker_threads(worker_threads);
+    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) =
+        buffer_pool_configs(worker_threads, runtime_cfg.max_blocking_threads());
+    let runtime_cfg = runtime_cfg
+        .with_network_buffer_pool_config(network_buffer_pool_cfg)
+        .with_storage_buffer_pool_config(storage_buffer_pool_cfg);
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
 
     runner.start(|context| async move {
@@ -696,6 +743,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (mut network, mut oracle) = discovery::Network::new(context.child("p2p"), p2p_config);
 
+        let mempool_drop_grace_blocks =
+            default_mempool_drop_grace_blocks(decoded.primary_participants.len());
         let primary: Set<ed25519::PublicKey> = decoded
             .primary_participants
             .into_iter()
@@ -756,7 +805,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_pool_bytes,
                 max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                drop_grace_blocks: 3,
+                drop_grace_blocks: mempool_drop_grace_blocks,
                 signature_strategy: signature_strategy.clone(),
                 hash_strategy: hash_strategy.clone(),
             },
@@ -934,8 +983,8 @@ mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, maybe_build_indexer,
-        recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        FinalizedQueueWriter, FinalizedUploadCursor, default_mempool_drop_grace_blocks,
+        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
         wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
@@ -965,6 +1014,13 @@ mod tests {
     type TestAccountValue = FixedBytes<{ Account::SIZE }>;
     type TestStateOperation =
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
+
+    #[test]
+    fn mempool_drop_grace_defaults_to_twice_validator_count() {
+        assert_eq!(default_mempool_drop_grace_blocks(1), 2);
+        assert_eq!(default_mempool_drop_grace_blocks(4), 8);
+        assert_eq!(default_mempool_drop_grace_blocks(50), 100);
+    }
 
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {

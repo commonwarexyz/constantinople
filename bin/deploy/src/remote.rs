@@ -268,6 +268,7 @@ fn remote_spammer_config(
         accounts: args.spammer_accounts,
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
+        rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
         relayer_submitters: args.validators as usize,
@@ -504,6 +505,7 @@ mod tests {
             spammer_accounts: 10,
             spammer_value: 1,
             spammer_seed_offset: 1000,
+            spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(LocalArgs {
@@ -660,6 +662,7 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES

@@ -41,6 +41,7 @@ fn main() {
         relayer_submitters,
         presigned_batches,
         primary_validators,
+        rayon_threads,
         accounts_jitter,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
@@ -61,6 +62,7 @@ fn main() {
             } else {
                 cfg.primary_validators
             },
+            cfg.rayon_threads,
             cfg.accounts_jitter,
         )
     } else {
@@ -74,6 +76,7 @@ fn main() {
             cli.relayer_submitters.max(1),
             cli.presigned_batches,
             cli.relayer_targets.clone(),
+            cli.rayon_threads,
             cli.accounts_jitter,
         )
     };
@@ -109,7 +112,7 @@ fn main() {
         );
 
         let strategy = context
-            .create_strategy(NZUsize!(cli.rayon_threads))
+            .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create parallel strategy");
 
         let config = RelayerModeConfig {
@@ -220,7 +223,9 @@ where
     St: commonware_parallel::Strategy + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel(presigned_batches);
-    tokio::spawn(async move {
+    // Keep the synchronous producer and bounded-channel backpressure off Tokio
+    // worker threads; `sign_batch` uses the shared Rayon strategy for CPU parallelism.
+    tokio::task::spawn_blocking(move || {
         let mut rng = JitterRng::new(account_offset.wrapping_add(1));
         let mut nonces = vec![0; accounts.len()];
         let mut cursor = 0;
@@ -235,7 +240,7 @@ where
                 &mut cursor,
                 batch_size,
             );
-            if sender.send(batch).await.is_err() {
+            if sender.blocking_send(batch).is_err() {
                 return;
             }
         }
@@ -248,7 +253,7 @@ async fn submit_presigned_batches(
     mut batches: mpsc::Receiver<Vec<Tx>>,
 ) {
     while let Some(batch) = batches.recv().await {
-        submitter.submit_until_finalized(batch).await;
+        submitter.submit(batch).await;
     }
 }
 
