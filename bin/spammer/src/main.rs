@@ -253,7 +253,7 @@ async fn submit_presigned_batches(
     mut batches: mpsc::Receiver<Vec<Tx>>,
 ) {
     while let Some(batch) = batches.recv().await {
-        submitter.submit_until_finalized(batch).await;
+        submitter.submit(batch).await;
     }
 }
 
