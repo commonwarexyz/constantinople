@@ -6,7 +6,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{
     Digest as _, Digestible as _, Signer as _,
-    certificate::{Attestation, Scheme as CertificateScheme, Subject},
+    certificate::{Attestation, Scheme as CertificateScheme, Subject, Verifier},
     ed25519, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
@@ -95,11 +95,37 @@ impl Subject for BenchSubject<'_> {
 #[derive(Clone, Debug)]
 struct BenchScheme;
 
-impl CertificateScheme for BenchScheme {
+impl Verifier for BenchScheme {
     type Subject<'a, D: commonware_cryptography::Digest> = BenchSubject<'a>;
     type PublicKey = TestPublicKey;
-    type Signature = U64;
     type Certificate = U64;
+
+    fn verify_certificate<R, D, M>(
+        &self,
+        _rng: &mut R,
+        _subject: Self::Subject<'_, D>,
+        _certificate: &Self::Certificate,
+        _strategy: &impl commonware_parallel::Strategy,
+    ) -> bool
+    where
+        R: rand_core::CryptoRngCore,
+        D: commonware_cryptography::Digest,
+        M: Faults,
+    {
+        unreachable!("benchmark scheme is never instantiated")
+    }
+
+    fn is_batchable() -> bool {
+        true
+    }
+
+    fn certificate_codec_config(&self) {}
+
+    fn certificate_codec_config_unbounded() {}
+}
+
+impl CertificateScheme for BenchScheme {
+    type Signature = U64;
 
     fn me(&self) -> Option<commonware_utils::Participant> {
         unreachable!("benchmark scheme is never instantiated")
@@ -143,32 +169,9 @@ impl CertificateScheme for BenchScheme {
         unreachable!("benchmark scheme is never instantiated")
     }
 
-    fn verify_certificate<R, D, M>(
-        &self,
-        _rng: &mut R,
-        _subject: Self::Subject<'_, D>,
-        _certificate: &Self::Certificate,
-        _strategy: &impl commonware_parallel::Strategy,
-    ) -> bool
-    where
-        R: rand_core::CryptoRngCore,
-        D: commonware_cryptography::Digest,
-        M: Faults,
-    {
-        unreachable!("benchmark scheme is never instantiated")
-    }
-
     fn is_attributable() -> bool {
         true
     }
-
-    fn is_batchable() -> bool {
-        true
-    }
-
-    fn certificate_codec_config(&self) {}
-
-    fn certificate_codec_config_unbounded() {}
 }
 
 #[derive(Clone, Copy)]
