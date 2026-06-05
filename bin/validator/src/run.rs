@@ -40,7 +40,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU16, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+    NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
 };
 use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
@@ -56,7 +56,7 @@ use constantinople_indexer::{
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use std::{
     future::Future,
-    num::{NonZeroU16, NonZeroU64, NonZeroUsize},
+    num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -75,8 +75,9 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-const BUFFER_POOL_BUDGET_BYTES: NonZeroUsize = NZUsize!(2 * 1024 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
+const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(4_096);
+const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(512);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
@@ -109,13 +110,13 @@ fn buffer_pool_configs(
     let network_cfg = BufferPoolConfig::for_network()
         .with_parallelism(network_parallelism)
         .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
-        .with_budget_bytes(BUFFER_POOL_BUDGET_BYTES);
+        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.
     let storage_cfg = BufferPoolConfig::for_storage()
         .with_parallelism(storage_parallelism)
-        .with_budget_bytes(BUFFER_POOL_BUDGET_BYTES);
+        .with_max_per_class(STORAGE_BUFFER_POOL_MAX_PER_CLASS);
 
     (network_cfg, storage_cfg)
 }
