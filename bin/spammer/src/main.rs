@@ -220,7 +220,7 @@ where
     St: commonware_parallel::Strategy + Send + 'static,
 {
     let (sender, receiver) = mpsc::channel(presigned_batches);
-    tokio::spawn(async move {
+    tokio::task::spawn_blocking(move || {
         let mut rng = JitterRng::new(account_offset.wrapping_add(1));
         let mut nonces = vec![0; accounts.len()];
         let mut cursor = 0;
@@ -235,7 +235,7 @@ where
                 &mut cursor,
                 batch_size,
             );
-            if sender.send(batch).await.is_err() {
+            if sender.blocking_send(batch).is_err() {
                 return;
             }
         }

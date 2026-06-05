@@ -29,7 +29,7 @@ pub struct Cli {
     #[arg(long, value_delimiter = ',')]
     pub relayer_targets: Vec<String>,
 
-    /// Number of spam accounts per validator in the ring transfer.
+    /// Number of spam accounts per relayer submitter.
     #[arg(long, default_value_t = 10)]
     pub accounts: u32,
 

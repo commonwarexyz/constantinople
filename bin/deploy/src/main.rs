@@ -109,7 +109,7 @@ pub(crate) struct GenerateArgs {
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
     spammer: bool,
-    /// Number of spam accounts per validator.
+    /// Number of spam accounts per relayer submitter.
     #[arg(long, default_value_t = 10)]
     spammer_accounts: u32,
     /// Transfer value per spam transaction.
@@ -574,7 +574,7 @@ pub(crate) fn default_bootstrappers(
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
-    4 * 1024 * 1024
+    8 * 1024 * 1024
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {

@@ -29,7 +29,7 @@ pub(crate) const fn default_upload_buffer() -> usize {
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
-    4 * 1024 * 1024
+    8 * 1024 * 1024
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
