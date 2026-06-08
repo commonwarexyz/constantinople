@@ -175,24 +175,34 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
     transfers: &[PreparedTransfer<H>],
-) -> Result<db::MerkleizedDatabases<E, H, EightCap, S>>
+) -> Result<(db::MerkleizedDatabases<E, H, EightCap, S>, Timings)>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
+    let load_started_at = Instant::now();
     let state = load_execution_state(&state_batch, transfers)
         .await
         .expect("state loading must succeed for certified apply");
+    let load_state_ms = load_started_at.elapsed().as_millis();
+
+    let execute_started_at = Instant::now();
     let changeset = execute_loaded(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
+    let execute_ms = execute_started_at.elapsed().as_millis();
     let digests = transfer_digests(transfers);
     let state_batch = apply_changeset(state_batch, &changeset);
     let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
         .with_inactivity_floor(transaction_floor);
+    let timings = Timings::before_finalize(0, load_state_ms, execute_ms);
 
-    db::finalize_execution(state_batch, transaction_batch)
+    let finalize_started_at = Instant::now();
+    let merkleized = db::finalize_execution(state_batch, transaction_batch)
         .await
-        .map_err(|_| STATIC_INVALID_TRANSACTION)
+        .map_err(|_| STATIC_INVALID_TRANSACTION)?;
+    let timings = timings.with_finalize_ms(finalize_started_at.elapsed().as_millis());
+
+    Ok((merkleized, timings))
 }
 
 pub(super) fn commitments_match<E, C, P, H, S>(

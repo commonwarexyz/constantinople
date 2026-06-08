@@ -3,7 +3,7 @@
 use super::TxStatus;
 use commonware_codec::Encode;
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{SignedTransaction, TransactionPublicKey};
+use constantinople_primitives::{LazySignedTransaction, SignedTransaction, TransactionPublicKey};
 use derive_more::Display;
 use serde::Deserialize;
 
@@ -69,7 +69,7 @@ impl Client {
     where
         H: Hasher,
     {
-        let body = transactions.encode();
+        let body = encode_batch(transactions);
         let response = self
             .http
             .post(format!("{}/transactions", self.url))
@@ -102,7 +102,7 @@ impl Client {
     where
         H: Hasher,
     {
-        self.ingest_encoded(transactions.encode()).await
+        self.ingest_encoded(encode_batch(transactions)).await
     }
 
     /// Submits an already codec-encoded batch to the fast ingest endpoint.
@@ -157,6 +157,18 @@ impl Client {
             other => Err(SubmitError::Unexpected(other)),
         }
     }
+}
+
+fn encode_batch<H>(transactions: &[SignedTransaction<H>]) -> bytes::Bytes
+where
+    H: Hasher,
+{
+    transactions
+        .iter()
+        .cloned()
+        .map(LazySignedTransaction::new)
+        .collect::<Vec<_>>()
+        .encode()
 }
 
 /// Committed account snapshot returned by [`Client::fetch_account`].

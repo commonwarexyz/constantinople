@@ -5,6 +5,7 @@
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
+use constantinople_primitives::LazySignedTransaction;
 use std::{
     sync::{
         Arc,
@@ -78,7 +79,11 @@ impl RelayerSubmitter {
     /// the next outer loop iteration uses a fresh nonce set.
     pub async fn submit(&self, batch: Vec<Tx>) {
         let count = batch.len() as u64;
-        let body = batch.encode();
+        let body = batch
+            .into_iter()
+            .map(LazySignedTransaction::new)
+            .collect::<Vec<_>>()
+            .encode();
         match self.submit_encoded(body).await {
             Ok(RelayerBatchStatus::Finalized { height }) => {
                 self.stats.finalized.fetch_add(count, Ordering::Relaxed);

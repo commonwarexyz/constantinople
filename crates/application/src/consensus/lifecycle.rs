@@ -4,7 +4,7 @@ use super::{
     Application, MALFORMED_TRANSACTION,
     body::{materialize_body, verify_signatures, wait_for_timestamp},
     execution::{apply_prepared_body, commitments_match, execute_body, execute_proposal},
-    reject_verify, time,
+    observe_ms, reject_verify, time,
 };
 use crate::executor;
 use commonware_consensus::simplex::types::Context;
@@ -83,8 +83,26 @@ where
         )
         .await;
 
-        self.proposed_transactions
+        self.metrics
+            .proposed_transactions
             .inc_by(execution.block.transaction_count as u64);
+        self.metrics
+            .propose_transactions_per_block
+            .observe(execution.block.transaction_count as f64);
+        observe_ms(&self.metrics.propose_input_duration, input_ms);
+        observe_ms(&self.metrics.propose_prepare_duration, prepare_ms);
+        observe_ms(
+            &self.metrics.propose_load_state_duration,
+            execution.block.timings.load_state_ms,
+        );
+        observe_ms(
+            &self.metrics.propose_execute_duration,
+            execution.block.timings.execute_ms,
+        );
+        observe_ms(
+            &self.metrics.propose_finalize_duration,
+            execution.block.timings.finalize_ms,
+        );
 
         let header = Header {
             context,
@@ -182,6 +200,27 @@ where
             return None;
         }
 
+        self.metrics
+            .verify_transactions_per_block
+            .observe(execution.transaction_count as f64);
+        observe_ms(&self.metrics.verify_signature_duration, signature_ms);
+        observe_ms(
+            &self.metrics.verify_prepare_duration,
+            execution.timings.prepare_ms,
+        );
+        observe_ms(
+            &self.metrics.verify_load_state_duration,
+            execution.timings.load_state_ms,
+        );
+        observe_ms(
+            &self.metrics.verify_execute_duration,
+            execution.timings.execute_ms,
+        );
+        observe_ms(
+            &self.metrics.verify_finalize_duration,
+            execution.timings.finalize_ms,
+        );
+
         info!(
             epoch = header.context.round.epoch().get(),
             view = header.context.round.view().get(),
@@ -221,24 +260,61 @@ where
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
+        let started_at = Instant::now();
+
+        let materialize_started_at = Instant::now();
         let materialized =
             materialize_body(runtime, self.hash_strategy.clone(), block.body.clone())
                 .await
                 .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+        let materialize_ms = materialize_started_at.elapsed().as_millis();
+
+        let prepare_started_at = Instant::now();
         let body = materialized
             .iter()
             .map(executor::prepare_transfer)
             .collect::<Option<Vec<_>>>()
             .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
+        let prepare_ms = prepare_started_at.elapsed().as_millis();
+        let transaction_count = body.len();
 
         let (state_batch, transaction_batch) = batches;
-        apply_prepared_body(
+        let (merkleized, timings) = apply_prepared_body(
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
             &body,
         )
         .await
-        .unwrap_or_else(|reason| panic!("certified block contained {reason}"))
+        .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+
+        self.metrics
+            .apply_transactions_per_block
+            .observe(transaction_count as f64);
+        observe_ms(&self.metrics.apply_materialize_duration, materialize_ms);
+        observe_ms(&self.metrics.apply_prepare_duration, prepare_ms);
+        observe_ms(
+            &self.metrics.apply_load_state_duration,
+            timings.load_state_ms,
+        );
+        observe_ms(&self.metrics.apply_execute_duration, timings.execute_ms);
+        observe_ms(&self.metrics.apply_finalize_duration, timings.finalize_ms);
+
+        info!(
+            epoch = block.header.context.round.epoch().get(),
+            view = block.header.context.round.view().get(),
+            height = block.header.height,
+            txs = transaction_count,
+            timestamp = block.header.timestamp,
+            materialize_ms,
+            prepare_ms,
+            load_state_ms = timings.load_state_ms,
+            execute_ms = timings.execute_ms,
+            finalize_ms = timings.finalize_ms,
+            total_ms = started_at.elapsed().as_millis(),
+            "application.apply.complete"
+        );
+
+        merkleized
     }
 }
