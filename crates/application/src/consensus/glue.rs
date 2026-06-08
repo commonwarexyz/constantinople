@@ -103,28 +103,8 @@ where
         block: &Self::Block,
         databases: &Self::Databases,
     ) {
-        let height = block.header.height;
         if let Some(hook) = &self.finalized_hook {
             hook(block, databases).await;
         }
-
-        if !self.should_prune_after_finalize(height) {
-            return;
-        }
-
-        let cadence = self.prune_cadence_blocks.get();
-        let prune_height = height.saturating_sub(cadence);
-        let state_prune_target = self.previous_prune_cadence_state_end;
-        self.previous_prune_cadence_state_end = block.header.state_range.end();
-
-        (self.finalized_pruner)(commonware_consensus::types::Height::new(prune_height)).await;
-
-        let (state, _) = databases;
-        let mut state = state.write().await;
-        let prune_to = mmr::Location::new(state_prune_target).min(state.sync_boundary());
-        state
-            .prune(prune_to)
-            .await
-            .expect("state db prune must not fail at the sync boundary");
     }
 }

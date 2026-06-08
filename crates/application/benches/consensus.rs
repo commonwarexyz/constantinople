@@ -525,7 +525,7 @@ async fn init_databases(
         runtime.child("databases"),
         (
             state_db_config(runtime, prefix, strategy.clone()),
-            transaction_db_config(prefix, strategy),
+            transaction_db_config(runtime, prefix, strategy),
         ),
     )
     .await;
@@ -569,8 +569,6 @@ async fn new_application(
         TRANSACTION_NAMESPACE,
         state_target,
         genesis_transactions_target,
-        NZU64!(1024),
-        Arc::new(|_| Box::pin(async {})),
         None,
     )
 }
@@ -633,10 +631,23 @@ fn state_db_config(
     }
 }
 
-fn transaction_db_config(prefix: &str, strategy: Rayon) -> keyless_fixed::CompactConfig<Rayon> {
+fn transaction_db_config(
+    runtime: &RuntimeContext,
+    prefix: &str,
+    strategy: Rayon,
+) -> keyless_fixed::CompactConfig<Rayon> {
+    let page_cache = CacheRef::from_pooler(
+        &runtime.child("transactions_page_cache"),
+        PAGE_CACHE_PAGE_SIZE,
+        PAGE_CACHE_CAPACITY,
+    );
+
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{prefix}-transactions-merkle"),
+            items_per_section: ITEMS_PER_BLOB,
+            page_cache,
+            write_buffer: WRITE_BUFFER,
             strategy,
         },
         commit_codec_config: (),

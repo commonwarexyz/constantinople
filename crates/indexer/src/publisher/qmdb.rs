@@ -2144,9 +2144,9 @@ mod tests {
     {
         let config = (
             test_state_db_config(&context, prefix),
-            test_transaction_db_config(prefix),
+            test_transaction_db_config(&context, prefix),
         );
-        Databases::init(context, config).await
+        <Databases<E, Sha256, EightCap, Sequential> as DatabaseSet<E>>::init(context, config).await
     }
 
     fn test_state_db_config<E>(context: &E, prefix: &str) -> FixedConfig<EightCap, Sequential>
@@ -2178,10 +2178,25 @@ mod tests {
         }
     }
 
-    fn test_transaction_db_config(prefix: &str) -> keyless_fixed::CompactConfig<Sequential> {
+    fn test_transaction_db_config<E>(
+        context: &E,
+        prefix: &str,
+    ) -> keyless_fixed::CompactConfig<Sequential>
+    where
+        E: BufferPooler + Supervisor,
+    {
+        let page_cache = CacheRef::from_pooler(
+            &context.child("transactions_page_cache"),
+            TEST_PAGE_CACHE_PAGE_SIZE,
+            TEST_PAGE_CACHE_CAPACITY,
+        );
+
         keyless_fixed::CompactConfig {
             merkle: CompactMerkleConfig {
                 partition: format!("{prefix}-transactions-merkle"),
+                items_per_section: TEST_ITEMS_PER_BLOB,
+                page_cache,
+                write_buffer: TEST_WRITE_BUFFER,
                 strategy: Sequential,
             },
             commit_codec_config: (),
@@ -2228,8 +2243,6 @@ mod tests {
             *transaction_history.bounds().inactivity_floor,
             transaction_history.bounds().total_size
         );
-        databases.finalize((state, transaction_history)).await;
-
         let leader = ed25519::PrivateKey::from_seed(height).public_key();
         let parent_digest = parent.map_or(Sha256Digest::EMPTY, |block| block.digest());
         let header = Header {
@@ -2246,7 +2259,9 @@ mod tests {
             transactions_root,
             transactions_range,
         };
-        Block::new(header, transactions).seal(&mut Sha256::default())
+        let block = Block::new(header, transactions).seal(&mut Sha256::default());
+        databases.finalize((state, transaction_history)).await;
+        block
     }
 
     async fn publish_block_and_assert_roots<E, Cx>(

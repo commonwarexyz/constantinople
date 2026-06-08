@@ -4,15 +4,15 @@
 //! account transitions to the executor, updates QMDB batches, and checks the
 //! commitments consensus votes on.
 
-use commonware_consensus::types::Height;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
+use commonware_storage::translator::EightCap;
 use constantinople_primitives::SealedBlock;
-use std::{future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc};
+use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 mod body;
 mod db;
@@ -31,17 +31,6 @@ pub use db::{
 };
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
-type FinalizedPruneFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
-type FinalizedPruneFn = Arc<dyn Fn(Height) -> FinalizedPruneFuture + Send + Sync>;
-type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-pub type FinalizedHookFn<E, C, H, P, HashSt> = Arc<
-    dyn for<'a> Fn(
-            &'a SealedBlock<C, P, H>,
-            &'a Databases<E, H, commonware_storage::translator::EightCap, HashSt>,
-        ) -> FinalizedHookFuture<'a>
-        + Send
-        + Sync,
->;
 type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
@@ -49,6 +38,19 @@ const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
 const MATERIALIZE_TASK_CLOSED: &str = "transaction materialization task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
+
+/// Future returned by a finalized-block hook.
+pub type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+
+/// Hook that runs after finalized batches are applied to local database handles.
+pub type FinalizedHookFn<E, C, H, P, S> = Arc<
+    dyn for<'a> Fn(
+            &'a SealedBlock<C, P, H>,
+            &'a Databases<E, H, EightCap, S>,
+        ) -> FinalizedHookFuture<'a>
+        + Send
+        + Sync,
+>;
 
 /// Core Constantinople application.
 pub struct Application<E, H, C, S, P, I, B, SigSt, HashSt>
@@ -66,9 +68,6 @@ where
     transaction_namespace: &'static [u8],
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
-    prune_cadence_blocks: NonZeroU64,
-    previous_prune_cadence_state_end: u64,
-    finalized_pruner: FinalizedPruneFn,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
     proposed_transactions: Counter,
     _marker: PhantomData<(E, C, S, I, B)>,
@@ -93,9 +92,6 @@ where
             transaction_namespace: self.transaction_namespace,
             genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
-            prune_cadence_blocks: self.prune_cadence_blocks,
-            previous_prune_cadence_state_end: self.previous_prune_cadence_state_end,
-            finalized_pruner: self.finalized_pruner.clone(),
             finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
@@ -125,15 +121,12 @@ where
         transaction_namespace: &'static [u8],
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
-        prune_cadence_blocks: NonZeroU64,
-        finalized_pruner: FinalizedPruneFn,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
             "The number of transactions proposed into blocks",
         );
-        let previous_prune_cadence_state_end = *genesis_state_target.range.end();
 
         Self {
             signature_strategy,
@@ -143,17 +136,10 @@ where
             transaction_namespace,
             genesis_state_target,
             genesis_transactions_target,
-            prune_cadence_blocks,
-            previous_prune_cadence_state_end,
-            finalized_pruner,
             finalized_hook,
             proposed_transactions,
             _marker: PhantomData,
         }
-    }
-
-    const fn should_prune_after_finalize(&self, height: u64) -> bool {
-        height != 0 && height.is_multiple_of(self.prune_cadence_blocks.get())
     }
 }
 

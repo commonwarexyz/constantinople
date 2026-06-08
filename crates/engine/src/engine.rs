@@ -36,7 +36,7 @@ use commonware_cryptography::{
     certificate::{ConstantProvider, Verifier},
 };
 use commonware_glue::stateful::{
-    Config as StatefulConfig, Stateful, SyncPlan,
+    Config as StatefulConfig, MaintenanceConfig, Stateful, SyncPlan,
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
@@ -63,7 +63,6 @@ use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
     num::{NonZero, NonZeroU16},
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -363,8 +362,11 @@ where
             } else {
                 None
             };
-        let transaction_db_config =
-            transaction_db_config(&config.partition_prefix, config.hash_strategy.clone());
+        let transaction_db_config = transaction_db_config(
+            &config.partition_prefix,
+            &storage_page_cache,
+            config.hash_strategy.clone(),
+        );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
         let mut startup_plan =
@@ -501,18 +503,13 @@ where
             config.transaction_namespace,
             genesis_state_target,
             genesis_transactions_target,
-            config.prune_cadence_blocks,
-            Arc::new({
-                let marshal = marshal_mailbox.clone();
-                move |height| {
-                    let marshal = marshal.clone();
-                    Box::pin(async move {
-                        marshal.prune(height);
-                    })
-                }
-            }),
             config.finalized_hook,
         );
+        let maintenance_interval = NonZero::<usize>::new(
+            usize::try_from(config.prune_cadence_blocks.get())
+                .expect("prune cadence must fit in usize"),
+        )
+        .expect("prune cadence must be non-zero");
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),
             StatefulConfig {
@@ -532,6 +529,10 @@ where
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
+                maintenance: MaintenanceConfig {
+                    interval: maintenance_interval,
+                    prune: true,
+                },
             },
         );
 
@@ -811,13 +812,20 @@ where
     }
 }
 
-fn transaction_db_config<T>(partition_prefix: &str, strategy: T) -> keyless_fixed::CompactConfig<T>
+fn transaction_db_config<T>(
+    partition_prefix: &str,
+    page_cache: &CacheRef,
+    strategy: T,
+) -> keyless_fixed::CompactConfig<T>
 where
     T: Strategy,
 {
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{partition_prefix}-transactions-merkle"),
+            items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+            page_cache: page_cache.clone(),
+            write_buffer: DB_WRITE_BUFFER,
             strategy,
         },
         commit_codec_config: (),

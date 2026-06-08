@@ -114,8 +114,8 @@ where
         );
 
         Some(Proposed {
-            block,
             merkleized: execution.block.into_merkleized(),
+            block,
         })
     }
 

@@ -53,7 +53,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    pub(super) fn into_merkleized(self) -> db::MerkleizedDatabases<E, H, S> {
+    pub(super) fn into_merkleized(self) -> db::MerkleizedDatabases<E, H, EightCap, S> {
         (self.state, self.transactions)
     }
 }
@@ -175,7 +175,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
     transfers: &[PreparedTransfer<H>],
-) -> Result<db::MerkleizedDatabases<E, H, S>>
+) -> Result<db::MerkleizedDatabases<E, H, EightCap, S>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
