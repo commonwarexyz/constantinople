@@ -622,7 +622,7 @@ mod test {
     fn lazy_signed_transaction_batch_defers_hashing() {
         HASH_UPDATES.store(0, Ordering::SeqCst);
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
-        let transactions = vec![signed_test_transaction(&private_key, 0)];
+        let transactions = [signed_test_transaction(&private_key, 0)];
         let batch = transactions
             .iter()
             .cloned()
