@@ -73,6 +73,7 @@ pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
+// For compact Merkle, this sections retained sync bases, not transaction leaves.
 const PRUNABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -81,9 +82,10 @@ const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
 const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
-// The compact transaction-history database can rewind one finalized commit.
-// Glue requires marshal's ack window to fit the narrowest database rewind window.
-const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(1);
+// Allow marshal to pipeline finalized blocks while waiting for application ACKs.
+const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(1024);
+// Keep this many finalized sync targets, including the tip, before pruning.
+const PRUNE_RETENTION_BLOCKS: NonZero<usize> = NZUsize!(1024);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -524,14 +526,13 @@ where
                 ),
                 input_provider: config.input,
                 marshal: marshal_mailbox.clone(),
-                max_pending_acks: MAX_PENDING_ACKS,
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
                 maintenance: MaintenanceConfig {
                     interval: maintenance_interval,
-                    prune: true,
+                    retention: Some(PRUNE_RETENTION_BLOCKS),
                 },
             },
         );
