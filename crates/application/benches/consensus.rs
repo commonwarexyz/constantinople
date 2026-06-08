@@ -15,7 +15,7 @@ use commonware_cryptography::{
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Error as RuntimeError, Handle, Storage as _, Supervisor, ThreadPooler,
+    Error as RuntimeError, Handle, Metrics as _, Storage as _, Supervisor, ThreadPooler,
     benchmarks::{context as bench_context, tokio as bench_tokio},
     buffer::paged::CacheRef,
     tokio::{Config as RuntimeConfig, Context as RuntimeContext},
@@ -40,7 +40,10 @@ use constantinople_primitives::{
     Account, AccountKey, Block, BlockCfg, DEFAULT_ACCOUNT_BALANCE, Header, Nonce, Sealable,
     SealedBlock, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
-use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{
+    BenchmarkId, Criterion, Throughput, async_executor::AsyncExecutor as _, criterion_group,
+    criterion_main,
+};
 use std::{
     collections::VecDeque,
     future::{Future, ready},
@@ -90,9 +93,9 @@ type TestBlock = SealedBlock<TestCommitment, TestPublicKey, TestHasher>;
 type TestConsensusContext = Context<TestCommitment, TestPublicKey>;
 
 const PROD_LIKE_TRANSACTION_COUNT: usize = 16_384;
-const PROD_LIKE_ACCOUNTS_PER_STREAM: usize = 4_096;
-const PROD_LIKE_STREAMS_PER_BLOCK: usize = 4;
-const PROD_LIKE_ACCOUNT_COUNT: usize = PROD_LIKE_ACCOUNTS_PER_STREAM * PROD_LIKE_STREAMS_PER_BLOCK;
+const PROD_LIKE_ACCOUNTS_PER_STREAM: usize = 16_384;
+const PROD_LIKE_SUBMITTERS: usize = 50;
+const PROD_LIKE_ACCOUNT_COUNT: usize = PROD_LIKE_ACCOUNTS_PER_STREAM * PROD_LIKE_SUBMITTERS;
 const PROD_LIKE_ACCOUNT_SEED_OFFSET: u64 = 1_000;
 const PROD_LIKE_WARMUP_BLOCKS: u64 = 256;
 const PROD_LIKE_MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
@@ -111,10 +114,11 @@ const BENCH_CASES: &[BenchCase] = &[
         rayon_threads: BASELINE_RAYON_THREADS,
     },
 ];
-const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(1_048_576);
-const WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
+const STATE_ITEMS_PER_BLOB: NonZeroU64 = NZU64!(1_048_576 * 25);
+const TRANSACTION_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
+const WRITE_BUFFER: NonZeroUsize = NZUsize!(8 * 1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192);
-const PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(16_384);
+const PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(65_536);
 
 #[derive(Clone, Copy)]
 struct BenchCase {
@@ -438,6 +442,11 @@ impl Operation {
 
 fn consensus(c: &mut Criterion) {
     let runner = bench_tokio::Runner::new(RuntimeConfig::default());
+    if std::env::var_os("CONSTANTINOPLE_PROFILE_CONSENSUS").is_some() {
+        (&runner).block_on(profile_consensus());
+        return;
+    }
+
     let mut group = c.benchmark_group("consensus/block");
 
     for &case in BENCH_CASES {
@@ -589,6 +598,8 @@ async fn build_with_mempool_once(
         prefix,
         &generated.accounts,
         generated.committed_transactions,
+        generated.state_history_blocks,
+        case.transaction_count,
         hash_strategy.clone(),
     )
     .await;
@@ -644,10 +655,41 @@ async fn build_with_mempool_once(
 
     black_box(proposed.block.body.len());
     black_box(proposed.block.digest());
+    maybe_print_profile(runtime, "build_with_mempool", elapsed);
     drop(proposed);
     mempool_handle.abort();
     drop(databases);
     elapsed
+}
+
+async fn profile_consensus() {
+    let runtime = bench_context::get::<RuntimeContext>();
+    let case = BENCH_CASES
+        .iter()
+        .copied()
+        .find(|case| matches!(case.workload, Workload::ProdLike))
+        .expect("prod-like benchmark case should exist");
+    let prefix = "consensus-profile-prod-like";
+    cleanup_partitions(&runtime, prefix).await;
+    let elapsed = build_with_mempool_once(&runtime, case, prefix).await;
+    eprintln!(
+        "profile_consensus operation=build-with-mempool case={} elapsed_ms={:.3}",
+        case.id(),
+        elapsed.as_secs_f64() * 1000.0
+    );
+    cleanup_partitions(&runtime, prefix).await;
+}
+
+fn maybe_print_profile(runtime: &RuntimeContext, operation: &str, elapsed: Duration) {
+    if std::env::var_os("CONSTANTINOPLE_PROFILE_CONSENSUS").is_none() {
+        return;
+    }
+
+    eprintln!(
+        "profile_consensus operation={operation} elapsed_ms={:.3}",
+        elapsed.as_secs_f64() * 1000.0
+    );
+    eprintln!("{}", runtime.encode());
 }
 
 async fn verify_once(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Duration {
@@ -742,6 +784,8 @@ impl Fixture {
             prefix,
             &generated.accounts,
             generated.committed_transactions,
+            generated.state_history_blocks,
+            case.transaction_count,
             hash_strategy.clone(),
         )
         .await;
@@ -841,6 +885,7 @@ struct GeneratedTransactions {
     accounts: Vec<(AccountKey, Account)>,
     committed_height: u64,
     committed_transactions: usize,
+    state_history_blocks: u64,
     warmup_transactions: Vec<TestTransaction>,
     transactions: Vec<TestTransaction>,
     leader: TestPublicKey,
@@ -882,6 +927,7 @@ impl GeneratedTransactions {
             accounts,
             committed_height: 0,
             committed_transactions: 0,
+            state_history_blocks: 0,
             warmup_transactions: Vec::new(),
             transactions,
             leader,
@@ -890,10 +936,24 @@ impl GeneratedTransactions {
 
     fn prod_like(transaction_count: usize) -> Self {
         let leader = TestSigner::new(u64::MAX).public_key;
-        let committed_height = PROD_LIKE_WARMUP_BLOCKS - 1;
-        let committed_transactions = usize::try_from(committed_height)
-            .expect("warmup block count must fit in usize")
-            .saturating_mul(transaction_count);
+        let state_history_blocks = prod_like_state_history_blocks();
+        let committed_height = if state_history_blocks > 0 {
+            state_history_blocks
+        } else {
+            PROD_LIKE_WARMUP_BLOCKS - 1
+        };
+        let committed_nonce = if state_history_blocks > 0 {
+            stream_updates_before(state_history_blocks, 0)
+        } else {
+            committed_height / PROD_LIKE_SUBMITTERS as u64
+        };
+        let committed_transactions = if state_history_blocks > 0 {
+            0
+        } else {
+            usize::try_from(committed_height)
+                .expect("warmup block count must fit in usize")
+                .saturating_mul(transaction_count)
+        };
         let signers = (0..PROD_LIKE_ACCOUNT_COUNT)
             .map(|index| TestSigner::new(PROD_LIKE_ACCOUNT_SEED_OFFSET + index as u64))
             .collect::<Vec<_>>();
@@ -905,26 +965,57 @@ impl GeneratedTransactions {
                     AccountKey::from_public_key(&public_key),
                     Account {
                         balance: DEFAULT_ACCOUNT_BALANCE,
-                        nonce: Nonce::new(committed_height, 0),
+                        nonce: Nonce::new(committed_nonce, 0),
                     },
                 )
             })
             .collect();
-        let mut nonces = vec![committed_height; signers.len()];
+        let proposal_signers = &signers[..PROD_LIKE_ACCOUNTS_PER_STREAM];
+        let mut nonces = vec![committed_nonce; proposal_signers.len()];
         let mut cursor = 0;
-        let warmup_transactions =
-            ring_transactions(&signers, transaction_count, &mut nonces, &mut cursor);
-        let transactions = ring_transactions(&signers, transaction_count, &mut nonces, &mut cursor);
+        let warmup_transactions = ring_transactions(
+            proposal_signers,
+            transaction_count,
+            &mut nonces,
+            &mut cursor,
+        );
+        let transactions = ring_transactions(
+            proposal_signers,
+            transaction_count,
+            &mut nonces,
+            &mut cursor,
+        );
 
         Self {
             accounts,
             committed_height,
             committed_transactions,
+            state_history_blocks,
             warmup_transactions,
             transactions,
             leader,
         }
     }
+}
+
+fn prod_like_state_history_blocks() -> u64 {
+    std::env::var("CONSTANTINOPLE_PROD_LIKE_STATE_HISTORY_BLOCKS")
+        .ok()
+        .map(|value| {
+            value
+                .parse()
+                .expect("CONSTANTINOPLE_PROD_LIKE_STATE_HISTORY_BLOCKS must be a u64")
+        })
+        .unwrap_or(0)
+}
+
+const fn stream_updates_before(blocks: u64, stream: usize) -> u64 {
+    let stream = stream as u64;
+    if blocks <= stream {
+        return 0;
+    }
+
+    ((blocks - 1 - stream) / PROD_LIKE_SUBMITTERS as u64) + 1
 }
 
 struct TestSigner {
@@ -1049,6 +1140,8 @@ async fn init_databases(
     prefix: &str,
     accounts: &[(AccountKey, Account)],
     committed_transactions: usize,
+    state_history_blocks: u64,
+    transactions_per_block: usize,
     strategy: Rayon,
 ) -> TestDatabases {
     let databases = TestDatabases::init(
@@ -1059,6 +1152,17 @@ async fn init_databases(
         ),
     )
     .await;
+    if state_history_blocks > 0 {
+        seed_state_history(
+            &databases,
+            accounts,
+            state_history_blocks,
+            transactions_per_block,
+        )
+        .await;
+        return databases;
+    }
+
     let (state_batch, transaction_batch) = databases.new_batches().await;
     let state_batch = accounts
         .iter()
@@ -1078,6 +1182,56 @@ async fn init_databases(
         ))
         .await;
     databases
+}
+
+async fn seed_state_history(
+    databases: &TestDatabases,
+    accounts: &[(AccountKey, Account)],
+    blocks: u64,
+    transactions_per_block: usize,
+) {
+    let mut stream_nonces = vec![0; PROD_LIKE_SUBMITTERS];
+
+    for block in 0..blocks {
+        let stream = (block as usize) % PROD_LIKE_SUBMITTERS;
+        let stream_start = stream
+            .checked_mul(PROD_LIKE_ACCOUNTS_PER_STREAM)
+            .expect("stream account offset should fit in usize");
+        let stream_end = stream_start
+            .checked_add(PROD_LIKE_ACCOUNTS_PER_STREAM)
+            .expect("stream account end should fit in usize");
+        let next_nonce = stream_nonces[stream] + 1;
+        stream_nonces[stream] = next_nonce;
+
+        let (state_batch, transaction_batch) = databases.new_batches().await;
+        let state_batch = accounts[stream_start..stream_end].iter().fold(
+            state_batch,
+            |batch, (account_key, _)| {
+                batch.write(
+                    account_key.clone(),
+                    Some(Account {
+                        balance: DEFAULT_ACCOUNT_BALANCE,
+                        nonce: Nonce::new(next_nonce, 0),
+                    }),
+                )
+            },
+        );
+        let transaction_offset = usize::try_from(block)
+            .expect("state history block must fit in usize")
+            .saturating_mul(transactions_per_block);
+        let transaction_batch =
+            (0..transactions_per_block).fold(transaction_batch, |batch, transaction| {
+                batch.append(dummy_transaction_digest(transaction_offset + transaction))
+            });
+        let (state_merkleized, transaction_merkleized) =
+            futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
+        databases
+            .finalize((
+                state_merkleized.expect("state history merkleization should succeed"),
+                transaction_merkleized.expect("transaction history merkleization should succeed"),
+            ))
+            .await;
+    }
 }
 
 fn dummy_transaction_digest(index: usize) -> TestCommitment {
@@ -1180,14 +1334,14 @@ fn state_db_config(
         merkle_config: MmrConfig {
             journal_partition: format!("{prefix}-state-journal"),
             metadata_partition: format!("{prefix}-state-metadata"),
-            items_per_blob: ITEMS_PER_BLOB,
+            items_per_blob: STATE_ITEMS_PER_BLOB,
             write_buffer: WRITE_BUFFER,
             strategy,
             page_cache: page_cache.clone(),
         },
         journal_config: FixedJournalConfig {
             partition: format!("{prefix}-state-log"),
-            items_per_blob: ITEMS_PER_BLOB,
+            items_per_blob: STATE_ITEMS_PER_BLOB,
             page_cache,
             write_buffer: WRITE_BUFFER,
         },
@@ -1209,7 +1363,7 @@ fn transaction_db_config(
     keyless_fixed::CompactConfig {
         merkle: CompactMerkleConfig {
             partition: format!("{prefix}-transactions-merkle"),
-            items_per_section: ITEMS_PER_BLOB,
+            items_per_section: TRANSACTION_ITEMS_PER_SECTION,
             page_cache,
             write_buffer: WRITE_BUFFER,
             strategy,
