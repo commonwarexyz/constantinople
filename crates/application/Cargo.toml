@@ -40,6 +40,7 @@ hashbrown = { workspace = true, features = ["default-hasher"] }
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 
 # Commonware
+commonware-actor.workspace = true
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
@@ -48,6 +49,7 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 # Other
 rand.workspace = true
 criterion.workspace = true
+tokio = { workspace = true, features = ["net"] }
 
 [[bench]]
 name = "executor"

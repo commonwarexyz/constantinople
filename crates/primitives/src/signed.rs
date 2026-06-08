@@ -13,13 +13,11 @@ use crate::{
 };
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{
-    DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write,
-    types::lazy::Lazy,
+    EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write, types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
 use rand_core::CryptoRngCore;
-use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.
 #[derive(Debug, Clone)]
@@ -200,8 +198,7 @@ pub struct LazySignedTransaction<H>
 where
     H: Hasher,
 {
-    pending: Option<Bytes>,
-    value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
+    inner: Lazy<SignedTransaction<H>>,
 }
 
 impl<H> LazySignedTransaction<H>
@@ -213,22 +210,13 @@ where
     /// Creates a lazy transaction from an already decoded value.
     pub fn new(value: SignedTransaction<H>) -> Self {
         Self {
-            pending: None,
-            value: Arc::new(Some(value).into()),
+            inner: Lazy::new(value),
         }
     }
 
     /// Returns the decoded transaction, if decoding succeeds.
     pub fn get(&self) -> Option<&SignedTransaction<H>> {
-        self.value
-            .get_or_init(|| {
-                let bytes = self
-                    .pending
-                    .as_ref()
-                    .expect("pending bytes must exist when value is absent");
-                SignedTransaction::decode(bytes.clone()).ok()
-            })
-            .as_ref()
+        self.inner.get()
     }
 
     /// Returns the encoded signed transaction bytes without the lazy length prefix.
@@ -236,19 +224,20 @@ where
     /// If this value came from block decoding, this clones the deferred bytes and
     /// does not materialize the transaction.
     pub fn encoded_signed_transaction(&self) -> Bytes {
-        if let Some(bytes) = &self.pending {
-            return bytes.clone();
-        }
+        let mut encoded = Vec::with_capacity(self.encoded_signed_transaction_len());
+        self.inner.write(&mut encoded);
+        Bytes::from(encoded)
+    }
 
-        self.get()
-            .expect("lazy signed transaction must have a value")
-            .encode()
+    /// Returns the encoded signed transaction size without the lazy length prefix.
+    pub fn encoded_signed_transaction_len(&self) -> usize {
+        self.inner.encode_size()
     }
 
     fn deferred(bytes: Bytes) -> Self {
+        let mut bytes = bytes;
         Self {
-            pending: Some(bytes),
-            value: Default::default(),
+            inner: Lazy::deferred(&mut bytes, ()),
         }
     }
 }
@@ -277,16 +266,9 @@ where
     H: Hasher,
 {
     fn write(&self, buf: &mut impl BufMut) {
-        if let Some(pending) = &self.pending {
-            pending.len().write(buf);
-            buf.put_slice(pending);
-            return;
-        }
-        let transaction = self
-            .get()
-            .expect("lazy signed transaction must have a value");
-        transaction.encode_size().write(buf);
-        transaction.write(buf);
+        let len = self.encoded_signed_transaction_len();
+        len.write(buf);
+        self.inner.write(buf);
     }
 }
 
@@ -295,13 +277,7 @@ where
     H: Hasher,
 {
     fn encode_size(&self) -> usize {
-        if let Some(pending) = &self.pending {
-            return pending.len().encode_size() + pending.len();
-        }
-        let len = self
-            .get()
-            .expect("lazy signed transaction must have a value")
-            .encode_size();
+        let len = self.encoded_signed_transaction_len();
         len.encode_size() + len
     }
 }
@@ -477,11 +453,12 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        LazySignedTransaction, Sealable, Sealed, Transaction, TransactionBatchVerifier,
-        TransactionPublicKey, signed::Signable,
+        LazySignedTransaction, Sealable, Sealed, SignedTransaction, Transaction,
+        TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
     };
     use commonware_codec::{
-        DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
+        Decode as _, DecodeExt as _, Encode as _, EncodeSize, FixedSize as _, RangeCfg,
+        ReadExt as _, Write as _,
     };
     use commonware_cryptography::{
         Hasher, Signer, Verifier, ed25519, secp256r1::standard as secp256r1, sha256,
@@ -490,8 +467,31 @@ mod test {
     use commonware_parallel::Sequential;
     use commonware_utils::test_rng;
     use core::num::NonZeroU64;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const NAMESPACE: &[u8] = b"test namespace";
+
+    static HASH_UPDATES: AtomicUsize = AtomicUsize::new(0);
+
+    #[derive(Clone, Default)]
+    struct CountingHasher;
+
+    impl Hasher for CountingHasher {
+        type Digest = sha256::Digest;
+
+        fn update(&mut self, _message: &[u8]) -> &mut Self {
+            HASH_UPDATES.fetch_add(1, Ordering::SeqCst);
+            self
+        }
+
+        fn finalize(&mut self) -> Self::Digest {
+            <sha256::Digest as commonware_cryptography::Digest>::EMPTY
+        }
+
+        fn reset(&mut self) -> &mut Self {
+            self
+        }
+    }
 
     #[derive(Debug)]
     struct MockValue([u8; 4]);
@@ -587,6 +587,62 @@ mod test {
     }
 
     #[test]
+    fn lazy_signed_transaction_batch_round_trips_without_materializing() {
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let transactions = vec![
+            signed_test_transaction(&private_key, 0),
+            signed_test_transaction(&private_key, 1),
+        ];
+        let total_bytes: usize = transactions.iter().map(EncodeSize::encode_size).sum();
+        let batch = transactions
+            .iter()
+            .cloned()
+            .map(LazySignedTransaction::new)
+            .collect::<Vec<_>>();
+
+        let lazy = Vec::<LazySignedTransaction<sha256::Sha256>>::decode_cfg(
+            batch.encode(),
+            &(RangeCfg::new(1..=transactions.len()), ()),
+        )
+        .expect("lazy transaction batch should decode");
+        let decoded_total_bytes = lazy
+            .iter()
+            .map(LazySignedTransaction::encoded_signed_transaction_len)
+            .sum::<usize>();
+
+        assert_eq!(decoded_total_bytes, total_bytes);
+        assert_eq!(lazy.len(), transactions.len());
+        for (lazy, transaction) in lazy.iter().zip(&transactions) {
+            assert_eq!(lazy.encoded_signed_transaction(), transaction.encode());
+            assert_eq!(lazy.get(), Some(transaction));
+        }
+    }
+
+    #[test]
+    fn lazy_signed_transaction_batch_defers_hashing() {
+        HASH_UPDATES.store(0, Ordering::SeqCst);
+        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let transactions = [signed_test_transaction(&private_key, 0)];
+        let batch = transactions
+            .iter()
+            .cloned()
+            .map(LazySignedTransaction::new)
+            .collect::<Vec<_>>();
+
+        let lazy = Vec::<LazySignedTransaction<CountingHasher>>::decode_cfg(
+            batch.encode(),
+            &(RangeCfg::new(1..=1), ()),
+        )
+        .expect("lazy transaction batch should decode");
+
+        assert_eq!(HASH_UPDATES.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            lazy[0].encoded_signed_transaction(),
+            transactions[0].encode()
+        );
+    }
+
+    #[test]
     fn preload_transaction_chunks_forces_nested_signature_inputs() {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
@@ -669,5 +725,20 @@ mod test {
                     .then_some(candidate)
             })
             .expect("test should find invalid public key bytes")
+    }
+
+    fn signed_test_transaction(
+        private_key: &ed25519::PrivateKey,
+        nonce: u64,
+    ) -> SignedTransaction<sha256::Sha256> {
+        let hasher = &mut sha256::Sha256::default();
+        let public_key = TransactionPublicKey::ed25519(private_key.public_key());
+        Transaction::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            nonce,
+        )
+        .seal_and_sign(private_key, NAMESPACE, hasher)
     }
 }

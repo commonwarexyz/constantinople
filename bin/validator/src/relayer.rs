@@ -9,13 +9,13 @@ use axum::{
     routing::{get, post},
 };
 use commonware_actor::Feedback;
-use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Decode, DecodeExt, Encode, FixedSize, RangeCfg};
 use commonware_consensus::{Reporter, Viewable};
 use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed25519, sha256};
 use commonware_formatting::from_hex;
 use constantinople_engine::types::EngineActivity;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
-use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
+use constantinople_primitives::{Account, LazySignedTransaction, Nonce, TransactionPublicKey};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -29,6 +29,7 @@ use tracing::debug;
 
 const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
+const MAX_TRANSACTION_LENGTH_PREFIX_BYTES: usize = 5;
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
@@ -117,7 +118,7 @@ struct Leader {
 
 #[derive(Debug)]
 struct DecodedBatch {
-    transactions: Vec<SignedTransaction<sha256::Sha256>>,
+    transactions: Vec<LazySignedTransaction<sha256::Sha256>>,
     digests: Vec<String>,
 }
 
@@ -553,19 +554,23 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<DecodedBatch, St
         return Err(StatusCode::BAD_REQUEST);
     };
     let cfg = (RangeCfg::new(1..=max_transactions), ());
-    let transactions = Vec::<SignedTransaction<sha256::Sha256>>::decode_cfg(body.as_ref(), &cfg)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
+    let transactions =
+        Vec::<LazySignedTransaction<sha256::Sha256>>::decode_cfg(body.as_ref(), &cfg)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
     let total_bytes = transactions
         .iter()
-        .map(EncodeSize::encode_size)
+        .map(LazySignedTransaction::encoded_signed_transaction_len)
         .sum::<usize>();
     if total_bytes > max_batch_bytes {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let digests = transactions
-        .iter()
-        .map(|transaction| transaction.message_digest().to_string())
-        .collect();
+    let mut digests = Vec::with_capacity(transactions.len());
+    for transaction in &transactions {
+        let Some(transaction) = transaction.get() else {
+            return Err(StatusCode::BAD_REQUEST);
+        };
+        digests.push(transaction.message_digest().to_string());
+    }
 
     Ok(DecodedBatch {
         transactions,
@@ -577,14 +582,23 @@ fn encode_pending(batch: &DecodedBatch, pending: &HashSet<String>) -> Bytes {
     batch
         .transactions
         .iter()
-        .filter(|transaction| pending.contains(&transaction.message_digest().to_string()))
+        .filter(|transaction| {
+            transaction.get().is_some_and(|transaction| {
+                pending.contains(&transaction.message_digest().to_string())
+            })
+        })
         .cloned()
         .collect::<Vec<_>>()
         .encode()
 }
 
 const fn max_request_bytes(max_batch_bytes: usize) -> usize {
-    max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
+    max_batch_bytes
+        .saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
+        .saturating_add(
+            (max_batch_bytes / min_signed_transaction_bytes())
+                .saturating_mul(MAX_TRANSACTION_LENGTH_PREFIX_BYTES),
+        )
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {

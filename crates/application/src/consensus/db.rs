@@ -40,7 +40,7 @@ pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 /// Shared QMDB handle for the append-only transaction history database.
 pub type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistoryDb<E, H, S>>>;
 
-/// The backing databases owned by the application.
+/// The backing QMDB handles owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
 
 /// Unmerkleized application state batch used for executor read-through.
@@ -62,10 +62,8 @@ pub(super) type StateMerkleized<E, H, T, S> = <StateBatch<E, H, T, S> as Unmerkl
 pub(super) type TransactionMerkleized<E, H, S> =
     <TransactionBatch<E, H, S> as Unmerkleized>::Merkleized;
 
-pub(super) type MerkleizedDatabases<E, H, S> = (
-    StateMerkleized<E, H, EightCap, S>,
-    TransactionMerkleized<E, H, S>,
-);
+pub(super) type MerkleizedDatabases<E, H, T, S> =
+    (StateMerkleized<E, H, T, S>, TransactionMerkleized<E, H, S>);
 
 /// Writes a changeset of account updates to a state batch.
 pub(super) fn apply_changeset<E, H, S>(
@@ -101,7 +99,7 @@ where
 pub(super) async fn finalize_execution<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
-) -> Result<MerkleizedDatabases<E, H, S>, commonware_storage::qmdb::Error<mmr::Family>>
+) -> Result<MerkleizedDatabases<E, H, EightCap, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,

@@ -11,13 +11,13 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Decode, DecodeExt, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, SignedTransaction, TransactionPublicKey,
-    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    Account, LazySignedTransaction, Nonce, TransactionPublicKey, TransactionSignature,
+    VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
 use std::{fmt::Display, sync::Arc};
@@ -28,6 +28,9 @@ use tower_http::cors::{Any, CorsLayer};
 /// `commonware-codec` encodes `Vec` lengths as `u32` varints, which fit in at
 /// most 5 bytes.
 const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
+
+/// Maximum bytes needed to encode each lazy transaction's length prefix.
+const MAX_TRANSACTION_LENGTH_PREFIX_BYTES: usize = 5;
 
 /// Minimum bytes needed to encode the batch-length prefix.
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
@@ -97,7 +100,12 @@ where
 }
 
 const fn max_request_bytes(max_batch_bytes: usize) -> usize {
-    max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
+    max_batch_bytes
+        .saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
+        .saturating_add(
+            (max_batch_bytes / min_signed_transaction_bytes())
+                .saturating_mul(MAX_TRANSACTION_LENGTH_PREFIX_BYTES),
+        )
 }
 
 const fn min_signed_transaction_bytes() -> usize {
@@ -236,9 +244,12 @@ where
         return Err(StatusCode::BAD_REQUEST);
     };
     let cfg = (RangeCfg::new(1..=max_transactions), ());
-    let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
+    let signed_lazy = Vec::<LazySignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
+    let total_bytes: usize = signed_lazy
+        .iter()
+        .map(LazySignedTransaction::encoded_signed_transaction_len)
+        .sum();
 
     if total_bytes > state.max_batch_bytes {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
@@ -247,10 +258,6 @@ where
     let signature_strategy = state.signature_strategy.clone();
     let hash_strategy = state.hash_strategy.clone();
     let namespace = state.namespace;
-    let signed_lazy = signed
-        .into_iter()
-        .map(LazySignedTransaction::new)
-        .collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
         verify_transaction_chunks::<H, _, _>(
             &signature_strategy,
