@@ -7,6 +7,7 @@ use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::channel::fallible::AsyncFallibleExt;
 use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
+use std::time::Instant;
 use tokio::sync::{
     mpsc::{self, error::TrySendError},
     oneshot,
@@ -31,6 +32,7 @@ where
 {
     /// A batch of verified transactions submitted by an HTTP handler.
     Submit {
+        enqueued_at: Instant,
         batch_id: String,
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
@@ -47,11 +49,15 @@ where
     QueryConsensusRound { response: oneshot::Sender<u64> },
     /// Consensus requests transactions for the next proposal.
     Propose {
+        enqueued_at: Instant,
         height: u64,
         response: oneshot::Sender<Vec<VerifiedTransaction<H>>>,
     },
     /// Consensus reports a finalized or tip block.
-    Report(Update<SealedBlock<C, P, H>>),
+    Report {
+        enqueued_at: Instant,
+        update: Update<SealedBlock<C, P, H>>,
+    },
 }
 
 /// Handle to the mempool actor, used by HTTP handlers and the consensus layer.
@@ -112,6 +118,7 @@ where
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
             .try_send(Message::Submit {
+                enqueued_at: Instant::now(),
                 batch_id,
                 digests,
                 transactions,
@@ -137,6 +144,7 @@ where
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
             .try_send(Message::Submit {
+                enqueued_at: Instant::now(),
                 batch_id,
                 digests,
                 transactions,
@@ -177,7 +185,11 @@ where
     ) -> Vec<VerifiedTransaction<H>> {
         let height = parent.height + 1;
         self.sender
-            .request(|response| Message::Propose { height, response })
+            .request(|response| Message::Propose {
+                enqueued_at: Instant::now(),
+                height,
+                response,
+            })
             .await
             .expect("mempool actor mailbox closed")
     }
@@ -193,7 +205,11 @@ where
     type Activity = Update<SealedBlock<C, P, H>>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match self.sender.try_send(Message::Report(activity)) {
+        let message = Message::Report {
+            enqueued_at: Instant::now(),
+            update: activity,
+        };
+        match self.sender.try_send(message) {
             Ok(()) => Feedback::Ok,
             Err(TrySendError::Full(message)) => {
                 let sender = self.sender.clone();

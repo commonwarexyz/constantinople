@@ -9,7 +9,10 @@ use commonware_codec::EncodeSize;
 use commonware_consensus::{marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
+use commonware_runtime::{
+    ContextCell, Handle, Metrics, Spawner, spawn_cell,
+    telemetry::metrics::{Gauge, GaugeExt as _, Histogram, MetricsExt as _, histogram::Buckets},
+};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::VerifiedTransaction;
 use serde::{Deserialize, Serialize};
@@ -18,11 +21,29 @@ use std::{
     fmt::Display,
     hash::Hash,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 use tokio::sync::{mpsc, oneshot};
 use tracing::warn;
 
 const MAX_STATUS_ENTRIES: usize = 1_000_000;
+const MEMPOOL_TRANSACTION_BUCKETS: [f64; 10] = [
+    0.0, 1024.0, 4096.0, 8192.0, 16_384.0, 32_768.0, 49_152.0, 65_536.0, 98_304.0, 131_072.0,
+];
+const MEMPOOL_BYTE_BUCKETS: [f64; 12] = [
+    0.0,
+    64.0 * 1024.0,
+    256.0 * 1024.0,
+    512.0 * 1024.0,
+    1.0 * 1024.0 * 1024.0,
+    2.0 * 1024.0 * 1024.0,
+    4.0 * 1024.0 * 1024.0,
+    8.0 * 1024.0 * 1024.0,
+    16.0 * 1024.0 * 1024.0,
+    32.0 * 1024.0 * 1024.0,
+    64.0 * 1024.0 * 1024.0,
+    128.0 * 1024.0 * 1024.0,
+];
 
 /// Shared cell that lets the mempool answer account lookups once the
 /// validator's state database is attached. The cell is populated after engine
@@ -100,6 +121,83 @@ struct ProposedBatch<H: Hasher> {
 enum DigestOutcome {
     Finalized { height: u64 },
     Dropped,
+}
+
+struct ActorMetrics {
+    submit_wait_duration: Histogram,
+    submit_service_duration: Histogram,
+    propose_wait_duration: Histogram,
+    propose_service_duration: Histogram,
+    propose_transactions_per_block: Histogram,
+    propose_bytes_per_block: Histogram,
+    report_wait_duration: Histogram,
+    report_service_duration: Histogram,
+    pool_batches: Gauge,
+    pool_bytes: Gauge,
+}
+
+impl ActorMetrics {
+    fn new(context: &impl Metrics) -> Self {
+        Self {
+            submit_wait_duration: context.histogram(
+                "mempool_submit_wait_duration",
+                "Histogram of time submitted batches wait in the mempool actor mailbox, in seconds",
+                Buckets::LOCAL,
+            ),
+            submit_service_duration: context.histogram(
+                "mempool_submit_service_duration",
+                "Histogram of time spent handling submitted batches in the mempool actor, in seconds",
+                Buckets::LOCAL,
+            ),
+            propose_wait_duration: context.histogram(
+                "mempool_propose_wait_duration",
+                "Histogram of time proposal requests wait in the mempool actor mailbox, in seconds",
+                Buckets::LOCAL,
+            ),
+            propose_service_duration: context.histogram(
+                "mempool_propose_service_duration",
+                "Histogram of time spent draining transactions for a proposal in the mempool actor, in seconds",
+                Buckets::LOCAL,
+            ),
+            propose_transactions_per_block: context.histogram(
+                "mempool_propose_transactions_per_block",
+                "Histogram of transaction counts returned from mempool proposal requests",
+                MEMPOOL_TRANSACTION_BUCKETS,
+            ),
+            propose_bytes_per_block: context.histogram(
+                "mempool_propose_bytes_per_block",
+                "Histogram of encoded transaction bytes returned from mempool proposal requests",
+                MEMPOOL_BYTE_BUCKETS,
+            ),
+            report_wait_duration: context.histogram(
+                "mempool_report_wait_duration",
+                "Histogram of time consensus reports wait in the mempool actor mailbox, in seconds",
+                Buckets::LOCAL,
+            ),
+            report_service_duration: context.histogram(
+                "mempool_report_service_duration",
+                "Histogram of time spent handling consensus reports in the mempool actor, in seconds",
+                Buckets::LOCAL,
+            ),
+            pool_batches: context.gauge(
+                "mempool_pool_batches",
+                "Current number of transaction batches queued in the mempool",
+            ),
+            pool_bytes: context.gauge(
+                "mempool_pool_bytes",
+                "Current encoded transaction bytes queued in the mempool",
+            ),
+        }
+    }
+
+    fn observe_pool<H: Hasher>(&self, pool: &VecDeque<PoolEntry<H>>, pool_bytes: usize) {
+        let _ = self.pool_batches.try_set(pool.len());
+        let _ = self.pool_bytes.try_set(pool_bytes);
+    }
+}
+
+fn observe_duration(histogram: &Histogram, duration: Duration) {
+    histogram.observe(duration.as_secs_f64());
 }
 
 pub(super) enum IngestStatus {
@@ -508,6 +606,7 @@ where
             let _ = axum::serve(listener, app).await;
         });
 
+        let metrics = ActorMetrics::new(context.as_present());
         let mut proposed: VecDeque<ProposedBatch<H>> = VecDeque::new();
         let mut statuses: HashMap<String, BatchStatus> = HashMap::new();
         let mut status_order = VecDeque::new();
@@ -517,10 +616,12 @@ where
         let mut pending_waiters: HashMap<String, Vec<oneshot::Sender<TxStatus>>> = HashMap::new();
         let mut known_digests: HashSet<H::Digest> = HashSet::new();
         let mut highest_consensus_round = 0;
+        metrics.observe_pool(&pool, pool_bytes);
 
         while let Some(message) = rx.recv().await {
             match message {
                 Message::Submit {
+                    enqueued_at,
                     batch_id,
                     digests,
                     transactions,
@@ -528,6 +629,11 @@ where
                     result,
                     ingest_result,
                 } => {
+                    let service_started_at = Instant::now();
+                    observe_duration(
+                        &metrics.submit_wait_duration,
+                        service_started_at.duration_since(enqueued_at),
+                    );
                     if let Some(status) = statuses.get(&batch_id) {
                         if let Some(ingest_result) = ingest_result {
                             let _ = ingest_result.send(IngestStatus::Accepted);
@@ -539,6 +645,11 @@ where
                                 pending_waiters.entry(batch_id).or_default().push(result);
                             }
                         }
+                        metrics.observe_pool(&pool, pool_bytes);
+                        observe_duration(
+                            &metrics.submit_service_duration,
+                            service_started_at.elapsed(),
+                        );
                         continue;
                     }
 
@@ -552,6 +663,11 @@ where
                         if let Some(ingest_result) = ingest_result {
                             let _ = ingest_result.send(IngestStatus::Dropped);
                         }
+                        metrics.observe_pool(&pool, pool_bytes);
+                        observe_duration(
+                            &metrics.submit_service_duration,
+                            service_started_at.elapsed(),
+                        );
                         continue;
                     }
 
@@ -586,6 +702,11 @@ where
                             total_bytes,
                         });
                     }
+                    metrics.observe_pool(&pool, pool_bytes);
+                    observe_duration(
+                        &metrics.submit_service_duration,
+                        service_started_at.elapsed(),
+                    );
                 }
                 Message::QueryStatus { batch_id, response } => {
                     let _ = response.send(statuses.get(&batch_id).cloned());
@@ -593,7 +714,16 @@ where
                 Message::QueryConsensusRound { response } => {
                     let _ = response.send(highest_consensus_round);
                 }
-                Message::Propose { height, response } => {
+                Message::Propose {
+                    enqueued_at,
+                    height,
+                    response,
+                } => {
+                    let service_started_at = Instant::now();
+                    observe_duration(
+                        &metrics.propose_wait_duration,
+                        service_started_at.duration_since(enqueued_at),
+                    );
                     let mut batch_txs = Vec::new();
                     let mut batch_bytes = 0;
 
@@ -613,9 +743,26 @@ where
                         proposed.push_back(ProposedBatch { height, digests });
                         batch_txs.extend(entry.transactions);
                     }
+                    metrics
+                        .propose_transactions_per_block
+                        .observe(batch_txs.len() as f64);
+                    metrics.propose_bytes_per_block.observe(batch_bytes as f64);
+                    metrics.observe_pool(&pool, pool_bytes);
+                    observe_duration(
+                        &metrics.propose_service_duration,
+                        service_started_at.elapsed(),
+                    );
                     response.send_lossy(batch_txs);
                 }
-                Message::Report(Update::Block(block, acknowledgement)) => {
+                Message::Report {
+                    enqueued_at,
+                    update: Update::Block(block, acknowledgement),
+                } => {
+                    let service_started_at = Instant::now();
+                    observe_duration(
+                        &metrics.report_wait_duration,
+                        service_started_at.duration_since(enqueued_at),
+                    );
                     highest_consensus_round =
                         highest_consensus_round.max(rotation_round(block.header.context.round));
                     let height = block.header.height;
@@ -676,9 +823,25 @@ where
                     proposed = remaining;
 
                     acknowledgement.acknowledge();
+                    observe_duration(
+                        &metrics.report_service_duration,
+                        service_started_at.elapsed(),
+                    );
                 }
-                Message::Report(Update::Tip(round, ..)) => {
+                Message::Report {
+                    enqueued_at,
+                    update: Update::Tip(round, ..),
+                } => {
+                    let service_started_at = Instant::now();
+                    observe_duration(
+                        &metrics.report_wait_duration,
+                        service_started_at.duration_since(enqueued_at),
+                    );
                     highest_consensus_round = highest_consensus_round.max(rotation_round(round));
+                    observe_duration(
+                        &metrics.report_service_duration,
+                        service_started_at.elapsed(),
+                    );
                 }
             }
         }

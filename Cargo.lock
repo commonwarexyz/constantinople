@@ -1669,6 +1669,7 @@ name = "constantinople-application"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",
@@ -1686,6 +1687,7 @@ dependencies = [
  "prometheus-client",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "tokio",
  "tracing",
 ]
 

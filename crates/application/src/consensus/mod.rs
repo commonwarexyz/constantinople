@@ -80,18 +80,21 @@ where
 struct ApplicationMetrics {
     proposed_transactions: Counter,
     propose_transactions_per_block: Histogram,
+    propose_total_duration: Histogram,
     propose_input_duration: Histogram,
     propose_prepare_duration: Histogram,
     propose_load_state_duration: Histogram,
     propose_execute_duration: Histogram,
     propose_finalize_duration: Histogram,
     verify_transactions_per_block: Histogram,
+    verify_total_duration: Histogram,
     verify_signature_duration: Histogram,
     verify_prepare_duration: Histogram,
     verify_load_state_duration: Histogram,
     verify_execute_duration: Histogram,
     verify_finalize_duration: Histogram,
     apply_transactions_per_block: Histogram,
+    apply_total_duration: Histogram,
     apply_materialize_duration: Histogram,
     apply_prepare_duration: Histogram,
     apply_load_state_duration: Histogram,
@@ -110,6 +113,11 @@ impl ApplicationMetrics {
                 "propose_transactions_per_block",
                 "Histogram of transaction counts in proposed blocks",
                 BLOCK_TRANSACTION_BUCKETS,
+            ),
+            propose_total_duration: context.histogram(
+                "propose_total_duration",
+                "Histogram of total application proposal duration, in seconds",
+                Buckets::LOCAL,
             ),
             propose_input_duration: context.histogram(
                 "propose_input_duration",
@@ -141,6 +149,11 @@ impl ApplicationMetrics {
                 "Histogram of transaction counts in verified blocks",
                 BLOCK_TRANSACTION_BUCKETS,
             ),
+            verify_total_duration: context.histogram(
+                "verify_total_duration",
+                "Histogram of total application verification duration, in seconds",
+                Buckets::LOCAL,
+            ),
             verify_signature_duration: context.histogram(
                 "verify_signature_duration",
                 "Histogram of time spent verifying block transaction signatures, in seconds",
@@ -170,6 +183,11 @@ impl ApplicationMetrics {
                 "apply_transactions_per_block",
                 "Histogram of transaction counts in applied certified blocks",
                 BLOCK_TRANSACTION_BUCKETS,
+            ),
+            apply_total_duration: context.histogram(
+                "apply_total_duration",
+                "Histogram of total certified block application duration, in seconds",
+                Buckets::LOCAL,
             ),
             apply_materialize_duration: context.histogram(
                 "apply_materialize_duration",

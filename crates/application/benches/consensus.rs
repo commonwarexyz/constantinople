@@ -1,6 +1,9 @@
 use bytes::Bytes;
-use commonware_codec::{Decode as _, Encode as _};
+use commonware_actor::Feedback;
+use commonware_codec::{Decode as _, Encode as _, EncodeSize as _};
 use commonware_consensus::{
+    Reporter,
+    marshal::Update,
     simplex::types::Context,
     types::{Round, View},
 };
@@ -12,7 +15,7 @@ use commonware_cryptography::{
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    Error as RuntimeError, Storage as _, Supervisor, ThreadPooler,
+    Error as RuntimeError, Handle, Storage as _, Supervisor, ThreadPooler,
     benchmarks::{context as bench_context, tokio as bench_tokio},
     buffer::paged::CacheRef,
     tokio::{Config as RuntimeConfig, Context as RuntimeContext},
@@ -28,19 +31,22 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    Faults, NZU16, NZU64, NZUsize, non_empty_range, sequence::U64, sync::AsyncRwLock,
+    Acknowledgement, Faults, NZU16, NZU64, NZUsize, non_empty_range, sequence::U64,
+    sync::AsyncRwLock,
 };
 use constantinople_application::consensus::{Application, TransactionHistoryDb};
-use constantinople_mempool::mocks::StaticTransactionSource;
+use constantinople_mempool::{TransactionSource, webserver};
 use constantinople_primitives::{
-    Account, AccountKey, Block, BlockCfg, Header, Nonce, Sealable, SealedBlock,
-    TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, Block, BlockCfg, DEFAULT_ACCOUNT_BALANCE, Header, Nonce, Sealable,
+    SealedBlock, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
 use std::{
+    collections::VecDeque,
+    future::{Future, ready},
     hint::black_box,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, Instant},
 };
 
@@ -48,7 +54,8 @@ type TestHasher = sha256::Sha256;
 type TestCommitment = sha256::Digest;
 type TestPublicKey = ed25519::PublicKey;
 type TestTransaction = VerifiedTransaction<TestHasher>;
-type TestTransactionSource = StaticTransactionSource<TestCommitment, TestPublicKey, TestHasher>;
+type TestTransactionSource = BenchTransactionSource;
+type TestMempool = webserver::Mailbox<TestCommitment, TestPublicKey, TestHasher>;
 type TestApplication = Application<
     RuntimeContext,
     TestHasher,
@@ -60,20 +67,215 @@ type TestApplication = Application<
     Rayon,
     Rayon,
 >;
+type TestMempoolApplication = Application<
+    RuntimeContext,
+    TestHasher,
+    TestCommitment,
+    BenchScheme,
+    TestPublicKey,
+    TestMempool,
+    ed25519::Batch,
+    Rayon,
+    Rayon,
+>;
 type TestStateDb =
     fixed::Db<mmr::Family, RuntimeContext, AccountKey, Account, TestHasher, EightCap, Rayon>;
 type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
 type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher, Rayon>;
 type TestTransactionDatabase = Arc<AsyncRwLock<TestTransactionDb>>;
 type TestDatabases = (TestStateDatabase, TestTransactionDatabase);
+type TestMerkleizedDatabases = <TestDatabases as DatabaseSet<RuntimeContext>>::Merkleized;
+type TestUnmerkleizedDatabases = <TestDatabases as DatabaseSet<RuntimeContext>>::Unmerkleized;
 type TestBlock = SealedBlock<TestCommitment, TestPublicKey, TestHasher>;
 type TestConsensusContext = Context<TestCommitment, TestPublicKey>;
 
-const TRANSACTION_COUNTS: &[usize] = &[16384, 32768];
+const PROD_LIKE_TRANSACTION_COUNT: usize = 16_384;
+const PROD_LIKE_ACCOUNTS_PER_STREAM: usize = 4_096;
+const PROD_LIKE_STREAMS_PER_BLOCK: usize = 4;
+const PROD_LIKE_ACCOUNT_COUNT: usize = PROD_LIKE_ACCOUNTS_PER_STREAM * PROD_LIKE_STREAMS_PER_BLOCK;
+const PROD_LIKE_ACCOUNT_SEED_OFFSET: u64 = 1_000;
+const PROD_LIKE_WARMUP_BLOCKS: u64 = 256;
+const PROD_LIKE_MAX_PROPOSE_BYTES: usize = 8 * 1024 * 1024;
+const PROD_LIKE_MAX_POOL_BYTES: usize = 64 * 1024 * 1024;
+const PROD_LIKE_RAYON_THREADS: usize = 2;
+const BASELINE_RAYON_THREADS: usize = 8;
+const BENCH_CASES: &[BenchCase] = &[
+    BenchCase {
+        transaction_count: PROD_LIKE_TRANSACTION_COUNT,
+        workload: Workload::ProdLike,
+        rayon_threads: PROD_LIKE_RAYON_THREADS,
+    },
+    BenchCase {
+        transaction_count: 32_768,
+        workload: Workload::Unique,
+        rayon_threads: BASELINE_RAYON_THREADS,
+    },
+];
 const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(1_048_576);
 const WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192);
 const PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(16_384);
+
+#[derive(Clone, Copy)]
+struct BenchCase {
+    transaction_count: usize,
+    workload: Workload,
+    rayon_threads: usize,
+}
+
+impl BenchCase {
+    fn id(self) -> String {
+        match self.workload {
+            Workload::Unique => self.transaction_count.to_string(),
+            Workload::ProdLike => format!("{}-prod-like", self.transaction_count),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Workload {
+    Unique,
+    ProdLike,
+}
+
+#[derive(Clone, Default)]
+struct BenchTransactionSource {
+    proposals: VecDeque<BenchProposal>,
+    proposed: VecDeque<(u64, Vec<TestCommitment>)>,
+}
+
+impl BenchTransactionSource {
+    fn new(case: BenchCase, transactions: Vec<TestTransaction>) -> Self {
+        match case.workload {
+            Workload::Unique => Self::static_source(transactions),
+            Workload::ProdLike => Self::mempool_like(transactions),
+        }
+    }
+
+    fn static_source(transactions: Vec<TestTransaction>) -> Self {
+        Self {
+            proposals: VecDeque::from([BenchProposal::Static(transactions)]),
+            proposed: VecDeque::new(),
+        }
+    }
+
+    fn mempool_like(transactions: Vec<TestTransaction>) -> Self {
+        let pool = transactions
+            .chunks(PROD_LIKE_ACCOUNTS_PER_STREAM)
+            .map(|chunk| {
+                let transactions = chunk.to_vec();
+                let total_bytes = total_bytes_for(&transactions);
+                BenchPoolEntry {
+                    transactions,
+                    total_bytes,
+                }
+            })
+            .collect();
+
+        Self {
+            proposals: VecDeque::from([BenchProposal::MempoolLike {
+                pool,
+                max_propose_bytes: PROD_LIKE_MAX_PROPOSE_BYTES,
+            }]),
+            proposed: VecDeque::new(),
+        }
+    }
+
+    fn pop_proposal(&mut self, height: u64) -> Vec<TestTransaction> {
+        let Some(proposal) = self.proposals.pop_front() else {
+            return Vec::new();
+        };
+
+        match proposal {
+            BenchProposal::Static(transactions) => transactions,
+            BenchProposal::MempoolLike {
+                mut pool,
+                max_propose_bytes,
+            } => {
+                let transactions = self.drain_mempool_like(height, &mut pool, max_propose_bytes);
+                if !pool.is_empty() {
+                    self.proposals.push_front(BenchProposal::MempoolLike {
+                        pool,
+                        max_propose_bytes,
+                    });
+                }
+                transactions
+            }
+        }
+    }
+
+    fn drain_mempool_like(
+        &mut self,
+        height: u64,
+        pool: &mut VecDeque<BenchPoolEntry>,
+        max_propose_bytes: usize,
+    ) -> Vec<TestTransaction> {
+        let mut batch_txs = Vec::new();
+        let mut batch_bytes = 0;
+
+        while let Some(entry) = pool.front() {
+            if batch_bytes + entry.total_bytes > max_propose_bytes && !batch_txs.is_empty() {
+                break;
+            }
+            let entry = pool.pop_front().expect("front was Some");
+            batch_bytes += entry.total_bytes;
+
+            let mut digests = Vec::with_capacity(entry.transactions.len());
+            for transaction in &entry.transactions {
+                digests.push(*transaction.message_digest());
+            }
+            self.proposed.push_back((height, digests));
+            batch_txs.extend(entry.transactions);
+        }
+
+        black_box(batch_bytes);
+        black_box(self.proposed.len());
+        batch_txs
+    }
+}
+
+#[derive(Clone)]
+enum BenchProposal {
+    Static(Vec<TestTransaction>),
+    MempoolLike {
+        pool: VecDeque<BenchPoolEntry>,
+        max_propose_bytes: usize,
+    },
+}
+
+#[derive(Clone)]
+struct BenchPoolEntry {
+    transactions: Vec<TestTransaction>,
+    total_bytes: usize,
+}
+
+impl TransactionSource<TestCommitment, TestPublicKey, TestHasher> for BenchTransactionSource {
+    fn propose(
+        &mut self,
+        parent: &Header<TestCommitment, TestCommitment, TestPublicKey>,
+        _context: &Context<TestCommitment, TestPublicKey>,
+    ) -> impl Future<Output = Vec<TestTransaction>> + Send {
+        ready(self.pop_proposal(parent.height + 1))
+    }
+}
+
+impl Reporter for BenchTransactionSource {
+    type Activity = Update<TestBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        if let Update::Block(_, acknowledgement) = activity {
+            acknowledgement.acknowledge();
+        }
+        Feedback::Ok
+    }
+}
+
+fn total_bytes_for(transactions: &[TestTransaction]) -> usize {
+    transactions
+        .iter()
+        .map(|transaction| transaction.encode_size())
+        .sum::<usize>()
+}
 
 #[derive(Clone, Copy, Debug)]
 struct BenchSubject<'a> {
@@ -177,14 +379,20 @@ impl CertificateScheme for BenchScheme {
 #[derive(Clone, Copy)]
 enum Operation {
     Propose,
+    BuildAfterFinalize,
+    BuildQueuedByFinalize,
+    BuildWithMempool,
     Verify,
     VerifyDecoded,
     Apply,
 }
 
 impl Operation {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 7] = [
         Self::Propose,
+        Self::BuildAfterFinalize,
+        Self::BuildQueuedByFinalize,
+        Self::BuildWithMempool,
         Self::Verify,
         Self::VerifyDecoded,
         Self::Apply,
@@ -193,6 +401,9 @@ impl Operation {
     const fn name(self) -> &'static str {
         match self {
             Self::Propose => "propose",
+            Self::BuildAfterFinalize => "build-after-finalize",
+            Self::BuildQueuedByFinalize => "build-queued-by-finalize",
+            Self::BuildWithMempool => "build-with-mempool",
             Self::Verify => "verify",
             Self::VerifyDecoded => "verify-decoded",
             Self::Apply => "apply",
@@ -202,20 +413,22 @@ impl Operation {
     async fn measure_once(
         self,
         runtime: &RuntimeContext,
-        transaction_count: usize,
+        case: BenchCase,
         iteration: u64,
     ) -> Duration {
-        let prefix = format!(
-            "consensus-bench-{}-{transaction_count}-{iteration}",
-            self.name()
-        );
+        let prefix = format!("consensus-bench-{}-{}-{iteration}", self.name(), case.id());
         cleanup_partitions(runtime, &prefix).await;
 
         let elapsed = match self {
-            Self::Propose => propose_once(runtime, transaction_count, &prefix).await,
-            Self::Verify => verify_once(runtime, transaction_count, &prefix).await,
-            Self::VerifyDecoded => verify_decoded_once(runtime, transaction_count, &prefix).await,
-            Self::Apply => apply_once(runtime, transaction_count, &prefix).await,
+            Self::Propose => propose_once(runtime, case, &prefix).await,
+            Self::BuildAfterFinalize => build_after_finalize_once(runtime, case, &prefix).await,
+            Self::BuildQueuedByFinalize => {
+                build_queued_by_finalize_once(runtime, case, &prefix).await
+            }
+            Self::BuildWithMempool => build_with_mempool_once(runtime, case, &prefix).await,
+            Self::Verify => verify_once(runtime, case, &prefix).await,
+            Self::VerifyDecoded => verify_decoded_once(runtime, case, &prefix).await,
+            Self::Apply => apply_once(runtime, case, &prefix).await,
         };
 
         cleanup_partitions(runtime, &prefix).await;
@@ -227,16 +440,16 @@ fn consensus(c: &mut Criterion) {
     let runner = bench_tokio::Runner::new(RuntimeConfig::default());
     let mut group = c.benchmark_group("consensus/block");
 
-    for &transaction_count in TRANSACTION_COUNTS {
-        group.throughput(Throughput::Elements(transaction_count as u64));
+    for &case in BENCH_CASES {
+        group.throughput(Throughput::Elements(case.transaction_count as u64));
         for operation in Operation::ALL {
             group.bench_with_input(
-                BenchmarkId::new(operation.name(), transaction_count),
-                &transaction_count,
-                |bencher, &transaction_count| {
-                    bencher.to_async(&runner).iter_custom(move |iterations| {
-                        measure(operation, transaction_count, iterations)
-                    });
+                BenchmarkId::new(operation.name(), case.id()),
+                &case,
+                |bencher, &case| {
+                    bencher
+                        .to_async(&runner)
+                        .iter_custom(move |iterations| measure(operation, case, iterations));
                 },
             );
         }
@@ -245,33 +458,28 @@ fn consensus(c: &mut Criterion) {
     group.finish();
 }
 
-async fn measure(operation: Operation, transaction_count: usize, iterations: u64) -> Duration {
+async fn measure(operation: Operation, case: BenchCase, iterations: u64) -> Duration {
     let runtime = bench_context::get::<RuntimeContext>();
     let mut total = Duration::ZERO;
 
     for iteration in 0..iterations {
-        total += operation
-            .measure_once(&runtime, transaction_count, iteration)
-            .await;
+        total += operation.measure_once(&runtime, case, iteration).await;
     }
 
     total
 }
 
-async fn propose_once(
-    runtime: &RuntimeContext,
-    transaction_count: usize,
-    prefix: &str,
-) -> Duration {
+async fn propose_once(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Duration {
     let Fixture {
         mut app,
         databases,
         parent,
+        parent_merkleized,
         context,
         transactions,
-    } = Fixture::new(runtime, transaction_count, prefix).await;
-    let mut input = TestTransactionSource::new(vec![transactions]);
-    let batches = databases.new_batches().await;
+    } = Fixture::new(runtime, case, prefix).await;
+    let mut input = TestTransactionSource::new(case, transactions);
+    let batches = parent_batches(&databases, parent_merkleized.as_ref()).await;
 
     let started_at = Instant::now();
     let proposed = app
@@ -292,8 +500,158 @@ async fn propose_once(
     elapsed
 }
 
-async fn verify_once(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
-    let prepared = PreparedBlock::new(runtime, transaction_count, prefix).await;
+async fn build_after_finalize_once(
+    runtime: &RuntimeContext,
+    case: BenchCase,
+    prefix: &str,
+) -> Duration {
+    let Fixture {
+        mut app,
+        databases,
+        parent,
+        parent_merkleized,
+        context,
+        transactions,
+    } = Fixture::new(runtime, case, prefix).await;
+    if let Some(parent_merkleized) = parent_merkleized {
+        databases.finalize(parent_merkleized).await;
+    }
+
+    let mut input = TestTransactionSource::new(case, transactions);
+    let started_at = Instant::now();
+    let propose_batches = databases.new_batches().await;
+    let proposed = app
+        .propose_child(
+            (runtime.child("build_after_finalize"), context),
+            &parent,
+            propose_batches,
+            &mut input,
+        )
+        .await
+        .expect("proposal after finalization should succeed");
+    let elapsed = started_at.elapsed();
+
+    black_box(proposed.block.body.len());
+    black_box(proposed.block.digest());
+    drop(proposed);
+    drop(databases);
+    elapsed
+}
+
+async fn build_queued_by_finalize_once(
+    runtime: &RuntimeContext,
+    case: BenchCase,
+    prefix: &str,
+) -> Duration {
+    let Fixture {
+        mut app,
+        databases,
+        parent,
+        parent_merkleized,
+        context,
+        transactions,
+    } = Fixture::new(runtime, case, prefix).await;
+    let mut input = TestTransactionSource::new(case, transactions);
+
+    let started_at = Instant::now();
+    if let Some(parent_merkleized) = parent_merkleized {
+        databases.finalize(parent_merkleized).await;
+    }
+    let propose_batches = databases.new_batches().await;
+    let proposed = app
+        .propose_child(
+            (runtime.child("build_queued_by_finalize"), context),
+            &parent,
+            propose_batches,
+            &mut input,
+        )
+        .await
+        .expect("proposal queued by finalization should succeed");
+    let elapsed = started_at.elapsed();
+
+    black_box(proposed.block.body.len());
+    black_box(proposed.block.digest());
+    drop(proposed);
+    drop(databases);
+    elapsed
+}
+
+async fn build_with_mempool_once(
+    runtime: &RuntimeContext,
+    case: BenchCase,
+    prefix: &str,
+) -> Duration {
+    let generated = GeneratedTransactions::new(case);
+    let signature_strategy = bench_strategy(runtime, case.rayon_threads);
+    let hash_strategy = bench_strategy(runtime, case.rayon_threads);
+    let databases = init_databases(
+        runtime,
+        prefix,
+        &generated.accounts,
+        generated.committed_transactions,
+        hash_strategy.clone(),
+    )
+    .await;
+    let leader = generated.leader.clone();
+    let genesis_parent = parent_block(leader.clone(), generated.committed_height, &databases).await;
+    let context = block_context(leader.clone());
+    let mut setup_app: TestApplication = new_application(
+        runtime,
+        leader.clone(),
+        &databases,
+        signature_strategy.clone(),
+        hash_strategy.clone(),
+    )
+    .await;
+    let (parent, parent_merkleized) = if generated.warmup_transactions.is_empty() {
+        (genesis_parent, None)
+    } else {
+        let mut input = TestTransactionSource::static_source(generated.warmup_transactions);
+        let batches = databases.new_batches().await;
+        let proposed = setup_app
+            .propose_child(
+                (runtime.child("mempool_pending_parent"), context.clone()),
+                &genesis_parent,
+                batches,
+                &mut input,
+            )
+            .await
+            .expect("pending parent proposal should succeed");
+        (proposed.block, Some(proposed.merkleized))
+    };
+    let mut app: TestMempoolApplication = new_application(
+        runtime,
+        leader,
+        &databases,
+        signature_strategy,
+        hash_strategy,
+    )
+    .await;
+    let (mut mempool, mempool_handle) = start_mempool(runtime, case, generated.transactions).await;
+    let batches = parent_batches(&databases, parent_merkleized.as_ref()).await;
+
+    let started_at = Instant::now();
+    let proposed = app
+        .propose_child(
+            (runtime.child("build_with_mempool"), context),
+            &parent,
+            batches,
+            &mut mempool,
+        )
+        .await
+        .expect("mempool-backed proposal should succeed");
+    let elapsed = started_at.elapsed();
+
+    black_box(proposed.block.body.len());
+    black_box(proposed.block.digest());
+    drop(proposed);
+    mempool_handle.abort();
+    drop(databases);
+    elapsed
+}
+
+async fn verify_once(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Duration {
+    let prepared = PreparedBlock::new(runtime, case, prefix).await;
     verify_prepared_once(
         runtime,
         prepared,
@@ -302,12 +660,8 @@ async fn verify_once(runtime: &RuntimeContext, transaction_count: usize, prefix:
     .await
 }
 
-async fn verify_decoded_once(
-    runtime: &RuntimeContext,
-    transaction_count: usize,
-    prefix: &str,
-) -> Duration {
-    let prepared = PreparedBlock::new_decoded(runtime, transaction_count, prefix).await;
+async fn verify_decoded_once(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Duration {
+    let prepared = PreparedBlock::new_decoded(runtime, case, prefix).await;
     verify_prepared_once(
         runtime,
         prepared,
@@ -325,9 +679,10 @@ async fn verify_prepared_once(
         mut app,
         databases,
         parent,
+        parent_merkleized,
         block,
     } = prepared;
-    let batches = databases.new_batches().await;
+    let batches = parent_batches(&databases, parent_merkleized.as_ref()).await;
     let context = block.header.context.clone();
 
     let started_at = Instant::now();
@@ -344,14 +699,15 @@ async fn verify_prepared_once(
     elapsed
 }
 
-async fn apply_once(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Duration {
+async fn apply_once(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Duration {
     let PreparedBlock {
         mut app,
         databases,
         parent: _,
+        parent_merkleized,
         block,
-    } = PreparedBlock::new(runtime, transaction_count, prefix).await;
-    let batches = databases.new_batches().await;
+    } = PreparedBlock::new(runtime, case, prefix).await;
+    let batches = parent_batches(&databases, parent_merkleized.as_ref()).await;
     let context = block.header.context.clone();
 
     let started_at = Instant::now();
@@ -371,21 +727,29 @@ struct Fixture {
     app: TestApplication,
     databases: TestDatabases,
     parent: TestBlock,
+    parent_merkleized: Option<TestMerkleizedDatabases>,
     context: TestConsensusContext,
     transactions: Vec<TestTransaction>,
 }
 
 impl Fixture {
-    async fn new(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
-        let generated = GeneratedTransactions::new(transaction_count);
-        let signature_strategy = bench_strategy(runtime);
-        let hash_strategy = bench_strategy(runtime);
-        let databases =
-            init_databases(runtime, prefix, &generated.accounts, hash_strategy.clone()).await;
+    async fn new(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Self {
+        let generated = GeneratedTransactions::new(case);
+        let signature_strategy = bench_strategy(runtime, case.rayon_threads);
+        let hash_strategy = bench_strategy(runtime, case.rayon_threads);
+        let databases = init_databases(
+            runtime,
+            prefix,
+            &generated.accounts,
+            generated.committed_transactions,
+            hash_strategy.clone(),
+        )
+        .await;
         let leader = generated.leader.clone();
-        let parent = parent_block(leader.clone(), &databases).await;
+        let genesis_parent =
+            parent_block(leader.clone(), generated.committed_height, &databases).await;
         let context = block_context(leader.clone());
-        let app = new_application(
+        let mut app = new_application(
             runtime,
             leader,
             &databases,
@@ -393,11 +757,28 @@ impl Fixture {
             hash_strategy,
         )
         .await;
+        let (parent, parent_merkleized) = if generated.warmup_transactions.is_empty() {
+            (genesis_parent, None)
+        } else {
+            let mut input = TestTransactionSource::static_source(generated.warmup_transactions);
+            let batches = databases.new_batches().await;
+            let proposed = app
+                .propose_child(
+                    (runtime.child("pending_parent"), context.clone()),
+                    &genesis_parent,
+                    batches,
+                    &mut input,
+                )
+                .await
+                .expect("pending parent proposal should succeed");
+            (proposed.block, Some(proposed.merkleized))
+        };
 
         Self {
             app,
             databases,
             parent,
+            parent_merkleized,
             context,
             transactions: generated.transactions,
         }
@@ -408,20 +789,22 @@ struct PreparedBlock {
     app: TestApplication,
     databases: TestDatabases,
     parent: TestBlock,
+    parent_merkleized: Option<TestMerkleizedDatabases>,
     block: TestBlock,
 }
 
 impl PreparedBlock {
-    async fn new(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
+    async fn new(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Self {
         let Fixture {
             mut app,
             databases,
             parent,
+            parent_merkleized,
             context,
             transactions,
-        } = Fixture::new(runtime, transaction_count, prefix).await;
-        let mut input = TestTransactionSource::new(vec![transactions]);
-        let batches = databases.new_batches().await;
+        } = Fixture::new(runtime, case, prefix).await;
+        let mut input = TestTransactionSource::new(case, transactions);
+        let batches = parent_batches(&databases, parent_merkleized.as_ref()).await;
         let proposed = app
             .propose_child(
                 (runtime.child("prepare_block"), context),
@@ -438,12 +821,13 @@ impl PreparedBlock {
             app,
             databases,
             parent,
+            parent_merkleized,
             block,
         }
     }
 
-    async fn new_decoded(runtime: &RuntimeContext, transaction_count: usize, prefix: &str) -> Self {
-        let mut prepared = Self::new(runtime, transaction_count, prefix).await;
+    async fn new_decoded(runtime: &RuntimeContext, case: BenchCase, prefix: &str) -> Self {
+        let mut prepared = Self::new(runtime, case, prefix).await;
         prepared.block = decode_block(prepared.block);
         prepared
     }
@@ -455,12 +839,22 @@ fn decode_block(block: TestBlock) -> TestBlock {
 
 struct GeneratedTransactions {
     accounts: Vec<(AccountKey, Account)>,
+    committed_height: u64,
+    committed_transactions: usize,
+    warmup_transactions: Vec<TestTransaction>,
     transactions: Vec<TestTransaction>,
     leader: TestPublicKey,
 }
 
 impl GeneratedTransactions {
-    fn new(transaction_count: usize) -> Self {
+    fn new(case: BenchCase) -> Self {
+        match case.workload {
+            Workload::Unique => Self::unique(case.transaction_count),
+            Workload::ProdLike => Self::prod_like(case.transaction_count),
+        }
+    }
+
+    fn unique(transaction_count: usize) -> Self {
         let leader = TestSigner::new(u64::MAX).public_key;
         let mut accounts = Vec::with_capacity(transaction_count.saturating_mul(2));
         let mut transactions = Vec::with_capacity(transaction_count);
@@ -486,6 +880,47 @@ impl GeneratedTransactions {
 
         Self {
             accounts,
+            committed_height: 0,
+            committed_transactions: 0,
+            warmup_transactions: Vec::new(),
+            transactions,
+            leader,
+        }
+    }
+
+    fn prod_like(transaction_count: usize) -> Self {
+        let leader = TestSigner::new(u64::MAX).public_key;
+        let committed_height = PROD_LIKE_WARMUP_BLOCKS - 1;
+        let committed_transactions = usize::try_from(committed_height)
+            .expect("warmup block count must fit in usize")
+            .saturating_mul(transaction_count);
+        let signers = (0..PROD_LIKE_ACCOUNT_COUNT)
+            .map(|index| TestSigner::new(PROD_LIKE_ACCOUNT_SEED_OFFSET + index as u64))
+            .collect::<Vec<_>>();
+        let accounts = signers
+            .iter()
+            .map(|signer| {
+                let public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
+                (
+                    AccountKey::from_public_key(&public_key),
+                    Account {
+                        balance: DEFAULT_ACCOUNT_BALANCE,
+                        nonce: Nonce::new(committed_height, 0),
+                    },
+                )
+            })
+            .collect();
+        let mut nonces = vec![committed_height; signers.len()];
+        let mut cursor = 0;
+        let warmup_transactions =
+            ring_transactions(&signers, transaction_count, &mut nonces, &mut cursor);
+        let transactions = ring_transactions(&signers, transaction_count, &mut nonces, &mut cursor);
+
+        Self {
+            accounts,
+            committed_height,
+            committed_transactions,
+            warmup_transactions,
             transactions,
             leader,
         }
@@ -515,10 +950,105 @@ impl TestSigner {
     }
 }
 
+fn ring_transactions(
+    signers: &[TestSigner],
+    count: usize,
+    nonces: &mut [u64],
+    cursor: &mut usize,
+) -> Vec<TestTransaction> {
+    assert_eq!(signers.len(), nonces.len(), "nonces must match accounts");
+    assert!(!signers.is_empty(), "need at least one signer");
+
+    let mut transactions = Vec::with_capacity(count);
+    for _ in 0..count {
+        let sender_index = *cursor;
+        let recipient_index = (sender_index + 1) % signers.len();
+        let nonce = nonces[sender_index];
+        nonces[sender_index] = nonce + 1;
+        *cursor = recipient_index;
+
+        transactions.push(signers[sender_index].sign(
+            signers[recipient_index].public_key.clone(),
+            1,
+            nonce,
+        ));
+    }
+    transactions
+}
+
+async fn parent_batches(
+    databases: &TestDatabases,
+    parent_merkleized: Option<&TestMerkleizedDatabases>,
+) -> TestUnmerkleizedDatabases {
+    match parent_merkleized {
+        Some(merkleized) => {
+            <TestDatabases as DatabaseSet<RuntimeContext>>::fork_batches(merkleized)
+        }
+        None => databases.new_batches().await,
+    }
+}
+
+async fn start_mempool(
+    runtime: &RuntimeContext,
+    case: BenchCase,
+    transactions: Vec<TestTransaction>,
+) -> (TestMempool, Handle<()>) {
+    let (mempool, receiver) = TestMempool::channel(65_536);
+    enqueue_mempool_batches(&mempool, case, transactions);
+    let actor = webserver::Actor::new(
+        runtime.child("mempool"),
+        webserver::Config {
+            max_pool_bytes: PROD_LIKE_MAX_POOL_BYTES,
+            max_propose_bytes: PROD_LIKE_MAX_PROPOSE_BYTES,
+            namespace: TRANSACTION_NAMESPACE,
+            drop_grace_blocks: 8,
+            signature_strategy: bench_strategy(runtime, case.rayon_threads),
+            hash_strategy: bench_strategy(runtime, case.rayon_threads),
+        },
+        mempool.clone(),
+        receiver,
+        Arc::new(OnceLock::new()),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("mempool listener should bind");
+    let handle = actor.start(listener);
+    (mempool, handle)
+}
+
+fn enqueue_mempool_batches(
+    mempool: &TestMempool,
+    case: BenchCase,
+    transactions: Vec<TestTransaction>,
+) {
+    let chunk_size = match case.workload {
+        Workload::ProdLike => PROD_LIKE_ACCOUNTS_PER_STREAM,
+        Workload::Unique => case.transaction_count,
+    };
+    for (batch, transactions) in transactions.chunks(chunk_size).enumerate() {
+        let transactions = transactions.to_vec();
+        let digests = transactions
+            .iter()
+            .map(|transaction| *transaction.message_digest())
+            .collect();
+        let total_bytes = total_bytes_for(&transactions);
+        let status = mempool
+            .try_submit(
+                format!("bench-batch-{batch}"),
+                digests,
+                transactions,
+                total_bytes,
+            )
+            .expect("mempool batch should enqueue");
+        drop(status);
+    }
+}
+
 async fn init_databases(
     runtime: &RuntimeContext,
     prefix: &str,
     accounts: &[(AccountKey, Account)],
+    committed_transactions: usize,
     strategy: Rayon,
 ) -> TestDatabases {
     let databases = TestDatabases::init(
@@ -535,6 +1065,10 @@ async fn init_databases(
         .fold(state_batch, |batch, (account_key, account)| {
             batch.write(account_key.clone(), Some(*account))
         });
+    let transaction_batch = (0..committed_transactions)
+        .fold(transaction_batch, |batch, transaction| {
+            batch.append(dummy_transaction_digest(transaction))
+        });
     let (state_merkleized, transaction_merkleized) =
         futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
     databases
@@ -546,13 +1080,29 @@ async fn init_databases(
     databases
 }
 
-async fn new_application(
+fn dummy_transaction_digest(index: usize) -> TestCommitment {
+    let mut bytes = [0; 32];
+    bytes[..core::mem::size_of::<usize>()].copy_from_slice(&index.to_le_bytes());
+    TestCommitment::from(bytes)
+}
+
+async fn new_application<I>(
     runtime: &RuntimeContext,
     leader: TestPublicKey,
     databases: &TestDatabases,
     signature_strategy: Rayon,
     hash_strategy: Rayon,
-) -> TestApplication {
+) -> Application<
+    RuntimeContext,
+    TestHasher,
+    TestCommitment,
+    BenchScheme,
+    TestPublicKey,
+    I,
+    ed25519::Batch,
+    Rayon,
+    Rayon,
+> {
     let (state_target, transaction_target) = databases.committed_targets().await;
     let genesis_transactions_target =
         constantinople_application::consensus::TransactionHistoryTarget {
@@ -560,7 +1110,17 @@ async fn new_application(
             leaf_count: transaction_target.leaf_count,
         };
 
-    TestApplication::new(
+    Application::<
+        RuntimeContext,
+        TestHasher,
+        TestCommitment,
+        BenchScheme,
+        TestPublicKey,
+        I,
+        ed25519::Batch,
+        Rayon,
+        Rayon,
+    >::new(
         runtime.child("application"),
         signature_strategy,
         hash_strategy,
@@ -573,16 +1133,20 @@ async fn new_application(
     )
 }
 
-fn bench_strategy(runtime: &RuntimeContext) -> Rayon {
-    Rayon::with_pool(runtime.create_thread_pool(NZUsize!(8)).unwrap())
+fn bench_strategy(runtime: &RuntimeContext, threads: usize) -> Rayon {
+    Rayon::with_pool(
+        runtime
+            .create_thread_pool(NonZeroUsize::new(threads).expect("rayon thread count is zero"))
+            .unwrap(),
+    )
 }
 
-async fn parent_block(leader: TestPublicKey, databases: &TestDatabases) -> TestBlock {
+async fn parent_block(leader: TestPublicKey, height: u64, databases: &TestDatabases) -> TestBlock {
     let (state_target, transaction_target) = databases.committed_targets().await;
     let header = Header {
         context: block_context(leader),
         parent: sha256::Digest::EMPTY,
-        height: 0,
+        height,
         timestamp: 0,
         state_root: state_target.root,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),

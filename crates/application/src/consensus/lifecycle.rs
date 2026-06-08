@@ -116,6 +116,9 @@ where
         };
         let block = Block::new(header, execution.body).seal(&mut H::default());
 
+        let total_ms = started_at.elapsed().as_millis();
+        observe_ms(&self.metrics.propose_total_duration, total_ms);
+
         info!(
             epoch = block.header.context.round.epoch().get(),
             view = block.header.context.round.view().get(),
@@ -127,7 +130,7 @@ where
             load_state_ms = execution.block.timings.load_state_ms,
             execute_ms = execution.block.timings.execute_ms,
             finalize_ms = execution.block.timings.finalize_ms,
-            total_ms = started_at.elapsed().as_millis(),
+            total_ms,
             "application.propose.complete"
         );
 
@@ -221,6 +224,9 @@ where
             execution.timings.finalize_ms,
         );
 
+        let total_ms = started_at.elapsed().as_millis();
+        observe_ms(&self.metrics.verify_total_duration, total_ms);
+
         info!(
             epoch = header.context.round.epoch().get(),
             view = header.context.round.view().get(),
@@ -233,7 +239,7 @@ where
             load_state_ms = execution.timings.load_state_ms,
             execute_ms = execution.timings.execute_ms,
             finalize_ms = execution.timings.finalize_ms,
-            total_ms = started_at.elapsed().as_millis(),
+            total_ms,
             "application.verify.complete"
         );
 
@@ -300,6 +306,9 @@ where
         observe_ms(&self.metrics.apply_execute_duration, timings.execute_ms);
         observe_ms(&self.metrics.apply_finalize_duration, timings.finalize_ms);
 
+        let total_ms = started_at.elapsed().as_millis();
+        observe_ms(&self.metrics.apply_total_duration, total_ms);
+
         info!(
             epoch = block.header.context.round.epoch().get(),
             view = block.header.context.round.view().get(),
@@ -311,7 +320,7 @@ where
             load_state_ms = timings.load_state_ms,
             execute_ms = timings.execute_ms,
             finalize_ms = timings.finalize_ms,
-            total_ms = started_at.elapsed().as_millis(),
+            total_ms,
             "application.apply.complete"
         );
 
