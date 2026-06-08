@@ -457,7 +457,8 @@ mod test {
         TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
     };
     use commonware_codec::{
-        DecodeExt as _, Encode as _, EncodeSize, FixedSize as _, RangeCfg, ReadExt as _, Write as _,
+        Decode as _, DecodeExt as _, Encode as _, EncodeSize, FixedSize as _, RangeCfg,
+        ReadExt as _, Write as _,
     };
     use commonware_cryptography::{
         Hasher, Signer, Verifier, ed25519, secp256r1::standard as secp256r1, sha256,
