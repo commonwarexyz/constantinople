@@ -689,15 +689,122 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchStatus, DigestOutcome, TxStatus, batch_status_from_outcomes, new_transactions,
-        status_for_finalized_block,
+        Actor, BatchStatus, Config, DigestOutcome, Mailbox, TxStatus, accepted_status,
+        batch_status_from_outcomes, forget_batch, new_transactions, remember_status,
+        send_pending_waiters, status_for_finalized_block, tx_status_from_batch, watch_batch,
+        watched_batches_for,
     };
-    use commonware_cryptography::{Signer, ed25519, sha256};
+    use crate::TransactionSource;
+    use commonware_actor::Feedback;
+    use commonware_codec::EncodeSize;
+    use commonware_consensus::{
+        Reporter,
+        marshal::Update,
+        simplex::types::Context,
+        types::{Epoch, Round, View},
+    };
+    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
-    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
-    use core::num::NonZeroU64;
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner, Supervisor};
+    use commonware_utils::{Acknowledgement, acknowledgement::Exact, non_empty_range};
+    use constantinople_primitives::{
+        Block, Header, Sealable, SealedBlock, TRANSACTION_NAMESPACE, Transaction,
+        TransactionPublicKey, VerifiedTransaction,
+    };
+    use core::{num::NonZeroU64, time::Duration};
     use rand::{SeedableRng, rngs::StdRng};
-    use std::collections::{HashMap, HashSet};
+    use std::{
+        collections::{HashMap, HashSet, VecDeque},
+        sync::{Arc, OnceLock},
+    };
+    use tokio::sync::oneshot;
+
+    type TestDigest = sha256::Digest;
+    type TestHasher = sha256::Sha256;
+    type TestPublicKey = ed25519::PublicKey;
+    type TestMailbox = Mailbox<TestDigest, TestPublicKey, TestHasher>;
+    type TestTransaction = VerifiedTransaction<TestHasher>;
+    type TestBlock = SealedBlock<TestDigest, TestPublicKey, TestHasher>;
+
+    fn signed_transaction(seed: u64, nonce: u64) -> TestTransaction {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 1_000).public_key();
+        Transaction::new(
+            TransactionPublicKey::ed25519(signer.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            NonZeroU64::new(1).expect("non-zero"),
+            nonce,
+        )
+        .seal_and_sign(
+            &signer,
+            TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        )
+    }
+
+    fn test_context(view: u64) -> Context<TestDigest, TestPublicKey> {
+        let leader = ed25519::PrivateKey::from_seed(42).public_key();
+        Context {
+            round: Round::new(Epoch::zero(), View::new(view)),
+            leader,
+            parent: (View::zero(), sha256::Digest::EMPTY),
+        }
+    }
+
+    fn test_header(height: u64) -> Header<TestDigest, TestDigest, TestPublicKey> {
+        Header {
+            context: test_context(height),
+            parent: sha256::Digest::EMPTY,
+            height,
+            timestamp: height,
+            state_root: sha256::Digest::EMPTY,
+            state_range: non_empty_range!(0, 1),
+            transactions_root: sha256::Digest::EMPTY,
+            transactions_range: non_empty_range!(0, 1),
+        }
+    }
+
+    fn sealed_block(height: u64, transactions: Vec<TestTransaction>) -> TestBlock {
+        Block::new(test_header(height), transactions).seal(&mut sha256::Sha256::default())
+    }
+
+    async fn start_actor(
+        context: commonware_runtime::tokio::Context,
+        max_pool_bytes: usize,
+        max_propose_bytes: usize,
+        drop_grace_blocks: u64,
+    ) -> TestMailbox {
+        let (mailbox, receiver) = Mailbox::channel(8);
+        let actor = Actor::new(
+            context.child("mempool"),
+            Config {
+                max_pool_bytes,
+                max_propose_bytes,
+                namespace: TRANSACTION_NAMESPACE,
+                drop_grace_blocks,
+                signature_strategy: Sequential,
+                hash_strategy: Sequential,
+            },
+            mailbox.clone(),
+            receiver,
+            Arc::new(OnceLock::new()),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let _handle = actor.start(listener);
+        mailbox
+    }
+
+    fn report_block(mailbox: &TestMailbox, block: TestBlock) {
+        let mut reporter = mailbox.clone();
+        let (acknowledgement, _acknowledged) = Exact::handle();
+        assert!(matches!(
+            reporter.report(Update::Block(block, acknowledgement)),
+            Feedback::Ok
+        ));
+    }
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {
@@ -791,5 +898,267 @@ mod tests {
                 filtered: vec![second.to_string()],
             }),
         );
+    }
+
+    #[test]
+    fn tx_status_from_batch_only_returns_terminal_statuses() {
+        let accepted = BatchStatus::Accepted {
+            digests: vec!["a".to_string()],
+        };
+        let finalized = BatchStatus::Finalized {
+            height: 3,
+            included: vec!["a".to_string()],
+        };
+        let partial = BatchStatus::PartiallyFinalized {
+            height: 4,
+            included: vec!["a".to_string()],
+            filtered: vec!["b".to_string()],
+        };
+        let dropped = BatchStatus::Dropped {
+            filtered: vec!["a".to_string()],
+        };
+
+        assert_eq!(tx_status_from_batch(&accepted), None);
+        assert_eq!(
+            tx_status_from_batch(&finalized),
+            Some(TxStatus::Finalized { height: 3 }),
+        );
+        assert_eq!(
+            tx_status_from_batch(&partial),
+            Some(TxStatus::PartiallyFinalized {
+                height: 4,
+                included: vec!["a".to_string()],
+                filtered: vec!["b".to_string()],
+            }),
+        );
+        assert_eq!(tx_status_from_batch(&dropped), Some(TxStatus::Dropped));
+    }
+
+    #[test]
+    fn remember_status_updates_existing_batch_without_reordering() {
+        let mut statuses = HashMap::new();
+        let mut status_order = VecDeque::new();
+        let digest = sha256::Digest::from([1u8; 32]);
+        let accepted = accepted_status(&[digest]);
+
+        let expired = remember_status(
+            &mut statuses,
+            &mut status_order,
+            "batch".to_string(),
+            accepted,
+        );
+
+        assert!(expired.is_empty());
+        assert_eq!(status_order, VecDeque::from(["batch".to_string()]));
+        assert!(matches!(
+            statuses.get("batch"),
+            Some(BatchStatus::Accepted { .. })
+        ));
+
+        let expired = remember_status(
+            &mut statuses,
+            &mut status_order,
+            "batch".to_string(),
+            BatchStatus::Finalized {
+                height: 5,
+                included: vec![digest.to_string()],
+            },
+        );
+
+        assert!(expired.is_empty());
+        assert_eq!(status_order, VecDeque::from(["batch".to_string()]));
+        assert!(matches!(
+            statuses.get("batch"),
+            Some(BatchStatus::Finalized { height: 5, .. })
+        ));
+    }
+
+    #[test]
+    fn send_pending_waiters_ignores_non_terminal_statuses() {
+        let (sender, mut receiver) = oneshot::channel();
+        let mut pending = HashMap::from([("batch".to_string(), vec![sender])]);
+        let status = BatchStatus::Accepted {
+            digests: vec!["a".to_string()],
+        };
+
+        send_pending_waiters(&mut pending, "batch", &status);
+
+        assert!(pending.contains_key("batch"));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(oneshot::error::TryRecvError::Empty),
+        ));
+    }
+
+    #[test]
+    fn send_pending_waiters_resolves_terminal_statuses() {
+        let (sender, receiver) = oneshot::channel();
+        let mut pending = HashMap::from([("batch".to_string(), vec![sender])]);
+        let status = BatchStatus::Finalized {
+            height: 6,
+            included: vec!["a".to_string()],
+        };
+
+        send_pending_waiters(&mut pending, "batch", &status);
+
+        assert!(!pending.contains_key("batch"));
+        assert_eq!(
+            futures::executor::block_on(receiver).expect("waiter resolves"),
+            TxStatus::Finalized { height: 6 },
+        );
+    }
+
+    #[test]
+    fn watch_batch_and_watched_batches_deduplicate_batch_ids() {
+        let mut rng = StdRng::from_seed([17; 32]);
+        let first = sha256::Digest::random(&mut rng);
+        let second = sha256::Digest::random(&mut rng);
+        let mut watchers = HashMap::new();
+
+        watch_batch("batch-a", &[first, first, second], &mut watchers);
+        watch_batch("batch-b", &[first], &mut watchers);
+
+        assert_eq!(
+            watchers.get(&first),
+            Some(&vec!["batch-a".to_string(), "batch-b".to_string()]),
+        );
+        assert_eq!(watchers.get(&second), Some(&vec!["batch-a".to_string()]));
+
+        let affected = watched_batches_for(&[first, second], &watchers);
+
+        assert_eq!(
+            affected,
+            HashSet::from(["batch-a".to_string(), "batch-b".to_string()]),
+        );
+    }
+
+    #[test]
+    fn forget_batch_removes_watchers_outcomes_and_waiters() {
+        let mut rng = StdRng::from_seed([19; 32]);
+        let first = sha256::Digest::random(&mut rng);
+        let second = sha256::Digest::random(&mut rng);
+        let (sender, _receiver) = oneshot::channel();
+        let mut batch_digests = HashMap::from([
+            ("batch-a".to_string(), vec![first, first, second]),
+            ("batch-b".to_string(), vec![second]),
+        ]);
+        let mut watchers = HashMap::from([
+            (first, vec!["batch-a".to_string()]),
+            (second, vec!["batch-a".to_string(), "batch-b".to_string()]),
+        ]);
+        let mut outcomes = HashMap::from([
+            (first, DigestOutcome::Dropped),
+            (second, DigestOutcome::Dropped),
+        ]);
+        let mut pending_waiters = HashMap::from([("batch-a".to_string(), vec![sender])]);
+
+        forget_batch(
+            "batch-a",
+            &mut batch_digests,
+            &mut watchers,
+            &mut outcomes,
+            &mut pending_waiters,
+        );
+
+        assert!(!batch_digests.contains_key("batch-a"));
+        assert!(!pending_waiters.contains_key("batch-a"));
+        assert!(!watchers.contains_key(&first));
+        assert!(!outcomes.contains_key(&first));
+        assert_eq!(watchers.get(&second), Some(&vec!["batch-b".to_string()]));
+        assert!(outcomes.contains_key(&second));
+    }
+
+    #[test]
+    fn actor_submit_propose_finalized_resolves_waiter() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mailbox = start_actor(context, 1024 * 1024, 1024 * 1024, 2).await;
+            let transaction = signed_transaction(1, 0);
+            let digest = *transaction.message_digest();
+
+            let waiter = mailbox
+                .try_submit(
+                    "batch".to_string(),
+                    vec![digest],
+                    vec![transaction.clone()],
+                    transaction.encode_size(),
+                )
+                .expect("submit accepted");
+
+            assert_eq!(
+                mailbox.query_status("batch".to_string()).await,
+                Some(BatchStatus::Accepted {
+                    digests: vec![digest.to_string()],
+                }),
+            );
+
+            let mut source = mailbox.clone();
+            let proposed = source.propose(&test_header(0), &test_context(1)).await;
+
+            assert_eq!(proposed.len(), 1);
+            assert_eq!(proposed[0].message_digest(), &digest);
+
+            report_block(&mailbox, sealed_block(1, proposed));
+
+            assert_eq!(
+                waiter.await.expect("submit waiter resolves"),
+                TxStatus::Finalized { height: 1 },
+            );
+            assert_eq!(
+                mailbox.query_status("batch".to_string()).await,
+                Some(BatchStatus::Finalized {
+                    height: 1,
+                    included: vec![digest.to_string()],
+                }),
+            );
+            assert_eq!(mailbox.query_consensus_round().await, Some(1));
+        });
+    }
+
+    #[test]
+    fn actor_proposed_batch_drops_after_grace_blocks() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mailbox = start_actor(context, 1024 * 1024, 1024 * 1024, 2).await;
+            let transaction = signed_transaction(2, 0);
+            let digest = *transaction.message_digest();
+
+            let mut waiter = mailbox
+                .try_submit(
+                    "batch".to_string(),
+                    vec![digest],
+                    vec![transaction.clone()],
+                    transaction.encode_size(),
+                )
+                .expect("submit accepted");
+
+            let mut source = mailbox.clone();
+            let proposed = source.propose(&test_header(0), &test_context(1)).await;
+
+            assert_eq!(proposed.len(), 1);
+            assert_eq!(proposed[0].message_digest(), &digest);
+
+            report_block(&mailbox, sealed_block(2, Vec::new()));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut waiter)
+                    .await
+                    .is_err(),
+                "batch should remain pending inside the grace window",
+            );
+
+            report_block(&mailbox, sealed_block(3, Vec::new()));
+
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), waiter)
+                    .await
+                    .expect("waiter resolves")
+                    .expect("submit waiter resolves"),
+                TxStatus::Dropped,
+            );
+            assert_eq!(
+                mailbox.query_status("batch".to_string()).await,
+                Some(BatchStatus::Dropped {
+                    filtered: vec![digest.to_string()],
+                }),
+            );
+        });
     }
 }
