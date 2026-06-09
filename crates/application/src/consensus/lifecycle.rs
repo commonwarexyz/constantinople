@@ -20,8 +20,8 @@ use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 use rand::Rng;
 use rand_core::CryptoRngCore;
-use std::{sync::Arc, time::Instant};
-use tracing::{info, warn};
+use std::sync::Arc;
+use tracing::{Instrument as _, info, info_span, warn};
 
 impl<E, H, C, S, P, I, B, SigSt, HashSt> Application<E, H, C, S, P, I, B, SigSt, HashSt>
 where
@@ -58,20 +58,21 @@ where
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
-        let started_at = Instant::now();
+        let body = input
+            .propose(&parent.header, &context)
+            .instrument(info_span!("application.propose.input"))
+            .await;
 
-        let input_started_at = Instant::now();
-        let body = input.propose(&parent.header, &context).await;
-        let input_ms = input_started_at.elapsed().as_millis();
-
-        let prepare_started_at = Instant::now();
-        let input = executor::prepare_proposal(body);
-        let candidate_transfers = input
-            .candidates
-            .iter()
-            .map(|candidate| candidate.transfer.clone())
-            .collect::<Vec<_>>();
-        let prepare_ms = prepare_started_at.elapsed().as_millis();
+        let (input, candidate_transfers) =
+            info_span!("application.propose.prepare").in_scope(|| {
+                let input = executor::prepare_proposal(body);
+                let candidate_transfers = input
+                    .candidates
+                    .iter()
+                    .map(|candidate| candidate.transfer.clone())
+                    .collect::<Vec<_>>();
+                (input, candidate_transfers)
+            });
 
         let (state_batch, transaction_batch) = batches;
         let execution = execute_proposal(
@@ -104,12 +105,6 @@ where
             height = block.header.height,
             txs = execution.block.transaction_count,
             timestamp = block.header.timestamp,
-            input_ms,
-            prepare_ms,
-            load_state_ms = execution.block.timings.load_state_ms,
-            execute_ms = execution.block.timings.execute_ms,
-            finalize_ms = execution.block.timings.finalize_ms,
-            total_ms = started_at.elapsed().as_millis(),
             "application.propose.complete"
         );
 
@@ -143,7 +138,6 @@ where
         SigSt: Strategy + Clone + Send + Sync + 'static,
         HashSt: Strategy + Clone + Send + Sync + 'static,
     {
-        let started_at = Instant::now();
         let Block { header, body } = block.into_inner();
 
         if !time::is_valid_child_timestamp(parent.header.timestamp, header.timestamp) {
@@ -169,14 +163,13 @@ where
         let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
-        let (signature_ms, execution, sleep_ms) =
-            match futures::try_join!(signatures, execution, wait) {
-                Ok(result) => result,
-                Err(reason) => {
-                    reject_verify(header.height, reason);
-                    return None;
-                }
-            };
+        let execution = match futures::try_join!(signatures, execution, wait) {
+            Ok(((), execution, ())) => execution,
+            Err(reason) => {
+                reject_verify(header.height, reason);
+                return None;
+            }
+        };
 
         if !commitments_match(&header, &execution) {
             return None;
@@ -188,13 +181,6 @@ where
             height = header.height,
             txs = execution.transaction_count,
             timestamp = header.timestamp,
-            signature_ms,
-            sleep_ms,
-            prepare_ms = execution.timings.prepare_ms,
-            load_state_ms = execution.timings.load_state_ms,
-            execute_ms = execution.timings.execute_ms,
-            finalize_ms = execution.timings.finalize_ms,
-            total_ms = started_at.elapsed().as_millis(),
             "application.verify.complete"
         );
 

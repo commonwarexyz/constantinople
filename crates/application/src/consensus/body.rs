@@ -12,7 +12,7 @@ use constantinople_primitives::{
     preload_transaction_chunks, verify_transaction_batch,
 };
 use rand_core::CryptoRngCore;
-use std::{sync::Arc, time::Instant};
+use std::sync::Arc;
 use tracing::{Instrument, info_span};
 
 pub(super) type PreparedBody<H> = Arc<Vec<LazySignedTransaction<H>>>;
@@ -23,7 +23,7 @@ pub(super) async fn verify_signatures<E, H, SigSt, HashSt>(
     hash_strategy: HashSt,
     namespace: &'static [u8],
     body: PreparedBody<H>,
-) -> Result<u128>
+) -> Result<()>
 where
     E: Spawner + CryptoRngCore,
     H: Hasher,
@@ -34,7 +34,6 @@ where
     let transaction_count = body.len();
     let _handle = runtime.shared(true).spawn(move |mut runtime| {
         async move {
-            let started_at = Instant::now();
             let result = preload_transaction_chunks(&hash_strategy, body.as_ref().clone())
                 .filter(|transactions| {
                     verify_transaction_batch::<H, _>(
@@ -44,7 +43,7 @@ where
                         transactions,
                     )
                 })
-                .map(|_| started_at.elapsed().as_millis())
+                .map(|_| ())
                 .ok_or(INVALID_SIGNATURE);
             let _ = result_tx.send(result);
         }
@@ -84,14 +83,11 @@ where
     result_rx.await.map_err(|_| MATERIALIZE_TASK_CLOSED)?
 }
 
-pub(super) async fn wait_for_timestamp<E>(
-    runtime: E,
-    deadline: std::time::SystemTime,
-) -> Result<u128>
+#[tracing::instrument(name = "application.verify.wait", level = "info", skip_all)]
+pub(super) async fn wait_for_timestamp<E>(runtime: E, deadline: std::time::SystemTime) -> Result<()>
 where
     E: Clock,
 {
-    let started_at = Instant::now();
     runtime.sleep_until(deadline).await;
-    Ok(started_at.elapsed().as_millis())
+    Ok(())
 }

@@ -36,7 +36,7 @@ use commonware_cryptography::{
     certificate::{ConstantProvider, Verifier},
 };
 use commonware_glue::stateful::{
-    Config as StatefulConfig, Stateful, SyncPlan,
+    Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
@@ -63,7 +63,6 @@ use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
     num::{NonZero, NonZeroU16},
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -172,7 +171,9 @@ where
     pub hash_strategy: HashT,
     pub startup: StartupMode<EngineFinalization<C::PublicKey, V>>,
     pub sync_config: SyncEngineConfig,
-    pub prune_cadence_blocks: NonZero<u64>,
+    /// Periodic database and marshal pruning configuration. `None` disables
+    /// automatic pruning.
+    pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
@@ -501,16 +502,6 @@ where
             config.transaction_namespace,
             genesis_state_target,
             genesis_transactions_target,
-            config.prune_cadence_blocks,
-            Arc::new({
-                let marshal = marshal_mailbox.clone();
-                move |height| {
-                    let marshal = marshal.clone();
-                    Box::pin(async move {
-                        marshal.prune(height);
-                    })
-                }
-            }),
             config.finalized_hook,
         );
         let (stateful, stateful_mailbox) = Stateful::init(
@@ -532,6 +523,7 @@ where
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
+                prune_config: config.prune_config,
             },
         );
 

@@ -21,6 +21,7 @@ use commonware_cryptography::{
 };
 use commonware_formatting::hex;
 use commonware_glue::stateful::{
+    PruneConfig,
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
@@ -32,6 +33,7 @@ use commonware_runtime::{
     tokio::{
         Context as RuntimeContext,
         telemetry::{self, Logging},
+        tracing::Config as TracesConfig,
     },
 };
 use commonware_storage::{
@@ -71,6 +73,16 @@ use tracing::{info, warn};
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
+/// Sampling rate for OTEL trace uploads, when enabled.
+const OTEL_SAMPLING_RATE: f64 = 1.0;
+/// Prune databases and marshal every 1024 finalized blocks, retaining 1024
+/// finalized blocks in marshal and 32 blocks' worth of QMDB operations beyond
+/// the rewind-safe window.
+const PRUNE_CONFIG: PruneConfig = PruneConfig {
+    maintenance_interval: NZUsize!(1024),
+    retained_marshal_blocks: 1024,
+    retained_qmdb_blocks: 32,
+};
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
@@ -674,7 +686,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
-        prune_cadence_blocks,
+        otel_endpoint,
         json_logs,
         deployer_managed,
         indexer,
@@ -703,7 +715,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 json: json_logs,
             },
             Some(metrics_listen),
-            None,
+            otel_endpoint.map(|endpoint| TracesConfig {
+                endpoint,
+                name: hex(&decoded.public_key.encode()),
+                rate: OTEL_SAMPLING_RATE,
+            }),
         );
 
         info!(
@@ -897,8 +913,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 hash_strategy,
                 startup,
                 sync_config: production_sync_config(),
-                prune_cadence_blocks: NonZeroU64::new(prune_cadence_blocks)
-                    .expect("prune_cadence_blocks must be non-zero"),
+                prune_config: Some(PRUNE_CONFIG),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),

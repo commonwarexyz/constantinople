@@ -202,6 +202,9 @@ pub(crate) struct RemoteArgs {
     qmdb_indexer_port: u16,
     #[arg(long, default_value_t = false)]
     profiling: bool,
+    /// Enable OTEL trace uploads from validators to the monitoring instance.
+    #[arg(long, default_value_t = false)]
+    otel_traces: bool,
     /// Instance type for the spammer (defaults to --instance-type).
     #[arg(long)]
     spammer_instance_type: Option<String>,
@@ -296,6 +299,9 @@ pub(crate) struct ValidatorConfig {
     metrics_port: u16,
     max_propose_bytes: usize,
     max_pool_bytes: usize,
+    /// Upload OTEL traces to the monitoring instance's OTLP endpoint.
+    #[serde(default)]
+    otel_traces: bool,
     bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.

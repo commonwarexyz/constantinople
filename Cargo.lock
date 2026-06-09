@@ -1093,7 +1093,7 @@ dependencies = [
 [[package]]
 name = "commonware-actor"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -1106,7 +1106,7 @@ dependencies = [
 [[package]]
 name = "commonware-broadcast"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "commonware-actor",
  "commonware-codec",
@@ -1122,7 +1122,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -1139,7 +1139,7 @@ dependencies = [
 [[package]]
 name = "commonware-codec-macros"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1150,7 +1150,7 @@ dependencies = [
 [[package]]
 name = "commonware-coding"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -1172,7 +1172,7 @@ dependencies = [
 [[package]]
 name = "commonware-conformance"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "commonware-conformance-macros",
  "commonware-formatting",
@@ -1186,7 +1186,7 @@ dependencies = [
 [[package]]
 name = "commonware-conformance-macros"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1196,7 +1196,7 @@ dependencies = [
 [[package]]
 name = "commonware-consensus"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -1228,7 +1228,7 @@ dependencies = [
 [[package]]
 name = "commonware-cryptography"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "anyhow",
  "arbitrary",
@@ -1270,7 +1270,7 @@ dependencies = [
 [[package]]
 name = "commonware-deployer"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -1280,7 +1280,7 @@ dependencies = [
 [[package]]
 name = "commonware-formatting"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "commonware-macros",
  "const-hex",
@@ -1289,7 +1289,7 @@ dependencies = [
 [[package]]
 name = "commonware-glue"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "bytes",
  "commonware-actor",
@@ -1314,7 +1314,7 @@ dependencies = [
 [[package]]
 name = "commonware-invariants"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "commonware-formatting",
@@ -1327,7 +1327,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "commonware-macros-impl",
  "tokio",
@@ -1336,7 +1336,7 @@ dependencies = [
 [[package]]
 name = "commonware-macros-impl"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1348,7 +1348,7 @@ dependencies = [
 [[package]]
 name = "commonware-math"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -1363,7 +1363,7 @@ dependencies = [
 [[package]]
 name = "commonware-p2p"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "commonware-actor",
@@ -1390,7 +1390,7 @@ dependencies = [
 [[package]]
 name = "commonware-parallel"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "cfg-if",
  "commonware-macros",
@@ -1400,7 +1400,7 @@ dependencies = [
 [[package]]
 name = "commonware-resolver"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "bytes",
@@ -1421,7 +1421,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "axum",
@@ -1460,7 +1460,7 @@ dependencies = [
 [[package]]
 name = "commonware-runtime-macros"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "proc-macro-crate",
  "proc-macro2",
@@ -1471,7 +1471,7 @@ dependencies = [
 [[package]]
 name = "commonware-storage"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "ahash",
  "anyhow",
@@ -1495,7 +1495,7 @@ dependencies = [
 [[package]]
 name = "commonware-stream"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "chacha20poly1305",
  "commonware-codec",
@@ -1515,7 +1515,7 @@ dependencies = [
 [[package]]
 name = "commonware-utils"
 version = "2026.5.0"
-source = "git+https://github.com/commonwarexyz/monorepo.git?rev=156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea#156ceea81aa7622b4c8b4c7e9b0a3c87abd8dfea"
+source = "git+https://git@github.com/commonwarexyz/monorepo.git?branch=cl%2Fapplication-tracing#d0e8cc6ebcfe2b9087b47b65c1e8aff6676ddcce"
 dependencies = [
  "arbitrary",
  "bytes",

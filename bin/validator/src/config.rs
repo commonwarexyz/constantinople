@@ -36,10 +36,6 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-pub(crate) const fn default_prune_cadence_blocks() -> u64 {
-    1024
-}
-
 pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
 }
@@ -100,8 +96,10 @@ pub struct ValidatorConfig {
     pub max_propose_bytes: usize,
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
-    #[serde(default = "default_prune_cadence_blocks")]
-    pub prune_cadence_blocks: u64,
+    /// Upload OTEL traces to the monitoring instance. Only honored in
+    /// deployer mode, where the hosts file names a monitoring instance.
+    #[serde(default)]
+    pub otel_traces: bool,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
@@ -173,7 +171,8 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     pub max_propose_bytes: usize,
     pub max_pool_bytes: usize,
-    pub prune_cadence_blocks: u64,
+    /// OTLP endpoint for trace uploads, when enabled.
+    pub otel_endpoint: Option<String>,
     pub json_logs: bool,
     pub deployer_managed: bool,
     pub indexer: Option<IndexerConfig>,
@@ -251,6 +250,7 @@ fn decode_with_network(
     primary_participants: Vec<ed25519::PublicKey>,
     secondary_participants: Vec<ed25519::PublicKey>,
     bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    otel_endpoint: Option<String>,
     json_logs: bool,
 ) -> LoadedConfig {
     let signer = decode_private_key(&config.private_key);
@@ -296,7 +296,7 @@ fn decode_with_network(
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
         max_pool_bytes: config.max_pool_bytes,
-        prune_cadence_blocks: config.prune_cadence_blocks,
+        otel_endpoint,
         json_logs,
         deployer_managed: json_logs,
         indexer: config.indexer,
@@ -378,6 +378,7 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
         primary_participants,
         secondary_participants,
         bootstrappers,
+        None,
         false,
     )
 }
@@ -430,12 +431,17 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         })
         .collect();
 
+    let otel_endpoint = config
+        .otel_traces
+        .then(|| format!("http://{}:4318/v1/traces", hosts.monitoring.private));
+
     decode_with_network(
         config,
         public_listen,
         primary_participants,
         secondary_participants,
         bootstrappers,
+        otel_endpoint,
         true,
     )
 }
@@ -444,8 +450,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_prune_cadence_blocks,
-        default_upload_buffer, load_deployer_config, load_local_config,
+        default_max_pool_bytes, default_max_propose_bytes, default_upload_buffer,
+        load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -565,7 +571,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
-                prune_cadence_blocks: default_prune_cadence_blocks(),
+                otel_traces: false,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -598,7 +604,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
-                prune_cadence_blocks: default_prune_cadence_blocks(),
+                otel_traces: false,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
