@@ -30,7 +30,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    Faults, NZU16, NZU64, NZUsize, non_empty_range, sequence::U64, sync::AsyncRwLock,
+    Faults, NZU16, NZU64, NZUsize, non_empty_range, sequence::U64, sync::TracedAsyncRwLock,
 };
 use constantinople_application::consensus::{Application, TransactionHistoryDb};
 use constantinople_mempool::mocks::StaticTransactionSource;
@@ -64,9 +64,9 @@ type TestApplication = Application<
 >;
 type TestStateDb =
     fixed::Db<mmr::Family, RuntimeContext, AccountKey, Account, TestHasher, EightCap, Rayon>;
-type TestStateDatabase = Arc<AsyncRwLock<TestStateDb>>;
+type TestStateDatabase = Arc<TracedAsyncRwLock<TestStateDb>>;
 type TestTransactionDb = TransactionHistoryDb<RuntimeContext, TestHasher, Rayon>;
-type TestTransactionDatabase = Arc<AsyncRwLock<TestTransactionDb>>;
+type TestTransactionDatabase = Arc<TracedAsyncRwLock<TestTransactionDb>>;
 type TestDatabases = (TestStateDatabase, TestTransactionDatabase);
 type TestBlock = SealedBlock<TestCommitment, TestPublicKey, TestHasher>;
 type TestConsensusContext = Context<TestCommitment, TestPublicKey>;

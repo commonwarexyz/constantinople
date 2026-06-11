@@ -24,7 +24,7 @@ use commonware_cryptography::{
 };
 use commonware_glue::stateful::Stateful;
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
-use commonware_utils::sync::AsyncRwLock;
+use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_application::consensus::{
     Application, TransactionHistoryDb, TransactionHistoryOperation,
 };
@@ -98,7 +98,7 @@ pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolo
 
 pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
 
-pub type StateSyncDb<E, H, T> = Arc<AsyncRwLock<StateDb<E, H, T>>>;
+pub type StateSyncDb<E, H, T> = Arc<TracedAsyncRwLock<StateDb<E, H, T>>>;
 
 pub(crate) type StateResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::p2p::standard::Mailbox<
@@ -113,7 +113,7 @@ pub(crate) type StateResolverActor<E, P, M, B, H, T> =
 
 pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
-pub type TransactionSyncDb<E, H, T> = Arc<AsyncRwLock<TransactionDb<E, H, T>>>;
+pub type TransactionSyncDb<E, H, T> = Arc<TracedAsyncRwLock<TransactionDb<E, H, T>>>;
 
 pub(crate) type TransactionResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::p2p::compact::Mailbox<

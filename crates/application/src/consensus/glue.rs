@@ -73,7 +73,12 @@ where
     ) -> Option<Proposed<Self, E>> {
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        self.propose_child(context, &parent, batches, input).await
+        let result = self.propose_child(context, &parent, batches, input).await;
+        let cleanup = tracing::info_span!("application.propose.cleanup").entered();
+        drop(parent);
+        drop(ancestry);
+        drop(cleanup);
+        result
     }
 
     async fn verify(

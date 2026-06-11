@@ -20,13 +20,13 @@ use commonware_storage::{
     },
     translator::EightCap,
 };
-use commonware_utils::sync::AsyncRwLock;
+use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_primitives::{Account, AccountKey};
 use std::sync::Arc;
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
-    Arc<AsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
+    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -38,7 +38,7 @@ pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
-pub type TransactionDatabase<E, H, S> = Arc<AsyncRwLock<TransactionHistoryDb<E, H, S>>>;
+pub type TransactionDatabase<E, H, S> = Arc<TracedAsyncRwLock<TransactionHistoryDb<E, H, S>>>;
 
 /// The backing databases owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
