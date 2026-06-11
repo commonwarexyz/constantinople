@@ -5,7 +5,7 @@ mod properties;
 
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
@@ -309,6 +309,7 @@ impl EngineDefinition for TestEngineDefinition {
                         max_retained_roots: 32,
                     },
                     prune_config: Some(PruneConfig {
+                        max_pending_acks: MAX_PENDING_ACKS,
                         maintenance_interval: NZUsize!(16),
                         retained_marshal_blocks: 16,
                         retained_qmdb_blocks: 0,

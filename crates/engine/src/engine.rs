@@ -47,8 +47,10 @@ use commonware_runtime::{
 };
 use commonware_storage::{
     archive::{Identifier as ArchiveIdentifier, prunable, prunable::Archive as PrunableArchive},
-    journal::contiguous::fixed::Config as FixedJournalConfig,
-    merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
+    journal::contiguous::{
+        fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
+    },
+    merkle::full::Config as MmrConfig,
     mmr,
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
@@ -81,9 +83,8 @@ const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
 const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
-// The compact transaction-history database can rewind one finalized commit.
-// Glue requires marshal's ack window to fit the narrowest database rewind window.
-const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(1);
+pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
+const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -364,8 +365,11 @@ where
             } else {
                 None
             };
-        let transaction_db_config =
-            transaction_db_config(&config.partition_prefix, config.hash_strategy.clone());
+        let transaction_db_config = transaction_db_config(
+            &config.partition_prefix,
+            &page_cache,
+            config.hash_strategy.clone(),
+        );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
         let mut startup_plan =
@@ -518,7 +522,6 @@ where
                 ),
                 input_provider: config.input,
                 marshal: marshal_mailbox.clone(),
-                max_pending_acks: MAX_PENDING_ACKS,
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
@@ -803,14 +806,23 @@ where
     }
 }
 
-fn transaction_db_config<T>(partition_prefix: &str, strategy: T) -> keyless_fixed::CompactConfig<T>
+fn transaction_db_config<T>(
+    partition_prefix: &str,
+    page_cache: &CacheRef,
+    strategy: T,
+) -> keyless_fixed::CompactConfig<T>
 where
     T: Strategy,
 {
     keyless_fixed::CompactConfig {
-        merkle: CompactMerkleConfig {
-            partition: format!("{partition_prefix}-transactions-merkle"),
-            strategy,
+        strategy,
+        witness: VariableJournalConfig {
+            partition: format!("{partition_prefix}-transactions-witness"),
+            items_per_section: WITNESS_ITEMS_PER_SECTION,
+            compression: None,
+            codec_config: (),
+            page_cache: page_cache.clone(),
+            write_buffer: DB_WRITE_BUFFER,
         },
         commit_codec_config: (),
     }

@@ -1619,8 +1619,10 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{BufferPooler, Runner as _, Supervisor, buffer::paged::CacheRef};
     use commonware_storage::{
-        journal::contiguous::fixed::Config as FixedJournalConfig,
-        merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
+        journal::contiguous::{
+            fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
+        },
+        merkle::full::Config as MmrConfig,
         qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
         translator::EightCap,
     };
@@ -2142,23 +2144,22 @@ mod tests {
     where
         E: BufferPooler + Clock + Metrics + Storage + Supervisor + Send + Sync + 'static,
     {
+        let page_cache = CacheRef::from_pooler(
+            &context,
+            TEST_PAGE_CACHE_PAGE_SIZE,
+            TEST_PAGE_CACHE_CAPACITY,
+        );
         let config = (
-            test_state_db_config(&context, prefix),
-            test_transaction_db_config(prefix),
+            test_state_db_config(&page_cache, prefix),
+            test_transaction_db_config(&page_cache, prefix),
         );
         Databases::init(context, config).await
     }
 
-    fn test_state_db_config<E>(context: &E, prefix: &str) -> FixedConfig<EightCap, Sequential>
-    where
-        E: BufferPooler + Supervisor,
-    {
-        let page_cache = CacheRef::from_pooler(
-            &context.child("state_page_cache"),
-            TEST_PAGE_CACHE_PAGE_SIZE,
-            TEST_PAGE_CACHE_CAPACITY,
-        );
-
+    fn test_state_db_config(
+        page_cache: &CacheRef,
+        prefix: &str,
+    ) -> FixedConfig<EightCap, Sequential> {
         FixedConfig {
             merkle_config: MmrConfig {
                 journal_partition: format!("{prefix}-state-journal"),
@@ -2171,18 +2172,26 @@ mod tests {
             journal_config: FixedJournalConfig {
                 partition: format!("{prefix}-state-log"),
                 items_per_blob: TEST_ITEMS_PER_BLOB,
-                page_cache,
+                page_cache: page_cache.clone(),
                 write_buffer: TEST_WRITE_BUFFER,
             },
             translator: EightCap,
         }
     }
 
-    fn test_transaction_db_config(prefix: &str) -> keyless_fixed::CompactConfig<Sequential> {
+    fn test_transaction_db_config(
+        page_cache: &CacheRef,
+        prefix: &str,
+    ) -> keyless_fixed::CompactConfig<Sequential> {
         keyless_fixed::CompactConfig {
-            merkle: CompactMerkleConfig {
-                partition: format!("{prefix}-transactions-merkle"),
-                strategy: Sequential,
+            strategy: Sequential,
+            witness: VariableJournalConfig {
+                partition: format!("{prefix}-transactions-witness"),
+                items_per_section: TEST_ITEMS_PER_BLOB,
+                compression: None,
+                codec_config: (),
+                page_cache: page_cache.clone(),
+                write_buffer: TEST_WRITE_BUFFER,
             },
             commit_codec_config: (),
         }

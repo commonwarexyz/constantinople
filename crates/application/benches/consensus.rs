@@ -18,8 +18,10 @@ use commonware_runtime::{
     tokio::{Config as RuntimeConfig, Context as RuntimeContext},
 };
 use commonware_storage::{
-    journal::contiguous::fixed::Config as FixedJournalConfig,
-    merkle::{compact::Config as CompactMerkleConfig, full::Config as MmrConfig},
+    journal::contiguous::{
+        fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
+    },
+    merkle::full::Config as MmrConfig,
     mmr,
     qmdb::{
         any::{FixedConfig, unordered::fixed},
@@ -74,6 +76,7 @@ const ITEMS_PER_BLOB: NonZeroU64 = NZU64!(1_048_576);
 const WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192);
 const PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(16_384);
+const WITNESS_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(64);
 
 #[derive(Clone, Copy, Debug)]
 struct BenchSubject<'a> {
@@ -521,11 +524,12 @@ async fn init_databases(
     accounts: &[(AccountKey, Account)],
     strategy: Rayon,
 ) -> TestDatabases {
+    let page_cache = CacheRef::from_pooler(runtime, PAGE_CACHE_PAGE_SIZE, PAGE_CACHE_CAPACITY);
     let databases = TestDatabases::init(
         runtime.child("databases"),
         (
-            state_db_config(runtime, prefix, strategy.clone()),
-            transaction_db_config(prefix, strategy),
+            state_db_config(&page_cache, prefix, strategy.clone()),
+            transaction_db_config(&page_cache, prefix, strategy),
         ),
     )
     .await;
@@ -602,16 +606,10 @@ const fn block_context(leader: TestPublicKey) -> TestConsensusContext {
 }
 
 fn state_db_config(
-    runtime: &RuntimeContext,
+    page_cache: &CacheRef,
     prefix: &str,
     strategy: Rayon,
 ) -> FixedConfig<EightCap, Rayon> {
-    let page_cache = CacheRef::from_pooler(
-        &runtime.child("state_page_cache"),
-        PAGE_CACHE_PAGE_SIZE,
-        PAGE_CACHE_CAPACITY,
-    );
-
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: format!("{prefix}-state-journal"),
@@ -624,18 +622,27 @@ fn state_db_config(
         journal_config: FixedJournalConfig {
             partition: format!("{prefix}-state-log"),
             items_per_blob: ITEMS_PER_BLOB,
-            page_cache,
+            page_cache: page_cache.clone(),
             write_buffer: WRITE_BUFFER,
         },
         translator: EightCap,
     }
 }
 
-fn transaction_db_config(prefix: &str, strategy: Rayon) -> keyless_fixed::CompactConfig<Rayon> {
+fn transaction_db_config(
+    page_cache: &CacheRef,
+    prefix: &str,
+    strategy: Rayon,
+) -> keyless_fixed::CompactConfig<Rayon> {
     keyless_fixed::CompactConfig {
-        merkle: CompactMerkleConfig {
-            partition: format!("{prefix}-transactions-merkle"),
-            strategy,
+        strategy,
+        witness: VariableJournalConfig {
+            partition: format!("{prefix}-transactions-witness"),
+            items_per_section: WITNESS_ITEMS_PER_SECTION,
+            compression: None,
+            codec_config: (),
+            page_cache: page_cache.clone(),
+            write_buffer: WRITE_BUFFER,
         },
         commit_codec_config: (),
     }
@@ -650,12 +657,13 @@ async fn cleanup_partitions(runtime: &RuntimeContext, prefix: &str) {
     }
 }
 
-fn partition_names(prefix: &str) -> [String; 4] {
+fn partition_names(prefix: &str) -> [String; 5] {
     [
         format!("{prefix}-state-journal"),
         format!("{prefix}-state-metadata"),
         format!("{prefix}-state-log"),
-        format!("{prefix}-transactions-merkle"),
+        format!("{prefix}-transactions-witness_data"),
+        format!("{prefix}-transactions-witness_offsets"),
     ]
 }
 
