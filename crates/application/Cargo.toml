@@ -52,7 +52,3 @@ criterion.workspace = true
 [[bench]]
 name = "executor"
 harness = false
-
-[[bench]]
-name = "consensus"
-harness = false
