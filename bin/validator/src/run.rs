@@ -32,7 +32,7 @@ use commonware_runtime::{
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
-        telemetry::{self, Logging},
+        telemetry::{self, Logs},
         tracing::Config as TracesConfig,
     },
 };
@@ -712,7 +712,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     runner.start(|context| async move {
         telemetry::init(
             context.child("telemetry"),
-            Logging {
+            Logs {
                 level: log_level.parse().expect("bad log_level in config"),
                 json: json_logs,
             },

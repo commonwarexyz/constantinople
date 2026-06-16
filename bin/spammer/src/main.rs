@@ -103,7 +103,7 @@ fn main() {
         let json_logs = cli.hosts.is_some();
         telemetry::init(
             context.child("telemetry"),
-            telemetry::Logging {
+            telemetry::Logs {
                 level: tracing::Level::INFO,
                 json: json_logs,
             },
