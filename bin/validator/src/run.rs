@@ -57,6 +57,7 @@ use constantinople_indexer::{
     publisher::qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
+use constantinople_primitives::PublicKeyCache;
 use std::{
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -683,6 +684,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
+        public_key_cache_size,
         otel,
         json_logs,
         deployer_managed,
@@ -733,6 +735,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let hash_strategy = context
             .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create hashing strategy");
+        let public_key_cache = PublicKeyCache::new(
+            NonZeroUsize::new(public_key_cache_size)
+                .expect("public_key_cache_size must be non-zero"),
+        );
+        public_key_cache.register(&context.child("public_key_cache"));
 
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
@@ -821,6 +828,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 drop_grace_blocks: mempool_drop_grace_blocks,
                 signature_strategy: signature_strategy.clone(),
                 hash_strategy: hash_strategy.clone(),
+                public_key_cache: public_key_cache.clone(),
             },
             mempool_mailbox.clone(),
             mempool_receiver,
@@ -908,6 +916,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 partition_prefix: decoded.partition_prefix,
                 signature_strategy,
                 hash_strategy,
+                public_key_cache,
                 startup,
                 sync_config: production_sync_config(),
                 prune_config: Some(PRUNE_CONFIG),

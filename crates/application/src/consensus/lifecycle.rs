@@ -155,10 +155,11 @@ where
         let (state_batch, transaction_batch) = batches;
         let signatures = verify_signatures::<E, H, SigSt, HashSt>(
             runtime.child("verify_signatures"),
+            self.transaction_namespace,
+            self.public_key_cache.clone(),
+            Arc::clone(&body),
             self.signature_strategy.clone(),
             self.hash_strategy.clone(),
-            self.transaction_namespace,
-            Arc::clone(&body),
         );
         let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));

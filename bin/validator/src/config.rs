@@ -40,6 +40,10 @@ pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
 }
 
+pub(crate) const fn default_public_key_cache_size() -> usize {
+    100_000
+}
+
 /// Indexer wiring for a secondary validator.
 ///
 /// Primary (voting) validators ignore this section; secondaries with
@@ -96,6 +100,8 @@ pub struct ValidatorConfig {
     pub max_propose_bytes: usize,
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
+    #[serde(default = "default_public_key_cache_size")]
+    pub public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
@@ -171,6 +177,7 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     pub max_propose_bytes: usize,
     pub max_pool_bytes: usize,
+    pub public_key_cache_size: usize,
     pub otel: Option<(String, f64)>,
     pub json_logs: bool,
     pub deployer_managed: bool,
@@ -295,6 +302,7 @@ fn decode_with_network(
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
         max_pool_bytes: config.max_pool_bytes,
+        public_key_cache_size: config.public_key_cache_size,
         otel,
         json_logs,
         deployer_managed: json_logs,
@@ -452,8 +460,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_upload_buffer,
-        load_deployer_config, load_local_config,
+        default_max_pool_bytes, default_max_propose_bytes, default_public_key_cache_size,
+        default_upload_buffer, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -573,6 +581,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
                 bootstrappers,
                 indexer: None,
@@ -606,6 +615,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
                 bootstrappers,
                 indexer: None,

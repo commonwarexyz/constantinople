@@ -45,6 +45,7 @@ use commonware_utils::{
     NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
+use constantinople_primitives::PublicKeyCache;
 use properties::{
     BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
     StateSyncReadyAtHeight,
@@ -300,6 +301,7 @@ impl EngineDefinition for TestEngineDefinition {
                     partition_prefix,
                     signature_strategy: Sequential,
                     hash_strategy: Sequential,
+                    public_key_cache: PublicKeyCache::new(NZUsize!(1024)),
                     startup,
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),

@@ -8,7 +8,7 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
-    Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
+    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
     TransactionSignature,
 };
 use bytes::{Buf, BufMut, Bytes};
@@ -362,8 +362,9 @@ where
 /// Returns the original lazy transactions after warming their cached decoded
 /// values, or `None` if any transaction fails to decode.
 pub fn preload_transaction_chunks<H, St>(
-    strategy: &St,
+    cache: &PublicKeyCache,
     transactions: Vec<LazySignedTransaction<H>>,
+    strategy: &St,
 ) -> Option<Vec<LazySignedTransaction<H>>>
 where
     H: Hasher,
@@ -377,7 +378,7 @@ where
     if parallelism <= 1 || transactions.len() <= parallelism {
         return transactions
             .iter()
-            .all(signature_inputs_decode)
+            .all(|lazy| signature_inputs_decode(lazy, cache))
             .then_some(transactions);
     }
 
@@ -385,20 +386,27 @@ where
         .fold(
             &transactions,
             || true,
-            |decoded, lazy| decoded && signature_inputs_decode(lazy),
+            |decoded, lazy| decoded && signature_inputs_decode(lazy, cache),
             |left, right| left && right,
         )
         .then_some(transactions)
 }
 
-fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>) -> bool
+/// Forces the lazy transaction to decode and decompresses its sender public key
+/// into `cache`, warming the cache (in parallel with its caller) for the
+/// subsequent batch verification. Returns `false` if decode fails or the sender
+/// is not a valid public key.
+fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>, cache: &PublicKeyCache) -> bool
 where
     H: Hasher,
 {
     let Some(transaction) = lazy.get() else {
         return false;
     };
-    transaction.value().sender().is_some()
+    let Some(sender) = transaction.value().sender() else {
+        return false;
+    };
+    cache.decompress(sender).is_some()
 }
 
 /// Verifies a slice of lazily-encoded signed transactions using batch
@@ -410,16 +418,17 @@ where
 /// Returns `true` if every transaction decodes and all signatures verify,
 /// `false` otherwise.
 pub fn verify_transaction_batch<H, St>(
-    signature_strategy: &St,
     namespace: &[u8],
     rng: &mut impl CryptoRngCore,
+    cache: &PublicKeyCache,
     transactions: &[LazySignedTransaction<H>],
+    signature_strategy: &St,
 ) -> bool
 where
     H: Hasher,
     St: Strategy,
 {
-    let mut verifier = TransactionBatchVerifier::new();
+    let mut verifier = TransactionBatchVerifier::new(cache);
     for lazy in transactions {
         let Some(transaction) = lazy.get() else {
             return false;
@@ -446,11 +455,12 @@ where
 /// the warmed transactions. Returns `None` if any transaction contains an invalid or
 /// undecodable transaction.
 pub fn verify_transaction_chunks<H, SigSt, HashSt>(
-    signature_strategy: &SigSt,
-    hash_strategy: &HashSt,
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
+    cache: &PublicKeyCache,
     transactions: Vec<LazySignedTransaction<H>>,
+    signature_strategy: &SigSt,
+    hash_strategy: &HashSt,
 ) -> Option<Vec<SignedTransaction<H>>>
 where
     H: Hasher,
@@ -461,9 +471,9 @@ where
         return Some(Vec::new());
     }
 
-    let transactions = preload_transaction_chunks(hash_strategy, transactions)?;
+    let transactions = preload_transaction_chunks(cache, transactions, hash_strategy)?;
 
-    if !verify_transaction_batch::<H, _>(signature_strategy, namespace, rng, &transactions) {
+    if !verify_transaction_batch::<H, _>(namespace, rng, cache, &transactions, signature_strategy) {
         return None;
     }
 
@@ -477,8 +487,8 @@ where
 #[cfg(test)]
 mod test {
     use crate::{
-        LazySignedTransaction, Sealable, Sealed, Transaction, TransactionBatchVerifier,
-        TransactionPublicKey, signed::Signable,
+        LazySignedTransaction, PublicKeyCache, Sealable, Sealed, Transaction,
+        TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
     };
     use commonware_codec::{
         DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
@@ -488,7 +498,7 @@ mod test {
     };
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
-    use commonware_utils::test_rng;
+    use commonware_utils::{NZUsize, test_rng};
     use core::num::NonZeroU64;
 
     const NAMESPACE: &[u8] = b"test namespace";
@@ -571,7 +581,8 @@ mod test {
         .seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert_eq!(signed.value().sender(), Some(&public_key));
-        let mut verifier = TransactionBatchVerifier::new();
+        let cache = PublicKeyCache::new(NZUsize!(16));
+        let mut verifier = TransactionBatchVerifier::new(&cache);
         assert!(
             verifier.add(
                 NAMESPACE,
@@ -615,7 +626,12 @@ mod test {
         );
 
         assert!(
-            super::preload_transaction_chunks(&Sequential, vec![lazy]).is_none(),
+            super::preload_transaction_chunks(
+                &PublicKeyCache::new(NZUsize!(16)),
+                vec![lazy],
+                &Sequential
+            )
+            .is_none(),
             "preload must force the nested sender public key"
         );
     }

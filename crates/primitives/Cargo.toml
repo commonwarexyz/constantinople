@@ -20,6 +20,7 @@ commonware-utils.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
+commonware-runtime.workspace = true
 
 # Other
 bytes.workspace = true

@@ -111,7 +111,10 @@ mod tests {
     fn signed_transactions_survive_encode_decode_roundtrip() {
         use commonware_codec::{Decode, Encode, RangeCfg};
         use commonware_cryptography::Sha256;
-        use constantinople_primitives::{TRANSACTION_NAMESPACE, verify_transaction_batch};
+        use commonware_utils::NZUsize;
+        use constantinople_primitives::{
+            PublicKeyCache, TRANSACTION_NAMESPACE, verify_transaction_batch,
+        };
 
         let accounts = generate_accounts(5, 1000);
         let value = NonZeroU64::new(1).unwrap();
@@ -136,10 +139,11 @@ mod tests {
             .collect();
         assert!(
             verify_transaction_batch::<Sha256, _>(
-                &Sequential,
                 TRANSACTION_NAMESPACE,
                 &mut rng,
+                &PublicKeyCache::new(NZUsize!(16)),
                 &lazy_decoded,
+                &Sequential,
             ),
             "batch signature verification should pass"
         );

@@ -112,6 +112,7 @@ fn build_validators(
             metrics_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
+            public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -185,6 +186,7 @@ fn build_secondaries(
             metrics_port,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
+            public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -378,7 +380,7 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig,
+        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_public_key_cache_size,
         generate_local_cluster_material, total_secondaries,
     };
     use std::path::{Path, PathBuf};
@@ -394,6 +396,7 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            public_key_cache_size: default_public_key_cache_size(),
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,

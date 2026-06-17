@@ -10,7 +10,7 @@ use commonware_runtime::{
     Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
-use constantinople_primitives::SealedBlock;
+use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 mod body;
@@ -61,6 +61,7 @@ where
     genesis_leader: P,
     genesis_parent: C,
     transaction_namespace: &'static [u8],
+    public_key_cache: PublicKeyCache,
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
@@ -85,6 +86,7 @@ where
             genesis_leader: self.genesis_leader.clone(),
             genesis_parent: self.genesis_parent,
             transaction_namespace: self.transaction_namespace,
+            public_key_cache: self.public_key_cache.clone(),
             genesis_state_target: self.genesis_state_target.clone(),
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             finalized_hook: self.finalized_hook.clone(),
@@ -114,6 +116,7 @@ where
         genesis_leader: P,
         genesis_parent: C,
         transaction_namespace: &'static [u8],
+        public_key_cache: PublicKeyCache,
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
@@ -129,6 +132,7 @@ where
             genesis_leader,
             genesis_parent,
             transaction_namespace,
+            public_key_cache,
             genesis_state_target,
             genesis_transactions_target,
             finalized_hook,

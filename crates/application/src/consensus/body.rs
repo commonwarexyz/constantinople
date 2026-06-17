@@ -8,7 +8,7 @@ use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner, telemetry::traces::TracedExt as _};
 use constantinople_primitives::{
-    LazySignedTransaction, SignedTransaction, materialize_transaction_chunks,
+    LazySignedTransaction, PublicKeyCache, SignedTransaction, materialize_transaction_chunks,
     preload_transaction_chunks, verify_transaction_batch,
 };
 use rand_core::CryptoRngCore;
@@ -19,10 +19,11 @@ pub(super) type PreparedBody<H> = Arc<Vec<LazySignedTransaction<H>>>;
 
 pub(super) async fn verify_signatures<E, H, SigSt, HashSt>(
     runtime: E,
+    namespace: &'static [u8],
+    public_key_cache: PublicKeyCache,
+    body: PreparedBody<H>,
     signature_strategy: SigSt,
     hash_strategy: HashSt,
-    namespace: &'static [u8],
-    body: PreparedBody<H>,
 ) -> Result<()>
 where
     E: Spawner + CryptoRngCore,
@@ -34,17 +35,22 @@ where
     let transaction_count = body.len();
     let _handle = runtime.shared(true).spawn(move |mut runtime| {
         async move {
-            let result = preload_transaction_chunks(&hash_strategy, body.as_ref().clone())
-                .filter(|transactions| {
-                    verify_transaction_batch::<H, _>(
-                        &signature_strategy,
-                        namespace,
-                        &mut runtime,
-                        transactions,
-                    )
-                })
-                .map(|_| ())
-                .ok_or(INVALID_SIGNATURE);
+            let result = preload_transaction_chunks(
+                &public_key_cache,
+                body.as_ref().clone(),
+                &hash_strategy,
+            )
+            .filter(|transactions| {
+                verify_transaction_batch::<H, _>(
+                    namespace,
+                    &mut runtime,
+                    &public_key_cache,
+                    transactions,
+                    &signature_strategy,
+                )
+            })
+            .map(|_| ())
+            .ok_or(INVALID_SIGNATURE);
             let _ = result_tx.send(result);
         }
         .instrument(info_span!(

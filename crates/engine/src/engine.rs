@@ -60,7 +60,7 @@ use constantinople_application::consensus::{
     Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::BlockCfg;
+use constantinople_primitives::{BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
 use rand_core::CryptoRngCore;
 use std::{
@@ -170,6 +170,7 @@ where
     pub partition_prefix: String,
     pub signature_strategy: SigT,
     pub hash_strategy: HashT,
+    pub public_key_cache: PublicKeyCache,
     pub startup: StartupMode<EngineFinalization<C::PublicKey, V>>,
     pub sync_config: SyncEngineConfig,
     pub prune_config: Option<PruneConfig>,
@@ -502,6 +503,7 @@ where
             config.genesis_leader.clone(),
             genesis_parent,
             config.transaction_namespace,
+            config.public_key_cache,
             genesis_state_target,
             genesis_transactions_target,
             config.finalized_hook,

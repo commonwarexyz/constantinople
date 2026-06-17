@@ -167,6 +167,7 @@ fn build_validators(
             metrics_port: METRICS_PORT,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
+            public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: None,
@@ -220,6 +221,7 @@ fn build_secondaries(
             metrics_port: METRICS_PORT,
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
+            public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
@@ -486,8 +488,8 @@ mod tests {
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, generate_local_cluster_material,
-        total_secondaries, validate_generate_args,
+        default_max_pool_bytes, default_max_propose_bytes, default_public_key_cache_size,
+        generate_local_cluster_material, total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -502,6 +504,7 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            public_key_cache_size: default_public_key_cache_size(),
             startup: StartupModeConfig::MarshalSync,
             spammer: false,
             spammer_accounts: 10,
@@ -568,6 +571,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
+                public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
                 bootstrappers: Vec::new(),
                 indexer: None,

@@ -11,7 +11,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
-use constantinople_primitives::VerifiedTransaction;
+use constantinople_primitives::{PublicKeyCache, VerifiedTransaction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -82,6 +82,8 @@ pub struct Config<SigSt: Strategy, HashSt: Strategy> {
     pub signature_strategy: SigSt,
     /// Parallel execution strategy for transaction decoding and seal hashing.
     pub hash_strategy: HashSt,
+    /// Shared cache of decompressed transaction public keys.
+    pub public_key_cache: PublicKeyCache,
 }
 
 /// A batch of transactions waiting in the pool.
@@ -430,6 +432,7 @@ where
     drop_grace_blocks: u64,
     signature_strategy: SigSt,
     hash_strategy: HashSt,
+    public_key_cache: PublicKeyCache,
     account_reader: AccountReaderCell,
 }
 
@@ -469,6 +472,7 @@ where
             drop_grace_blocks: config.drop_grace_blocks,
             signature_strategy: config.signature_strategy,
             hash_strategy: config.hash_strategy,
+            public_key_cache: config.public_key_cache,
             account_reader,
         }
     }
@@ -492,6 +496,7 @@ where
             drop_grace_blocks,
             signature_strategy,
             hash_strategy,
+            public_key_cache,
             account_reader,
         } = self;
 
@@ -501,6 +506,7 @@ where
             max_batch_bytes: max_propose_bytes,
             signature_strategy,
             hash_strategy,
+            public_key_cache,
             account_reader,
         });
         let app = http::router::<C, P, H, SigSt, HashSt>(app_state);

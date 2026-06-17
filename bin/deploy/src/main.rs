@@ -57,6 +57,7 @@ const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
+const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -104,6 +105,9 @@ pub(crate) struct GenerateArgs {
     worker_threads: usize,
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    /// Capacity of each node's decompressed public key cache.
+    #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
+    public_key_cache_size: usize,
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
 
@@ -310,6 +314,8 @@ pub(crate) struct ValidatorConfig {
     metrics_port: u16,
     max_propose_bytes: usize,
     max_pool_bytes: usize,
+    #[serde(default = "default_public_key_cache_size")]
+    public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
@@ -607,6 +613,10 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) const fn default_public_key_cache_size() -> usize {
+    DEFAULT_PUBLIC_KEY_CACHE_SIZE
 }
 
 pub(crate) fn generate_deployer_tag() -> String {

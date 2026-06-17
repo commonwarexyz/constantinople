@@ -16,7 +16,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, SignedTransaction, TransactionPublicKey,
+    Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
     TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
@@ -49,6 +49,7 @@ where
     pub max_batch_bytes: usize,
     pub signature_strategy: SigSt,
     pub hash_strategy: HashSt,
+    pub public_key_cache: PublicKeyCache,
     pub account_reader: AccountReaderCell,
 }
 
@@ -247,17 +248,19 @@ where
     let signature_strategy = state.signature_strategy.clone();
     let hash_strategy = state.hash_strategy.clone();
     let namespace = state.namespace;
+    let public_key_cache = state.public_key_cache.clone();
     let signed_lazy = signed
         .into_iter()
         .map(LazySignedTransaction::new)
         .collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
         verify_transaction_chunks::<H, _, _>(
-            &signature_strategy,
-            &hash_strategy,
             namespace,
             &mut OsRng,
+            &public_key_cache,
             signed_lazy,
+            &signature_strategy,
+            &hash_strategy,
         )
     })
     .await
@@ -408,7 +411,7 @@ impl From<Nonce> for NonceResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, router};
+    use super::{AppState, PublicKeyCache, router};
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
@@ -416,6 +419,7 @@ mod tests {
     use commonware_codec::Encode;
     use commonware_cryptography::{ed25519, sha256};
     use commonware_parallel::Sequential;
+    use commonware_utils::NZUsize;
     use futures::executor::block_on;
     use std::{
         panic::{AssertUnwindSafe, catch_unwind},
@@ -432,6 +436,7 @@ mod tests {
             max_batch_bytes,
             signature_strategy: Sequential,
             hash_strategy: Sequential,
+            public_key_cache: PublicKeyCache::new(NZUsize!(16)),
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
         });
 
