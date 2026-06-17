@@ -5,6 +5,7 @@
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
+use constantinople_mempool::webserver::client::SubmitError;
 use std::{
     sync::{
         Arc,
@@ -118,12 +119,7 @@ impl RelayerSubmitter {
         }
     }
 
-    async fn submit_encoded(
-        &self,
-        body: bytes::Bytes,
-    ) -> Result<RelayerBatchStatus, constantinople_mempool::webserver::client::SubmitError> {
-        use constantinople_mempool::webserver::client::SubmitError;
-
+    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<RelayerBatchStatus, SubmitError> {
         let mut request = self
             .http
             .post(format!("{}/transactions", self.url))

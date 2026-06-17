@@ -134,33 +134,33 @@ pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
         H,
     >;
 
-pub(crate) type App<E, H, P, V, I, B, SigT, HashT> =
-    Application<E, H, Commitment, ThresholdScheme<P, V>, P, I, B, SigT, HashT>;
+pub(crate) type App<E, H, P, V, I, B, St> =
+    Application<E, H, Commitment, ThresholdScheme<P, V>, P, I, B, St>;
 
-pub(crate) type AppMailbox<E, H, P, V, I, B, SigT, HashT> =
-    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, SigT, HashT>>;
+pub(crate) type AppMailbox<E, H, P, V, I, B, St> =
+    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, St>>;
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, B, SigT, HashT> = Stateful<
+pub(crate) type StatefulApp<E, H, P, V, I, B, St> = Stateful<
     E,
-    App<E, H, P, V, I, B, SigT, HashT>,
+    App<E, H, P, V, I, B, St>,
     ThresholdScheme<P, V>,
     EngineVariant<H, P>,
     (
-        StateResolverMailbox<E, H, HashT>,
-        TransactionResolverMailbox<E, H, HashT>,
+        StateResolverMailbox<E, H, St>,
+        TransactionResolverMailbox<E, H, St>,
     ),
 >;
 
-pub(crate) type MarshaledApp<E, H, P, V, I, B, SigT, HashT> = Marshaled<
+pub(crate) type MarshaledApp<E, H, P, V, I, B, St> = Marshaled<
     E,
-    AppMailbox<E, H, P, V, I, B, SigT, HashT>,
+    AppMailbox<E, H, P, V, I, B, St>,
     EngineBlock<H, P>,
     ReedSolomon<H>,
     H,
     SchemeProvider<P, V>,
-    HashT,
+    St,
     FixedEpocher,
 >;
 
@@ -174,14 +174,14 @@ pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSol
 pub(crate) type SimplexReporter<H, P, V, O> =
     Reporters<EngineActivity<P, V>, EngineMarshalMailbox<H, P, V>, O>;
 
-pub(crate) type SimplexEngine<E, B, H, P, V, L, SigT, HashT, I, BV, O> = simplex::Engine<
+pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
     E,
     ThresholdScheme<P, V>,
     L,
     B,
     Commitment,
-    MarshaledApp<E, H, P, V, I, BV, SigT, HashT>,
-    MarshaledApp<E, H, P, V, I, BV, SigT, HashT>,
+    MarshaledApp<E, H, P, V, I, BV, St>,
+    MarshaledApp<E, H, P, V, I, BV, St>,
     SimplexReporter<H, P, V, O>,
-    HashT,
+    St,
 >;

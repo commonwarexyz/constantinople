@@ -69,7 +69,11 @@ pub fn sign_batch<St: Strategy>(
 mod tests {
     use super::*;
     use crate::accounts::generate_accounts;
+    use commonware_codec::{Decode, Encode, RangeCfg};
     use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, deterministic};
+    use commonware_utils::NZUsize;
+    use constantinople_primitives::{PublicKeyCache, verify_transaction_batch};
 
     #[test]
     fn sign_produces_correct_count() {
@@ -109,40 +113,41 @@ mod tests {
 
     #[test]
     fn signed_transactions_survive_encode_decode_roundtrip() {
-        use commonware_codec::{Decode, Encode, RangeCfg};
-        use commonware_cryptography::Sha256;
-        use constantinople_primitives::{TRANSACTION_NAMESPACE, verify_transaction_batch};
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
 
-        let accounts = generate_accounts(5, 1000);
-        let value = NonZeroU64::new(1).unwrap();
-        let mut nonces = vec![0; accounts.len()];
-        let mut cursor = 0;
-        let txs = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 10);
+            let accounts = generate_accounts(5, 1000);
+            let value = NonZeroU64::new(1).unwrap();
+            let mut nonces = vec![0; accounts.len()];
+            let mut cursor = 0;
+            let txs = sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 10);
 
-        // Encode as the client would.
-        let body = txs.as_slice().encode();
+            // Encode as the client would.
+            let body = txs.as_slice().encode();
 
-        // Decode as the server would.
-        let max_transactions = body.len() / 118; // conservative min tx size
-        let cfg = (RangeCfg::new(1..=max_transactions), ());
-        let decoded = Vec::<Tx>::decode_cfg(&mut &body[..], &cfg).expect("decode should succeed");
-        assert_eq!(decoded.len(), txs.len());
+            // Decode as the server would.
+            let max_transactions = body.len() / 118; // conservative min tx size
+            let cfg = (RangeCfg::new(1..=max_transactions), ());
+            let decoded =
+                Vec::<Tx>::decode_cfg(&mut &body[..], &cfg).expect("decode should succeed");
+            assert_eq!(decoded.len(), txs.len());
 
-        // Verify signatures as the server would (using Sha256, same as the validator).
-        let mut rng = commonware_utils::test_rng();
-        let lazy_decoded: Vec<_> = decoded
-            .into_iter()
-            .map(constantinople_primitives::LazySignedTransaction::new)
-            .collect();
-        assert!(
-            verify_transaction_batch::<Sha256, _>(
-                &Sequential,
-                TRANSACTION_NAMESPACE,
-                &mut rng,
-                &lazy_decoded,
-            ),
-            "batch signature verification should pass"
-        );
+            // Verify signatures as the server would (using Sha256, same as the validator).
+            let lazy_decoded: Vec<_> = decoded
+                .into_iter()
+                .map(constantinople_primitives::LazySignedTransaction::new)
+                .collect();
+            assert!(
+                verify_transaction_batch::<Sha256, _>(
+                    TRANSACTION_NAMESPACE,
+                    &mut commonware_utils::test_rng(),
+                    &cache,
+                    &lazy_decoded,
+                    &Sequential,
+                ),
+                "batch signature verification should pass"
+            );
+        });
     }
 
     #[test]

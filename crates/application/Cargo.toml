@@ -19,6 +19,7 @@ constantinople-primitives.workspace = true
 # Commonware
 commonware-glue.workspace = true
 commonware-codec.workspace = true
+commonware-macros.workspace = true
 commonware-utils.workspace = true
 commonware-runtime.workspace = true
 commonware-storage.workspace = true

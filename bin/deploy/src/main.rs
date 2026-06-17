@@ -57,6 +57,7 @@ const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
+const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,6 +70,7 @@ pub(crate) enum StartupModeConfig {
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-deploy")]
 struct Cli {
+    /// Subcommand to run.
     #[command(subcommand)]
     command: Command,
 }
@@ -88,6 +90,7 @@ struct SimplexVerificationMaterialArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct GenerateArgs {
+    /// Number of primary (voting) validators.
     #[arg(long)]
     validators: u32,
     /// Include the full indexer secondary and shared indexer services.
@@ -96,14 +99,22 @@ pub(crate) struct GenerateArgs {
     /// Include a transaction relayer secondary.
     #[arg(long, default_value_t = false)]
     relayer: bool,
+    /// Directory to write the generated deployment into.
     #[arg(long)]
     output_dir: PathBuf,
+    /// Logging verbosity (e.g. info, debug, trace).
     #[arg(long, default_value = "info")]
     log_level: String,
+    /// Tokio worker threads per validator runtime.
     #[arg(long, default_value_t = 2)]
     worker_threads: usize,
+    /// Rayon threads per validator for parallel verification.
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    /// Capacity of each node's decompressed public key cache.
+    #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
+    public_key_cache_size: usize,
+    /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
 
@@ -132,6 +143,7 @@ pub(crate) struct GenerateArgs {
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
 
+    /// Deployment target (local or remote).
     #[command(subcommand)]
     target: GenerateTarget,
 }
@@ -144,10 +156,13 @@ enum GenerateTarget {
 
 #[derive(Debug, Args)]
 pub(crate) struct LocalArgs {
+    /// Base p2p listen port; each validator is offset from this.
     #[arg(long, default_value_t = 9000)]
     base_port: u16,
+    /// Base HTTP port; each validator is offset from this.
     #[arg(long, default_value_t = 8080)]
     base_http_port: u16,
+    /// Base metrics port; each validator is offset from this.
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
     /// Local `chain-indexer` Store port.
@@ -164,10 +179,13 @@ pub(crate) struct LocalArgs {
 
 #[derive(Debug, Args)]
 pub(crate) struct RemoteArgs {
+    /// AWS regions to spread validators across (comma-separated).
     #[arg(long, value_delimiter = ',')]
     regions: Vec<String>,
+    /// EC2 instance type for validators.
     #[arg(long)]
     instance_type: String,
+    /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
     /// Instance type for the shared chain-indexer instance.
@@ -179,16 +197,22 @@ pub(crate) struct RemoteArgs {
     /// Provisioned IOPS for the shared chain-indexer io2 volume.
     #[arg(long = "chain-indexer-storage-iops", default_value_t = DEFAULT_CHAIN_INDEXER_STORAGE_IOPS)]
     chain_indexer_storage_iops: i32,
+    /// EC2 instance type for the monitoring instance.
     #[arg(long)]
     monitoring_instance_type: String,
+    /// Monitoring instance EBS volume size in GiB.
     #[arg(long)]
     monitoring_storage_size: i32,
+    /// Grafana dashboard JSON to provision on the monitoring instance.
     #[arg(long)]
     dashboard: PathBuf,
+    /// Validator p2p listen port.
     #[arg(long, default_value_t = 9000)]
     listen_port: u16,
+    /// Validator HTTP port.
     #[arg(long, default_value_t = 8080)]
     http_port: u16,
+    /// CIDR ranges allowed to reach the validator HTTP port (comma-separated).
     #[arg(long = "http-cidr", value_delimiter = ',')]
     http_cidrs: Vec<String>,
     /// Shared `chain-indexer` Store port.
@@ -200,6 +224,7 @@ pub(crate) struct RemoteArgs {
     /// Shared `qmdb-indexer` query facade port.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
+    /// Enable validator CPU profiling.
     #[arg(long, default_value_t = false)]
     profiling: bool,
     /// Trace sampling rate (0.0..=1.0) for validator uploads to the monitoring
@@ -217,12 +242,16 @@ pub(crate) struct RemoteArgs {
 /// Spammer configuration, written as YAML by deploy and read by the spammer binary.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct SpammerConfig {
+    /// Number of spam accounts per submitter.
     pub accounts: u32,
+    /// Transfer value per spam transaction.
     pub value: u64,
+    /// Seed offset for spam account keys.
     pub seed_offset: u64,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
+    /// Local HTTP port the spammer serves on.
     pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
@@ -249,12 +278,15 @@ pub(crate) struct SpammerConfig {
 /// Relayer configuration written into the relayer secondary's YAML.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RelayerConfig {
+    /// Per-leader relayer endpoints.
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct RelayerLeaderConfig {
+    /// Hex-encoded ed25519 public key of the target leader.
     pub public_key: String,
+    /// Relayer URL for submitting to this leader.
     pub url: String,
 }
 
@@ -280,21 +312,30 @@ fn parse_sampling_rate(value: &str) -> Result<f64, String> {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NamedBootstrapperEntry {
+    /// Hex-encoded ed25519 public key of the bootstrapper.
     public_key: String,
+    /// Host name used to resolve the bootstrapper's address.
     name: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ValidatorConfig {
+    /// Hex-encoded ed25519 private key.
     private_key: String,
+    /// Hex-encoded DKG output (threshold public material).
     dkg_output: String,
     /// Hex-encoded DKG share for this validator. Empty string `""` indicates
     /// a secondary (non-voting) validator that holds no share.
     dkg_share: String,
+    /// Startup sync mode.
     startup: StartupModeConfig,
+    /// p2p listen port.
     listen_port: u16,
+    /// Hex-encoded ed25519 public key of the genesis leader.
     genesis_leader: String,
+    /// Storage partition prefix for this validator.
     partition_prefix: String,
+    /// Number of primary validators (DKG participant count).
     num_validators: u32,
     /// Hex-encoded ed25519 public keys of the primary (voting) validators,
     /// in DKG order. Must be identical across every validator config in the
@@ -303,16 +344,27 @@ pub(crate) struct ValidatorConfig {
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     secondary_validators: Vec<String>,
+    /// Logging verbosity.
     log_level: String,
+    /// Tokio worker threads.
     worker_threads: usize,
+    /// Rayon threads for parallel verification.
     rayon_threads: usize,
+    /// HTTP service port.
     http_port: u16,
+    /// Prometheus metrics port.
     metrics_port: u16,
+    /// Maximum bytes proposed per block.
     max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
     max_pool_bytes: usize,
+    /// Capacity of the decompressed public key cache.
+    #[serde(default = "default_public_key_cache_size")]
+    public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
+    /// Bootstrapper peers used for initial p2p discovery.
     bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.
@@ -332,55 +384,77 @@ pub(crate) struct ValidatorConfig {
 /// operation logs, and simplex artifacts.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
+    /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
+    /// Number of blocks buffered before upload.
     pub upload_buffer: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ChainIndexerConfig {
+    /// Store port the chain-indexer listens on.
     pub port: u16,
+    /// Directory for chain-indexer data.
     pub data_dir: PathBuf,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct MetadataIndexerConfig {
+    /// Read-service port the metadata-indexer listens on.
     pub port: u16,
+    /// URL of the chain-indexer store to read from.
     pub chain_indexer_url: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct QmdbIndexerConfig {
+    /// Query facade port the qmdb-indexer listens on.
     pub port: u16,
+    /// URL of the chain-indexer store to read from.
     pub chain_indexer_url: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PeerEntry {
+    /// Host name (hex-encoded public key).
     name: String,
+    /// p2p socket address.
     p2p: String,
+    /// HTTP socket address.
     http: String,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct PeersConfig {
+    /// Primary validator peers.
     pub validators: Vec<PeerEntry>,
+    /// Secondary (non-voting) validator peers.
     #[serde(default)]
     pub secondaries: Vec<PeerEntry>,
 }
 
 #[derive(Debug, Deserialize)]
 struct SimplexMaterialConfig {
+    /// Hex-encoded DKG output.
     dkg_output: String,
+    /// Number of primary validators.
     num_validators: u32,
 }
 
 pub(crate) struct ClusterMaterial {
+    /// Primary (voting) validator private keys.
     pub signers: Vec<ed25519::PrivateKey>,
+    /// Primary (voting) validator public keys, in DKG order.
     pub public_keys: Vec<ed25519::PublicKey>,
+    /// Secondary (non-voting) validator private keys.
     pub secondary_signers: Vec<ed25519::PrivateKey>,
+    /// Secondary (non-voting) validator public keys.
     pub secondary_public_keys: Vec<ed25519::PublicKey>,
+    /// DKG output over the primary validators.
     pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
+    /// DKG share per primary validator.
     pub shares: BTreeMap<ed25519::PublicKey, Share>,
+    /// Hex-encoded genesis leader public key.
     pub genesis_leader: String,
 }
 
@@ -607,6 +681,10 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) const fn default_public_key_cache_size() -> usize {
+    DEFAULT_PUBLIC_KEY_CACHE_SIZE
 }
 
 pub(crate) fn generate_deployer_tag() -> String {

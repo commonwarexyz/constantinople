@@ -13,6 +13,7 @@ use commonware_glue::stateful::{
     Application as CApplication, Proposed,
     db::{DatabaseSet, Merkleized as _},
 };
+use commonware_macros::boxed;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _};
 use commonware_storage::mmr;
@@ -23,17 +24,18 @@ use rand_core::CryptoRngCore;
 use std::sync::Arc;
 use tracing::{Instrument as _, info, info_span, warn};
 
-impl<E, H, C, S, P, I, B, SigSt, HashSt> Application<E, H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
 where
     E: Storage + Metrics + Clock,
     C: Digest,
     H: Hasher,
     P: PublicKey,
     B: Send + Sync + 'static,
-    HashSt: Strategy,
+    St: Strategy,
 {
     /// Proposes a child block from an already fetched parent.
     #[doc(hidden)]
+    #[boxed]
     #[tracing::instrument(
         name = "application.propose",
         skip_all,
@@ -55,8 +57,7 @@ where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
-        SigSt: Strategy + Clone + Send + Sync + 'static,
-        HashSt: Strategy + Clone + Send + Sync + 'static,
+        St: Strategy,
     {
         let body = input
             .propose(&parent.header, &context)
@@ -116,6 +117,7 @@ where
 
     /// Verifies a child block against an already fetched parent.
     #[doc(hidden)]
+    #[boxed]
     #[tracing::instrument(
         name = "application.verify",
         skip_all,
@@ -135,8 +137,7 @@ where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
-        SigSt: Strategy + Clone + Send + Sync + 'static,
-        HashSt: Strategy + Clone + Send + Sync + 'static,
+        St: Strategy,
     {
         let Block { header, body } = block.into_inner();
 
@@ -153,12 +154,12 @@ where
 
         let body = Arc::new(body);
         let (state_batch, transaction_batch) = batches;
-        let signatures = verify_signatures::<E, H, SigSt, HashSt>(
+        let signatures = verify_signatures::<E, H, St>(
             runtime.child("verify_signatures"),
-            self.signature_strategy.clone(),
-            self.hash_strategy.clone(),
             self.transaction_namespace,
+            self.public_key_cache.clone(),
             Arc::clone(&body),
+            self.strategy.clone(),
         );
         let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
@@ -189,6 +190,7 @@ where
 
     /// Applies a certified block to speculative batches.
     #[doc(hidden)]
+    #[boxed]
     #[tracing::instrument(
         name = "application.apply",
         skip_all,
@@ -204,13 +206,11 @@ where
         E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
-        SigSt: Strategy + Clone + Send + Sync + 'static,
-        HashSt: Strategy + Clone + Send + Sync + 'static,
+        St: Strategy,
     {
-        let materialized =
-            materialize_body(runtime, self.hash_strategy.clone(), block.body.clone())
-                .await
-                .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+        let materialized = materialize_body(runtime, self.strategy.clone(), block.body.clone())
+            .await
+            .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
         let body = materialized
             .iter()
             .map(executor::prepare_transfer)

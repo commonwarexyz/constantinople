@@ -11,7 +11,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
 use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
-use constantinople_primitives::VerifiedTransaction;
+use constantinople_primitives::{PublicKeyCache, VerifiedTransaction};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashMap, HashSet, VecDeque},
@@ -67,7 +67,7 @@ pub enum BatchStatus {
 }
 
 /// Mempool actor configuration.
-pub struct Config<SigSt: Strategy, HashSt: Strategy> {
+pub struct Config<St: Strategy> {
     /// Maximum total bytes the pool will hold.
     pub max_pool_bytes: usize,
     /// Maximum bytes returned in a single `propose` call, and the
@@ -78,10 +78,11 @@ pub struct Config<SigSt: Strategy, HashSt: Strategy> {
     /// Number of finalized blocks to wait before marking a proposed
     /// batch as [`TxStatus::Dropped`].
     pub drop_grace_blocks: u64,
-    /// Parallel execution strategy for batch signature verification.
-    pub signature_strategy: SigSt,
-    /// Parallel execution strategy for transaction decoding and seal hashing.
-    pub hash_strategy: HashSt,
+    /// Parallel execution strategy for transaction verification: decoding, seal
+    /// hashing, and batch signature verification.
+    pub strategy: St,
+    /// Shared cache of decompressed transaction public keys.
+    pub public_key_cache: PublicKeyCache,
 }
 
 /// A batch of transactions waiting in the pool.
@@ -410,14 +411,13 @@ const fn rotation_round(round: Round) -> u64 {
 /// Create via [`Actor::new`], which consumes the receiver half of a mailbox
 /// created by [`Mailbox::channel`](super::Mailbox::channel). Call
 /// [`Actor::start`] to spawn the event loop and HTTP server on the runtime.
-pub struct Actor<E, C, P, H, SigSt, HashSt>
+pub struct Actor<E, C, P, H, St>
 where
     E: Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     context: ContextCell<E>,
     mailbox: Mailbox<C, P, H>,
@@ -428,20 +428,19 @@ where
     max_propose_bytes: usize,
     namespace: &'static [u8],
     drop_grace_blocks: u64,
-    signature_strategy: SigSt,
-    hash_strategy: HashSt,
+    strategy: St,
+    public_key_cache: PublicKeyCache,
     account_reader: AccountReaderCell,
 }
 
-impl<E, C, P, H, SigSt, HashSt> Actor<E, C, P, H, SigSt, HashSt>
+impl<E, C, P, H, St> Actor<E, C, P, H, St>
 where
     E: Spawner + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
     H::Digest: Eq + Hash,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     /// Creates a new mempool actor.
     ///
@@ -452,7 +451,7 @@ where
     /// empty.
     pub fn new(
         context: E,
-        config: Config<SigSt, HashSt>,
+        config: Config<St>,
         mailbox: Mailbox<C, P, H>,
         receiver: ActorReceiver<C, P, H>,
         account_reader: AccountReaderCell,
@@ -467,8 +466,8 @@ where
             max_propose_bytes: config.max_propose_bytes,
             namespace: config.namespace,
             drop_grace_blocks: config.drop_grace_blocks,
-            signature_strategy: config.signature_strategy,
-            hash_strategy: config.hash_strategy,
+            strategy: config.strategy,
+            public_key_cache: config.public_key_cache,
             account_reader,
         }
     }
@@ -490,8 +489,8 @@ where
             max_propose_bytes,
             namespace,
             drop_grace_blocks,
-            signature_strategy,
-            hash_strategy,
+            strategy,
+            public_key_cache,
             account_reader,
         } = self;
 
@@ -499,11 +498,11 @@ where
             mailbox,
             namespace,
             max_batch_bytes: max_propose_bytes,
-            signature_strategy,
-            hash_strategy,
+            strategy,
+            public_key_cache,
             account_reader,
         });
-        let app = http::router::<C, P, H, SigSt, HashSt>(app_state);
+        let app = http::router::<C, P, H, St>(app_state);
         let _http_handle = context.as_present().child("http").spawn(|_| async {
             let _ = axum::serve(listener, app).await;
         });

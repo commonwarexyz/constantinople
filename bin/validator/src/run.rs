@@ -25,6 +25,7 @@ use commonware_glue::stateful::{
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
+use commonware_macros::boxed;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
@@ -57,6 +58,7 @@ use constantinople_indexer::{
     publisher::qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
+use constantinople_primitives::PublicKeyCache;
 use std::{
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -286,7 +288,7 @@ fn recovered_finalized_upload_cursor(
 
 impl FinalizedUploadProducer {
     async fn enqueue(
-        &self,
+        self,
         context: RuntimeContext,
         block: &EngineBlock<Sha256, PublicKey>,
         databases: &EngineDatabases,
@@ -512,6 +514,7 @@ async fn ack_finalized_queue_entry(
     }
 }
 
+#[boxed]
 async fn start_queued_upload(
     active: &mut JoinSet<(u64, u64)>,
     publisher: Arc<LazyPublisher>,
@@ -646,19 +649,11 @@ fn indexer_finalized_hook(
     let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, databases| {
-        let publisher = publisher.clone();
-        let finalized_producer = finalized_producer.clone();
-        let block = block.clone();
-        let databases = databases.clone();
-        Box::pin(async move {
-            finalized_producer
-                .enqueue(
-                    publisher.context.child("finalized_queue"),
-                    &block,
-                    &databases,
-                )
-                .await;
-        })
+        Box::pin(finalized_producer.clone().enqueue(
+            publisher.context.child("finalized_queue"),
+            block,
+            databases,
+        ))
     }))
 }
 
@@ -683,6 +678,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
+        public_key_cache_size,
         otel,
         json_logs,
         deployer_managed,
@@ -727,12 +723,14 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        let signature_strategy = context
+        let strategy = context
             .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create signature verification strategy");
-        let hash_strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create hashing strategy");
+            .expect("failed to create worker strategy");
+        let public_key_cache = PublicKeyCache::new(
+            context.child("public_key_cache"),
+            NonZeroUsize::new(public_key_cache_size)
+                .expect("public_key_cache_size must be non-zero"),
+        );
 
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
@@ -792,7 +790,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let (probe, probe_mailbox) = Probe::new(ProbeConfig {
             context: context.child("probe"),
             provider,
-            strategy: signature_strategy.clone(),
+            strategy: strategy.clone(),
             capacity: NZUsize!(32),
             blocker: oracle.clone(),
             minimum_epoch: Epoch::zero(),
@@ -819,8 +817,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: mempool_drop_grace_blocks,
-                signature_strategy: signature_strategy.clone(),
-                hash_strategy: hash_strategy.clone(),
+                strategy: strategy.clone(),
+                public_key_cache: public_key_cache.clone(),
             },
             mempool_mailbox.clone(),
             mempool_receiver,
@@ -891,7 +889,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             MinSig,
             RoundRobin<Sha256>,
             Rayon,
-            Rayon,
             _,
             Batch,
             SimplexObserver,
@@ -906,8 +903,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 share: decoded.share,
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
-                signature_strategy,
-                hash_strategy,
+                strategy,
+                public_key_cache,
                 startup,
                 sync_config: production_sync_config(),
                 prune_config: Some(PRUNE_CONFIG),

@@ -35,6 +35,7 @@ missing-const-for-fn = "warn"
 use-self = "warn"
 option-if-let-else = "warn"
 redundant-clone = "warn"
+large_futures = "warn"
 
 [workspace.dependencies]
 # Workspace

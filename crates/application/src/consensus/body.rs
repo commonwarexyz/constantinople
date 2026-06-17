@@ -8,7 +8,7 @@ use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner, telemetry::traces::TracedExt as _};
 use constantinople_primitives::{
-    LazySignedTransaction, SignedTransaction, materialize_transaction_chunks,
+    LazySignedTransaction, PublicKeyCache, SignedTransaction, materialize_transaction_chunks,
     preload_transaction_chunks, verify_transaction_batch,
 };
 use rand_core::CryptoRngCore;
@@ -17,30 +17,30 @@ use tracing::{Instrument, info_span};
 
 pub(super) type PreparedBody<H> = Arc<Vec<LazySignedTransaction<H>>>;
 
-pub(super) async fn verify_signatures<E, H, SigSt, HashSt>(
+pub(super) async fn verify_signatures<E, H, St>(
     runtime: E,
-    signature_strategy: SigSt,
-    hash_strategy: HashSt,
     namespace: &'static [u8],
+    public_key_cache: PublicKeyCache,
     body: PreparedBody<H>,
+    strategy: St,
 ) -> Result<()>
 where
     E: Spawner + CryptoRngCore,
     H: Hasher,
-    SigSt: Strategy + Send + Sync + 'static,
-    HashSt: Strategy + Send + Sync + 'static,
+    St: Strategy,
 {
     let (result_tx, result_rx) = futures::channel::oneshot::channel();
     let transaction_count = body.len();
     let _handle = runtime.shared(true).spawn(move |mut runtime| {
         async move {
-            let result = preload_transaction_chunks(&hash_strategy, body.as_ref().clone())
+            let result = preload_transaction_chunks(body.as_ref().clone(), &strategy)
                 .filter(|transactions| {
                     verify_transaction_batch::<H, _>(
-                        &signature_strategy,
                         namespace,
                         &mut runtime,
+                        &public_key_cache,
                         transactions,
+                        &strategy,
                     )
                 })
                 .map(|_| ())
@@ -56,21 +56,21 @@ where
     result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
 }
 
-pub(super) async fn materialize_body<E, H, HashSt>(
+pub(super) async fn materialize_body<E, H, St>(
     runtime: E,
-    hash_strategy: HashSt,
+    strategy: St,
     transactions: Vec<LazySignedTransaction<H>>,
 ) -> Result<Vec<SignedTransaction<H>>>
 where
     E: Spawner,
     H: Hasher,
-    HashSt: Strategy + Send + Sync + 'static,
+    St: Strategy,
 {
     let (result_tx, result_rx) = futures::channel::oneshot::channel();
     let transaction_count = transactions.len();
     let _handle = runtime.shared(true).spawn(move |_| {
         async move {
-            let result = materialize_transaction_chunks(&hash_strategy, transactions)
+            let result = materialize_transaction_chunks(&strategy, transactions)
                 .ok_or(MALFORMED_TRANSACTION);
             let _ = result_tx.send(result);
         }

@@ -16,6 +16,9 @@ pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAP
 mod auth;
 pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};
 
+mod cache;
+pub use cache::{DecompressedPublicKey, PublicKeyCache};
+
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};
 
