@@ -56,7 +56,9 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
 /// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
+    /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
+    /// Number of blocks buffered before upload.
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
 }
@@ -71,16 +73,23 @@ pub enum StartupModeConfig {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorConfig {
+    /// Hex-encoded ed25519 private key.
     pub private_key: String,
+    /// Hex-encoded DKG output (threshold public material).
     pub dkg_output: String,
     /// Hex-encoded DKG share for this validator. Empty string `""` indicates
     /// a secondary (non-voting) validator that holds no share.
     pub dkg_share: String,
+    /// Startup sync mode.
     #[serde(default)]
     pub startup: StartupModeConfig,
+    /// p2p listen port.
     pub listen_port: u16,
+    /// Hex-encoded ed25519 public key of the genesis leader.
     pub genesis_leader: String,
+    /// Storage partition prefix for this validator.
     pub partition_prefix: String,
+    /// Number of primary validators (DKG participant count).
     pub num_validators: u32,
     /// Hex-encoded ed25519 public keys of the primary (voting) validators,
     /// in DKG order. Must be identical across every validator config in the
@@ -89,23 +98,32 @@ pub struct ValidatorConfig {
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     pub secondary_validators: Vec<String>,
+    /// Logging verbosity.
     pub log_level: String,
+    /// Tokio worker threads.
     pub worker_threads: usize,
+    /// Rayon threads for parallel verification.
     #[serde(default = "default_rayon_threads")]
     pub rayon_threads: usize,
+    /// HTTP service port.
     pub http_port: u16,
+    /// Prometheus metrics port.
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// Maximum bytes proposed per block.
     #[serde(default = "default_max_propose_bytes")]
     pub max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
+    /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
     pub traces: f64,
+    /// Bootstrapper peers used for initial p2p discovery.
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
@@ -118,70 +136,104 @@ pub struct ValidatorConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayerConfig {
+    /// Views to retry a submission before giving up.
     #[serde(default = "default_relayer_retry_views")]
     pub max_retry_views: u64,
+    /// Per-leader relayer endpoints.
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayerLeaderConfig {
+    /// Hex-encoded ed25519 public key of the target leader.
     pub public_key: String,
+    /// Relayer URL for submitting to this leader.
     pub url: String,
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct NamedBootstrapperEntry {
+    /// Hex-encoded ed25519 public key of the bootstrapper.
     pub public_key: String,
+    /// Host name used to resolve the bootstrapper's address.
     pub name: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PeerEntry {
+    /// Host name (hex-encoded public key).
     name: String,
+    /// p2p socket address.
     p2p: String,
+    /// HTTP socket address.
     http: String,
 }
 
 #[derive(Debug, Deserialize)]
 struct PeersFile {
+    /// Primary validator peers.
     validators: Vec<PeerEntry>,
+    /// Secondary (non-voting) validator peers.
     #[serde(default)]
     secondaries: Vec<PeerEntry>,
 }
 
 /// Decoded key material and network info ready for use by the engine.
 pub struct DecodedConfig {
+    /// This validator's ed25519 private key.
     pub signer: ed25519::PrivateKey,
+    /// This validator's ed25519 public key.
     pub public_key: ed25519::PublicKey,
+    /// Decoded DKG output (threshold public material).
     pub dkg_output: dkg::Output<MinSig, ed25519::PublicKey>,
     /// DKG share for this validator. `None` for secondary (non-voting) validators.
     pub share: Option<Share>,
+    /// Genesis leader public key.
     pub genesis_leader: ed25519::PublicKey,
+    /// Local p2p bind address.
     pub listen_bind: SocketAddr,
+    /// Advertised p2p address other peers dial.
     pub listen_advertise: SocketAddr,
     /// Primary (voting) validators in DKG order.
     pub primary_participants: Vec<ed25519::PublicKey>,
     /// Secondary (non-voting) validators.
     pub secondary_participants: Vec<ed25519::PublicKey>,
+    /// Bootstrapper peers with resolved addresses.
     pub bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    /// Storage partition prefix for this validator.
     pub partition_prefix: String,
 }
 
 pub struct LoadedConfig {
+    /// Decoded key material and network info.
     pub decoded: DecodedConfig,
+    /// Startup sync mode.
     pub startup: StartupModeConfig,
+    /// Logging verbosity.
     pub log_level: String,
+    /// Tokio worker threads.
     pub worker_threads: usize,
+    /// Rayon threads for parallel verification.
     pub rayon_threads: usize,
+    /// HTTP service bind address.
     pub http_listen: SocketAddr,
+    /// Prometheus metrics bind address.
     pub metrics_listen: SocketAddr,
+    /// Maximum bytes proposed per block.
     pub max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
+    /// Capacity of the decompressed public key cache.
     pub public_key_cache_size: usize,
+    /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
     pub otel: Option<(String, f64)>,
+    /// Whether logs are emitted as JSON.
     pub json_logs: bool,
+    /// Whether this node is managed by the deployer.
     pub deployer_managed: bool,
+    /// Optional indexer wiring (secondaries only).
     pub indexer: Option<IndexerConfig>,
+    /// Optional relayer wiring (secondaries only).
     pub relayer: Option<RelayerConfig>,
 }
 
