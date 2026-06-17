@@ -74,9 +74,6 @@ use tracing::{info, warn};
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
-/// Prune databases and marshal every 1024 finalized blocks, retaining 1024
-/// finalized blocks in marshal and 32 blocks' worth of QMDB operations beyond
-/// the rewind-safe window.
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
     max_pending_acks: MAX_PENDING_ACKS,
     maintenance_interval: NZUsize!(1024),

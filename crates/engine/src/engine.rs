@@ -172,8 +172,6 @@ where
     pub hash_strategy: HashT,
     pub startup: StartupMode<EngineFinalization<C::PublicKey, V>>,
     pub sync_config: SyncEngineConfig,
-    /// Periodic database and marshal pruning configuration. `None` disables
-    /// automatic pruning.
     pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
