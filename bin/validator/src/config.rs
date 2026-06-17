@@ -96,10 +96,10 @@ pub struct ValidatorConfig {
     pub max_propose_bytes: usize,
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
-    /// Upload OTEL traces to the monitoring instance. Only honored in
+    /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
-    pub otel_traces: bool,
+    pub traces: f64,
     pub bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
@@ -171,8 +171,7 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     pub max_propose_bytes: usize,
     pub max_pool_bytes: usize,
-    /// OTLP endpoint for trace uploads, when enabled.
-    pub otel_endpoint: Option<String>,
+    pub otel: Option<(String, f64)>,
     pub json_logs: bool,
     pub deployer_managed: bool,
     pub indexer: Option<IndexerConfig>,
@@ -250,7 +249,7 @@ fn decode_with_network(
     primary_participants: Vec<ed25519::PublicKey>,
     secondary_participants: Vec<ed25519::PublicKey>,
     bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
-    otel_endpoint: Option<String>,
+    otel: Option<(String, f64)>,
     json_logs: bool,
 ) -> LoadedConfig {
     let signer = decode_private_key(&config.private_key);
@@ -296,7 +295,7 @@ fn decode_with_network(
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
         max_pool_bytes: config.max_pool_bytes,
-        otel_endpoint,
+        otel,
         json_logs,
         deployer_managed: json_logs,
         indexer: config.indexer,
@@ -431,9 +430,12 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         })
         .collect();
 
-    let otel_endpoint = config
-        .otel_traces
-        .then(|| format!("http://{}:4318/v1/traces", hosts.monitoring.private));
+    let otel = (config.traces > 0.0).then(|| {
+        (
+            format!("http://{}:4318/v1/traces", hosts.monitoring.private),
+            config.traces,
+        )
+    });
 
     decode_with_network(
         config,
@@ -441,7 +443,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         primary_participants,
         secondary_participants,
         bootstrappers,
-        otel_endpoint,
+        otel,
         true,
     )
 }
@@ -571,7 +573,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
-                otel_traces: false,
+                traces: 0.0,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -604,7 +606,7 @@ mod tests {
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
-                otel_traces: false,
+                traces: 0.0,
                 bootstrappers,
                 indexer: None,
                 relayer: None,
@@ -747,6 +749,56 @@ hosts:
         assert_eq!(
             loaded.decoded.bootstrappers[0].1,
             commonware_p2p::Ingress::Socket("203.0.113.2:9000".parse().unwrap())
+        );
+        assert!(loaded.otel.is_none());
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(hosts_path);
+    }
+
+    #[test]
+    fn deployer_config_enables_traces_with_sampling_rate() {
+        let cluster = Cluster::new(2, 0);
+        let self_key = &cluster.primary_keys[0];
+        let peer_key = &cluster.primary_keys[1];
+        let self_name = hex(&self_key.encode());
+        let peer_name = hex(&peer_key.encode());
+        let config_path = temp_path("validator-config", ".yaml");
+        let hosts_path = temp_path("validator-hosts", ".yaml");
+
+        let mut config = cluster.primary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            vec![bootstrapper_entry(peer_key)],
+        );
+        config.traces = 0.25;
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &hosts_path,
+            format!(
+                r#"monitoring:
+  public: 10.0.0.1
+  private: 10.0.0.2
+hosts:
+  - name: "{self_name}"
+    region: us-east-1
+    ip: 203.0.113.1
+  - name: "{peer_name}"
+    region: us-west-2
+    ip: 203.0.113.2
+"#,
+            ),
+        )
+        .expect("hosts should write");
+
+        let loaded = load_deployer_config(&hosts_path, &config_path);
+        assert_eq!(
+            loaded.otel,
+            Some(("http://10.0.0.2:4318/v1/traces".to_string(), 0.25))
         );
 
         let _ = fs::remove_file(config_path);

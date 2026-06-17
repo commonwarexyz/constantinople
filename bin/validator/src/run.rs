@@ -74,8 +74,6 @@ use tracing::{info, warn};
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
-/// Sampling rate for OTEL trace uploads, when enabled.
-const OTEL_SAMPLING_RATE: f64 = 1.0;
 /// Prune databases and marshal every 1024 finalized blocks, retaining 1024
 /// finalized blocks in marshal and 32 blocks' worth of QMDB operations beyond
 /// the rewind-safe window.
@@ -688,7 +686,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
-        otel_endpoint,
+        otel,
         json_logs,
         deployer_managed,
         indexer,
@@ -717,10 +715,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 json: json_logs,
             },
             Some(metrics_listen),
-            otel_endpoint.map(|endpoint| TracesConfig {
+            otel.map(|(endpoint, rate)| TracesConfig {
                 endpoint,
                 name: hex(&decoded.public_key.encode()),
-                rate: OTEL_SAMPLING_RATE,
+                rate,
             }),
         );
 
