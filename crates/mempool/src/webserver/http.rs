@@ -408,34 +408,244 @@ impl From<Nonce> for NonceResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, router};
-    use axum::{
-        body::Body,
-        http::{Method, Request, StatusCode, header},
+    use super::{
+        super::{
+            AccountReader, Actor, Config, Mailbox,
+            actor::{AccountReaderCell, BatchStatus},
+        },
+        AppState, router, verify_body,
     };
-    use commonware_codec::Encode;
-    use commonware_cryptography::{ed25519, sha256};
+    use crate::TransactionSource;
+    use axum::{
+        body::{Body, Bytes, to_bytes},
+        http::{Method, Request, StatusCode, header},
+        response::Response,
+    };
+    use commonware_actor::Feedback;
+    use commonware_codec::{Encode, EncodeSize};
+    use commonware_consensus::{
+        Reporter,
+        marshal::Update,
+        simplex::types::Context,
+        types::{Epoch, Round, View},
+    };
+    use commonware_cryptography::{Digest, Hasher, Signer, ed25519, sha256};
+    use commonware_formatting::hex;
     use commonware_parallel::Sequential;
-    use futures::executor::block_on;
+    use commonware_runtime::{Runner, Supervisor};
+    use commonware_utils::{Acknowledgement, acknowledgement::Exact, non_empty_range};
+    use constantinople_primitives::{
+        Account, Block, Header, Nonce, Sealable, SealedBlock, SignedTransaction,
+        TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, VerifiedTransaction,
+    };
+    use futures::{executor::block_on, future::BoxFuture};
+    use serde_json::json;
     use std::{
+        collections::HashMap,
+        num::NonZeroU64,
         panic::{AssertUnwindSafe, catch_unwind},
-        sync::Arc,
+        sync::{Arc, OnceLock},
+        time::Duration,
     };
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn test_router(max_batch_bytes: usize) -> axum::Router {
-        let (sender, _receiver) = mpsc::channel(1);
-        let state = Arc::new(AppState {
-            mailbox: super::super::mailbox::Mailbox::new(sender),
-            namespace: b"mempool-http-test",
+    type TestDigest = sha256::Digest;
+    type TestHasher = sha256::Sha256;
+    type TestPublicKey = ed25519::PublicKey;
+    type TestMailbox = Mailbox<TestDigest, TestPublicKey, TestHasher>;
+    type TestTransaction = SignedTransaction<TestHasher>;
+    type TestBlock = SealedBlock<TestDigest, TestPublicKey, TestHasher>;
+
+    struct StaticAccountReader {
+        accounts: HashMap<TransactionPublicKey, Account>,
+    }
+
+    impl AccountReader for StaticAccountReader {
+        fn get<'a>(&'a self, public_key: TransactionPublicKey) -> BoxFuture<'a, Option<Account>> {
+            Box::pin(async move { self.accounts.get(&public_key).copied() })
+        }
+    }
+
+    fn account_reader_cell() -> AccountReaderCell {
+        Arc::new(OnceLock::new())
+    }
+
+    fn install_account_reader(
+        cell: &AccountReaderCell,
+        accounts: HashMap<TransactionPublicKey, Account>,
+    ) {
+        let reader: Arc<dyn AccountReader> = Arc::new(StaticAccountReader { accounts });
+        assert!(cell.set(reader).is_ok());
+    }
+
+    fn test_state(
+        mailbox: TestMailbox,
+        max_batch_bytes: usize,
+        account_reader: AccountReaderCell,
+    ) -> Arc<AppState<TestDigest, TestPublicKey, TestHasher, Sequential, Sequential>> {
+        Arc::new(AppState {
+            mailbox,
+            namespace: TRANSACTION_NAMESPACE,
             max_batch_bytes,
             signature_strategy: Sequential,
             hash_strategy: Sequential,
-            account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
-        });
+            account_reader,
+        })
+    }
 
-        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential, Sequential>(state)
+    fn test_app(
+        mailbox: TestMailbox,
+        max_batch_bytes: usize,
+        account_reader: AccountReaderCell,
+    ) -> axum::Router {
+        router::<TestDigest, TestPublicKey, TestHasher, Sequential, Sequential>(test_state(
+            mailbox,
+            max_batch_bytes,
+            account_reader,
+        ))
+    }
+
+    fn closed_mailbox() -> TestMailbox {
+        let (mailbox, receiver) = Mailbox::channel(1);
+        drop(receiver);
+        mailbox
+    }
+
+    fn test_router(max_batch_bytes: usize) -> axum::Router {
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
+        let mailbox = super::super::mailbox::Mailbox::new(sender);
+
+        test_app(mailbox, max_batch_bytes, account_reader_cell())
+    }
+
+    fn signed_transaction(seed: u64, nonce: u64) -> TestTransaction {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 1_000).public_key();
+        Transaction::new(
+            TransactionPublicKey::ed25519(signer.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            NonZeroU64::new(1).expect("non-zero value"),
+            nonce,
+        )
+        .seal_and_sign(
+            &signer,
+            TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        )
+    }
+
+    fn encoded_batch(transactions: &[TestTransaction]) -> Bytes {
+        transactions.to_vec().encode()
+    }
+
+    fn test_context(view: u64) -> Context<TestDigest, TestPublicKey> {
+        let leader = ed25519::PrivateKey::from_seed(42).public_key();
+        Context {
+            round: Round::new(Epoch::zero(), View::new(view)),
+            leader,
+            parent: (View::zero(), TestDigest::EMPTY),
+        }
+    }
+
+    fn test_header(height: u64) -> Header<TestDigest, TestDigest, TestPublicKey> {
+        Header {
+            context: test_context(height),
+            parent: TestDigest::EMPTY,
+            height,
+            timestamp: height,
+            state_root: TestDigest::EMPTY,
+            state_range: non_empty_range!(0, 1),
+            transactions_root: TestDigest::EMPTY,
+            transactions_range: non_empty_range!(0, 1),
+        }
+    }
+
+    fn sealed_block(height: u64, transactions: Vec<VerifiedTransaction<TestHasher>>) -> TestBlock {
+        Block::new(test_header(height), transactions).seal(&mut TestHasher::default())
+    }
+
+    fn report_block(mailbox: &TestMailbox, block: TestBlock) {
+        let mut reporter = mailbox.clone();
+        let (acknowledgement, _acknowledged) = Exact::handle();
+        assert!(matches!(
+            reporter.report(Update::Block(block, acknowledgement)),
+            Feedback::Ok
+        ));
+    }
+
+    async fn start_actor(
+        context: commonware_runtime::tokio::Context,
+        max_pool_bytes: usize,
+        max_propose_bytes: usize,
+    ) -> TestMailbox {
+        let (mailbox, receiver) = Mailbox::channel(8);
+        let actor = Actor::new(
+            context.child("mempool"),
+            Config {
+                max_pool_bytes,
+                max_propose_bytes,
+                namespace: TRANSACTION_NAMESPACE,
+                drop_grace_blocks: 2,
+                signature_strategy: Sequential,
+                hash_strategy: Sequential,
+            },
+            mailbox.clone(),
+            receiver,
+            account_reader_cell(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let _handle = actor.start(listener);
+        mailbox
+    }
+
+    fn post(uri: &str, body: Bytes) -> Request<Body> {
+        Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .body(Body::from(body))
+            .expect("request should build")
+    }
+
+    fn get(uri: impl AsRef<str>) -> Request<Body> {
+        Request::builder()
+            .method(Method::GET)
+            .uri(uri.as_ref())
+            .body(Body::empty())
+            .expect("request should build")
+    }
+
+    async fn send(app: axum::Router, request: Request<Body>) -> Response {
+        app.oneshot(request)
+            .await
+            .expect("router should return a response")
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        serde_json::from_slice(&body).expect("response body should be JSON")
+    }
+
+    async fn response_text(response: Response) -> String {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        String::from_utf8(body.to_vec()).expect("response body should be UTF-8")
+    }
+
+    async fn wait_for_batch_status(mailbox: &TestMailbox, batch_id: &str) -> BatchStatus {
+        for _ in 0..100 {
+            if let Some(status) = mailbox.query_status(batch_id.to_string()).await {
+                return status;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("batch status was not recorded");
     }
 
     #[test]
@@ -486,5 +696,233 @@ mod tests {
             response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
             Some(&header::HeaderValue::from_static("*")),
         );
+    }
+
+    #[test]
+    fn verify_body_accepts_valid_signed_batch_and_returns_digests() {
+        commonware_runtime::tokio::Runner::default().start(|_| async move {
+            let transaction = signed_transaction(1, 0);
+            let body = encoded_batch(std::slice::from_ref(&transaction));
+            let state = test_state(closed_mailbox(), 1024 * 1024, account_reader_cell());
+
+            let batch = verify_body::<TestPublicKey, TestHasher, _, _>(state.as_ref(), body)
+                .await
+                .expect("valid signed transaction batch verifies");
+
+            assert_eq!(batch.transactions.len(), 1);
+            assert_eq!(
+                batch.transactions[0].message_digest(),
+                transaction.message_digest()
+            );
+            assert_eq!(batch.digests, vec![*transaction.message_digest()]);
+            assert_eq!(batch.total_bytes, transaction.encode_size());
+        });
+    }
+
+    #[test]
+    fn verify_body_rejects_decoded_batch_over_max_bytes() {
+        commonware_runtime::tokio::Runner::default().start(|_| async move {
+            let transaction = signed_transaction(2, 0);
+            let body = encoded_batch(std::slice::from_ref(&transaction));
+            let state = test_state(
+                closed_mailbox(),
+                transaction.encode_size() - 1,
+                account_reader_cell(),
+            );
+
+            let Err(status) =
+                verify_body::<TestPublicKey, TestHasher, _, _>(state.as_ref(), body).await
+            else {
+                panic!("decoded transaction bytes should exceed the batch limit");
+            };
+
+            assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        });
+    }
+
+    #[test]
+    fn submit_batch_returns_finalized_status_after_actor_report() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let transaction = signed_transaction(3, 0);
+            let digest = *transaction.message_digest();
+            let body = encoded_batch(std::slice::from_ref(&transaction));
+            let batch_id = TestHasher::hash(&body).to_string();
+            let mailbox = start_actor(context, 1024 * 1024, 1024 * 1024).await;
+            let app = test_app(mailbox.clone(), 1024 * 1024, account_reader_cell());
+
+            let response_task =
+                tokio::spawn(async move { send(app, post("/transactions", body)).await });
+
+            assert_eq!(
+                wait_for_batch_status(&mailbox, &batch_id).await,
+                BatchStatus::Accepted {
+                    digests: vec![digest.to_string()],
+                },
+            );
+
+            let mut source = mailbox.clone();
+            let proposed = source.propose(&test_header(0), &test_context(1)).await;
+            assert_eq!(proposed.len(), 1);
+            assert_eq!(proposed[0].message_digest(), &digest);
+
+            report_block(&mailbox, sealed_block(1, proposed));
+
+            let response = tokio::time::timeout(Duration::from_secs(1), response_task)
+                .await
+                .expect("submit response should resolve after finalization")
+                .expect("submit task should not panic");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await,
+                json!({
+                    "status": "finalized",
+                    "height": 1,
+                }),
+            );
+        });
+    }
+
+    #[test]
+    fn submit_batch_returns_service_unavailable_when_mailbox_is_closed() {
+        commonware_runtime::tokio::Runner::default().start(|_| async move {
+            let transaction = signed_transaction(4, 0);
+            let app = test_app(closed_mailbox(), 1024 * 1024, account_reader_cell());
+
+            let response = send(
+                app,
+                post(
+                    "/transactions",
+                    encoded_batch(std::slice::from_ref(&transaction)),
+                ),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response_text(response).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn ingest_batch_returns_digests_and_fetch_status_returns_accepted() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let transaction = signed_transaction(5, 0);
+            let digest = *transaction.message_digest();
+            let body = encoded_batch(std::slice::from_ref(&transaction));
+            let batch_id = TestHasher::hash(&body).to_string();
+            let mailbox = start_actor(context, 1024 * 1024, 1024 * 1024).await;
+            let app = test_app(mailbox, 1024 * 1024, account_reader_cell());
+
+            let response = send(app.clone(), post("/transactions/ingest", body)).await;
+            assert_eq!(response.status(), StatusCode::ACCEPTED);
+            assert_eq!(
+                response_json(response).await,
+                json!({
+                    "digests": [digest.to_string()],
+                }),
+            );
+
+            let response = send(app.clone(), get(format!("/transactions/{batch_id}"))).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await,
+                json!({
+                    "status": "accepted",
+                    "digests": [digest.to_string()],
+                }),
+            );
+
+            let response = send(app, get("/transactions/unknown-batch")).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+            assert!(response_text(response).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn ingest_batch_returns_service_unavailable_when_pool_is_full() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let transaction = signed_transaction(6, 0);
+            let mailbox = start_actor(context, transaction.encode_size() - 1, 1024 * 1024).await;
+            let app = test_app(mailbox, 1024 * 1024, account_reader_cell());
+
+            let response = send(
+                app,
+                post(
+                    "/transactions/ingest",
+                    encoded_batch(std::slice::from_ref(&transaction)),
+                ),
+            )
+            .await;
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response_text(response).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn fetch_consensus_round_returns_observed_round_and_503_when_unavailable() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let mailbox = start_actor(context, 1024 * 1024, 1024 * 1024).await;
+            let app = test_app(mailbox.clone(), 1024 * 1024, account_reader_cell());
+
+            report_block(&mailbox, sealed_block(7, Vec::new()));
+
+            let response = send(app, get("/consensus/round")).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await,
+                json!({
+                    "round": 7,
+                }),
+            );
+
+            let unavailable = test_app(closed_mailbox(), 1024 * 1024, account_reader_cell());
+            let response = send(unavailable, get("/consensus/round")).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(response_text(response).await.is_empty());
+        });
+    }
+
+    #[test]
+    fn fetch_account_maps_reader_results_to_http() {
+        commonware_runtime::tokio::Runner::default().start(|_| async move {
+            let public_key =
+                TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(7).public_key());
+            let public_key_path = format!("/account/{}", hex(public_key.as_ref()));
+
+            let app = test_app(closed_mailbox(), 1024 * 1024, account_reader_cell());
+            let response = send(app.clone(), get("/account/not-hex")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let response = send(app.clone(), get("/account/00")).await;
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let response = send(app, get(&public_key_path)).await;
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+            let missing_reader = account_reader_cell();
+            install_account_reader(&missing_reader, HashMap::new());
+            let app = test_app(closed_mailbox(), 1024 * 1024, missing_reader);
+            let response = send(app, get(&public_key_path)).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+            let account = Account {
+                balance: 55,
+                nonce: Nonce::new(8, 3),
+            };
+            let reader = account_reader_cell();
+            install_account_reader(&reader, HashMap::from([(public_key, account)]));
+            let app = test_app(closed_mailbox(), 1024 * 1024, reader);
+            let response = send(app, get(&public_key_path)).await;
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response_json(response).await,
+                json!({
+                    "balance": 55,
+                    "nonce": {
+                        "base": 8,
+                        "bitmap": 3,
+                    },
+                }),
+            );
+        });
     }
 }
