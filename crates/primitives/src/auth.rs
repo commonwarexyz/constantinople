@@ -380,9 +380,6 @@ impl TransactionBatchVerifier {
 
     /// Adds a transaction signature to the appropriate verification group,
     /// decompressing the sender public key through `cache`.
-    ///
-    /// The Ed25519 key is copied into the batch and the secp256r1 key into the
-    /// queued assertion item.
     pub fn add(
         &mut self,
         namespace: &[u8],
