@@ -285,7 +285,6 @@ impl EngineDefinition for TestEngineDefinition {
                 RoundRobin<TestHasher>,
                 _,
                 _,
-                _,
                 Ed25519Batch,
                 crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
             >::new(
@@ -299,8 +298,7 @@ impl EngineDefinition for TestEngineDefinition {
                     share,
                     input,
                     partition_prefix,
-                    signature_strategy: Sequential,
-                    hash_strategy: Sequential,
+                    strategy: Sequential,
                     public_key_cache: PublicKeyCache::new(
                         context.child("public_key_cache"),
                         NZUsize!(1024),

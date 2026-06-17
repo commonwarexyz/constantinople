@@ -36,34 +36,31 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
-pub(super) struct AppState<C, P, H, SigSt, HashSt>
+pub(super) struct AppState<C, P, H, St>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     pub mailbox: Mailbox<C, P, H>,
     pub namespace: &'static [u8],
     pub max_batch_bytes: usize,
-    pub signature_strategy: SigSt,
-    pub hash_strategy: HashSt,
+    pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub account_reader: AccountReaderCell,
 }
 
-type SharedState<C, P, H, SigSt, HashSt> = Arc<AppState<C, P, H, SigSt, HashSt>>;
+type SharedState<C, P, H, St> = Arc<AppState<C, P, H, St>>;
 
 /// Builds the axum [`Router`] for the mempool HTTP API.
-pub(super) fn router<C, P, H, SigSt, HashSt>(state: SharedState<C, P, H, SigSt, HashSt>) -> Router
+pub(super) fn router<C, P, H, St>(state: SharedState<C, P, H, St>) -> Router
 where
     C: Digest + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Display + Send + Sync,
-    SigSt: Strategy + Send + Sync + 'static,
-    HashSt: Strategy + Send + Sync + 'static,
+    St: Strategy + Send + Sync + 'static,
 {
     let max_request_bytes = max_request_bytes(state.max_batch_bytes);
     let cors = CorsLayer::new()
@@ -72,25 +69,13 @@ where
         .allow_headers([CONTENT_TYPE]);
 
     Router::new()
-        .route(
-            "/transactions",
-            post(submit_batch::<C, P, H, SigSt, HashSt>),
-        )
-        .route(
-            "/transactions/ingest",
-            post(ingest_batch::<C, P, H, SigSt, HashSt>),
-        )
-        .route(
-            "/transactions/{batch_id}",
-            get(fetch_status::<C, P, H, SigSt, HashSt>),
-        )
-        .route(
-            "/account/{public_key}",
-            get(fetch_account::<C, P, H, SigSt, HashSt>),
-        )
+        .route("/transactions", post(submit_batch::<C, P, H, St>))
+        .route("/transactions/ingest", post(ingest_batch::<C, P, H, St>))
+        .route("/transactions/{batch_id}", get(fetch_status::<C, P, H, St>))
+        .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
         .route(
             "/consensus/round",
-            get(fetch_consensus_round::<C, P, H, SigSt, HashSt>),
+            get(fetch_consensus_round::<C, P, H, St>),
         )
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(cors)
@@ -127,19 +112,18 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
 ///   or any signature is invalid.
 /// - `413 Payload Too Large` if the batch exceeds `max_propose_bytes`.
 /// - `503 Service Unavailable` if the pool is full.
-async fn submit_batch<C, P, H, SigSt, HashSt>(
-    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
+async fn submit_batch<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
     body: Bytes,
 ) -> (StatusCode, String)
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     let batch_id = H::hash(&body).to_string();
-    let batch = match verify_body::<P, H, _, _>(&state, body).await {
+    let batch = match verify_body::<P, H, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
@@ -170,19 +154,18 @@ where
 /// This endpoint is intended for relayers. It uses the same body format and
 /// validation path as [`submit_batch`], but returns as soon as the actor has
 /// accepted the batch for proposal.
-async fn ingest_batch<C, P, H, SigSt, HashSt>(
-    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
+async fn ingest_batch<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
     body: Bytes,
 ) -> (StatusCode, String)
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     let batch_id = H::hash(&body).to_string();
-    let batch = match verify_body::<P, H, _, _>(&state, body).await {
+    let batch = match verify_body::<P, H, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
@@ -219,15 +202,14 @@ where
     total_bytes: usize,
 }
 
-async fn verify_body<P, H, SigSt, HashSt>(
-    state: &AppState<impl Digest, P, H, SigSt, HashSt>,
+async fn verify_body<P, H, St>(
+    state: &AppState<impl Digest, P, H, St>,
     body: Bytes,
 ) -> Result<VerifiedBatch<H>, StatusCode>
 where
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     if body.len() > max_request_bytes(state.max_batch_bytes) {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
@@ -245,8 +227,7 @@ where
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let signature_strategy = state.signature_strategy.clone();
-    let hash_strategy = state.hash_strategy.clone();
+    let strategy = state.strategy.clone();
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
     let signed_lazy = signed
@@ -254,13 +235,12 @@ where
         .map(LazySignedTransaction::new)
         .collect::<Vec<_>>();
     let transactions = tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<H, _, _>(
+        verify_transaction_chunks::<H, _>(
             namespace,
             &mut OsRng,
             &public_key_cache,
             signed_lazy,
-            &signature_strategy,
-            &hash_strategy,
+            &strategy,
         )
     })
     .await
@@ -289,16 +269,15 @@ struct ConsensusRoundResponse {
 }
 
 /// Returns the latest known status for a submitted batch.
-async fn fetch_status<C, P, H, SigSt, HashSt>(
-    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
+async fn fetch_status<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
     Path(batch_id): Path<String>,
 ) -> (StatusCode, String)
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     state.mailbox.query_status(batch_id).await.map_or_else(
         || (StatusCode::NOT_FOUND, String::new()),
@@ -312,15 +291,14 @@ where
 }
 
 /// Returns the highest consensus round observed by this validator.
-async fn fetch_consensus_round<C, P, H, SigSt, HashSt>(
-    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
+async fn fetch_consensus_round<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
 ) -> (StatusCode, String)
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     state.mailbox.query_consensus_round().await.map_or_else(
         || (StatusCode::SERVICE_UNAVAILABLE, String::new()),
@@ -341,16 +319,15 @@ where
 /// - `404 Not Found` if the account has not been written.
 /// - `400 Bad Request` if the path is not a valid public key hex string.
 /// - `503 Service Unavailable` if the state database has not been attached yet.
-async fn fetch_account<C, P, H, SigSt, HashSt>(
-    State(state): State<SharedState<C, P, H, SigSt, HashSt>>,
+async fn fetch_account<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
     Path(public_key): Path<String>,
 ) -> (StatusCode, String)
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     let Some(bytes) = from_hex(&public_key) else {
         return (StatusCode::BAD_REQUEST, String::new());
@@ -431,13 +408,12 @@ mod tests {
             mailbox: super::super::mailbox::Mailbox::new(sender),
             namespace: b"mempool-http-test",
             max_batch_bytes,
-            signature_strategy: Sequential,
-            hash_strategy: Sequential,
+            strategy: Sequential,
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
         });
 
-        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential, Sequential>(state)
+        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state)
     }
 
     #[test]

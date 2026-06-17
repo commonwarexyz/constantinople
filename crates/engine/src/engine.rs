@@ -148,15 +148,14 @@ pub enum StartupMode<F> {
     StateSync { finalization: F },
 }
 
-pub struct Config<E, C, M, B, V, SigT, HashT, I, H, O>
+pub struct Config<E, C, M, B, V, St, I, H, O>
 where
     E: Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     V: Variant,
-    SigT: Strategy,
-    HashT: Strategy,
+    St: Strategy,
     H: Hasher,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
@@ -168,8 +167,7 @@ where
     pub share: Option<group::Share>,
     pub input: I,
     pub partition_prefix: String,
-    pub signature_strategy: SigT,
-    pub hash_strategy: HashT,
+    pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub startup: StartupMode<EngineFinalization<C::PublicKey, V>>,
     pub sync_config: SyncEngineConfig,
@@ -185,11 +183,11 @@ where
     pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
-    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, HashT>>,
+    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, St>>,
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, SigT, HashT, I, BV, O>
+pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
@@ -198,8 +196,7 @@ where
     H: Hasher,
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
-    SigT: Strategy,
-    HashT: Strategy,
+    St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
@@ -208,11 +205,11 @@ where
     signer: C,
     manager: M,
     blocker: B,
-    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, HashT>,
-    transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, HashT>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, SigT, HashT>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, SigT, HashT>,
-    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, HashT>,
+    state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, St>,
+    transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
+    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, St>,
+    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, St>,
+    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     #[expect(
         clippy::type_complexity,
@@ -230,18 +227,14 @@ where
         >,
         PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
         FixedEpocher,
-        HashT,
+        St,
     >,
     #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
-    #[expect(
-        clippy::type_complexity,
-        reason = "simplex actor type is inherently complex"
-    )]
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, SigT, HashT, I, BV, O>,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
 }
 
-impl<E, C, M, B, H, V, L, SigT, HashT, I, BV, O> Engine<E, C, M, B, H, V, L, SigT, HashT, I, BV, O>
+impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
     C: Signer,
@@ -250,8 +243,7 @@ where
     H: Hasher,
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
-    SigT: Strategy,
-    HashT: Strategy,
+    St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
@@ -263,7 +255,7 @@ where
 
     /// Returns the state database once the stateful actor has initialized it.
     /// Blocks until the database is ready.
-    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, HashT> {
+    pub async fn subscribe_databases(&self) -> StateSyncDb<E, H, St> {
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
@@ -275,13 +267,13 @@ where
     /// with [`start`](Self::start) (which consumes the engine).
     pub fn subscribe_databases_detached(
         &self,
-    ) -> impl std::future::Future<Output = StateSyncDb<E, H, HashT>> + Send + 'static {
+    ) -> impl std::future::Future<Output = StateSyncDb<E, H, St>> + Send + 'static {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
     }
 
     /// Initializes the full engine stack.
-    pub async fn new(context: E, config: Config<E, C, M, B, V, SigT, HashT, I, H, O>) -> Self {
+    pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
@@ -300,7 +292,7 @@ where
             ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
 
         let (state_resolver, state_sync_resolver) =
-            StateResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
+            StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("state_resolver"),
                 qmdb_resolver::standard::Config {
                     peer_provider: config.manager.clone(),
@@ -317,7 +309,7 @@ where
                 },
             );
         let (transaction_resolver, transaction_sync_resolver) =
-            TransactionResolverActor::<_, C::PublicKey, _, _, H, HashT>::new(
+            TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("transaction_resolver"),
                 qmdb_resolver::compact::Config {
                     peer_provider: config.manager.clone(),
@@ -367,7 +359,7 @@ where
         let transaction_db_config = transaction_db_config(
             &config.partition_prefix,
             &page_cache,
-            config.hash_strategy.clone(),
+            config.strategy.clone(),
         );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
@@ -400,29 +392,27 @@ where
                     SimplexFloor::Finalized(finalization),
                 )
             } else {
-                let genesis_state_db = StateDb::<E, H, HashT>::init(
+                let genesis_state_db = StateDb::<E, H, St>::init(
                     context.child("genesis_state"),
                     state_db_config(
                         &config.partition_prefix,
                         &storage_page_cache,
-                        config.hash_strategy.clone(),
+                        config.strategy.clone(),
                     ),
                 )
                 .await
                 .expect("state db must initialize for genesis target");
                 let genesis_state_target =
-                    <StateDb<E, H, HashT> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
-                let genesis_transaction_db = TransactionDb::<E, H, HashT>::init(
+                    <StateDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
+                let genesis_transaction_db = TransactionDb::<E, H, St>::init(
                     context.child("genesis_transactions"),
                     transaction_db_config.clone(),
                 )
                 .await
                 .expect("transaction history db must initialize for genesis target");
                 let genesis_transactions_target =
-                    <TransactionDb<E, H, HashT> as ManagedDb<E>>::sync_target(
-                        &genesis_transaction_db,
-                    )
-                    .await;
+                    <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_transaction_db)
+                        .await;
                 let genesis_block =
                     constantinople_application::consensus::genesis_block_with_parent(
                         &mut H::default(),
@@ -433,7 +423,7 @@ where
                         genesis_transactions_target.clone(),
                     );
                 let coded_block =
-                    EngineCodedBlock::new(genesis_block, coding_config, &config.hash_strategy);
+                    EngineCodedBlock::new(genesis_block, coding_config, &config.strategy);
                 let commitment = coded_block.commitment();
                 let simplex_floor = match &config.startup {
                     StartupMode::StateSync { finalization } if startup_plan.may_state_sync() => {
@@ -472,7 +462,7 @@ where
                 block_codec_config: config.block_codec.clone(),
                 max_repair: MAX_REPAIR,
                 max_pending_acks: MAX_PENDING_ACKS,
-                strategy: config.hash_strategy.clone(),
+                strategy: config.strategy.clone(),
             },
         )
         .await;
@@ -489,7 +479,7 @@ where
                     maximum_shard_size: 1024 * 1024,
                 },
                 block_codec_cfg: config.block_codec.clone(),
-                strategy: config.hash_strategy.clone(),
+                strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
@@ -498,8 +488,7 @@ where
         );
         let application = Application::new(
             context.child("application"),
-            config.signature_strategy,
-            config.hash_strategy.clone(),
+            config.strategy.clone(),
             config.genesis_leader.clone(),
             genesis_parent,
             config.transaction_namespace,
@@ -516,7 +505,7 @@ where
                     state_db_config(
                         &config.partition_prefix,
                         &storage_page_cache,
-                        config.hash_strategy.clone(),
+                        config.strategy.clone(),
                     ),
                     transaction_db_config,
                 ),
@@ -537,7 +526,7 @@ where
                 marshal: marshal_mailbox.clone(),
                 shards: shard_mailbox.clone(),
                 scheme_provider: provider,
-                strategy: config.hash_strategy.clone(),
+                strategy: config.strategy.clone(),
                 epocher,
             },
         );
@@ -562,7 +551,7 @@ where
                 automaton: application.clone(),
                 relay: application,
                 reporter: simplex_reporter,
-                strategy: config.hash_strategy,
+                strategy: config.strategy.clone(),
                 partition: format!("{}_simplex", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
                 epoch: Epoch::zero(),

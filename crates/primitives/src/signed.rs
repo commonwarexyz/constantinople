@@ -487,30 +487,27 @@ where
 
 /// Verifies lazily-encoded transactions.
 ///
-/// The hash strategy first forces each [`Lazy`] to decode and compute its seal
-/// digest. The signature strategy then runs batch signature verification over
-/// the warmed transactions. Returns `None` if any transaction contains an invalid or
-/// undecodable transaction.
-pub fn verify_transaction_chunks<H, SigSt, HashSt>(
+/// First forces each [`Lazy`] to decode and compute its seal digest, then runs
+/// batch signature verification over the warmed transactions, both on
+/// `strategy`. Returns `None` if any transaction is invalid or undecodable.
+pub fn verify_transaction_chunks<H, St>(
     namespace: &'static [u8],
     rng: &mut impl CryptoRngCore,
     cache: &PublicKeyCache,
     transactions: Vec<LazySignedTransaction<H>>,
-    signature_strategy: &SigSt,
-    hash_strategy: &HashSt,
+    strategy: &St,
 ) -> Option<Vec<SignedTransaction<H>>>
 where
     H: Hasher,
-    SigSt: Strategy,
-    HashSt: Strategy,
+    St: Strategy,
 {
     if transactions.is_empty() {
         return Some(Vec::new());
     }
 
-    let transactions = preload_transaction_chunks(transactions, hash_strategy)?;
+    let transactions = preload_transaction_chunks(transactions, strategy)?;
 
-    if !verify_transaction_batch::<H, _>(namespace, rng, cache, &transactions, signature_strategy) {
+    if !verify_transaction_batch::<H, _>(namespace, rng, cache, &transactions, strategy) {
         return None;
     }
 

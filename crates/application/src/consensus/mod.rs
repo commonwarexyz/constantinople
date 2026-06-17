@@ -31,10 +31,10 @@ pub use db::{
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-pub type FinalizedHookFn<E, C, H, P, HashSt> = Arc<
+pub type FinalizedHookFn<E, C, H, P, St> = Arc<
     dyn for<'a> Fn(
             &'a SealedBlock<C, P, H>,
-            &'a Databases<E, H, commonware_storage::translator::EightCap, HashSt>,
+            &'a Databases<E, H, commonware_storage::translator::EightCap, St>,
         ) -> FinalizedHookFuture<'a>
         + Send
         + Sync,
@@ -48,41 +48,38 @@ const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
 /// Core Constantinople application.
-pub struct Application<E, H, C, S, P, I, B, SigSt, HashSt>
+pub struct Application<E, H, C, S, P, I, B, St>
 where
     H: Hasher,
     E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
-    HashSt: Strategy,
+    St: Strategy,
 {
-    signature_strategy: SigSt,
-    hash_strategy: HashSt,
+    strategy: St,
     genesis_leader: P,
     genesis_parent: C,
     transaction_namespace: &'static [u8],
     public_key_cache: PublicKeyCache,
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
-    finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
+    finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
     proposed_transactions: Counter,
     _marker: PhantomData<(E, C, S, I, B)>,
 }
 
-impl<E, H, C, S, P, I, B, SigSt, HashSt> Clone for Application<E, H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, St> Clone for Application<E, H, C, S, P, I, B, St>
 where
     H: Hasher,
     E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     P: Clone,
-    SigSt: Clone,
-    HashSt: Strategy + Clone,
+    St: Strategy,
 {
     fn clone(&self) -> Self {
         Self {
-            signature_strategy: self.signature_strategy.clone(),
-            hash_strategy: self.hash_strategy.clone(),
+            strategy: self.strategy.clone(),
             genesis_leader: self.genesis_leader.clone(),
             genesis_parent: self.genesis_parent,
             transaction_namespace: self.transaction_namespace,
@@ -96,13 +93,13 @@ where
     }
 }
 
-impl<E, H, C, S, P, I, B, SigSt, HashSt> Application<E, H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
 where
     H: Hasher,
     E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
-    HashSt: Strategy,
+    St: Strategy,
 {
     /// Creates an application.
     #[expect(
@@ -111,15 +108,14 @@ where
     )]
     pub fn new(
         context: impl Metrics,
-        signature_strategy: SigSt,
-        hash_strategy: HashSt,
+        strategy: St,
         genesis_leader: P,
         genesis_parent: C,
         transaction_namespace: &'static [u8],
         public_key_cache: PublicKeyCache,
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
-        finalized_hook: Option<FinalizedHookFn<E, C, H, P, HashSt>>,
+        finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
@@ -127,8 +123,7 @@ where
         );
 
         Self {
-            signature_strategy,
-            hash_strategy,
+            strategy,
             genesis_leader,
             genesis_parent,
             transaction_namespace,

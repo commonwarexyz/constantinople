@@ -729,12 +729,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        let signature_strategy = context
+        let strategy = context
             .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create signature verification strategy");
-        let hash_strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create hashing strategy");
+            .expect("failed to create worker strategy");
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),
             NonZeroUsize::new(public_key_cache_size)
@@ -799,7 +796,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let (probe, probe_mailbox) = Probe::new(ProbeConfig {
             context: context.child("probe"),
             provider,
-            strategy: signature_strategy.clone(),
+            strategy: strategy.clone(),
             capacity: NZUsize!(32),
             blocker: oracle.clone(),
             minimum_epoch: Epoch::zero(),
@@ -826,8 +823,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: mempool_drop_grace_blocks,
-                signature_strategy: signature_strategy.clone(),
-                hash_strategy: hash_strategy.clone(),
+                strategy: strategy.clone(),
                 public_key_cache: public_key_cache.clone(),
             },
             mempool_mailbox.clone(),
@@ -899,7 +895,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             MinSig,
             RoundRobin<Sha256>,
             Rayon,
-            Rayon,
             _,
             Batch,
             SimplexObserver,
@@ -914,8 +909,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 share: decoded.share,
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
-                signature_strategy,
-                hash_strategy,
+                strategy,
                 public_key_cache,
                 startup,
                 sync_config: production_sync_config(),

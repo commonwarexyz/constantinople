@@ -15,8 +15,7 @@ use futures::{Stream, StreamExt};
 use rand::Rng;
 use rand_core::CryptoRngCore;
 
-impl<E, H, C, S, P, I, B, SigSt, HashSt> CApplication<E>
-    for Application<E, H, C, S, P, I, B, SigSt, HashSt>
+impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
 where
     E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
     H: Hasher,
@@ -25,13 +24,12 @@ where
     P: PublicKey,
     I: TransactionSource<C, P, H> + Sync,
     B: Send + Sync + 'static,
-    SigSt: Strategy + Clone + Send + Sync + 'static,
-    HashSt: Strategy + Clone + Send + Sync + 'static,
+    St: Strategy,
 {
     type SigningScheme = S;
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
-    type Databases = Databases<E, H, EightCap, HashSt>;
+    type Databases = Databases<E, H, EightCap, St>;
     type InputProvider = I;
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
