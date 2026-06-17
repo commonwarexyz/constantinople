@@ -16,7 +16,8 @@ use std::sync::Arc;
 ///
 /// Both schemes store a compressed point on the wire. Recovering the affine
 /// point (an Edwards point for Ed25519, the SEC1 `y` coordinate for secp256r1)
-/// requires curve arithmetic that dominates per-signature verification cost.
+/// requires curve arithmetic that is a significant part of per-signature
+/// verification cost.
 #[derive(Clone)]
 pub enum DecompressedPublicKey {
     /// A decompressed Ed25519 verification key.
@@ -27,28 +28,14 @@ pub enum DecompressedPublicKey {
 
 /// A shared, fixed-capacity cache mapping a [`TransactionPublicKey`] to its
 /// [`DecompressedPublicKey`].
-///
-/// The same sender's key recurs across mempool ingest and consensus
-/// verification of every transaction it submits, so caching the decompression
-/// is a large win for active accounts. A single instance is shared across the
-/// mempool and consensus verification paths.
-///
-/// Cloning shares the underlying cache. Lookups take a shared read lock and run
-/// concurrently on the hit path; only misses take the write lock to install the
-/// computed key.
 #[derive(Clone)]
 pub struct PublicKeyCache {
     inner: Arc<RwLock<Clock<TransactionPublicKey, DecompressedPublicKey>>>,
-    /// Cache-miss counter. Only misses are counted: a miss already holds the
-    /// write lock, so the counter is contention-free, whereas a per-hit counter
-    /// would be a shared atomic hit by every parallel verification shard. A miss
-    /// rate of ~0 confirms the cache is effective.
     misses: Counter,
 }
 
 impl PublicKeyCache {
-    /// Creates a cache holding at most `capacity` decompressed keys, registering
-    /// its miss counter on the runtime metrics `context`.
+    /// Creates a cache holding at most `capacity` decompressed keys.
     pub fn new(context: impl Metrics, capacity: NonZeroUsize) -> Self {
         Self {
             inner: Arc::new(RwLock::new(Clock::new(capacity))),
@@ -58,15 +45,15 @@ impl PublicKeyCache {
 
     /// Returns the decompressed key for `key`, computing and caching it on a
     /// miss. Returns `None` if `key` does not encode a valid curve point.
-    ///
-    /// The hit path takes only a shared read lock, so concurrent verification
-    /// shards look keys up in parallel. The read lock is released before the
-    /// caller uses the returned key, so the expensive per-signature work never
-    /// runs under the lock.
     pub fn decompress(&self, key: &TransactionPublicKey) -> Option<DecompressedPublicKey> {
         if let Some(decompressed) = self.inner.read().get(key).cloned() {
             return Some(decompressed);
         }
+
+        // The hit path takes only a shared read lock, so concurrent verification
+        // shards look keys up in parallel. The read lock is released before the
+        // caller uses the returned key, so the expensive per-signature work never
+        // runs under the lock.
         let decompressed = Self::decompress_uncached(key)?;
         self.misses.inc();
         self.inner.write().put(key.clone(), decompressed.clone());
