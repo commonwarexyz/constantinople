@@ -607,20 +607,21 @@ mod test {
 
     #[test]
     fn signed_transaction_exposes_sender_public_key() {
-        let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
-        let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
-            public_key.clone(),
-            public_key.clone(),
-            NonZeroU64::new(1).expect("test value should be non-zero"),
-            0,
-        )
-        .seal_and_sign(&private_key, NAMESPACE, hasher);
-
-        assert_eq!(signed.value().sender(), Some(&public_key));
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
+            let hasher = &mut sha256::Sha256::default();
+            let private_key = ed25519::PrivateKey::random(&mut test_rng());
+            let public_key = TransactionPublicKey::ed25519(private_key.public_key());
+            let signed = Transaction::new(
+                public_key.clone(),
+                public_key.clone(),
+                NonZeroU64::new(1).expect("test value should be non-zero"),
+                0,
+            )
+            .seal_and_sign(&private_key, NAMESPACE, hasher);
+
+            assert_eq!(signed.value().sender(), Some(&public_key));
+
             let mut verifier = TransactionBatchVerifier::new();
             assert!(
                 verifier.add(

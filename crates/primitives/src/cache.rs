@@ -135,17 +135,10 @@ mod tests {
         TransactionPublicKey::secp256r1(secp256r1::PrivateKey::random(&mut rng).public_key())
     }
 
-    /// Runs `test` with a freshly built cache inside a deterministic runtime,
-    /// which supplies the metrics context `PublicKeyCache::new` requires.
-    fn with_cache(capacity: NonZeroUsize, test: impl FnOnce(PublicKeyCache)) {
-        deterministic::Runner::default().start(|context| async move {
-            test(PublicKeyCache::new(context, capacity));
-        });
-    }
-
     #[test]
     fn ed25519_decompress_matches_direct_and_caches() {
-        with_cache(NZUsize!(4), |cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(4));
             let key = ed25519_key(0);
             assert!(cache.is_empty());
 
@@ -169,7 +162,8 @@ mod tests {
 
     #[test]
     fn secp256r1_decompress_matches_direct_and_caches() {
-        with_cache(NZUsize!(4), |cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(4));
             let key = secp256r1_key(0);
 
             let DecompressedPublicKey::Secp256r1(decompressed) =
@@ -191,7 +185,8 @@ mod tests {
 
     #[test]
     fn caches_both_schemes_together() {
-        with_cache(NZUsize!(8), |cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(8));
             let ed = ed25519_key(0);
             let r1 = secp256r1_key(0);
 
@@ -211,7 +206,8 @@ mod tests {
 
     #[test]
     fn respects_capacity_via_eviction() {
-        with_cache(NZUsize!(1), |cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(1));
             let key_a = ed25519_key(0);
             let key_b = ed25519_key(1);
             assert_ne!(key_a, key_b);
@@ -226,19 +222,22 @@ mod tests {
 
     #[test]
     fn rejects_invalid_point_and_does_not_cache() {
-        // A secp256r1 transaction key that decodes structurally but whose bytes
-        // are not a curve point: decode accepts it, so decompression rejects it.
-        let valid = secp256r1_key(0);
-        let mut encoded = valid.encode().to_vec();
-        // Corrupt the x-coordinate so no matching y exists for most values.
-        for byte in encoded.iter_mut().skip(1) {
-            *byte = 0xff;
-        }
-        let key = TransactionPublicKey::read(&mut &encoded[..])
-            .expect("decode no longer validates the point");
-        assert_eq!(encoded.len(), TransactionPublicKey::SIZE);
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(4));
 
-        with_cache(NZUsize!(4), |cache| {
+            // A secp256r1 transaction key that decodes structurally but whose
+            // bytes are not a curve point: decode accepts it, so decompression
+            // rejects it.
+            let valid = secp256r1_key(0);
+            let mut encoded = valid.encode().to_vec();
+            // Corrupt the x-coordinate so no matching y exists for most values.
+            for byte in encoded.iter_mut().skip(1) {
+                *byte = 0xff;
+            }
+            let key = TransactionPublicKey::read(&mut &encoded[..])
+                .expect("decode no longer validates the point");
+            assert_eq!(encoded.len(), TransactionPublicKey::SIZE);
+
             assert!(cache.decompress(&key).is_none());
             assert!(cache.is_empty());
         });

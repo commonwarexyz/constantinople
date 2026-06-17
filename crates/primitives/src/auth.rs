@@ -553,14 +553,6 @@ mod tests {
 
     const NAMESPACE: &[u8] = b"constantinople-tx";
 
-    /// Runs `test` with a cache inside a deterministic runtime, which supplies
-    /// the metrics context `PublicKeyCache::new` requires.
-    fn with_cache(test: impl FnOnce(PublicKeyCache)) {
-        deterministic::Runner::default().start(|context| async move {
-            test(PublicKeyCache::new(context, NZUsize!(16)));
-        });
-    }
-
     #[test]
     fn public_key_codec_carries_scheme_byte() {
         let signer = secp256r1::PrivateKey::random(&mut test_rng());
@@ -586,7 +578,8 @@ mod tests {
 
     #[test]
     fn mixed_batch_verifier_accepts_both_schemes() {
-        with_cache(|cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
             let ed25519 = ed25519::PrivateKey::random(&mut test_rng());
             let ed_message = sha256::Sha256::hash(b"ed25519").to_vec();
             let r1_message = sha256::Sha256::hash(b"secp256r1").to_vec();
@@ -617,7 +610,8 @@ mod tests {
 
     #[test]
     fn mixed_batch_verifier_rejects_scheme_mismatch() {
-        with_cache(|cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
             let ed25519 = ed25519::PrivateKey::random(&mut test_rng());
             let message = sha256::Sha256::hash(b"message").to_vec();
             let (_, signature) = webauthn_signature(&message);
@@ -635,7 +629,8 @@ mod tests {
 
     #[test]
     fn webauthn_signature_rejects_wrong_challenge() {
-        with_cache(|cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
             let message = sha256::Sha256::hash(b"message").to_vec();
             let wrong_message = sha256::Sha256::hash(b"wrong").to_vec();
             let (public_key, signature) = webauthn_signature(&wrong_message);
@@ -648,7 +643,8 @@ mod tests {
 
     #[test]
     fn webauthn_signature_rejects_missing_user_verification() {
-        with_cache(|cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
             let message = sha256::Sha256::hash(b"message").to_vec();
             let (public_key, mut signature) = webauthn_signature(&message);
             let TransactionSignature::Secp256r1 {
@@ -702,7 +698,8 @@ mod tests {
 
     #[test]
     fn webauthn_verification_populates_and_reuses_cache() {
-        with_cache(|cache| {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
             let message = sha256::Sha256::hash(b"secp256r1").to_vec();
             let (public_key, signature) = webauthn_signature(&message);
 
