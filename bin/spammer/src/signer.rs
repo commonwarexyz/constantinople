@@ -69,7 +69,11 @@ pub fn sign_batch<St: Strategy>(
 mod tests {
     use super::*;
     use crate::accounts::generate_accounts;
+    use commonware_codec::{Decode, Encode, RangeCfg};
     use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, deterministic};
+    use commonware_utils::NZUsize;
+    use constantinople_primitives::{PublicKeyCache, verify_transaction_batch};
 
     #[test]
     fn sign_produces_correct_count() {
@@ -109,14 +113,6 @@ mod tests {
 
     #[test]
     fn signed_transactions_survive_encode_decode_roundtrip() {
-        use commonware_codec::{Decode, Encode, RangeCfg};
-        use commonware_cryptography::Sha256;
-        use commonware_runtime::{Runner as _, deterministic};
-        use commonware_utils::NZUsize;
-        use constantinople_primitives::{
-            PublicKeyCache, TRANSACTION_NAMESPACE, verify_transaction_batch,
-        };
-
         let accounts = generate_accounts(5, 1000);
         let value = NonZeroU64::new(1).unwrap();
         let mut nonces = vec![0; accounts.len()];

@@ -233,6 +233,7 @@ impl<D: Digest> arbitrary::Arbitrary<'_> for Transaction<D> {
 #[cfg(test)]
 mod test {
     use super::*;
+    use crate::Sealable;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
     use commonware_codec::{DecodeExt, EncodeSize};
     use commonware_cryptography::{Signer, ed25519, sha256};
@@ -275,8 +276,6 @@ mod test {
 
     #[test]
     fn transaction_seal_matches_hash_slow() {
-        use crate::Sealable;
-
         let tx: Transaction<sha256::Digest> =
             Transaction::arbitrary(&mut Unstructured::new(&[])).unwrap();
         let hasher = &mut sha256::Sha256::default();
