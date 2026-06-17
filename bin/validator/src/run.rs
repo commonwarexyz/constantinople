@@ -25,6 +25,7 @@ use commonware_glue::stateful::{
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
+use commonware_macros::boxed;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
@@ -287,7 +288,7 @@ fn recovered_finalized_upload_cursor(
 
 impl FinalizedUploadProducer {
     async fn enqueue(
-        &self,
+        self,
         context: RuntimeContext,
         block: &EngineBlock<Sha256, PublicKey>,
         databases: &EngineDatabases,
@@ -513,6 +514,7 @@ async fn ack_finalized_queue_entry(
     }
 }
 
+#[boxed]
 async fn start_queued_upload(
     active: &mut JoinSet<(u64, u64)>,
     publisher: Arc<LazyPublisher>,
@@ -647,19 +649,11 @@ fn indexer_finalized_hook(
     let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, databases| {
-        let publisher = publisher.clone();
-        let finalized_producer = finalized_producer.clone();
-        let block = block.clone();
-        let databases = databases.clone();
-        Box::pin(async move {
-            finalized_producer
-                .enqueue(
-                    publisher.context.child("finalized_queue"),
-                    &block,
-                    &databases,
-                )
-                .await;
-        })
+        Box::pin(finalized_producer.clone().enqueue(
+            publisher.context.child("finalized_queue"),
+            block,
+            databases,
+        ))
     }))
 }
 

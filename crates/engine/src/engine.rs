@@ -39,6 +39,7 @@ use commonware_glue::stateful::{
     Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
     db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
 };
+use commonware_macros::boxed;
 use commonware_p2p::{Blocker, Manager, Receiver, Sender};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
@@ -273,6 +274,7 @@ where
     }
 
     /// Initializes the full engine stack.
+    #[boxed]
     pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),

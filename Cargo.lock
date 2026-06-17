@@ -1690,6 +1690,7 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-glue",
+ "commonware-macros",
  "commonware-math",
  "commonware-parallel",
  "commonware-runtime",

@@ -13,6 +13,7 @@ use commonware_glue::stateful::{
     Application as CApplication, Proposed,
     db::{DatabaseSet, Merkleized as _},
 };
+use commonware_macros::boxed;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _};
 use commonware_storage::mmr;
@@ -34,6 +35,7 @@ where
 {
     /// Proposes a child block from an already fetched parent.
     #[doc(hidden)]
+    #[boxed]
     #[tracing::instrument(
         name = "application.propose",
         skip_all,
@@ -115,6 +117,7 @@ where
 
     /// Verifies a child block against an already fetched parent.
     #[doc(hidden)]
+    #[boxed]
     #[tracing::instrument(
         name = "application.verify",
         skip_all,
@@ -187,6 +190,7 @@ where
 
     /// Applies a certified block to speculative batches.
     #[doc(hidden)]
+    #[boxed]
     #[tracing::instrument(
         name = "application.apply",
         skip_all,
