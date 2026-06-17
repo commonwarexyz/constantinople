@@ -285,7 +285,8 @@ async fn forward_to_targets(
     targets: &[Leader],
     body: Bytes,
 ) -> ForwardSummary {
-    let sends = targets.iter().cloned().map(|leader| {
+    let sends = targets.iter().map(|leader| {
+        let leader = leader.clone();
         let http = http.clone();
         let body = body.clone();
         async move { forward_to_leader(&http, leader, body).await }

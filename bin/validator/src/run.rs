@@ -21,6 +21,7 @@ use commonware_cryptography::{
 };
 use commonware_formatting::hex;
 use commonware_glue::stateful::{
+    PruneConfig,
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
@@ -31,7 +32,8 @@ use commonware_runtime::{
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
-        telemetry::{self, Logging},
+        telemetry::{self, Logs},
+        tracing::Config as TracesConfig,
     },
 };
 use commonware_storage::{
@@ -45,8 +47,9 @@ use commonware_utils::{
 use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL,
+    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme,
+    VOTE_CHANNEL,
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
@@ -71,6 +74,12 @@ use tracing::{info, warn};
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
+const PRUNE_CONFIG: PruneConfig = PruneConfig {
+    max_pending_acks: MAX_PENDING_ACKS,
+    maintenance_interval: NZUsize!(1024),
+    retained_marshal_blocks: 1024,
+    retained_qmdb_blocks: 32,
+};
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
@@ -674,7 +683,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
-        prune_cadence_blocks,
+        otel,
         json_logs,
         deployer_managed,
         indexer,
@@ -698,12 +707,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     runner.start(|context| async move {
         telemetry::init(
             context.child("telemetry"),
-            Logging {
+            Logs {
                 level: log_level.parse().expect("bad log_level in config"),
                 json: json_logs,
             },
             Some(metrics_listen),
-            None,
+            otel.map(|(endpoint, rate)| TracesConfig {
+                endpoint,
+                name: hex(&decoded.public_key.encode()),
+                rate,
+            }),
         );
 
         info!(
@@ -897,8 +910,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 hash_strategy,
                 startup,
                 sync_config: production_sync_config(),
-                prune_cadence_blocks: NonZeroU64::new(prune_cadence_blocks)
-                    .expect("prune_cadence_blocks must be non-zero"),
+                prune_config: Some(PRUNE_CONFIG),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),

@@ -5,7 +5,7 @@ mod properties;
 
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
@@ -32,6 +32,7 @@ use commonware_glue::{
         plan::PlanBuilder,
     },
     stateful::{
+        PruneConfig,
         db::SyncEngineConfig,
         probe::{Config as ProbeConfig, Probe},
     },
@@ -307,7 +308,12 @@ impl EngineDefinition for TestEngineDefinition {
                         update_channel_size: NZUsize!(256),
                         max_retained_roots: 32,
                     },
-                    prune_cadence_blocks: NZU64!(16),
+                    prune_config: Some(PruneConfig {
+                        max_pending_acks: MAX_PENDING_ACKS,
+                        maintenance_interval: NZUsize!(16),
+                        retained_marshal_blocks: 16,
+                        retained_qmdb_blocks: 0,
+                    }),
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),

@@ -202,6 +202,10 @@ pub(crate) struct RemoteArgs {
     qmdb_indexer_port: u16,
     #[arg(long, default_value_t = false)]
     profiling: bool,
+    /// Trace sampling rate (0.0..=1.0) for validator uploads to the monitoring
+    /// instance; 0.0 disables uploads.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_sampling_rate)]
+    traces: f64,
     /// Instance type for the spammer (defaults to --instance-type).
     #[arg(long)]
     spammer_instance_type: Option<String>,
@@ -264,6 +268,16 @@ fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
     Ok(parsed)
 }
 
+fn parse_sampling_rate(value: &str) -> Result<f64, String> {
+    let parsed = value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid sampling rate: {error}"))?;
+    if !(0.0..=1.0).contains(&parsed) {
+        return Err("sampling rate must be between 0 and 1".to_string());
+    }
+    Ok(parsed)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct NamedBootstrapperEntry {
     public_key: String,
@@ -296,6 +310,9 @@ pub(crate) struct ValidatorConfig {
     metrics_port: u16,
     max_propose_bytes: usize,
     max_pool_bytes: usize,
+    /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
+    #[serde(default)]
+    traces: f64,
     bootstrappers: Vec<NamedBootstrapperEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.
@@ -656,6 +673,77 @@ mod tests {
             remote.http_cidrs,
             vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
         );
+    }
+
+    #[test]
+    fn remote_parses_traces_sampling_rate() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "remote",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8g.large",
+            "--storage-size",
+            "25",
+            "--monitoring-instance-type",
+            "c8g.2xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--dashboard",
+            "dashboard.json",
+            "--http-cidr",
+            "10.0.0.0/8",
+            "--traces",
+            "0.5",
+        ])
+        .expect("remote invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("expected remote target");
+        };
+        assert_eq!(remote.traces, 0.5);
+    }
+
+    #[test]
+    fn rejects_traces_sampling_rate_above_one() {
+        let error = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "remote",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8g.large",
+            "--storage-size",
+            "25",
+            "--monitoring-instance-type",
+            "c8g.2xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--dashboard",
+            "dashboard.json",
+            "--http-cidr",
+            "10.0.0.0/8",
+            "--traces",
+            "1.5",
+        ])
+        .expect_err("sampling rate above one should fail");
+
+        assert!(error.to_string().contains("invalid value"));
     }
 
     #[test]

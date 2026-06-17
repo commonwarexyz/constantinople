@@ -16,7 +16,7 @@ use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, transla
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, SignedTransaction};
 use hashbrown::HashSet;
-use std::time::Instant;
+use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
 where
@@ -39,7 +39,6 @@ where
     pub(super) state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transaction_count: usize,
-    pub(super) timings: Timings,
 }
 
 enum LoadedState {
@@ -58,30 +57,6 @@ where
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(super) struct Timings {
-    pub(super) prepare_ms: u128,
-    pub(super) load_state_ms: u128,
-    pub(super) execute_ms: u128,
-    pub(super) finalize_ms: u128,
-}
-
-impl Timings {
-    const fn before_finalize(prepare_ms: u128, load_state_ms: u128, execute_ms: u128) -> Self {
-        Self {
-            prepare_ms,
-            load_state_ms,
-            execute_ms,
-            finalize_ms: 0,
-        }
-    }
-
-    const fn with_finalize_ms(mut self, finalize_ms: u128) -> Self {
-        self.finalize_ms = finalize_ms;
-        self
-    }
-}
-
 pub(super) async fn execute_proposal<E, C, P, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -96,19 +71,19 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let load_started_at = Instant::now();
     let state = load_state(&state_batch, candidate_transfers)
+        .instrument(info_span!("application.execute.load_state"))
         .await
         .expect("proposal state loading must succeed");
-    let load_state_ms = load_started_at.elapsed().as_millis();
 
-    let execute_started_at = Instant::now();
-    let output = executor::propose_prepared(&state, input);
-    let execute_ms = execute_started_at.elapsed().as_millis();
-    let digests = transfer_digests(&output.transfers);
-    let state_batch = apply_changeset(state_batch, &output.changeset);
-    let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
-    let timings = Timings::before_finalize(0, load_state_ms, execute_ms);
+    let output = info_span!("application.execute.transfers")
+        .in_scope(|| executor::propose_prepared(&state, input));
+    let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
+        let digests = transfer_digests(&output.transfers);
+        let state_batch = apply_changeset(state_batch, &output.changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
+        (state_batch, transaction_batch)
+    });
 
     ProposalExecution {
         block: finalize_child(
@@ -116,7 +91,6 @@ where
             transaction_batch,
             parent,
             output.valid.len(),
-            timings,
             "database merkleization must succeed",
         )
         .await,
@@ -137,34 +111,33 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let prepare_started_at = Instant::now();
-    let transfers = body
-        .iter()
-        .map(|transaction| executor::prepare_transfer(transaction.get()?))
-        .collect::<Option<Vec<_>>>()
-        .ok_or(MALFORMED_TRANSACTION)?;
-    let prepare_ms = prepare_started_at.elapsed().as_millis();
+    let transfers = info_span!("application.execute.prepare").in_scope(|| {
+        body.iter()
+            .map(|transaction| executor::prepare_transfer(transaction.get()?))
+            .collect::<Option<Vec<_>>>()
+            .ok_or(MALFORMED_TRANSACTION)
+    })?;
 
-    let load_started_at = Instant::now();
     let state = load_execution_state(&state_batch, &transfers)
+        .instrument(info_span!("application.execute.load_state"))
         .await
         .expect("block state loading must succeed");
-    let load_state_ms = load_started_at.elapsed().as_millis();
 
-    let execute_started_at = Instant::now();
-    let changeset = execute_loaded(&state, &transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
-    let execute_ms = execute_started_at.elapsed().as_millis();
-    let digests = transfer_digests(&transfers);
-    let state_batch = apply_changeset(state_batch, &changeset);
-    let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
-    let timings = Timings::before_finalize(prepare_ms, load_state_ms, execute_ms);
+    let changeset = info_span!("application.execute.transfers")
+        .in_scope(|| execute_loaded(&state, &transfers))
+        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
+        let digests = transfer_digests(&transfers);
+        let state_batch = apply_changeset(state_batch, &changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
+        (state_batch, transaction_batch)
+    });
 
     Ok(finalize_child(
         state_batch,
         transaction_batch,
         parent,
         transfers.len(),
-        timings,
         "database merkleization during verification must succeed",
     )
     .await)
@@ -182,13 +155,19 @@ where
     S: Strategy,
 {
     let state = load_execution_state(&state_batch, transfers)
+        .instrument(info_span!("application.execute.load_state"))
         .await
         .expect("state loading must succeed for certified apply");
-    let changeset = execute_loaded(&state, transfers).ok_or(STATIC_INVALID_TRANSACTION)?;
-    let digests = transfer_digests(transfers);
-    let state_batch = apply_changeset(state_batch, &changeset);
-    let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
-        .with_inactivity_floor(transaction_floor);
+    let changeset = info_span!("application.execute.transfers")
+        .in_scope(|| execute_loaded(&state, transfers))
+        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
+        let digests = transfer_digests(transfers);
+        let state_batch = apply_changeset(state_batch, &changeset);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
+            .with_inactivity_floor(transaction_floor);
+        (state_batch, transaction_batch)
+    });
 
     db::finalize_execution(state_batch, transaction_batch)
         .await
@@ -319,12 +298,12 @@ where
     }
 }
 
+#[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
 async fn finalize_child<E, C, P, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     transaction_count: usize,
-    timings: Timings,
     expect_message: &'static str,
 ) -> BlockExecution<E, H, S>
 where
@@ -336,11 +315,9 @@ where
 {
     let transaction_batch =
         transaction_batch.with_inactivity_floor(parent_transactions_inactivity_floor(parent));
-    let finalize_started_at = Instant::now();
     let (state, transactions) = db::finalize_execution(state_batch, transaction_batch)
         .await
         .expect(expect_message);
-    let finalize_ms = finalize_started_at.elapsed().as_millis();
     let state_sync_range = range_from_bounds(state.bounds());
     let transactions_range = range_from_bounds(transactions.bounds());
 
@@ -350,7 +327,6 @@ where
         state_sync_range,
         transactions_range,
         transaction_count,
-        timings: timings.with_finalize_ms(finalize_ms),
     }
 }
 

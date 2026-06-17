@@ -12,10 +12,10 @@
     "dependencies": {
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
-        "@exowarexyz/qmdb": "file:vendor/exoware-6d921fe1685bd63b5faa3f3e529a37595d7fbc09/exowarexyz-qmdb-6d921fe1685bd63b5faa3f3e529a37595d7fbc09.tgz",
-        "@exowarexyz/sdk": "file:vendor/exoware-6d921fe1685bd63b5faa3f3e529a37595d7fbc09/exowarexyz-sdk-6d921fe1685bd63b5faa3f3e529a37595d7fbc09.tgz",
-        "@exowarexyz/simplex": "file:vendor/exoware-6d921fe1685bd63b5faa3f3e529a37595d7fbc09/exowarexyz-simplex-6d921fe1685bd63b5faa3f3e529a37595d7fbc09.tgz",
-        "@exowarexyz/sql": "file:vendor/exoware-6d921fe1685bd63b5faa3f3e529a37595d7fbc09/exowarexyz-sql-6d921fe1685bd63b5faa3f3e529a37595d7fbc09.tgz",
+        "@exowarexyz/qmdb": "file:vendor/exoware-c1febc520113dbb98078dfb59eef1f4bed4ee93e/exowarexyz-qmdb-c1febc520113dbb98078dfb59eef1f4bed4ee93e.tgz",
+        "@exowarexyz/sdk": "file:vendor/exoware-c1febc520113dbb98078dfb59eef1f4bed4ee93e/exowarexyz-sdk-c1febc520113dbb98078dfb59eef1f4bed4ee93e.tgz",
+        "@exowarexyz/simplex": "file:vendor/exoware-c1febc520113dbb98078dfb59eef1f4bed4ee93e/exowarexyz-simplex-c1febc520113dbb98078dfb59eef1f4bed4ee93e.tgz",
+        "@exowarexyz/sql": "file:vendor/exoware-c1febc520113dbb98078dfb59eef1f4bed4ee93e/exowarexyz-sql-c1febc520113dbb98078dfb59eef1f4bed4ee93e.tgz",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"
     },
