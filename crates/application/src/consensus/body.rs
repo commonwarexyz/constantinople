@@ -6,7 +6,7 @@ use super::{
 };
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Spawner};
+use commonware_runtime::{Clock, Spawner, telemetry::traces::TracedExt as _};
 use constantinople_primitives::{
     LazySignedTransaction, SignedTransaction, materialize_transaction_chunks,
     preload_transaction_chunks, verify_transaction_batch,
@@ -49,7 +49,7 @@ where
         }
         .instrument(info_span!(
             "application.verify.signatures",
-            txs = transaction_count
+            txs = transaction_count.traced()
         ))
     });
 
@@ -76,7 +76,7 @@ where
         }
         .instrument(info_span!(
             "application.apply.materialize_body",
-            txs = transaction_count
+            txs = transaction_count.traced()
         ))
     });
 

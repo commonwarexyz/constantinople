@@ -14,7 +14,7 @@ use commonware_glue::stateful::{
     db::{DatabaseSet, Merkleized as _},
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _};
 use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
@@ -38,10 +38,10 @@ where
         name = "application.propose",
         skip_all,
         fields(
-            epoch = context.round.epoch().get(),
-            view = context.round.view().get(),
-            parent_height = parent.header.height,
-            height = parent.header.height + 1,
+            epoch = context.round.epoch().get().traced(),
+            view = context.round.view().get().traced(),
+            parent_height = parent.header.height.traced(),
+            height = (parent.header.height + 1).traced(),
         )
     )]
     pub async fn propose_child(
@@ -120,8 +120,8 @@ where
         name = "application.verify",
         skip_all,
         fields(
-            height = block.header.height,
-            parent_height = parent.header.height,
+            height = block.header.height.traced(),
+            parent_height = parent.header.height.traced(),
         )
     )]
     pub async fn verify_child(
@@ -192,7 +192,7 @@ where
     #[tracing::instrument(
         name = "application.apply",
         skip_all,
-        fields(height = block.header.height)
+        fields(height = block.header.height.traced())
     )]
     pub async fn apply_certified(
         &mut self,
