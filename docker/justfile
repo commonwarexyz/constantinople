@@ -1,7 +1,5 @@
-# Mount Constantinople plus its sibling Exoware checkout. Cargo resolves
-# `../exoware-monorepo-faster-qmdb-uploads` from `/constantinople` to
-# `/exoware-monorepo-faster-qmdb-uploads` inside the builder container.
-source-mounts := "-v ${PWD}:/constantinople -v ${PWD}/../exoware-monorepo-faster-qmdb-uploads:/exoware-monorepo-faster-qmdb-uploads:ro -v ${PWD}/.docker-cache/cargo:/cargo-home -v ${PWD}/.docker-cache/target:/constantinople/target"
+# Mount the Constantinople source and the shared cargo/target build caches.
+source-mounts := "-v ${PWD}:/constantinople -v ${PWD}/.docker-cache/cargo:/cargo-home -v ${PWD}/.docker-cache/target:/constantinople/target"
 cache-env := "-e CARGO_HOME=/cargo-home"
 
 prepare-docker-cache:
