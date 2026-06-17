@@ -419,16 +419,13 @@ mod tests {
     use commonware_codec::Encode;
     use commonware_cryptography::{ed25519, sha256};
     use commonware_parallel::Sequential;
+    use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
-    use futures::executor::block_on;
-    use std::{
-        panic::{AssertUnwindSafe, catch_unwind},
-        sync::Arc,
-    };
+    use std::sync::Arc;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn test_router(max_batch_bytes: usize) -> axum::Router {
+    fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
         let (sender, _receiver) = mpsc::channel(1);
         let state = Arc::new(AppState {
             mailbox: super::super::mailbox::Mailbox::new(sender),
@@ -436,7 +433,7 @@ mod tests {
             max_batch_bytes,
             signature_strategy: Sequential,
             hash_strategy: Sequential,
-            public_key_cache: PublicKeyCache::new(NZUsize!(16)),
+            public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
         });
 
@@ -445,51 +442,56 @@ mod tests {
 
     #[test]
     fn router_accepts_requests_above_axum_default_limit() {
-        let app = test_router(4 * 1024 * 1024);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/transactions")
-            .body(Body::from(vec![0u8; 2 * 1024 * 1024 + 1]))
-            .expect("request should build");
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let app = test_router(context, 4 * 1024 * 1024);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions")
+                .body(Body::from(vec![0u8; 2 * 1024 * 1024 + 1]))
+                .expect("request should build");
 
-        let response = block_on(app.oneshot(request)).expect("router should return a response");
+            let response = app.oneshot(request).await.expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
     }
 
     #[test]
     fn router_rejects_malformed_length_prefix_without_panicking() {
-        let app = test_router(4 * 1024 * 1024);
-        let request = Request::builder()
-            .method("POST")
-            .uri("/transactions")
-            .body(Body::from(u32::MAX.encode()))
-            .expect("request should build");
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let app = test_router(context, 4 * 1024 * 1024);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions")
+                .body(Body::from(u32::MAX.encode()))
+                .expect("request should build");
 
-        let result = catch_unwind(AssertUnwindSafe(|| block_on(app.oneshot(request))));
+            // A panic here (rather than a clean rejection) would fail the test.
+            let response = app.oneshot(request).await.expect("router should respond");
 
-        let response = result.expect("malformed prefixes must not panic");
-        let response = response.expect("router should return a response");
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
     }
 
     #[test]
     fn router_allows_explorer_account_preflight() {
-        let app = test_router(4 * 1024 * 1024);
-        let request = Request::builder()
-            .method(Method::OPTIONS)
-            .uri("/account/00")
-            .header(header::ORIGIN, "http://127.0.0.1:5173")
-            .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
-            .body(Body::empty())
-            .expect("request should build");
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let app = test_router(context, 4 * 1024 * 1024);
+            let request = Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/account/00")
+                .header(header::ORIGIN, "http://127.0.0.1:5173")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .body(Body::empty())
+                .expect("request should build");
 
-        let response = block_on(app.oneshot(request)).expect("router should return a response");
+            let response = app.oneshot(request).await.expect("router should respond");
 
-        assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
-            Some(&header::HeaderValue::from_static("*")),
-        );
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
+                Some(&header::HeaderValue::from_static("*")),
+            );
+        });
     }
 }

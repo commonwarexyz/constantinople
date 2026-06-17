@@ -736,10 +736,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create hashing strategy");
         let public_key_cache = PublicKeyCache::new(
+            context.child("public_key_cache"),
             NonZeroUsize::new(public_key_cache_size)
                 .expect("public_key_cache_size must be non-zero"),
         );
-        public_key_cache.register(&context.child("public_key_cache"));
 
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(

@@ -301,7 +301,10 @@ impl EngineDefinition for TestEngineDefinition {
                     partition_prefix,
                     signature_strategy: Sequential,
                     hash_strategy: Sequential,
-                    public_key_cache: PublicKeyCache::new(NZUsize!(1024)),
+                    public_key_cache: PublicKeyCache::new(
+                        context.child("public_key_cache"),
+                        NZUsize!(1024),
+                    ),
                     startup,
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),

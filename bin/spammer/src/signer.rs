@@ -111,6 +111,7 @@ mod tests {
     fn signed_transactions_survive_encode_decode_roundtrip() {
         use commonware_codec::{Decode, Encode, RangeCfg};
         use commonware_cryptography::Sha256;
+        use commonware_runtime::{Runner as _, deterministic};
         use commonware_utils::NZUsize;
         use constantinople_primitives::{
             PublicKeyCache, TRANSACTION_NAMESPACE, verify_transaction_batch,
@@ -132,21 +133,23 @@ mod tests {
         assert_eq!(decoded.len(), txs.len());
 
         // Verify signatures as the server would (using Sha256, same as the validator).
-        let mut rng = commonware_utils::test_rng();
         let lazy_decoded: Vec<_> = decoded
             .into_iter()
             .map(constantinople_primitives::LazySignedTransaction::new)
             .collect();
-        assert!(
-            verify_transaction_batch::<Sha256, _>(
-                TRANSACTION_NAMESPACE,
-                &mut rng,
-                &PublicKeyCache::new(NZUsize!(16)),
-                &lazy_decoded,
-                &Sequential,
-            ),
-            "batch signature verification should pass"
-        );
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
+            assert!(
+                verify_transaction_batch::<Sha256, _>(
+                    TRANSACTION_NAMESPACE,
+                    &mut commonware_utils::test_rng(),
+                    &cache,
+                    &lazy_decoded,
+                    &Sequential,
+                ),
+                "batch signature verification should pass"
+            );
+        });
     }
 
     #[test]

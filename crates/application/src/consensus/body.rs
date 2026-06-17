@@ -35,22 +35,18 @@ where
     let transaction_count = body.len();
     let _handle = runtime.shared(true).spawn(move |mut runtime| {
         async move {
-            let result = preload_transaction_chunks(
-                &public_key_cache,
-                body.as_ref().clone(),
-                &hash_strategy,
-            )
-            .filter(|transactions| {
-                verify_transaction_batch::<H, _>(
-                    namespace,
-                    &mut runtime,
-                    &public_key_cache,
-                    transactions,
-                    &signature_strategy,
-                )
-            })
-            .map(|_| ())
-            .ok_or(INVALID_SIGNATURE);
+            let result = preload_transaction_chunks(body.as_ref().clone(), &hash_strategy)
+                .filter(|transactions| {
+                    verify_transaction_batch::<H, _>(
+                        namespace,
+                        &mut runtime,
+                        &public_key_cache,
+                        transactions,
+                        &signature_strategy,
+                    )
+                })
+                .map(|_| ())
+                .ok_or(INVALID_SIGNATURE);
             let _ = result_tx.send(result);
         }
         .instrument(info_span!(
