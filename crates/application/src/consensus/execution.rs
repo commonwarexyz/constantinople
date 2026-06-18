@@ -3,19 +3,18 @@
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
-    db::{self, StateBatch, TransactionBatch, apply_changeset, apply_transaction_digests},
+    db::{self, StateBatch, TransactionBatch, apply_shard_maps, apply_transaction_digests},
     history::parent_transactions_inactivity_floor,
     reject_verify,
 };
-use crate::executor::{self, PreparedTransfer, State};
+use crate::executor::{self, PreparedTransfer, ShardMap};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, SignedTransaction};
-use hashbrown::HashSet;
+use constantinople_primitives::{Header, SealedBlock, SignedTransaction};
 use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -41,11 +40,6 @@ where
     pub(super) transaction_count: usize,
 }
 
-enum LoadedState {
-    Unique(Vec<Account>),
-    Shared(State),
-}
-
 impl<E, H, S> BlockExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
@@ -57,12 +51,61 @@ where
     }
 }
 
+/// Loads and executes a batch as a per-shard pipeline.
+///
+/// Transfers are routed to shards by account-key prefix; each shard concurrently
+/// loads only the accounts it owns from the state batch, then applies its debits
+/// and credits in place. The returned per-shard maps are the accounts to write.
+/// Returns `None` if any transfer fails its nonce or balance check or overflows
+/// a recipient (the whole batch is rejected). The batch is only borrowed for the
+/// concurrent reads, so the caller may move it afterward to apply the writes.
+async fn load_and_execute<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transfers: &[PreparedTransfer<H>],
+) -> Option<Vec<ShardMap>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    if transfers.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let shards = executor::partition(transfers, strategy.parallelism_hint());
+    let loaded: Vec<Option<ShardMap>> =
+        futures::future::try_join_all(shards.iter().map(|shard| async move {
+            let keys = shard.account_keys(transfers);
+            let values = batch.get_many(&keys).await?;
+            let mut accounts = ShardMap::with_capacity(keys.len());
+            for (key, value) in keys.iter().zip(values) {
+                accounts
+                    .entry((*key).clone())
+                    .or_insert_with(|| value.unwrap_or_default());
+            }
+            Ok::<_, commonware_storage::qmdb::Error<mmr::Family>>(executor::execute_shard(
+                accounts, shard, transfers,
+            ))
+        }))
+        .await
+        .expect("state loading must succeed");
+
+    loaded.into_iter().collect()
+}
+
+/// Executes a proposal's candidate transactions all or nothing.
+///
+/// If every candidate executes cleanly the block includes them all. If any
+/// candidate is malformed, fails its nonce or balance check, or overflows a
+/// recipient, the whole batch is dropped and an empty block is proposed so the
+/// chain still makes progress.
 pub(super) async fn execute_proposal<E, C, P, H, S>(
+    strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
-    input: executor::ProposalInput<H>,
-    candidate_transfers: &[PreparedTransfer<H>],
+    transactions: Vec<SignedTransaction<H>>,
 ) -> ProposalExecution<E, H, S>
 where
     E: Storage + Clock + Metrics,
@@ -71,34 +114,46 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let state = load_state(&state_batch, candidate_transfers)
-        .instrument(info_span!("application.execute.load_state"))
-        .await
-        .expect("proposal state loading must succeed");
+    let prepared = transactions
+        .iter()
+        .map(executor::prepare_transfer)
+        .collect::<Option<Vec<_>>>();
 
-    let output = info_span!("application.execute.transfers")
-        .in_scope(|| executor::propose_prepared(&state, input));
-    let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let digests = transfer_digests(&output.transfers);
-        let state_batch = apply_changeset(state_batch, &output.changeset);
-        let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
-        (state_batch, transaction_batch)
-    });
+    let outcome = match prepared {
+        Some(transfers) if !transfers.is_empty() => {
+            load_and_execute(&state_batch, &strategy, &transfers)
+                .instrument(info_span!("application.execute.load_execute"))
+                .await
+                .map(|shard_maps| (transactions, transfers, shard_maps))
+        }
+        _ => None,
+    };
+
+    let (body, transfers, state_batch) = match outcome {
+        Some((body, transfers, shard_maps)) => {
+            (body, transfers, apply_shard_maps(state_batch, shard_maps))
+        }
+        None => (Vec::new(), Vec::new(), state_batch),
+    };
+
+    let transaction_batch = info_span!("application.execute.apply")
+        .in_scope(|| apply_transaction_digests(transaction_batch, &transfer_digests(&transfers)));
 
     ProposalExecution {
         block: finalize_child(
             state_batch,
             transaction_batch,
             parent,
-            output.valid.len(),
+            body.len(),
             "database merkleization must succeed",
         )
         .await,
-        body: output.valid,
+        body,
     }
 }
 
 pub(super) async fn execute_body<E, C, P, H, S>(
+    strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
@@ -118,17 +173,14 @@ where
             .ok_or(MALFORMED_TRANSACTION)
     })?;
 
-    let state = load_execution_state(&state_batch, &transfers)
-        .instrument(info_span!("application.execute.load_state"))
+    let shard_maps = load_and_execute(&state_batch, &strategy, &transfers)
+        .instrument(info_span!("application.execute.load_execute"))
         .await
-        .expect("block state loading must succeed");
-
-    let changeset = info_span!("application.execute.transfers")
-        .in_scope(|| execute_loaded(&state, &transfers))
         .ok_or(STATIC_INVALID_TRANSACTION)?;
+
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let digests = transfer_digests(&transfers);
-        let state_batch = apply_changeset(state_batch, &changeset);
+        let state_batch = apply_shard_maps(state_batch, shard_maps);
         let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
         (state_batch, transaction_batch)
     });
@@ -144,6 +196,7 @@ where
 }
 
 pub(super) async fn apply_prepared_body<E, H, S>(
+    strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
@@ -154,16 +207,14 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let state = load_execution_state(&state_batch, transfers)
-        .instrument(info_span!("application.execute.load_state"))
+    let shard_maps = load_and_execute(&state_batch, &strategy, transfers)
+        .instrument(info_span!("application.execute.load_execute"))
         .await
-        .expect("state loading must succeed for certified apply");
-    let changeset = info_span!("application.execute.transfers")
-        .in_scope(|| execute_loaded(&state, transfers))
         .ok_or(STATIC_INVALID_TRANSACTION)?;
+
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let digests = transfer_digests(transfers);
-        let state_batch = apply_changeset(state_batch, &changeset);
+        let state_batch = apply_shard_maps(state_batch, shard_maps);
         let transaction_batch = apply_transaction_digests(transaction_batch, &digests)
             .with_inactivity_floor(transaction_floor);
         (state_batch, transaction_batch)
@@ -203,99 +254,6 @@ where
     }
 
     true
-}
-
-async fn load_state<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    transfers: &[PreparedTransfer<H>],
-) -> core::result::Result<State, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    if transfers.is_empty() {
-        return Ok(State::new());
-    }
-
-    let mut account_keys = HashSet::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
-        account_keys.insert(transfer.sender.clone());
-        account_keys.insert(transfer.recipient.clone());
-    }
-
-    load_accounts(batch, account_keys.into_iter().collect()).await
-}
-
-async fn load_execution_state<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    transfers: &[PreparedTransfer<H>],
-) -> core::result::Result<LoadedState, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    if transfers.is_empty() {
-        return Ok(LoadedState::Unique(Vec::new()));
-    }
-
-    let mut account_keys = Vec::with_capacity(transfers.len().saturating_mul(2));
-    let mut unique = HashSet::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
-        account_keys.push(&transfer.sender);
-        account_keys.push(&transfer.recipient);
-        unique.insert(&transfer.sender);
-        unique.insert(&transfer.recipient);
-    }
-
-    if unique.len() == account_keys.len() {
-        let values = batch.get_many(&account_keys).await?;
-        let accounts = values
-            .into_iter()
-            .map(|account| account.unwrap_or_default())
-            .collect();
-        return Ok(LoadedState::Unique(accounts));
-    }
-
-    load_accounts(batch, unique.into_iter().cloned().collect())
-        .await
-        .map(LoadedState::Shared)
-}
-
-async fn load_accounts<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    account_keys: Vec<AccountKey>,
-) -> core::result::Result<State, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    if account_keys.is_empty() {
-        return Ok(State::new());
-    }
-
-    let keys = account_keys.iter().collect::<Vec<_>>();
-    let values = batch.get_many(&keys).await?;
-    Ok(account_keys
-        .into_iter()
-        .zip(values)
-        .map(|(account_key, account)| (account_key, account.unwrap_or_default()))
-        .collect())
-}
-
-fn execute_loaded<H>(
-    state: &LoadedState,
-    transfers: &[PreparedTransfer<H>],
-) -> Option<executor::Changeset>
-where
-    H: Hasher,
-{
-    match state {
-        LoadedState::Unique(accounts) => executor::execute_unique(transfers, accounts),
-        LoadedState::Shared(accounts) => executor::execute(accounts, transfers),
-    }
 }
 
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
@@ -361,5 +319,187 @@ mod tests {
         };
 
         assert_eq!(range_from_bounds(&bounds), non_empty_range!(11, 15));
+    }
+}
+
+/// DB-backed timing harness for the load + execute path against a real QMDB.
+///
+/// Run with: `cargo test -p constantinople-application --release -- --ignored
+/// --nocapture bench_load_execute`. Seeds a committed state DB, then times the
+/// new per-shard `load_and_execute` against the previous global-load + overlay
+/// path. Note: the deterministic runtime serves reads from memory, so this
+/// measures the load+execute CPU/memory path (single-map reuse vs global state +
+/// separate changeset), not the per-shard I/O concurrency, which only helps on
+/// cold disk misses.
+#[cfg(test)]
+mod db_bench {
+    use crate::executor::{PreparedTransfer, State};
+    use commonware_cryptography::{Hasher as _, Sha256};
+    use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
+    use commonware_parallel::{Rayon, Strategy as _};
+    use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
+    use commonware_storage::{
+        journal::contiguous::fixed::Config as FixedJournalConfig,
+        merkle::full::Config as MmrConfig, qmdb::any::FixedConfig, translator::EightCap,
+    };
+    use commonware_utils::{NZU16, NZU64, NZUsize};
+    use constantinople_primitives::{Account, AccountKey, Nonce};
+    use hashbrown::HashSet;
+    use std::{
+        hint::black_box,
+        time::{Duration, Instant},
+    };
+
+    type Bench = super::db::StateDatabase<deterministic::Context, Sha256, EightCap, Rayon>;
+
+    const ACCOUNTS: u64 = 131_072;
+    const TRANSACTIONS: usize = 65_536;
+    const WARMUP: u32 = 3;
+    const ITERS: u32 = 20;
+
+    fn key(index: u64) -> AccountKey {
+        AccountKey::from_bytes(bytes::Bytes::copy_from_slice(
+            Sha256::hash(&index.to_le_bytes()).as_ref(),
+        ))
+        .expect("32-byte key")
+    }
+
+    fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
+        FixedConfig {
+            merkle_config: MmrConfig {
+                journal_partition: "bench-state-journal".into(),
+                metadata_partition: "bench-state-metadata".into(),
+                items_per_blob: NZU64!(1 << 20),
+                write_buffer: NZUsize!(1 << 20),
+                strategy,
+                page_cache: cache.clone(),
+            },
+            journal_config: FixedJournalConfig {
+                partition: "bench-state-log".into(),
+                items_per_blob: NZU64!(1 << 20),
+                page_cache: cache,
+                write_buffer: NZUsize!(1 << 20),
+            },
+            translator: EightCap,
+        }
+    }
+
+    /// The previous path: one global `get_many` then an inline overlay execute.
+    async fn legacy(
+        batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
+        transfers: &[PreparedTransfer<Sha256>],
+    ) -> usize {
+        let mut keys = HashSet::with_capacity(transfers.len() * 2);
+        for transfer in transfers {
+            keys.insert(transfer.sender.clone());
+            keys.insert(transfer.recipient.clone());
+        }
+        let keys: Vec<AccountKey> = keys.into_iter().collect();
+        let refs: Vec<&AccountKey> = keys.iter().collect();
+        let values = batch.get_many(&refs).await.expect("load");
+        let state: State = keys
+            .into_iter()
+            .zip(values)
+            .map(|(k, v)| (k, v.unwrap_or_default()))
+            .collect();
+
+        let mut writes = State::with_capacity(transfers.len() * 2);
+        for transfer in transfers {
+            let mut sender = writes
+                .get(&transfer.sender)
+                .copied()
+                .or_else(|| state.get(&transfer.sender).copied())
+                .unwrap_or_default();
+            sender.balance -= transfer.value;
+            sender.nonce.consume(transfer.nonce);
+            if transfer.sender == transfer.recipient {
+                writes.insert(transfer.sender.clone(), sender);
+                continue;
+            }
+            let mut recipient = writes
+                .get(&transfer.recipient)
+                .copied()
+                .or_else(|| state.get(&transfer.recipient).copied())
+                .unwrap_or_default();
+            recipient.balance += transfer.value;
+            writes.insert(transfer.sender.clone(), sender);
+            writes.insert(transfer.recipient.clone(), recipient);
+        }
+        writes.len()
+    }
+
+    #[test]
+    #[ignore = "timing harness; run explicitly with --ignored --nocapture --release"]
+    fn bench_load_execute() {
+        deterministic::Runner::default().start(|context| async move {
+            let strategy = Rayon::new(NZUsize!(8)).expect("rayon pool");
+            let cache = CacheRef::from_pooler(&context, NZU16!(8192), NZUsize!(65536));
+            let db = <Bench as DatabaseSet<deterministic::Context>>::init(
+                context,
+                config(strategy.clone(), cache),
+            )
+            .await;
+
+            // Seed a committed state of ACCOUNTS funded accounts.
+            let mut batch = db.new_batches().await;
+            for index in 0..ACCOUNTS {
+                batch = batch.write(
+                    key(index),
+                    Some(Account {
+                        balance: 1_000_000,
+                        nonce: Nonce::default(),
+                    }),
+                );
+            }
+            let merkleized = batch.merkleize().await.expect("seed merkleize");
+            db.finalize(merkleized).await;
+
+            // Disjoint senders/recipients, each sender used once (nonce 0).
+            let transfers: Vec<PreparedTransfer<Sha256>> = (0..TRANSACTIONS)
+                .map(|i| PreparedTransfer {
+                    sender: key(i as u64),
+                    recipient: key(TRANSACTIONS as u64 + i as u64),
+                    value: 1,
+                    nonce: 0,
+                    digest: Sha256::hash(&(i as u64).to_le_bytes()),
+                })
+                .collect();
+
+            let mut new_total = Duration::ZERO;
+            for iter in 0..(WARMUP + ITERS) {
+                let batch = db.new_batches().await;
+                let start = Instant::now();
+                let maps = super::load_and_execute(&batch, &strategy, &transfers)
+                    .await
+                    .expect("new path");
+                let elapsed = start.elapsed();
+                black_box(&maps);
+                if iter >= WARMUP {
+                    new_total += elapsed;
+                }
+            }
+
+            let mut old_total = Duration::ZERO;
+            for iter in 0..(WARMUP + ITERS) {
+                let batch = db.new_batches().await;
+                let start = Instant::now();
+                let count = legacy(&batch, &transfers).await;
+                let elapsed = start.elapsed();
+                black_box(count);
+                if iter >= WARMUP {
+                    old_total += elapsed;
+                }
+            }
+
+            let new = new_total / ITERS;
+            let old = old_total / ITERS;
+            let tps = |d: Duration| TRANSACTIONS as f64 / d.as_secs_f64() / 1e6;
+            println!(
+                "load+execute  {TRANSACTIONS} txs / {ACCOUNTS} accounts, {} shards\n  new (per-shard): {new:?}  ({:.2} Melem/s)\n  old (global):    {old:?}  ({:.2} Melem/s)",
+                strategy.parallelism_hint(),
+                tps(new),
+                tps(old),
+            );
+        });
     }
 }

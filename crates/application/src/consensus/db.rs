@@ -1,6 +1,6 @@
 //! Database aliases and batch helpers for consensus execution.
 
-use crate::executor::Changeset;
+use crate::executor::ShardMap;
 use commonware_cryptography::Hasher;
 use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, any::AnyUnmerkleized};
 use commonware_parallel::Strategy;
@@ -67,21 +67,26 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
     TransactionMerkleized<E, H, S>,
 );
 
-/// Writes a changeset of account updates to a state batch.
-pub(super) fn apply_changeset<E, H, S>(
+/// Writes each shard's mutated accounts to a state batch.
+///
+/// The resulting `state_root` depends only on the final key->value set, so the
+/// shards (and accounts within them) may be folded in any order.
+pub(super) fn apply_shard_maps<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
-    changeset: &Changeset,
+    shard_maps: Vec<ShardMap>,
 ) -> StateBatch<E, H, EightCap, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    changeset
-        .iter()
-        .fold(batch, |batch, (account_key, account)| {
-            batch.write(account_key.clone(), Some(*account))
-        })
+    shard_maps.into_iter().fold(batch, |batch, shard_map| {
+        shard_map
+            .into_iter()
+            .fold(batch, |batch, (account_key, account)| {
+                batch.write(account_key, Some(account))
+            })
+    })
 }
 
 pub(super) fn apply_transaction_digests<E, H, S>(

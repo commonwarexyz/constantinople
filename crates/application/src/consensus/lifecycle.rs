@@ -64,24 +64,13 @@ where
             .instrument(info_span!("application.propose.input"))
             .await;
 
-        let (input, candidate_transfers) =
-            info_span!("application.propose.prepare").in_scope(|| {
-                let input = executor::prepare_proposal(body);
-                let candidate_transfers = input
-                    .candidates
-                    .iter()
-                    .map(|candidate| candidate.transfer.clone())
-                    .collect::<Vec<_>>();
-                (input, candidate_transfers)
-            });
-
         let (state_batch, transaction_batch) = batches;
         let execution = execute_proposal(
+            self.strategy.clone(),
             state_batch,
             transaction_batch,
             parent,
-            input,
-            &candidate_transfers,
+            body,
         )
         .await;
 
@@ -161,7 +150,13 @@ where
             Arc::clone(&body),
             self.strategy.clone(),
         );
-        let execution = execute_body(state_batch, transaction_batch, parent, Arc::clone(&body));
+        let execution = execute_body(
+            self.strategy.clone(),
+            state_batch,
+            transaction_batch,
+            parent,
+            Arc::clone(&body),
+        );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let execution = match futures::try_join!(signatures, execution, wait) {
@@ -219,6 +214,7 @@ where
 
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body(
+            self.strategy.clone(),
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),

@@ -1,5 +1,6 @@
-use super::{ProposalOutput, State, execute, execute_unique, prepare_transfer, propose};
+use super::{Changeset, State, execute, execute_with_shards, prepare_transfer};
 use commonware_cryptography::{Signer, ed25519, sha256};
+use commonware_parallel::Sequential;
 use constantinople_primitives::{
     Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
     TransactionPublicKey, VerifiedTransaction,
@@ -10,7 +11,6 @@ const NAMESPACE: &[u8] = b"executor-test";
 
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
-type TestProposal = ProposalOutput<TestHasher>;
 
 #[derive(Debug, Clone)]
 struct TestSigner {
@@ -50,37 +50,24 @@ fn account_key(public_key: &ed25519::PublicKey) -> AccountKey {
 fn changeset_account(
     changeset: &[(AccountKey, Account)],
     public_key: ed25519::PublicKey,
-) -> Option<Account> {
+) -> Account {
     let account_key = account_key(&public_key);
     changeset
         .iter()
         .find_map(|(candidate, account)| (candidate == &account_key).then_some(*account))
+        .expect("account should be in changeset")
+}
+
+fn run(accounts: &State, transactions: &[TestTransaction]) -> Option<Changeset> {
+    let transfers = transactions
+        .iter()
+        .map(prepare_transfer)
+        .collect::<Option<Vec<_>>>()?;
+    execute(&Sequential, accounts, &transfers)
 }
 
 #[test]
-fn proposal_tracks_pending_nonce_and_balance() {
-    let signer = TestSigner::from_seed(0);
-    let recipient = TestSigner::from_seed(1);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(10, 0));
-    accounts.insert(account_key(&recipient.public_key), Account::default());
-
-    let transactions = vec![
-        signer.sign(recipient.public_key.clone(), 4, 0),
-        signer.sign(recipient.public_key.clone(), 7, 1),
-        signer.sign(recipient.public_key, 6, 1),
-    ];
-    let proposal: TestProposal = propose(&accounts, transactions);
-
-    assert_eq!(proposal.valid.len(), 2);
-    assert_eq!(proposal.invalid.len(), 1);
-    assert_eq!(proposal.valid[0].value().nonce, 0);
-    assert_eq!(proposal.valid[1].value().nonce, 1);
-    assert_eq!(proposal.invalid[0].value().value.get(), 7);
-}
-
-#[test]
-fn proposal_accepts_nonce_inside_run_ahead_window() {
+fn executes_run_ahead_nonces() {
     let signer = TestSigner::from_seed(2);
     let recipient = TestSigner::from_seed(3);
     let mut accounts = State::new();
@@ -92,21 +79,29 @@ fn proposal_accepts_nonce_inside_run_ahead_window() {
         signer.sign(recipient.public_key.clone(), 4, 0),
         signer.sign(recipient.public_key.clone(), 2, 1),
     ];
-    let proposal = propose(&accounts, transactions);
-    let sender = changeset_account(&proposal.changeset, signer.public_key)
-        .expect("sender should be updated");
-    let recipient = changeset_account(&proposal.changeset, recipient.public_key)
-        .expect("recipient should be updated");
+    let changeset = run(&accounts, &transactions).expect("valid batch should execute");
 
-    assert_eq!(proposal.valid.len(), 3);
-    assert!(proposal.invalid.is_empty());
+    let sender = changeset_account(&changeset, signer.public_key);
+    let recipient = changeset_account(&changeset, recipient.public_key);
     assert_eq!(sender.balance, 1);
     assert_eq!(sender.nonce.base, 3);
     assert_eq!(recipient.balance, DEFAULT_ACCOUNT_BALANCE + 9);
 }
 
 #[test]
-fn proposal_rejects_duplicate_run_ahead_nonce() {
+fn rejects_insufficient_balance() {
+    let signer = TestSigner::from_seed(0);
+    let recipient = TestSigner::from_seed(1);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(5, 0));
+    accounts.insert(account_key(&recipient.public_key), Account::default());
+
+    let transactions = vec![signer.sign(recipient.public_key, 6, 0)];
+    assert!(run(&accounts, &transactions).is_none());
+}
+
+#[test]
+fn rejects_duplicate_run_ahead_nonce() {
     let signer = TestSigner::from_seed(4);
     let recipient = TestSigner::from_seed(5);
     let mut accounts = State::new();
@@ -117,18 +112,11 @@ fn proposal_rejects_duplicate_run_ahead_nonce() {
         signer.sign(recipient.public_key.clone(), 3, 2),
         signer.sign(recipient.public_key, 4, 2),
     ];
-    let proposal = propose(&accounts, transactions);
-    let sender = changeset_account(&proposal.changeset, signer.public_key)
-        .expect("sender should be updated");
-
-    assert_eq!(proposal.valid.len(), 1);
-    assert_eq!(proposal.invalid.len(), 1);
-    assert_eq!(sender.balance, 7);
-    assert_eq!(sender.nonce.base, 0);
+    assert!(run(&accounts, &transactions).is_none());
 }
 
 #[test]
-fn proposal_accepts_far_ahead_nonce_and_rejects_duplicate() {
+fn rejects_far_ahead_duplicate_nonce() {
     let signer = TestSigner::from_seed(6);
     let recipient = TestSigner::from_seed(7);
     let mut accounts = State::new();
@@ -140,18 +128,11 @@ fn proposal_accepts_far_ahead_nonce_and_rejects_duplicate() {
         signer.sign(recipient.public_key.clone(), 3, nonce),
         signer.sign(recipient.public_key, 4, nonce),
     ];
-    let proposal = propose(&accounts, transactions);
-    let sender = changeset_account(&proposal.changeset, signer.public_key)
-        .expect("sender should be updated");
-
-    assert_eq!(proposal.valid.len(), 1);
-    assert_eq!(proposal.invalid.len(), 1);
-    assert_eq!(sender.balance, 7);
-    assert_eq!(sender.nonce.base, NONCE_BITMAP_CAPACITY + 2);
+    assert!(run(&accounts, &transactions).is_none());
 }
 
 #[test]
-fn proposal_and_replay_match_for_transfer_batch() {
+fn executes_multi_sender_batch() {
     let sender_a = TestSigner::from_seed(10);
     let sender_b = TestSigner::from_seed(11);
     let recipient = TestSigner::from_seed(12);
@@ -165,56 +146,19 @@ fn proposal_and_replay_match_for_transfer_batch() {
         sender_a.sign(recipient.public_key.clone(), 4, 0),
         sender_b.sign(recipient.public_key.clone(), 6, 0),
     ];
+    let changeset = run(&accounts, &transactions).expect("valid batch should execute");
 
-    let proposal = propose(&accounts, transactions);
-    let changeset = execute_prepared(&accounts, &proposal.valid)
-        .expect("valid proposal transactions should execute");
-
-    assert_eq!(proposal.changeset, changeset);
     assert_eq!(
         changeset_account(&changeset, sender_a.public_key),
-        Some(account(7, 1))
+        account(7, 1)
     );
     assert_eq!(
         changeset_account(&changeset, sender_b.public_key),
-        Some(account(7, 1))
+        account(7, 1)
     );
     assert_eq!(
         changeset_account(&changeset, recipient.public_key),
-        Some(account(15, 0))
-    );
-}
-
-#[test]
-fn unique_loaded_execution_matches_overlay_execution() {
-    let sender_a = TestSigner::from_seed(20);
-    let sender_b = TestSigner::from_seed(21);
-    let recipient_a = TestSigner::from_seed(22);
-    let recipient_b = TestSigner::from_seed(23);
-
-    let mut accounts = State::new();
-    accounts.insert(account_key(&sender_a.public_key), account(11, 0));
-    accounts.insert(account_key(&sender_b.public_key), account(13, 0));
-    accounts.insert(account_key(&recipient_a.public_key), account(5, 0));
-    accounts.insert(account_key(&recipient_b.public_key), account(7, 0));
-
-    let transactions = [
-        sender_a.sign(recipient_a.public_key, 4, 0),
-        sender_b.sign(recipient_b.public_key, 6, 0),
-    ];
-    let transfers = transactions
-        .iter()
-        .map(prepare_transfer)
-        .collect::<Option<Vec<_>>>()
-        .expect("test transactions should prepare");
-    let loaded = transfers
-        .iter()
-        .flat_map(|transfer| [accounts[&transfer.sender], accounts[&transfer.recipient]])
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        execute_unique(&transfers, &loaded),
-        execute(&accounts, &transfers)
+        account(15, 0)
     );
 }
 
@@ -225,44 +169,16 @@ fn self_transfer_only_bumps_nonce() {
     accounts.insert(account_key(&signer.public_key), account(9, 3));
 
     let transactions = vec![signer.sign(signer.public_key.clone(), 4, 3)];
-    let proposal = propose(&accounts, transactions);
-    let changeset = execute_prepared(&accounts, &proposal.valid)
-        .expect("valid proposal transactions should execute");
+    let changeset = run(&accounts, &transactions).expect("self-transfer should execute");
 
     assert_eq!(
         changeset_account(&changeset, signer.public_key),
-        Some(account(9, 4))
+        account(9, 4)
     );
 }
 
 #[test]
-fn invalid_transfer_does_not_mutate_overlay() {
-    let signer = TestSigner::from_seed(30);
-    let recipient = TestSigner::from_seed(31);
-    let mut accounts = State::new();
-    accounts.insert(account_key(&signer.public_key), account(5, 0));
-    accounts.insert(account_key(&recipient.public_key), account(0, 0));
-
-    let transactions = vec![
-        signer.sign(recipient.public_key.clone(), 6, 0),
-        signer.sign(recipient.public_key.clone(), 4, 0),
-    ];
-    let proposal = propose(&accounts, transactions);
-
-    assert_eq!(proposal.invalid.len(), 1);
-    assert_eq!(proposal.valid.len(), 1);
-    assert_eq!(
-        changeset_account(&proposal.changeset, signer.public_key),
-        Some(account(1, 1))
-    );
-    assert_eq!(
-        changeset_account(&proposal.changeset, recipient.public_key),
-        Some(account(4, 0))
-    );
-}
-
-#[test]
-fn recipient_overflow_rejects_without_charging_sender() {
+fn rejects_recipient_overflow() {
     let signer = TestSigner::from_seed(40);
     let recipient = TestSigner::from_seed(41);
     let mut accounts = State::new();
@@ -270,21 +186,114 @@ fn recipient_overflow_rejects_without_charging_sender() {
     accounts.insert(account_key(&recipient.public_key), account(u64::MAX, 0));
 
     let transactions = vec![signer.sign(recipient.public_key, 1, 0)];
-    let proposal = propose(&accounts, transactions);
-
-    assert!(proposal.valid.is_empty());
-    assert_eq!(proposal.invalid.len(), 1);
-    assert!(proposal.changeset.is_empty());
-    assert!(execute_prepared(&accounts, &proposal.invalid).is_none());
+    assert!(run(&accounts, &transactions).is_none());
 }
 
-fn execute_prepared(
-    accounts: &State,
-    transactions: &[TestTransaction],
-) -> Option<super::Changeset> {
-    let transfers = transactions
+fn contended_accounts(account_count: usize) -> (State, Vec<TestSigner>) {
+    let signers: Vec<TestSigner> = (0..account_count as u64)
+        .map(TestSigner::from_seed)
+        .collect();
+    let mut accounts = State::new();
+    for signer in &signers {
+        accounts.insert(account_key(&signer.public_key), account(1_000, 0));
+    }
+    (accounts, signers)
+}
+
+fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer<TestHasher>> {
+    transactions
         .iter()
         .map(prepare_transfer)
-        .collect::<Option<Vec<_>>>()?;
-    execute(accounts, &transfers)
+        .collect::<Option<Vec<_>>>()
+        .expect("transactions should prepare")
+}
+
+const SHARD_COUNTS: &[usize] = &[1, 2, 3, 5, 8, 16];
+
+#[test]
+fn execution_is_independent_of_shard_count() {
+    // Contended accounts: senders overlap recipients, each signs several
+    // transactions in out-of-order (run-ahead) nonces, and round 2 is a
+    // self-transfer for every account. Every transaction is valid.
+    let account_count = 600usize;
+    let (accounts, signers) = contended_accounts(account_count);
+
+    let mut transactions = Vec::new();
+    for round in 0..4u64 {
+        for (index, signer) in signers.iter().enumerate() {
+            let recipient = if round == 2 {
+                signer.public_key.clone()
+            } else {
+                signers[(index * 7 + 1) % account_count].public_key.clone()
+            };
+            transactions.push(signer.sign(recipient, 1, round));
+        }
+    }
+    let transfers = prepared(&transactions);
+
+    let expected = execute_with_shards(&accounts, &transfers, 1).expect("valid batch executes");
+    for &shards in SHARD_COUNTS {
+        assert_eq!(
+            execute_with_shards(&accounts, &transfers, shards),
+            Some(expected.clone()),
+            "shards={shards}"
+        );
+    }
+}
+
+#[test]
+fn invalid_batch_rejected_for_all_shard_counts() {
+    // A duplicate nonce makes the batch invalid; every shard count must reject it.
+    let account_count = 600usize;
+    let (accounts, signers) = contended_accounts(account_count);
+
+    let mut transactions = Vec::new();
+    for (index, signer) in signers.iter().enumerate() {
+        let recipient = signers[(index + 1) % account_count].public_key.clone();
+        transactions.push(signer.sign(recipient.clone(), 1, 0));
+        transactions.push(signer.sign(recipient.clone(), 2, 0)); // duplicate nonce
+        transactions.push(signer.sign(recipient, 1, 1));
+    }
+    let transfers = prepared(&transactions);
+
+    for &shards in SHARD_COUNTS {
+        assert!(
+            execute_with_shards(&accounts, &transfers, shards).is_none(),
+            "shards={shards}"
+        );
+    }
+}
+
+#[test]
+fn failed_debit_rejects_for_all_shard_counts() {
+    // A failed debit (insufficient balance) rejects the whole batch on every
+    // shard count, even when its recipient is near overflow (no phantom credit
+    // can ever spuriously overflow the valid transfer).
+    let broke = TestSigner::from_seed(1);
+    let funded = TestSigner::from_seed(2);
+    let recipient = TestSigner::from_seed(3);
+
+    let mut accounts = State::new();
+    accounts.insert(account_key(&broke.public_key), account(0, 0)); // cannot pay
+    accounts.insert(account_key(&funded.public_key), account(100, 0));
+    accounts.insert(
+        account_key(&recipient.public_key),
+        Account {
+            balance: u64::MAX - 1,
+            nonce: Nonce::new(0, 0),
+        },
+    );
+
+    let transactions = [
+        broke.sign(recipient.public_key.clone(), 1, 0), // debit fails
+        funded.sign(recipient.public_key, 1, 0),
+    ];
+    let transfers = prepared(&transactions);
+
+    for &shards in SHARD_COUNTS {
+        assert!(
+            execute_with_shards(&accounts, &transfers, shards).is_none(),
+            "shards={shards}"
+        );
+    }
 }
