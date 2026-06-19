@@ -1,6 +1,5 @@
-use super::{Changeset, State, execute, execute_with_shards, prepare_transfer};
+use super::{Changeset, State, compute, prepare_transfer};
 use commonware_cryptography::{Signer, ed25519, sha256};
-use commonware_parallel::Sequential;
 use constantinople_primitives::{
     Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
     TransactionPublicKey, VerifiedTransaction,
@@ -64,7 +63,7 @@ fn run(accounts: &State, transactions: &[TestTransaction]) -> Option<Changeset> 
         .iter()
         .map(prepare_transfer)
         .collect::<Option<Vec<_>>>()?;
-    execute(&Sequential, accounts, &transfers)
+    compute(accounts, &transfers)
 }
 
 #[test]
@@ -205,12 +204,7 @@ fn rejects_spend_funded_by_in_block_credit() {
     ];
     let transfers = prepared(&transactions);
 
-    for &shards in SHARD_COUNTS {
-        assert!(
-            execute_with_shards(&accounts, &transfers, shards).is_none(),
-            "shards={shards}"
-        );
-    }
+    assert!(compute(&accounts, &transfers).is_none());
 }
 
 #[test]
@@ -229,7 +223,7 @@ fn self_transfer_only_bumps_nonce() {
 }
 
 #[test]
-fn rejects_unfunded_self_transfer_for_all_shard_counts() {
+fn rejects_unfunded_self_transfer() {
     let signer = TestSigner::from_seed(42);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(0, 0));
@@ -237,12 +231,7 @@ fn rejects_unfunded_self_transfer_for_all_shard_counts() {
     let transactions = vec![signer.sign(signer.public_key.clone(), 1, 0)];
     let transfers = prepared(&transactions);
 
-    for &shards in SHARD_COUNTS {
-        assert!(
-            execute_with_shards(&accounts, &transfers, shards).is_none(),
-            "shards={shards}"
-        );
-    }
+    assert!(compute(&accounts, &transfers).is_none());
 }
 
 #[test]
@@ -275,8 +264,6 @@ fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer> {
         .collect::<Option<Vec<_>>>()
         .expect("transactions should prepare")
 }
-
-const SHARD_COUNTS: &[usize] = &[1, 2, 3, 5, 8, 16];
 
 #[test]
 fn contended_general_account_load_keys_are_deduplicated() {
@@ -365,7 +352,7 @@ fn mixed_discrete_and_general_execution_writes_each_account_once() {
 }
 
 #[test]
-fn execution_is_independent_of_shard_count() {
+fn executes_large_contended_batch() {
     // Contended accounts: senders overlap recipients, each signs several
     // transactions in out-of-order (run-ahead) nonces, and round 2 is a
     // self-transfer for every account. Every transaction is valid.
@@ -385,19 +372,12 @@ fn execution_is_independent_of_shard_count() {
     }
     let transfers = prepared(&transactions);
 
-    let expected = execute_with_shards(&accounts, &transfers, 1).expect("valid batch executes");
-    for &shards in SHARD_COUNTS {
-        assert_eq!(
-            execute_with_shards(&accounts, &transfers, shards),
-            Some(expected.clone()),
-            "shards={shards}"
-        );
-    }
+    assert!(compute(&accounts, &transfers).is_some());
 }
 
 #[test]
-fn invalid_batch_rejected_for_all_shard_counts() {
-    // A duplicate nonce makes the batch invalid; every shard count must reject it.
+fn rejects_large_duplicate_nonce_batch() {
+    // A duplicate nonce makes the batch invalid.
     let account_count = 600usize;
     let (accounts, signers) = contended_accounts(account_count);
 
@@ -410,19 +390,13 @@ fn invalid_batch_rejected_for_all_shard_counts() {
     }
     let transfers = prepared(&transactions);
 
-    for &shards in SHARD_COUNTS {
-        assert!(
-            execute_with_shards(&accounts, &transfers, shards).is_none(),
-            "shards={shards}"
-        );
-    }
+    assert!(compute(&accounts, &transfers).is_none());
 }
 
 #[test]
-fn failed_debit_rejects_for_all_shard_counts() {
-    // A failed debit (insufficient balance) rejects the whole batch on every
-    // shard count, even when its recipient is near overflow (no phantom credit
-    // can ever spuriously overflow the valid transfer).
+fn failed_debit_rejects_batch() {
+    // A failed debit rejects the whole batch, even when its recipient is near
+    // overflow.
     let broke = TestSigner::from_seed(1);
     let funded = TestSigner::from_seed(2);
     let recipient = TestSigner::from_seed(3);
@@ -444,10 +418,5 @@ fn failed_debit_rejects_for_all_shard_counts() {
     ];
     let transfers = prepared(&transactions);
 
-    for &shards in SHARD_COUNTS {
-        assert!(
-            execute_with_shards(&accounts, &transfers, shards).is_none(),
-            "shards={shards}"
-        );
-    }
+    assert!(compute(&accounts, &transfers).is_none());
 }

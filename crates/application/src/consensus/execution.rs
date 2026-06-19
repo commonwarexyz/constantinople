@@ -989,7 +989,7 @@ mod tests {
     }
 }
 
-/// DB-backed timing harness for the load + execute path against a real QMDB.
+/// DB-backed timing harness for the compute path against a real QMDB.
 ///
 /// Run with: `cargo test -p constantinople-application --release -- --ignored
 /// --nocapture bench_compute`. Seeds a committed state DB, then times the
@@ -1024,7 +1024,7 @@ mod db_bench {
     const ACCOUNTS: u64 = 1_000_000;
     const TRANSACTION_COUNTS: &[usize] = &[16_384, 32_768];
     const MAX_SIGNED_ACCOUNTS: u64 = 65_536;
-    const NAMESPACE: &[u8] = b"load-execute-bench";
+    const NAMESPACE: &[u8] = b"compute-bench";
     const SHARED_FANOUT: usize = 8;
     const WARMUP: u32 = 2;
     const ITERS: u32 = 10;

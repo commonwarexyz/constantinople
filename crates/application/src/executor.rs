@@ -27,7 +27,6 @@
 
 use ahash::RandomState;
 use commonware_cryptography::Hasher;
-use commonware_parallel::Strategy;
 use constantinople_primitives::{Account, AccountKey, SignedTransaction};
 use core::marker::PhantomData;
 use hashbrown::HashMap;
@@ -353,31 +352,6 @@ pub(crate) fn apply_general_accounts(
     Some(writes)
 }
 
-/// Executes a batch against an in-memory base state.
-///
-/// Used by tests and benchmarks; the consensus path loads accounts from the
-/// database instead (see `consensus::execution`). The shard count is retained
-/// for benchmark/test compatibility and does not affect the execution result.
-pub(crate) fn execute_with_shards(
-    state: &State,
-    transfers: &[PreparedTransfer],
-    _shards: usize,
-) -> Option<Changeset> {
-    let plan = execution_plan(transfers)?;
-    let mut changeset = execute_discrete(state, &plan.discrete)?;
-    if !plan.general.is_empty() {
-        let accounts = plan
-            .general
-            .account_keys()
-            .iter()
-            .map(|key| state.get(*key).copied())
-            .collect();
-        changeset.extend(apply_general_accounts(accounts, &plan.general, transfers)?);
-    }
-    changeset.sort_unstable_by_key(|(key, _)| *key);
-    Some(changeset)
-}
-
 fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Changeset> {
     assert_eq!(plan.sender_keys.len(), plan.transfers.len());
     let mut changeset =
@@ -405,15 +379,24 @@ fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Change
     Some(changeset)
 }
 
-/// Executes a batch against an in-memory base state.
+/// Computes a batch changeset against an in-memory base state.
 ///
 /// Returns the sorted changeset, or `None` if any transfer fails its nonce or
 /// balance check or any recipient credit overflows.
-pub fn execute<S>(strategy: &S, state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset>
-where
-    S: Strategy,
-{
-    execute_with_shards(state, transfers, strategy.parallelism_hint())
+pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset> {
+    let plan = execution_plan(transfers)?;
+    let mut changeset = execute_discrete(state, &plan.discrete)?;
+    if !plan.general.is_empty() {
+        let accounts = plan
+            .general
+            .account_keys()
+            .iter()
+            .map(|key| state.get(*key).copied())
+            .collect();
+        changeset.extend(apply_general_accounts(accounts, &plan.general, transfers)?);
+    }
+    changeset.sort_unstable_by_key(|(key, _)| *key);
+    Some(changeset)
 }
 
 #[cfg(test)]

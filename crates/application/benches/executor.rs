@@ -1,6 +1,5 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
-use commonware_parallel::Sequential;
 use constantinople_application::executor::{self, PreparedTransfer, State};
 use constantinople_primitives::{
     Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
@@ -28,23 +27,23 @@ fn executor(c: &mut Criterion) {
 
         // Unique senders and recipients (every account touched once).
         let (state, transfers) = build_unique_fixture(transaction_count);
-        bench_execute(&mut group, "unique", transaction_count, &state, &transfers);
+        bench_compute(&mut group, "unique", transaction_count, &state, &transfers);
 
         // Contended accounts: each sender signs several transactions to shared
         // recipients, so senders and recipients overlap across the batch.
         let (state, transfers) = build_shared_fixture(transaction_count);
-        bench_execute(&mut group, "shared", transaction_count, &state, &transfers);
+        bench_compute(&mut group, "shared", transaction_count, &state, &transfers);
     }
 
     group.finish();
 }
 
-/// Benchmarks only the in-memory CPU cost of the current execute kernel on
+/// Benchmarks only the in-memory CPU cost of the current compute kernel on
 /// pre-loaded state. It does NOT measure the load, which is the part this
 /// change restructures, so it is not a benchmark of the pipeline. For the real
-/// load + execute measurement against a QMDB, see the `db_bench` harness in
+/// load + compute measurement against a QMDB, see the `db_bench` harness in
 /// `consensus::execution` (run with `--ignored --nocapture --release`).
-fn bench_execute(
+fn bench_compute(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     fixture: &str,
     transaction_count: usize,
@@ -57,7 +56,7 @@ fn bench_execute(
         |bencher, _| {
             bencher.iter(|| {
                 black_box(
-                    executor::execute(&Sequential, black_box(state), black_box(transfers))
+                    executor::compute(black_box(state), black_box(transfers))
                         .expect("bench transfers should execute")
                         .len(),
                 )
@@ -133,7 +132,7 @@ fn finalize_fixture(accounts: State, transactions: Vec<TestTransaction>) -> (Sta
         .map(executor::prepare_transfer)
         .collect::<Option<Vec<_>>>()
         .expect("bench transactions should prepare");
-    executor::execute(&Sequential, &accounts, &transfers).expect("bench fixtures must be valid");
+    executor::compute(&accounts, &transfers).expect("bench fixtures must be valid");
     (accounts, transfers)
 }
 
