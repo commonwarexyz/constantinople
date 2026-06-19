@@ -40,6 +40,7 @@ exoware-sql.workspace = true
 datafusion.workspace = true
 
 # Other
+ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }

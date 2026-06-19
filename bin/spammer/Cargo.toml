@@ -27,6 +27,7 @@ commonware-runtime.workspace = true
 commonware-utils.workspace = true
 
 # Other
+ahash.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }

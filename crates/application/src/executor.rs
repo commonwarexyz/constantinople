@@ -25,16 +25,13 @@
 //! batch has no failed debits, every loaded account effect produces one final
 //! write.
 
-use ahash::RandomState;
+use ahash::AHashMap;
 use commonware_cryptography::Hasher;
 use constantinople_primitives::{Account, AccountKey, SignedTransaction};
 use core::marker::PhantomData;
-use hashbrown::HashMap;
-
-type FastMap<K, V> = HashMap<K, V, RandomState>;
 
 /// Fully loaded base account state for one in-memory execution batch.
-pub type State = HashMap<AccountKey, Account>;
+pub type State = AHashMap<AccountKey, Account>;
 
 /// Deterministic account writes produced by execution.
 pub type Changeset = Vec<(AccountKey, Account)>;
@@ -256,8 +253,8 @@ impl<'a> GeneralBuilder<'a> {
 
 /// Builds the execution plan used by both DB-backed and in-memory execution.
 pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<ExecutionPlan<'_>> {
-    let mut touches: FastMap<&AccountKey, usize> =
-        FastMap::with_capacity_and_hasher(transfers.len().saturating_mul(2), RandomState::new());
+    let mut touches: AHashMap<&AccountKey, usize> =
+        AHashMap::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
         *touches.entry(&transfer.sender).or_default() += 1;
         if transfer.sender != transfer.recipient {

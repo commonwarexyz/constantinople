@@ -6,6 +6,7 @@
 //! certificate artifacts with only the commitment-tagged header so height/latest
 //! verification does not fetch the full body.
 
+use ahash::AHashMap;
 use bytes::Buf;
 use commonware_actor::Feedback;
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
@@ -18,7 +19,7 @@ use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
-use std::{collections::HashMap, time::Duration};
+use std::time::Duration;
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{debug, warn};
 
@@ -161,7 +162,7 @@ where
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send + Sync,
 {
-    let mut pending = HashMap::<Vec<u8>, PendingBlockCertificates<H, P, S>>::new();
+    let mut pending: AHashMap<Vec<u8>, PendingBlockCertificates<H, P, S>> = AHashMap::new();
     while let Some(input) = rx.recv().await {
         let key = input.block_digest_key();
         let entry = pending.entry(key.clone()).or_default();

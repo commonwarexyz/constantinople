@@ -27,6 +27,7 @@ commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
+ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }

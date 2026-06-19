@@ -1701,7 +1701,6 @@ dependencies = [
  "constantinople-primitives",
  "criterion",
  "futures",
- "hashbrown 0.17.1",
  "prometheus-client",
  "rand 0.8.6",
  "rand_core 0.6.4",
@@ -1762,6 +1761,7 @@ dependencies = [
 name = "constantinople-indexer"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "axum",
  "bytes",
  "clap",
@@ -1807,6 +1807,7 @@ dependencies = [
 name = "constantinople-mempool"
 version = "0.1.0"
 dependencies = [
+ "ahash",
  "axum",
  "bytes",
  "commonware-actor",
@@ -1858,6 +1859,7 @@ dependencies = [
 name = "constantinople-spammer"
 version = "0.0.0"
 dependencies = [
+ "ahash",
  "bytes",
  "clap",
  "commonware-codec",
@@ -1881,6 +1883,7 @@ dependencies = [
 name = "constantinople-validator"
 version = "0.0.0"
 dependencies = [
+ "ahash",
  "axum",
  "bytes",
  "clap",
@@ -3540,7 +3543,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed5909b6e89a2db4456e54cd5f673791d7eca6732202bbf2a9cc504fe2f9b84a"
 dependencies = [
  "allocator-api2",
- "foldhash 0.2.0",
 ]
 
 [[package]]

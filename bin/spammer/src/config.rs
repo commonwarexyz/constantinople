@@ -1,8 +1,9 @@
 //! Configuration loading and relayer URL resolution.
 
+use ahash::AHashMap;
 use commonware_deployer::aws::Hosts;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, path::Path};
+use std::path::Path;
 
 /// Default number of fully signed local batches kept ready per submitter.
 pub const DEFAULT_PRESIGNED_BATCHES: usize = 16;
@@ -66,7 +67,7 @@ pub fn resolve_named_http_url(url: &str, hosts_path: Option<&Path>) -> String {
         .hosts
         .iter()
         .map(|host| (host.name.as_str(), host.ip))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
 
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();

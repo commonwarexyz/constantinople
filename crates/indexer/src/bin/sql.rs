@@ -6,6 +6,7 @@
 //! direct local invocations (`--store-url`, `--port`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
 
+use ahash::AHashMap;
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
 use commonware_deployer::aws::Hosts;
@@ -14,7 +15,6 @@ use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
     fs,
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
@@ -66,7 +66,7 @@ fn load_deployer_config(path: &Path) -> DeployerConfig {
     serde_yaml::from_str(&raw).expect("failed to parse metadata-indexer config")
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &HashMap<&str, std::net::IpAddr>) -> String {
+fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();
     };
@@ -96,7 +96,7 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
             .hosts
             .iter()
             .map(|host| (host.name.as_str(), host.ip))
-            .collect::<HashMap<_, _>>();
+            .collect::<AHashMap<_, _>>();
         let store_url = resolve_named_http_url(&config.chain_indexer_url, &hosts_by_name);
         return (store_url, cli.host, config.port);
     }

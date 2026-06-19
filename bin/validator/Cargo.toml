@@ -36,6 +36,7 @@ commonware-storage.workspace = true
 commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 
 # Other
+ahash.workspace = true
 axum.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true

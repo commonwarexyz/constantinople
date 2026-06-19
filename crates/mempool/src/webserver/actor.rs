@@ -5,6 +5,7 @@
 //! consensus layer via the [`Mailbox`].
 
 use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
+use ahash::{AHashMap, AHashSet};
 use commonware_codec::EncodeSize;
 use commonware_consensus::{marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
@@ -14,7 +15,7 @@ use commonware_utils::{Acknowledgement, channel::fallible::OneshotExt};
 use constantinople_primitives::{PublicKeyCache, VerifiedTransaction};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     fmt::Display,
     hash::Hash,
     sync::{Arc, OnceLock},
@@ -112,7 +113,7 @@ pub(super) enum IngestStatus {
 fn status_for_finalized_block<D>(
     height: u64,
     digests: &[D],
-    finalized: &HashSet<D>,
+    finalized: &AHashSet<D>,
 ) -> Option<TxStatus>
 where
     D: Copy + Display + Eq + Hash,
@@ -145,7 +146,7 @@ where
 
 fn batch_status_from_outcomes<D>(
     digests: &[D],
-    outcomes: &HashMap<D, DigestOutcome>,
+    outcomes: &AHashMap<D, DigestOutcome>,
 ) -> Option<BatchStatus>
 where
     D: Copy + Display + Eq + Hash,
@@ -210,7 +211,7 @@ where
 }
 
 fn remember_status(
-    statuses: &mut HashMap<String, BatchStatus>,
+    statuses: &mut AHashMap<String, BatchStatus>,
     status_order: &mut VecDeque<String>,
     batch_id: String,
     status: BatchStatus,
@@ -232,7 +233,7 @@ fn remember_status(
 }
 
 fn send_pending_waiters(
-    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
     batch_id: &str,
     status: &BatchStatus,
 ) {
@@ -247,11 +248,11 @@ fn send_pending_waiters(
     }
 }
 
-fn watch_batch<D>(batch_id: &str, digests: &[D], watchers: &mut HashMap<D, Vec<String>>)
+fn watch_batch<D>(batch_id: &str, digests: &[D], watchers: &mut AHashMap<D, Vec<String>>)
 where
     D: Copy + Eq + Hash,
 {
-    let mut seen = HashSet::new();
+    let mut seen: AHashSet<D> = AHashSet::new();
     for digest in digests {
         if !seen.insert(*digest) {
             continue;
@@ -265,10 +266,10 @@ where
 
 fn forget_batch<D>(
     batch_id: &str,
-    batch_digests: &mut HashMap<String, Vec<D>>,
-    watchers: &mut HashMap<D, Vec<String>>,
-    outcomes: &mut HashMap<D, DigestOutcome>,
-    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    batch_digests: &mut AHashMap<String, Vec<D>>,
+    watchers: &mut AHashMap<D, Vec<String>>,
+    outcomes: &mut AHashMap<D, DigestOutcome>,
+    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Eq + Hash,
 {
@@ -277,7 +278,7 @@ fn forget_batch<D>(
         return;
     };
 
-    let mut seen = HashSet::new();
+    let mut seen: AHashSet<D> = AHashSet::new();
     for digest in digests {
         if !seen.insert(digest) {
             continue;
@@ -295,10 +296,10 @@ fn forget_batch<D>(
 
 fn forget_expired_batches<D>(
     expired: Vec<String>,
-    batch_digests: &mut HashMap<String, Vec<D>>,
-    watchers: &mut HashMap<D, Vec<String>>,
-    outcomes: &mut HashMap<D, DigestOutcome>,
-    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    batch_digests: &mut AHashMap<String, Vec<D>>,
+    watchers: &mut AHashMap<D, Vec<String>>,
+    outcomes: &mut AHashMap<D, DigestOutcome>,
+    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Eq + Hash,
 {
@@ -313,11 +314,11 @@ fn forget_expired_batches<D>(
     }
 }
 
-fn watched_batches_for<D>(digests: &[D], watchers: &HashMap<D, Vec<String>>) -> HashSet<String>
+fn watched_batches_for<D>(digests: &[D], watchers: &AHashMap<D, Vec<String>>) -> AHashSet<String>
 where
     D: Copy + Eq + Hash,
 {
-    let mut affected = HashSet::new();
+    let mut affected: AHashSet<String> = AHashSet::new();
     for digest in digests {
         let Some(batch_ids) = watchers.get(digest) else {
             continue;
@@ -329,12 +330,12 @@ where
 
 fn resolve_batch_if_terminal<D>(
     batch_id: &str,
-    statuses: &mut HashMap<String, BatchStatus>,
+    statuses: &mut AHashMap<String, BatchStatus>,
     status_order: &mut VecDeque<String>,
-    batch_digests: &mut HashMap<String, Vec<D>>,
-    digest_watchers: &mut HashMap<D, Vec<String>>,
-    digest_outcomes: &mut HashMap<D, DigestOutcome>,
-    pending_waiters: &mut HashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    batch_digests: &mut AHashMap<String, Vec<D>>,
+    digest_watchers: &mut AHashMap<D, Vec<String>>,
+    digest_outcomes: &mut AHashMap<D, DigestOutcome>,
+    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Display + Eq + Hash,
 {
@@ -367,7 +368,7 @@ fn resolve_batch_if_terminal<D>(
 
 fn new_transactions<H>(
     transactions: Vec<VerifiedTransaction<H>>,
-    known_digests: &mut HashSet<H::Digest>,
+    known_digests: &mut AHashSet<H::Digest>,
 ) -> Vec<VerifiedTransaction<H>>
 where
     H: Hasher,
@@ -385,7 +386,7 @@ where
 
 fn remove_known_digests<H>(
     transactions: &[VerifiedTransaction<H>],
-    known_digests: &mut HashSet<H::Digest>,
+    known_digests: &mut AHashSet<H::Digest>,
 ) where
     H: Hasher,
     H::Digest: Eq + Hash,
@@ -508,13 +509,13 @@ where
         });
 
         let mut proposed: VecDeque<ProposedBatch<H>> = VecDeque::new();
-        let mut statuses: HashMap<String, BatchStatus> = HashMap::new();
+        let mut statuses: AHashMap<String, BatchStatus> = AHashMap::new();
         let mut status_order = VecDeque::new();
-        let mut batch_digests: HashMap<String, Vec<H::Digest>> = HashMap::new();
-        let mut digest_watchers: HashMap<H::Digest, Vec<String>> = HashMap::new();
-        let mut digest_outcomes: HashMap<H::Digest, DigestOutcome> = HashMap::new();
-        let mut pending_waiters: HashMap<String, Vec<oneshot::Sender<TxStatus>>> = HashMap::new();
-        let mut known_digests: HashSet<H::Digest> = HashSet::new();
+        let mut batch_digests: AHashMap<String, Vec<H::Digest>> = AHashMap::new();
+        let mut digest_watchers: AHashMap<H::Digest, Vec<String>> = AHashMap::new();
+        let mut digest_outcomes: AHashMap<H::Digest, DigestOutcome> = AHashMap::new();
+        let mut pending_waiters: AHashMap<String, Vec<oneshot::Sender<TxStatus>>> = AHashMap::new();
+        let mut known_digests: AHashSet<H::Digest> = AHashSet::new();
         let mut highest_consensus_round = 0;
 
         while let Some(message) = rx.recv().await {
@@ -618,7 +619,7 @@ where
                     highest_consensus_round =
                         highest_consensus_round.max(rotation_round(block.header.context.round));
                     let height = block.header.height;
-                    let finalized: HashSet<H::Digest> = block
+                    let finalized: AHashSet<H::Digest> = block
                         .body
                         .iter()
                         .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
@@ -691,12 +692,12 @@ mod tests {
         BatchStatus, DigestOutcome, TxStatus, batch_status_from_outcomes, new_transactions,
         status_for_finalized_block,
     };
+    use ahash::{AHashMap, AHashSet};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
-    use std::collections::{HashMap, HashSet};
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {
@@ -705,7 +706,7 @@ mod tests {
         let second = sha256::Digest::random(&mut rng);
         let third = sha256::Digest::random(&mut rng);
         let digests = vec![first, second, third];
-        let finalized = HashSet::from([first, third]);
+        let finalized = [first, third].into_iter().collect::<AHashSet<_>>();
 
         let status = status_for_finalized_block(42, &digests, &finalized);
 
@@ -725,7 +726,7 @@ mod tests {
         let first = sha256::Digest::random(&mut rng);
         let second = sha256::Digest::random(&mut rng);
         let digests = vec![first, second];
-        let finalized = HashSet::from([first, second]);
+        let finalized = [first, second].into_iter().collect::<AHashSet<_>>();
 
         let status = status_for_finalized_block(11, &digests, &finalized);
 
@@ -748,7 +749,7 @@ mod tests {
             &mut sha256::Sha256::default(),
         );
         let duplicate = transaction.clone();
-        let mut known = HashSet::new();
+        let mut known: AHashSet<_> = AHashSet::new();
 
         let accepted = new_transactions(vec![transaction, duplicate], &mut known);
 
@@ -762,7 +763,9 @@ mod tests {
         let first = sha256::Digest::random(&mut rng);
         let second = sha256::Digest::random(&mut rng);
         let digests = vec![first, second];
-        let outcomes = HashMap::from([(first, DigestOutcome::Finalized { height: 7 })]);
+        let outcomes = [(first, DigestOutcome::Finalized { height: 7 })]
+            .into_iter()
+            .collect::<AHashMap<_, _>>();
 
         let status = batch_status_from_outcomes(&digests, &outcomes);
 
@@ -775,10 +778,12 @@ mod tests {
         let first = sha256::Digest::random(&mut rng);
         let second = sha256::Digest::random(&mut rng);
         let digests = vec![first, second];
-        let outcomes = HashMap::from([
+        let outcomes = [
             (first, DigestOutcome::Finalized { height: 7 }),
             (second, DigestOutcome::Dropped),
-        ]);
+        ]
+        .into_iter()
+        .collect::<AHashMap<_, _>>();
 
         let status = batch_status_from_outcomes(&digests, &outcomes);
 

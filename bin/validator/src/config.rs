@@ -1,5 +1,6 @@
 //! YAML-serializable validator configuration.
 
+use ahash::AHashMap;
 use commonware_codec::{Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
     Signer,
@@ -14,7 +15,7 @@ use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
 use serde::Deserialize;
-use std::{collections::HashMap, net::SocketAddr, path::Path};
+use std::{net::SocketAddr, path::Path};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
@@ -284,7 +285,7 @@ fn parse_socket(name: &str, socket: &str) -> SocketAddr {
         .unwrap_or_else(|_| panic!("failed to parse {name} socket"))
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &HashMap<&str, std::net::IpAddr>) -> String {
+fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();
     };
@@ -410,7 +411,7 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
             let name = peer.name.clone();
             (name, peer)
         })
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
 
     let self_peer = peers_by_name
         .get(&self_name)
@@ -460,7 +461,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .hosts
         .iter()
         .map(|host| (host.name.as_str(), host.ip))
-        .collect::<HashMap<_, _>>();
+        .collect::<AHashMap<_, _>>();
 
     if let Some(indexer) = config.indexer.as_mut() {
         indexer.chain_indexer_url =
