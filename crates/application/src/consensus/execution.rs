@@ -182,20 +182,15 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let (sender_writes, sender_resolved) =
+    let sender_writes =
         load_disjoint_sender_writes(batch, strategy, transfers, disjoint.sender_keys.as_slice())
             .await
             .expect("sender state loading must succeed")?;
 
     let mut writes = vec![sender_writes];
-    let mut indexed_resolved = sender_resolved
-        .into_iter()
-        .map(|resolved| db::StateIndexedResolvedRead { shard: 0, resolved })
-        .collect::<Vec<_>>();
     if disjoint.recipient_count() > 0 {
         let all_recipients_non_self = disjoint.all_recipients_non_self(transfers);
-        let recipient_shard = writes.len();
-        let (recipient_writes, recipient_resolved) = load_disjoint_recipient_writes(
+        let recipient_writes = load_disjoint_recipient_writes(
             batch,
             strategy,
             transfers,
@@ -204,19 +199,10 @@ where
         )
         .await
         .expect("recipient state loading must succeed")?;
-        indexed_resolved.extend(recipient_resolved.into_iter().map(|resolved| {
-            db::StateIndexedResolvedRead {
-                shard: recipient_shard,
-                resolved,
-            }
-        }));
         writes.push(recipient_writes);
     }
 
-    Some(db::StateWrites::with_indexed_resolved(
-        writes,
-        indexed_resolved,
-    ))
+    Some(db::StateWrites::new(writes))
 }
 
 async fn load_disjoint_sender_writes<E, H, S>(
@@ -224,10 +210,7 @@ async fn load_disjoint_sender_writes<E, H, S>(
     strategy: &S,
     transfers: &[PreparedTransfer],
     sender_keys: &[&AccountKey],
-) -> core::result::Result<
-    Option<(ShardWrites, Vec<db::StateResolvedReadIndex>)>,
-    commonware_storage::qmdb::Error<mmr::Family>,
->
+) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -238,9 +221,9 @@ where
     if chunks <= 1 {
         let values = batch.get_many(sender_keys).await?;
         let valid = apply_disjoint_sender_values_into(transfers, values, &mut writes);
-        return Ok(valid.then(|| (initialized_copy_vec(writes), Vec::new())));
+        return Ok(valid.then(|| initialized_copy_vec(writes)));
     }
-    let (valid, resolved) = parallel_disjoint_sender_writes_into(
+    let valid = parallel_disjoint_sender_writes_into(
         batch,
         strategy,
         transfers,
@@ -248,7 +231,7 @@ where
         &mut writes,
         chunks,
     )?;
-    Ok(valid.then(|| (initialized_copy_vec(writes), resolved)))
+    Ok(valid.then(|| initialized_copy_vec(writes)))
 }
 
 fn parallel_disjoint_sender_writes_into<E, H, S>(
@@ -258,10 +241,7 @@ fn parallel_disjoint_sender_writes_into<E, H, S>(
     keys: &[&AccountKey],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
     chunks: usize,
-) -> core::result::Result<
-    (bool, Vec<db::StateResolvedReadIndex>),
-    commonware_storage::qmdb::Error<mmr::Family>,
->
+) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -269,12 +249,8 @@ where
 {
     debug_assert_eq!(transfers.len(), keys.len());
     if chunks <= 1 || transfers.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
-        let (values, resolved) =
-            futures::executor::block_on(batch.get_many_deferred_cache_indices(keys))?;
-        return Ok((
-            apply_disjoint_sender_values_into(transfers, values, writes),
-            resolved,
-        ));
+        let values = futures::executor::block_on(batch.get_many(keys))?;
+        return Ok(apply_disjoint_sender_values_into(transfers, values, writes));
     }
 
     let left_chunks = chunks / 2;
@@ -304,13 +280,9 @@ where
             )
         },
     );
-    let (left_valid, mut left_resolved) = left?;
-    let (right_valid, mut right_resolved) = right?;
-    for resolved in &mut right_resolved {
-        resolved.0 += split;
-    }
-    left_resolved.extend(right_resolved);
-    Ok((left_valid && right_valid, left_resolved))
+    let left_valid = left?;
+    let right_valid = right?;
+    Ok(left_valid && right_valid)
 }
 
 fn apply_disjoint_sender_values_into(
@@ -337,10 +309,7 @@ async fn load_disjoint_recipient_writes<E, H, S>(
     transfers: &[PreparedTransfer],
     recipient_keys: &[&AccountKey],
     all_recipients_non_self: bool,
-) -> core::result::Result<
-    Option<(ShardWrites, Vec<db::StateResolvedReadIndex>)>,
-    commonware_storage::qmdb::Error<mmr::Family>,
->
+) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -352,9 +321,9 @@ where
         if chunks <= 1 {
             let values = batch.get_many(recipient_keys).await?;
             let valid = apply_disjoint_dense_recipient_values_into(transfers, values, &mut writes);
-            return Ok(valid.then(|| (initialized_copy_vec(writes), Vec::new())));
+            return Ok(valid.then(|| initialized_copy_vec(writes)));
         }
-        let (valid, resolved) = parallel_disjoint_dense_recipient_writes_into(
+        let valid = parallel_disjoint_dense_recipient_writes_into(
             batch,
             strategy,
             transfers,
@@ -362,15 +331,12 @@ where
             &mut writes,
             chunks,
         )?;
-        return Ok(valid.then(|| (initialized_copy_vec(writes), resolved)));
+        return Ok(valid.then(|| initialized_copy_vec(writes)));
     }
 
     if chunks <= 1 {
-        let (values, resolved) = batch
-            .get_many_deferred_cache_indices(recipient_keys)
-            .await?;
-        return Ok(apply_disjoint_sparse_recipient_values(transfers, values)
-            .map(|writes| (writes, resolved)));
+        let values = batch.get_many(recipient_keys).await?;
+        return Ok(apply_disjoint_sparse_recipient_values(transfers, values));
     }
     parallel_disjoint_sparse_recipient_writes(batch, strategy, transfers, recipient_keys, chunks)
 }
@@ -382,10 +348,7 @@ fn parallel_disjoint_dense_recipient_writes_into<E, H, S>(
     keys: &[&AccountKey],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
     chunks: usize,
-) -> core::result::Result<
-    (bool, Vec<db::StateResolvedReadIndex>),
-    commonware_storage::qmdb::Error<mmr::Family>,
->
+) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -393,11 +356,9 @@ where
 {
     debug_assert_eq!(transfers.len(), keys.len());
     if chunks <= 1 || transfers.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
-        let (values, resolved) =
-            futures::executor::block_on(batch.get_many_deferred_cache_indices(keys))?;
-        return Ok((
-            apply_disjoint_dense_recipient_values_into(transfers, values, writes),
-            resolved,
+        let values = futures::executor::block_on(batch.get_many(keys))?;
+        return Ok(apply_disjoint_dense_recipient_values_into(
+            transfers, values, writes,
         ));
     }
 
@@ -428,13 +389,9 @@ where
             )
         },
     );
-    let (left_valid, mut left_resolved) = left?;
-    let (right_valid, mut right_resolved) = right?;
-    for resolved in &mut right_resolved {
-        resolved.0 += split;
-    }
-    left_resolved.extend(right_resolved);
-    Ok((left_valid && right_valid, left_resolved))
+    let left_valid = left?;
+    let right_valid = right?;
+    Ok(left_valid && right_valid)
 }
 
 fn parallel_disjoint_sparse_recipient_writes<E, H, S>(
@@ -443,10 +400,7 @@ fn parallel_disjoint_sparse_recipient_writes<E, H, S>(
     transfers: &[PreparedTransfer],
     recipient_keys: &[&AccountKey],
     chunks: usize,
-) -> core::result::Result<
-    Option<(ShardWrites, Vec<db::StateResolvedReadIndex>)>,
-    commonware_storage::qmdb::Error<mmr::Family>,
->
+) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -454,12 +408,10 @@ where
 {
     if chunks <= 1 || transfers.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
         if recipient_keys.is_empty() {
-            return Ok(Some((ShardWrites::new(), Vec::new())));
+            return Ok(Some(ShardWrites::new()));
         }
-        let (values, resolved) =
-            futures::executor::block_on(batch.get_many_deferred_cache_indices(recipient_keys))?;
-        return Ok(apply_disjoint_sparse_recipient_values(transfers, values)
-            .map(|writes| (writes, resolved)));
+        let values = futures::executor::block_on(batch.get_many(recipient_keys))?;
+        return Ok(apply_disjoint_sparse_recipient_values(transfers, values));
     }
 
     let left_chunks = chunks / 2;
@@ -490,13 +442,7 @@ where
             )
         },
     );
-    let right = right?.map(|(writes, mut resolved)| {
-        for entry in &mut resolved {
-            entry.0 += recipient_split;
-        }
-        (writes, resolved)
-    });
-    merge_optional_sparse_recipient_writes(left?, right)
+    merge_optional_sparse_recipient_writes(left?, right?)
 }
 
 fn apply_disjoint_dense_recipient_values_into(
@@ -534,21 +480,17 @@ fn apply_disjoint_sparse_recipient_values(
 }
 
 fn merge_optional_sparse_recipient_writes(
-    left: Option<(ShardWrites, Vec<db::StateResolvedReadIndex>)>,
-    right: Option<(ShardWrites, Vec<db::StateResolvedReadIndex>)>,
-) -> core::result::Result<
-    Option<(ShardWrites, Vec<db::StateResolvedReadIndex>)>,
-    commonware_storage::qmdb::Error<mmr::Family>,
-> {
-    let Some((mut left_writes, mut left_resolved)) = left else {
+    left: Option<ShardWrites>,
+    right: Option<ShardWrites>,
+) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>> {
+    let Some(mut left_writes) = left else {
         return Ok(None);
     };
-    let Some((right_writes, right_resolved)) = right else {
+    let Some(right_writes) = right else {
         return Ok(None);
     };
     left_writes.extend(right_writes);
-    left_resolved.extend(right_resolved);
-    Ok(Some((left_writes, left_resolved)))
+    Ok(Some(left_writes))
 }
 
 async fn get_many_accounts<E, H, S>(
@@ -1524,7 +1466,7 @@ mod db_bench {
         breakdown.disjoint = start.elapsed();
         if let Some(disjoint) = disjoint {
             let start = Instant::now();
-            let (sender_writes, mut resolved) = super::load_disjoint_sender_writes(
+            let sender_writes = super::load_disjoint_sender_writes(
                 batch,
                 strategy,
                 transfers,
@@ -1539,7 +1481,7 @@ mod db_bench {
             if disjoint.recipient_count() > 0 {
                 let all_recipients_non_self = disjoint.all_recipients_non_self(transfers);
                 let load_start = Instant::now();
-                let (recipient_writes, recipient_resolved) = super::load_disjoint_recipient_writes(
+                let recipient_writes = super::load_disjoint_recipient_writes(
                     batch,
                     strategy,
                     transfers,
@@ -1550,12 +1492,11 @@ mod db_bench {
                 .expect("recipient state loading must succeed")
                 .expect("bench transfers should execute");
                 breakdown.recipient_load = load_start.elapsed();
-                resolved.extend(recipient_resolved);
                 writes.push(recipient_writes);
             }
 
             let count = writes.iter().map(|map| map.len()).sum();
-            black_box((&writes, &resolved));
+            black_box(&writes);
             breakdown.total = total.elapsed();
             return (count, breakdown);
         }

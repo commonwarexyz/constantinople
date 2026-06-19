@@ -11,7 +11,6 @@ use commonware_storage::{
     mmr,
     qmdb::{
         any::{
-            batch::DeferredResolvedReadIndex,
             operation::Operation as AnyOperation,
             unordered::{Update as UnorderedUpdate, fixed},
             value::FixedEncoding,
@@ -68,35 +67,13 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
     TransactionMerkleized<E, H, S>,
 );
 
-pub(super) type StateResolvedReadIndex =
-    DeferredResolvedReadIndex<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>;
-
-pub(super) struct StateIndexedResolvedRead {
-    pub(super) shard: usize,
-    pub(super) resolved: StateResolvedReadIndex,
-}
-
 pub(super) struct StateWrites {
     pub(super) shards: Vec<ShardWrites>,
-    pub(super) indexed_resolved: Vec<StateIndexedResolvedRead>,
 }
 
 impl StateWrites {
     pub(super) const fn new(shards: Vec<ShardWrites>) -> Self {
-        Self {
-            shards,
-            indexed_resolved: Vec::new(),
-        }
-    }
-
-    pub(super) const fn with_indexed_resolved(
-        shards: Vec<ShardWrites>,
-        indexed_resolved: Vec<StateIndexedResolvedRead>,
-    ) -> Self {
-        Self {
-            shards,
-            indexed_resolved,
-        }
+        Self { shards }
     }
 }
 
@@ -113,16 +90,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let StateWrites {
-        shards,
-        indexed_resolved,
-    } = state_writes;
-    let indexed_resolved = indexed_resolved.into_iter().map(|entry| {
-        let (index, loc, cached) = entry.resolved;
-        let key = shards[entry.shard][index].0;
-        (key, loc, cached)
-    });
-    batch.extend_resolved(indexed_resolved);
+    let StateWrites { shards } = state_writes;
     shards.into_iter().fold(batch, |batch, shard_map| {
         shard_map
             .into_iter()
