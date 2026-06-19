@@ -41,8 +41,7 @@ fn executor(c: &mut Criterion) {
 /// Benchmarks only the in-memory CPU cost of the current compute kernel on
 /// pre-loaded state. It does NOT measure the load, which is the part this
 /// change restructures, so it is not a benchmark of the pipeline. For the real
-/// load + compute measurement against a QMDB, see the `db_bench` harness in
-/// `consensus::execution` (run with `--ignored --nocapture --release`).
+/// load + compute measurement against a QMDB, run the `compute` bench target.
 fn bench_compute(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     fixture: &str,

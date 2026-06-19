@@ -34,6 +34,8 @@ use commonware_runtime::{
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
+#[cfg(feature = "bench-utils")]
+pub mod bench;
 mod body;
 mod db;
 mod execution;
