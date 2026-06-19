@@ -931,7 +931,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{chunk_ranges, range_from_bounds, sparse_chunks};
-    use crate::executor::{PreparedTransfer, key_prefix};
+    use crate::executor::PreparedTransfer;
     use commonware_codec::FixedSize as _;
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
@@ -963,8 +963,8 @@ mod tests {
         let transfer = |sender, recipient| PreparedTransfer {
             sender,
             recipient,
-            sender_prefix: key_prefix(&sender),
-            recipient_prefix: key_prefix(&recipient),
+            sender_prefix: sender.prefix(),
+            recipient_prefix: recipient.prefix(),
             value: 1,
             nonce: 0,
         };
@@ -1106,8 +1106,8 @@ mod db_bench {
                     PreparedTransfer {
                         sender,
                         recipient,
-                        sender_prefix: crate::executor::key_prefix(&sender),
-                        recipient_prefix: crate::executor::key_prefix(&recipient),
+                        sender_prefix: sender.prefix(),
+                        recipient_prefix: recipient.prefix(),
                         value: 1,
                         nonce: 0,
                     }
@@ -1127,8 +1127,8 @@ mod db_bench {
                         PreparedTransfer {
                             sender,
                             recipient,
-                            sender_prefix: crate::executor::key_prefix(&sender),
-                            recipient_prefix: crate::executor::key_prefix(&recipient),
+                            sender_prefix: sender.prefix(),
+                            recipient_prefix: recipient.prefix(),
                             value: 1,
                             nonce,
                         }

@@ -61,6 +61,14 @@ impl AccountKey {
             _ => None,
         }
     }
+
+    /// First eight account-key bytes as a little-endian routing prefix.
+    #[inline]
+    pub fn prefix(&self) -> u64 {
+        let mut prefix = [0u8; 8];
+        prefix.copy_from_slice(&self.bytes[..8]);
+        u64::from_le_bytes(prefix)
+    }
 }
 
 impl FixedSize for AccountKey {

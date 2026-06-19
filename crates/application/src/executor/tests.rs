@@ -303,8 +303,8 @@ fn execution_plan_keeps_unique_transfers_discrete_in_mixed_batches() {
     let transfer = |sender, recipient, nonce| super::PreparedTransfer {
         sender,
         recipient,
-        sender_prefix: super::key_prefix(&sender),
-        recipient_prefix: super::key_prefix(&recipient),
+        sender_prefix: sender.prefix(),
+        recipient_prefix: recipient.prefix(),
         value: 1,
         nonce,
     };

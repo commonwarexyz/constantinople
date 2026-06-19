@@ -109,8 +109,8 @@ where
     Some(PreparedTransfer {
         sender,
         recipient,
-        sender_prefix: key_prefix(&sender),
-        recipient_prefix: key_prefix(&recipient),
+        sender_prefix: sender.prefix(),
+        recipient_prefix: recipient.prefix(),
         value: transfer.value.get(),
         nonce: transfer.nonce,
     })
@@ -205,7 +205,7 @@ impl<'a> AccountIndexTable<'a> {
     }
 
     fn insert_unique(&mut self, key: &'a AccountKey, index: u32) {
-        let mut slot = (key_prefix(key) as usize) & self.mask;
+        let mut slot = (key.prefix() as usize) & self.mask;
         while !self.slots[slot].key.is_null() {
             slot = (slot + 1) & self.mask;
         }
@@ -414,13 +414,6 @@ where
     S: Strategy,
 {
     execute_with_shards(state, transfers, strategy.parallelism_hint())
-}
-
-#[inline]
-pub(crate) fn key_prefix(key: &AccountKey) -> u64 {
-    let mut prefix = [0u8; 8];
-    prefix.copy_from_slice(&key[..8]);
-    u64::from_le_bytes(prefix)
 }
 
 #[cfg(test)]
