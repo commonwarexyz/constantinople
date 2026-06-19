@@ -1606,7 +1606,6 @@ fn retry_backoff(attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
-    use bytes::Bytes;
     use commonware_consensus::{
         simplex::types::Context as SimplexContext,
         types::{Round, View, coding::Commitment},
@@ -1708,7 +1707,7 @@ mod tests {
             let sql_writer = schema.batch_writer();
 
             let seed = 1u8;
-            let key = AccountKey::from_bytes(Bytes::from(vec![seed; AccountKey::SIZE])).unwrap();
+            let key = AccountKey::from([seed; AccountKey::SIZE]);
             let state_ops = [
                 StateOperation::Update(UnorderedUpdate(
                     key,
@@ -2402,7 +2401,7 @@ mod tests {
     }
 
     fn account_key(seed: u64) -> AccountKey {
-        AccountKey::from_bytes(Bytes::from(vec![seed as u8; AccountKey::SIZE])).unwrap()
+        AccountKey::from([seed as u8; AccountKey::SIZE])
     }
 
     fn signed_transaction(seed: u64, nonce: u64) -> SignedTransaction<Sha256> {
@@ -2446,7 +2445,7 @@ mod tests {
     }
 
     fn state_ops(seed: u8) -> Vec<StateOperation> {
-        let key = AccountKey::from_bytes(Bytes::from(vec![seed; AccountKey::SIZE])).unwrap();
+        let key = AccountKey::from([seed; AccountKey::SIZE]);
         vec![
             StateOperation::Update(UnorderedUpdate(
                 key,
@@ -2484,7 +2483,7 @@ mod tests {
         };
         let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
             .seal(&mut Sha256::default());
-        let account_key = AccountKey::from_bytes(Bytes::from(vec![1u8; AccountKey::SIZE])).unwrap();
+        let account_key = AccountKey::from([1u8; AccountKey::SIZE]);
         let state_delta = vec![
             StateOperation::Update(UnorderedUpdate(
                 account_key,

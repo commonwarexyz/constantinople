@@ -932,6 +932,7 @@ where
 mod tests {
     use super::{chunk_ranges, range_from_bounds, sparse_chunks};
     use crate::executor::{PreparedTransfer, key_prefix};
+    use commonware_codec::FixedSize as _;
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
     use constantinople_primitives::AccountKey;
@@ -958,7 +959,7 @@ mod tests {
 
     #[test]
     fn sparse_chunks_align_with_non_self_recipients() {
-        let account = |byte| AccountKey::from_bytes([byte; 32]).expect("account key");
+        let account = |byte| AccountKey::from([byte; AccountKey::SIZE]);
         let transfer = |sender, recipient| PreparedTransfer {
             sender,
             recipient,
@@ -1044,7 +1045,7 @@ mod db_bench {
     }
 
     fn key(index: u64) -> AccountKey {
-        AccountKey::from_bytes(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+        AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
     }
 
     fn signed_key(index: u64) -> AccountKey {

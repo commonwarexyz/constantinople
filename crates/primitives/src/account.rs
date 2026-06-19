@@ -5,7 +5,7 @@ use crate::{
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
 use bytes::{Buf, BufMut};
-use commonware_codec::{Error as CodecError, FixedSize, Read, ReadExt, Write};
+use commonware_codec::{Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Hasher, ed25519, sha256};
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
@@ -26,7 +26,8 @@ const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
 /// [`AccountKey`] does not validate or decompress the curve point. This keeps
 /// state-database replay, indexing, and lookup on cheap byte comparisons while
 /// preserving the legacy Ed25519 account format.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FixedArray)]
+#[fixed_array(infallible)]
 pub struct AccountKey {
     bytes: [u8; ACCOUNT_KEY_SIZE],
 }
@@ -36,10 +37,12 @@ impl AccountKey {
     pub fn from_public_key(public_key: &TransactionPublicKey) -> Self {
         match public_key {
             TransactionPublicKey::Ed25519 { encoded } => {
-                Self::copy_from_slice(&encoded[1..1 + Self::SIZE])
+                Self::try_from(&encoded[1..1 + Self::SIZE])
+                    .expect("ed25519 account-key slice has account-key length")
             }
             TransactionPublicKey::Secp256r1 { encoded } => {
-                Self::copy_from_slice(sha256::Sha256::hash(encoded).as_ref())
+                Self::try_from(sha256::Sha256::hash(encoded).as_ref())
+                    .expect("sha256 digest has account-key length")
             }
         }
     }
@@ -51,26 +54,10 @@ impl AccountKey {
         }
 
         match bytes[0] {
-            ED25519_SCHEME => Some(Self::copy_from_slice(&bytes[1..1 + Self::SIZE])),
-            SECP256R1_SCHEME => Some(Self::copy_from_slice(sha256::Sha256::hash(bytes).as_ref())),
+            ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
+            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(bytes).as_ref()).ok(),
             _ => None,
         }
-    }
-
-    /// Creates an account key from canonical account-key bytes.
-    pub fn from_bytes(bytes: impl AsRef<[u8]>) -> Option<Self> {
-        let bytes = bytes.as_ref();
-        if bytes.len() != Self::SIZE {
-            return None;
-        }
-
-        Some(Self::copy_from_slice(bytes))
-    }
-
-    const fn copy_from_slice(bytes: &[u8]) -> Self {
-        let mut key = [0u8; ACCOUNT_KEY_SIZE];
-        key.copy_from_slice(bytes);
-        Self { bytes: key }
     }
 }
 
