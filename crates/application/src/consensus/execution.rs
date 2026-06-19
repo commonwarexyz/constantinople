@@ -145,7 +145,7 @@ where
 /// nonce or balance check or overflows a recipient (the whole batch is
 /// rejected). The batch is only borrowed for reads, so the caller may move it
 /// afterward to apply the writes.
-async fn load_exec<E, H, S>(
+async fn compute<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
@@ -764,8 +764,8 @@ where
 
     let outcome = match prepared {
         Some((transfers, digests)) if !transfers.is_empty() => {
-            load_exec(&state_batch, &strategy, &transfers)
-                .instrument(info_span!("application.execute.load_execute"))
+            compute(&state_batch, &strategy, &transfers)
+                .instrument(info_span!("application.execute.compute"))
                 .await
                 .map(|shard_maps| (transactions, digests, shard_maps))
         }
@@ -812,8 +812,8 @@ where
     let (transfers, digests) = info_span!("application.execute.prepare")
         .in_scope(|| prepare_lazy(&strategy, body.as_ref().as_slice()))?;
 
-    let shard_maps = load_exec(&state_batch, &strategy, &transfers)
-        .instrument(info_span!("application.execute.load_execute"))
+    let shard_maps = compute(&state_batch, &strategy, &transfers)
+        .instrument(info_span!("application.execute.compute"))
         .await
         .ok_or(STATIC_INVALID_TRANSACTION)?;
 
@@ -846,8 +846,8 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let shard_maps = load_exec(&state_batch, &strategy, transfers)
-        .instrument(info_span!("application.execute.load_execute"))
+    let shard_maps = compute(&state_batch, &strategy, transfers)
+        .instrument(info_span!("application.execute.compute"))
         .await
         .ok_or(STATIC_INVALID_TRANSACTION)?;
 
@@ -996,10 +996,9 @@ mod tests {
 /// DB-backed timing harness for the load + execute path against a real QMDB.
 ///
 /// Run with: `cargo test -p constantinople-application --release -- --ignored
-/// --nocapture bench_load_execute`. Seeds a committed state DB, then times the
-/// account-plan `load_exec`. Note: the deterministic runtime serves
-/// reads from memory, so this measures the load+execute CPU/memory path, not
-/// cold disk behavior.
+/// --nocapture bench_compute`. Seeds a committed state DB, then times the
+/// account-plan `compute`. Note: the deterministic runtime serves reads from
+/// memory, so this measures the compute CPU/memory path, not cold disk behavior.
 #[cfg(test)]
 mod db_bench {
     use crate::executor::PreparedTransfer;
@@ -1195,31 +1194,31 @@ mod db_bench {
             .collect()
     }
 
-    async fn time_exec(
+    async fn time_compute(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         transfers: &[PreparedTransfer],
     ) -> (usize, Duration) {
         let start = Instant::now();
-        let state_writes = super::load_exec(batch, strategy, transfers)
+        let state_writes = super::compute(batch, strategy, transfers)
             .await
-            .expect("exec path");
+            .expect("compute path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
         black_box(&state_writes);
         (count, elapsed)
     }
 
-    async fn time_prepare_exec(
+    async fn time_prepare_compute(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         txs: &[TestTransaction],
     ) -> (usize, Duration) {
         let start = Instant::now();
         let (transfers, digests) = super::prepare_signed(strategy, txs).expect("prepare");
-        let state_writes = super::load_exec(batch, strategy, &transfers)
+        let state_writes = super::compute(batch, strategy, &transfers)
             .await
-            .expect("exec path");
+            .expect("compute path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
         black_box((&transfers, &digests, &state_writes));
@@ -1361,7 +1360,7 @@ mod db_bench {
 
     #[test]
     #[ignore = "timing harness; run explicitly with --ignored --nocapture --release"]
-    fn bench_load_execute() {
+    fn bench_compute() {
         deterministic::Runner::default().start(|context| async move {
             let bench_prepare = std::env::var_os("CONSTANTINOPLE_BENCH_PREPARE").is_some();
             let warmup = std::env::var("CONSTANTINOPLE_BENCH_WARMUP")
@@ -1424,7 +1423,7 @@ mod db_bench {
                     let mut writes = 0usize;
                     for iter in 0..(warmup + iters) {
                         let batch = db.new_batches().await;
-                        let (count, elapsed) = time_exec(&batch, &strategy, &transfers).await;
+                        let (count, elapsed) = time_compute(&batch, &strategy, &transfers).await;
                         writes = count;
                         if iter >= warmup {
                             total += elapsed;
@@ -1434,7 +1433,7 @@ mod db_bench {
 
                     let avg = total / iters;
                     println!(
-                        "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  exec: {avg:?}  ({:.2} Melem/s) / {writes} writes",
+                        "compute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  compute: {avg:?}  ({:.2} Melem/s) / {writes} writes",
                         fixture.name(),
                         strategy.parallelism_hint().max(1),
                         tps(avg),
@@ -1461,7 +1460,7 @@ mod db_bench {
                         for iter in 0..(warmup + iters) {
                             let batch = db.new_batches().await;
                             let (count, elapsed) =
-                                time_prepare_exec(&batch, &strategy, &transactions).await;
+                                time_prepare_compute(&batch, &strategy, &transactions).await;
                             writes = count;
                             if iter >= warmup {
                                 total += elapsed;
@@ -1470,7 +1469,7 @@ mod db_bench {
 
                         let avg = total / iters;
                         println!(
-                            "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  exec: {avg:?}  ({:.2} Melem/s) / {writes} writes",
+                            "prepare+compute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  compute: {avg:?}  ({:.2} Melem/s) / {writes} writes",
                             fixture.name(),
                             strategy.parallelism_hint().max(1),
                             tps(avg),
