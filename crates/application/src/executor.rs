@@ -141,13 +141,6 @@ struct AccountIndexSlot {
     index: u32,
 }
 
-// SAFETY: `AccountIndexTable` only stores immutable pointers to `AccountKey`
-// values borrowed from the transfer slice for lifetime `'a`. Those keys are
-// never mutated through the table, and `AccountKey` is `Sync`.
-unsafe impl<'a> Send for AccountIndexTable<'a> {}
-// SAFETY: see the `Send` impl above.
-unsafe impl<'a> Sync for AccountIndexTable<'a> {}
-
 impl<'a> AccountIndexTable<'a> {
     fn with_capacity(capacity: usize) -> Self {
         let slots = capacity.saturating_mul(2).next_power_of_two().max(16);
