@@ -34,6 +34,7 @@ futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
 rand_core.workspace = true
 prometheus-client.workspace = true
+ahash.workspace = true
 hashbrown = { workspace = true, features = ["default-hasher"] }
 
 [dev-dependencies]

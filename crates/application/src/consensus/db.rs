@@ -1,6 +1,6 @@
 //! Database aliases and batch helpers for consensus execution.
 
-use crate::executor::ShardMap;
+use crate::executor::ShardWrites;
 use commonware_cryptography::Hasher;
 use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, any::AnyUnmerkleized};
 use commonware_parallel::Strategy;
@@ -11,6 +11,7 @@ use commonware_storage::{
     mmr,
     qmdb::{
         any::{
+            batch::{DeferredResolvedRead, DeferredResolvedReadIndex},
             operation::Operation as AnyOperation,
             unordered::{Update as UnorderedUpdate, fixed},
             value::FixedEncoding,
@@ -67,20 +68,71 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
     TransactionMerkleized<E, H, S>,
 );
 
+pub(super) type StateResolvedRead =
+    DeferredResolvedRead<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>;
+pub(super) type StateResolvedReadIndex =
+    DeferredResolvedReadIndex<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>;
+
+pub(super) struct StateIndexedResolvedRead {
+    pub(super) shard: usize,
+    pub(super) resolved: StateResolvedReadIndex,
+}
+
+pub(super) struct StateWrites {
+    pub(super) shards: Vec<ShardWrites>,
+    pub(super) resolved: Vec<StateResolvedRead>,
+    pub(super) indexed_resolved: Vec<StateIndexedResolvedRead>,
+}
+
+impl StateWrites {
+    pub(super) const fn new(shards: Vec<ShardWrites>) -> Self {
+        Self {
+            shards,
+            resolved: Vec::new(),
+            indexed_resolved: Vec::new(),
+        }
+    }
+
+    pub(super) const fn with_indexed_resolved(
+        shards: Vec<ShardWrites>,
+        indexed_resolved: Vec<StateIndexedResolvedRead>,
+    ) -> Self {
+        Self {
+            shards,
+            resolved: Vec::new(),
+            indexed_resolved,
+        }
+    }
+}
+
 /// Writes each shard's mutated accounts to a state batch.
 ///
 /// The resulting `state_root` depends only on the final key->value set, so the
 /// shards (and accounts within them) may be folded in any order.
 pub(super) fn apply_shard_maps<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
-    shard_maps: Vec<ShardMap>,
+    state_writes: StateWrites,
 ) -> StateBatch<E, H, EightCap, S>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    shard_maps.into_iter().fold(batch, |batch, shard_map| {
+    let StateWrites {
+        shards,
+        resolved,
+        indexed_resolved,
+    } = state_writes;
+    let indexed_resolved = indexed_resolved
+        .into_iter()
+        .map(|entry| {
+            let (index, loc, cached) = entry.resolved;
+            let key = shards[entry.shard][index].0;
+            (key, loc, cached)
+        })
+        .collect::<Vec<_>>();
+    batch.extend_resolved(resolved.into_iter().chain(indexed_resolved));
+    shards.into_iter().fold(batch, |batch, shard_map| {
         shard_map
             .into_iter()
             .fold(batch, |batch, (account_key, account)| {

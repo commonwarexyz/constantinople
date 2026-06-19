@@ -6,6 +6,7 @@ use constantinople_primitives::{
     TransactionPublicKey, VerifiedTransaction,
 };
 use core::num::NonZeroU64;
+use std::collections::HashSet;
 
 const NAMESPACE: &[u8] = b"executor-test";
 
@@ -163,6 +164,31 @@ fn executes_multi_sender_batch() {
 }
 
 #[test]
+fn credits_apply_to_post_debit_sender_state() {
+    let sender_a = TestSigner::from_seed(50);
+    let sender_b = TestSigner::from_seed(51);
+
+    let mut accounts = State::new();
+    accounts.insert(account_key(&sender_a.public_key), account(10, 0));
+    accounts.insert(account_key(&sender_b.public_key), account(10, 0));
+
+    let transactions = vec![
+        sender_a.sign(sender_b.public_key.clone(), 4, 0),
+        sender_b.sign(sender_a.public_key.clone(), 3, 0),
+    ];
+    let changeset = run(&accounts, &transactions).expect("valid batch should execute");
+
+    assert_eq!(
+        changeset_account(&changeset, sender_a.public_key),
+        account(9, 1)
+    );
+    assert_eq!(
+        changeset_account(&changeset, sender_b.public_key),
+        account(11, 1)
+    );
+}
+
+#[test]
 fn self_transfer_only_bumps_nonce() {
     let signer = TestSigner::from_seed(0);
     let mut accounts = State::new();
@@ -175,6 +201,23 @@ fn self_transfer_only_bumps_nonce() {
         changeset_account(&changeset, signer.public_key),
         account(9, 4)
     );
+}
+
+#[test]
+fn rejects_unfunded_self_transfer_for_all_shard_counts() {
+    let signer = TestSigner::from_seed(42);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&signer.public_key), account(0, 0));
+
+    let transactions = vec![signer.sign(signer.public_key.clone(), 1, 0)];
+    let transfers = prepared(&transactions);
+
+    for &shards in SHARD_COUNTS {
+        assert!(
+            execute_with_shards(&accounts, &transfers, shards).is_none(),
+            "shards={shards}"
+        );
+    }
 }
 
 #[test]
@@ -200,7 +243,7 @@ fn contended_accounts(account_count: usize) -> (State, Vec<TestSigner>) {
     (accounts, signers)
 }
 
-fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer<TestHasher>> {
+fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer> {
     transactions
         .iter()
         .map(prepare_transfer)
@@ -209,6 +252,22 @@ fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer<Tes
 }
 
 const SHARD_COUNTS: &[usize] = &[1, 2, 3, 5, 8, 16];
+
+#[test]
+fn contended_shard_sender_load_keys_are_deduplicated() {
+    let sender = TestSigner::from_seed(80);
+    let recipient = TestSigner::from_seed(81);
+    let transactions = (0..4)
+        .map(|nonce| sender.sign(recipient.public_key.clone(), 1, nonce))
+        .collect::<Vec<_>>();
+    let transfers = prepared(&transactions);
+    let shards = super::partition(&transfers, 1);
+    let keys = shards[0].sender_keys();
+    let unique = keys.iter().copied().collect::<HashSet<_>>();
+
+    assert_eq!(keys.len(), unique.len());
+    assert_eq!(keys.len(), 1);
+}
 
 #[test]
 fn execution_is_independent_of_shard_count() {

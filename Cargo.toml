@@ -46,23 +46,23 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
-commonware-actor = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
+commonware-actor = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/actor" }
+commonware-p2p = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/p2p" }
+commonware-glue = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/glue" }
+commonware-math = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/math" }
+commonware-codec = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/codec" }
+commonware-formatting = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/formatting" }
+commonware-utils = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/utils" }
+commonware-coding = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/coding" }
+commonware-macros = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/macros" }
+commonware-runtime = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/runtime" }
+commonware-storage = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/storage" }
+commonware-deployer = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/deployer" }
+commonware-parallel = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/parallel" }
+commonware-resolver = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/resolver" }
+commonware-broadcast = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/broadcast" }
+commonware-consensus = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/consensus" }
+commonware-cryptography = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/cryptography", default-features = false }
 
 # Exoware
 exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
@@ -88,6 +88,7 @@ rstest = "0.26.0"
 futures = { version = "0.3.31", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 arbitrary = { version = "1.4.2", features = ["derive"] }
+ahash = "0.8.12"
 hashbrown = { version = "0.17.0", default-features = false }
 rand_core = "0.6.4"
 reqwest = { version = "0.12", default-features = false }
@@ -97,6 +98,32 @@ serde_yaml = "0.9"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+
+[patch."https://github.com/commonwarexyz/monorepo.git"]
+commonware-actor = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/actor" }
+commonware-broadcast = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/broadcast" }
+commonware-codec = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/codec" }
+commonware-codec-macros = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/codec/macros" }
+commonware-coding = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/coding" }
+commonware-conformance = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/conformance" }
+commonware-conformance-macros = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/conformance/macros" }
+commonware-consensus = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/consensus" }
+commonware-cryptography = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/cryptography" }
+commonware-deployer = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/deployer" }
+commonware-formatting = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/formatting" }
+commonware-glue = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/glue" }
+commonware-invariants = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/invariants" }
+commonware-macros = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/macros" }
+commonware-macros-impl = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/macros/impl" }
+commonware-math = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/math" }
+commonware-p2p = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/p2p" }
+commonware-parallel = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/parallel" }
+commonware-resolver = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/resolver" }
+commonware-runtime = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/runtime" }
+commonware-runtime-macros = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/runtime/macros" }
+commonware-storage = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/storage" }
+commonware-stream = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/stream" }
+commonware-utils = { path = "/Users/patrickogrady/code/monorepo-update-qmdb-access/utils" }
 
 [profile.samply]
 inherits = "release"

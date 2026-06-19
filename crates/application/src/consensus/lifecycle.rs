@@ -3,10 +3,12 @@
 use super::{
     Application, MALFORMED_TRANSACTION,
     body::{materialize_body, verify_signatures, wait_for_timestamp},
-    execution::{apply_prepared_body, commitments_match, execute_body, execute_proposal},
+    execution::{
+        apply_prepared_body, commitments_match, execute_body, execute_proposal,
+        prepare_signed_transfers_with_digests,
+    },
     reject_verify, time,
 };
-use crate::executor;
 use commonware_consensus::simplex::types::Context;
 use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
@@ -206,10 +208,7 @@ where
         let materialized = materialize_body(runtime, self.strategy.clone(), block.body.clone())
             .await
             .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
-        let body = materialized
-            .iter()
-            .map(executor::prepare_transfer)
-            .collect::<Option<Vec<_>>>()
+        let (body, digests) = prepare_signed_transfers_with_digests(&self.strategy, &materialized)
             .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
 
         let (state_batch, transaction_batch) = batches;
@@ -219,6 +218,7 @@ where
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
             &body,
+            &digests,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))

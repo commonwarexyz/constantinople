@@ -12,7 +12,7 @@ use std::hint::black_box;
 
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
-type Transfers = Vec<PreparedTransfer<TestHasher>>;
+type Transfers = Vec<PreparedTransfer>;
 
 /// The previous single-overlay execution, kept for a same-run baseline. Debits
 /// and credits are applied inline against one map, so a recipient could spend
@@ -30,7 +30,7 @@ fn legacy_execute(state: &State, transfers: &Transfers) -> Changeset {
             "bench fixtures must be valid"
         );
         if transfer.sender == transfer.recipient {
-            writes.insert(transfer.sender.clone(), sender);
+            writes.insert(transfer.sender, sender);
             continue;
         }
         let mut recipient = writes
@@ -43,11 +43,11 @@ fn legacy_execute(state: &State, transfers: &Transfers) -> Changeset {
             .checked_add(transfer.value)
             .expect("bench fixtures must not overflow");
         sender.balance -= transfer.value;
-        writes.insert(transfer.sender.clone(), sender);
-        writes.insert(transfer.recipient.clone(), recipient);
+        writes.insert(transfer.sender, sender);
+        writes.insert(transfer.recipient, recipient);
     }
     let mut changeset: Changeset = writes.into_iter().collect();
-    changeset.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+    changeset.sort_unstable_by_key(|(key, _)| *key);
     changeset
 }
 
