@@ -392,7 +392,7 @@ where
         result
     });
 
-    let mut merged = ShardWrites::new();
+    let mut merged = ShardWrites::with_capacity(recipient_keys.len());
     for result in results {
         let Some(writes) = result? else {
             return Ok(None);
