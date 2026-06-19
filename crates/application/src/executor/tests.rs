@@ -254,20 +254,22 @@ fn prepared(transactions: &[TestTransaction]) -> Vec<super::PreparedTransfer> {
 const SHARD_COUNTS: &[usize] = &[1, 2, 3, 5, 8, 16];
 
 #[test]
-fn contended_shard_sender_load_keys_are_deduplicated() {
+fn contended_general_account_load_keys_are_deduplicated() {
     let sender = TestSigner::from_seed(80);
     let recipient = TestSigner::from_seed(81);
     let transactions = (0..4)
         .map(|nonce| sender.sign(recipient.public_key.clone(), 1, nonce))
         .collect::<Vec<_>>();
     let transfers = prepared(&transactions);
-    let plan = super::execution_plan(&transfers, 1);
-    let keys = plan.general[0].sender_keys();
+    let plan = super::execution_plan(&transfers).expect("execution plan");
+    let keys = plan.general.account_keys();
     let unique = keys.iter().copied().collect::<HashSet<_>>();
 
     assert!(plan.discrete.transfers.is_empty());
     assert_eq!(keys.len(), unique.len());
-    assert_eq!(keys.len(), 1);
+    assert_eq!(keys.len(), 2);
+    assert!(unique.contains(&account_key(&sender.public_key)));
+    assert!(unique.contains(&account_key(&recipient.public_key)));
 }
 
 #[test]
@@ -289,17 +291,12 @@ fn execution_plan_keeps_unique_transfers_discrete_in_mixed_batches() {
         transfer(repeated, key(83), 1),
         transfer(key(84), key(85), 0),
     ];
-    let plan = super::execution_plan(&transfers, 4);
-    let general_transfers = plan
-        .general
-        .iter()
-        .map(|shard| shard.senders.len())
-        .sum::<usize>();
+    let plan = super::execution_plan(&transfers).expect("execution plan");
 
     assert_eq!(plan.discrete.transfers.len(), 2);
     assert_eq!(plan.discrete.sender_keys.len(), 2);
     assert_eq!(plan.discrete.recipient_keys.len(), 2);
-    assert_eq!(general_transfers, 2);
+    assert_eq!(plan.general.account_keys().len(), 3);
 }
 
 #[test]

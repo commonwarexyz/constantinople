@@ -1,11 +1,11 @@
 //! Transfer execution for the Constantinople account model.
 //!
 //! This module is the state-agnostic account engine used by consensus execution,
-//! tests, and benchmarks. It decides which sender accounts must be loaded,
-//! applies nonce/debit checks to those loaded sender accounts, routes credits to
-//! loaded senders, and reports the recipient-only credits that must be swept by
-//! the caller. DB-backed loading is handled by `consensus::execution`; the
-//! in-memory entry points in this module read from [`State`].
+//! tests, and benchmarks. It decides which account keys must be loaded, builds
+//! deterministic account effects from the transfer list, and applies those
+//! effects to loaded block-start account state. DB-backed loading is handled by
+//! `consensus::execution`; the in-memory entry points in this module read from
+//! [`State`].
 //!
 //! Execution first builds an account-touch plan. The plan counts non-self
 //! sender/recipient touches across the block. Transfers whose touched accounts
@@ -13,18 +13,17 @@
 //! produces one final write. Transfers that touch any contended account move to
 //! the general lane.
 //!
-//! The general lane is sharded by a prefix of the sender key. Each shard owns
-//! only its sender accounts and applies debits and nonce advances. Recipient
-//! accounts are not loaded or mutated by the shards. After all sender shards
-//! finish, a final credit sweep routes credits back to the post-debit sender
-//! shard maps first, then credits any remaining recipient-only accounts. A
-//! sender spends only the balance it held at the start of the block, never funds
-//! credited to it within the same block.
+//! The general lane is account-owned. It aggregates every contended transfer
+//! into one effect per account: sent nonces, non-self debit total,
+//! self-transfer affordability floor, and recipient credit total. Account state
+//! is loaded after these effects are known, then each loaded account is checked
+//! and written once. A sender spends only the balance it held at the start of the
+//! block, never funds credited to it within the same block.
 //!
 //! Execution is all or nothing: if any transfer fails its nonce or balance check
 //! or overflows its recipient, the whole batch is rejected. Because a successful
-//! batch has no failed debits, every loaded sender account is mutated, and the
-//! credit sweep produces the remaining recipient writes.
+//! batch has no failed debits, every loaded account effect produces one final
+//! write.
 
 use ahash::RandomState;
 use commonware_cryptography::Hasher;
@@ -44,21 +43,12 @@ pub type Changeset = Vec<(AccountKey, Account)>;
 /// One independently applicable group of account writes.
 pub(crate) type ShardWrites = Vec<(AccountKey, Account)>;
 
-/// One shard's loaded sender accounts, in the same order as its sender keys.
-pub(crate) type ShardAccounts = Vec<Account>;
-
-/// Aggregated recipient credits used by the final sweep.
-pub(crate) type AggregatedCredits<'a> = Vec<(&'a AccountKey, u64)>;
-
-/// Transfer indices whose recipients were not loaded as senders.
-pub(crate) type MissingCredits = Vec<u32>;
-
 /// Account execution plan for one batch.
 pub(crate) struct ExecutionPlan<'a> {
     /// Transfers whose non-self account touches are unique in the block.
     pub(crate) discrete: DiscreteWorkload<'a>,
-    /// Sender-sharded work for the remaining transfers.
-    pub(crate) general: Vec<Shard<'a>>,
+    /// Account-owned effects for the remaining transfers.
+    pub(crate) general: GeneralWorkload<'a>,
 }
 
 /// Transfers that can produce direct sender and recipient writes.
@@ -71,10 +61,24 @@ pub(crate) struct DiscreteWorkload<'a> {
     pub(crate) recipient_keys: Vec<&'a AccountKey>,
 }
 
-/// Sender-shard execution output.
-pub(crate) struct ShardOutput {
-    /// Post-debit sender accounts to write.
-    pub(crate) senders: ShardAccounts,
+/// Account-owned effects for transfers that touch contended accounts.
+pub(crate) struct GeneralWorkload<'a> {
+    /// Account keys to load, deduplicated exactly.
+    account_keys: Vec<&'a AccountKey>,
+    /// Effects to apply to each loaded account.
+    effects: Vec<AccountEffect>,
+}
+
+impl<'a> GeneralWorkload<'a> {
+    /// Whether the general lane has no account effects.
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.account_keys.is_empty()
+    }
+
+    /// Account keys to load for the general lane.
+    pub(crate) fn account_keys(&self) -> &[&'a AccountKey] {
+        &self.account_keys
+    }
 }
 
 /// Transfer data used by the executor.
@@ -112,19 +116,16 @@ where
     })
 }
 
-/// One sender shard's work: the transfers it must debit, in block order.
-pub(crate) struct Shard<'a> {
-    /// Transfer indices to debit, in block order.
-    senders: Vec<ShardSender>,
-    /// Sender account keys this shard must load, deduplicated exactly.
-    sender_keys: Vec<&'a AccountKey>,
-    /// Sender key -> index in `sender_keys` and `ShardOutput::senders`.
-    sender_indices: AccountIndexTable<'a>,
-}
-
-struct ShardSender {
-    transfer: u32,
-    account: u32,
+#[derive(Default)]
+pub(crate) struct AccountEffect {
+    /// Transfer indices sent by this account, in block order.
+    sent: Vec<u32>,
+    /// Total non-self debit to subtract from the account.
+    debit: u64,
+    /// Largest self-transfer value that must be affordable.
+    self_transfer_floor: u64,
+    /// Total credit to add to the account after debits.
+    credit: u64,
 }
 
 struct AccountIndexTable<'a> {
@@ -161,22 +162,6 @@ impl<'a> AccountIndexTable<'a> {
             mask: slots - 1,
             len: 0,
             _marker: PhantomData,
-        }
-    }
-
-    fn get(&self, prefix: u64, key: &AccountKey) -> Option<u32> {
-        let mut slot = (prefix as usize) & self.mask;
-        loop {
-            let entry = self.slots[slot];
-            if entry.key.is_null() {
-                return None;
-            }
-            // SAFETY: keys are pointers to accounts borrowed from `transfers`,
-            // which outlive the table through `'a`.
-            if unsafe { *entry.key == *key } {
-                return Some(entry.index);
-            }
-            slot = (slot + 1) & self.mask;
         }
     }
 
@@ -236,15 +221,43 @@ impl<'a> AccountIndexTable<'a> {
     }
 }
 
-impl<'a> Shard<'a> {
-    /// The sender account keys this shard must load, deduplicated exactly.
-    pub(crate) fn sender_keys(&self) -> &[&'a AccountKey] {
-        &self.sender_keys
+struct GeneralBuilder<'a> {
+    account_keys: Vec<&'a AccountKey>,
+    effects: Vec<AccountEffect>,
+    indices: AccountIndexTable<'a>,
+}
+
+impl<'a> GeneralBuilder<'a> {
+    fn new(transfers: usize) -> Self {
+        let expected_accounts = transfers.saturating_mul(2).max(16);
+        Self {
+            account_keys: Vec::with_capacity(expected_accounts),
+            effects: Vec::with_capacity(expected_accounts),
+            indices: AccountIndexTable::with_capacity(expected_accounts),
+        }
+    }
+
+    fn account(&mut self, prefix: u64, key: &'a AccountKey) -> &mut AccountEffect {
+        let (account, inserted) =
+            self.indices
+                .get_or_insert(prefix, key, self.account_keys.len() as u32);
+        if inserted {
+            self.account_keys.push(key);
+            self.effects.push(AccountEffect::default());
+        }
+        &mut self.effects[account as usize]
+    }
+
+    fn into_workload(self) -> GeneralWorkload<'a> {
+        GeneralWorkload {
+            account_keys: self.account_keys,
+            effects: self.effects,
+        }
     }
 }
 
 /// Builds the execution plan used by both DB-backed and in-memory execution.
-pub(crate) fn execution_plan(transfers: &[PreparedTransfer], shards: usize) -> ExecutionPlan<'_> {
+pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<ExecutionPlan<'_>> {
     let mut touches: FastMap<&AccountKey, usize> =
         FastMap::with_capacity_and_hasher(transfers.len().saturating_mul(2), RandomState::new());
     for transfer in transfers {
@@ -254,10 +267,7 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer], shards: usize) -> E
         }
     }
 
-    let shards = shards.max(1);
-    let expected_shard_len = transfers.len().div_ceil(shards).clamp(16, 1024);
-    let mut general = new_shards(shards, expected_shard_len);
-    let mut has_general = false;
+    let mut general = None;
     let mut discrete = DiscreteWorkload {
         transfers: Vec::with_capacity(transfers.len()),
         sender_keys: Vec::with_capacity(transfers.len()),
@@ -281,172 +291,28 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer], shards: usize) -> E
             continue;
         }
 
-        has_general = true;
-        push_sender(&mut general, index as u32, transfer);
-    }
-
-    if !has_general {
-        general.clear();
-    }
-
-    ExecutionPlan { discrete, general }
-}
-
-fn new_shards<'a>(shards: usize, expected_shard_len: usize) -> Vec<Shard<'a>> {
-    (0..shards)
-        .map(|_| Shard {
-            senders: Vec::new(),
-            sender_keys: Vec::new(),
-            sender_indices: AccountIndexTable::with_capacity(expected_shard_len),
-        })
-        .collect()
-}
-
-fn push_sender<'a>(shards: &mut [Shard<'a>], index: u32, transfer: &'a PreparedTransfer) {
-    let shard = shard_of_prefix(transfer.sender_prefix, shards.len());
-    let shard = &mut shards[shard];
-    let (account, inserted) = shard.sender_indices.get_or_insert(
-        transfer.sender_prefix,
-        &transfer.sender,
-        shard.sender_keys.len() as u32,
-    );
-    if inserted {
-        shard.sender_keys.push(&transfer.sender);
-    }
-    shard.senders.push(ShardSender {
-        transfer: index,
-        account,
-    });
-}
-
-/// Applies one sender shard's debits.
-///
-/// `accounts` must already hold every sender key this shard owns (loaded from
-/// block-start state); each lookup is therefore infallible. Returns post-debit
-/// sender writes, or `None` if any debit fails its nonce or balance check.
-pub(crate) fn execute_shard(
-    mut accounts: ShardAccounts,
-    shard: &Shard<'_>,
-    transfers: &[PreparedTransfer],
-) -> Option<ShardOutput> {
-    let mut debits = vec![0u64; accounts.len()];
-    for sender in &shard.senders {
-        let transfer = &transfers[sender.transfer as usize];
-        let account = &mut accounts[sender.account as usize];
-        if !account.nonce.consume(transfer.nonce) {
-            return None;
-        }
+        let general = general.get_or_insert_with(|| GeneralBuilder::new(transfers.len()));
+        let sender = general.account(transfer.sender_prefix, &transfer.sender);
+        sender.sent.push(index as u32);
         if transfer.sender == transfer.recipient {
-            if account.balance < transfer.value {
-                return None;
-            }
+            sender.self_transfer_floor = sender.self_transfer_floor.max(transfer.value);
         } else {
-            let debit = &mut debits[sender.account as usize];
-            *debit = (*debit).checked_add(transfer.value)?;
+            sender.debit = sender.debit.checked_add(transfer.value)?;
+            let recipient = general.account(transfer.recipient_prefix, &transfer.recipient);
+            recipient.credit = recipient.credit.checked_add(transfer.value)?;
         }
     }
 
-    for (account, debit) in accounts.iter_mut().zip(debits) {
-        if account.balance < debit {
-            return None;
-        }
-        account.balance -= debit;
-    }
-
-    Some(ShardOutput { senders: accounts })
-}
-
-/// Applies credits to recipients already loaded as sender accounts.
-///
-/// Returns transfer indices whose recipients were not loaded by any sender
-/// shard and therefore still need state fetched in the final sweep.
-pub(crate) fn apply_loaded_credits(
-    outputs: &mut [ShardOutput],
-    shards: &[Shard<'_>],
-    transfers: &[PreparedTransfer],
-) -> Option<MissingCredits> {
-    let shard_count = outputs.len();
-    let mut missing = MissingCredits::new();
-    for owner in shards {
-        for sender in &owner.senders {
-            let index = sender.transfer;
-            let transfer = &transfers[index as usize];
-            if transfer.sender == transfer.recipient {
-                continue;
-            }
-            let recipient_shard = shard_of_prefix(transfer.recipient_prefix, shard_count);
-            if let Some(account) = shards[recipient_shard]
-                .sender_indices
-                .get(transfer.recipient_prefix, &transfer.recipient)
-            {
-                apply_credit(
-                    &mut outputs[recipient_shard].senders[account as usize],
-                    transfer.value,
-                )?;
-            } else {
-                missing.push(index);
-            }
-        }
-    }
-    Some(missing)
-}
-
-/// Converts a sender shard output into account writes.
-pub(crate) fn shard_writes(shard: &Shard<'_>, output: ShardOutput) -> ShardWrites {
-    shard
-        .sender_keys
-        .iter()
-        .zip(output.senders)
-        .map(|(key, account)| (**key, account))
-        .collect()
-}
-
-/// Aggregates recipient-only credits for the final state fetch.
-pub(crate) fn aggregate_credits<'a>(
-    missing: MissingCredits,
-    transfers: &'a [PreparedTransfer],
-) -> Option<AggregatedCredits<'a>> {
-    let mut aggregated: FastMap<&AccountKey, u64> =
-        FastMap::with_capacity_and_hasher(missing.len(), RandomState::new());
-    for index in missing {
-        let transfer = &transfers[index as usize];
-        let credit = aggregated.entry(&transfer.recipient).or_default();
-        *credit = credit.checked_add(transfer.value)?;
-    }
-    Some(aggregated.into_iter().collect())
-}
-
-/// Applies aggregated recipient-only credits to fetched accounts.
-pub(crate) fn apply_aggregated_credits<'a, I>(
-    recipients: I,
-    values: impl IntoIterator<Item = Option<Account>>,
-) -> Option<ShardWrites>
-where
-    I: IntoIterator<Item = (&'a AccountKey, u64)>,
-{
-    let recipients = recipients.into_iter();
-    let mut writes = ShardWrites::with_capacity(recipients.size_hint().0);
-    for ((recipient, credit), value) in recipients.zip(values) {
-        let mut account = value.unwrap_or_default();
-        apply_credit(&mut account, credit)?;
-        writes.push((*recipient, account));
-    }
-    Some(writes)
-}
-
-/// Applies aggregated recipient-only credits to the in-memory state.
-pub(crate) fn apply_state_credits<'a, I>(state: &State, recipients: I) -> Option<ShardWrites>
-where
-    I: IntoIterator<Item = (&'a AccountKey, u64)>,
-{
-    let recipients = recipients.into_iter();
-    let mut writes = ShardWrites::with_capacity(recipients.size_hint().0);
-    for (recipient, credit) in recipients {
-        let mut account = state.get(recipient).copied().unwrap_or_default();
-        apply_credit(&mut account, credit)?;
-        writes.push((*recipient, account));
-    }
-    Some(writes)
+    Some(ExecutionPlan {
+        discrete,
+        general: general.map_or_else(
+            || GeneralWorkload {
+                account_keys: Vec::new(),
+                effects: Vec::new(),
+            },
+            GeneralBuilder::into_workload,
+        ),
+    })
 }
 
 /// Applies one credit to an account.
@@ -455,41 +321,59 @@ pub(crate) fn apply_credit(account: &mut Account, value: u64) -> Option<()> {
     Some(())
 }
 
-/// Executes a batch against an in-memory base state, sharding by `shards`.
+/// Applies account-owned effects to loaded accounts.
+pub(crate) fn apply_general_accounts(
+    values: Vec<Option<Account>>,
+    workload: &GeneralWorkload<'_>,
+    transfers: &[PreparedTransfer],
+) -> Option<ShardWrites> {
+    assert_eq!(values.len(), workload.account_keys.len());
+    assert_eq!(values.len(), workload.effects.len());
+
+    let mut writes = ShardWrites::with_capacity(workload.account_keys.len());
+    for ((key, effect), value) in workload
+        .account_keys
+        .iter()
+        .zip(&workload.effects)
+        .zip(values)
+    {
+        let mut account = value.unwrap_or_default();
+        for index in &effect.sent {
+            let transfer = &transfers[*index as usize];
+            if !account.nonce.consume(transfer.nonce) {
+                return None;
+            }
+        }
+        if account.balance < effect.self_transfer_floor || account.balance < effect.debit {
+            return None;
+        }
+        account.balance -= effect.debit;
+        apply_credit(&mut account, effect.credit)?;
+        writes.push((**key, account));
+    }
+    Some(writes)
+}
+
+/// Executes a batch against an in-memory base state.
 ///
-/// Used by tests and benchmarks; the consensus path loads each shard's accounts
-/// from the database instead (see `consensus::execution`). The result is
-/// independent of the shard count.
+/// Used by tests and benchmarks; the consensus path loads accounts from the
+/// database instead (see `consensus::execution`). The shard count is retained
+/// for benchmark/test compatibility and does not affect the execution result.
 pub(crate) fn execute_with_shards(
     state: &State,
     transfers: &[PreparedTransfer],
-    shards: usize,
+    _shards: usize,
 ) -> Option<Changeset> {
-    let plan = execution_plan(transfers, shards);
+    let plan = execution_plan(transfers)?;
     let mut changeset = execute_discrete(state, &plan.discrete)?;
     if !plan.general.is_empty() {
-        let mut outputs = Vec::with_capacity(plan.general.len());
-        for shard in &plan.general {
-            let accounts = shard
-                .sender_keys()
-                .iter()
-                .map(|key| state.get(*key).copied().unwrap_or_default())
-                .collect();
-            outputs.push(execute_shard(accounts, shard, transfers)?);
-        }
-        let missing = apply_loaded_credits(&mut outputs, &plan.general, transfers)?;
-        let mut recipient_writes = ShardWrites::new();
-        if !missing.is_empty() {
-            recipient_writes = apply_state_credits(state, aggregate_credits(missing, transfers)?)?;
-        }
-
-        changeset.extend(
-            outputs
-                .into_iter()
-                .zip(&plan.general)
-                .flat_map(|(output, shard)| shard_writes(shard, output))
-                .chain(recipient_writes),
-        );
+        let accounts = plan
+            .general
+            .account_keys()
+            .iter()
+            .map(|key| state.get(*key).copied())
+            .collect();
+        changeset.extend(apply_general_accounts(accounts, &plan.general, transfers)?);
     }
     changeset.sort_unstable_by_key(|(key, _)| *key);
     Some(changeset)
@@ -531,19 +415,6 @@ where
     S: Strategy,
 {
     execute_with_shards(state, transfers, strategy.parallelism_hint())
-}
-
-/// The shard that owns an account, derived from a prefix of its key. Account
-/// keys are uniformly distributed (public keys or hashes), so a key prefix
-/// spreads accounts evenly across shards.
-#[inline]
-const fn shard_of_prefix(prefix: u64, shards: usize) -> usize {
-    let value = prefix as usize;
-    if shards.is_power_of_two() {
-        value & (shards - 1)
-    } else {
-        value % shards
-    }
 }
 
 #[inline]

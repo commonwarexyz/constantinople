@@ -6,20 +6,20 @@
 //! against QMDB-backed state, appends transaction-history entries, and returns
 //! the commitments consensus proposes, verifies, or applies.
 //!
-//! Account execution is sender-owned. A sender spends only the balance it had at
-//! the start of the block, and credits created by the same block cannot fund
-//! later debits in that block. The executor therefore loads sender accounts for
-//! nonce and debit checks first, then applies credits after all debits have
-//! succeeded.
+//! Account execution is based on block-start state. A sender spends only the
+//! balance it had at the start of the block, and credits created by the same
+//! block cannot fund later debits in that block. The executor therefore builds
+//! deterministic account effects first, then applies those effects to loaded
+//! accounts all or nothing.
 //!
 //! The executor builds one account-touch plan for each block. Transfers whose
 //! non-self sender/recipient accounts are unique in the block stay on a discrete
 //! lane and can write their sender and recipient accounts directly. Transfers
-//! that touch contended accounts go through the general sender-sharded lane: each
-//! shard owns its senders, and the final sweep credits already-loaded senders or
-//! aggregates recipient-only credits before loading and writing those accounts.
-//! If any lane fails a nonce check, balance check, or checked credit addition,
-//! the whole block body is invalid and no partial state is applied.
+//! that touch contended accounts go through the general account-owned lane: each
+//! affected account is loaded once, receives its accumulated nonce/debit/credit
+//! effect, and writes once. If any lane fails a nonce check, balance check, or
+//! checked credit addition, the whole block body is invalid and no partial state
+//! is applied.
 //!
 //! State writes are folded into the unordered state QMDB, whose commitment
 //! depends on the final key/value set. Transaction history is append-only, so

@@ -5,12 +5,12 @@
 //! account and transaction-history updates into QMDB batches, and returns the
 //! merkleized commitments that consensus proposes, verifies, or applies.
 //!
-//! The important invariant is that parallel account execution is owned by
-//! sender, not by every account a transfer touches. Nonces and spends are both
-//! sender-local, and credits from this block are not available for spending
-//! until the block has finished executing. Because of that rule, a sender shard
-//! can load only sender accounts, advance nonces, and apply debits without any
-//! shared recipient map, recipient locks, or recipient state loads.
+//! The important invariant is that account execution is based on block-start
+//! state. Nonces and spends are sender-local, and credits from this block are
+//! not available for spending until the block has finished executing. Because of
+//! that rule, execution can build deterministic account effects from the
+//! transfer list before looking at account state, then apply those effects to
+//! loaded accounts all or nothing.
 //!
 //! ```text
 //! body transactions
@@ -29,13 +29,9 @@
 //!        +--> discrete lane -- load unique senders/recipients    |
 //!        |                   -- check nonce/debit, apply credits |
 //!        |                                                       |
-//!        +--> general lane -- route debits by sender             |
-//!        |                  -- sender shard 0 -- load/check/debit|
-//!        |                  -- sender shard 1 -- load/check/debit|
-//!        |                  -- final credit sweep                |
-//!        |                     * credit loaded senders           |
-//!        |                     * aggregate recipient-only credits|
-//!        |                     * get_many missing recipients     |
+//!        +--> general lane -- aggregate account effects          |
+//!        |                  -- get_many affected accounts        |
+//!        |                  -- check/apply each account once     |
 //!        |                                                       |
 //!        v                                                       |
 //! StateWrites ---------------------------------------------------+
@@ -50,18 +46,15 @@
 //! The account-touch plan has two lanes. The discrete lane contains only
 //! transfers whose non-self sender and recipient accounts are unique in the
 //! block, so each loaded account produces exactly one final write. The general
-//! lane contains every transfer that touches a contended account and is executed
-//! by sender-owned shards.
-//!
-//! The general lane's final credit sweep is what makes sender-only sharding
-//! correct. Once all general-lane debits have succeeded, every loaded sender
-//! account has a single owner and can receive any in-block credits addressed to
-//! it. Recipients that were never loaded as senders cannot affect debit
-//! validity, so their credits are summed after the sender phase, loaded through
-//! batched `get_many` reads, and written once. Large borrowed key slices may be
-//! split into flat `Strategy` chunks for fan-out, but this is still one logical
-//! final sweep. If any debit check or credit addition fails in either lane, the
-//! whole batch is rejected; there is no partial execution state to reconcile.
+//! lane contains every transfer that touches a contended account. It aggregates
+//! one effect per affected account: sent nonces, non-self debit total,
+//! self-transfer affordability floor, and recipient credit total. The account is
+//! loaded once, checked once, and written once. Credits are added after debit
+//! affordability is checked, so an in-block credit cannot fund an in-block
+//! spend. Large borrowed key slices may be split into flat `Strategy` chunks for
+//! fan-out, but this is still one logical account load. If any debit check or
+//! credit addition fails in either lane, the whole batch is rejected; there is no
+//! partial execution state to reconcile.
 //!
 //! A single execution plan separates the workload into these lanes before any
 //! state is loaded. This keeps independent work on the cheap path even in mixed
@@ -144,12 +137,11 @@ where
     }
 }
 
-/// Loads and executes a batch as a sender-sharded pipeline.
+/// Loads and executes a batch from a deterministic account-touch plan.
 ///
-/// Transfers are routed by sender-key prefix; each shard concurrently loads
-/// only sender accounts and applies debits. The final sweep applies credits to
-/// already-loaded sender accounts first, then aggregates, loads, and credits
-/// remaining recipient-only accounts. Returns `None` if any transfer fails its
+/// Unique transfers use the discrete lane. Transfers touching contended
+/// accounts use the general lane, which loads each affected account once and
+/// applies its accumulated effect. Returns `None` if any transfer fails its
 /// nonce or balance check or overflows a recipient (the whole batch is
 /// rejected). The batch is only borrowed for reads, so the caller may move it
 /// afterward to apply the writes.
@@ -167,18 +159,19 @@ where
         return Some(db::StateWrites::new(Vec::new()));
     }
 
-    let plan = executor::execution_plan(transfers, strategy.parallelism_hint().max(1));
+    let plan = executor::execution_plan(transfers)?;
     let mut writes = Vec::new();
-    if !plan.discrete.transfers.is_empty() {
+    let executor::ExecutionPlan { discrete, general } = plan;
+    if !discrete.transfers.is_empty() {
         writes.extend(
-            load_and_execute_discrete(batch, strategy, plan.discrete)
+            load_and_execute_discrete(batch, strategy, discrete)
                 .await?
                 .shards,
         );
     }
-    if !plan.general.is_empty() {
+    if !general.is_empty() {
         writes.extend(
-            load_and_execute_sharded(batch, strategy, transfers, plan.general)
+            load_and_execute_general(batch, strategy, transfers, &general)
                 .await?
                 .shards,
         );
@@ -186,55 +179,22 @@ where
     Some(db::StateWrites::new(writes))
 }
 
-async fn load_and_execute_sharded<E, H, S>(
+async fn load_and_execute_general<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
-    shards: Vec<executor::Shard<'_>>,
+    workload: &executor::GeneralWorkload<'_>,
 ) -> Option<db::StateWrites>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let loaded = futures::future::try_join_all(shards.iter().map(|shard| async move {
-        let keys = shard.sender_keys();
-        let values = batch.get_many(keys).await?;
-        let accounts = values
-            .into_iter()
-            .map(|value| value.unwrap_or_default())
-            .collect();
-        Ok::<_, commonware_storage::qmdb::Error<mmr::Family>>(executor::execute_shard(
-            accounts, shard, transfers,
-        ))
-    }))
-    .await
-    .expect("state loading must succeed");
-
-    let mut outputs = loaded.into_iter().collect::<Option<Vec<_>>>()?;
-    let missing = executor::apply_loaded_credits(&mut outputs, &shards, transfers)?;
-    let mut recipient_writes = ShardWrites::new();
-    if !missing.is_empty() {
-        let missing_credits = executor::aggregate_credits(missing, transfers)?;
-        let keys = missing_credits
-            .iter()
-            .map(|(recipient, _)| *recipient)
-            .collect::<Vec<_>>();
-        let values = get_many_accounts(batch, strategy, &keys)
-            .await
-            .expect("recipient state loading must succeed");
-        recipient_writes = executor::apply_aggregated_credits(missing_credits, values)?;
-    }
-
-    let mut writes = outputs
-        .into_iter()
-        .zip(&shards)
-        .map(|(output, shard)| executor::shard_writes(shard, output))
-        .collect::<Vec<_>>();
-    if !recipient_writes.is_empty() {
-        writes.push(recipient_writes);
-    }
-    Some(db::StateWrites::new(writes))
+    let values = get_many_accounts(batch, strategy, workload.account_keys())
+        .await
+        .expect("general account state loading must succeed");
+    let writes = executor::apply_general_accounts(values, workload, transfers)?;
+    Some(db::StateWrites::new(vec![writes]))
 }
 
 async fn load_and_execute_discrete<E, H, S>(
@@ -1053,10 +1013,9 @@ mod tests {
 ///
 /// Run with: `cargo test -p constantinople-application --release -- --ignored
 /// --nocapture bench_load_execute`. Seeds a committed state DB, then times the
-/// sender-sharded `load_and_execute` plus final credit sweep. Note: the
-/// deterministic runtime serves reads from memory, so this measures the
-/// load+execute CPU/memory path, not the per-shard I/O concurrency, which only
-/// helps on cold disk misses.
+/// account-plan `load_and_execute`. Note: the deterministic runtime serves
+/// reads from memory, so this measures the load+execute CPU/memory path, not
+/// cold disk behavior.
 #[cfg(test)]
 mod db_bench {
     use crate::executor::PreparedTransfer;
@@ -1302,13 +1261,14 @@ mod db_bench {
         let mut breakdown = CurrentBreakdown::default();
 
         let start = Instant::now();
-        let plan = crate::executor::execution_plan(transfers, strategy.parallelism_hint().max(1));
+        let plan = crate::executor::execution_plan(transfers).expect("execution plan");
         breakdown.plan = start.elapsed();
 
         let mut count = 0;
-        if !plan.discrete.transfers.is_empty() {
+        let crate::executor::ExecutionPlan { discrete, general } = plan;
+        if !discrete.transfers.is_empty() {
             let start = Instant::now();
-            let state_writes = super::load_and_execute_discrete(batch, strategy, plan.discrete)
+            let state_writes = super::load_and_execute_discrete(batch, strategy, discrete)
                 .await
                 .expect("discrete path should execute");
             breakdown.discrete = start.elapsed();
@@ -1319,10 +1279,10 @@ mod db_bench {
                 .sum::<usize>();
             black_box(&state_writes);
         }
-        if !plan.general.is_empty() {
+        if !general.is_empty() {
             let start = Instant::now();
             let state_writes =
-                super::load_and_execute_sharded(batch, strategy, transfers, plan.general)
+                super::load_and_execute_general(batch, strategy, transfers, &general)
                     .await
                     .expect("general path should execute");
             breakdown.general = start.elapsed();
