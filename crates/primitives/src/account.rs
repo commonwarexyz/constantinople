@@ -18,6 +18,8 @@ pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
 /// Number of future nonce uses tracked on each account.
 pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
 
+// Account keys keep the legacy Ed25519 public-key width. Secp256r1 accounts
+// are hashed into this same fixed-width state key.
 const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
 
 /// Fixed-width account identifier derived from a transaction public key.
