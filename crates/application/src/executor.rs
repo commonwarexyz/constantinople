@@ -214,6 +214,12 @@ impl<'a> AccountIndexTable<'a> {
     }
 }
 
+/// Builder for the general lane's dense account-effect table.
+///
+/// Account keys are borrowed from the prepared transfer slice and deduplicated by
+/// value. The prefix only seeds the probe position; equality still compares the
+/// full account key, so equal keys from different transfer slots share one
+/// effect.
 struct GeneralBuilder<'a> {
     account_keys: Vec<&'a AccountKey>,
     effects: Vec<AccountEffect>,

@@ -190,6 +190,9 @@ where
     H: Hasher,
     S: Strategy,
 {
+    // The general lane already aggregated every contended sender and recipient
+    // into account-owned effects. State is loaded once per affected account and
+    // applied only after the full block effect is known.
     let values = get_many_accounts(batch, strategy, workload.account_keys())
         .await
         .expect("general account state loading must succeed");
@@ -350,6 +353,8 @@ where
 {
     let chunks = chunk_count(strategy, transfers.len());
     if all_recipients_non_self {
+        // Dense unique transfers have one recipient key per transfer, so the
+        // same write-into helper shape used for senders can be reused.
         return load_discrete_writes(
             batch,
             strategy,
