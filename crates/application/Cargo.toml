@@ -11,9 +11,6 @@ publish = false
 [lints]
 workspace = true
 
-[features]
-bench-utils = []
-
 [dependencies]
 # Workspace
 constantinople-mempool.workspace = true
@@ -60,9 +57,3 @@ harness = false
 [[bench]]
 name = "compute"
 harness = false
-required-features = ["bench-utils"]
-
-[[bench]]
-name = "lazy_body_prepare"
-harness = false
-required-features = ["bench-utils"]

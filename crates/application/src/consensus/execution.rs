@@ -145,7 +145,7 @@ where
 /// nonce or balance check or overflows a recipient (the whole batch is
 /// rejected). The batch is only borrowed for reads, so the caller may move it
 /// afterward to apply the writes.
-pub(super) async fn compute<E, H, S>(
+pub async fn compute<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
@@ -524,7 +524,7 @@ fn sparse_chunks(
         .collect()
 }
 
-pub(super) fn prepare_signed<H, S>(
+pub fn prepare_signed<H, S>(
     strategy: &S,
     txs: &[SignedTransaction<H>],
 ) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
@@ -621,7 +621,7 @@ where
 pub(super) fn prepare_lazy<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
-) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
+) -> core::result::Result<(Vec<PreparedTransfer>, Vec<H::Digest>), &'static str>
 where
     H: Hasher,
     S: Strategy,

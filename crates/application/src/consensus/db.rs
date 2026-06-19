@@ -44,7 +44,7 @@ pub type TransactionDatabase<E, H, S> = Arc<TracedAsyncRwLock<TransactionHistory
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
 
 /// Unmerkleized application state batch used for executor read-through.
-pub(super) type StateBatch<E, H, T, S> = AnyUnmerkleized<
+pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
     FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
@@ -71,13 +71,21 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
 ///
 /// This is a state diff, not an ordered log: shard order is not consensus
 /// relevant, and each account should be emitted by at most one shard.
-pub(super) struct StateWrites {
+pub struct StateWrites {
     pub(super) shards: Vec<ShardWrites>,
 }
 
 impl StateWrites {
     pub(super) const fn new(shards: Vec<ShardWrites>) -> Self {
         Self { shards }
+    }
+
+    pub fn len(&self) -> usize {
+        self.shards.iter().map(Vec::len).sum()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.shards.iter().all(Vec::is_empty)
     }
 }
 

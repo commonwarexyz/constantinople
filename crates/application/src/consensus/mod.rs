@@ -34,8 +34,6 @@ use commonware_runtime::{
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
-#[cfg(feature = "bench-utils")]
-pub mod bench;
 mod body;
 mod db;
 mod execution;
@@ -48,9 +46,10 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, StateDatabase, StateSyncTarget, TransactionDatabase, TransactionHistoryDb,
-    TransactionHistoryOperation, TransactionHistoryTarget,
+    Databases, StateBatch, StateDatabase, StateSyncTarget, StateWrites, TransactionDatabase,
+    TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
 };
+pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
