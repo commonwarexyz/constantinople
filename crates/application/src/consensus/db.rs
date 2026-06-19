@@ -127,3 +127,91 @@ where
         futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
     Ok((state_merkleized?, transaction_merkleized?))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{StateDatabase, StateWrites, apply_shard_maps};
+    use commonware_codec::FixedSize as _;
+    use commonware_cryptography::Sha256;
+    use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
+    use commonware_storage::{
+        journal::contiguous::fixed::Config as FixedJournalConfig,
+        merkle::full::Config as MmrConfig, qmdb::any::FixedConfig, translator::EightCap,
+    };
+    use commonware_utils::{NZU16, NZU64, NZUsize};
+    use constantinople_primitives::{Account, AccountKey, Nonce};
+
+    type Db = StateDatabase<deterministic::Context, Sha256, EightCap, Sequential>;
+
+    fn config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
+        FixedConfig {
+            merkle_config: MmrConfig {
+                journal_partition: "state-order-test-merkle-journal".into(),
+                metadata_partition: "state-order-test-merkle-metadata".into(),
+                items_per_blob: NZU64!(1024),
+                write_buffer: NZUsize!(4096),
+                strategy: Sequential,
+                page_cache: cache.clone(),
+            },
+            journal_config: FixedJournalConfig {
+                partition: "state-order-test-log".into(),
+                items_per_blob: NZU64!(1024),
+                page_cache: cache,
+                write_buffer: NZUsize!(4096),
+            },
+            translator: EightCap,
+        }
+    }
+
+    #[test]
+    fn state_root_ignores_write_order() {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = CacheRef::from_pooler(&context, NZU16!(16), NZUsize!(4096));
+            let db =
+                <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache)).await;
+            let key = |byte| AccountKey::from([byte; AccountKey::SIZE]);
+            let account = |balance| Account {
+                balance,
+                nonce: Nonce::default(),
+            };
+            let a = key(1);
+            let b = key(2);
+            let c = key(3);
+            let d = key(4);
+
+            let mut seed = db.new_batches().await;
+            seed = seed.write(c, Some(account(300)));
+            seed = seed.write(a, Some(account(100)));
+            let seed = seed.merkleize().await.expect("seed state");
+            db.finalize(seed).await;
+
+            let x = apply_shard_maps(
+                db.new_batches().await,
+                StateWrites::new(vec![
+                    vec![(c, account(301)), (a, account(101))],
+                    vec![(d, account(401)), (b, account(201))],
+                ]),
+            )
+            .merkleize()
+            .await
+            .expect("first order")
+            .root();
+
+            let y = apply_shard_maps(
+                db.new_batches().await,
+                StateWrites::new(vec![
+                    vec![(b, account(201)), (d, account(401))],
+                    vec![(a, account(101)), (c, account(301))],
+                ]),
+            )
+            .merkleize()
+            .await
+            .expect("second order")
+            .root();
+
+            assert_eq!(x, y);
+        });
+    }
+}
