@@ -1089,13 +1089,13 @@ mod tests {
 ///
 /// Run with: `cargo test -p constantinople-application --release -- --ignored
 /// --nocapture bench_load_execute`. Seeds a committed state DB, then times the
-/// new sender-sharded `load_and_execute` plus final credit sweep against the
-/// previous global-load + overlay path. Note: the deterministic runtime serves
-/// reads from memory, so this measures the load+execute CPU/memory path, not
-/// the per-shard I/O concurrency, which only helps on cold disk misses.
+/// sender-sharded `load_and_execute` plus final credit sweep. Note: the
+/// deterministic runtime serves reads from memory, so this measures the
+/// load+execute CPU/memory path, not the per-shard I/O concurrency, which only
+/// helps on cold disk misses.
 #[cfg(test)]
 mod db_bench {
-    use crate::executor::{Changeset, PreparedTransfer, ShardWrites, State};
+    use crate::executor::{PreparedTransfer, ShardWrites};
     use commonware_codec::{EncodeSize as _, ReadExt as _, Write as _};
     use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
@@ -1108,10 +1108,9 @@ mod db_bench {
     use commonware_utils::{NZU16, NZU64, NZUsize};
     use constantinople_primitives::{
         Account, AccountKey, LazySignedTransaction, Nonce, Transaction, TransactionPublicKey,
-        VerifiedTransaction, materialize_transaction_chunks, preload_transaction_chunks,
+        VerifiedTransaction,
     };
     use core::num::NonZeroU64;
-    use hashbrown::HashSet;
     use std::{
         hint::black_box,
         time::{Duration, Instant},
@@ -1194,106 +1193,6 @@ mod db_bench {
             },
             translator: EightCap,
         }
-    }
-
-    /// Main's previous path: global load with the unique-account fast path, then
-    /// overlay execution for contended batches.
-    async fn main_load_execute(
-        batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
-        transfers: &[PreparedTransfer],
-    ) -> usize {
-        let mut account_keys = Vec::with_capacity(transfers.len().saturating_mul(2));
-        let mut unique = HashSet::with_capacity(transfers.len().saturating_mul(2));
-        for transfer in transfers {
-            account_keys.push(&transfer.sender);
-            account_keys.push(&transfer.recipient);
-            unique.insert(&transfer.sender);
-            unique.insert(&transfer.recipient);
-        }
-
-        if unique.len() == account_keys.len() {
-            let accounts = batch
-                .get_many(&account_keys)
-                .await
-                .expect("load")
-                .into_iter()
-                .map(|account| account.unwrap_or_default())
-                .collect::<Vec<_>>();
-            return main_execute_unique(transfers, &accounts)
-                .expect("bench transfers should execute")
-                .len();
-        }
-
-        let keys: Vec<AccountKey> = unique.into_iter().copied().collect();
-        let refs: Vec<&AccountKey> = keys.iter().collect();
-        let values = batch.get_many(&refs).await.expect("load");
-        let state: State = keys
-            .into_iter()
-            .zip(values)
-            .map(|(k, v)| (k, v.unwrap_or_default()))
-            .collect();
-
-        main_execute_shared(&state, transfers)
-            .expect("bench transfers should execute")
-            .len()
-    }
-
-    fn main_execute_unique(
-        transfers: &[PreparedTransfer],
-        accounts: &[Account],
-    ) -> Option<Changeset> {
-        if accounts.len() != transfers.len().saturating_mul(2) {
-            return None;
-        }
-        let mut changeset = Vec::with_capacity(transfers.len().saturating_mul(2));
-
-        for (transfer, accounts) in transfers.iter().zip(accounts.chunks_exact(2)) {
-            let mut sender = accounts[0];
-            if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
-                return None;
-            }
-
-            let mut recipient = accounts[1];
-            let recipient_balance = recipient.balance.checked_add(transfer.value)?;
-
-            sender.balance -= transfer.value;
-            recipient.balance = recipient_balance;
-            changeset.push((transfer.sender, sender));
-            changeset.push((transfer.recipient, recipient));
-        }
-
-        changeset.sort_unstable_by_key(|(key, _)| *key);
-        Some(changeset)
-    }
-
-    fn main_execute_shared(state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset> {
-        let mut writes = State::with_capacity(transfers.len() * 2);
-        for transfer in transfers {
-            let mut sender = writes
-                .get(&transfer.sender)
-                .copied()
-                .or_else(|| state.get(&transfer.sender).copied())
-                .unwrap_or_default();
-            if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
-                return None;
-            }
-            if transfer.sender == transfer.recipient {
-                writes.insert(transfer.sender, sender);
-                continue;
-            }
-            let mut recipient = writes
-                .get(&transfer.recipient)
-                .copied()
-                .or_else(|| state.get(&transfer.recipient).copied())
-                .unwrap_or_default();
-            recipient.balance = recipient.balance.checked_add(transfer.value)?;
-            sender.balance -= transfer.value;
-            writes.insert(transfer.sender, sender);
-            writes.insert(transfer.recipient, recipient);
-        }
-        let mut changeset: Changeset = writes.into_iter().collect();
-        changeset.sort_unstable_by_key(|(key, _)| *key);
-        Some(changeset)
     }
 
     fn transfers(fixture: Fixture, transaction_count: usize) -> Vec<PreparedTransfer> {
@@ -1389,7 +1288,7 @@ mod db_bench {
             .collect()
     }
 
-    async fn timed_new(
+    async fn timed_current(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         transfers: &[PreparedTransfer],
@@ -1397,14 +1296,14 @@ mod db_bench {
         let start = Instant::now();
         let state_writes = super::load_and_execute(batch, strategy, transfers)
             .await
-            .expect("new path");
+            .expect("current path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
         black_box(&state_writes);
         (count, elapsed)
     }
 
-    async fn timed_new_prepare(
+    async fn timed_current_prepare(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         transactions: &[TestTransaction],
@@ -1412,10 +1311,10 @@ mod db_bench {
         let start = Instant::now();
         let (transfers, digests) =
             super::prepare_signed_transfers_with_digests(strategy, transactions)
-                .expect("new prepare");
+                .expect("current prepare");
         let state_writes = super::load_and_execute(batch, strategy, &transfers)
             .await
-            .expect("new path");
+            .expect("current path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
         black_box((&transfers, &digests, &state_writes));
@@ -1423,24 +1322,23 @@ mod db_bench {
     }
 
     #[derive(Default)]
-    struct NewBreakdown {
+    struct CurrentBreakdown {
         total: Duration,
         disjoint: Duration,
         index: Duration,
         sender_load: Duration,
         debit: Duration,
-        loaded_credits: Duration,
         recipient_load: Duration,
         writes: Duration,
     }
 
-    async fn timed_new_breakdown(
+    async fn timed_current_breakdown(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         transfers: &[PreparedTransfer],
-    ) -> (usize, NewBreakdown) {
+    ) -> (usize, CurrentBreakdown) {
         let total = Instant::now();
-        let mut breakdown = NewBreakdown::default();
+        let mut breakdown = CurrentBreakdown::default();
 
         let start = Instant::now();
         let disjoint = crate::executor::disjoint_account_plan(transfers);
@@ -1486,7 +1384,7 @@ mod db_bench {
         let sender_index = crate::executor::index_senders(transfers);
         breakdown.index = start.elapsed();
         if !super::use_indexed_execution(sender_index.sender_count(), transfers.len()) {
-            let (count, elapsed) = timed_new(batch, strategy, transfers).await;
+            let (count, elapsed) = timed_current(batch, strategy, transfers).await;
             breakdown.total = elapsed;
             return (count, breakdown);
         }
@@ -1505,16 +1403,17 @@ mod db_bench {
         let start = Instant::now();
         let execution = if super::use_parallel_indexed_execution(strategy, transfers.len()) {
             crate::executor::execute_indexed_parallel(strategy, accounts, &sender_index, transfers)
-                .expect("new path")
+                .expect("current path")
         } else {
-            crate::executor::execute_indexed(accounts, &sender_index, transfers).expect("new path")
+            crate::executor::execute_indexed(accounts, &sender_index, transfers)
+                .expect("current path")
         };
         breakdown.debit = start.elapsed();
 
         let mut recipient_writes = ShardWrites::new();
         if !execution.missing.is_empty() {
-            let missing_credits =
-                crate::executor::aggregate_credits(execution.missing, transfers).expect("new path");
+            let missing_credits = crate::executor::aggregate_credits(execution.missing, transfers)
+                .expect("current path");
             let keys = missing_credits
                 .iter()
                 .map(|(recipient, _)| *recipient)
@@ -1525,7 +1424,7 @@ mod db_bench {
                 .expect("recipient state loading must succeed");
             breakdown.recipient_load = start.elapsed();
             recipient_writes = crate::executor::apply_aggregated_credits(missing_credits, values)
-                .expect("new path");
+                .expect("current path");
         }
 
         let start = Instant::now();
@@ -1543,47 +1442,7 @@ mod db_bench {
         (count, breakdown)
     }
 
-    async fn timed_main(
-        batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
-        transfers: &[PreparedTransfer],
-    ) -> (usize, Duration) {
-        let start = Instant::now();
-        let count = main_load_execute(batch, transfers).await;
-        let elapsed = start.elapsed();
-        black_box(count);
-        (count, elapsed)
-    }
-
-    async fn timed_main_prepare(
-        batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
-        transactions: &[TestTransaction],
-    ) -> (usize, Duration) {
-        let start = Instant::now();
-        let transfers = transactions
-            .iter()
-            .map(crate::executor::prepare_transfer)
-            .collect::<Option<Vec<_>>>()
-            .expect("main prepare");
-        let count = main_load_execute(batch, &transfers).await;
-        let elapsed = start.elapsed();
-        black_box((&transfers, count));
-        (count, elapsed)
-    }
-
-    fn timed_old_lazy_preload(
-        strategy: &Rayon,
-        body: &[LazySignedTransaction<Sha256>],
-    ) -> (usize, Duration) {
-        let start = Instant::now();
-        let transactions =
-            preload_transaction_chunks(body.to_vec(), strategy).expect("lazy preload");
-        let elapsed = start.elapsed();
-        let count = transactions.len();
-        black_box(transactions);
-        (count, elapsed)
-    }
-
-    fn timed_new_lazy_preload(
+    fn timed_lazy_preload(
         strategy: &Rayon,
         body: &[LazySignedTransaction<Sha256>],
     ) -> (usize, Duration) {
@@ -1597,23 +1456,7 @@ mod db_bench {
         (body.len(), elapsed)
     }
 
-    fn timed_old_lazy_apply_prepare(
-        strategy: &Rayon,
-        body: &[LazySignedTransaction<Sha256>],
-    ) -> (usize, Duration) {
-        let start = Instant::now();
-        let materialized =
-            materialize_transaction_chunks(strategy, body.to_vec()).expect("materialize");
-        let (transfers, digests) =
-            super::prepare_signed_transfers_with_digests(strategy, &materialized)
-                .expect("prepare materialized");
-        let elapsed = start.elapsed();
-        let count = transfers.len();
-        black_box((materialized, transfers, digests));
-        (count, elapsed)
-    }
-
-    fn timed_new_lazy_apply_prepare(
+    fn timed_lazy_apply_prepare(
         strategy: &Rayon,
         body: &[LazySignedTransaction<Sha256>],
     ) -> (usize, Duration) {
@@ -1651,41 +1494,32 @@ mod db_bench {
             "bench body should preload"
         );
 
-        let mut old_preload_total = Duration::ZERO;
-        let mut new_preload_total = Duration::ZERO;
-        let mut old_apply_total = Duration::ZERO;
-        let mut new_apply_total = Duration::ZERO;
+        let mut preload_total = Duration::ZERO;
+        let mut apply_total = Duration::ZERO;
         for iter in 0..(warmup + iters) {
-            let (old_count, old_elapsed) = timed_old_lazy_preload(&strategy, &body);
-            let (new_count, new_elapsed) = timed_new_lazy_preload(&strategy, &body);
-            assert_eq!(old_count, new_count, "preload count should match");
+            let (preload_count, preload_elapsed) = timed_lazy_preload(&strategy, &body);
+            assert_eq!(
+                preload_count, transaction_count,
+                "preload count should match"
+            );
 
-            let (old_count, old_elapsed_apply) = timed_old_lazy_apply_prepare(&strategy, &body);
-            let (new_count, new_elapsed_apply) = timed_new_lazy_apply_prepare(&strategy, &body);
-            assert_eq!(old_count, new_count, "prepare count should match");
+            let (apply_count, apply_elapsed) = timed_lazy_apply_prepare(&strategy, &body);
+            assert_eq!(apply_count, transaction_count, "prepare count should match");
 
             if iter >= warmup {
-                old_preload_total += old_elapsed;
-                new_preload_total += new_elapsed;
-                old_apply_total += old_elapsed_apply;
-                new_apply_total += new_elapsed_apply;
+                preload_total += preload_elapsed;
+                apply_total += apply_elapsed;
             }
         }
 
-        let old_preload = old_preload_total / iters;
-        let new_preload = new_preload_total / iters;
-        let old_apply = old_apply_total / iters;
-        let new_apply = new_apply_total / iters;
+        let preload = preload_total / iters;
+        let apply = apply_total / iters;
         let tps = |d: Duration| transaction_count as f64 / d.as_secs_f64() / 1e6;
         println!(
-            "lazy body prepare  {transaction_count} txs / unique / {} shards\n  verify preload old clone: {old_preload:?}  ({:.2} Melem/s)\n  verify preload new borrow: {new_preload:?}  ({:.2} Melem/s)\n  verify speedup: {:.2}x\n  apply prepare old materialize: {old_apply:?}  ({:.2} Melem/s)\n  apply prepare new borrow:     {new_apply:?}  ({:.2} Melem/s)\n  apply speedup: {:.2}x",
+            "lazy body prepare  {transaction_count} txs / unique / {} shards\n  verify preload: {preload:?}  ({:.2} Melem/s)\n  apply prepare:  {apply:?}  ({:.2} Melem/s)",
             super::execution_shard_count(&strategy),
-            tps(old_preload),
-            tps(new_preload),
-            old_preload.as_secs_f64() / new_preload.as_secs_f64(),
-            tps(old_apply),
-            tps(new_apply),
-            old_apply.as_secs_f64() / new_apply.as_secs_f64(),
+            tps(preload),
+            tps(apply),
         );
     }
 
@@ -1694,7 +1528,6 @@ mod db_bench {
     fn bench_load_execute() {
         deterministic::Runner::default().start(|context| async move {
             let bench_prepare = std::env::var_os("CONSTANTINOPLE_BENCH_PREPARE").is_some();
-            let bench_new_only = std::env::var_os("CONSTANTINOPLE_BENCH_NEW_ONLY").is_some();
             let warmup = std::env::var("CONSTANTINOPLE_BENCH_WARMUP")
                 .ok()
                 .and_then(|value| value.parse::<u32>().ok())
@@ -1751,63 +1584,38 @@ mod db_bench {
                     }
                     let transfers = transfers(fixture, transaction_count);
 
-                    let mut new_total = Duration::ZERO;
-                    let mut main_total = Duration::ZERO;
-                    let mut new_writes = 0usize;
-                    let mut main_writes = 0usize;
+                    let mut current_total = Duration::ZERO;
+                    let mut current_writes = 0usize;
                     for iter in 0..(warmup + iters) {
                         let batch = db.new_batches().await;
-                        let (count, elapsed) = timed_new(&batch, &strategy, &transfers).await;
-                        new_writes = count;
+                        let (count, elapsed) = timed_current(&batch, &strategy, &transfers).await;
+                        current_writes = count;
                         if iter >= warmup {
-                            new_total += elapsed;
+                            current_total += elapsed;
                         }
                     }
                     let tps = |d: Duration| transaction_count as f64 / d.as_secs_f64() / 1e6;
-                    if bench_new_only {
-                        let new = new_total / iters;
-                        println!(
-                            "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  new (per-shard): {new:?}  ({:.2} Melem/s)",
-                            fixture.name(),
-                            super::execution_shard_count(&strategy),
-                            tps(new),
-                        );
-                        continue;
-                    }
-                    for iter in 0..(warmup + iters) {
-                        let batch = db.new_batches().await;
-                        let (count, elapsed) = timed_main(&batch, &transfers).await;
-                        main_writes = count;
-                        if iter >= warmup {
-                            main_total += elapsed;
-                        }
-                    }
-                    assert_eq!(new_writes, main_writes, "write count should match");
 
-                    let new = new_total / iters;
-                    let main = main_total / iters;
+                    let current = current_total / iters;
                     println!(
-                        "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  new (per-shard): {new:?}  ({:.2} Melem/s)\n  main:            {main:?}  ({:.2} Melem/s)\n  speedup:         {:.2}x",
+                        "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  current: {current:?}  ({:.2} Melem/s) / {current_writes} writes",
                         fixture.name(),
                         super::execution_shard_count(&strategy),
-                        tps(new),
-                        tps(main),
-                        main.as_secs_f64() / new.as_secs_f64(),
+                        tps(current),
                     );
 
                     if std::env::var_os("CONSTANTINOPLE_BENCH_BREAKDOWN").is_some() {
                         let batch = db.new_batches().await;
                         let (count, breakdown) =
-                            timed_new_breakdown(&batch, &strategy, &transfers).await;
-                        assert_eq!(count, new_writes, "breakdown write count should match");
+                            timed_current_breakdown(&batch, &strategy, &transfers).await;
+                        assert_eq!(count, current_writes, "breakdown write count should match");
                         println!(
-                            "  breakdown: total={:?} disjoint={:?} index={:?} sender_load={:?} debit={:?} loaded_credits={:?} recipient_load={:?} writes={:?}",
+                            "  breakdown: total={:?} disjoint={:?} index={:?} sender_load={:?} debit={:?} recipient_load={:?} writes={:?}",
                             breakdown.total,
                             breakdown.disjoint,
                             breakdown.index,
                             breakdown.sender_load,
                             breakdown.debit,
-                            breakdown.loaded_credits,
                             breakdown.recipient_load,
                             breakdown.writes,
                         );
@@ -1815,48 +1623,24 @@ mod db_bench {
 
                     if bench_prepare {
                         let transactions = signed_transactions(fixture, transaction_count);
-                        let mut new_total = Duration::ZERO;
-                        let mut main_total = Duration::ZERO;
-                        let mut new_writes = 0usize;
-                        let mut main_writes = 0usize;
+                        let mut current_total = Duration::ZERO;
+                        let mut current_writes = 0usize;
                         for iter in 0..(warmup + iters) {
                             let batch = db.new_batches().await;
                             let (count, elapsed) =
-                                timed_new_prepare(&batch, &strategy, &transactions).await;
-                            new_writes = count;
+                                timed_current_prepare(&batch, &strategy, &transactions).await;
+                            current_writes = count;
                             if iter >= warmup {
-                                new_total += elapsed;
+                                current_total += elapsed;
                             }
                         }
-                        if bench_new_only {
-                            let new = new_total / iters;
-                            println!(
-                                "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  new:  {new:?}  ({:.2} Melem/s)",
-                                fixture.name(),
-                                super::execution_shard_count(&strategy),
-                                tps(new),
-                            );
-                            continue;
-                        }
-                        for iter in 0..(warmup + iters) {
-                            let batch = db.new_batches().await;
-                            let (count, elapsed) = timed_main_prepare(&batch, &transactions).await;
-                            main_writes = count;
-                            if iter >= warmup {
-                                main_total += elapsed;
-                            }
-                        }
-                        assert_eq!(new_writes, main_writes, "write count should match");
 
-                        let new = new_total / iters;
-                        let main = main_total / iters;
+                        let current = current_total / iters;
                         println!(
-                            "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  new:  {new:?}  ({:.2} Melem/s)\n  main: {main:?}  ({:.2} Melem/s)\n  speedup: {:.2}x",
+                            "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  current: {current:?}  ({:.2} Melem/s) / {current_writes} writes",
                             fixture.name(),
                             super::execution_shard_count(&strategy),
-                            tps(new),
-                            tps(main),
-                            main.as_secs_f64() / new.as_secs_f64(),
+                            tps(current),
                         );
                     }
                 }

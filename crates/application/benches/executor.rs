@@ -1,7 +1,7 @@
 use commonware_cryptography::{Signer, ed25519, sha256};
 use commonware_math::algebra::Random;
 use commonware_parallel::Sequential;
-use constantinople_application::executor::{self, Changeset, PreparedTransfer, State};
+use constantinople_application::executor::{self, PreparedTransfer, State};
 use constantinople_primitives::{
     Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
@@ -13,43 +13,6 @@ use std::hint::black_box;
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
 type Transfers = Vec<PreparedTransfer>;
-
-/// The previous single-overlay execution, kept for a same-run baseline. Debits
-/// and credits are applied inline against one map, so a recipient could spend
-/// funds received earlier in the block.
-fn legacy_execute(state: &State, transfers: &Transfers) -> Changeset {
-    let mut writes = State::with_capacity(transfers.len() * 2);
-    for transfer in transfers {
-        let mut sender = writes
-            .get(&transfer.sender)
-            .copied()
-            .or_else(|| state.get(&transfer.sender).copied())
-            .unwrap_or_default();
-        assert!(
-            sender.balance >= transfer.value && sender.nonce.consume(transfer.nonce),
-            "bench fixtures must be valid"
-        );
-        if transfer.sender == transfer.recipient {
-            writes.insert(transfer.sender, sender);
-            continue;
-        }
-        let mut recipient = writes
-            .get(&transfer.recipient)
-            .copied()
-            .or_else(|| state.get(&transfer.recipient).copied())
-            .unwrap_or_default();
-        recipient.balance = recipient
-            .balance
-            .checked_add(transfer.value)
-            .expect("bench fixtures must not overflow");
-        sender.balance -= transfer.value;
-        writes.insert(transfer.sender, sender);
-        writes.insert(transfer.recipient, recipient);
-    }
-    let mut changeset: Changeset = writes.into_iter().collect();
-    changeset.sort_unstable_by_key(|(key, _)| *key);
-    changeset
-}
 
 const NAMESPACE: &[u8] = b"executor-bench";
 const TRANSACTION_COUNTS: &[usize] = &[256, 1024, 8192, 16_384, 65_536];
@@ -76,11 +39,10 @@ fn executor(c: &mut Criterion) {
     group.finish();
 }
 
-/// Benchmarks only the in-memory CPU cost of the execute kernel (legacy
-/// single-overlay vs the new sharded all-or-nothing pass) on pre-loaded state.
-/// It does NOT measure the load, which is the part this change restructures, so
-/// it is not a benchmark of the pipeline. For the real load + execute
-/// measurement against a QMDB, see the `db_bench` harness in
+/// Benchmarks only the in-memory CPU cost of the current execute kernel on
+/// pre-loaded state. It does NOT measure the load, which is the part this
+/// change restructures, so it is not a benchmark of the pipeline. For the real
+/// load + execute measurement against a QMDB, see the `db_bench` harness in
 /// `consensus::execution` (run with `--ignored --nocapture --release`).
 fn bench_execute(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
@@ -90,15 +52,7 @@ fn bench_execute(
     transfers: &Transfers,
 ) {
     group.bench_with_input(
-        BenchmarkId::new(format!("{fixture}/legacy"), transaction_count),
-        &transaction_count,
-        |bencher, _| {
-            bencher
-                .iter(|| black_box(legacy_execute(black_box(state), black_box(transfers)).len()));
-        },
-    );
-    group.bench_with_input(
-        BenchmarkId::new(format!("{fixture}/new"), transaction_count),
+        BenchmarkId::new(fixture, transaction_count),
         &transaction_count,
         |bencher, _| {
             bencher.iter(|| {
