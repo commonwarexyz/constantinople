@@ -23,7 +23,7 @@
 use ahash::RandomState;
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction, TransactionPublicKey};
+use constantinople_primitives::{Account, AccountKey, SignedTransaction};
 use core::marker::PhantomData;
 use hashbrown::HashMap;
 
@@ -53,18 +53,6 @@ pub(crate) struct DisjointAccountPlan<'a> {
     pub(crate) sender_keys: Vec<&'a AccountKey>,
     /// Non-self recipient account keys, in transfer order.
     pub(crate) recipient_keys: Vec<&'a AccountKey>,
-}
-
-impl DisjointAccountPlan<'_> {
-    /// Number of recipient accounts that are not also the sender in the same transfer.
-    pub(crate) const fn recipient_count(&self) -> usize {
-        self.recipient_keys.len()
-    }
-
-    /// Whether every transfer credits a distinct non-self recipient.
-    pub(crate) const fn all_recipients_non_self(&self, transfers: &[PreparedTransfer]) -> bool {
-        self.recipient_keys.len() == transfers.len()
-    }
 }
 
 /// Sender-shard execution output.
@@ -110,7 +98,7 @@ where
     H: Hasher,
 {
     let transfer = transaction.value();
-    let sender = account_key_from_sender(transfer.sender_lazy())?;
+    let sender = AccountKey::from_public_key(transfer.sender_lazy().get()?);
     let recipient = transfer.to;
     Some(PreparedTransfer {
         sender,
@@ -195,7 +183,7 @@ impl<'a> AccountIndexTable<'a> {
     }
 
     fn get(&self, prefix: u64, key: &AccountKey) -> Option<u32> {
-        let mut slot = account_index_hash(prefix) & self.mask;
+        let mut slot = (prefix as usize) & self.mask;
         loop {
             let entry = self.slots[slot];
             if entry.key.is_null() {
@@ -215,7 +203,7 @@ impl<'a> AccountIndexTable<'a> {
             self.grow();
         }
 
-        let mut slot = account_index_hash(prefix) & self.mask;
+        let mut slot = (prefix as usize) & self.mask;
         loop {
             let entry = self.slots[slot];
             if entry.key.is_null() {
@@ -257,7 +245,7 @@ impl<'a> AccountIndexTable<'a> {
     }
 
     fn insert_unique(&mut self, key: &'a AccountKey, index: u32) {
-        let mut slot = account_index_hash(key_prefix(key)) & self.mask;
+        let mut slot = (key_prefix(key) as usize) & self.mask;
         while !self.slots[slot].key.is_null() {
             slot = (slot + 1) & self.mask;
         }
@@ -481,7 +469,7 @@ impl DisjointAccountFilter {
 
     fn insert(&mut self, prefix: u64, key: &AccountKey) -> bool {
         let fingerprint = account_fingerprint(prefix, key);
-        let mut slot = account_index_hash(prefix) & self.mask;
+        let mut slot = (prefix as usize) & self.mask;
         loop {
             let entry = self.slots[slot];
             if entry == 0 {
@@ -843,12 +831,6 @@ where
     execute_with_shards(state, transfers, strategy.parallelism_hint())
 }
 
-fn account_key_from_sender(
-    sender: &commonware_codec::types::lazy::Lazy<TransactionPublicKey>,
-) -> Option<AccountKey> {
-    Some(AccountKey::from_public_key(sender.get()?))
-}
-
 /// The shard that owns an account, derived from a prefix of its key. Account
 /// keys are uniformly distributed (public keys or hashes), so a key prefix
 /// spreads accounts evenly across shards.
@@ -870,20 +852,10 @@ pub(crate) fn key_prefix(key: &AccountKey) -> u64 {
 }
 
 #[inline]
-fn key_suffix(key: &AccountKey) -> u64 {
+fn account_fingerprint(prefix: u64, key: &AccountKey) -> u64 {
     let mut suffix = [0u8; 8];
     suffix.copy_from_slice(&key[8..16]);
-    u64::from_le_bytes(suffix)
-}
-
-#[inline]
-const fn account_index_hash(prefix: u64) -> usize {
-    prefix as usize
-}
-
-#[inline]
-fn account_fingerprint(prefix: u64, key: &AccountKey) -> u64 {
-    let value = prefix ^ key_suffix(key).rotate_left(32);
+    let value = prefix ^ u64::from_le_bytes(suffix).rotate_left(32);
     if value == 0 { 1 } else { value }
 }
 

@@ -171,11 +171,11 @@ where
     }
 
     let sender_index = executor::index_senders(transfers);
-    if use_indexed_execution(sender_index.sender_count(), transfers.len()) {
+    if sender_index.sender_count().saturating_mul(2) <= transfers.len() {
         return load_and_execute_indexed(batch, strategy, &sender_index, transfers).await;
     }
 
-    let shard_count = execution_shard_count(strategy);
+    let shard_count = strategy.parallelism_hint().max(1);
     let shards = executor::partition(transfers, shard_count);
     let loaded = futures::future::try_join_all(shards.iter().map(|shard| async move {
         let keys = shard.sender_keys();
@@ -217,10 +217,6 @@ where
     Some(db::StateWrites::new(writes))
 }
 
-const fn use_indexed_execution(sender_count: usize, transfer_count: usize) -> bool {
-    sender_count.saturating_mul(2) <= transfer_count
-}
-
 async fn load_and_execute_indexed<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
@@ -240,7 +236,7 @@ where
         .into_iter()
         .map(|value| value.unwrap_or_default())
         .collect();
-    let execution = if should_chunk_indexed_execution(strategy, transfers.len()) {
+    let execution = if chunk_count(strategy, transfers.len()) > 1 {
         executor::execute_indexed_parallel(strategy, accounts, sender_index, transfers)?
     } else {
         executor::execute_indexed(accounts, sender_index, transfers)?
@@ -273,14 +269,19 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let sender_writes =
-        load_disjoint_sender_writes(batch, strategy, transfers, disjoint.sender_keys.as_slice())
-            .await
-            .expect("sender state loading must succeed")?;
+    let sender_writes = load_disjoint_writes(
+        batch,
+        strategy,
+        transfers,
+        disjoint.sender_keys.as_slice(),
+        apply_disjoint_sender_values_into,
+    )
+    .await
+    .expect("sender state loading must succeed")?;
 
     let mut writes = vec![sender_writes];
-    if disjoint.recipient_count() > 0 {
-        let all_recipients_non_self = disjoint.all_recipients_non_self(transfers);
+    if !disjoint.recipient_keys.is_empty() {
+        let all_recipients_non_self = disjoint.recipient_keys.len() == transfers.len();
         let recipient_writes = load_disjoint_recipient_writes(
             batch,
             strategy,
@@ -294,27 +295,6 @@ where
     }
 
     Some(db::StateWrites::new(writes))
-}
-
-async fn load_disjoint_sender_writes<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    transfers: &[PreparedTransfer],
-    sender_keys: &[&AccountKey],
-) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    load_disjoint_writes(
-        batch,
-        strategy,
-        transfers,
-        sender_keys,
-        apply_disjoint_sender_values_into,
-    )
-    .await
 }
 
 // These QMDB fan-out helpers split borrowed transfer/key slices into flat
@@ -621,27 +601,6 @@ fn sparse_recipient_chunks(
         .collect()
 }
 
-fn execution_shard_count<S>(strategy: &S) -> usize
-where
-    S: Strategy,
-{
-    strategy.parallelism_hint().max(1)
-}
-
-fn should_chunk_indexed_execution<S>(strategy: &S, transfer_count: usize) -> bool
-where
-    S: Strategy,
-{
-    chunk_count(strategy, transfer_count) > 1
-}
-
-fn should_chunk_prepare<S>(strategy: &S, transaction_count: usize) -> bool
-where
-    S: Strategy,
-{
-    chunk_count(strategy, transaction_count) > 1
-}
-
 pub(super) fn prepare_signed_transfers_with_digests<H, S>(
     strategy: &S,
     transactions: &[SignedTransaction<H>],
@@ -650,7 +609,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if should_chunk_prepare(strategy, transactions.len()) {
+    if chunk_count(strategy, transactions.len()) > 1 {
         return prepare_signed_transfers_with_digests_in_chunks(strategy, transactions);
     }
 
@@ -750,7 +709,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if should_chunk_prepare(strategy, body.len()) {
+    if chunk_count(strategy, body.len()) > 1 {
         return prepare_lazy_transfers_in_chunks(strategy, body);
     }
 
@@ -1125,7 +1084,7 @@ mod db_bench {
     use commonware_codec::{EncodeSize as _, ReadExt as _, Write as _};
     use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
-    use commonware_parallel::Rayon;
+    use commonware_parallel::{Rayon, Strategy as _};
     use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedJournalConfig,
@@ -1371,11 +1330,12 @@ mod db_bench {
         breakdown.disjoint = start.elapsed();
         if let Some(disjoint) = disjoint {
             let start = Instant::now();
-            let sender_writes = super::load_disjoint_sender_writes(
+            let sender_writes = super::load_disjoint_writes(
                 batch,
                 strategy,
                 transfers,
                 disjoint.sender_keys.as_slice(),
+                super::apply_disjoint_sender_values_into,
             )
             .await
             .expect("sender state loading must succeed")
@@ -1383,8 +1343,8 @@ mod db_bench {
             breakdown.sender_load = start.elapsed();
 
             let mut writes = vec![sender_writes];
-            if disjoint.recipient_count() > 0 {
-                let all_recipients_non_self = disjoint.all_recipients_non_self(transfers);
+            if !disjoint.recipient_keys.is_empty() {
+                let all_recipients_non_self = disjoint.recipient_keys.len() == transfers.len();
                 let load_start = Instant::now();
                 let recipient_writes = super::load_disjoint_recipient_writes(
                     batch,
@@ -1409,7 +1369,7 @@ mod db_bench {
         let start = Instant::now();
         let sender_index = crate::executor::index_senders(transfers);
         breakdown.index = start.elapsed();
-        if !super::use_indexed_execution(sender_index.sender_count(), transfers.len()) {
+        if sender_index.sender_count().saturating_mul(2) > transfers.len() {
             let (count, elapsed) = timed_current(batch, strategy, transfers).await;
             breakdown.total = elapsed;
             return (count, breakdown);
@@ -1427,7 +1387,7 @@ mod db_bench {
         breakdown.sender_load = start.elapsed();
 
         let start = Instant::now();
-        let execution = if super::should_chunk_indexed_execution(strategy, transfers.len()) {
+        let execution = if super::chunk_count(strategy, transfers.len()) > 1 {
             crate::executor::execute_indexed_parallel(strategy, accounts, &sender_index, transfers)
                 .expect("current path")
         } else {
@@ -1543,7 +1503,7 @@ mod db_bench {
         let tps = |d: Duration| transaction_count as f64 / d.as_secs_f64() / 1e6;
         println!(
             "lazy body prepare  {transaction_count} txs / unique / {} shards\n  verify preload: {preload:?}  ({:.2} Melem/s)\n  apply prepare:  {apply:?}  ({:.2} Melem/s)",
-            super::execution_shard_count(&strategy),
+            strategy.parallelism_hint().max(1),
             tps(preload),
             tps(apply),
         );
@@ -1626,7 +1586,7 @@ mod db_bench {
                     println!(
                         "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  current: {current:?}  ({:.2} Melem/s) / {current_writes} writes",
                         fixture.name(),
-                        super::execution_shard_count(&strategy),
+                        strategy.parallelism_hint().max(1),
                         tps(current),
                     );
 
@@ -1665,7 +1625,7 @@ mod db_bench {
                         println!(
                             "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  current: {current:?}  ({:.2} Melem/s) / {current_writes} writes",
                             fixture.name(),
-                            super::execution_shard_count(&strategy),
+                            strategy.parallelism_hint().max(1),
                             tps(current),
                         );
                     }
