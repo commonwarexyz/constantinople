@@ -67,6 +67,10 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
     TransactionMerkleized<E, H, S>,
 );
 
+/// Per-shard account writes produced by compute.
+///
+/// This is a state diff, not an ordered log: shard order is not consensus
+/// relevant, and each account should be emitted by at most one shard.
 pub(super) struct StateWrites {
     pub(super) shards: Vec<ShardWrites>,
 }
