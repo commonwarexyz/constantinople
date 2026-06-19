@@ -305,31 +305,57 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = parallel_chunks(strategy, transfers.len());
-    let mut writes = uninit_vec(transfers.len());
-    if chunks <= 1 {
-        let values = batch.get_many(sender_keys).await?;
-        let valid = apply_disjoint_sender_values_into(transfers, values, &mut writes);
-        return Ok(valid.then(|| initialized_copy_vec(writes)));
-    }
-    let valid = parallel_disjoint_sender_writes_into(
+    load_disjoint_writes(
         batch,
         strategy,
         transfers,
         sender_keys,
-        &mut writes,
-        chunks,
-    )?;
+        apply_disjoint_sender_values_into,
+    )
+    .await
+}
+
+// These QMDB fan-out helpers split borrowed transfer/key slices with
+// `Strategy::join`. The runtime spawner requires `'static` futures, so it
+// cannot directly express this borrowed shape without first owning or copying
+// each key chunk.
+type DisjointApplyFn = fn(
+    &[PreparedTransfer],
+    Vec<Option<Account>>,
+    &mut [MaybeUninit<(AccountKey, Account)>],
+) -> bool;
+
+async fn load_disjoint_writes<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transfers: &[PreparedTransfer],
+    keys: &[&AccountKey],
+    apply: DisjointApplyFn,
+) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    let chunks = parallel_chunks(strategy, transfers.len());
+    let mut writes = uninit_vec(transfers.len());
+    let valid = if chunks <= 1 {
+        let values = batch.get_many(keys).await?;
+        apply(transfers, values, &mut writes)
+    } else {
+        parallel_disjoint_writes_into(batch, strategy, transfers, keys, &mut writes, chunks, apply)?
+    };
     Ok(valid.then(|| initialized_copy_vec(writes)))
 }
 
-fn parallel_disjoint_sender_writes_into<E, H, S>(
+fn parallel_disjoint_writes_into<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
     keys: &[&AccountKey],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
     chunks: usize,
+    apply: DisjointApplyFn,
 ) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -339,7 +365,7 @@ where
     debug_assert_eq!(transfers.len(), keys.len());
     if chunks <= 1 {
         let values = futures::executor::block_on(batch.get_many(keys))?;
-        return Ok(apply_disjoint_sender_values_into(transfers, values, writes));
+        return Ok(apply(transfers, values, writes));
     }
 
     let left_chunks = chunks / 2;
@@ -349,23 +375,25 @@ where
     let (left_keys, right_keys) = keys.split_at(split);
     let (left, right) = strategy.join(
         || {
-            parallel_disjoint_sender_writes_into(
+            parallel_disjoint_writes_into(
                 batch,
                 strategy,
                 &transfers[..split],
                 left_keys,
                 left_writes,
                 left_chunks,
+                apply,
             )
         },
         || {
-            parallel_disjoint_sender_writes_into(
+            parallel_disjoint_writes_into(
                 batch,
                 strategy,
                 &transfers[split..],
                 right_keys,
                 right_writes,
                 right_chunks,
+                apply,
             )
         },
     );
@@ -406,21 +434,14 @@ where
 {
     let chunks = parallel_chunks(strategy, transfers.len());
     if all_recipients_non_self {
-        let mut writes = uninit_vec(transfers.len());
-        if chunks <= 1 {
-            let values = batch.get_many(recipient_keys).await?;
-            let valid = apply_disjoint_dense_recipient_values_into(transfers, values, &mut writes);
-            return Ok(valid.then(|| initialized_copy_vec(writes)));
-        }
-        let valid = parallel_disjoint_dense_recipient_writes_into(
+        return load_disjoint_writes(
             batch,
             strategy,
             transfers,
             recipient_keys,
-            &mut writes,
-            chunks,
-        )?;
-        return Ok(valid.then(|| initialized_copy_vec(writes)));
+            apply_disjoint_dense_recipient_values_into,
+        )
+        .await;
     }
 
     if chunks <= 1 {
@@ -428,59 +449,6 @@ where
         return Ok(apply_disjoint_sparse_recipient_values(transfers, values));
     }
     parallel_disjoint_sparse_recipient_writes(batch, strategy, transfers, recipient_keys, chunks)
-}
-
-fn parallel_disjoint_dense_recipient_writes_into<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    transfers: &[PreparedTransfer],
-    keys: &[&AccountKey],
-    writes: &mut [MaybeUninit<(AccountKey, Account)>],
-    chunks: usize,
-) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    debug_assert_eq!(transfers.len(), keys.len());
-    if chunks <= 1 {
-        let values = futures::executor::block_on(batch.get_many(keys))?;
-        return Ok(apply_disjoint_dense_recipient_values_into(
-            transfers, values, writes,
-        ));
-    }
-
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = transfers.len() * left_chunks / chunks;
-    let (left_writes, right_writes) = writes.split_at_mut(split);
-    let (left_keys, right_keys) = keys.split_at(split);
-    let (left, right) = strategy.join(
-        || {
-            parallel_disjoint_dense_recipient_writes_into(
-                batch,
-                strategy,
-                &transfers[..split],
-                left_keys,
-                left_writes,
-                left_chunks,
-            )
-        },
-        || {
-            parallel_disjoint_dense_recipient_writes_into(
-                batch,
-                strategy,
-                &transfers[split..],
-                right_keys,
-                right_writes,
-                right_chunks,
-            )
-        },
-    );
-    let left_valid = left?;
-    let right_valid = right?;
-    Ok(left_valid && right_valid)
 }
 
 fn parallel_disjoint_sparse_recipient_writes<E, H, S>(
