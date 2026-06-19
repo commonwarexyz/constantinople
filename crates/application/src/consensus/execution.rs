@@ -454,6 +454,8 @@ where
     S: Strategy,
 {
     let work = sparse_recipient_chunks(transfers, chunks);
+    let covered_recipients = work.last().map_or(0, |(_, range)| range.end);
+    assert_eq!(covered_recipients, recipient_keys.len());
     let results = strategy.map_collect_vec(work, |(transfer_range, recipient_range)| {
         let result: StateReadResult<Option<ShardWrites>> = if recipient_range.is_empty() {
             Ok(apply_disjoint_sparse_recipient_values(
@@ -1044,9 +1046,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::range_from_bounds;
+    use super::{chunk_ranges, range_from_bounds, sparse_recipient_chunks};
+    use crate::executor::{PreparedTransfer, key_prefix};
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
+    use constantinople_primitives::AccountKey;
 
     #[test]
     fn range_comes_from_qmdb_bounds() {
@@ -1059,6 +1063,43 @@ mod tests {
         };
 
         assert_eq!(range_from_bounds(&bounds), non_empty_range!(11, 15));
+    }
+
+    #[test]
+    fn flat_chunk_ranges_cover_items_once() {
+        assert_eq!(chunk_ranges(0, 4), Vec::<core::ops::Range<usize>>::new());
+        assert_eq!(chunk_ranges(2, 8), vec![0..1, 1..2]);
+        assert_eq!(chunk_ranges(10, 3), vec![0..3, 3..6, 6..10]);
+    }
+
+    #[test]
+    fn sparse_recipient_chunks_align_with_non_self_recipients() {
+        let account = |byte| AccountKey::from_bytes([byte; 32]).expect("account key");
+        let transfer = |sender, recipient| PreparedTransfer {
+            sender,
+            recipient,
+            sender_prefix: key_prefix(&sender),
+            recipient_prefix: key_prefix(&recipient),
+            value: 1,
+            nonce: 0,
+        };
+        let a = account(1);
+        let b = account(2);
+        let c = account(3);
+        let d = account(4);
+
+        let transfers = vec![
+            transfer(a, a),
+            transfer(a, b),
+            transfer(b, c),
+            transfer(c, c),
+            transfer(c, d),
+        ];
+
+        assert_eq!(
+            sparse_recipient_chunks(&transfers, 3),
+            vec![(0..1, 0..0), (1..3, 0..2), (3..5, 2..3)]
+        );
     }
 }
 
