@@ -234,16 +234,12 @@ where
     Some(db::StateWrites::new(writes))
 }
 
-// These QMDB fan-out helpers split borrowed transfer/key slices into flat
-// chunks and run them with `Strategy`. The runtime spawner requires `'static`
-// futures, so it cannot directly express this borrowed shape without first
-// owning or copying each key chunk.
+// Shared sender/recipient write callback shape used by the chunked loaders.
 type ApplyFn = fn(
     &[&PreparedTransfer],
     Vec<Option<Account>>,
     &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool;
-type ReadResult<T> = core::result::Result<T, commonware_storage::qmdb::Error<mmr::Family>>;
 
 async fn load_writes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
@@ -376,7 +372,7 @@ where
     let covered_recipients = work.last().map_or(0, |(_, range)| range.end);
     assert_eq!(covered_recipients, recipient_keys.len());
     let results = strategy.map_collect_vec(work, |(transfer_range, recipient_range)| {
-        let result: ReadResult<Option<ShardWrites>> = if recipient_range.is_empty() {
+        if recipient_range.is_empty() {
             Ok(apply_sparse_recipients(
                 &transfers[transfer_range],
                 Vec::new(),
@@ -388,8 +384,7 @@ where
                 Ok(values) => Ok(apply_sparse_recipients(&transfers[transfer_range], values)),
                 Err(error) => Err(error),
             }
-        };
-        result
+        }
     });
 
     let mut merged = ShardWrites::with_capacity(recipient_keys.len());
