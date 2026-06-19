@@ -4,8 +4,7 @@ use super::{
     Application,
     body::{verify_signatures, wait_for_timestamp},
     execution::{
-        apply_prepared_body, commitments_match, execute_body, execute_proposal,
-        prepare_lazy_transfers,
+        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
     },
     reject_verify, time,
 };
@@ -206,7 +205,7 @@ where
         St: Strategy,
     {
         let (body, digests) = info_span!("application.apply.prepare")
-            .in_scope(|| prepare_lazy_transfers(&self.strategy, block.body.as_slice()))
+            .in_scope(|| prepare_lazy(&self.strategy, block.body.as_slice()))
             .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
 
         let (state_batch, transaction_batch) = batches;

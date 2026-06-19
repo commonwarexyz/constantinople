@@ -189,6 +189,31 @@ fn credits_apply_to_post_debit_sender_state() {
 }
 
 #[test]
+fn rejects_spend_funded_by_in_block_credit() {
+    let payer = TestSigner::from_seed(52);
+    let middle = TestSigner::from_seed(53);
+    let sink = TestSigner::from_seed(54);
+
+    let mut accounts = State::new();
+    accounts.insert(account_key(&payer.public_key), account(10, 0));
+    accounts.insert(account_key(&middle.public_key), account(0, 0));
+    accounts.insert(account_key(&sink.public_key), account(0, 0));
+
+    let transactions = vec![
+        payer.sign(middle.public_key.clone(), 10, 0),
+        middle.sign(sink.public_key, 1, 0),
+    ];
+    let transfers = prepared(&transactions);
+
+    for &shards in SHARD_COUNTS {
+        assert!(
+            execute_with_shards(&accounts, &transfers, shards).is_none(),
+            "shards={shards}"
+        );
+    }
+}
+
+#[test]
 fn self_transfer_only_bumps_nonce() {
     let signer = TestSigner::from_seed(0);
     let mut accounts = State::new();

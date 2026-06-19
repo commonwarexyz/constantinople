@@ -145,7 +145,7 @@ where
 /// nonce or balance check or overflows a recipient (the whole batch is
 /// rejected). The batch is only borrowed for reads, so the caller may move it
 /// afterward to apply the writes.
-async fn load_and_execute<E, H, S>(
+async fn load_exec<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
@@ -163,15 +163,11 @@ where
     let mut writes = Vec::new();
     let executor::ExecutionPlan { discrete, general } = plan;
     if !discrete.transfers.is_empty() {
-        writes.extend(
-            load_and_execute_discrete(batch, strategy, discrete)
-                .await?
-                .shards,
-        );
+        writes.extend(load_discrete(batch, strategy, discrete).await?.shards);
     }
     if !general.is_empty() {
         writes.extend(
-            load_and_execute_general(batch, strategy, transfers, &general)
+            load_general(batch, strategy, transfers, &general)
                 .await?
                 .shards,
         );
@@ -179,7 +175,7 @@ where
     Some(db::StateWrites::new(writes))
 }
 
-async fn load_and_execute_general<E, H, S>(
+async fn load_general<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
@@ -193,14 +189,14 @@ where
     // The general lane already aggregated every contended sender and recipient
     // into account-owned effects. State is loaded once per affected account and
     // applied only after the full block effect is known.
-    let values = get_many_accounts(batch, strategy, workload.account_keys())
+    let values = get_accounts(batch, strategy, workload.account_keys())
         .await
         .expect("general account state loading must succeed");
     let writes = executor::apply_general_accounts(values, workload, transfers)?;
     Some(db::StateWrites::new(vec![writes]))
 }
 
-async fn load_and_execute_discrete<E, H, S>(
+async fn load_discrete<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     plan: executor::DiscreteWorkload<'_>,
@@ -210,25 +206,25 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let sender_writes = load_discrete_writes(
+    let sender_writes = load_writes(
         batch,
         strategy,
         plan.transfers.as_slice(),
         plan.sender_keys.as_slice(),
-        apply_discrete_sender_values_into,
+        apply_senders,
     )
     .await
     .expect("sender state loading must succeed")?;
 
     let mut writes = vec![sender_writes];
     if !plan.recipient_keys.is_empty() {
-        let all_recipients_non_self = plan.recipient_keys.len() == plan.transfers.len();
-        let recipient_writes = load_discrete_recipient_writes(
+        let dense = plan.recipient_keys.len() == plan.transfers.len();
+        let recipient_writes = load_recipients(
             batch,
             strategy,
             plan.transfers.as_slice(),
             plan.recipient_keys.as_slice(),
-            all_recipients_non_self,
+            dense,
         )
         .await
         .expect("recipient state loading must succeed")?;
@@ -242,19 +238,19 @@ where
 // chunks and run them with `Strategy`. The runtime spawner requires `'static`
 // futures, so it cannot directly express this borrowed shape without first
 // owning or copying each key chunk.
-type DiscreteApplyFn = fn(
+type ApplyFn = fn(
     &[&PreparedTransfer],
     Vec<Option<Account>>,
     &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool;
-type StateReadResult<T> = core::result::Result<T, commonware_storage::qmdb::Error<mmr::Family>>;
+type ReadResult<T> = core::result::Result<T, commonware_storage::qmdb::Error<mmr::Family>>;
 
-async fn load_discrete_writes<E, H, S>(
+async fn load_writes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[&PreparedTransfer],
     keys: &[&AccountKey],
-    apply: DiscreteApplyFn,
+    apply: ApplyFn,
 ) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -267,27 +263,19 @@ where
         let values = batch.get_many(keys).await?;
         apply(transfers, values, &mut writes)
     } else {
-        load_discrete_writes_into_chunks(
-            batch,
-            strategy,
-            transfers,
-            keys,
-            &mut writes,
-            chunks,
-            apply,
-        )?
+        load_write_chunks(batch, strategy, transfers, keys, &mut writes, chunks, apply)?
     };
     Ok(valid.then(|| initialized_copy_vec(writes)))
 }
 
-fn load_discrete_writes_into_chunks<E, H, S>(
+fn load_write_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[&PreparedTransfer],
     keys: &[&AccountKey],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
     chunks: usize,
-    apply: DiscreteApplyFn,
+    apply: ApplyFn,
 ) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -321,7 +309,7 @@ where
     Ok(true)
 }
 
-fn apply_discrete_sender_values_into(
+fn apply_senders(
     transfers: &[&PreparedTransfer],
     values: Vec<Option<Account>>,
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
@@ -339,12 +327,12 @@ fn apply_discrete_sender_values_into(
     true
 }
 
-async fn load_discrete_recipient_writes<E, H, S>(
+async fn load_recipients<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[&PreparedTransfer],
     recipient_keys: &[&AccountKey],
-    all_recipients_non_self: bool,
+    dense: bool,
 ) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -352,27 +340,27 @@ where
     S: Strategy,
 {
     let chunks = chunk_count(strategy, transfers.len());
-    if all_recipients_non_self {
+    if dense {
         // Dense unique transfers have one recipient key per transfer, so the
         // same write-into helper shape used for senders can be reused.
-        return load_discrete_writes(
+        return load_writes(
             batch,
             strategy,
             transfers,
             recipient_keys,
-            apply_discrete_dense_recipient_values_into,
+            apply_dense_recipients,
         )
         .await;
     }
 
     if chunks <= 1 {
         let values = batch.get_many(recipient_keys).await?;
-        return Ok(apply_discrete_sparse_recipient_values(transfers, values));
+        return Ok(apply_sparse_recipients(transfers, values));
     }
-    load_sparse_recipient_writes_in_chunks(batch, strategy, transfers, recipient_keys, chunks)
+    load_sparse(batch, strategy, transfers, recipient_keys, chunks)
 }
 
-fn load_sparse_recipient_writes_in_chunks<E, H, S>(
+fn load_sparse<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[&PreparedTransfer],
@@ -384,12 +372,12 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let work = sparse_recipient_chunks(transfers, chunks);
+    let work = sparse_chunks(transfers, chunks);
     let covered_recipients = work.last().map_or(0, |(_, range)| range.end);
     assert_eq!(covered_recipients, recipient_keys.len());
     let results = strategy.map_collect_vec(work, |(transfer_range, recipient_range)| {
-        let result: StateReadResult<Option<ShardWrites>> = if recipient_range.is_empty() {
-            Ok(apply_discrete_sparse_recipient_values(
+        let result: ReadResult<Option<ShardWrites>> = if recipient_range.is_empty() {
+            Ok(apply_sparse_recipients(
                 &transfers[transfer_range],
                 Vec::new(),
             ))
@@ -397,10 +385,7 @@ where
             // This leaf borrows transfer/key slices. Runtime spawning would
             // require owned chunks; `Strategy` provides the fan-out.
             match futures::executor::block_on(batch.get_many(&recipient_keys[recipient_range])) {
-                Ok(values) => Ok(apply_discrete_sparse_recipient_values(
-                    &transfers[transfer_range],
-                    values,
-                )),
+                Ok(values) => Ok(apply_sparse_recipients(&transfers[transfer_range], values)),
                 Err(error) => Err(error),
             }
         };
@@ -417,7 +402,7 @@ where
     Ok(Some(merged))
 }
 
-fn apply_discrete_dense_recipient_values_into(
+fn apply_dense_recipients(
     transfers: &[&PreparedTransfer],
     values: Vec<Option<Account>>,
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
@@ -432,12 +417,12 @@ fn apply_discrete_dense_recipient_values_into(
     true
 }
 
-fn apply_discrete_sparse_recipient_values(
+fn apply_sparse_recipients(
     transfers: &[&PreparedTransfer],
     values: Vec<Option<Account>>,
 ) -> Option<ShardWrites> {
     let mut values = values.into_iter();
-    let mut recipient_writes = ShardWrites::with_capacity(values.size_hint().0);
+    let mut writes = ShardWrites::with_capacity(values.size_hint().0);
     for transfer in transfers {
         if transfer.sender == transfer.recipient {
             continue;
@@ -445,13 +430,13 @@ fn apply_discrete_sparse_recipient_values(
         let value = values.next().expect("one value per non-self recipient");
         let mut account = value.unwrap_or_default();
         executor::apply_credit(&mut account, transfer.value)?;
-        recipient_writes.push((transfer.recipient, account));
+        writes.push((transfer.recipient, account));
     }
     assert!(values.next().is_none());
-    Some(recipient_writes)
+    Some(writes)
 }
 
-async fn get_many_accounts<E, H, S>(
+async fn get_accounts<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     keys: &[&AccountKey],
@@ -465,13 +450,13 @@ where
     if chunks <= 1 {
         return batch.get_many(keys).await;
     }
-    get_many_account_chunks(batch, strategy, keys, chunks)
+    get_account_chunks(batch, strategy, keys, chunks)
 }
 
 /// Fan out a large QMDB read without requiring the borrowed batch/key slices to
 /// be `'static`. Callers still choose where this runs; account execution uses
 /// this for large sender or recipient reads.
-fn get_many_account_chunks<E, H, S>(
+fn get_account_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     keys: &[&AccountKey],
@@ -524,7 +509,7 @@ fn chunk_ranges(items: usize, chunks: usize) -> Vec<Range<usize>> {
 /// `recipient_keys` omits self-transfer recipients, so each transfer chunk maps
 /// to a potentially smaller recipient-key chunk. The returned ranges preserve
 /// transfer order and cover every non-self recipient exactly once.
-fn sparse_recipient_chunks(
+fn sparse_chunks(
     transfers: &[&PreparedTransfer],
     chunks: usize,
 ) -> Vec<(Range<usize>, Range<usize>)> {
@@ -544,45 +529,39 @@ fn sparse_recipient_chunks(
         .collect()
 }
 
-pub(super) fn prepare_signed_transfers_with_digests<H, S>(
+pub(super) fn prepare_signed<H, S>(
     strategy: &S,
-    transactions: &[SignedTransaction<H>],
+    txs: &[SignedTransaction<H>],
 ) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
 where
     H: Hasher,
     S: Strategy,
 {
-    if chunk_count(strategy, transactions.len()) > 1 {
-        return prepare_signed_transfers_with_digests_in_chunks(strategy, transactions);
+    if chunk_count(strategy, txs.len()) > 1 {
+        return prepare_signed_chunks(strategy, txs);
     }
 
-    let mut transfers = Vec::with_capacity(transactions.len());
-    let mut digests = Vec::with_capacity(transactions.len());
-    for transaction in transactions {
-        transfers.push(executor::prepare_transfer(transaction)?);
-        digests.push(*transaction.message_digest());
+    let mut transfers = Vec::with_capacity(txs.len());
+    let mut digests = Vec::with_capacity(txs.len());
+    for tx in txs {
+        transfers.push(executor::prepare_transfer(tx)?);
+        digests.push(*tx.message_digest());
     }
     Some((transfers, digests))
 }
 
-fn prepare_signed_transfers_with_digests_in_chunks<H, S>(
+fn prepare_signed_chunks<H, S>(
     strategy: &S,
-    transactions: &[SignedTransaction<H>],
+    txs: &[SignedTransaction<H>],
 ) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
 where
     H: Hasher,
     S: Strategy,
 {
-    let mut transfers = uninit_vec(transactions.len());
-    let mut digests = uninit_vec(transactions.len());
-    let chunks = chunk_count(strategy, transactions.len());
-    if !prepare_signed_transfers_with_digests_into_chunks(
-        strategy,
-        transactions,
-        &mut transfers,
-        &mut digests,
-        chunks,
-    ) {
+    let mut transfers = uninit_vec(txs.len());
+    let mut digests = uninit_vec(txs.len());
+    let chunks = chunk_count(strategy, txs.len());
+    if !prepare_signed_into(strategy, txs, &mut transfers, &mut digests, chunks) {
         return None;
     }
 
@@ -592,9 +571,9 @@ where
     ))
 }
 
-fn prepare_signed_transfers_with_digests_into_chunks<H, S>(
+fn prepare_signed_into<H, S>(
     strategy: &S,
-    transactions: &[SignedTransaction<H>],
+    txs: &[SignedTransaction<H>],
     transfers: &mut [MaybeUninit<PreparedTransfer>],
     digests: &mut [MaybeUninit<H::Digest>],
     chunks: usize,
@@ -603,7 +582,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let ranges = chunk_ranges(transactions.len(), chunks);
+    let ranges = chunk_ranges(txs.len(), chunks);
     let mut remaining_transfers = transfers;
     let mut remaining_digests = digests;
     let mut work = Vec::with_capacity(ranges.len());
@@ -611,7 +590,7 @@ where
         let len = range.end - range.start;
         let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
         let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
-        work.push((&transactions[range], chunk_transfers, chunk_digests));
+        work.push((&txs[range], chunk_transfers, chunk_digests));
         remaining_transfers = rest_transfers;
         remaining_digests = rest_digests;
     }
@@ -619,32 +598,32 @@ where
     assert!(remaining_digests.is_empty());
 
     strategy
-        .map_collect_vec(work, |(transactions, transfers, digests)| {
-            prepare_signed_transfers_with_digests_chunk(transactions, transfers, digests)
+        .map_collect_vec(work, |(txs, transfers, digests)| {
+            prepare_signed_chunk(txs, transfers, digests)
         })
         .into_iter()
         .all(core::convert::identity)
 }
 
-fn prepare_signed_transfers_with_digests_chunk<H>(
-    transactions: &[SignedTransaction<H>],
+fn prepare_signed_chunk<H>(
+    txs: &[SignedTransaction<H>],
     transfers: &mut [MaybeUninit<PreparedTransfer>],
     digests: &mut [MaybeUninit<H::Digest>],
 ) -> bool
 where
     H: Hasher,
 {
-    for ((transaction, transfer), digest) in transactions.iter().zip(transfers).zip(digests) {
-        let Some(prepared) = executor::prepare_transfer(transaction) else {
+    for ((tx, transfer), digest) in txs.iter().zip(transfers).zip(digests) {
+        let Some(prepared) = executor::prepare_transfer(tx) else {
             return false;
         };
         transfer.write(prepared);
-        digest.write(*transaction.message_digest());
+        digest.write(*tx.message_digest());
     }
     true
 }
 
-pub(super) fn prepare_lazy_transfers<H, S>(
+pub(super) fn prepare_lazy<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
 ) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
@@ -653,20 +632,20 @@ where
     S: Strategy,
 {
     if chunk_count(strategy, body.len()) > 1 {
-        return prepare_lazy_transfers_in_chunks(strategy, body);
+        return prepare_lazy_chunks(strategy, body);
     }
 
     let mut transfers = Vec::with_capacity(body.len());
     let mut digests = Vec::with_capacity(body.len());
-    for transaction in body.iter() {
-        let transaction = transaction.get().ok_or(MALFORMED_TRANSACTION)?;
-        transfers.push(executor::prepare_transfer(transaction).ok_or(MALFORMED_TRANSACTION)?);
-        digests.push(*transaction.message_digest());
+    for lazy in body.iter() {
+        let tx = lazy.get().ok_or(MALFORMED_TRANSACTION)?;
+        transfers.push(executor::prepare_transfer(tx).ok_or(MALFORMED_TRANSACTION)?);
+        digests.push(*tx.message_digest());
     }
     Ok((transfers, digests))
 }
 
-fn prepare_lazy_transfers_in_chunks<H, S>(
+fn prepare_lazy_chunks<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
 ) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
@@ -677,7 +656,7 @@ where
     let mut transfers = uninit_vec(body.len());
     let mut digests = uninit_vec(body.len());
     let chunks = chunk_count(strategy, body.len());
-    if !prepare_lazy_transfers_into_chunks(strategy, body, &mut transfers, &mut digests, chunks) {
+    if !prepare_lazy_into(strategy, body, &mut transfers, &mut digests, chunks) {
         return Err(MALFORMED_TRANSACTION);
     }
 
@@ -687,7 +666,7 @@ where
     ))
 }
 
-fn prepare_lazy_transfers_into_chunks<H, S>(
+fn prepare_lazy_into<H, S>(
     strategy: &S,
     body: &[constantinople_primitives::LazySignedTransaction<H>],
     transfers: &mut [MaybeUninit<PreparedTransfer>],
@@ -715,13 +694,13 @@ where
 
     strategy
         .map_collect_vec(work, |(body, transfers, digests)| {
-            prepare_lazy_transfers_chunk(body, transfers, digests)
+            prepare_lazy_chunk(body, transfers, digests)
         })
         .into_iter()
         .all(core::convert::identity)
 }
 
-fn prepare_lazy_transfers_chunk<H>(
+fn prepare_lazy_chunk<H>(
     body: &[constantinople_primitives::LazySignedTransaction<H>],
     transfers: &mut [MaybeUninit<PreparedTransfer>],
     digests: &mut [MaybeUninit<H::Digest>],
@@ -729,15 +708,15 @@ fn prepare_lazy_transfers_chunk<H>(
 where
     H: Hasher,
 {
-    for ((transaction, transfer), digest) in body.iter().zip(transfers).zip(digests) {
-        let Some(transaction) = transaction.get() else {
+    for ((lazy, transfer), digest) in body.iter().zip(transfers).zip(digests) {
+        let Some(tx) = lazy.get() else {
             return false;
         };
-        let Some(prepared) = executor::prepare_transfer(transaction) else {
+        let Some(prepared) = executor::prepare_transfer(tx) else {
             return false;
         };
         transfer.write(prepared);
-        digest.write(*transaction.message_digest());
+        digest.write(*tx.message_digest());
     }
     true
 }
@@ -781,11 +760,11 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let prepared = prepare_signed_transfers_with_digests(&strategy, &transactions);
+    let prepared = prepare_signed(&strategy, &transactions);
 
     let outcome = match prepared {
         Some((transfers, digests)) if !transfers.is_empty() => {
-            load_and_execute(&state_batch, &strategy, &transfers)
+            load_exec(&state_batch, &strategy, &transfers)
                 .instrument(info_span!("application.execute.load_execute"))
                 .await
                 .map(|shard_maps| (transactions, digests, shard_maps))
@@ -831,9 +810,9 @@ where
     S: Strategy,
 {
     let (transfers, digests) = info_span!("application.execute.prepare")
-        .in_scope(|| prepare_lazy_transfers(&strategy, body.as_ref().as_slice()))?;
+        .in_scope(|| prepare_lazy(&strategy, body.as_ref().as_slice()))?;
 
-    let shard_maps = load_and_execute(&state_batch, &strategy, &transfers)
+    let shard_maps = load_exec(&state_batch, &strategy, &transfers)
         .instrument(info_span!("application.execute.load_execute"))
         .await
         .ok_or(STATIC_INVALID_TRANSACTION)?;
@@ -867,7 +846,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let shard_maps = load_and_execute(&state_batch, &strategy, transfers)
+    let shard_maps = load_exec(&state_batch, &strategy, transfers)
         .instrument(info_span!("application.execute.load_execute"))
         .await
         .ok_or(STATIC_INVALID_TRANSACTION)?;
@@ -956,7 +935,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_ranges, range_from_bounds, sparse_recipient_chunks};
+    use super::{chunk_ranges, range_from_bounds, sparse_chunks};
     use crate::executor::{PreparedTransfer, key_prefix};
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
@@ -983,7 +962,7 @@ mod tests {
     }
 
     #[test]
-    fn sparse_recipient_chunks_align_with_non_self_recipients() {
+    fn sparse_chunks_align_with_non_self_recipients() {
         let account = |byte| AccountKey::from_bytes([byte; 32]).expect("account key");
         let transfer = |sender, recipient| PreparedTransfer {
             sender,
@@ -1008,7 +987,7 @@ mod tests {
         let transfer_refs = transfers.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            sparse_recipient_chunks(&transfer_refs, 3),
+            sparse_chunks(&transfer_refs, 3),
             vec![(0..1, 0..0), (1..3, 0..2), (3..5, 2..3)]
         );
     }
@@ -1018,7 +997,7 @@ mod tests {
 ///
 /// Run with: `cargo test -p constantinople-application --release -- --ignored
 /// --nocapture bench_load_execute`. Seeds a committed state DB, then times the
-/// account-plan `load_and_execute`. Note: the deterministic runtime serves
+/// account-plan `load_exec`. Note: the deterministic runtime serves
 /// reads from memory, so this measures the load+execute CPU/memory path, not
 /// cold disk behavior.
 #[cfg(test)]
@@ -1216,33 +1195,31 @@ mod db_bench {
             .collect()
     }
 
-    async fn timed_current(
+    async fn time_exec(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         transfers: &[PreparedTransfer],
     ) -> (usize, Duration) {
         let start = Instant::now();
-        let state_writes = super::load_and_execute(batch, strategy, transfers)
+        let state_writes = super::load_exec(batch, strategy, transfers)
             .await
-            .expect("current path");
+            .expect("exec path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
         black_box(&state_writes);
         (count, elapsed)
     }
 
-    async fn timed_current_prepare(
+    async fn time_prepare_exec(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
-        transactions: &[TestTransaction],
+        txs: &[TestTransaction],
     ) -> (usize, Duration) {
         let start = Instant::now();
-        let (transfers, digests) =
-            super::prepare_signed_transfers_with_digests(strategy, transactions)
-                .expect("current prepare");
-        let state_writes = super::load_and_execute(batch, strategy, &transfers)
+        let (transfers, digests) = super::prepare_signed(strategy, txs).expect("prepare");
+        let state_writes = super::load_exec(batch, strategy, &transfers)
             .await
-            .expect("current path");
+            .expect("exec path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
         black_box((&transfers, &digests, &state_writes));
@@ -1250,20 +1227,20 @@ mod db_bench {
     }
 
     #[derive(Default)]
-    struct CurrentBreakdown {
+    struct Breakdown {
         total: Duration,
         plan: Duration,
         discrete: Duration,
         general: Duration,
     }
 
-    async fn timed_current_breakdown(
+    async fn time_breakdown(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
         transfers: &[PreparedTransfer],
-    ) -> (usize, CurrentBreakdown) {
+    ) -> (usize, Breakdown) {
         let total = Instant::now();
-        let mut breakdown = CurrentBreakdown::default();
+        let mut breakdown = Breakdown::default();
 
         let start = Instant::now();
         let plan = crate::executor::execution_plan(transfers).expect("execution plan");
@@ -1273,7 +1250,7 @@ mod db_bench {
         let crate::executor::ExecutionPlan { discrete, general } = plan;
         if !discrete.transfers.is_empty() {
             let start = Instant::now();
-            let state_writes = super::load_and_execute_discrete(batch, strategy, discrete)
+            let state_writes = super::load_discrete(batch, strategy, discrete)
                 .await
                 .expect("discrete path should execute");
             breakdown.discrete = start.elapsed();
@@ -1286,10 +1263,9 @@ mod db_bench {
         }
         if !general.is_empty() {
             let start = Instant::now();
-            let state_writes =
-                super::load_and_execute_general(batch, strategy, transfers, &general)
-                    .await
-                    .expect("general path should execute");
+            let state_writes = super::load_general(batch, strategy, transfers, &general)
+                .await
+                .expect("general path should execute");
             breakdown.general = start.elapsed();
             count += state_writes
                 .shards
@@ -1303,7 +1279,7 @@ mod db_bench {
         (count, breakdown)
     }
 
-    fn timed_lazy_preload(
+    fn time_lazy_preload(
         strategy: &Rayon,
         body: &[LazySignedTransaction<Sha256>],
     ) -> (usize, Duration) {
@@ -1317,13 +1293,12 @@ mod db_bench {
         (body.len(), elapsed)
     }
 
-    fn timed_lazy_apply_prepare(
+    fn time_lazy_prepare(
         strategy: &Rayon,
         body: &[LazySignedTransaction<Sha256>],
     ) -> (usize, Duration) {
         let start = Instant::now();
-        let (transfers, digests) =
-            super::prepare_lazy_transfers(strategy, body).expect("prepare lazy body");
+        let (transfers, digests) = super::prepare_lazy(strategy, body).expect("prepare lazy body");
         let elapsed = start.elapsed();
         let count = transfers.len();
         black_box((transfers, digests));
@@ -1358,13 +1333,13 @@ mod db_bench {
         let mut preload_total = Duration::ZERO;
         let mut apply_total = Duration::ZERO;
         for iter in 0..(warmup + iters) {
-            let (preload_count, preload_elapsed) = timed_lazy_preload(&strategy, &body);
+            let (preload_count, preload_elapsed) = time_lazy_preload(&strategy, &body);
             assert_eq!(
                 preload_count, transaction_count,
                 "preload count should match"
             );
 
-            let (apply_count, apply_elapsed) = timed_lazy_apply_prepare(&strategy, &body);
+            let (apply_count, apply_elapsed) = time_lazy_prepare(&strategy, &body);
             assert_eq!(apply_count, transaction_count, "prepare count should match");
 
             if iter >= warmup {
@@ -1445,31 +1420,31 @@ mod db_bench {
                     }
                     let transfers = transfers(fixture, transaction_count);
 
-                    let mut current_total = Duration::ZERO;
-                    let mut current_writes = 0usize;
+                    let mut total = Duration::ZERO;
+                    let mut writes = 0usize;
                     for iter in 0..(warmup + iters) {
                         let batch = db.new_batches().await;
-                        let (count, elapsed) = timed_current(&batch, &strategy, &transfers).await;
-                        current_writes = count;
+                        let (count, elapsed) = time_exec(&batch, &strategy, &transfers).await;
+                        writes = count;
                         if iter >= warmup {
-                            current_total += elapsed;
+                            total += elapsed;
                         }
                     }
                     let tps = |d: Duration| transaction_count as f64 / d.as_secs_f64() / 1e6;
 
-                    let current = current_total / iters;
+                    let avg = total / iters;
                     println!(
-                        "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  current: {current:?}  ({:.2} Melem/s) / {current_writes} writes",
+                        "load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  exec: {avg:?}  ({:.2} Melem/s) / {writes} writes",
                         fixture.name(),
                         strategy.parallelism_hint().max(1),
-                        tps(current),
+                        tps(avg),
                     );
 
                     if std::env::var_os("CONSTANTINOPLE_BENCH_BREAKDOWN").is_some() {
                         let batch = db.new_batches().await;
                         let (count, breakdown) =
-                            timed_current_breakdown(&batch, &strategy, &transfers).await;
-                        assert_eq!(count, current_writes, "breakdown write count should match");
+                            time_breakdown(&batch, &strategy, &transfers).await;
+                        assert_eq!(count, writes, "breakdown write count should match");
                         println!(
                             "  breakdown: total={:?} plan={:?} discrete={:?} general={:?}",
                             breakdown.total,
@@ -1481,24 +1456,24 @@ mod db_bench {
 
                     if bench_prepare {
                         let transactions = signed_transactions(fixture, transaction_count);
-                        let mut current_total = Duration::ZERO;
-                        let mut current_writes = 0usize;
+                        let mut total = Duration::ZERO;
+                        let mut writes = 0usize;
                         for iter in 0..(warmup + iters) {
                             let batch = db.new_batches().await;
                             let (count, elapsed) =
-                                timed_current_prepare(&batch, &strategy, &transactions).await;
-                            current_writes = count;
+                                time_prepare_exec(&batch, &strategy, &transactions).await;
+                            writes = count;
                             if iter >= warmup {
-                                current_total += elapsed;
+                                total += elapsed;
                             }
                         }
 
-                        let current = current_total / iters;
+                        let avg = total / iters;
                         println!(
-                            "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  current: {current:?}  ({:.2} Melem/s) / {current_writes} writes",
+                            "prepare+load+execute  {transaction_count} txs / {ACCOUNTS} accounts / {} / {} shards\n  exec: {avg:?}  ({:.2} Melem/s) / {writes} writes",
                             fixture.name(),
                             strategy.parallelism_hint().max(1),
-                            tps(current),
+                            tps(avg),
                         );
                     }
                 }
