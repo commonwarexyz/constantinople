@@ -340,22 +340,29 @@ where
     H: Hasher,
     St: Strategy,
 {
-    if transactions.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let parallelism = strategy.parallelism_hint();
-    if parallelism <= 1 || transactions.len() <= parallelism {
-        return transactions
-            .into_iter()
-            .map(|lazy| lazy.get().cloned())
-            .collect();
-    }
-
     strategy
         .map_collect_vec(transactions, |lazy| lazy.get().cloned())
         .into_iter()
         .collect()
+}
+
+/// Forces lazily encoded signed transactions to decode in parallel.
+///
+/// Returns `false` if any transaction fails to decode.
+fn preload_transaction_slice<H, St>(
+    transactions: &[LazySignedTransaction<H>],
+    strategy: &St,
+) -> bool
+where
+    H: Hasher,
+    St: Strategy,
+{
+    strategy.fold(
+        transactions,
+        || true,
+        |decoded, lazy| decoded && signature_inputs_decode(lazy),
+        |left, right| left && right,
+    )
 }
 
 /// Forces lazily encoded signed transactions to decode in parallel.
@@ -370,26 +377,7 @@ where
     H: Hasher,
     St: Strategy,
 {
-    if transactions.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let parallelism = strategy.parallelism_hint();
-    if parallelism <= 1 || transactions.len() <= parallelism {
-        return transactions
-            .iter()
-            .all(signature_inputs_decode)
-            .then_some(transactions);
-    }
-
-    strategy
-        .fold(
-            &transactions,
-            || true,
-            |decoded, lazy| decoded && signature_inputs_decode(lazy),
-            |left, right| left && right,
-        )
-        .then_some(transactions)
+    preload_transaction_slice(&transactions, strategy).then_some(transactions)
 }
 
 /// Forces the lazy transaction to decode and its sender public key to parse, in

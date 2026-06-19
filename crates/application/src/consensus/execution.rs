@@ -1,4 +1,91 @@
 //! Execution and commitment checks for consensus blocks.
+//!
+//! This module is the consensus-facing wrapper around the account executor. It
+//! prepares block bodies, loads the state needed for account execution, writes
+//! account and transaction-history updates into QMDB batches, and returns the
+//! merkleized commitments that consensus proposes, verifies, or applies.
+//!
+//! The important invariant is that parallel account execution is owned by
+//! sender, not by every account a transfer touches. Nonces and spends are both
+//! sender-local, and credits from this block are not available for spending
+//! until the block has finished executing. Because of that rule, a sender shard
+//! can load only sender accounts, advance nonces, and apply debits without any
+//! shared recipient map, recipient locks, or recipient state loads.
+//!
+//! ```text
+//! body transactions
+//!        |
+//!        v
+//! prepare
+//!        |
+//!        +--> sealed message digests ----------------------------+
+//!        |                                                       |
+//!        v                                                       |
+//! prepared transfers                                             |
+//!        |                                                       |
+//!        v                                                       |
+//! route transfer debits by sender                                |
+//!        |                                                       |
+//!        +--> sender shard 0 -- load senders -- check nonce/debit|
+//!        +--> sender shard 1 -- load senders -- check nonce/debit|
+//!        +--> ...                                                |
+//!        |                                                       |
+//!        v                                                       |
+//! final credit sweep                                             |
+//!        |                                                       |
+//!        +--> credit recipients already loaded as senders        |
+//!        +--> aggregate recipient-only credits                   |
+//!        +--> get_many missing recipient accounts                |
+//!        |                                                       |
+//!        v                                                       |
+//! StateWrites ---------------------------------------------------+
+//!        |
+//!        v
+//! state batch + transaction-history batch
+//!        |
+//!        v
+//! merkleized commitments
+//! ```
+//!
+//! The final credit sweep is what makes sender-only sharding correct. Once all
+//! debits have succeeded, every loaded sender account has a single owner and can
+//! receive any in-block credits addressed to it. Recipients that were never
+//! loaded as senders cannot affect debit validity, so their credits are summed
+//! after the sender phase, loaded once with `get_many`, and written once. If any
+//! debit check or credit addition fails, the whole batch is rejected; there is no
+//! partial execution state to reconcile.
+//!
+//! There are three execution shapes, all preserving the same account semantics:
+//!
+//! - The disjoint path proves every non-self account touch is unique, so sender
+//!   writes and recipient writes can be loaded and produced directly.
+//! - The indexed path is for repeated-sender batches. It loads each unique
+//!   sender once, executes all sender debits against that index, credits loaded
+//!   senders, and sweeps the recipient-only remainder.
+//! - The general path partitions transfers by sender prefix and runs the sender
+//!   shards independently before the same final credit sweep.
+//!
+//! Proposing, verifying, and applying certified blocks all use this same
+//! transition. `execute_proposal` prepares locally selected transactions and
+//! falls back to an empty proposal if the selected body is malformed or invalid.
+//! `execute_body` prepares a proposed body, recomputes execution, and compares
+//! the resulting commitments to the header. Certified apply prepares from the
+//! block's lazy body by reference, so it does not clone the block body or build
+//! an intermediate materialized transaction vector. Preparing a transfer does
+//! not invent a second transaction identifier: it reads the transaction's sealed
+//! message digest. For lazily encoded block bodies, whichever consumer first
+//! materializes the transaction computes that seal once and caches the decoded
+//! transaction for the other consumers.
+//!
+//! State writes are returned as independent shard write vectors. For the
+//! unordered state database, the state root depends on the final key/value set,
+//! not on the order in which these vectors are folded into the QMDB batch.
+//! Transaction history is different: transaction digests are appended in block
+//! order, so the transaction-history commitment still reflects block order.
+//!
+//! Parallel fan-out comes from the supplied `Strategy`, so this file avoids
+//! fixed worker counts. The same strategy drives preparation, large `get_many`
+//! reads, indexed execution, and QMDB merkleization beneath the batch APIs.
 
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
@@ -14,7 +101,9 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{Account, AccountKey, Header, SealedBlock, SignedTransaction};
+use constantinople_primitives::{
+    Account, AccountKey, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
+};
 use core::mem::MaybeUninit;
 use tracing::{Instrument as _, info_span};
 
@@ -561,99 +650,11 @@ where
     parallel_chunks(strategy, transfer_count) > 1
 }
 
-fn prepare_signed_transfers<H, S>(
-    strategy: &S,
-    transactions: &[SignedTransaction<H>],
-) -> Option<Vec<PreparedTransfer>>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    if use_parallel_prepare(strategy, transactions.len()) {
-        return parallel_prepare_signed_transfers(strategy, transactions);
-    }
-
-    let mut transfers = Vec::with_capacity(transactions.len());
-    for transaction in transactions {
-        transfers.push(executor::prepare_transfer(transaction)?);
-    }
-    Some(transfers)
-}
-
 fn use_parallel_prepare<S>(strategy: &S, transaction_count: usize) -> bool
 where
     S: Strategy,
 {
     parallel_chunks(strategy, transaction_count) > 1
-}
-
-fn parallel_prepare_signed_transfers<H, S>(
-    strategy: &S,
-    transactions: &[SignedTransaction<H>],
-) -> Option<Vec<PreparedTransfer>>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let mut transfers = Vec::with_capacity(transactions.len());
-    // SAFETY: `MaybeUninit<PreparedTransfer>` does not need initialization.
-    // The helper writes every slot before this vector is converted on success.
-    unsafe {
-        transfers.set_len(transactions.len());
-    }
-
-    let chunks = parallel_chunks(strategy, transactions.len());
-    if !parallel_prepare_signed_transfers_into(strategy, transactions, &mut transfers, chunks) {
-        return None;
-    }
-
-    Some(initialized_copy_vec(transfers))
-}
-
-fn parallel_prepare_signed_transfers_into<H, S>(
-    strategy: &S,
-    transactions: &[SignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    chunks: usize,
-) -> bool
-where
-    H: Hasher,
-    S: Strategy,
-{
-    if chunks <= 1 {
-        for (transaction, transfer) in transactions.iter().zip(transfers) {
-            let Some(prepared) = executor::prepare_transfer(transaction) else {
-                return false;
-            };
-            transfer.write(prepared);
-        }
-        return true;
-    }
-
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = transactions.len() * left_chunks / chunks;
-    let (left_transactions, right_transactions) = transactions.split_at(split);
-    let (left_transfers, right_transfers) = transfers.split_at_mut(split);
-    let (left, right) = strategy.join(
-        || {
-            parallel_prepare_signed_transfers_into(
-                strategy,
-                left_transactions,
-                left_transfers,
-                left_chunks,
-            )
-        },
-        || {
-            parallel_prepare_signed_transfers_into(
-                strategy,
-                right_transactions,
-                right_transfers,
-                right_chunks,
-            )
-        },
-    );
-    left && right
 }
 
 pub(super) fn prepare_signed_transfers_with_digests<H, S>(
@@ -755,9 +756,9 @@ where
     left && right
 }
 
-fn prepare_lazy_transfers<H, S>(
+pub(super) fn prepare_lazy_transfers<H, S>(
     strategy: &S,
-    body: &PreparedBody<H>,
+    body: &[LazySignedTransaction<H>],
 ) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
 where
     H: Hasher,
@@ -779,7 +780,7 @@ where
 
 fn parallel_prepare_lazy_transfers<H, S>(
     strategy: &S,
-    body: &PreparedBody<H>,
+    body: &[LazySignedTransaction<H>],
 ) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
 where
     H: Hasher,
@@ -788,13 +789,7 @@ where
     let mut transfers = uninit_vec(body.len());
     let mut digests = uninit_vec(body.len());
     let chunks = parallel_chunks(strategy, body.len());
-    if !parallel_prepare_lazy_transfers_into(
-        strategy,
-        body.as_slice(),
-        &mut transfers,
-        &mut digests,
-        chunks,
-    ) {
+    if !parallel_prepare_lazy_transfers_into(strategy, body, &mut transfers, &mut digests, chunks) {
         return Err(MALFORMED_TRANSACTION);
     }
 
@@ -897,25 +892,27 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let prepared = prepare_signed_transfers(&strategy, &transactions);
+    let prepared = prepare_signed_transfers_with_digests(&strategy, &transactions);
 
     let outcome = match prepared {
-        Some(transfers) if !transfers.is_empty() => {
+        Some((transfers, digests)) if !transfers.is_empty() => {
             load_and_execute(&state_batch, &strategy, &transfers)
                 .instrument(info_span!("application.execute.load_execute"))
                 .await
-                .map(|shard_maps| (transactions, shard_maps))
+                .map(|shard_maps| (transactions, digests, shard_maps))
         }
         _ => None,
     };
 
-    let (body, state_batch) = match outcome {
-        Some((body, shard_maps)) => (body, apply_shard_maps(state_batch, shard_maps)),
-        None => (Vec::new(), state_batch),
+    let (body, digests, state_batch) = match outcome {
+        Some((body, digests, shard_maps)) => {
+            (body, digests, apply_shard_maps(state_batch, shard_maps))
+        }
+        None => (Vec::new(), Vec::new(), state_batch),
     };
 
     let transaction_batch = info_span!("application.execute.apply")
-        .in_scope(|| apply_transaction_digests(transaction_batch, &transaction_digests(&body)));
+        .in_scope(|| apply_transaction_digests(transaction_batch, &digests));
 
     ProposalExecution {
         block: finalize_child(
@@ -945,7 +942,7 @@ where
     S: Strategy,
 {
     let (transfers, digests) = info_span!("application.execute.prepare")
-        .in_scope(|| prepare_lazy_transfers(&strategy, &body))?;
+        .in_scope(|| prepare_lazy_transfers(&strategy, body.as_ref().as_slice()))?;
 
     let shard_maps = load_and_execute(&state_batch, &strategy, &transfers)
         .instrument(info_span!("application.execute.load_execute"))
@@ -1068,16 +1065,6 @@ where
     non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
 }
 
-fn transaction_digests<H>(transactions: &[SignedTransaction<H>]) -> Vec<H::Digest>
-where
-    H: Hasher,
-{
-    transactions
-        .iter()
-        .map(|transaction| *transaction.message_digest())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::range_from_bounds;
@@ -1109,6 +1096,7 @@ mod tests {
 #[cfg(test)]
 mod db_bench {
     use crate::executor::{Changeset, PreparedTransfer, ShardWrites, State};
+    use commonware_codec::{EncodeSize as _, ReadExt as _, Write as _};
     use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
     use commonware_parallel::Rayon;
@@ -1119,7 +1107,8 @@ mod db_bench {
     };
     use commonware_utils::{NZU16, NZU64, NZUsize};
     use constantinople_primitives::{
-        Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
+        Account, AccountKey, LazySignedTransaction, Nonce, Transaction, TransactionPublicKey,
+        VerifiedTransaction, materialize_transaction_chunks, preload_transaction_chunks,
     };
     use core::num::NonZeroU64;
     use hashbrown::HashSet;
@@ -1381,6 +1370,25 @@ mod db_bench {
         }
     }
 
+    fn lazy_body(transactions: &[TestTransaction]) -> Vec<LazySignedTransaction<Sha256>> {
+        transactions
+            .iter()
+            .map(|transaction| {
+                let mut encoded_transaction = Vec::with_capacity(transaction.encode_size());
+                transaction.write(&mut encoded_transaction);
+
+                let mut encoded_lazy = Vec::with_capacity(
+                    encoded_transaction.len().encode_size() + encoded_transaction.len(),
+                );
+                encoded_transaction.len().write(&mut encoded_lazy);
+                encoded_lazy.extend_from_slice(&encoded_transaction);
+
+                LazySignedTransaction::<Sha256>::read(&mut encoded_lazy.as_slice())
+                    .expect("lazy transaction should decode")
+            })
+            .collect()
+    }
+
     async fn timed_new(
         batch: &super::StateBatch<deterministic::Context, Sha256, EightCap, Rayon>,
         strategy: &Rayon,
@@ -1402,14 +1410,15 @@ mod db_bench {
         transactions: &[TestTransaction],
     ) -> (usize, Duration) {
         let start = Instant::now();
-        let transfers =
-            super::prepare_signed_transfers(strategy, transactions).expect("new prepare");
+        let (transfers, digests) =
+            super::prepare_signed_transfers_with_digests(strategy, transactions)
+                .expect("new prepare");
         let state_writes = super::load_and_execute(batch, strategy, &transfers)
             .await
             .expect("new path");
         let elapsed = start.elapsed();
         let count = state_writes.shards.iter().map(|map| map.len()).sum();
-        black_box((&transfers, &state_writes));
+        black_box((&transfers, &digests, &state_writes));
         (count, elapsed)
     }
 
@@ -1559,6 +1568,125 @@ mod db_bench {
         let elapsed = start.elapsed();
         black_box((&transfers, count));
         (count, elapsed)
+    }
+
+    fn timed_old_lazy_preload(
+        strategy: &Rayon,
+        body: &[LazySignedTransaction<Sha256>],
+    ) -> (usize, Duration) {
+        let start = Instant::now();
+        let transactions =
+            preload_transaction_chunks(body.to_vec(), strategy).expect("lazy preload");
+        let elapsed = start.elapsed();
+        let count = transactions.len();
+        black_box(transactions);
+        (count, elapsed)
+    }
+
+    fn timed_new_lazy_preload(
+        strategy: &Rayon,
+        body: &[LazySignedTransaction<Sha256>],
+    ) -> (usize, Duration) {
+        let start = Instant::now();
+        assert!(
+            super::super::body::preload_transaction_slice(body, strategy),
+            "lazy preload should succeed"
+        );
+        let elapsed = start.elapsed();
+        black_box(body);
+        (body.len(), elapsed)
+    }
+
+    fn timed_old_lazy_apply_prepare(
+        strategy: &Rayon,
+        body: &[LazySignedTransaction<Sha256>],
+    ) -> (usize, Duration) {
+        let start = Instant::now();
+        let materialized =
+            materialize_transaction_chunks(strategy, body.to_vec()).expect("materialize");
+        let (transfers, digests) =
+            super::prepare_signed_transfers_with_digests(strategy, &materialized)
+                .expect("prepare materialized");
+        let elapsed = start.elapsed();
+        let count = transfers.len();
+        black_box((materialized, transfers, digests));
+        (count, elapsed)
+    }
+
+    fn timed_new_lazy_apply_prepare(
+        strategy: &Rayon,
+        body: &[LazySignedTransaction<Sha256>],
+    ) -> (usize, Duration) {
+        let start = Instant::now();
+        let (transfers, digests) =
+            super::prepare_lazy_transfers(strategy, body).expect("prepare lazy body");
+        let elapsed = start.elapsed();
+        let count = transfers.len();
+        black_box((transfers, digests));
+        (count, elapsed)
+    }
+
+    #[test]
+    #[ignore = "timing harness; run explicitly with --ignored --nocapture --release"]
+    fn bench_lazy_body_prepare() {
+        let transaction_count = std::env::var("CONSTANTINOPLE_BENCH_COUNT")
+            .ok()
+            .and_then(|count| count.parse::<usize>().ok())
+            .unwrap_or(32_768);
+        let warmup = std::env::var("CONSTANTINOPLE_BENCH_WARMUP")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(WARMUP);
+        let iters = std::env::var("CONSTANTINOPLE_BENCH_ITERS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .unwrap_or(ITERS)
+            .max(1);
+        let strategy = Rayon::new(NZUsize!(8)).expect("rayon pool");
+        let transactions = signed_transactions(Fixture::Unique, transaction_count);
+        let body = lazy_body(&transactions);
+
+        assert!(
+            super::super::body::preload_transaction_slice(&body, &strategy),
+            "bench body should preload"
+        );
+
+        let mut old_preload_total = Duration::ZERO;
+        let mut new_preload_total = Duration::ZERO;
+        let mut old_apply_total = Duration::ZERO;
+        let mut new_apply_total = Duration::ZERO;
+        for iter in 0..(warmup + iters) {
+            let (old_count, old_elapsed) = timed_old_lazy_preload(&strategy, &body);
+            let (new_count, new_elapsed) = timed_new_lazy_preload(&strategy, &body);
+            assert_eq!(old_count, new_count, "preload count should match");
+
+            let (old_count, old_elapsed_apply) = timed_old_lazy_apply_prepare(&strategy, &body);
+            let (new_count, new_elapsed_apply) = timed_new_lazy_apply_prepare(&strategy, &body);
+            assert_eq!(old_count, new_count, "prepare count should match");
+
+            if iter >= warmup {
+                old_preload_total += old_elapsed;
+                new_preload_total += new_elapsed;
+                old_apply_total += old_elapsed_apply;
+                new_apply_total += new_elapsed_apply;
+            }
+        }
+
+        let old_preload = old_preload_total / iters;
+        let new_preload = new_preload_total / iters;
+        let old_apply = old_apply_total / iters;
+        let new_apply = new_apply_total / iters;
+        let tps = |d: Duration| transaction_count as f64 / d.as_secs_f64() / 1e6;
+        println!(
+            "lazy body prepare  {transaction_count} txs / unique / {} shards\n  verify preload old clone: {old_preload:?}  ({:.2} Melem/s)\n  verify preload new borrow: {new_preload:?}  ({:.2} Melem/s)\n  verify speedup: {:.2}x\n  apply prepare old materialize: {old_apply:?}  ({:.2} Melem/s)\n  apply prepare new borrow:     {new_apply:?}  ({:.2} Melem/s)\n  apply speedup: {:.2}x",
+            super::execution_shard_count(&strategy),
+            tps(old_preload),
+            tps(new_preload),
+            old_preload.as_secs_f64() / new_preload.as_secs_f64(),
+            tps(old_apply),
+            tps(new_apply),
+            old_apply.as_secs_f64() / new_apply.as_secs_f64(),
+        );
     }
 
     #[test]

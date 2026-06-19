@@ -1,11 +1,11 @@
 //! Propose, verify, and apply entry points.
 
 use super::{
-    Application, MALFORMED_TRANSACTION,
-    body::{materialize_body, verify_signatures, wait_for_timestamp},
+    Application,
+    body::{verify_signatures, wait_for_timestamp},
     execution::{
         apply_prepared_body, commitments_match, execute_body, execute_proposal,
-        prepare_signed_transfers_with_digests,
+        prepare_lazy_transfers,
     },
     reject_verify, time,
 };
@@ -195,7 +195,7 @@ where
     )]
     pub async fn apply_certified(
         &mut self,
-        (runtime, _): (E, Context<C, P>),
+        (_, _): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
@@ -205,11 +205,9 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let materialized = materialize_body(runtime, self.strategy.clone(), block.body.clone())
-            .await
+        let (body, digests) = info_span!("application.apply.prepare")
+            .in_scope(|| prepare_lazy_transfers(&self.strategy, block.body.as_slice()))
             .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
-        let (body, digests) = prepare_signed_transfers_with_digests(&self.strategy, &materialized)
-            .unwrap_or_else(|| panic!("certified block contained {MALFORMED_TRANSACTION}"));
 
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body(
