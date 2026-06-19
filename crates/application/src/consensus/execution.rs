@@ -216,7 +216,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = get_many_chunks(strategy, transfers.len());
+    let chunks = parallel_chunks(strategy, transfers.len());
     let mut writes = uninit_vec(transfers.len());
     if chunks <= 1 {
         let values = batch.get_many(sender_keys).await?;
@@ -248,7 +248,7 @@ where
     S: Strategy,
 {
     debug_assert_eq!(transfers.len(), keys.len());
-    if chunks <= 1 || transfers.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
+    if chunks <= 1 {
         let values = futures::executor::block_on(batch.get_many(keys))?;
         return Ok(apply_disjoint_sender_values_into(transfers, values, writes));
     }
@@ -315,7 +315,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = get_many_chunks(strategy, transfers.len());
+    let chunks = parallel_chunks(strategy, transfers.len());
     if all_recipients_non_self {
         let mut writes = uninit_vec(transfers.len());
         if chunks <= 1 {
@@ -355,7 +355,7 @@ where
     S: Strategy,
 {
     debug_assert_eq!(transfers.len(), keys.len());
-    if chunks <= 1 || transfers.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
+    if chunks <= 1 {
         let values = futures::executor::block_on(batch.get_many(keys))?;
         return Ok(apply_disjoint_dense_recipient_values_into(
             transfers, values, writes,
@@ -406,7 +406,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 || transfers.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
+    if chunks <= 1 {
         if recipient_keys.is_empty() {
             return Ok(Some(ShardWrites::new()));
         }
@@ -503,7 +503,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = get_many_chunks(strategy, keys.len());
+    let chunks = parallel_chunks(strategy, keys.len());
     if chunks <= 1 {
         return batch.get_many(keys).await;
     }
@@ -524,7 +524,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 || keys.len() <= MIN_GET_MANY_KEYS_PER_CHUNK {
+    if chunks <= 1 {
         return futures::executor::block_on(batch.get_many(keys));
     }
 
@@ -540,19 +540,12 @@ where
     Ok(left)
 }
 
-fn get_many_chunks<S>(strategy: &S, keys: usize) -> usize
+fn parallel_chunks<S>(strategy: &S, items: usize) -> usize
 where
     S: Strategy,
 {
-    let workers = strategy.parallelism_hint();
-    if workers <= 1 {
-        return 1;
-    }
-    keys.div_ceil(MIN_GET_MANY_KEYS_PER_CHUNK)
-        .clamp(1, workers.saturating_mul(2))
+    strategy.parallelism_hint().max(1).min(items.max(1))
 }
-
-const MIN_GET_MANY_KEYS_PER_CHUNK: usize = 2048;
 
 fn execution_shard_count<S>(strategy: &S) -> usize
 where
@@ -565,9 +558,7 @@ fn use_parallel_indexed_execution<S>(strategy: &S, transfer_count: usize) -> boo
 where
     S: Strategy,
 {
-    const MIN_INDEXED_TRANSFERS_PER_WORKER: usize = 4096;
-    let workers = strategy.parallelism_hint();
-    workers > 1 && transfer_count >= workers.saturating_mul(MIN_INDEXED_TRANSFERS_PER_WORKER)
+    parallel_chunks(strategy, transfer_count) > 1
 }
 
 fn prepare_signed_transfers<H, S>(
@@ -593,9 +584,7 @@ fn use_parallel_prepare<S>(strategy: &S, transaction_count: usize) -> bool
 where
     S: Strategy,
 {
-    const MIN_PREPARE_TXS_PER_WORKER: usize = 2048;
-    let workers = strategy.parallelism_hint();
-    workers > 1 && transaction_count >= workers.saturating_mul(MIN_PREPARE_TXS_PER_WORKER)
+    parallel_chunks(strategy, transaction_count) > 1
 }
 
 fn parallel_prepare_signed_transfers<H, S>(
@@ -613,7 +602,7 @@ where
         transfers.set_len(transactions.len());
     }
 
-    let chunks = prepare_chunks(strategy, transactions.len());
+    let chunks = parallel_chunks(strategy, transactions.len());
     if !parallel_prepare_signed_transfers_into(strategy, transactions, &mut transfers, chunks) {
         return None;
     }
@@ -631,7 +620,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 || transactions.len() <= MIN_PARALLEL_PREPARE_CHUNK {
+    if chunks <= 1 {
         for (transaction, transfer) in transactions.iter().zip(transfers) {
             let Some(prepared) = executor::prepare_transfer(transaction) else {
                 return false;
@@ -667,23 +656,6 @@ where
     left && right
 }
 
-fn prepare_chunks<S>(strategy: &S, transaction_count: usize) -> usize
-where
-    S: Strategy,
-{
-    let workers = strategy.parallelism_hint();
-    let chunk_size = if transaction_count > workers.saturating_mul(MIN_PARALLEL_PREPARE_CHUNK) {
-        MIN_PARALLEL_PREPARE_CHUNK.saturating_mul(2)
-    } else {
-        MIN_PARALLEL_PREPARE_CHUNK
-    };
-    transaction_count
-        .div_ceil(chunk_size)
-        .clamp(1, workers.saturating_mul(2))
-}
-
-const MIN_PARALLEL_PREPARE_CHUNK: usize = 2048;
-
 pub(super) fn prepare_signed_transfers_with_digests<H, S>(
     strategy: &S,
     transactions: &[SignedTransaction<H>],
@@ -715,7 +687,7 @@ where
 {
     let mut transfers = uninit_vec(transactions.len());
     let mut digests = uninit_vec(transactions.len());
-    let chunks = prepare_chunks(strategy, transactions.len());
+    let chunks = parallel_chunks(strategy, transactions.len());
     if !parallel_prepare_signed_transfers_with_digests_into(
         strategy,
         transactions,
@@ -743,7 +715,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 || transactions.len() <= MIN_PARALLEL_PREPARE_CHUNK {
+    if chunks <= 1 {
         for ((transaction, transfer), digest) in transactions.iter().zip(transfers).zip(digests) {
             let Some(prepared) = executor::prepare_transfer(transaction) else {
                 return false;
@@ -815,7 +787,7 @@ where
 {
     let mut transfers = uninit_vec(body.len());
     let mut digests = uninit_vec(body.len());
-    let chunks = prepare_chunks(strategy, body.len());
+    let chunks = parallel_chunks(strategy, body.len());
     if !parallel_prepare_lazy_transfers_into(
         strategy,
         body.as_slice(),
@@ -843,7 +815,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 || body.len() <= MIN_PARALLEL_PREPARE_CHUNK {
+    if chunks <= 1 {
         for ((transaction, transfer), digest) in body.iter().zip(transfers).zip(digests) {
             let Some(transaction) = transaction.get() else {
                 return false;
