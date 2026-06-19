@@ -7,7 +7,13 @@
 //! the caller. DB-backed loading is handled by `consensus::execution`; the
 //! in-memory entry points in this module read from [`State`].
 //!
-//! Execution shards transactions by a prefix of the sender key. Each shard owns
+//! Execution first builds an account-touch plan. The plan counts non-self
+//! sender/recipient touches across the block. Transfers whose touched accounts
+//! are unique stay on the discrete lane, where each loaded sender or recipient
+//! produces one final write. Transfers that touch any contended account move to
+//! the general lane.
+//!
+//! The general lane is sharded by a prefix of the sender key. Each shard owns
 //! only its sender accounts and applies debits and nonce advances. Recipient
 //! accounts are not loaded or mutated by the shards. After all sender shards
 //! finish, a final credit sweep routes credits back to the post-debit sender
@@ -47,8 +53,18 @@ pub(crate) type AggregatedCredits<'a> = Vec<(&'a AccountKey, u64)>;
 /// Transfer indices whose recipients were not loaded as senders.
 pub(crate) type MissingCredits = Vec<u32>;
 
-/// Account-touch proof and load keys for a batch proven to be disjoint.
-pub(crate) struct DisjointAccountPlan<'a> {
+/// Account execution plan for one batch.
+pub(crate) struct ExecutionPlan<'a> {
+    /// Transfers whose non-self account touches are unique in the block.
+    pub(crate) discrete: DiscreteWorkload<'a>,
+    /// Sender-sharded work for the remaining transfers.
+    pub(crate) general: Vec<Shard<'a>>,
+}
+
+/// Transfers that can produce direct sender and recipient writes.
+pub(crate) struct DiscreteWorkload<'a> {
+    /// Transfers, in block order.
+    pub(crate) transfers: Vec<&'a PreparedTransfer>,
     /// Sender account keys, in transfer order.
     pub(crate) sender_keys: Vec<&'a AccountKey>,
     /// Non-self recipient account keys, in transfer order.
@@ -59,20 +75,6 @@ pub(crate) struct DisjointAccountPlan<'a> {
 pub(crate) struct ShardOutput {
     /// Post-debit sender accounts to write.
     pub(crate) senders: ShardAccounts,
-}
-
-/// One indexed batch output.
-pub(crate) struct IndexedOutput {
-    /// Post-debit and loaded-recipient-credit sender accounts to write.
-    pub(crate) senders: ShardAccounts,
-}
-
-/// Indexed execution output plus recipient-only transfer indices.
-pub(crate) struct IndexedExecution {
-    /// Post-debit and post-credit sender accounts to write.
-    pub(crate) output: IndexedOutput,
-    /// Transfer indices whose recipients were not loaded as senders.
-    pub(crate) missing: MissingCredits,
 }
 
 /// Transfer data used by the executor.
@@ -123,26 +125,6 @@ pub(crate) struct Shard<'a> {
 struct ShardSender {
     transfer: u32,
     account: u32,
-}
-
-/// Sender-indexed transfer work for contended batches.
-pub(crate) struct SenderIndex<'a> {
-    /// Transfer sender indices, in block order.
-    senders: Vec<IndexedSender>,
-    /// Sender account keys to load, deduplicated exactly.
-    sender_keys: Vec<&'a AccountKey>,
-    /// Sender key -> index in `sender_keys` and `IndexedOutput::senders`.
-    sender_indices: AccountIndexTable<'a>,
-}
-
-struct IndexedSender {
-    account: u32,
-}
-
-#[derive(Clone, Copy, Default)]
-struct AccountDelta {
-    debit: u64,
-    credit: u64,
 }
 
 struct AccountIndexTable<'a> {
@@ -261,227 +243,80 @@ impl<'a> Shard<'a> {
     }
 }
 
-impl<'a> SenderIndex<'a> {
-    /// The sender account keys this batch must load, deduplicated exactly.
-    pub(crate) fn sender_keys(&self) -> &[&'a AccountKey] {
-        &self.sender_keys
+/// Builds the execution plan used by both DB-backed and in-memory execution.
+pub(crate) fn execution_plan(transfers: &[PreparedTransfer], shards: usize) -> ExecutionPlan<'_> {
+    let mut touches: FastMap<&AccountKey, usize> =
+        FastMap::with_capacity_and_hasher(transfers.len().saturating_mul(2), RandomState::new());
+    for transfer in transfers {
+        *touches.entry(&transfer.sender).or_default() += 1;
+        if transfer.sender != transfer.recipient {
+            *touches.entry(&transfer.recipient).or_default() += 1;
+        }
     }
 
-    /// Number of unique sender accounts.
-    pub(crate) const fn sender_count(&self) -> usize {
-        self.sender_keys.len()
-    }
-}
-
-/// Routes transfers to sender shards by sender-key prefix.
-///
-/// Each transfer is assigned only to its sender's shard. Sender indices are
-/// emitted in block order (the input is scanned in order), which is the order
-/// nonce checks must see.
-pub(crate) fn partition(transfers: &[PreparedTransfer], shards: usize) -> Vec<Shard<'_>> {
     let shards = shards.max(1);
     let expected_shard_len = transfers.len().div_ceil(shards).clamp(16, 1024);
-    let mut result: Vec<Shard<'_>> = (0..shards)
+    let mut general = new_shards(shards, expected_shard_len);
+    let mut has_general = false;
+    let mut discrete = DiscreteWorkload {
+        transfers: Vec::with_capacity(transfers.len()),
+        sender_keys: Vec::with_capacity(transfers.len()),
+        recipient_keys: Vec::with_capacity(transfers.len()),
+    };
+
+    for (index, transfer) in transfers.iter().enumerate() {
+        let sender_is_unique = touches.get(&transfer.sender).copied().unwrap_or_default() == 1;
+        let recipient_is_unique = transfer.sender == transfer.recipient
+            || touches
+                .get(&transfer.recipient)
+                .copied()
+                .unwrap_or_default()
+                == 1;
+        if sender_is_unique && recipient_is_unique {
+            discrete.transfers.push(transfer);
+            discrete.sender_keys.push(&transfer.sender);
+            if transfer.sender != transfer.recipient {
+                discrete.recipient_keys.push(&transfer.recipient);
+            }
+            continue;
+        }
+
+        has_general = true;
+        push_sender(&mut general, index as u32, transfer);
+    }
+
+    if !has_general {
+        general.clear();
+    }
+
+    ExecutionPlan { discrete, general }
+}
+
+fn new_shards<'a>(shards: usize, expected_shard_len: usize) -> Vec<Shard<'a>> {
+    (0..shards)
         .map(|_| Shard {
             senders: Vec::new(),
             sender_keys: Vec::new(),
             sender_indices: AccountIndexTable::with_capacity(expected_shard_len),
         })
-        .collect();
-
-    for (index, transfer) in transfers.iter().enumerate() {
-        let index = index as u32;
-        let shard = shard_of_prefix(transfer.sender_prefix, shards);
-        let shard = &mut result[shard];
-        let (account, inserted) = shard.sender_indices.get_or_insert(
-            transfer.sender_prefix,
-            &transfer.sender,
-            shard.sender_keys.len() as u32,
-        );
-        if inserted {
-            shard.sender_keys.push(&transfer.sender);
-        }
-        shard.senders.push(ShardSender {
-            transfer: index,
-            account,
-        });
-    }
-
-    result
+        .collect()
 }
 
-/// Builds a global sender index for contended batches.
-///
-/// This is still sender-only accounting: only senders are indexed and loaded.
-/// The final sweep can use this index to credit recipients that were already
-/// loaded as senders without re-hashing through per-shard maps.
-pub(crate) fn index_senders(transfers: &[PreparedTransfer]) -> SenderIndex<'_> {
-    let expected_senders = transfers.len().div_ceil(4).max(16);
-    let mut sender_keys = Vec::with_capacity(expected_senders);
-    let mut sender_indices = AccountIndexTable::with_capacity(expected_senders);
-    let mut senders = Vec::with_capacity(transfers.len());
-
-    for transfer in transfers {
-        let (account, inserted) = sender_indices.get_or_insert(
-            transfer.sender_prefix,
-            &transfer.sender,
-            sender_keys.len() as u32,
-        );
-        if inserted {
-            sender_keys.push(&transfer.sender);
-        }
-        senders.push(IndexedSender { account });
+fn push_sender<'a>(shards: &mut [Shard<'a>], index: u32, transfer: &'a PreparedTransfer) {
+    let shard = shard_of_prefix(transfer.sender_prefix, shards.len());
+    let shard = &mut shards[shard];
+    let (account, inserted) = shard.sender_indices.get_or_insert(
+        transfer.sender_prefix,
+        &transfer.sender,
+        shard.sender_keys.len() as u32,
+    );
+    if inserted {
+        shard.sender_keys.push(&transfer.sender);
     }
-
-    SenderIndex {
-        senders,
-        sender_keys,
-        sender_indices,
-    }
-}
-
-/// Returns true when no account is touched by more than one non-self role.
-///
-/// This is a no-false-negative check: `true` proves disjointness; `false` means
-/// there may be overlap, so callers must use the general path.
-pub(crate) fn account_keys_are_disjoint(transfers: &[PreparedTransfer]) -> bool {
-    let mut accounts = AccountDisjointTracker::new(transfers.len());
-    for transfer in transfers {
-        if !accounts.insert(transfer.sender_prefix, &transfer.sender) {
-            return false;
-        }
-        if transfer.sender != transfer.recipient
-            && !accounts.insert(transfer.recipient_prefix, &transfer.recipient)
-        {
-            return false;
-        }
-    }
-    true
-}
-
-/// Returns load keys when no account is touched by more than one non-self role.
-pub(crate) fn disjoint_account_plan(
-    transfers: &[PreparedTransfer],
-) -> Option<DisjointAccountPlan<'_>> {
-    let mut accounts = AccountDisjointTracker::new(transfers.len());
-    let mut sender_keys =
-        Vec::with_capacity(transfers.len().min(AccountDisjointTracker::SMALL_KEYS));
-    let mut recipient_keys =
-        Vec::with_capacity(transfers.len().min(AccountDisjointTracker::SMALL_KEYS));
-    let mut reserved_full = transfers.len() <= AccountDisjointTracker::SMALL_KEYS;
-
-    for transfer in transfers {
-        if !accounts.insert(transfer.sender_prefix, &transfer.sender) {
-            return None;
-        }
-        if transfer.sender != transfer.recipient
-            && !accounts.insert(transfer.recipient_prefix, &transfer.recipient)
-        {
-            return None;
-        }
-
-        if !reserved_full
-            && sender_keys.len().saturating_add(recipient_keys.len())
-                >= AccountDisjointTracker::SMALL_KEYS
-        {
-            sender_keys.reserve_exact(transfers.len().saturating_sub(sender_keys.len()));
-            recipient_keys.reserve_exact(transfers.len().saturating_sub(recipient_keys.len()));
-            reserved_full = true;
-        }
-
-        sender_keys.push(&transfer.sender);
-        if transfer.sender != transfer.recipient {
-            recipient_keys.push(&transfer.recipient);
-        }
-    }
-
-    Some(DisjointAccountPlan {
-        sender_keys,
-        recipient_keys,
-    })
-}
-
-/// Small-front account overlap detector with a no-false-negative fingerprint
-/// table after the front fills.
-struct AccountDisjointTracker {
-    state: AccountDisjointState,
-    transfers: usize,
-}
-
-enum AccountDisjointState {
-    Small(Vec<AccountKey>),
-    Dense(DisjointAccountFilter),
-}
-
-impl AccountDisjointTracker {
-    const SMALL_KEYS: usize = 128;
-
-    fn new(transfers: usize) -> Self {
-        Self {
-            state: AccountDisjointState::Small(Vec::with_capacity(Self::SMALL_KEYS)),
-            transfers,
-        }
-    }
-
-    fn insert(&mut self, prefix: u64, key: &AccountKey) -> bool {
-        match &mut self.state {
-            AccountDisjointState::Small(keys) => {
-                if keys.contains(key) {
-                    return false;
-                }
-                if keys.len() < Self::SMALL_KEYS {
-                    keys.push(*key);
-                    return true;
-                }
-
-                let existing = core::mem::take(keys);
-                let mut dense = DisjointAccountFilter::new(self.transfers.saturating_mul(2));
-                for key in &existing {
-                    dense.insert(key_prefix(key), key);
-                }
-                let inserted = dense.insert(prefix, key);
-                self.state = AccountDisjointState::Dense(dense);
-                inserted
-            }
-            AccountDisjointState::Dense(filter) => filter.insert(prefix, key),
-        }
-    }
-}
-
-struct DisjointAccountFilter {
-    slots: Vec<u64>,
-    mask: usize,
-}
-
-impl DisjointAccountFilter {
-    const MIN_SLOTS: usize = 256;
-
-    fn new(accounts: usize) -> Self {
-        let slots = accounts
-            .saturating_mul(2)
-            .next_power_of_two()
-            .max(Self::MIN_SLOTS);
-        Self {
-            slots: vec![0; slots],
-            mask: slots - 1,
-        }
-    }
-
-    fn insert(&mut self, prefix: u64, key: &AccountKey) -> bool {
-        let fingerprint = account_fingerprint(prefix, key);
-        let mut slot = (prefix as usize) & self.mask;
-        loop {
-            let entry = self.slots[slot];
-            if entry == 0 {
-                self.slots[slot] = fingerprint;
-                return true;
-            }
-            if entry == fingerprint {
-                return false;
-            }
-            slot = (slot + 1) & self.mask;
-        }
-    }
+    shard.senders.push(ShardSender {
+        transfer: index,
+        account,
+    });
 }
 
 /// Applies one sender shard's debits.
@@ -521,134 +356,6 @@ pub(crate) fn execute_shard(
     Some(ShardOutput { senders: accounts })
 }
 
-/// Applies indexed sender debits and credits to recipients loaded as senders.
-///
-/// `accounts` must hold every sender key in [`SenderIndex::sender_keys`].
-pub(crate) fn execute_indexed(
-    mut accounts: ShardAccounts,
-    index: &SenderIndex<'_>,
-    transfers: &[PreparedTransfer],
-) -> Option<IndexedExecution> {
-    let mut deltas = vec![AccountDelta::default(); accounts.len()];
-    let mut missing = MissingCredits::new();
-    for (transfer_index, (sender, transfer)) in index.senders.iter().zip(transfers).enumerate() {
-        let account = &mut accounts[sender.account as usize];
-        if !account.nonce.consume(transfer.nonce) {
-            return None;
-        }
-        if transfer.sender == transfer.recipient {
-            if account.balance < transfer.value {
-                return None;
-            }
-        } else {
-            let sender_delta = &mut deltas[sender.account as usize];
-            sender_delta.debit = sender_delta.debit.checked_add(transfer.value)?;
-            if let Some(recipient) = index
-                .sender_indices
-                .get(transfer.recipient_prefix, &transfer.recipient)
-            {
-                let recipient_delta = &mut deltas[recipient as usize];
-                recipient_delta.credit = recipient_delta.credit.checked_add(transfer.value)?;
-            } else {
-                missing.push(transfer_index as u32);
-            }
-        }
-    }
-
-    for (account, delta) in accounts.iter_mut().zip(deltas) {
-        if account.balance < delta.debit {
-            return None;
-        }
-        account.balance -= delta.debit;
-        apply_credit(account, delta.credit)?;
-    }
-
-    Some(IndexedExecution {
-        output: IndexedOutput { senders: accounts },
-        missing,
-    })
-}
-
-/// Executes the indexed path with sender validation and recipient routing split
-/// across the configured strategy.
-pub(crate) fn execute_indexed_parallel<S>(
-    strategy: &S,
-    accounts: ShardAccounts,
-    index: &SenderIndex<'_>,
-    transfers: &[PreparedTransfer],
-) -> Option<IndexedExecution>
-where
-    S: Strategy,
-{
-    let account_count = accounts.len();
-    let (debits, credits) = strategy.join(
-        || execute_indexed_debits(accounts, index, transfers),
-        || route_indexed_credits(account_count, index, transfers),
-    );
-    let (mut accounts, debits) = debits?;
-    let (credits, missing) = credits?;
-
-    for ((account, debit), credit) in accounts.iter_mut().zip(debits).zip(credits) {
-        if account.balance < debit {
-            return None;
-        }
-        account.balance -= debit;
-        apply_credit(account, credit)?;
-    }
-
-    Some(IndexedExecution {
-        output: IndexedOutput { senders: accounts },
-        missing,
-    })
-}
-
-fn execute_indexed_debits(
-    mut accounts: ShardAccounts,
-    index: &SenderIndex<'_>,
-    transfers: &[PreparedTransfer],
-) -> Option<(ShardAccounts, Vec<u64>)> {
-    let mut debits = vec![0u64; accounts.len()];
-    for (sender, transfer) in index.senders.iter().zip(transfers) {
-        let account = &mut accounts[sender.account as usize];
-        if !account.nonce.consume(transfer.nonce) {
-            return None;
-        }
-        if transfer.sender == transfer.recipient {
-            if account.balance < transfer.value {
-                return None;
-            }
-        } else {
-            let debit = &mut debits[sender.account as usize];
-            *debit = (*debit).checked_add(transfer.value)?;
-        }
-    }
-    Some((accounts, debits))
-}
-
-fn route_indexed_credits(
-    account_count: usize,
-    index: &SenderIndex<'_>,
-    transfers: &[PreparedTransfer],
-) -> Option<(Vec<u64>, MissingCredits)> {
-    let mut credits = vec![0u64; account_count];
-    let mut missing = MissingCredits::new();
-    for (transfer_index, transfer) in transfers.iter().enumerate() {
-        if transfer.sender == transfer.recipient {
-            continue;
-        }
-        if let Some(recipient) = index
-            .sender_indices
-            .get(transfer.recipient_prefix, &transfer.recipient)
-        {
-            let credit = &mut credits[recipient as usize];
-            *credit = credit.checked_add(transfer.value)?;
-        } else {
-            missing.push(transfer_index as u32);
-        }
-    }
-    Some((credits, missing))
-}
-
 /// Applies credits to recipients already loaded as sender accounts.
 ///
 /// Returns transfer indices whose recipients were not loaded by any sender
@@ -660,21 +367,25 @@ pub(crate) fn apply_loaded_credits(
 ) -> Option<MissingCredits> {
     let shard_count = outputs.len();
     let mut missing = MissingCredits::new();
-    for (index, transfer) in transfers.iter().enumerate() {
-        if transfer.sender == transfer.recipient {
-            continue;
-        }
-        let shard = shard_of_prefix(transfer.recipient_prefix, shard_count);
-        if let Some(account) = shards[shard]
-            .sender_indices
-            .get(transfer.recipient_prefix, &transfer.recipient)
-        {
-            apply_credit(
-                &mut outputs[shard].senders[account as usize],
-                transfer.value,
-            )?;
-        } else {
-            missing.push(index as u32);
+    for owner in shards {
+        for sender in &owner.senders {
+            let index = sender.transfer;
+            let transfer = &transfers[index as usize];
+            if transfer.sender == transfer.recipient {
+                continue;
+            }
+            let recipient_shard = shard_of_prefix(transfer.recipient_prefix, shard_count);
+            if let Some(account) = shards[recipient_shard]
+                .sender_indices
+                .get(transfer.recipient_prefix, &transfer.recipient)
+            {
+                apply_credit(
+                    &mut outputs[recipient_shard].senders[account as usize],
+                    transfer.value,
+                )?;
+            } else {
+                missing.push(index);
+            }
         }
     }
     Some(missing)
@@ -683,16 +394,6 @@ pub(crate) fn apply_loaded_credits(
 /// Converts a sender shard output into account writes.
 pub(crate) fn shard_writes(shard: &Shard<'_>, output: ShardOutput) -> ShardWrites {
     shard
-        .sender_keys
-        .iter()
-        .zip(output.senders)
-        .map(|(key, account)| (**key, account))
-        .collect()
-}
-
-/// Converts indexed sender output into account writes.
-pub(crate) fn indexed_writes(index: &SenderIndex<'_>, output: IndexedOutput) -> ShardWrites {
-    index
         .sender_keys
         .iter()
         .zip(output.senders)
@@ -764,39 +465,41 @@ pub(crate) fn execute_with_shards(
     transfers: &[PreparedTransfer],
     shards: usize,
 ) -> Option<Changeset> {
-    if account_keys_are_disjoint(transfers) {
-        return execute_disjoint(state, transfers);
-    }
+    let plan = execution_plan(transfers, shards);
+    let mut changeset = execute_discrete(state, &plan.discrete)?;
+    if !plan.general.is_empty() {
+        let mut outputs = Vec::with_capacity(plan.general.len());
+        for shard in &plan.general {
+            let accounts = shard
+                .sender_keys()
+                .iter()
+                .map(|key| state.get(*key).copied().unwrap_or_default())
+                .collect();
+            outputs.push(execute_shard(accounts, shard, transfers)?);
+        }
+        let missing = apply_loaded_credits(&mut outputs, &plan.general, transfers)?;
+        let mut recipient_writes = ShardWrites::new();
+        if !missing.is_empty() {
+            recipient_writes = apply_state_credits(state, aggregate_credits(missing, transfers)?)?;
+        }
 
-    let shards = partition(transfers, shards);
-    let mut outputs = Vec::with_capacity(shards.len());
-    for shard in &shards {
-        let accounts = shard
-            .sender_keys()
-            .iter()
-            .map(|key| state.get(*key).copied().unwrap_or_default())
-            .collect();
-        outputs.push(execute_shard(accounts, shard, transfers)?);
+        changeset.extend(
+            outputs
+                .into_iter()
+                .zip(&plan.general)
+                .flat_map(|(output, shard)| shard_writes(shard, output))
+                .chain(recipient_writes),
+        );
     }
-    let missing = apply_loaded_credits(&mut outputs, &shards, transfers)?;
-    let mut recipient_writes = ShardWrites::new();
-    if !missing.is_empty() {
-        recipient_writes = apply_state_credits(state, aggregate_credits(missing, transfers)?)?;
-    }
-
-    let mut changeset: Changeset = outputs
-        .into_iter()
-        .zip(&shards)
-        .flat_map(|(output, shard)| shard_writes(shard, output))
-        .chain(recipient_writes)
-        .collect();
     changeset.sort_unstable_by_key(|(key, _)| *key);
     Some(changeset)
 }
 
-fn execute_disjoint(state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset> {
-    let mut changeset = Changeset::with_capacity(transfers.len().saturating_mul(2));
-    for transfer in transfers {
+fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Changeset> {
+    assert_eq!(plan.sender_keys.len(), plan.transfers.len());
+    let mut changeset =
+        Changeset::with_capacity(plan.sender_keys.len() + plan.recipient_keys.len());
+    for (sender_key, transfer) in plan.sender_keys.iter().zip(&plan.transfers) {
         let mut sender = state.get(&transfer.sender).copied().unwrap_or_default();
         if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
             return None;
@@ -804,10 +507,10 @@ fn execute_disjoint(state: &State, transfers: &[PreparedTransfer]) -> Option<Cha
         if transfer.sender != transfer.recipient {
             sender.balance -= transfer.value;
         }
-        changeset.push((transfer.sender, sender));
+        changeset.push((**sender_key, sender));
     }
 
-    for transfer in transfers {
+    for transfer in &plan.transfers {
         if transfer.sender == transfer.recipient {
             continue;
         }
@@ -816,7 +519,6 @@ fn execute_disjoint(state: &State, transfers: &[PreparedTransfer]) -> Option<Cha
         changeset.push((transfer.recipient, recipient));
     }
 
-    changeset.sort_unstable_by_key(|(key, _)| *key);
     Some(changeset)
 }
 
@@ -849,14 +551,6 @@ pub(crate) fn key_prefix(key: &AccountKey) -> u64 {
     let mut prefix = [0u8; 8];
     prefix.copy_from_slice(&key[..8]);
     u64::from_le_bytes(prefix)
-}
-
-#[inline]
-fn account_fingerprint(prefix: u64, key: &AccountKey) -> u64 {
-    let mut suffix = [0u8; 8];
-    suffix.copy_from_slice(&key[8..16]);
-    let value = prefix ^ u64::from_le_bytes(suffix).rotate_left(32);
-    if value == 0 { 1 } else { value }
 }
 
 #[cfg(test)]

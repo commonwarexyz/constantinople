@@ -26,7 +26,7 @@ fn executor(c: &mut Criterion) {
     for &transaction_count in TRANSACTION_COUNTS {
         group.throughput(Throughput::Elements(transaction_count as u64));
 
-        // Disjoint senders and recipients (every account touched once).
+        // Unique senders and recipients (every account touched once).
         let (state, transfers) = build_unique_fixture(transaction_count);
         bench_execute(&mut group, "unique", transaction_count, &state, &transfers);
 

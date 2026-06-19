@@ -24,18 +24,18 @@
 //! prepared transfers                                             |
 //!        |                                                       |
 //!        v                                                       |
-//! route transfer debits by sender                                |
+//! build account-touch execution plan                             |
 //!        |                                                       |
-//!        +--> sender shard 0 -- load senders -- check nonce/debit|
-//!        +--> sender shard 1 -- load senders -- check nonce/debit|
-//!        +--> ...                                                |
+//!        +--> discrete lane -- load unique senders/recipients    |
+//!        |                   -- check nonce/debit, apply credits |
 //!        |                                                       |
-//!        v                                                       |
-//! final credit sweep                                             |
-//!        |                                                       |
-//!        +--> credit recipients already loaded as senders        |
-//!        +--> aggregate recipient-only credits                   |
-//!        +--> get_many missing recipient accounts                |
+//!        +--> general lane -- route debits by sender             |
+//!        |                  -- sender shard 0 -- load/check/debit|
+//!        |                  -- sender shard 1 -- load/check/debit|
+//!        |                  -- final credit sweep                |
+//!        |                     * credit loaded senders           |
+//!        |                     * aggregate recipient-only credits|
+//!        |                     * get_many missing recipients     |
 //!        |                                                       |
 //!        v                                                       |
 //! StateWrites ---------------------------------------------------+
@@ -47,25 +47,26 @@
 //! merkleized commitments
 //! ```
 //!
-//! The final credit sweep is what makes sender-only sharding correct. Once all
-//! debits have succeeded, every loaded sender account has a single owner and can
-//! receive any in-block credits addressed to it. Recipients that were never
-//! loaded as senders cannot affect debit validity, so their credits are summed
-//! after the sender phase, loaded through batched `get_many` reads, and written
-//! once. Large borrowed key slices may be split into flat `Strategy` chunks for
-//! fan-out, but this is still one logical final sweep. If any debit check or
-//! credit addition fails, the whole batch is rejected; there is no partial
-//! execution state to reconcile.
+//! The account-touch plan has two lanes. The discrete lane contains only
+//! transfers whose non-self sender and recipient accounts are unique in the
+//! block, so each loaded account produces exactly one final write. The general
+//! lane contains every transfer that touches a contended account and is executed
+//! by sender-owned shards.
 //!
-//! There are three execution shapes, all preserving the same account semantics:
+//! The general lane's final credit sweep is what makes sender-only sharding
+//! correct. Once all general-lane debits have succeeded, every loaded sender
+//! account has a single owner and can receive any in-block credits addressed to
+//! it. Recipients that were never loaded as senders cannot affect debit
+//! validity, so their credits are summed after the sender phase, loaded through
+//! batched `get_many` reads, and written once. Large borrowed key slices may be
+//! split into flat `Strategy` chunks for fan-out, but this is still one logical
+//! final sweep. If any debit check or credit addition fails in either lane, the
+//! whole batch is rejected; there is no partial execution state to reconcile.
 //!
-//! - The disjoint path proves every non-self account touch is unique, so sender
-//!   writes and recipient writes can be loaded and produced directly.
-//! - The indexed path is for repeated-sender batches. It loads each unique
-//!   sender once, executes all sender debits against that index, credits loaded
-//!   senders, and sweeps the recipient-only remainder.
-//! - The general path partitions transfers by sender prefix and runs the sender
-//!   shards independently before the same final credit sweep.
+//! A single execution plan separates the workload into these lanes before any
+//! state is loaded. This keeps independent work on the cheap path even in mixed
+//! blocks, while any contended sender or recipient is handled by the general
+//! aggregation rules.
 //!
 //! Proposing, verifying, and applying certified blocks all use this same
 //! transition. `execute_proposal` prepares locally selected transactions and
@@ -87,7 +88,7 @@
 //!
 //! Parallel fan-out comes from the supplied `Strategy`, so this file avoids
 //! fixed worker counts. The same strategy drives preparation, large `get_many`
-//! reads, indexed execution, and QMDB merkleization beneath the batch APIs.
+//! reads, discrete-lane fan-out, and QMDB merkleization beneath the batch APIs.
 
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
@@ -166,17 +167,36 @@ where
         return Some(db::StateWrites::new(Vec::new()));
     }
 
-    if let Some(disjoint) = executor::disjoint_account_plan(transfers) {
-        return load_and_execute_disjoint(batch, strategy, transfers, disjoint).await;
+    let plan = executor::execution_plan(transfers, strategy.parallelism_hint().max(1));
+    let mut writes = Vec::new();
+    if !plan.discrete.transfers.is_empty() {
+        writes.extend(
+            load_and_execute_discrete(batch, strategy, plan.discrete)
+                .await?
+                .shards,
+        );
     }
-
-    let sender_index = executor::index_senders(transfers);
-    if sender_index.sender_count().saturating_mul(2) <= transfers.len() {
-        return load_and_execute_indexed(batch, strategy, &sender_index, transfers).await;
+    if !plan.general.is_empty() {
+        writes.extend(
+            load_and_execute_sharded(batch, strategy, transfers, plan.general)
+                .await?
+                .shards,
+        );
     }
+    Some(db::StateWrites::new(writes))
+}
 
-    let shard_count = strategy.parallelism_hint().max(1);
-    let shards = executor::partition(transfers, shard_count);
+async fn load_and_execute_sharded<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transfers: &[PreparedTransfer],
+    shards: Vec<executor::Shard<'_>>,
+) -> Option<db::StateWrites>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
     let loaded = futures::future::try_join_all(shards.iter().map(|shard| async move {
         let keys = shard.sender_keys();
         let values = batch.get_many(keys).await?;
@@ -217,76 +237,34 @@ where
     Some(db::StateWrites::new(writes))
 }
 
-async fn load_and_execute_indexed<E, H, S>(
+async fn load_and_execute_discrete<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
-    sender_index: &executor::SenderIndex<'_>,
-    transfers: &[PreparedTransfer],
+    plan: executor::DiscreteWorkload<'_>,
 ) -> Option<db::StateWrites>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let values = batch
-        .get_many(sender_index.sender_keys())
-        .await
-        .expect("sender state loading must succeed");
-    let accounts = values
-        .into_iter()
-        .map(|value| value.unwrap_or_default())
-        .collect();
-    let execution = if chunk_count(strategy, transfers.len()) > 1 {
-        executor::execute_indexed_parallel(strategy, accounts, sender_index, transfers)?
-    } else {
-        executor::execute_indexed(accounts, sender_index, transfers)?
-    };
-
-    let mut writes = vec![executor::indexed_writes(sender_index, execution.output)];
-    if !execution.missing.is_empty() {
-        let missing_credits = executor::aggregate_credits(execution.missing, transfers)?;
-        let keys = missing_credits
-            .iter()
-            .map(|(recipient, _)| *recipient)
-            .collect::<Vec<_>>();
-        let values = get_many_accounts(batch, strategy, &keys)
-            .await
-            .expect("recipient state loading must succeed");
-        writes.push(executor::apply_aggregated_credits(missing_credits, values)?);
-    }
-
-    Some(db::StateWrites::new(writes))
-}
-
-async fn load_and_execute_disjoint<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    transfers: &[PreparedTransfer],
-    disjoint: executor::DisjointAccountPlan<'_>,
-) -> Option<db::StateWrites>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let sender_writes = load_disjoint_writes(
+    let sender_writes = load_discrete_writes(
         batch,
         strategy,
-        transfers,
-        disjoint.sender_keys.as_slice(),
-        apply_disjoint_sender_values_into,
+        plan.transfers.as_slice(),
+        plan.sender_keys.as_slice(),
+        apply_discrete_sender_values_into,
     )
     .await
     .expect("sender state loading must succeed")?;
 
     let mut writes = vec![sender_writes];
-    if !disjoint.recipient_keys.is_empty() {
-        let all_recipients_non_self = disjoint.recipient_keys.len() == transfers.len();
-        let recipient_writes = load_disjoint_recipient_writes(
+    if !plan.recipient_keys.is_empty() {
+        let all_recipients_non_self = plan.recipient_keys.len() == plan.transfers.len();
+        let recipient_writes = load_discrete_recipient_writes(
             batch,
             strategy,
-            transfers,
-            disjoint.recipient_keys.as_slice(),
+            plan.transfers.as_slice(),
+            plan.recipient_keys.as_slice(),
             all_recipients_non_self,
         )
         .await
@@ -301,19 +279,19 @@ where
 // chunks and run them with `Strategy`. The runtime spawner requires `'static`
 // futures, so it cannot directly express this borrowed shape without first
 // owning or copying each key chunk.
-type DisjointApplyFn = fn(
-    &[PreparedTransfer],
+type DiscreteApplyFn = fn(
+    &[&PreparedTransfer],
     Vec<Option<Account>>,
     &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool;
 type StateReadResult<T> = core::result::Result<T, commonware_storage::qmdb::Error<mmr::Family>>;
 
-async fn load_disjoint_writes<E, H, S>(
+async fn load_discrete_writes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
-    transfers: &[PreparedTransfer],
+    transfers: &[&PreparedTransfer],
     keys: &[&AccountKey],
-    apply: DisjointApplyFn,
+    apply: DiscreteApplyFn,
 ) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -326,7 +304,7 @@ where
         let values = batch.get_many(keys).await?;
         apply(transfers, values, &mut writes)
     } else {
-        load_disjoint_writes_into_chunks(
+        load_discrete_writes_into_chunks(
             batch,
             strategy,
             transfers,
@@ -339,14 +317,14 @@ where
     Ok(valid.then(|| initialized_copy_vec(writes)))
 }
 
-fn load_disjoint_writes_into_chunks<E, H, S>(
+fn load_discrete_writes_into_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
-    transfers: &[PreparedTransfer],
+    transfers: &[&PreparedTransfer],
     keys: &[&AccountKey],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
     chunks: usize,
-    apply: DisjointApplyFn,
+    apply: DiscreteApplyFn,
 ) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: Storage + Clock + Metrics,
@@ -380,8 +358,8 @@ where
     Ok(true)
 }
 
-fn apply_disjoint_sender_values_into(
-    transfers: &[PreparedTransfer],
+fn apply_discrete_sender_values_into(
+    transfers: &[&PreparedTransfer],
     values: Vec<Option<Account>>,
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool {
@@ -398,10 +376,10 @@ fn apply_disjoint_sender_values_into(
     true
 }
 
-async fn load_disjoint_recipient_writes<E, H, S>(
+async fn load_discrete_recipient_writes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
-    transfers: &[PreparedTransfer],
+    transfers: &[&PreparedTransfer],
     recipient_keys: &[&AccountKey],
     all_recipients_non_self: bool,
 ) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
@@ -412,19 +390,19 @@ where
 {
     let chunks = chunk_count(strategy, transfers.len());
     if all_recipients_non_self {
-        return load_disjoint_writes(
+        return load_discrete_writes(
             batch,
             strategy,
             transfers,
             recipient_keys,
-            apply_disjoint_dense_recipient_values_into,
+            apply_discrete_dense_recipient_values_into,
         )
         .await;
     }
 
     if chunks <= 1 {
         let values = batch.get_many(recipient_keys).await?;
-        return Ok(apply_disjoint_sparse_recipient_values(transfers, values));
+        return Ok(apply_discrete_sparse_recipient_values(transfers, values));
     }
     load_sparse_recipient_writes_in_chunks(batch, strategy, transfers, recipient_keys, chunks)
 }
@@ -432,7 +410,7 @@ where
 fn load_sparse_recipient_writes_in_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
-    transfers: &[PreparedTransfer],
+    transfers: &[&PreparedTransfer],
     recipient_keys: &[&AccountKey],
     chunks: usize,
 ) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
@@ -446,7 +424,7 @@ where
     assert_eq!(covered_recipients, recipient_keys.len());
     let results = strategy.map_collect_vec(work, |(transfer_range, recipient_range)| {
         let result: StateReadResult<Option<ShardWrites>> = if recipient_range.is_empty() {
-            Ok(apply_disjoint_sparse_recipient_values(
+            Ok(apply_discrete_sparse_recipient_values(
                 &transfers[transfer_range],
                 Vec::new(),
             ))
@@ -454,7 +432,7 @@ where
             // This leaf borrows transfer/key slices. Runtime spawning would
             // require owned chunks; `Strategy` provides the fan-out.
             match futures::executor::block_on(batch.get_many(&recipient_keys[recipient_range])) {
-                Ok(values) => Ok(apply_disjoint_sparse_recipient_values(
+                Ok(values) => Ok(apply_discrete_sparse_recipient_values(
                     &transfers[transfer_range],
                     values,
                 )),
@@ -474,8 +452,8 @@ where
     Ok(Some(merged))
 }
 
-fn apply_disjoint_dense_recipient_values_into(
-    transfers: &[PreparedTransfer],
+fn apply_discrete_dense_recipient_values_into(
+    transfers: &[&PreparedTransfer],
     values: Vec<Option<Account>>,
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool {
@@ -489,8 +467,8 @@ fn apply_disjoint_dense_recipient_values_into(
     true
 }
 
-fn apply_disjoint_sparse_recipient_values(
-    transfers: &[PreparedTransfer],
+fn apply_discrete_sparse_recipient_values(
+    transfers: &[&PreparedTransfer],
     values: Vec<Option<Account>>,
 ) -> Option<ShardWrites> {
     let mut values = values.into_iter();
@@ -526,8 +504,8 @@ where
 }
 
 /// Fan out a large QMDB read without requiring the borrowed batch/key slices to
-/// be `'static`. Callers still choose where this runs; disjoint execution uses
-/// this for sender reads first, then recipient reads only during the final sweep.
+/// be `'static`. Callers still choose where this runs; account execution uses
+/// this for large sender or recipient reads.
 fn get_many_account_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
@@ -582,7 +560,7 @@ fn chunk_ranges(items: usize, chunks: usize) -> Vec<Range<usize>> {
 /// to a potentially smaller recipient-key chunk. The returned ranges preserve
 /// transfer order and cover every non-self recipient exactly once.
 fn sparse_recipient_chunks(
-    transfers: &[PreparedTransfer],
+    transfers: &[&PreparedTransfer],
     chunks: usize,
 ) -> Vec<(Range<usize>, Range<usize>)> {
     let mut recipient_start = 0;
@@ -1055,16 +1033,17 @@ mod tests {
         let c = account(3);
         let d = account(4);
 
-        let transfers = vec![
+        let transfers = [
             transfer(a, a),
             transfer(a, b),
             transfer(b, c),
             transfer(c, c),
             transfer(c, d),
         ];
+        let transfer_refs = transfers.iter().collect::<Vec<_>>();
 
         assert_eq!(
-            sparse_recipient_chunks(&transfers, 3),
+            sparse_recipient_chunks(&transfer_refs, 3),
             vec![(0..1, 0..0), (1..3, 0..2), (3..5, 2..3)]
         );
     }
@@ -1080,7 +1059,7 @@ mod tests {
 /// helps on cold disk misses.
 #[cfg(test)]
 mod db_bench {
-    use crate::executor::{PreparedTransfer, ShardWrites};
+    use crate::executor::PreparedTransfer;
     use commonware_codec::{EncodeSize as _, ReadExt as _, Write as _};
     use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
@@ -1309,12 +1288,9 @@ mod db_bench {
     #[derive(Default)]
     struct CurrentBreakdown {
         total: Duration,
-        disjoint: Duration,
-        index: Duration,
-        sender_load: Duration,
-        debit: Duration,
-        recipient_load: Duration,
-        writes: Duration,
+        plan: Duration,
+        discrete: Duration,
+        general: Duration,
     }
 
     async fn timed_current_breakdown(
@@ -1326,104 +1302,38 @@ mod db_bench {
         let mut breakdown = CurrentBreakdown::default();
 
         let start = Instant::now();
-        let disjoint = crate::executor::disjoint_account_plan(transfers);
-        breakdown.disjoint = start.elapsed();
-        if let Some(disjoint) = disjoint {
+        let plan = crate::executor::execution_plan(transfers, strategy.parallelism_hint().max(1));
+        breakdown.plan = start.elapsed();
+
+        let mut count = 0;
+        if !plan.discrete.transfers.is_empty() {
             let start = Instant::now();
-            let sender_writes = super::load_disjoint_writes(
-                batch,
-                strategy,
-                transfers,
-                disjoint.sender_keys.as_slice(),
-                super::apply_disjoint_sender_values_into,
-            )
-            .await
-            .expect("sender state loading must succeed")
-            .expect("bench transfers should execute");
-            breakdown.sender_load = start.elapsed();
-
-            let mut writes = vec![sender_writes];
-            if !disjoint.recipient_keys.is_empty() {
-                let all_recipients_non_self = disjoint.recipient_keys.len() == transfers.len();
-                let load_start = Instant::now();
-                let recipient_writes = super::load_disjoint_recipient_writes(
-                    batch,
-                    strategy,
-                    transfers,
-                    disjoint.recipient_keys.as_slice(),
-                    all_recipients_non_self,
-                )
+            let state_writes = super::load_and_execute_discrete(batch, strategy, plan.discrete)
                 .await
-                .expect("recipient state loading must succeed")
-                .expect("bench transfers should execute");
-                breakdown.recipient_load = load_start.elapsed();
-                writes.push(recipient_writes);
-            }
-
-            let count = writes.iter().map(|map| map.len()).sum();
-            black_box(&writes);
-            breakdown.total = total.elapsed();
-            return (count, breakdown);
-        }
-
-        let start = Instant::now();
-        let sender_index = crate::executor::index_senders(transfers);
-        breakdown.index = start.elapsed();
-        if sender_index.sender_count().saturating_mul(2) > transfers.len() {
-            let (count, elapsed) = timed_current(batch, strategy, transfers).await;
-            breakdown.total = elapsed;
-            return (count, breakdown);
-        }
-
-        let start = Instant::now();
-        let values = batch
-            .get_many(sender_index.sender_keys())
-            .await
-            .expect("sender state loading must succeed");
-        let accounts = values
-            .into_iter()
-            .map(|value| value.unwrap_or_default())
-            .collect();
-        breakdown.sender_load = start.elapsed();
-
-        let start = Instant::now();
-        let execution = if super::chunk_count(strategy, transfers.len()) > 1 {
-            crate::executor::execute_indexed_parallel(strategy, accounts, &sender_index, transfers)
-                .expect("current path")
-        } else {
-            crate::executor::execute_indexed(accounts, &sender_index, transfers)
-                .expect("current path")
-        };
-        breakdown.debit = start.elapsed();
-
-        let mut recipient_writes = ShardWrites::new();
-        if !execution.missing.is_empty() {
-            let missing_credits = crate::executor::aggregate_credits(execution.missing, transfers)
-                .expect("current path");
-            let keys = missing_credits
+                .expect("discrete path should execute");
+            breakdown.discrete = start.elapsed();
+            count += state_writes
+                .shards
                 .iter()
-                .map(|(recipient, _)| *recipient)
-                .collect::<Vec<_>>();
+                .map(|map| map.len())
+                .sum::<usize>();
+            black_box(&state_writes);
+        }
+        if !plan.general.is_empty() {
             let start = Instant::now();
-            let values = super::get_many_accounts(batch, strategy, &keys)
-                .await
-                .expect("recipient state loading must succeed");
-            breakdown.recipient_load = start.elapsed();
-            recipient_writes = crate::executor::apply_aggregated_credits(missing_credits, values)
-                .expect("current path");
+            let state_writes =
+                super::load_and_execute_sharded(batch, strategy, transfers, plan.general)
+                    .await
+                    .expect("general path should execute");
+            breakdown.general = start.elapsed();
+            count += state_writes
+                .shards
+                .iter()
+                .map(|map| map.len())
+                .sum::<usize>();
+            black_box(&state_writes);
         }
 
-        let start = Instant::now();
-        let mut writes = vec![crate::executor::indexed_writes(
-            &sender_index,
-            execution.output,
-        )];
-        if !recipient_writes.is_empty() {
-            writes.push(recipient_writes);
-        }
-        let count = writes.iter().map(|map| map.len()).sum();
-        black_box(&writes);
-        breakdown.writes = start.elapsed();
         breakdown.total = total.elapsed();
         (count, breakdown)
     }
@@ -1596,14 +1506,11 @@ mod db_bench {
                             timed_current_breakdown(&batch, &strategy, &transfers).await;
                         assert_eq!(count, current_writes, "breakdown write count should match");
                         println!(
-                            "  breakdown: total={:?} disjoint={:?} index={:?} sender_load={:?} debit={:?} recipient_load={:?} writes={:?}",
+                            "  breakdown: total={:?} plan={:?} discrete={:?} general={:?}",
                             breakdown.total,
-                            breakdown.disjoint,
-                            breakdown.index,
-                            breakdown.sender_load,
-                            breakdown.debit,
-                            breakdown.recipient_load,
-                            breakdown.writes,
+                            breakdown.plan,
+                            breakdown.discrete,
+                            breakdown.general,
                         );
                     }
 

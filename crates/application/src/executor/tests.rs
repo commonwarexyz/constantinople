@@ -261,12 +261,85 @@ fn contended_shard_sender_load_keys_are_deduplicated() {
         .map(|nonce| sender.sign(recipient.public_key.clone(), 1, nonce))
         .collect::<Vec<_>>();
     let transfers = prepared(&transactions);
-    let shards = super::partition(&transfers, 1);
-    let keys = shards[0].sender_keys();
+    let plan = super::execution_plan(&transfers, 1);
+    let keys = plan.general[0].sender_keys();
     let unique = keys.iter().copied().collect::<HashSet<_>>();
 
+    assert!(plan.discrete.transfers.is_empty());
     assert_eq!(keys.len(), unique.len());
     assert_eq!(keys.len(), 1);
+}
+
+#[test]
+fn execution_plan_keeps_unique_transfers_discrete_in_mixed_batches() {
+    let key = |seed| account_key(&TestSigner::from_seed(seed).public_key);
+    let transfer = |sender, recipient, nonce| super::PreparedTransfer {
+        sender,
+        recipient,
+        sender_prefix: super::key_prefix(&sender),
+        recipient_prefix: super::key_prefix(&recipient),
+        value: 1,
+        nonce,
+    };
+
+    let repeated = key(90);
+    let transfers = vec![
+        transfer(key(80), key(81), 0),
+        transfer(repeated, key(82), 0),
+        transfer(repeated, key(83), 1),
+        transfer(key(84), key(85), 0),
+    ];
+    let plan = super::execution_plan(&transfers, 4);
+    let general_transfers = plan
+        .general
+        .iter()
+        .map(|shard| shard.senders.len())
+        .sum::<usize>();
+
+    assert_eq!(plan.discrete.transfers.len(), 2);
+    assert_eq!(plan.discrete.sender_keys.len(), 2);
+    assert_eq!(plan.discrete.recipient_keys.len(), 2);
+    assert_eq!(general_transfers, 2);
+}
+
+#[test]
+fn mixed_discrete_and_general_execution_writes_each_account_once() {
+    let discrete_sender = TestSigner::from_seed(100);
+    let discrete_recipient = TestSigner::from_seed(101);
+    let repeated_sender = TestSigner::from_seed(102);
+    let general_recipient = TestSigner::from_seed(103);
+
+    let mut accounts = State::new();
+    accounts.insert(account_key(&discrete_sender.public_key), account(10, 0));
+    accounts.insert(account_key(&discrete_recipient.public_key), account(5, 0));
+    accounts.insert(account_key(&repeated_sender.public_key), account(10, 0));
+    accounts.insert(account_key(&general_recipient.public_key), account(7, 0));
+
+    let transactions = vec![
+        discrete_sender.sign(discrete_recipient.public_key.clone(), 3, 0),
+        repeated_sender.sign(general_recipient.public_key.clone(), 2, 0),
+        repeated_sender.sign(general_recipient.public_key.clone(), 2, 1),
+    ];
+    let changeset = run(&accounts, &transactions).expect("valid mixed batch should execute");
+    let unique = changeset.iter().map(|(key, _)| key).collect::<HashSet<_>>();
+
+    assert_eq!(changeset.len(), unique.len());
+    assert_eq!(
+        changeset_account(&changeset, discrete_sender.public_key),
+        account(7, 1)
+    );
+    assert_eq!(
+        changeset_account(&changeset, discrete_recipient.public_key),
+        account(8, 0)
+    );
+    assert_eq!(
+        changeset_account(&changeset, repeated_sender.public_key),
+        account(6, 2)
+    );
+    assert_eq!(
+        changeset_account(&changeset, general_recipient.public_key),
+        account(11, 0)
+    );
 }
 
 #[test]
