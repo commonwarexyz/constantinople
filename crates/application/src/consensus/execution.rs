@@ -51,9 +51,11 @@
 //! debits have succeeded, every loaded sender account has a single owner and can
 //! receive any in-block credits addressed to it. Recipients that were never
 //! loaded as senders cannot affect debit validity, so their credits are summed
-//! after the sender phase, loaded once with `get_many`, and written once. If any
-//! debit check or credit addition fails, the whole batch is rejected; there is no
-//! partial execution state to reconcile.
+//! after the sender phase, loaded through batched `get_many` reads, and written
+//! once. Large borrowed key slices may be split into flat `Strategy` chunks for
+//! fan-out, but this is still one logical final sweep. If any debit check or
+//! credit addition fails, the whole batch is rejected; there is no partial
+//! execution state to reconcile.
 //!
 //! There are three execution shapes, all preserving the same account semantics:
 //!
@@ -104,7 +106,7 @@ use commonware_utils::non_empty_range;
 use constantinople_primitives::{
     Account, AccountKey, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
 };
-use core::mem::MaybeUninit;
+use core::{mem::MaybeUninit, ops::Range};
 use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -315,15 +317,16 @@ where
     .await
 }
 
-// These QMDB fan-out helpers split borrowed transfer/key slices with
-// `Strategy::join`. The runtime spawner requires `'static` futures, so it
-// cannot directly express this borrowed shape without first owning or copying
-// each key chunk.
+// These QMDB fan-out helpers split borrowed transfer/key slices into flat
+// chunks and run them with `Strategy`. The runtime spawner requires `'static`
+// futures, so it cannot directly express this borrowed shape without first
+// owning or copying each key chunk.
 type DisjointApplyFn = fn(
     &[PreparedTransfer],
     Vec<Option<Account>>,
     &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool;
+type StateReadResult<T> = core::result::Result<T, commonware_storage::qmdb::Error<mmr::Family>>;
 
 async fn load_disjoint_writes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
@@ -362,44 +365,31 @@ where
     H: Hasher,
     S: Strategy,
 {
-    debug_assert_eq!(transfers.len(), keys.len());
-    if chunks <= 1 {
-        let values = futures::executor::block_on(batch.get_many(keys))?;
-        return Ok(apply(transfers, values, writes));
+    assert_eq!(transfers.len(), keys.len());
+    let ranges = chunk_ranges(transfers.len(), chunks);
+    let mut remaining_writes = writes;
+    let mut work = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let len = range.end - range.start;
+        let (chunk_writes, rest) = remaining_writes.split_at_mut(len);
+        work.push((&transfers[range.clone()], &keys[range], chunk_writes));
+        remaining_writes = rest;
     }
+    assert!(remaining_writes.is_empty());
 
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = transfers.len() * left_chunks / chunks;
-    let (left_writes, right_writes) = writes.split_at_mut(split);
-    let (left_keys, right_keys) = keys.split_at(split);
-    let (left, right) = strategy.join(
-        || {
-            parallel_disjoint_writes_into(
-                batch,
-                strategy,
-                &transfers[..split],
-                left_keys,
-                left_writes,
-                left_chunks,
-                apply,
-            )
-        },
-        || {
-            parallel_disjoint_writes_into(
-                batch,
-                strategy,
-                &transfers[split..],
-                right_keys,
-                right_writes,
-                right_chunks,
-                apply,
-            )
-        },
-    );
-    let left_valid = left?;
-    let right_valid = right?;
-    Ok(left_valid && right_valid)
+    let results = strategy.map_collect_vec(work, |(transfers, keys, writes)| {
+        // This leaf borrows the batch, key slice, transfer slice, and output
+        // slice. Spawning it onto the runtime would require `'static` ownership
+        // or copying each chunk; `Strategy` provides the fan-out.
+        let values = futures::executor::block_on(batch.get_many(keys))?;
+        Ok::<bool, commonware_storage::qmdb::Error<mmr::Family>>(apply(transfers, values, writes))
+    });
+    for result in results {
+        if !result? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn apply_disjoint_sender_values_into(
@@ -463,43 +453,35 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 {
-        if recipient_keys.is_empty() {
-            return Ok(Some(ShardWrites::new()));
-        }
-        let values = futures::executor::block_on(batch.get_many(recipient_keys))?;
-        return Ok(apply_disjoint_sparse_recipient_values(transfers, values));
-    }
+    let work = sparse_recipient_chunks(transfers, chunks);
+    let results = strategy.map_collect_vec(work, |(transfer_range, recipient_range)| {
+        let result: StateReadResult<Option<ShardWrites>> = if recipient_range.is_empty() {
+            Ok(apply_disjoint_sparse_recipient_values(
+                &transfers[transfer_range],
+                Vec::new(),
+            ))
+        } else {
+            // This leaf borrows transfer/key slices. Runtime spawning would
+            // require owned chunks; `Strategy` provides the fan-out.
+            match futures::executor::block_on(batch.get_many(&recipient_keys[recipient_range])) {
+                Ok(values) => Ok(apply_disjoint_sparse_recipient_values(
+                    &transfers[transfer_range],
+                    values,
+                )),
+                Err(error) => Err(error),
+            }
+        };
+        result
+    });
 
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = transfers.len() * left_chunks / chunks;
-    let recipient_split = transfers[..split]
-        .iter()
-        .filter(|transfer| transfer.sender != transfer.recipient)
-        .count();
-    let (left_recipient_keys, right_recipient_keys) = recipient_keys.split_at(recipient_split);
-    let (left, right) = strategy.join(
-        || {
-            parallel_disjoint_sparse_recipient_writes(
-                batch,
-                strategy,
-                &transfers[..split],
-                left_recipient_keys,
-                left_chunks,
-            )
-        },
-        || {
-            parallel_disjoint_sparse_recipient_writes(
-                batch,
-                strategy,
-                &transfers[split..],
-                right_recipient_keys,
-                right_chunks,
-            )
-        },
-    );
-    merge_optional_sparse_recipient_writes(left?, right?)
+    let mut merged = ShardWrites::new();
+    for result in results {
+        let Some(writes) = result? else {
+            return Ok(None);
+        };
+        merged.extend(writes);
+    }
+    Ok(Some(merged))
 }
 
 fn apply_disjoint_dense_recipient_values_into(
@@ -532,22 +514,8 @@ fn apply_disjoint_sparse_recipient_values(
         executor::apply_credit(&mut account, transfer.value)?;
         recipient_writes.push((transfer.recipient, account));
     }
-    debug_assert!(values.next().is_none());
+    assert!(values.next().is_none());
     Some(recipient_writes)
-}
-
-fn merge_optional_sparse_recipient_writes(
-    left: Option<ShardWrites>,
-    right: Option<ShardWrites>,
-) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>> {
-    let Some(mut left_writes) = left else {
-        return Ok(None);
-    };
-    let Some(right_writes) = right else {
-        return Ok(None);
-    };
-    left_writes.extend(right_writes);
-    Ok(Some(left_writes))
 }
 
 async fn get_many_accounts<E, H, S>(
@@ -581,20 +549,18 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 {
-        return futures::executor::block_on(batch.get_many(keys));
-    }
+    let results = strategy.map_collect_vec(chunk_ranges(keys.len(), chunks), |range| {
+        // This leaf borrows a key slice. The runtime spawner requires `'static`
+        // futures, so using it here would force us to own/copy each chunk just
+        // to issue the same QMDB read.
+        futures::executor::block_on(batch.get_many(&keys[range]))
+    });
 
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = keys.len() * left_chunks / chunks;
-    let (left, right) = strategy.join(
-        || parallel_get_many_accounts(batch, strategy, &keys[..split], left_chunks),
-        || parallel_get_many_accounts(batch, strategy, &keys[split..], right_chunks),
-    );
-    let mut left = left?;
-    left.extend(right?);
-    Ok(left)
+    let mut values = Vec::with_capacity(keys.len());
+    for result in results {
+        values.extend(result?);
+    }
+    Ok(values)
 }
 
 fn parallel_chunks<S>(strategy: &S, items: usize) -> usize
@@ -602,6 +568,47 @@ where
     S: Strategy,
 {
     strategy.parallelism_hint().max(1).min(items.max(1))
+}
+
+fn chunk_ranges(items: usize, chunks: usize) -> Vec<Range<usize>> {
+    if items == 0 {
+        return Vec::new();
+    }
+
+    let chunks = chunks.max(1).min(items);
+    (0..chunks)
+        .map(|chunk| {
+            let start = items * chunk / chunks;
+            let end = items * (chunk + 1) / chunks;
+            start..end
+        })
+        .collect()
+}
+
+/// Produces aligned transfer and recipient-key ranges for sparse recipient
+/// loading.
+///
+/// `recipient_keys` omits self-transfer recipients, so each transfer chunk maps
+/// to a potentially smaller recipient-key chunk. The returned ranges preserve
+/// transfer order and cover every non-self recipient exactly once.
+fn sparse_recipient_chunks(
+    transfers: &[PreparedTransfer],
+    chunks: usize,
+) -> Vec<(Range<usize>, Range<usize>)> {
+    let mut recipient_start = 0;
+    chunk_ranges(transfers.len(), chunks)
+        .into_iter()
+        .map(|transfer_range| {
+            let recipient_count = transfers[transfer_range.clone()]
+                .iter()
+                .filter(|transfer| transfer.sender != transfer.recipient)
+                .count();
+            let recipient_end = recipient_start + recipient_count;
+            let recipient_range = recipient_start..recipient_end;
+            recipient_start = recipient_end;
+            (transfer_range, recipient_range)
+        })
+        .collect()
 }
 
 fn execution_shard_count<S>(strategy: &S) -> usize
@@ -684,44 +691,45 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 {
-        for ((transaction, transfer), digest) in transactions.iter().zip(transfers).zip(digests) {
-            let Some(prepared) = executor::prepare_transfer(transaction) else {
-                return false;
-            };
-            transfer.write(prepared);
-            digest.write(*transaction.message_digest());
-        }
-        return true;
+    let ranges = chunk_ranges(transactions.len(), chunks);
+    let mut remaining_transfers = transfers;
+    let mut remaining_digests = digests;
+    let mut work = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let len = range.end - range.start;
+        let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
+        let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
+        work.push((&transactions[range], chunk_transfers, chunk_digests));
+        remaining_transfers = rest_transfers;
+        remaining_digests = rest_digests;
     }
+    assert!(remaining_transfers.is_empty());
+    assert!(remaining_digests.is_empty());
 
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = transactions.len() * left_chunks / chunks;
-    let (left_transactions, right_transactions) = transactions.split_at(split);
-    let (left_transfers, right_transfers) = transfers.split_at_mut(split);
-    let (left_digests, right_digests) = digests.split_at_mut(split);
-    let (left, right) = strategy.join(
-        || {
-            parallel_prepare_signed_transfers_with_digests_into(
-                strategy,
-                left_transactions,
-                left_transfers,
-                left_digests,
-                left_chunks,
-            )
-        },
-        || {
-            parallel_prepare_signed_transfers_with_digests_into(
-                strategy,
-                right_transactions,
-                right_transfers,
-                right_digests,
-                right_chunks,
-            )
-        },
-    );
-    left && right
+    strategy
+        .map_collect_vec(work, |(transactions, transfers, digests)| {
+            prepare_signed_transfers_with_digests_chunk(transactions, transfers, digests)
+        })
+        .into_iter()
+        .all(core::convert::identity)
+}
+
+fn prepare_signed_transfers_with_digests_chunk<H>(
+    transactions: &[SignedTransaction<H>],
+    transfers: &mut [MaybeUninit<PreparedTransfer>],
+    digests: &mut [MaybeUninit<H::Digest>],
+) -> bool
+where
+    H: Hasher,
+{
+    for ((transaction, transfer), digest) in transactions.iter().zip(transfers).zip(digests) {
+        let Some(prepared) = executor::prepare_transfer(transaction) else {
+            return false;
+        };
+        transfer.write(prepared);
+        digest.write(*transaction.message_digest());
+    }
+    true
 }
 
 pub(super) fn prepare_lazy_transfers<H, S>(
@@ -778,47 +786,48 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunks <= 1 {
-        for ((transaction, transfer), digest) in body.iter().zip(transfers).zip(digests) {
-            let Some(transaction) = transaction.get() else {
-                return false;
-            };
-            let Some(prepared) = executor::prepare_transfer(transaction) else {
-                return false;
-            };
-            transfer.write(prepared);
-            digest.write(*transaction.message_digest());
-        }
-        return true;
+    let ranges = chunk_ranges(body.len(), chunks);
+    let mut remaining_transfers = transfers;
+    let mut remaining_digests = digests;
+    let mut work = Vec::with_capacity(ranges.len());
+    for range in ranges {
+        let len = range.end - range.start;
+        let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
+        let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
+        work.push((&body[range], chunk_transfers, chunk_digests));
+        remaining_transfers = rest_transfers;
+        remaining_digests = rest_digests;
     }
+    assert!(remaining_transfers.is_empty());
+    assert!(remaining_digests.is_empty());
 
-    let left_chunks = chunks / 2;
-    let right_chunks = chunks - left_chunks;
-    let split = body.len() * left_chunks / chunks;
-    let (left_body, right_body) = body.split_at(split);
-    let (left_transfers, right_transfers) = transfers.split_at_mut(split);
-    let (left_digests, right_digests) = digests.split_at_mut(split);
-    let (left, right) = strategy.join(
-        || {
-            parallel_prepare_lazy_transfers_into(
-                strategy,
-                left_body,
-                left_transfers,
-                left_digests,
-                left_chunks,
-            )
-        },
-        || {
-            parallel_prepare_lazy_transfers_into(
-                strategy,
-                right_body,
-                right_transfers,
-                right_digests,
-                right_chunks,
-            )
-        },
-    );
-    left && right
+    strategy
+        .map_collect_vec(work, |(body, transfers, digests)| {
+            prepare_lazy_transfers_chunk(body, transfers, digests)
+        })
+        .into_iter()
+        .all(core::convert::identity)
+}
+
+fn prepare_lazy_transfers_chunk<H>(
+    body: &[constantinople_primitives::LazySignedTransaction<H>],
+    transfers: &mut [MaybeUninit<PreparedTransfer>],
+    digests: &mut [MaybeUninit<H::Digest>],
+) -> bool
+where
+    H: Hasher,
+{
+    for ((transaction, transfer), digest) in body.iter().zip(transfers).zip(digests) {
+        let Some(transaction) = transaction.get() else {
+            return false;
+        };
+        let Some(prepared) = executor::prepare_transfer(transaction) else {
+            return false;
+        };
+        transfer.write(prepared);
+        digest.write(*transaction.message_digest());
+    }
+    true
 }
 
 fn uninit_vec<T>(len: usize) -> Vec<MaybeUninit<T>> {

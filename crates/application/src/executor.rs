@@ -1,12 +1,19 @@
 //! Transfer execution for the Constantinople account model.
 //!
-//! Execution shards transactions by a prefix of the sender key. Each shard loads
+//! This module is the state-agnostic account engine used by consensus execution,
+//! tests, and benchmarks. It decides which sender accounts must be loaded,
+//! applies nonce/debit checks to those loaded sender accounts, routes credits to
+//! loaded senders, and reports the recipient-only credits that must be swept by
+//! the caller. DB-backed loading is handled by `consensus::execution`; the
+//! in-memory entry points in this module read from [`State`].
+//!
+//! Execution shards transactions by a prefix of the sender key. Each shard owns
 //! only its sender accounts and applies debits and nonce advances. Recipient
 //! accounts are not loaded or mutated by the shards. After all sender shards
 //! finish, a final credit sweep routes credits back to the post-debit sender
-//! shard maps first, then loads and credits any remaining recipient-only
-//! accounts. A sender spends only the balance it held at the start of the block,
-//! never funds credited to it within the same block.
+//! shard maps first, then credits any remaining recipient-only accounts. A
+//! sender spends only the balance it held at the start of the block, never funds
+//! credited to it within the same block.
 //!
 //! Execution is all or nothing: if any transfer fails its nonce or balance check
 //! or overflows its recipient, the whole batch is rejected. Because a successful
