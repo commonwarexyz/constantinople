@@ -1108,7 +1108,7 @@ mod db_bench {
     use commonware_utils::{NZU16, NZU64, NZUsize};
     use constantinople_primitives::{
         Account, AccountKey, LazySignedTransaction, Nonce, Transaction, TransactionPublicKey,
-        VerifiedTransaction,
+        VerifiedTransaction, preload_transaction_slice,
     };
     use core::num::NonZeroU64;
     use std::{
@@ -1448,7 +1448,7 @@ mod db_bench {
     ) -> (usize, Duration) {
         let start = Instant::now();
         assert!(
-            super::super::body::preload_transaction_slice(body, strategy),
+            preload_transaction_slice(body, strategy),
             "lazy preload should succeed"
         );
         let elapsed = start.elapsed();
@@ -1490,7 +1490,7 @@ mod db_bench {
         let body = lazy_body(&transactions);
 
         assert!(
-            super::super::body::preload_transaction_slice(&body, &strategy),
+            preload_transaction_slice(&body, &strategy),
             "bench body should preload"
         );
 

@@ -4,7 +4,9 @@ use super::{INVALID_SIGNATURE, Result, SIGNATURE_TASK_CLOSED};
 use commonware_cryptography::Hasher;
 use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Spawner, telemetry::traces::TracedExt as _};
-use constantinople_primitives::{LazySignedTransaction, PublicKeyCache, verify_transaction_batch};
+use constantinople_primitives::{
+    LazySignedTransaction, PublicKeyCache, preload_transaction_slice, verify_transaction_batch,
+};
 use rand_core::CryptoRngCore;
 use std::sync::Arc;
 use tracing::{Instrument, info_span};
@@ -47,32 +49,6 @@ where
     });
 
     result_rx.await.map_err(|_| SIGNATURE_TASK_CLOSED)?
-}
-
-pub(super) fn preload_transaction_slice<H, St>(
-    transactions: &[LazySignedTransaction<H>],
-    strategy: &St,
-) -> bool
-where
-    H: Hasher,
-    St: Strategy,
-{
-    strategy.fold(
-        transactions,
-        || true,
-        |decoded, lazy| decoded && signature_inputs_decode(lazy),
-        |left, right| left && right,
-    )
-}
-
-fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>) -> bool
-where
-    H: Hasher,
-{
-    let Some(transaction) = lazy.get() else {
-        return false;
-    };
-    transaction.value().sender().is_some()
 }
 
 #[tracing::instrument(name = "application.verify.wait", level = "info", skip_all)]

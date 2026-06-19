@@ -346,10 +346,11 @@ where
         .collect()
 }
 
-/// Forces lazily encoded signed transactions to decode in parallel.
+/// Forces a borrowed slice of lazily encoded signed transactions to decode in
+/// parallel.
 ///
 /// Returns `false` if any transaction fails to decode.
-fn preload_transaction_slice<H, St>(
+pub fn preload_transaction_slice<H, St>(
     transactions: &[LazySignedTransaction<H>],
     strategy: &St,
 ) -> bool

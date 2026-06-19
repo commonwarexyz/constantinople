@@ -7,7 +7,8 @@ pub use sealed::{Sealable, Sealed};
 mod signed;
 pub use signed::{
     LazySignedTransaction, Signable, Signed, materialize_transaction_chunks,
-    preload_transaction_chunks, verify_transaction_batch, verify_transaction_chunks,
+    preload_transaction_chunks, preload_transaction_slice, verify_transaction_batch,
+    verify_transaction_chunks,
 };
 
 mod account;
