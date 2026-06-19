@@ -240,7 +240,7 @@ where
         .into_iter()
         .map(|value| value.unwrap_or_default())
         .collect();
-    let execution = if use_parallel_indexed_execution(strategy, transfers.len()) {
+    let execution = if should_chunk_indexed_execution(strategy, transfers.len()) {
         executor::execute_indexed_parallel(strategy, accounts, sender_index, transfers)?
     } else {
         executor::execute_indexed(accounts, sender_index, transfers)?
@@ -340,18 +340,26 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = parallel_chunks(strategy, transfers.len());
+    let chunks = chunk_count(strategy, transfers.len());
     let mut writes = uninit_vec(transfers.len());
     let valid = if chunks <= 1 {
         let values = batch.get_many(keys).await?;
         apply(transfers, values, &mut writes)
     } else {
-        parallel_disjoint_writes_into(batch, strategy, transfers, keys, &mut writes, chunks, apply)?
+        load_disjoint_writes_into_chunks(
+            batch,
+            strategy,
+            transfers,
+            keys,
+            &mut writes,
+            chunks,
+            apply,
+        )?
     };
     Ok(valid.then(|| initialized_copy_vec(writes)))
 }
 
-fn parallel_disjoint_writes_into<E, H, S>(
+fn load_disjoint_writes_into_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
@@ -422,7 +430,7 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = parallel_chunks(strategy, transfers.len());
+    let chunks = chunk_count(strategy, transfers.len());
     if all_recipients_non_self {
         return load_disjoint_writes(
             batch,
@@ -438,10 +446,10 @@ where
         let values = batch.get_many(recipient_keys).await?;
         return Ok(apply_disjoint_sparse_recipient_values(transfers, values));
     }
-    parallel_disjoint_sparse_recipient_writes(batch, strategy, transfers, recipient_keys, chunks)
+    load_sparse_recipient_writes_in_chunks(batch, strategy, transfers, recipient_keys, chunks)
 }
 
-fn parallel_disjoint_sparse_recipient_writes<E, H, S>(
+fn load_sparse_recipient_writes_in_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transfers: &[PreparedTransfer],
@@ -530,17 +538,17 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let chunks = parallel_chunks(strategy, keys.len());
+    let chunks = chunk_count(strategy, keys.len());
     if chunks <= 1 {
         return batch.get_many(keys).await;
     }
-    parallel_get_many_accounts(batch, strategy, keys, chunks)
+    get_many_account_chunks(batch, strategy, keys, chunks)
 }
 
 /// Fan out a large QMDB read without requiring the borrowed batch/key slices to
 /// be `'static`. Callers still choose where this runs; disjoint execution uses
 /// this for sender reads first, then recipient reads only during the final sweep.
-fn parallel_get_many_accounts<E, H, S>(
+fn get_many_account_chunks<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     keys: &[&AccountKey],
@@ -565,7 +573,7 @@ where
     Ok(values)
 }
 
-fn parallel_chunks<S>(strategy: &S, items: usize) -> usize
+fn chunk_count<S>(strategy: &S, items: usize) -> usize
 where
     S: Strategy,
 {
@@ -620,18 +628,18 @@ where
     strategy.parallelism_hint().max(1)
 }
 
-fn use_parallel_indexed_execution<S>(strategy: &S, transfer_count: usize) -> bool
+fn should_chunk_indexed_execution<S>(strategy: &S, transfer_count: usize) -> bool
 where
     S: Strategy,
 {
-    parallel_chunks(strategy, transfer_count) > 1
+    chunk_count(strategy, transfer_count) > 1
 }
 
-fn use_parallel_prepare<S>(strategy: &S, transaction_count: usize) -> bool
+fn should_chunk_prepare<S>(strategy: &S, transaction_count: usize) -> bool
 where
     S: Strategy,
 {
-    parallel_chunks(strategy, transaction_count) > 1
+    chunk_count(strategy, transaction_count) > 1
 }
 
 pub(super) fn prepare_signed_transfers_with_digests<H, S>(
@@ -642,8 +650,8 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if use_parallel_prepare(strategy, transactions.len()) {
-        return parallel_prepare_signed_transfers_with_digests(strategy, transactions);
+    if should_chunk_prepare(strategy, transactions.len()) {
+        return prepare_signed_transfers_with_digests_in_chunks(strategy, transactions);
     }
 
     let mut transfers = Vec::with_capacity(transactions.len());
@@ -655,7 +663,7 @@ where
     Some((transfers, digests))
 }
 
-fn parallel_prepare_signed_transfers_with_digests<H, S>(
+fn prepare_signed_transfers_with_digests_in_chunks<H, S>(
     strategy: &S,
     transactions: &[SignedTransaction<H>],
 ) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
@@ -665,8 +673,8 @@ where
 {
     let mut transfers = uninit_vec(transactions.len());
     let mut digests = uninit_vec(transactions.len());
-    let chunks = parallel_chunks(strategy, transactions.len());
-    if !parallel_prepare_signed_transfers_with_digests_into(
+    let chunks = chunk_count(strategy, transactions.len());
+    if !prepare_signed_transfers_with_digests_into_chunks(
         strategy,
         transactions,
         &mut transfers,
@@ -682,7 +690,7 @@ where
     ))
 }
 
-fn parallel_prepare_signed_transfers_with_digests_into<H, S>(
+fn prepare_signed_transfers_with_digests_into_chunks<H, S>(
     strategy: &S,
     transactions: &[SignedTransaction<H>],
     transfers: &mut [MaybeUninit<PreparedTransfer>],
@@ -742,8 +750,8 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if use_parallel_prepare(strategy, body.len()) {
-        return parallel_prepare_lazy_transfers(strategy, body);
+    if should_chunk_prepare(strategy, body.len()) {
+        return prepare_lazy_transfers_in_chunks(strategy, body);
     }
 
     let mut transfers = Vec::with_capacity(body.len());
@@ -756,7 +764,7 @@ where
     Ok((transfers, digests))
 }
 
-fn parallel_prepare_lazy_transfers<H, S>(
+fn prepare_lazy_transfers_in_chunks<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
 ) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
@@ -766,8 +774,8 @@ where
 {
     let mut transfers = uninit_vec(body.len());
     let mut digests = uninit_vec(body.len());
-    let chunks = parallel_chunks(strategy, body.len());
-    if !parallel_prepare_lazy_transfers_into(strategy, body, &mut transfers, &mut digests, chunks) {
+    let chunks = chunk_count(strategy, body.len());
+    if !prepare_lazy_transfers_into_chunks(strategy, body, &mut transfers, &mut digests, chunks) {
         return Err(MALFORMED_TRANSACTION);
     }
 
@@ -777,7 +785,7 @@ where
     ))
 }
 
-fn parallel_prepare_lazy_transfers_into<H, S>(
+fn prepare_lazy_transfers_into_chunks<H, S>(
     strategy: &S,
     body: &[constantinople_primitives::LazySignedTransaction<H>],
     transfers: &mut [MaybeUninit<PreparedTransfer>],
@@ -1419,7 +1427,7 @@ mod db_bench {
         breakdown.sender_load = start.elapsed();
 
         let start = Instant::now();
-        let execution = if super::use_parallel_indexed_execution(strategy, transfers.len()) {
+        let execution = if super::should_chunk_indexed_execution(strategy, transfers.len()) {
             crate::executor::execute_indexed_parallel(strategy, accounts, &sender_index, transfers)
                 .expect("current path")
         } else {
