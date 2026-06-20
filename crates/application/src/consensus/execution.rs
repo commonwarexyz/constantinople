@@ -161,80 +161,102 @@ where
     }
 
     let plan = executor::execution_plan(transfers)?;
+    let executor::ExecutionPlan { discrete, general } = &plan;
+    let values = load_accounts(batch, discrete, general).await;
     let mut writes = Vec::new();
-    let executor::ExecutionPlan { discrete, general } = plan;
     if !discrete.transfers.is_empty() {
-        writes.extend(load_discrete(batch, strategy, discrete).await?.shards);
+        writes.extend(apply_discrete(
+            strategy,
+            discrete,
+            &values.senders,
+            &values.recipients,
+        )?);
     }
     if !general.is_empty() {
-        writes.extend(load_general(batch, transfers, &general).await?.shards);
+        writes.push(executor::apply_general_accounts(
+            values.general,
+            general,
+            transfers,
+        )?);
     }
     Some(db::StateWrites::new(writes))
 }
 
-pub(super) async fn load_general<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    transfers: &[PreparedTransfer],
-    workload: &executor::GeneralWorkload<'_>,
-) -> Option<db::StateWrites>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    // The general lane already aggregated every contended sender and recipient
-    // into account-owned effects. State is loaded once per affected account and
-    // applied only after the full block effect is known.
-    let values = batch
-        .get_many(workload.account_keys())
-        .await
-        .expect("general account state loading must succeed");
-    let writes = executor::apply_general_accounts(values, workload, transfers)?;
-    Some(db::StateWrites::new(vec![writes]))
+struct LoadedAccounts {
+    senders: Vec<Option<Account>>,
+    recipients: Vec<Option<Account>>,
+    general: Vec<Option<Account>>,
 }
 
-pub(super) async fn load_discrete<E, H, S>(
+async fn load_accounts<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    plan: executor::DiscreteWorkload<'_>,
-) -> Option<db::StateWrites>
+    discrete: &executor::DiscreteWorkload<'_>,
+    general: &executor::GeneralWorkload<'_>,
+) -> LoadedAccounts
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let sender_values = batch
-        .get_many(plan.sender_keys.as_slice())
+    let sender_len = discrete.sender_keys.len();
+    let recipient_len = discrete.recipient_keys.len();
+    let general_len = general.account_keys().len();
+    let mut keys = Vec::with_capacity(sender_len + recipient_len + general_len);
+    keys.extend(discrete.sender_keys.iter().copied());
+    keys.extend(discrete.recipient_keys.iter().copied());
+    keys.extend(general.account_keys().iter().copied());
+
+    // One QMDB read lets the storage layer sort and batch journal positions
+    // across both lanes.
+    let values = batch
+        .get_many(keys.as_slice())
         .await
-        .expect("sender state loading must succeed");
+        .expect("account state loading must succeed");
+    let mut values = values.into_iter();
+    let senders = values.by_ref().take(sender_len).collect();
+    let recipients = values.by_ref().take(recipient_len).collect();
+    let general = values.by_ref().take(general_len).collect();
+    assert_eq!(values.len(), 0);
+    LoadedAccounts {
+        senders,
+        recipients,
+        general,
+    }
+}
+
+fn apply_discrete<S>(
+    strategy: &S,
+    plan: &executor::DiscreteWorkload<'_>,
+    sender_values: &[Option<Account>],
+    recipient_values: &[Option<Account>],
+) -> Option<Vec<ShardWrites>>
+where
+    S: Strategy,
+{
     let sender_writes = apply_writes(
         strategy,
         plan.transfers.as_slice(),
-        &sender_values,
+        sender_values,
         apply_senders,
     )?;
 
     let mut writes = vec![sender_writes];
     if !plan.recipient_keys.is_empty() {
-        let recipient_values = batch
-            .get_many(plan.recipient_keys.as_slice())
-            .await
-            .expect("recipient state loading must succeed");
         let dense = plan.recipient_keys.len() == plan.transfers.len();
         let recipient_writes = if dense {
             apply_writes(
                 strategy,
                 plan.transfers.as_slice(),
-                &recipient_values,
+                recipient_values,
                 apply_dense_recipients,
             )
         } else {
-            apply_sparse_recipients(plan.transfers.as_slice(), &recipient_values)
+            apply_sparse_recipients(plan.transfers.as_slice(), recipient_values)
         }?;
         writes.push(recipient_writes);
     }
 
-    Some(db::StateWrites::new(writes))
+    Some(writes)
 }
 
 // Shared sender/recipient callback shape used after QMDB values are loaded.

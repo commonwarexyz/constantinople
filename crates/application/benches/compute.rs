@@ -1,7 +1,8 @@
+use ahash::{AHashMap, AHashSet};
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
 use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
 use commonware_parallel::{Rayon, Strategy as _};
-use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
+use commonware_runtime::{Runner as _, buffer::paged::CacheRef, tokio};
 use commonware_storage::{
     journal::contiguous::fixed::Config as FixedJournalConfig, merkle::full::Config as MmrConfig,
     qmdb::any::FixedConfig, translator::EightCap,
@@ -14,14 +15,14 @@ use constantinople_application::{
 use constantinople_primitives::{
     Account, AccountKey, Nonce, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
-use core::num::NonZeroU64;
+use core::num::{NonZeroU64, NonZeroUsize};
 use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
 
-type Db = StateDatabase<deterministic::Context, Sha256, EightCap, Rayon>;
-type Batch = StateBatch<deterministic::Context, Sha256, EightCap, Rayon>;
+type Db = StateDatabase<tokio::Context, Sha256, EightCap, Rayon>;
+type Batch = StateBatch<tokio::Context, Sha256, EightCap, Rayon>;
 type TestTx = VerifiedTransaction<Sha256>;
 
 const ACCOUNTS: u64 = 1_000_000;
@@ -36,6 +37,7 @@ const ITERS: u32 = 10;
 enum Fixture {
     Unique,
     Shared,
+    Mixed,
 }
 
 impl Fixture {
@@ -43,6 +45,7 @@ impl Fixture {
         match self {
             Self::Unique => "unique",
             Self::Shared => "shared",
+            Self::Mixed => "mixed",
         }
     }
 }
@@ -80,6 +83,22 @@ impl TestSigner {
     }
 }
 
+struct LoadPlan<'a> {
+    discrete_senders: Vec<&'a AccountKey>,
+    discrete_recipients: Vec<&'a AccountKey>,
+    general: Vec<&'a AccountKey>,
+}
+
+impl LoadPlan<'_> {
+    const fn discrete(&self) -> bool {
+        !self.discrete_senders.is_empty()
+    }
+
+    const fn general(&self) -> bool {
+        !self.general.is_empty()
+    }
+}
+
 fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
     FixedConfig {
         merkle_config: MmrConfig {
@@ -98,6 +117,48 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
         },
         translator: EightCap,
     }
+}
+
+fn load_plan(transfers: &[PreparedTransfer]) -> LoadPlan<'_> {
+    let mut touches: AHashMap<&AccountKey, usize> =
+        AHashMap::with_capacity(transfers.len().saturating_mul(2));
+    for transfer in transfers {
+        *touches.entry(&transfer.sender).or_default() += 1;
+        if transfer.sender != transfer.recipient {
+            *touches.entry(&transfer.recipient).or_default() += 1;
+        }
+    }
+
+    let mut general_seen = AHashSet::with_capacity(transfers.len().saturating_mul(2));
+    let mut plan = LoadPlan {
+        discrete_senders: Vec::with_capacity(transfers.len()),
+        discrete_recipients: Vec::with_capacity(transfers.len()),
+        general: Vec::new(),
+    };
+    for transfer in transfers {
+        let sender_unique = touches.get(&transfer.sender).copied().unwrap_or_default() == 1;
+        let recipient_unique = transfer.sender == transfer.recipient
+            || touches
+                .get(&transfer.recipient)
+                .copied()
+                .unwrap_or_default()
+                == 1;
+        if sender_unique && recipient_unique {
+            plan.discrete_senders.push(&transfer.sender);
+            if transfer.sender != transfer.recipient {
+                plan.discrete_recipients.push(&transfer.recipient);
+            }
+            continue;
+        }
+
+        if general_seen.insert(&transfer.sender) {
+            plan.general.push(&transfer.sender);
+        }
+        if transfer.sender != transfer.recipient && general_seen.insert(&transfer.recipient) {
+            plan.general.push(&transfer.recipient);
+        }
+    }
+    plan
 }
 
 fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
@@ -138,6 +199,42 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
                 })
                 .collect()
         }
+        Fixture::Mixed => {
+            let shared = n / 2;
+            let unique = n - shared;
+            let shared_accounts = (shared / SHARED_FANOUT).max(1);
+            let mut nonces = vec![0u64; shared_accounts];
+            let mut transfers = Vec::with_capacity(n);
+            for i in 0..shared {
+                let sender_index = i % shared_accounts;
+                let recipient_index = (i * 7 + 3) % shared_accounts;
+                let nonce = nonces[sender_index];
+                nonces[sender_index] += 1;
+                let sender = key(sender_index as u64);
+                let recipient = key(recipient_index as u64);
+                transfers.push(PreparedTransfer {
+                    sender,
+                    recipient,
+                    sender_prefix: sender.prefix(),
+                    recipient_prefix: recipient.prefix(),
+                    value: 1,
+                    nonce,
+                });
+            }
+            for i in 0..unique {
+                let sender = key(n as u64 + i as u64);
+                let recipient = key(n as u64 + unique as u64 + i as u64);
+                transfers.push(PreparedTransfer {
+                    sender,
+                    recipient,
+                    sender_prefix: sender.prefix(),
+                    recipient_prefix: recipient.prefix(),
+                    value: 1,
+                    nonce: 0,
+                });
+            }
+            transfers
+        }
     }
 }
 
@@ -170,6 +267,37 @@ fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
                 })
                 .collect()
         }
+        Fixture::Mixed => {
+            let shared = n / 2;
+            let unique = n - shared;
+            let shared_accounts = (shared / SHARED_FANOUT).max(1);
+            let signers = (0..MAX_SIGNED_ACCOUNTS)
+                .map(TestSigner::from_seed)
+                .collect::<Vec<_>>();
+            let mut nonces = vec![0u64; shared_accounts];
+            let mut txs = Vec::with_capacity(n);
+            for i in 0..shared {
+                let sender_index = i % shared_accounts;
+                let recipient_index = (i * 7 + 3) % shared_accounts;
+                let nonce = nonces[sender_index];
+                nonces[sender_index] += 1;
+                txs.push(signers[sender_index].sign(
+                    signers[recipient_index].public_key.clone(),
+                    1,
+                    nonce,
+                ));
+            }
+            for i in 0..unique {
+                let sender_index = n + i;
+                let recipient_index = n + unique + i;
+                txs.push(signers[sender_index].sign(
+                    signers[recipient_index].public_key.clone(),
+                    1,
+                    0,
+                ));
+            }
+            txs
+        }
     }
 }
 
@@ -186,6 +314,62 @@ async fn time_compute(
     let count = writes.len();
     black_box(&writes);
     (count, elapsed)
+}
+
+async fn load_discrete(batch: &Batch, plan: &LoadPlan<'_>) {
+    let values = batch
+        .get_many(plan.discrete_senders.as_slice())
+        .await
+        .expect("sender loads");
+    black_box(values);
+    if !plan.discrete_recipients.is_empty() {
+        let values = batch
+            .get_many(plan.discrete_recipients.as_slice())
+            .await
+            .expect("recipient loads");
+        black_box(values);
+    }
+}
+
+async fn load_general(batch: &Batch, plan: &LoadPlan<'_>) {
+    let values = batch
+        .get_many(plan.general.as_slice())
+        .await
+        .expect("general loads");
+    black_box(values);
+}
+
+async fn load_combined(batch: &Batch, plan: &LoadPlan<'_>) {
+    let mut keys = Vec::with_capacity(
+        plan.discrete_senders.len() + plan.discrete_recipients.len() + plan.general.len(),
+    );
+    keys.extend(plan.discrete_senders.iter().copied());
+    keys.extend(plan.discrete_recipients.iter().copied());
+    keys.extend(plan.general.iter().copied());
+    let values = batch
+        .get_many(keys.as_slice())
+        .await
+        .expect("account loads");
+    black_box(values);
+}
+
+async fn time_loads(batch: &Batch, plan: &LoadPlan<'_>, overlap: bool) -> Duration {
+    let start = Instant::now();
+    match (plan.discrete(), plan.general(), overlap) {
+        (true, true, true) => {
+            futures::join!(load_discrete(batch, plan), load_general(batch, plan));
+        }
+        (true, _, _) => load_discrete(batch, plan).await,
+        (_, true, _) => load_general(batch, plan).await,
+        (false, false, _) => {}
+    }
+    start.elapsed()
+}
+
+async fn time_combined_load(batch: &Batch, plan: &LoadPlan<'_>) -> Duration {
+    let start = Instant::now();
+    load_combined(batch, plan).await;
+    start.elapsed()
 }
 
 async fn time_prepare_compute(
@@ -211,14 +395,30 @@ fn env_u32(name: &str, default: u32) -> u32 {
         .unwrap_or(default)
 }
 
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
 fn main() {
-    deterministic::Runner::default().start(|context| async move {
+    let workers = env_usize("CONSTANTINOPLE_BENCH_WORKERS", 8).max(1);
+    tokio::Runner::new(tokio::Config::default().with_worker_threads(workers)).start(
+        |context| async move {
         let bench_prepare = std::env::var_os("CONSTANTINOPLE_BENCH_PREPARE").is_some();
+        let bench_loads = std::env::var_os("CONSTANTINOPLE_BENCH_LOADS").is_some();
         let warmup = env_u32("CONSTANTINOPLE_BENCH_WARMUP", WARMUP);
         let iters = env_u32("CONSTANTINOPLE_BENCH_ITERS", ITERS).max(1);
-        let strategy = Rayon::new(NZUsize!(8)).expect("rayon pool");
-        let cache = CacheRef::from_pooler(&context, NZU16!(8192), NZUsize!(65536));
-        let db = <Db as DatabaseSet<deterministic::Context>>::init(
+        let cache_pages = env_usize("CONSTANTINOPLE_BENCH_CACHE_PAGES", 65_536).max(1);
+        let strategy =
+            Rayon::new(NonZeroUsize::new(workers).expect("worker count")).expect("rayon pool");
+        let cache = CacheRef::from_pooler(
+            &context,
+            NZU16!(8192),
+            NonZeroUsize::new(cache_pages).expect("cache pages"),
+        );
+        let db = <Db as DatabaseSet<tokio::Context>>::init(
             context,
             config(strategy.clone(), cache),
         )
@@ -256,7 +456,7 @@ fn main() {
             if count_filter.is_some_and(|filter| filter != n) {
                 continue;
             }
-            for fixture in [Fixture::Unique, Fixture::Shared] {
+            for fixture in [Fixture::Unique, Fixture::Shared, Fixture::Mixed] {
                 if fixture_filter
                     .as_deref()
                     .is_some_and(|filter| filter != fixture.name())
@@ -265,6 +465,35 @@ fn main() {
                 }
 
                 let transfers = transfers(fixture, n);
+                if bench_loads {
+                    let plan = load_plan(&transfers);
+                    let mut seq_total = Duration::ZERO;
+                    let mut overlap_total = Duration::ZERO;
+                    let mut combined_total = Duration::ZERO;
+                    for iter in 0..(warmup + iters) {
+                        let seq_batch = db.new_batches().await;
+                        let seq = time_loads(&seq_batch, &plan, false).await;
+                        let overlap_batch = db.new_batches().await;
+                        let overlap = time_loads(&overlap_batch, &plan, true).await;
+                        let combined_batch = db.new_batches().await;
+                        let combined = time_combined_load(&combined_batch, &plan).await;
+                        if iter >= warmup {
+                            seq_total += seq;
+                            overlap_total += overlap;
+                            combined_total += combined;
+                        }
+                    }
+
+                    println!(
+                        "loads    {n} txs / {ACCOUNTS} accounts / {} / {} shards\n  sequential: {:?}\n  overlap:    {:?}\n  combined:   {:?}",
+                        fixture.name(),
+                        strategy.parallelism_hint().max(1),
+                        seq_total / iters,
+                        overlap_total / iters,
+                        combined_total / iters,
+                    );
+                }
+
                 let mut total = Duration::ZERO;
                 let mut writes = 0usize;
                 for iter in 0..(warmup + iters) {
@@ -307,5 +536,6 @@ fn main() {
                 }
             }
         }
-    });
+    },
+    );
 }
