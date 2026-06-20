@@ -204,36 +204,35 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
             let unique = n - shared;
             let shared_accounts = (shared / SHARED_FANOUT).max(1);
             let mut nonces = vec![0u64; shared_accounts];
-            let mut transfers = Vec::with_capacity(n);
-            for i in 0..shared {
+            let shared_transfers = (0..shared).map(|i| {
                 let sender_index = i % shared_accounts;
                 let recipient_index = (i * 7 + 3) % shared_accounts;
                 let nonce = nonces[sender_index];
                 nonces[sender_index] += 1;
                 let sender = key(sender_index as u64);
                 let recipient = key(recipient_index as u64);
-                transfers.push(PreparedTransfer {
+                PreparedTransfer {
                     sender,
                     recipient,
                     sender_prefix: sender.prefix(),
                     recipient_prefix: recipient.prefix(),
                     value: 1,
                     nonce,
-                });
-            }
-            for i in 0..unique {
+                }
+            });
+            let unique_transfers = (0..unique).map(|i| {
                 let sender = key(n as u64 + i as u64);
                 let recipient = key(n as u64 + unique as u64 + i as u64);
-                transfers.push(PreparedTransfer {
+                PreparedTransfer {
                     sender,
                     recipient,
                     sender_prefix: sender.prefix(),
                     recipient_prefix: recipient.prefix(),
                     value: 1,
                     nonce: 0,
-                });
-            }
-            transfers
+                }
+            });
+            shared_transfers.chain(unique_transfers).collect()
         }
     }
 }
@@ -275,28 +274,19 @@ fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
                 .map(TestSigner::from_seed)
                 .collect::<Vec<_>>();
             let mut nonces = vec![0u64; shared_accounts];
-            let mut txs = Vec::with_capacity(n);
-            for i in 0..shared {
+            let shared_txs = (0..shared).map(|i| {
                 let sender_index = i % shared_accounts;
                 let recipient_index = (i * 7 + 3) % shared_accounts;
                 let nonce = nonces[sender_index];
                 nonces[sender_index] += 1;
-                txs.push(signers[sender_index].sign(
-                    signers[recipient_index].public_key.clone(),
-                    1,
-                    nonce,
-                ));
-            }
-            for i in 0..unique {
+                signers[sender_index].sign(signers[recipient_index].public_key.clone(), 1, nonce)
+            });
+            let unique_txs = (0..unique).map(|i| {
                 let sender_index = n + i;
                 let recipient_index = n + unique + i;
-                txs.push(signers[sender_index].sign(
-                    signers[recipient_index].public_key.clone(),
-                    1,
-                    0,
-                ));
-            }
-            txs
+                signers[sender_index].sign(signers[recipient_index].public_key.clone(), 1, 0)
+            });
+            shared_txs.chain(unique_txs).collect()
         }
     }
 }
