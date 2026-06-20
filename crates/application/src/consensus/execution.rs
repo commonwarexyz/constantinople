@@ -166,18 +166,13 @@ where
         writes.extend(load_discrete(batch, strategy, discrete).await?.shards);
     }
     if !general.is_empty() {
-        writes.extend(
-            load_general(batch, strategy, transfers, &general)
-                .await?
-                .shards,
-        );
+        writes.extend(load_general(batch, transfers, &general).await?.shards);
     }
     Some(db::StateWrites::new(writes))
 }
 
 pub(super) async fn load_general<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
     transfers: &[PreparedTransfer],
     workload: &executor::GeneralWorkload<'_>,
 ) -> Option<db::StateWrites>
@@ -189,7 +184,8 @@ where
     // The general lane already aggregated every contended sender and recipient
     // into account-owned effects. State is loaded once per affected account and
     // applied only after the full block effect is known.
-    let values = get_accounts(batch, strategy, workload.account_keys())
+    let values = batch
+        .get_many(workload.account_keys())
         .await
         .expect("general account state loading must succeed");
     let writes = executor::apply_general_accounts(values, workload, transfers)?;
@@ -206,112 +202,106 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let sender_writes = load_writes(
-        batch,
+    let sender_values = batch
+        .get_many(plan.sender_keys.as_slice())
+        .await
+        .expect("sender state loading must succeed");
+    let sender_writes = apply_writes(
         strategy,
         plan.transfers.as_slice(),
-        plan.sender_keys.as_slice(),
+        &sender_values,
         apply_senders,
-    )
-    .await
-    .expect("sender state loading must succeed")?;
+    )?;
 
     let mut writes = vec![sender_writes];
     if !plan.recipient_keys.is_empty() {
+        let recipient_values = batch
+            .get_many(plan.recipient_keys.as_slice())
+            .await
+            .expect("recipient state loading must succeed");
         let dense = plan.recipient_keys.len() == plan.transfers.len();
-        let recipient_writes = load_recipients(
-            batch,
-            strategy,
-            plan.transfers.as_slice(),
-            plan.recipient_keys.as_slice(),
-            dense,
-        )
-        .await
-        .expect("recipient state loading must succeed")?;
+        let recipient_writes = if dense {
+            apply_writes(
+                strategy,
+                plan.transfers.as_slice(),
+                &recipient_values,
+                apply_dense_recipients,
+            )
+        } else {
+            apply_sparse_recipients(plan.transfers.as_slice(), &recipient_values)
+        }?;
         writes.push(recipient_writes);
     }
 
     Some(db::StateWrites::new(writes))
 }
 
-// Shared sender/recipient write callback shape used by the chunked loaders.
-type ApplyFn = fn(
-    &[&PreparedTransfer],
-    Vec<Option<Account>>,
-    &mut [MaybeUninit<(AccountKey, Account)>],
-) -> bool;
+// Shared sender/recipient callback shape used after QMDB values are loaded.
+// `Strategy` workers only apply CPU mutations; they never block on DB reads.
+type ApplyFn =
+    fn(&[&PreparedTransfer], &[Option<Account>], &mut [MaybeUninit<(AccountKey, Account)>]) -> bool;
 
-async fn load_writes<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
+fn apply_writes<S>(
     strategy: &S,
     transfers: &[&PreparedTransfer],
-    keys: &[&AccountKey],
+    values: &[Option<Account>],
     apply: ApplyFn,
-) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
+) -> Option<ShardWrites>
 where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
     S: Strategy,
 {
     let chunks = chunk_count(strategy, transfers.len());
+    assert_eq!(values.len(), transfers.len());
+
     let mut writes = uninit_vec(transfers.len());
     let valid = if chunks <= 1 {
-        let values = batch.get_many(keys).await?;
         apply(transfers, values, &mut writes)
     } else {
-        load_write_chunks(batch, strategy, transfers, keys, &mut writes, chunks, apply)?
+        apply_write_chunks(strategy, transfers, values, &mut writes, chunks, apply)
     };
-    Ok(valid.then(|| initialized_copy_vec(writes)))
+    valid.then(|| initialized_copy_vec(writes))
 }
 
-fn load_write_chunks<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
+fn apply_write_chunks<S>(
     strategy: &S,
     transfers: &[&PreparedTransfer],
-    keys: &[&AccountKey],
+    values: &[Option<Account>],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
     chunks: usize,
     apply: ApplyFn,
-) -> core::result::Result<bool, commonware_storage::qmdb::Error<mmr::Family>>
+) -> bool
 where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
     S: Strategy,
 {
-    assert_eq!(transfers.len(), keys.len());
+    assert_eq!(transfers.len(), values.len());
+    assert_eq!(transfers.len(), writes.len());
+
     let ranges = chunk_ranges(transfers.len(), chunks);
     let mut remaining_writes = writes;
     let mut work = Vec::with_capacity(ranges.len());
     for range in ranges {
         let len = range.end - range.start;
         let (chunk_writes, rest) = remaining_writes.split_at_mut(len);
-        work.push((&transfers[range.clone()], &keys[range], chunk_writes));
+        work.push((&transfers[range.clone()], &values[range], chunk_writes));
         remaining_writes = rest;
     }
     assert!(remaining_writes.is_empty());
 
-    let results = strategy.map_collect_vec(work, |(transfers, keys, writes)| {
-        // This leaf borrows the batch, key slice, transfer slice, and output
-        // slice. Spawning it onto the runtime would require `'static` ownership
-        // or copying each chunk; `Strategy` provides the fan-out.
-        let values = futures::executor::block_on(batch.get_many(keys))?;
-        Ok::<bool, commonware_storage::qmdb::Error<mmr::Family>>(apply(transfers, values, writes))
-    });
-    for result in results {
-        if !result? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+    strategy
+        .map_collect_vec(work, |(transfers, values, writes)| {
+            apply(transfers, values, writes)
+        })
+        .into_iter()
+        .all(core::convert::identity)
 }
 
 fn apply_senders(
     transfers: &[&PreparedTransfer],
-    values: Vec<Option<Account>>,
+    values: &[Option<Account>],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool {
     for ((transfer, value), write) in transfers.iter().zip(values).zip(writes) {
-        let mut account = value.unwrap_or_default();
+        let mut account = (*value).unwrap_or_default();
         if account.balance < transfer.value || !account.nonce.consume(transfer.nonce) {
             return false;
         }
@@ -323,87 +313,13 @@ fn apply_senders(
     true
 }
 
-async fn load_recipients<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    transfers: &[&PreparedTransfer],
-    recipient_keys: &[&AccountKey],
-    dense: bool,
-) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let chunks = chunk_count(strategy, transfers.len());
-    if dense {
-        // Dense unique transfers have one recipient key per transfer, so the
-        // same write-into helper shape used for senders can be reused.
-        return load_writes(
-            batch,
-            strategy,
-            transfers,
-            recipient_keys,
-            apply_dense_recipients,
-        )
-        .await;
-    }
-
-    if chunks <= 1 {
-        let values = batch.get_many(recipient_keys).await?;
-        return Ok(apply_sparse_recipients(transfers, values));
-    }
-    load_sparse(batch, strategy, transfers, recipient_keys, chunks)
-}
-
-fn load_sparse<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    transfers: &[&PreparedTransfer],
-    recipient_keys: &[&AccountKey],
-    chunks: usize,
-) -> core::result::Result<Option<ShardWrites>, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let work = sparse_chunks(transfers, chunks);
-    let covered_recipients = work.last().map_or(0, |(_, range)| range.end);
-    assert_eq!(covered_recipients, recipient_keys.len());
-    let results = strategy.map_collect_vec(work, |(transfer_range, recipient_range)| {
-        if recipient_range.is_empty() {
-            Ok(apply_sparse_recipients(
-                &transfers[transfer_range],
-                Vec::new(),
-            ))
-        } else {
-            // This leaf borrows transfer/key slices. Runtime spawning would
-            // require owned chunks; `Strategy` provides the fan-out.
-            match futures::executor::block_on(batch.get_many(&recipient_keys[recipient_range])) {
-                Ok(values) => Ok(apply_sparse_recipients(&transfers[transfer_range], values)),
-                Err(error) => Err(error),
-            }
-        }
-    });
-
-    let mut merged = ShardWrites::with_capacity(recipient_keys.len());
-    for result in results {
-        let Some(writes) = result? else {
-            return Ok(None);
-        };
-        merged.extend(writes);
-    }
-    Ok(Some(merged))
-}
-
 fn apply_dense_recipients(
     transfers: &[&PreparedTransfer],
-    values: Vec<Option<Account>>,
+    values: &[Option<Account>],
     writes: &mut [MaybeUninit<(AccountKey, Account)>],
 ) -> bool {
     for ((transfer, value), write) in transfers.iter().zip(values).zip(writes) {
-        let mut account = value.unwrap_or_default();
+        let mut account = (*value).unwrap_or_default();
         if executor::apply_credit(&mut account, transfer.value).is_none() {
             return false;
         }
@@ -414,66 +330,21 @@ fn apply_dense_recipients(
 
 fn apply_sparse_recipients(
     transfers: &[&PreparedTransfer],
-    values: Vec<Option<Account>>,
+    values: &[Option<Account>],
 ) -> Option<ShardWrites> {
-    let mut values = values.into_iter();
+    let mut values = values.iter();
     let mut writes = ShardWrites::with_capacity(values.size_hint().0);
     for transfer in transfers {
         if transfer.sender == transfer.recipient {
             continue;
         }
         let value = values.next().expect("one value per non-self recipient");
-        let mut account = value.unwrap_or_default();
+        let mut account = (*value).unwrap_or_default();
         executor::apply_credit(&mut account, transfer.value)?;
         writes.push((transfer.recipient, account));
     }
     assert!(values.next().is_none());
     Some(writes)
-}
-
-async fn get_accounts<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    keys: &[&AccountKey],
-) -> core::result::Result<Vec<Option<Account>>, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let chunks = chunk_count(strategy, keys.len());
-    if chunks <= 1 {
-        return batch.get_many(keys).await;
-    }
-    get_account_chunks(batch, strategy, keys, chunks)
-}
-
-/// Fan out a large QMDB read without requiring the borrowed batch/key slices to
-/// be `'static`. Callers still choose where this runs; account execution uses
-/// this for large sender or recipient reads.
-fn get_account_chunks<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
-    keys: &[&AccountKey],
-    chunks: usize,
-) -> core::result::Result<Vec<Option<Account>>, commonware_storage::qmdb::Error<mmr::Family>>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let results = strategy.map_collect_vec(chunk_ranges(keys.len(), chunks), |range| {
-        // This leaf borrows a key slice. The runtime spawner requires `'static`
-        // futures, so using it here would force us to own/copy each chunk just
-        // to issue the same QMDB read.
-        futures::executor::block_on(batch.get_many(&keys[range]))
-    });
-
-    let mut values = Vec::with_capacity(keys.len());
-    for result in results {
-        values.extend(result?);
-    }
-    Ok(values)
 }
 
 fn chunk_count<S>(strategy: &S, items: usize) -> usize
@@ -494,32 +365,6 @@ fn chunk_ranges(items: usize, chunks: usize) -> Vec<Range<usize>> {
             let start = items * chunk / chunks;
             let end = items * (chunk + 1) / chunks;
             start..end
-        })
-        .collect()
-}
-
-/// Produces aligned transfer and recipient-key ranges for sparse recipient
-/// loading.
-///
-/// `recipient_keys` omits self-transfer recipients, so each transfer chunk maps
-/// to a potentially smaller recipient-key chunk. The returned ranges preserve
-/// transfer order and cover every non-self recipient exactly once.
-fn sparse_chunks(
-    transfers: &[&PreparedTransfer],
-    chunks: usize,
-) -> Vec<(Range<usize>, Range<usize>)> {
-    let mut recipient_start = 0;
-    chunk_ranges(transfers.len(), chunks)
-        .into_iter()
-        .map(|transfer_range| {
-            let recipient_count = transfers[transfer_range.clone()]
-                .iter()
-                .filter(|transfer| transfer.sender != transfer.recipient)
-                .count();
-            let recipient_end = recipient_start + recipient_count;
-            let recipient_range = recipient_start..recipient_end;
-            recipient_start = recipient_end;
-            (transfer_range, recipient_range)
         })
         .collect()
 }
@@ -930,12 +775,9 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_ranges, range_from_bounds, sparse_chunks};
-    use crate::executor::PreparedTransfer;
-    use commonware_codec::FixedSize as _;
+    use super::{chunk_ranges, range_from_bounds};
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
-    use constantinople_primitives::AccountKey;
 
     #[test]
     fn range_comes_from_qmdb_bounds() {
@@ -955,36 +797,5 @@ mod tests {
         assert_eq!(chunk_ranges(0, 4), Vec::<core::ops::Range<usize>>::new());
         assert_eq!(chunk_ranges(2, 8), vec![0..1, 1..2]);
         assert_eq!(chunk_ranges(10, 3), vec![0..3, 3..6, 6..10]);
-    }
-
-    #[test]
-    fn sparse_chunks_align_with_non_self_recipients() {
-        let account = |byte| AccountKey::from([byte; AccountKey::SIZE]);
-        let transfer = |sender, recipient| PreparedTransfer {
-            sender,
-            recipient,
-            sender_prefix: sender.prefix(),
-            recipient_prefix: recipient.prefix(),
-            value: 1,
-            nonce: 0,
-        };
-        let a = account(1);
-        let b = account(2);
-        let c = account(3);
-        let d = account(4);
-
-        let transfers = [
-            transfer(a, a),
-            transfer(a, b),
-            transfer(b, c),
-            transfer(c, c),
-            transfer(c, d),
-        ];
-        let transfer_refs = transfers.iter().collect::<Vec<_>>();
-
-        assert_eq!(
-            sparse_chunks(&transfer_refs, 3),
-            vec![(0..1, 0..0), (1..3, 0..2), (3..5, 2..3)]
-        );
     }
 }
