@@ -51,8 +51,8 @@
 //! self-transfer affordability floor, and recipient credit total. The account is
 //! loaded once, checked once, and written once. Credits are added after debit
 //! affordability is checked, so an in-block credit cannot fund an in-block
-//! spend. Large borrowed key slices may be split into flat `Strategy` chunks for
-//! fan-out, but this is still one logical account load. If any debit check or
+//! spend. Account values are loaded with awaited QMDB `get_many` calls before
+//! `Strategy` workers split CPU-only account mutation. If any debit check or
 //! credit addition fails in either lane, the whole batch is rejected; there is no
 //! partial execution state to reconcile.
 //!
@@ -80,8 +80,9 @@
 //! order, so the transaction-history commitment still reflects block order.
 //!
 //! Parallel fan-out comes from the supplied `Strategy`, so this file avoids
-//! fixed worker counts. The same strategy drives preparation, large `get_many`
-//! reads, discrete-lane fan-out, and QMDB merkleization beneath the batch APIs.
+//! fixed worker counts. The same strategy drives preparation, CPU account
+//! mutation, and QMDB merkleization beneath the batch APIs. QMDB reads stay on
+//! the async path and are not run inside `Strategy` workers.
 
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
