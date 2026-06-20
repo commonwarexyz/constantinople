@@ -340,12 +340,13 @@ async fn load_general(batch: &Batch, plan: &LoadPlan<'_>) {
 }
 
 async fn load_combined(batch: &Batch, plan: &LoadPlan<'_>) {
-    let mut keys = Vec::with_capacity(
-        plan.discrete_senders.len() + plan.discrete_recipients.len() + plan.general.len(),
-    );
-    keys.extend(plan.discrete_senders.iter().copied());
-    keys.extend(plan.discrete_recipients.iter().copied());
-    keys.extend(plan.general.iter().copied());
+    let keys = plan
+        .discrete_senders
+        .iter()
+        .chain(&plan.discrete_recipients)
+        .chain(&plan.general)
+        .copied()
+        .collect::<Vec<_>>();
     let values = batch
         .get_many(keys.as_slice())
         .await

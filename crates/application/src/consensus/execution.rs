@@ -201,10 +201,13 @@ where
     let sender_len = discrete.sender_keys.len();
     let recipient_len = discrete.recipient_keys.len();
     let general_len = general.account_keys().len();
-    let mut keys = Vec::with_capacity(sender_len + recipient_len + general_len);
-    keys.extend(discrete.sender_keys.iter().copied());
-    keys.extend(discrete.recipient_keys.iter().copied());
-    keys.extend(general.account_keys().iter().copied());
+    let keys = discrete
+        .sender_keys
+        .iter()
+        .chain(&discrete.recipient_keys)
+        .chain(general.account_keys())
+        .copied()
+        .collect::<Vec<_>>();
 
     // One QMDB read lets the storage layer sort and batch journal positions
     // across both lanes.
