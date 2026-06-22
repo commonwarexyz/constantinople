@@ -242,9 +242,11 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
     for retry in 0..=state.max_retry_views {
         let body = encode_pending(&batch, &pending);
         let sent_batch_id = batch_id(&body);
+
         for target in next_two_leaders(&state.leaders, view) {
             attempts.push((sent_batch_id.clone(), target));
         }
+
         let targets = attempts
             .iter()
             .filter(|(batch_id, _)| batch_id == &sent_batch_id)
@@ -667,14 +669,45 @@ fn leader_by_id<'a>(leaders: &'a [Leader], public_key: &str) -> Option<&'a Leade
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use axum::{
+        body::{Body, to_bytes},
+        extract::Path,
+        http::HeaderValue,
+        response::Response,
+    };
+    use commonware_cryptography::Signer as _;
+    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction};
+    use futures::future::BoxFuture;
+    use std::{
+        collections::HashMap,
+        num::NonZeroU64,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tower::ServiceExt;
+
+    struct StaticAccountReader {
+        accounts: HashMap<TransactionPublicKey, Account>,
+    }
+
+    impl AccountReader for StaticAccountReader {
+        fn get<'a>(&'a self, public_key: TransactionPublicKey) -> BoxFuture<'a, Option<Account>> {
+            Box::pin(async move { self.accounts.get(&public_key).copied() })
+        }
+    }
 
     fn leader(key: &str) -> Leader {
         Leader {
             public_key: key.to_string(),
             sort_key: from_hex(key).expect("hex key"),
             url: format!("http://{key}"),
+        }
+    }
+
+    fn leader_with_url(key: &str, url: String) -> Leader {
+        Leader {
+            public_key: key.to_string(),
+            sort_key: from_hex(key).expect("hex key"),
+            url,
         }
     }
 
@@ -707,11 +740,587 @@ mod tests {
         }
     }
 
+    fn test_state(
+        leaders: Vec<Leader>,
+        account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
+    ) -> AppState {
+        let (_, view_clock) = Observer::new();
+        AppState {
+            leaders: Arc::new(leaders),
+            max_retry_views: 0,
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            account_reader,
+            view_clock,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    fn empty_account_reader() -> Arc<OnceLock<Arc<dyn AccountReader>>> {
+        Arc::new(OnceLock::new())
+    }
+
+    fn account_reader_with(
+        accounts: HashMap<TransactionPublicKey, Account>,
+    ) -> Arc<OnceLock<Arc<dyn AccountReader>>> {
+        let cell = empty_account_reader();
+        let reader: Arc<dyn AccountReader> = Arc::new(StaticAccountReader { accounts });
+        assert!(cell.set(reader).is_ok());
+        cell
+    }
+
     fn pinned_headers() -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(TARGET_LEADER_HEADER, HeaderValue::from_static("00"));
         headers.insert(LEADER_FANOUT_HEADER, HeaderValue::from_static("1"));
         headers
+    }
+
+    fn signed_transaction(seed: u64, nonce: u64) -> SignedTransaction<sha256::Sha256> {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 1_000).public_key();
+        Transaction::new(
+            TransactionPublicKey::ed25519(signer.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            NonZeroU64::new(1).expect("non-zero value"),
+            nonce,
+        )
+        .seal_and_sign(
+            &signer,
+            TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        )
+    }
+
+    fn encoded_batch(transactions: &[SignedTransaction<sha256::Sha256>]) -> Bytes {
+        transactions.to_vec().encode()
+    }
+
+    async fn response_json(response: Response) -> serde_json::Value {
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body should collect");
+        serde_json::from_slice(&body).expect("response body should be JSON")
+    }
+
+    async fn router_get(app: Router, uri: &str) -> Response {
+        app.oneshot(
+            axum::http::Request::builder()
+                .method("GET")
+                .uri(uri)
+                .body(Body::empty())
+                .expect("request should build"),
+        )
+        .await
+        .expect("router should respond")
+    }
+
+    async fn spawn_accepting_status_leader(status: BatchStatus) -> String {
+        let status = Arc::new(status);
+        let mock = Router::new()
+            .route(
+                "/transactions/ingest",
+                post(|| async {
+                    (
+                        StatusCode::ACCEPTED,
+                        r#"{"digests":["accepted"]}"#.to_string(),
+                    )
+                }),
+            )
+            .route(
+                "/transactions/{batch_id}",
+                get(move || {
+                    let status = status.clone();
+                    async move {
+                        (
+                            StatusCode::OK,
+                            serde_json::to_string(status.as_ref()).expect("status serializes"),
+                        )
+                    }
+                }),
+            );
+        spawn_mock_leader(mock).await
+    }
+
+    #[tokio::test]
+    async fn router_serves_health_ready_and_unknown_transaction_status() {
+        let app = router(test_state(Vec::new(), empty_account_reader()));
+
+        let response = router_get(app.clone(), "/health").await;
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let response = router_get(app.clone(), "/ready").await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let response = router_get(app, "/transactions/some-batch").await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let ready_app = router(test_state(vec![leader("00")], empty_account_reader()));
+        let response = router_get(ready_app, "/ready").await;
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn account_endpoint_maps_reader_results_to_http() {
+        let public_key =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(7).public_key());
+        let public_key_path = format!("/account/{public_key}");
+
+        let app = router(test_state(Vec::new(), empty_account_reader()));
+        let response = router_get(app.clone(), "/account/not-hex").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = router_get(app.clone(), "/account/00").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let response = router_get(app, &public_key_path).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let missing_app = router(test_state(Vec::new(), account_reader_with(HashMap::new())));
+        let response = router_get(missing_app, &public_key_path).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let account = Account {
+            balance: 55,
+            nonce: Nonce::new(8, 3),
+        };
+        let present_app = router(test_state(
+            Vec::new(),
+            account_reader_with(HashMap::from([(public_key, account)])),
+        ));
+        let response = router_get(present_app, &public_key_path).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response_json(response).await,
+            serde_json::json!({
+                "balance": 55,
+                "nonce": {
+                    "base": 8,
+                    "bitmap": 3,
+                },
+            }),
+        );
+    }
+
+    #[test]
+    fn decode_batch_validates_encoded_transaction_batches() {
+        let transaction = signed_transaction(1, 0);
+        let body = encoded_batch(std::slice::from_ref(&transaction));
+
+        let batch = decode_batch(&body, DEFAULT_MAX_BATCH_BYTES).expect("batch decodes");
+        assert_eq!(batch.transactions.len(), 1);
+        assert_eq!(
+            batch.digests,
+            vec![transaction.message_digest().to_string()]
+        );
+
+        assert_eq!(
+            decode_batch(&Bytes::from_static(b"bad"), DEFAULT_MAX_BATCH_BYTES)
+                .expect_err("malformed body rejected"),
+            StatusCode::BAD_REQUEST,
+        );
+
+        assert_eq!(
+            decode_batch(&Bytes::from(vec![0; max_request_bytes(0) + 1]), 0)
+                .expect_err("oversized raw body rejected"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        );
+
+        assert_eq!(
+            decode_batch(&body, transaction.encode_size() - 1)
+                .expect_err("oversized decoded batch rejected"),
+            StatusCode::PAYLOAD_TOO_LARGE,
+        );
+    }
+
+    #[test]
+    fn encode_pending_only_resubmits_unresolved_transactions() {
+        let first = signed_transaction(2, 0);
+        let second = signed_transaction(3, 0);
+        let second_digest = second.message_digest().to_string();
+        let body = encoded_batch(&[first, second]);
+        let batch = decode_batch(&body, DEFAULT_MAX_BATCH_BYTES).expect("batch decodes");
+        let pending = HashSet::from([second_digest.clone()]);
+
+        let retried = decode_batch(&encode_pending(&batch, &pending), DEFAULT_MAX_BATCH_BYTES)
+            .expect("pending batch decodes");
+
+        assert_eq!(retried.transactions.len(), 1);
+        assert_eq!(retried.digests, vec![second_digest]);
+    }
+
+    #[tokio::test]
+    async fn forward_to_leader_classifies_responses() {
+        let accepted_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { (StatusCode::ACCEPTED, r#"{"digests":["aa"]}"#.to_string()) }),
+        ))
+        .await;
+        match forward_to_leader(
+            &reqwest::Client::new(),
+            leader_with_url("00", accepted_url),
+            Bytes::from_static(b"body"),
+        )
+        .await
+        {
+            ForwardResult::Accepted { leader } => assert_eq!(leader.public_key, "00"),
+            result => panic!("expected accepted result, got {result:?}"),
+        }
+
+        let invalid_json_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { (StatusCode::ACCEPTED, "not-json") }),
+        ))
+        .await;
+        assert!(matches!(
+            forward_to_leader(
+                &reqwest::Client::new(),
+                leader_with_url("01", invalid_json_url),
+                Bytes::from_static(b"body"),
+            )
+            .await,
+            ForwardResult::Transient { .. }
+        ));
+
+        let empty_digests_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { (StatusCode::ACCEPTED, r#"{"digests":[]}"#.to_string()) }),
+        ))
+        .await;
+        assert!(matches!(
+            forward_to_leader(
+                &reqwest::Client::new(),
+                leader_with_url("02", empty_digests_url),
+                Bytes::from_static(b"body"),
+            )
+            .await,
+            ForwardResult::Transient { .. }
+        ));
+
+        for (key, status) in [
+            ("03", StatusCode::BAD_REQUEST),
+            ("04", StatusCode::PAYLOAD_TOO_LARGE),
+        ] {
+            let url = spawn_mock_leader(
+                Router::new().route("/transactions/ingest", post(move || async move { status })),
+            )
+            .await;
+            assert!(matches!(
+                forward_to_leader(
+                    &reqwest::Client::new(),
+                    leader_with_url(key, url),
+                    Bytes::from_static(b"body"),
+                )
+                .await,
+                ForwardResult::Deterministic(actual) if actual == status
+            ));
+        }
+
+        let unavailable_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        assert!(matches!(
+            forward_to_leader(
+                &reqwest::Client::new(),
+                leader_with_url("05", unavailable_url),
+                Bytes::from_static(b"body"),
+            )
+            .await,
+            ForwardResult::Transient { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn forward_to_targets_summarizes_acceptance_and_deterministic_errors() {
+        let accepted_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { (StatusCode::ACCEPTED, r#"{"digests":["aa"]}"#.to_string()) }),
+        ))
+        .await;
+        let deterministic_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { StatusCode::PAYLOAD_TOO_LARGE }),
+        ))
+        .await;
+        let targets = vec![
+            leader_with_url("00", accepted_url),
+            leader_with_url("01", deterministic_url),
+        ];
+
+        let summary = forward_to_targets(
+            &reqwest::Client::new(),
+            &targets,
+            Bytes::from_static(b"body"),
+        )
+        .await;
+
+        assert!(summary.accepted);
+        assert_eq!(summary.deterministic, Some(StatusCode::PAYLOAD_TOO_LARGE));
+    }
+
+    #[tokio::test]
+    async fn fetch_and_merge_statuses_collect_only_included_digests() {
+        let statuses = Arc::new(HashMap::from([
+            (
+                "accepted".to_string(),
+                BatchStatus::Accepted {
+                    digests: vec!["aa".to_string()],
+                },
+            ),
+            (
+                "finalized".to_string(),
+                BatchStatus::Finalized {
+                    height: 4,
+                    included: vec!["aa".to_string()],
+                },
+            ),
+            (
+                "partial".to_string(),
+                BatchStatus::PartiallyFinalized {
+                    height: 7,
+                    included: vec!["bb".to_string()],
+                    filtered: vec!["cc".to_string()],
+                },
+            ),
+            (
+                "dropped".to_string(),
+                BatchStatus::Dropped {
+                    filtered: vec!["dd".to_string()],
+                },
+            ),
+        ]));
+        let mock = Router::new().route(
+            "/transactions/{batch_id}",
+            get(move |Path(batch_id): Path<String>| {
+                let statuses = statuses.clone();
+                async move {
+                    let Some(status) = statuses.get(&batch_id) else {
+                        return (StatusCode::NOT_FOUND, String::new());
+                    };
+                    (
+                        StatusCode::OK,
+                        serde_json::to_string(status).expect("status serializes"),
+                    )
+                }
+            }),
+        );
+        let url = spawn_mock_leader(mock).await;
+        let leader = leader_with_url("00", url);
+        let state = test_state(vec![leader.clone()], empty_account_reader());
+
+        assert!(matches!(
+            fetch_status_from_leader(&state.http, &leader, "finalized").await,
+            Some(BatchStatus::Finalized { height: 4, .. })
+        ));
+        assert!(
+            fetch_status_from_leader(&state.http, &leader, "missing")
+                .await
+                .is_none()
+        );
+
+        let mut included = HashSet::new();
+        let mut height = 0;
+        let attempts = vec![
+            ("accepted".to_string(), leader.clone()),
+            ("finalized".to_string(), leader.clone()),
+            ("partial".to_string(), leader.clone()),
+            ("dropped".to_string(), leader),
+        ];
+
+        merge_statuses(&state, &attempts, &mut included, &mut height).await;
+
+        assert_eq!(
+            included,
+            HashSet::from(["aa".to_string(), "bb".to_string()])
+        );
+        assert_eq!(height, 7);
+    }
+
+    #[tokio::test]
+    async fn wait_for_view_advance_ignores_same_view_until_newer_view_arrives() {
+        let (sender, mut receiver) = tokio::sync::watch::channel(1);
+        let mut current = 1;
+
+        let waiter = tokio::spawn(async move {
+            wait_for_view_advance(&mut receiver, &mut current).await;
+            current
+        });
+        sender.send_replace(1);
+        sender.send_replace(2);
+
+        assert_eq!(waiter.await.expect("waiter task completes"), 2);
+    }
+
+    #[tokio::test]
+    async fn submit_with_retries_handles_core_outcomes() {
+        let first = signed_transaction(10, 0);
+        let second = signed_transaction(11, 0);
+        let first_digest = first.message_digest().to_string();
+        let second_digest = second.message_digest().to_string();
+        let one_tx_batch = decode_batch(
+            &encoded_batch(std::slice::from_ref(&first)),
+            DEFAULT_MAX_BATCH_BYTES,
+        )
+        .expect("single transaction batch decodes");
+        let two_tx_batch = decode_batch(&encoded_batch(&[first, second]), DEFAULT_MAX_BATCH_BYTES)
+            .expect("two transaction batch decodes");
+
+        let empty_state = test_state(Vec::new(), empty_account_reader());
+        let (status, body) = submit_with_retries(&empty_state, one_tx_batch).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.is_empty());
+
+        let deterministic_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { StatusCode::BAD_REQUEST }),
+        ))
+        .await;
+        let deterministic_state = test_state(
+            vec![leader_with_url("00", deterministic_url)],
+            empty_account_reader(),
+        );
+        let (status, body) = submit_with_retries(&deterministic_state, two_tx_batch).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty());
+
+        let finalized_tx = signed_transaction(12, 0);
+        let finalized_digest = finalized_tx.message_digest().to_string();
+        let finalized_batch = decode_batch(
+            &encoded_batch(std::slice::from_ref(&finalized_tx)),
+            DEFAULT_MAX_BATCH_BYTES,
+        )
+        .expect("finalized batch decodes");
+        let finalized_url = spawn_accepting_status_leader(BatchStatus::Finalized {
+            height: 5,
+            included: vec![finalized_digest],
+        })
+        .await;
+        let finalized_state = test_state(
+            vec![leader_with_url("00", finalized_url)],
+            empty_account_reader(),
+        );
+
+        let (status, body) = submit_with_retries(&finalized_state, finalized_batch).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&body).expect("status json"),
+            TxStatus::Finalized { height: 5 },
+        );
+
+        let partial_first = signed_transaction(13, 0);
+        let partial_second = signed_transaction(14, 0);
+        let partial_first_digest = partial_first.message_digest().to_string();
+        let partial_second_digest = partial_second.message_digest().to_string();
+        let partial_batch = decode_batch(
+            &encoded_batch(&[partial_first, partial_second]),
+            DEFAULT_MAX_BATCH_BYTES,
+        )
+        .expect("partial batch decodes");
+        let partial_url = spawn_accepting_status_leader(BatchStatus::PartiallyFinalized {
+            height: 8,
+            included: vec![partial_first_digest.clone()],
+            filtered: vec![partial_second_digest.clone()],
+        })
+        .await;
+        let partial_state = test_state(
+            vec![leader_with_url("00", partial_url)],
+            empty_account_reader(),
+        );
+
+        let (status, body) = submit_with_retries(&partial_state, partial_batch).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&body).expect("status json"),
+            TxStatus::PartiallyFinalized {
+                height: 8,
+                included: vec![partial_first_digest],
+                filtered: vec![partial_second_digest],
+            },
+        );
+
+        let unavailable_tx = signed_transaction(15, 0);
+        let unavailable_batch = decode_batch(
+            &encoded_batch(std::slice::from_ref(&unavailable_tx)),
+            DEFAULT_MAX_BATCH_BYTES,
+        )
+        .expect("unavailable batch decodes");
+        let unavailable_url = spawn_mock_leader(Router::new().route(
+            "/transactions/ingest",
+            post(|| async { StatusCode::SERVICE_UNAVAILABLE }),
+        ))
+        .await;
+        let unavailable_state = test_state(
+            vec![leader_with_url("00", unavailable_url)],
+            empty_account_reader(),
+        );
+
+        let (status, body) = submit_with_retries(&unavailable_state, unavailable_batch).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(body.is_empty());
+
+        assert_ne!(first_digest, second_digest);
+    }
+
+    #[tokio::test]
+    async fn pinned_submission_rejects_bad_target_fanout_and_oversized_body() {
+        let state = pinned_state("http://127.0.0.1:9".to_string());
+
+        let mut unknown_target = HeaderMap::new();
+        unknown_target.insert(TARGET_LEADER_HEADER, HeaderValue::from_static("ff"));
+        unknown_target.insert(LEADER_FANOUT_HEADER, HeaderValue::from_static("1"));
+        let (status, body) = submit_transactions(
+            State(state.clone()),
+            unknown_target,
+            Bytes::from_static(b"body"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty());
+
+        let mut bad_fanout = HeaderMap::new();
+        bad_fanout.insert(TARGET_LEADER_HEADER, HeaderValue::from_static("00"));
+        bad_fanout.insert(LEADER_FANOUT_HEADER, HeaderValue::from_static("2"));
+        let (status, body) = submit_transactions(
+            State(state.clone()),
+            bad_fanout,
+            Bytes::from_static(b"body"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.is_empty());
+
+        let mut tiny_limit_state = state;
+        tiny_limit_state.max_batch_bytes = 0;
+        let (status, body) = submit_transactions(
+            State(tiny_limit_state),
+            pinned_headers(),
+            Bytes::from(vec![0; max_request_bytes(0) + 1]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+        assert!(body.is_empty());
+    }
+
+    #[test]
+    fn normalize_leaders_sorts_lowercases_and_trims_urls() {
+        let leaders = normalize_leaders(vec![
+            RelayerLeaderConfig {
+                public_key: "0B".to_string(),
+                url: "http://second/".to_string(),
+            },
+            RelayerLeaderConfig {
+                public_key: "0a".to_string(),
+                url: "http://first///".to_string(),
+            },
+        ]);
+
+        assert_eq!(
+            leaders
+                .iter()
+                .map(|leader| (leader.public_key.as_str(), leader.url.as_str()))
+                .collect::<Vec<_>>(),
+            vec![("0a", "http://first"), ("0b", "http://second")],
+        );
     }
 
     #[test]
