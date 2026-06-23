@@ -1,5 +1,5 @@
 These tarballs were packed from `exowarexyz/monorepo` commit
-`ba53731b24164c2034b2a862a7ec2b09175a9e14`. The directory and tarball
+`cdf5c93859b9c6931c88758b1e3257efe67e0680`. The directory and tarball
 filenames include the git revision so the vendored TypeScript artifacts stay
 visibly tied to the Rust Exoware pin.
 
