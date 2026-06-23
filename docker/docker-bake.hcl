@@ -53,3 +53,21 @@ target "intel" {
     TARGET_STRIP = "x86_64-linux-gnu-strip"
   }
 }
+
+target "amd" {
+  context = "."
+  dockerfile = "docker/Dockerfile"
+  tags = ["constantinople-builder:amd-${DEFAULT_TAG}"]
+  args = {
+    BASE_IMAGE = BASE_IMAGE
+    RUST_TOOLCHAIN = RUST_TOOLCHAIN
+    TARGET_TRIPLE = "x86_64-unknown-linux-gnu"
+    TARGET_CARGO_NAME = "X86_64_UNKNOWN_LINUX_GNU"
+    TARGET_CC_NAME = "x86_64_unknown_linux_gnu"
+    TARGET_CPU = "znver5"
+    TARGET_LINKER = "x86_64-linux-gnu-gcc"
+    TARGET_CXX = "x86_64-linux-gnu-g++"
+    TARGET_AR = "x86_64-linux-gnu-ar"
+    TARGET_STRIP = "x86_64-linux-gnu-strip"
+  }
+}
