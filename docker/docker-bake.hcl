@@ -30,6 +30,7 @@ target "graviton" {
     TARGET_CC_NAME = "aarch64_unknown_linux_gnu"
     TARGET_CPU = "neoverse-v2"
     TARGET_LINKER = "aarch64-linux-gnu-gcc"
+    TARGET_CXX = "aarch64-linux-gnu-g++"
     TARGET_AR = "aarch64-linux-gnu-ar"
     TARGET_STRIP = "aarch64-linux-gnu-strip"
   }
@@ -47,6 +48,7 @@ target "intel" {
     TARGET_CC_NAME = "x86_64_unknown_linux_gnu"
     TARGET_CPU = "graniterapids"
     TARGET_LINKER = "x86_64-linux-gnu-gcc"
+    TARGET_CXX = "x86_64-linux-gnu-g++"
     TARGET_AR = "x86_64-linux-gnu-ar"
     TARGET_STRIP = "x86_64-linux-gnu-strip"
   }
