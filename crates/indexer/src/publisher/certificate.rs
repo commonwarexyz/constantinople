@@ -48,7 +48,7 @@ where
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
-        let client = SimplexClient::new(store_url);
+        let client = SimplexClient::new(StoreClient::new(store_url));
         let (tx, rx) = mpsc::channel(buffer);
         let join = tokio::spawn(run_uploader::<H, P, S>(client, rx));
         (Self { tx }, join)

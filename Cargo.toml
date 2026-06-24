@@ -101,3 +101,14 @@ tracing-subscriber = "0.3"
 [profile.samply]
 inherits = "release"
 debug = true
+
+# TEMPORARY: build against the local monorepo checkout that carries the Store
+# key-namespacing fix (PrefixedStoreClient + Namespace; sql/simplex trio).
+# Remove once those changes merge upstream and bump the `rev` above instead.
+[patch."https://github.com/exowarexyz/monorepo.git"]
+exoware-sdk = { path = "../monorepo/sdk/rs" }
+exoware-server = { path = "../monorepo/server" }
+exoware-qmdb = { path = "../monorepo/qmdb/rs" }
+exoware-simplex = { path = "../monorepo/simplex/rs" }
+exoware-simulator = { path = "../monorepo/examples/simulator" }
+exoware-sql = { path = "../monorepo/sql/rs" }

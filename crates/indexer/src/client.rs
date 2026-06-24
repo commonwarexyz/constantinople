@@ -83,7 +83,7 @@ impl IndexerClient {
             .map_err(ReadError::SqlSchema)?
             .register_all(&sql)?;
         Ok(Self {
-            blocks: SimplexClient::from_client(blocks),
+            blocks: SimplexClient::new(blocks),
             sql,
         })
     }
