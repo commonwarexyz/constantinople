@@ -213,7 +213,7 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex block upload must stage");
-    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let seq = commit_with_retry(client.store_client().client(), &batch).await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
@@ -277,7 +277,7 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex upload must stage");
-    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let seq = commit_with_retry(client.store_client().client(), &batch).await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,

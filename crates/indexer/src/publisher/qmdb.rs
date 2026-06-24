@@ -362,8 +362,8 @@ where
         let state = recover_state_writer_state::<H>(state_client.clone()).await?;
         let transactions =
             recover_transaction_writer_state::<H>(transaction_client.clone()).await?;
-        let state_writer = Arc::new(StateWriter::prefixed(state_client, state));
-        let transaction_writer = Arc::new(TransactionWriter::prefixed(
+        let state_writer = Arc::new(StateWriter::from_prefixed(state_client, state));
+        let transaction_writer = Arc::new(TransactionWriter::from_prefixed(
             transaction_client,
             transactions,
         ));
@@ -1693,11 +1693,11 @@ mod tests {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let client =
                 StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
-            let state_writer = Arc::new(StateWriter::<Sha256>::prefixed(
+            let state_writer = Arc::new(StateWriter::<Sha256>::from_prefixed(
                 state_qmdb_client(&client),
                 WriterState::empty(),
             ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::prefixed(
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::from_prefixed(
                 transactions_qmdb_client(&client),
                 WriterState::empty(),
             ));
@@ -1772,9 +1772,11 @@ mod tests {
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
-            let state_writer =
-                StateWriter::<Sha256>::prefixed(state_qmdb_client(&client), WriterState::empty());
-            let transaction_writer = TransactionWriter::<Sha256>::prefixed(
+            let state_writer = StateWriter::<Sha256>::from_prefixed(
+                state_qmdb_client(&client),
+                WriterState::empty(),
+            );
+            let transaction_writer = TransactionWriter::<Sha256>::from_prefixed(
                 transactions_qmdb_client(&client),
                 WriterState::empty(),
             );
@@ -1887,11 +1889,11 @@ mod tests {
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
-            let state_writer = Arc::new(StateWriter::<Sha256>::prefixed(
+            let state_writer = Arc::new(StateWriter::<Sha256>::from_prefixed(
                 state_qmdb_client(&client),
                 WriterState::empty(),
             ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::prefixed(
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::from_prefixed(
                 transactions_qmdb_client(&client),
                 WriterState::empty(),
             ));
@@ -2010,11 +2012,11 @@ mod tests {
             let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
                 .await
                 .expect("spawn simulator");
-            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+            let publisher = Box::pin(Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
                 &url,
                 2,
-            )
+            ))
             .await
             .expect("publisher connects");
 
@@ -2037,11 +2039,11 @@ mod tests {
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
-            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+            let publisher = Box::pin(Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
                 &url,
                 2,
-            )
+            ))
             .await
             .expect("publisher connects");
             let databases =
@@ -2125,10 +2127,12 @@ mod tests {
             let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
                 .await
                 .expect("spawn simulator");
-            let publisher = Publisher::<
+            let publisher = Box::pin(Publisher::<
                 commonware_cryptography::sha256::Sha256,
                 commonware_cryptography::ed25519::PublicKey,
-            >::connect(context.child("qmdb_publisher"), &url, 1)
+            >::connect(
+                context.child("qmdb_publisher"), &url, 1
+            ))
             .await
             .expect("publisher connects");
 
