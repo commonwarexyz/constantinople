@@ -65,12 +65,12 @@ commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", 
 commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", branch = "leo/store-namespaces" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", branch = "leo/store-namespaces" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", branch = "leo/store-namespaces" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", branch = "leo/store-namespaces" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", branch = "leo/store-namespaces" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", branch = "leo/store-namespaces" }
 datafusion = "52"
 
 # Other
@@ -101,14 +101,3 @@ tracing-subscriber = "0.3"
 [profile.samply]
 inherits = "release"
 debug = true
-
-# TEMPORARY: build against the local monorepo checkout that carries the Store
-# key-namespacing fix (PrefixedStoreClient + Namespace; sql/simplex trio).
-# Remove once those changes merge upstream and bump the `rev` above instead.
-[patch."https://github.com/exowarexyz/monorepo.git"]
-exoware-sdk = { path = "../monorepo/sdk/rs" }
-exoware-server = { path = "../monorepo/server" }
-exoware-qmdb = { path = "../monorepo/qmdb/rs" }
-exoware-simplex = { path = "../monorepo/simplex/rs" }
-exoware-simulator = { path = "../monorepo/examples/simulator" }
-exoware-sql = { path = "../monorepo/sql/rs" }
