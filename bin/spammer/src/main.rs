@@ -16,7 +16,6 @@ mod submitter;
 use accounts::{SpamAccount, generate_accounts};
 use clap::Parser;
 use cli::Cli;
-use commonware_deployer::aws::METRICS_PORT;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
@@ -111,7 +110,7 @@ fn main() {
             },
             Some(SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                METRICS_PORT,
+                cli.metrics_port,
             )),
             None,
         );

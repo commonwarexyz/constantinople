@@ -348,6 +348,13 @@ fn local_run_commands(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
         );
+
+        // Place the spammer's metrics port past the primary and secondary ranges
+        // so it does not collide with any validator on the loopback host.
+        let metrics_port = local
+            .base_metrics_port
+            .checked_add(args.validators as u16 + total_secondaries as u16)
+            .expect("spammer metrics port overflow");
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -356,7 +363,8 @@ fn local_run_commands(
              --seed-offset {} \
              --rayon-threads {} \
              --accounts-jitter {} \
-             --presigned-batches {}",
+             --presigned-batches {} \
+             --metrics-port {metrics_port}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
