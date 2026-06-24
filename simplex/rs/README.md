@@ -24,7 +24,7 @@ use exoware_simplex::{Finalized, SimplexClient};
 #   S: commonware_cryptography::certificate::Scheme,
 #   D: commonware_cryptography::Digest,
 # {
-let client = SimplexClient::new(store_url);
+let client = SimplexClient::new(exoware_sdk::StoreClient::new(store_url));
 let finalized = Finalized::new(proof, header)?;
 let receipt = client.upload_finalized(&finalized).await?;
 println!("stored at sequence {}", receipt.store_sequence_number);

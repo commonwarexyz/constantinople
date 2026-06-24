@@ -330,6 +330,127 @@ impl StoreKeyPrefix {
     }
 }
 
+/// Reserved high bits selecting the *subsystem* within a namespace prefix.
+/// Three bits → up to eight subsystems.
+pub const NAMESPACE_SLOT_BITS: u8 = 3;
+
+/// Reserved high bits selecting the *instance* of a subsystem within a
+/// namespace prefix. One bit → up to two instances per subsystem (e.g. QMDB's
+/// account-state and transaction-history operation logs).
+pub const NAMESPACE_INSTANCE_BITS: u8 = 1;
+
+/// Total reserved high bits in *every* namespace key prefix (slot + instance).
+///
+/// The width is uniform across all namespaces and instances — that uniformity
+/// is what makes the scheme footgun-free: every prefix is the same length, so
+/// distinct prefixes are pairwise prefix-disjoint and no "bare" namespace can
+/// ever be a bit-prefix of one of its own instances. These bits sit *above*
+/// each subsystem's own internal reserved bits; the combined width stays within
+/// the 16-bit budget the codec enforces.
+pub const NAMESPACE_RESERVED_BITS: u8 = NAMESPACE_SLOT_BITS + NAMESPACE_INSTANCE_BITS;
+
+/// Canonical key-prefix allocation for the SDK's built-in subsystems when they
+/// co-tenant a single Store.
+///
+/// Co-tenancy is load-bearing: [`StoreWriteBatch`] commits rows from multiple
+/// subsystems in one atomic Store `Put`, so they must share a keyspace to get
+/// cross-subsystem atomicity. This enum is the single source of truth that
+/// keeps their slots from colliding. It is deliberately *not* a runtime
+/// registry — distinct variants of one fixed width are disjoint by construction.
+///
+/// Any subsystem can run more than one instance in a Store via [`Self::sub`];
+/// the bare namespace is exactly [`Self::sub(0)`](Self::sub).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Namespace {
+    Sql,
+    Simplex,
+    Qmdb,
+}
+
+impl Namespace {
+    /// The subsystem slot stored in the high [`NAMESPACE_SLOT_BITS`].
+    #[inline]
+    const fn slot(self) -> u16 {
+        match self {
+            Namespace::Sql => 0,
+            Namespace::Simplex => 1,
+            Namespace::Qmdb => 2,
+        }
+    }
+
+    /// The canonical [`StoreKeyPrefix`] for this subsystem — its default
+    /// instance, i.e. [`Self::sub(0)`](Self::sub).
+    #[inline]
+    pub const fn key_prefix(self) -> StoreKeyPrefix {
+        self.sub(0)
+    }
+
+    /// The [`StoreKeyPrefix`] for `instance` of this subsystem.
+    ///
+    /// For a consumer that co-locates more than one instance of a subsystem in
+    /// one Store (e.g. QMDB's two operation logs). Every `sub` of every
+    /// namespace is the same fixed width, so they are all pairwise
+    /// prefix-disjoint — a prefix-bounded range scan in one can never observe
+    /// another's keys. `instance` must be less than `2^NAMESPACE_INSTANCE_BITS`.
+    #[inline]
+    pub const fn sub(self, instance: u8) -> StoreKeyPrefix {
+        assert!(
+            (instance as u16) < (1 << NAMESPACE_INSTANCE_BITS),
+            "namespace instance out of range",
+        );
+        let prefix = (self.slot() << NAMESPACE_INSTANCE_BITS) | instance as u16;
+        StoreKeyPrefix {
+            codec: KeyCodec::new(NAMESPACE_RESERVED_BITS, prefix),
+        }
+    }
+}
+
+/// A [`StoreClient`] guaranteed to carry a [`StoreKeyPrefix`].
+///
+/// Constructable only from a `(client, prefix)` pair, so a value of this type is
+/// *always* namespaced. Subsystem constructors that must not silently share a
+/// raw keyspace take this type instead of a bare [`StoreClient`], turning "did
+/// you namespace?" into a compile-time fact.
+///
+/// Intentionally does **not** `Deref` to [`StoreClient`]: that would re-expose
+/// [`StoreClient::without_key_prefix`] and let callers quietly drop the
+/// guarantee.
+#[derive(Clone, Debug)]
+pub struct PrefixedStoreClient {
+    client: StoreClient,
+}
+
+impl PrefixedStoreClient {
+    /// Wrap a client with an explicit namespace prefix.
+    pub fn new(mut client: StoreClient, prefix: StoreKeyPrefix) -> Self {
+        // Owned, so set the prefix in place instead of cloning via `with_key_prefix`.
+        client.key_prefix = Some(prefix);
+        Self { client }
+    }
+
+    /// Wrap a client with the canonical prefix for a built-in [`Namespace`].
+    pub fn for_namespace(client: StoreClient, namespace: Namespace) -> Self {
+        Self::new(client, namespace.key_prefix())
+    }
+
+    /// The configured key prefix (always present).
+    pub fn key_prefix(&self) -> StoreKeyPrefix {
+        self.client
+            .key_prefix()
+            .expect("PrefixedStoreClient always carries a prefix")
+    }
+
+    /// Borrow the underlying prefixed client for read/write operations.
+    pub fn client(&self) -> &StoreClient {
+        &self.client
+    }
+
+    /// Consume into the underlying (prefixed) client.
+    pub fn into_client(self) -> StoreClient {
+        self.client
+    }
+}
+
 /// A physical Store write batch assembled from one or more logical clients.
 ///
 /// Use [`Self::push`] with the specific prefixed client that produced each
@@ -1305,6 +1426,17 @@ impl StoreClient {
         let mut out = self.clone();
         out.key_prefix = None;
         out
+    }
+
+    /// Clone this client into a [`PrefixedStoreClient`] carrying `prefix`.
+    pub fn prefixed(&self, prefix: StoreKeyPrefix) -> PrefixedStoreClient {
+        PrefixedStoreClient::new(self.clone(), prefix)
+    }
+
+    /// Clone this client into a [`PrefixedStoreClient`] using the canonical
+    /// prefix for a built-in [`Namespace`].
+    pub fn for_namespace(&self, namespace: Namespace) -> PrefixedStoreClient {
+        PrefixedStoreClient::for_namespace(self.clone(), namespace)
     }
 
     /// Encode a logical key as it will appear in the physical Store.
@@ -2986,6 +3118,65 @@ mod tests {
         let physical = prefix.encode_key(&logical).unwrap();
         assert!(prefix.codec.matches(&physical));
         assert_eq!(prefix.decode_key(&physical).unwrap(), logical);
+    }
+
+    #[test]
+    fn namespace_prefixes_are_pairwise_disjoint() {
+        // Every leaf prefix: each subsystem's default and its other instance.
+        let all = [
+            Namespace::Sql.sub(0),
+            Namespace::Sql.sub(1),
+            Namespace::Simplex.sub(0),
+            Namespace::Simplex.sub(1),
+            Namespace::Qmdb.sub(0),
+            Namespace::Qmdb.sub(1),
+        ];
+        // A key encoded under one prefix never matches another's codec — so a
+        // prefix-bounded range scan in one can't observe another's keys (this is
+        // the bug being fixed). Uniform width ⇒ no prefix is a bit-prefix of
+        // another, including a subsystem's default vs its own sub(1).
+        let logical = Bytes::from_static(b"\x00\x10whatever-block-meta-or-op-log-key");
+        for (i, pa) in all.iter().enumerate() {
+            let physical = pa.encode_key(&logical).unwrap();
+            assert!(pa.codec.matches(&physical));
+            assert_eq!(pa.decode_key(&physical).unwrap(), logical);
+            for (j, pb) in all.iter().enumerate() {
+                if i == j {
+                    continue;
+                }
+                assert!(
+                    !pb.codec.matches(&physical),
+                    "prefix {j} matched a key encoded under prefix {i}",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_default_is_instance_zero_and_all_widths_match() {
+        for ns in [Namespace::Sql, Namespace::Simplex, Namespace::Qmdb] {
+            assert_eq!(ns.key_prefix(), ns.sub(0));
+            assert_eq!(ns.sub(0).reserved_bits(), NAMESPACE_RESERVED_BITS);
+            assert_eq!(ns.sub(1).reserved_bits(), NAMESPACE_RESERVED_BITS);
+            // The two instances differ only in the low instance bit.
+            assert_eq!(ns.sub(0).prefix() ^ ns.sub(1).prefix(), 1);
+        }
+    }
+
+    #[test]
+    fn prefixed_store_client_always_carries_its_namespace_prefix() {
+        let base = StoreClient::new("http://localhost:8090");
+        assert!(base.key_prefix().is_none());
+        let sql = base.for_namespace(Namespace::Sql);
+        assert_eq!(sql.key_prefix(), Namespace::Sql.key_prefix());
+        assert_eq!(
+            sql.client().key_prefix(),
+            Some(Namespace::Sql.key_prefix()),
+            "underlying client carries the prefix for all reads/writes",
+        );
+        // A non-default sub instance also threads through.
+        let explicit = base.prefixed(Namespace::Qmdb.sub(1));
+        assert_eq!(explicit.key_prefix(), Namespace::Qmdb.sub(1));
     }
 
     #[test]

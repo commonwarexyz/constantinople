@@ -14,7 +14,9 @@ use commonware_storage::qmdb::{
 };
 use commonware_utils::bitmap::Readable as BitmapReadable;
 use exoware_sdk::keys::Key;
-use exoware_sdk::{RangeMode, SerializableReadSession, StoreClient};
+use exoware_sdk::{
+    Namespace, PrefixedStoreClient, RangeMode, SerializableReadSession, StoreClient,
+};
 
 use crate::codec::{
     bitmap_chunk_bits, chunk_index_for_location, clear_below_floor,
@@ -169,7 +171,25 @@ where
         Self::from_client(StoreClient::new(url), op_cfg)
     }
 
+    /// Read client over the canonical [`Namespace::Qmdb`] keyspace (matches the
+    /// writer default). Use [`Self::from_prefixed`] for a co-located QMDB log.
     pub fn from_client(
+        client: StoreClient,
+        op_cfg: <unordered::Operation<F, K, E> as commonware_codec::Read>::Cfg,
+    ) -> Self {
+        Self::from_prefixed(client.for_namespace(Namespace::Qmdb), op_cfg)
+    }
+
+    /// Read client over a caller-chosen namespace.
+    pub fn from_prefixed(
+        client: PrefixedStoreClient,
+        op_cfg: <unordered::Operation<F, K, E> as commonware_codec::Read>::Cfg,
+    ) -> Self {
+        Self::from_unprefixed(client.into_client(), op_cfg)
+    }
+
+    /// Read client over a raw, un-namespaced client.
+    pub fn from_unprefixed(
         client: StoreClient,
         op_cfg: <unordered::Operation<F, K, E> as commonware_codec::Read>::Cfg,
     ) -> Self {

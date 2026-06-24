@@ -4926,7 +4926,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let seed_schema = KvSchema::new(client.clone())
+        let seed_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -4967,7 +4967,7 @@ mod tests {
             assert_eq!(index_rows, 0);
         }
 
-        let backfill_schema = KvSchema::new(client.clone())
+        let backfill_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5026,7 +5026,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let seed_schema = KvSchema::new(client.clone())
+        let seed_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "points",
                 vec![
@@ -5055,7 +5055,7 @@ mod tests {
         }
         writer.flush().await.expect("seed flush");
 
-        let backfill_schema = KvSchema::new(client.clone())
+        let backfill_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "points",
                 vec![
@@ -5328,7 +5328,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let seed_schema = KvSchema::new(client.clone())
+        let seed_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5355,7 +5355,7 @@ mod tests {
         }
         writer.flush().await.expect("seed flush");
 
-        let backfill_schema = KvSchema::new(client.clone())
+        let backfill_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5442,7 +5442,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let schema = KvSchema::new(client.clone())
+        let schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5509,7 +5509,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let schema = KvSchema::new(client.clone())
+        let schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5670,7 +5670,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let seed_schema = KvSchema::new(client.clone())
+        let seed_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5697,7 +5697,7 @@ mod tests {
         }
         writer.flush().await.expect("seed flush");
 
-        let backfill_schema = KvSchema::new(client.clone())
+        let backfill_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5710,7 +5710,7 @@ mod tests {
             )
             .expect("backfill schema");
 
-        let task_schema = KvSchema::new(client.clone())
+        let task_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5790,7 +5790,7 @@ mod tests {
         let (base_url, shutdown_tx) = spawn_mock_server(state.clone()).await;
         let client = StoreClient::new(&base_url);
 
-        let seed_schema = KvSchema::new(client.clone())
+        let seed_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5817,7 +5817,7 @@ mod tests {
         }
         seed_writer.flush().await.expect("seed flush");
 
-        let backfill_schema = KvSchema::new(client.clone())
+        let backfill_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -5832,7 +5832,7 @@ mod tests {
             )
             .expect("backfill schema");
 
-        let task_schema = KvSchema::new(client.clone())
+        let task_schema = KvSchema::unprefixed(client.clone())
             .table(
                 "orders",
                 vec![
@@ -6255,7 +6255,7 @@ mod tests {
         });
 
         let client = StoreClient::new(&url);
-        let schema = KvSchema::new(client)
+        let schema = KvSchema::unprefixed(client)
             .table(
                 "items",
                 vec![TableColumnConfig::new("id", DataType::Int64, false)],
@@ -6388,7 +6388,7 @@ mod tests {
         });
 
         let client = StoreClient::new(&url);
-        let schema = KvSchema::new(client)
+        let schema = KvSchema::unprefixed(client)
             .table(
                 "tx_activity",
                 vec![
@@ -6905,7 +6905,7 @@ mod tests {
         });
 
         let client = StoreClient::new(&url);
-        let schema = KvSchema::new(client)
+        let schema = KvSchema::unprefixed(client)
             .table(
                 "orders",
                 vec![

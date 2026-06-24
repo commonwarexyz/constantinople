@@ -3,7 +3,10 @@ use commonware_codec::{Decode, Encode};
 use commonware_consensus::{Block, Viewable};
 use commonware_cryptography::{certificate, Digest};
 use exoware_sdk::keys::Key;
-use exoware_sdk::{ClientError, RangeMode, StoreBatchUpload, StoreClient, StoreWriteBatch};
+use exoware_sdk::{
+    ClientError, Namespace, PrefixedStoreClient, RangeMode, StoreBatchUpload, StoreClient,
+    StoreWriteBatch,
+};
 use futures::future::BoxFuture;
 
 use crate::error::SimplexError;
@@ -75,11 +78,21 @@ pub struct SimplexClient {
 }
 
 impl SimplexClient {
-    pub fn new(store_url: &str) -> Self {
-        Self::from_client(StoreClient::new(store_url))
+    /// Build a client over the canonical [`Namespace::Simplex`] keyspace — the
+    /// safe default when the Store is co-tenanted with SQL/QMDB. Use
+    /// [`Self::unprefixed`] only for a Store simplex owns exclusively.
+    pub fn new(client: StoreClient) -> Self {
+        Self::prefixed(client.for_namespace(Namespace::Simplex))
     }
 
-    pub fn from_client(client: StoreClient) -> Self {
+    /// Build a client over a caller-chosen namespace.
+    pub fn prefixed(client: PrefixedStoreClient) -> Self {
+        Self::unprefixed(client.into_client())
+    }
+
+    /// Build a client over a raw, un-namespaced client — escape hatch for a
+    /// Store simplex owns exclusively.
+    pub fn unprefixed(client: StoreClient) -> Self {
         Self { client }
     }
 

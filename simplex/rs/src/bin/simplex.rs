@@ -19,7 +19,7 @@ use commonware_cryptography::{
 use commonware_math::algebra::Random;
 use commonware_parallel::Sequential;
 use commonware_utils::{ordered::Set, N3f1};
-use exoware_sdk::StoreWriteBatch;
+use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{encode_block_data, keys, Finalized, Notarized, SimplexClient};
 use rand::{rngs::StdRng, SeedableRng};
 use tracing::info;
@@ -259,7 +259,7 @@ async fn seed(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!(store_url, interval_secs, "starting simplex seed");
 
-    let client = SimplexClient::new(store_url);
+    let client = SimplexClient::new(StoreClient::new(store_url));
     let schemes = demo_schemes();
     let verification_material = schemes[0].identity().encode().to_vec();
     let leader = schemes

@@ -15,8 +15,8 @@ use commonware_storage::qmdb::{
 };
 use exoware_sdk::keys::Key;
 use exoware_sdk::{
-    StoreBatchPublication, StoreBatchUpload, StoreClient, StorePublicationFrontierWriter,
-    StoreWriteBatch,
+    Namespace, PrefixedStoreClient, StoreBatchPublication, StoreBatchUpload, StoreClient,
+    StorePublicationFrontierWriter, StoreWriteBatch,
 };
 use futures::future::BoxFuture;
 
@@ -170,8 +170,23 @@ where
     E: ValueEncoding<Value = V>,
     unordered::Operation<F, K, E>: Encode,
 {
-    /// Construct a writer from caller-supplied frontier state. No store I/O.
+    /// Construct a writer over the canonical [`Namespace::Qmdb`] keyspace from
+    /// caller-supplied frontier state (no store I/O). For more than one QMDB
+    /// log in one Store, use [`Self::prefixed`] with distinct
+    /// [`Namespace::sub`] instances.
     pub fn new(client: StoreClient, state: WriterState<H::Digest, F>) -> Self {
+        Self::prefixed(client.for_namespace(Namespace::Qmdb), state)
+    }
+
+    /// Construct a writer over a caller-chosen namespace (e.g. one
+    /// [`Namespace::sub`] per co-located QMDB log).
+    pub fn prefixed(client: PrefixedStoreClient, state: WriterState<H::Digest, F>) -> Self {
+        Self::unprefixed(client.into_client(), state)
+    }
+
+    /// Construct a writer directly over a raw, un-namespaced client. Escape
+    /// hatch for a Store this writer owns exclusively.
+    pub fn unprefixed(client: StoreClient, state: WriterState<H::Digest, F>) -> Self {
         Self {
             client,
             core: WriterCore::from_cache(Cache::from_writer_state(state)),
