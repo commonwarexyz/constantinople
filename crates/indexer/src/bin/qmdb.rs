@@ -127,9 +127,9 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
 
 fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let base = StoreClient::new(store_url);
-    let state = Arc::new(StateClient::from_client(state_qmdb_client(&base)?, ()));
-    let transactions = Arc::new(TransactionClient::from_client(
-        transactions_qmdb_client(&base)?,
+    let state = Arc::new(StateClient::from_prefixed(state_qmdb_client(&base), ()));
+    let transactions = Arc::new(TransactionClient::from_prefixed(
+        transactions_qmdb_client(&base),
         (),
     ));
 

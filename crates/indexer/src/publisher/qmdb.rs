@@ -30,7 +30,7 @@ use exoware_qmdb::{
     KeylessClient, KeylessWriter, PreparedUpload, PreparedWatermark, QmdbError, UnorderedClient,
     UnorderedWriter, WriterState,
 };
-use exoware_sdk::{ClientError, StoreClient, StoreKeyPrefix, StoreWriteBatch};
+use exoware_sdk::{ClientError, Namespace, PrefixedStoreClient, StoreClient, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
 use std::{
     collections::VecDeque,
@@ -46,12 +46,6 @@ use tokio::{
 };
 use tracing::{debug, warn};
 
-/// Store namespace for QMDB account-state rows.
-pub const STATE_QMDB_PREFIX_VALUE: u16 = 0x8;
-/// Store namespace for QMDB transaction-hash rows.
-pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u16 = 0x9;
-/// Number of high-order Store key bits used for QMDB operation-log namespaces.
-pub const STORE_PREFIX_RESERVED_BITS: u8 = 4;
 /// Durable queued uploads are self-contained and comparatively cheap to admit.
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
 
@@ -212,8 +206,6 @@ where
 /// QMDB upload failure.
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
-    #[error("failed to configure QMDB Store prefix: {0}")]
-    Prefix(#[from] exoware_sdk::StoreKeyPrefixError),
     #[error("QMDB writer error: {0}")]
     Qmdb(#[from] QmdbError),
     #[error("Store client error: {0}")]
@@ -362,16 +354,19 @@ where
         Cx: Spawner,
     {
         let commit_client = StoreClient::new(store_url);
-        let state_client = state_qmdb_client(&commit_client)?;
-        let transaction_client = transactions_qmdb_client(&commit_client)?;
+        let state_client = state_qmdb_client(&commit_client);
+        let transaction_client = transactions_qmdb_client(&commit_client);
         let sql_writer = build_meta_schema(commit_client.clone())
             .map_err(PublishError::SqlSchema)?
             .batch_writer();
         let state = recover_state_writer_state::<H>(state_client.clone()).await?;
         let transactions =
             recover_transaction_writer_state::<H>(transaction_client.clone()).await?;
-        let state_writer = Arc::new(StateWriter::new(state_client, state));
-        let transaction_writer = Arc::new(TransactionWriter::new(transaction_client, transactions));
+        let state_writer = Arc::new(StateWriter::prefixed(state_client, state));
+        let transaction_writer = Arc::new(TransactionWriter::prefixed(
+            transaction_client,
+            transactions,
+        ));
         let state_next_location =
             next_writer_location(state_writer.latest_published_watermark().await);
         let transaction_next_location =
@@ -1240,35 +1235,32 @@ fn prepare_sql_rows<'a>(
     Ok(writer.prepare_flush()?)
 }
 
-/// Store namespace prefix for account-state QMDB rows.
-pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, exoware_sdk::StoreKeyPrefixError> {
-    StoreKeyPrefix::new(STORE_PREFIX_RESERVED_BITS, STATE_QMDB_PREFIX_VALUE)
+/// QMDB log instances co-located in the shared Store. Each selects a distinct
+/// [`Namespace::Qmdb`] instance; the SDK owns the prefix widths and guarantees
+/// the instances are disjoint from each other and from sql/simplex. This is the
+/// only QMDB namespacing decision Constantinople owns: which log is which.
+pub const STATE_QMDB_INSTANCE: u8 = 0;
+pub const TRANSACTIONS_QMDB_INSTANCE: u8 = 1;
+
+/// The account-state QMDB log.
+pub fn state_qmdb_client(client: &StoreClient) -> PrefixedStoreClient {
+    client.prefixed(Namespace::Qmdb.sub(STATE_QMDB_INSTANCE))
 }
 
-/// Store namespace prefix for transaction-history QMDB rows.
-pub fn transactions_qmdb_prefix() -> Result<StoreKeyPrefix, exoware_sdk::StoreKeyPrefixError> {
-    StoreKeyPrefix::new(STORE_PREFIX_RESERVED_BITS, TRANSACTIONS_QMDB_PREFIX_VALUE)
-}
-
-/// Clone `client` into the account-state QMDB namespace.
-pub fn state_qmdb_client(client: &StoreClient) -> Result<StoreClient, PublishError> {
-    Ok(client.with_key_prefix(state_qmdb_prefix()?))
-}
-
-/// Clone `client` into the transaction-history QMDB namespace.
-pub fn transactions_qmdb_client(client: &StoreClient) -> Result<StoreClient, PublishError> {
-    Ok(client.with_key_prefix(transactions_qmdb_prefix()?))
+/// The transaction-history QMDB log.
+pub fn transactions_qmdb_client(client: &StoreClient) -> PrefixedStoreClient {
+    client.prefixed(Namespace::Qmdb.sub(TRANSACTIONS_QMDB_INSTANCE))
 }
 
 async fn recover_state_writer_state<H>(
-    client: StoreClient,
+    client: PrefixedStoreClient,
 ) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
     let reader =
-        UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::from_client(
+        UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::from_prefixed(
             client,
             (),
         );
@@ -1287,14 +1279,16 @@ where
 }
 
 async fn recover_transaction_writer_state<H>(
-    client: StoreClient,
+    client: PrefixedStoreClient,
 ) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
 where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
-    let reader =
-        KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::from_client(client, ());
+    let reader = KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::from_prefixed(
+        client,
+        (),
+    );
     recover_writer_state::<H, _, _>(
         reader.writer_location_watermark().await?,
         |watermark, max| {
@@ -1641,14 +1635,16 @@ mod tests {
 
     #[test]
     fn qmdb_operation_logs_use_distinct_store_namespaces() {
-        let state = state_qmdb_prefix().expect("state prefix");
-        let transactions = transactions_qmdb_prefix().expect("transaction prefix");
+        let client = StoreClient::new("http://127.0.0.1:0");
+        let state = state_qmdb_client(&client).key_prefix();
+        let transactions = transactions_qmdb_client(&client).key_prefix();
 
-        assert_eq!(state.reserved_bits(), STORE_PREFIX_RESERVED_BITS);
-        assert_eq!(state.prefix(), STATE_QMDB_PREFIX_VALUE);
-        assert_eq!(transactions.reserved_bits(), STORE_PREFIX_RESERVED_BITS);
-        assert_eq!(transactions.prefix(), TRANSACTIONS_QMDB_PREFIX_VALUE);
-        assert_ne!(state.prefix(), transactions.prefix());
+        assert_eq!(state, Namespace::Qmdb.sub(STATE_QMDB_INSTANCE));
+        assert_eq!(
+            transactions,
+            Namespace::Qmdb.sub(TRANSACTIONS_QMDB_INSTANCE)
+        );
+        assert_ne!(state, transactions);
     }
 
     #[test]
@@ -1697,11 +1693,13 @@ mod tests {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let client =
                 StoreClient::with_retry_config("http://127.0.0.1:0", RetryConfig::disabled());
-            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
-                state_qmdb_client(&client).expect("state client"),
+            let state_writer = Arc::new(StateWriter::<Sha256>::prefixed(
+                state_qmdb_client(&client),
+                WriterState::empty(),
             ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
-                transactions_qmdb_client(&client).expect("transaction client"),
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::prefixed(
+                transactions_qmdb_client(&client),
+                WriterState::empty(),
             ));
             let schema = build_meta_schema(client.clone()).expect("schema");
             let sql_writer = schema.batch_writer();
@@ -1775,9 +1773,10 @@ mod tests {
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
             let state_writer =
-                StateWriter::<Sha256>::empty(state_qmdb_client(&client).expect("state client"));
-            let transaction_writer = TransactionWriter::<Sha256>::empty(
-                transactions_qmdb_client(&client).expect("transaction client"),
+                StateWriter::<Sha256>::prefixed(state_qmdb_client(&client), WriterState::empty());
+            let transaction_writer = TransactionWriter::<Sha256>::prefixed(
+                transactions_qmdb_client(&client),
+                WriterState::empty(),
             );
 
             let mut first_state = state_writer
@@ -1888,11 +1887,13 @@ mod tests {
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
-            let state_writer = Arc::new(StateWriter::<Sha256>::empty(
-                state_qmdb_client(&client).expect("state client"),
+            let state_writer = Arc::new(StateWriter::<Sha256>::prefixed(
+                state_qmdb_client(&client),
+                WriterState::empty(),
             ));
-            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::empty(
-                transactions_qmdb_client(&client).expect("transaction client"),
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::prefixed(
+                transactions_qmdb_client(&client),
+                WriterState::empty(),
             ));
             let schema = build_meta_schema(client.clone()).expect("schema");
             let mut sql_writer = schema.batch_writer();
@@ -2291,18 +2292,13 @@ mod tests {
             AccountKey,
             AccountValue,
             StateEncoding,
-        >::from_client(
-            state_qmdb_client(client).expect("state client"), ()
-        );
+        >::from_prefixed(state_qmdb_client(client), ());
         let transaction_reader = KeylessClient::<
             QmdbFamily,
             Sha256,
             Sha256Digest,
             TransactionEncoding<Sha256>,
-        >::from_client(
-            transactions_qmdb_client(client).expect("transaction client"),
-            (),
-        );
+        >::from_prefixed(transactions_qmdb_client(client), ());
         let state_tip = Location::new(block.header.state_range.end() - 1);
         let transaction_tip = Location::new(block.header.transactions_range.end() - 1);
 
@@ -2356,8 +2352,8 @@ mod tests {
             Sha256,
             Sha256Digest,
             TransactionEncoding<Sha256>,
-        >::from_client(
-            transactions_qmdb_client(client).expect("transaction client"),
+        >::from_prefixed(
+            transactions_qmdb_client(client),
             (),
         );
         let rows = encode_indexed_block_rows_at(block, 0);
