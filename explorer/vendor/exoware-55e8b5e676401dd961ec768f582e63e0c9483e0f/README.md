@@ -1,5 +1,5 @@
 These tarballs were packed from `exowarexyz/monorepo` commit
-`c1febc520113dbb98078dfb59eef1f4bed4ee93e`. The directory and tarball
+`55e8b5e676401dd961ec768f582e63e0c9483e0f`. The directory and tarball
 filenames include the git revision so the vendored TypeScript artifacts stay
 visibly tied to the Rust Exoware pin.
 
@@ -9,4 +9,4 @@ the Cargo Exoware git revision in the workspace manifest.
 
 When rebuilding the QMDB or Simplex wasm packages on macOS, use a clang with
 WebAssembly target support, for example:
-`CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang npm run build`.
+`CC_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/clang AR_wasm32_unknown_unknown=/opt/homebrew/opt/llvm/bin/llvm-ar npm run build`.

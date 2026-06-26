@@ -33,7 +33,7 @@ commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-storage.workspace = true
-commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 ahash.workspace = true
