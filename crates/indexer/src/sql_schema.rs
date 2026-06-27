@@ -19,6 +19,7 @@
 //! external consumers (the explorer and the SQL CLI) can hard-code the
 //! exact same identifiers without an out-of-band agreement.
 
+use crate::store_prefixes;
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::StoreClient;
 use exoware_sql::{KvSchema, TableColumnConfig};
@@ -106,7 +107,7 @@ pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 /// [`BatchWriter`]: exoware_sql::BatchWriter
 /// [`SessionContext`]: datafusion::prelude::SessionContext
 pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
-    KvSchema::new(client)
+    KvSchema::new(client.prefixed(store_prefixes::sql_meta()))
         .table(
             BLOCK_META_TABLE,
             vec![
