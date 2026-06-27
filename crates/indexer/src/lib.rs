@@ -6,6 +6,7 @@ pub mod codec;
 pub mod publisher;
 mod simplex_block;
 pub mod sql_schema;
+pub mod store_prefixes;
 
 pub use client::{IndexerClient, ReadError};
 pub use publisher::{CertificateReporter, Publisher};

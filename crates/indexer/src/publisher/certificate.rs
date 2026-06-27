@@ -6,6 +6,7 @@
 //! certificate artifacts with only the commitment-tagged header so height/latest
 //! verification does not fetch the full body.
 
+use crate::store_prefixes;
 use ahash::AHashMap;
 use bytes::Buf;
 use commonware_actor::Feedback;
@@ -48,7 +49,9 @@ where
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
-        let client = SimplexClient::new(StoreClient::new(store_url));
+        let client = SimplexClient::new(
+            StoreClient::new(store_url).prefixed(store_prefixes::simplex_blocks()),
+        );
         let (tx, rx) = mpsc::channel(buffer);
         let join = tokio::spawn(run_uploader::<H, P, S>(client, rx));
         (Self { tx }, join)

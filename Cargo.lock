@@ -3038,7 +3038,7 @@ dependencies = [
 [[package]]
 name = "exoware-qmdb"
 version = "2026.5.0"
-source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#d1e59977e1859e7951459f118ef2889676cd5a99"
+source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#3ff58d7830fd2339d12ab401e8789ac15a64604a"
 dependencies = [
  "axum",
  "buffa",
@@ -3068,7 +3068,7 @@ dependencies = [
 [[package]]
 name = "exoware-sdk"
 version = "2026.5.0"
-source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#d1e59977e1859e7951459f118ef2889676cd5a99"
+source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#3ff58d7830fd2339d12ab401e8789ac15a64604a"
 dependencies = [
  "anyhow",
  "base64",
@@ -3097,7 +3097,7 @@ dependencies = [
 [[package]]
 name = "exoware-server"
 version = "2026.5.0"
-source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#d1e59977e1859e7951459f118ef2889676cd5a99"
+source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#3ff58d7830fd2339d12ab401e8789ac15a64604a"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -3113,7 +3113,7 @@ dependencies = [
 [[package]]
 name = "exoware-simplex"
 version = "2026.5.0"
-source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#d1e59977e1859e7951459f118ef2889676cd5a99"
+source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#3ff58d7830fd2339d12ab401e8789ac15a64604a"
 dependencies = [
  "bytes",
  "clap",
@@ -3139,7 +3139,7 @@ dependencies = [
 [[package]]
 name = "exoware-simulator"
 version = "2026.5.0"
-source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#d1e59977e1859e7951459f118ef2889676cd5a99"
+source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#3ff58d7830fd2339d12ab401e8789ac15a64604a"
 dependencies = [
  "axum",
  "buffa",
@@ -3159,7 +3159,7 @@ dependencies = [
 [[package]]
 name = "exoware-sql"
 version = "2026.5.0"
-source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#d1e59977e1859e7951459f118ef2889676cd5a99"
+source = "git+https://github.com/exowarexyz/monorepo.git?branch=leo%2Fstore-namespaces#3ff58d7830fd2339d12ab401e8789ac15a64604a"
 dependencies = [
  "async-trait",
  "axum",
