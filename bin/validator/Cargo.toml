@@ -12,6 +12,11 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+default = ["mimalloc"]
+# Use mimalloc as the global memory allocator.
+mimalloc = ["dep:mimalloc"]
+
 [dependencies]
 # Workspace
 constantinople-engine.workspace = true
@@ -50,6 +55,7 @@ rand_core.workspace = true
 serde_yaml.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
+mimalloc = { workspace = true, optional = true }
 
 [dev-dependencies]
 # Other

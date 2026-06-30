@@ -8,6 +8,10 @@ mod state_reader;
 
 use clap::Parser;
 
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let cli = cli::Cli::parse();
     if let Some(hosts) = cli.hosts {
