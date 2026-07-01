@@ -35,20 +35,7 @@ fn main() {
     let cli = Cli::parse();
 
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
-    let (
-        accounts_count,
-        value,
-        seed_offset,
-        relayer_url,
-        relayer_submitters,
-        presigned_batches,
-        primary_validators,
-        rayon_threads,
-        accounts_jitter,
-        channel_fraction,
-        channel_operator_url,
-        channel_vouchers,
-    ) = if let Some(config_path) = &cli.config {
+    let (config, rayon_threads) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
             cfg.primary_validators.len().max(1)
@@ -56,70 +43,86 @@ fn main() {
             cfg.relayer_submitters
         };
         (
-            cfg.accounts,
-            cfg.value,
-            cfg.seed_offset,
-            config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
-            relayer_submitters,
-            cfg.presigned_batches,
-            if cfg.primary_validators.is_empty() {
-                cli.relayer_targets.clone()
-            } else {
-                cfg.primary_validators
+            RelayerModeConfig {
+                relayer_url: config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
+                accounts_count: cfg.accounts,
+                value: NonZeroU64::new(cfg.value).expect("transfer value must be > 0"),
+                seed_offset: cfg.seed_offset,
+                accounts_jitter: cfg.accounts_jitter,
+                relayer_submitters,
+                presigned_batches: cfg.presigned_batches,
+                relayer_targets: if cfg.primary_validators.is_empty() {
+                    cli.relayer_targets.clone()
+                } else {
+                    cfg.primary_validators
+                },
+                channel_fraction: cfg.channel_fraction,
+                channel_operator_url: cfg
+                    .channel_operator_url
+                    .map(|url| config::resolve_named_http_url(&url, cli.hosts.as_deref())),
+                channel_vouchers: cfg.channel_vouchers,
             },
             cfg.rayon_threads,
-            cfg.accounts_jitter,
-            cfg.channel_fraction,
-            cfg.channel_operator_url
-                .map(|url| config::resolve_named_http_url(&url, cli.hosts.as_deref())),
-            cfg.channel_vouchers,
         )
     } else {
         (
-            cli.accounts,
-            cli.value,
-            cli.seed_offset,
-            cli.relayer_url
-                .clone()
-                .expect("provide --relayer-url or --config"),
-            cli.relayer_submitters.max(1),
-            cli.presigned_batches,
-            cli.relayer_targets.clone(),
+            RelayerModeConfig {
+                relayer_url: cli
+                    .relayer_url
+                    .clone()
+                    .expect("provide --relayer-url or --config"),
+                accounts_count: cli.accounts,
+                value: NonZeroU64::new(cli.value).expect("transfer value must be > 0"),
+                seed_offset: cli.seed_offset,
+                accounts_jitter: cli.accounts_jitter,
+                relayer_submitters: cli.relayer_submitters.max(1),
+                presigned_batches: cli.presigned_batches,
+                relayer_targets: cli.relayer_targets.clone(),
+                channel_fraction: cli.channel_fraction,
+                channel_operator_url: cli.channel_operator_url.clone(),
+                channel_vouchers: cli.channel_vouchers,
+            },
             cli.rayon_threads,
-            cli.accounts_jitter,
-            cli.channel_fraction,
-            cli.channel_operator_url.clone(),
-            cli.channel_vouchers,
         )
     };
     assert!(
-        (0.0..=1.0).contains(&accounts_jitter),
+        (0.0..=1.0).contains(&config.accounts_jitter),
         "--accounts-jitter must be between 0 and 1"
     );
-    assert!(presigned_batches > 0, "--presigned-batches must be > 0");
     assert!(
-        (0.0..=1.0).contains(&channel_fraction),
+        config.presigned_batches > 0,
+        "--presigned-batches must be > 0"
+    );
+    assert!(
+        (0.0..=1.0).contains(&config.channel_fraction),
         "--channel-fraction must be between 0 and 1"
     );
-    assert!(channel_vouchers >= 1, "--channel-vouchers must be >= 1");
+    assert!(
+        config.channel_vouchers >= 1,
+        "--channel-vouchers must be >= 1"
+    );
 
     // Validate parameters.
-    assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
-    assert!(value > 0, "transfer value must be > 0");
+    assert!(
+        config.accounts_count >= 2,
+        "need at least 2 accounts for a ring"
+    );
+    let value = config.value.get();
     assert!(
         value <= DEFAULT_ACCOUNT_BALANCE,
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
     );
-    if channel_fraction > 0.0 {
+    if config.channel_fraction > 0.0 {
         assert!(
-            channel_operator_url.is_some(),
+            config.channel_operator_url.is_some(),
             "--channel-fraction > 0 requires --channel-operator-url"
         );
         // A channel's deposit is `vouchers * value` and is debited from the
         // payer up front; the jittered count peaks at `avg + avg/2`. Keep the
         // peak deposit within the faucet balance so opens don't fail outright.
-        let max_vouchers = channel_vouchers
-            .saturating_add(channel_vouchers / 2)
+        let max_vouchers = config
+            .channel_vouchers
+            .saturating_add(config.channel_vouchers / 2)
             .saturating_add(channels::MAX_REFUND_VOUCHERS);
         let max_deposit = max_vouchers.saturating_mul(value);
         assert!(
@@ -129,7 +132,6 @@ fn main() {
              lower --channel-vouchers or --value"
         );
     }
-    let value = NonZeroU64::new(value).expect("checked above");
 
     let runtime_cfg = commonware_runtime::tokio::Config::default();
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
@@ -151,19 +153,6 @@ fn main() {
             .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create parallel strategy");
 
-        let config = RelayerModeConfig {
-            relayer_url,
-            accounts_count,
-            value,
-            seed_offset,
-            accounts_jitter,
-            relayer_submitters,
-            presigned_batches,
-            relayer_targets: primary_validators,
-            channel_fraction,
-            channel_operator_url,
-            channel_vouchers,
-        };
         run_relayer_mode(config, strategy).await;
     });
 }
@@ -254,30 +243,37 @@ async fn run_relayer_mode(
         // Channels use their own account ring (a disjoint seed range) so their
         // nonces never collide with the transfer presigner's accounts.
         let channel_offset = channel_account_offset(seed_offset, index, accounts_count);
-        let channel_runner = (channel_fraction > 0.0).then(|| {
-            let channel_accounts = generate_accounts(accounts_count, channel_offset);
-            let (operator, operator_pk) = operator
-                .as_ref()
-                .expect("operator configured when channel_fraction > 0");
-            ChannelRunner::new(
-                channel_accounts,
-                operator.clone(),
-                operator_pk.clone(),
-                channel_vouchers,
-                value.get(),
-                channel_offset,
+        let operator = operator.clone();
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            // Generate the channel ring inside the task so each submitter's
+            // keygen runs concurrently instead of serializing startup.
+            let channel_runner = (channel_fraction > 0.0).then(|| {
+                let channel_accounts = generate_accounts(accounts_count, channel_offset);
+                let (operator, operator_pk) = operator
+                    .as_ref()
+                    .expect("operator configured when channel_fraction > 0");
+                ChannelRunner::new(
+                    channel_accounts,
+                    operator.clone(),
+                    operator_pk.clone(),
+                    channel_vouchers,
+                    value.get(),
+                    channel_offset,
+                )
+            });
+            run_submitter(
+                submitter,
+                batches,
+                channel_runner,
+                channel_fraction,
+                stats,
+                // Distinct seed from the runner's own voucher-count RNG so the
+                // channel/transfer coin flip is an independent stream.
+                JitterRng::new(channel_offset.wrapping_add(1)),
             )
+            .await;
         });
-        tokio::spawn(run_submitter(
-            submitter,
-            batches,
-            channel_runner,
-            channel_fraction,
-            stats.clone(),
-            // Distinct seed from the runner's own voucher-count RNG so the
-            // channel/transfer coin flip is an independent stream.
-            JitterRng::new(channel_offset.wrapping_add(1)),
-        ));
     }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));

@@ -64,11 +64,17 @@ pub enum Operation {
 }
 
 impl Operation {
-    /// Smallest encoded operation (a transfer).
-    pub const MIN_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
-    /// Largest encoded operation (a channel close).
-    pub const MAX_SIZE: usize =
+    /// Encoded size of a transfer: tag, recipient, and value.
+    const TRANSFER_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
+    /// Encoded size of a channel open: tag, receiver, and deposit.
+    const OPEN_CHANNEL_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
+    /// Encoded size of a channel close: tag, payer, open nonce, cumulative, and voucher.
+    const CLOSE_CHANNEL_SIZE: usize =
         1 + TransactionPublicKey::SIZE + u64::SIZE + u64::SIZE + ed25519::Signature::SIZE;
+    /// Smallest encoded operation (a transfer).
+    pub const MIN_SIZE: usize = Self::TRANSFER_SIZE;
+    /// Largest encoded operation (a channel close).
+    pub const MAX_SIZE: usize = Self::CLOSE_CHANNEL_SIZE;
 }
 
 impl Write for Operation {
@@ -103,11 +109,9 @@ impl Write for Operation {
 impl EncodeSize for Operation {
     fn encode_size(&self) -> usize {
         match self {
-            Self::Transfer { .. } => 1 + AccountKey::SIZE + u64::SIZE,
-            Self::OpenChannel { .. } => 1 + AccountKey::SIZE + u64::SIZE,
-            Self::CloseChannel { .. } => {
-                1 + TransactionPublicKey::SIZE + u64::SIZE + u64::SIZE + ed25519::Signature::SIZE
-            }
+            Self::Transfer { .. } => Self::TRANSFER_SIZE,
+            Self::OpenChannel { .. } => Self::OPEN_CHANNEL_SIZE,
+            Self::CloseChannel { .. } => Self::CLOSE_CHANNEL_SIZE,
         }
     }
 }
@@ -179,6 +183,10 @@ impl<H> SignedTransaction<H>
 where
     H: Hasher,
 {
+    /// Smallest possible encoded signed transaction.
+    pub const MIN_ENCODED_SIZE: usize =
+        Transaction::<H::Digest>::MIN_SIZE + TransactionSignature::MIN_SIZE;
+
     /// Creates a signed transaction without checking the signature.
     pub const fn new_unchecked(
         inner: Sealed<Transaction<H::Digest>, H>,

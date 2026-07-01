@@ -1839,7 +1839,6 @@ name = "constantinople-operator"
 version = "0.0.0"
 dependencies = [
  "axum",
- "bytes",
  "clap",
  "commonware-codec",
  "commonware-consensus",
@@ -1854,9 +1853,7 @@ dependencies = [
  "constantinople-primitives",
  "exoware-qmdb",
  "exoware-sdk",
- "reqwest",
  "serde",
- "serde_json",
  "serde_yaml",
  "tokio",
  "tracing",

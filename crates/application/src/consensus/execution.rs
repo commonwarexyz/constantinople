@@ -209,20 +209,17 @@ where
 
 /// Whether any account key is written by both lanes (a same-block conflict).
 fn lanes_conflict(transfers: &db::StateWrites, channel_ops: &ChannelWrites) -> bool {
-    // The overwhelmingly common block has no channel ops; skip building the
-    // transfer key set entirely in that case.
     if channel_ops.is_empty() {
         return false;
     }
-    let transfer_keys: HashSet<AccountKey> = transfers
+    // Channel ops are rare; probe the small channel key set with the (much
+    // larger) transfer write set instead of materializing the latter.
+    let channel_keys: HashSet<&AccountKey> = channel_ops.iter().map(|(key, _)| key).collect();
+    transfers
         .shards
         .iter()
         .flatten()
-        .map(|(key, _)| *key)
-        .collect();
-    channel_ops
-        .iter()
-        .any(|(key, _)| transfer_keys.contains(key))
+        .any(|(key, _)| channel_keys.contains(key))
 }
 
 /// Runs both lanes against block-start state and returns their writes.

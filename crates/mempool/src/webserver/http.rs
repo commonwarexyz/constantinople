@@ -16,8 +16,8 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, Operation, PublicKeyCache, SignedTransaction,
-    TransactionPublicKey, TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
+    VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
 use std::{fmt::Display, sync::Arc};
@@ -83,15 +83,9 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
-const fn min_signed_transaction_bytes() -> usize {
-    // Smallest signed transaction: the common sender + nonce, the smallest
-    // operation (a transfer), and the smallest signature.
-    u64::SIZE + TransactionPublicKey::SIZE + Operation::MIN_SIZE + TransactionSignature::MIN_SIZE
-}
-
-fn max_transaction_count(body_len: usize) -> Option<usize> {
+fn max_transaction_count<H: Hasher>(body_len: usize) -> Option<usize> {
     let payload_len = body_len.saturating_sub(MIN_BATCH_LENGTH_PREFIX_BYTES);
-    let max_transactions = payload_len / min_signed_transaction_bytes();
+    let max_transactions = payload_len / SignedTransaction::<H>::MIN_ENCODED_SIZE;
     (max_transactions > 0).then_some(max_transactions)
 }
 
@@ -210,7 +204,7 @@ where
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let Some(max_transactions) = max_transaction_count(body.len()) else {
+    let Some(max_transactions) = max_transaction_count::<H>(body.len()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
     let cfg = (RangeCfg::new(1..=max_transactions), ());

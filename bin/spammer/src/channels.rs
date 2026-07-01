@@ -105,6 +105,10 @@ impl ChannelRunner {
 
     /// Runs one lifecycle: open -> stream vouchers off-chain -> close.
     pub async fn run_once(&mut self, submitter: &RelayerSubmitter) -> LifecycleStats {
+        let mut stats = LifecycleStats {
+            channel_txs: 0,
+            vouchers: 0,
+        };
         let n = self.accounts.len();
         let payer_i = self.cursor;
         self.cursor = (self.cursor + 1) % n;
@@ -116,10 +120,7 @@ impl ChannelRunner {
         let cumulative = vouchers.saturating_mul(self.price);
         let deposit_value = self.next_deposit(cumulative);
         let Some(deposit) = NonZeroU64::new(deposit_value) else {
-            return LifecycleStats {
-                channel_txs: 0,
-                vouchers: 0,
-            };
+            return stats;
         };
 
         // On-chain: open the channel. The address derives from this nonce, so
@@ -136,11 +137,9 @@ impl ChannelRunner {
         let open_tx_digest = *open.message_digest();
         if submitter.submit_reporting(vec![open]).await == 0 {
             // Open did not finalize; don't close a channel that doesn't exist.
-            return LifecycleStats {
-                channel_txs: 0,
-                vouchers: 0,
-            };
+            return stats;
         }
+        stats.channel_txs += 1;
 
         // Off-chain: stream vouchers, verifying each with the shared predicate.
         // These are the payments that never touch the chain.
@@ -151,43 +150,31 @@ impl ChannelRunner {
             .await
         {
             warn!(%error, %channel, "operator channel registration failed");
-            return LifecycleStats {
-                channel_txs: 1,
-                vouchers: 0,
-            };
+            return stats;
         }
 
-        let mut served = 0u64;
         for i in 1..=vouchers {
             let amount = i.saturating_mul(self.price);
             let voucher = Voucher::sign(&self.accounts[payer_i].private_key, channel, amount);
             match self.operator.serve_voucher(&voucher).await {
-                Ok(()) => served += 1,
+                Ok(()) => stats.vouchers += 1,
                 Err(error) => {
                     warn!(%error, %channel, amount, "operator voucher rejected");
                     break;
                 }
             }
         }
-        if served == 0 {
-            return LifecycleStats {
-                channel_txs: 1,
-                vouchers: 0,
-            };
+        if stats.vouchers == 0 {
+            return stats;
         }
 
         if let Err(error) = self.operator.settle_channel(channel).await {
             warn!(%error, %channel, "operator settlement failed");
-            return LifecycleStats {
-                channel_txs: 1,
-                vouchers: served,
-            };
+            return stats;
         }
+        stats.channel_txs += 1;
 
-        LifecycleStats {
-            channel_txs: 2,
-            vouchers: served,
-        }
+        stats
     }
 }
 

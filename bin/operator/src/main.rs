@@ -13,7 +13,7 @@ use axum::{
     routing::{get, post},
 };
 use clap::Parser;
-use commonware_codec::{DecodeExt as _, Encode};
+use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::{
     Sha256, Signer as _, bls12381::primitives::variant::MinSig, certificate::Verifier as _, ed25519,
 };
@@ -26,7 +26,7 @@ use commonware_storage::{
 use constantinople_application::operator::{ChannelOperator, ServeError};
 use constantinople_engine::ThresholdScheme;
 use constantinople_indexer::IndexerClient;
-use constantinople_mempool::webserver::client::SubmitError;
+use constantinople_mempool::webserver::{TxStatus, client::Client};
 use constantinople_primitives::{
     AccountKey, Operation, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
     TransactionPublicKey, Voucher, channel_address,
@@ -86,11 +86,11 @@ struct Cli {
     qmdb_url: Option<String>,
 
     /// Deterministic receiver key seed.
-    #[arg(long, default_value_t = 2_000_000_000)]
+    #[arg(long, default_value_t = default_receiver_seed())]
     receiver_seed: u64,
 
     /// Price charged per voucher step.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = default_price())]
     price: u64,
 }
 
@@ -122,16 +122,21 @@ const fn default_price() -> u64 {
 
 #[derive(Clone)]
 struct AppState {
-    inner: Arc<Mutex<OperatorState>>,
+    shared: Arc<AppShared>,
+}
+
+/// Read-only after startup, except for the mutable state behind the mutex.
+struct AppShared {
+    receiver: ed25519::PrivateKey,
+    receiver_pk: TransactionPublicKey,
+    receiver_account: AccountKey,
+    relayer: Client,
+    verifier: ChannelVerifier,
+    state: Mutex<OperatorState>,
 }
 
 struct OperatorState {
     operator: ChannelOperator,
-    receiver: ed25519::PrivateKey,
-    receiver_pk: TransactionPublicKey,
-    receiver_account: AccountKey,
-    relayer: RelayerClient,
-    verifier: ChannelVerifier,
     nonce: u64,
     channels: BTreeMap<AccountKey, RegisteredChannel>,
 }
@@ -139,7 +144,7 @@ struct OperatorState {
 struct RegisteredChannel {
     payer: TransactionPublicKey,
     open_nonce: u64,
-    latest: Option<AcceptedVoucher>,
+    latest: Option<Voucher>,
     settlement: SettlementState,
 }
 
@@ -150,19 +155,6 @@ enum SettlementState {
     Settled,
 }
 
-#[derive(Clone)]
-struct AcceptedVoucher {
-    cumulative: u64,
-    signature: ed25519::Signature,
-}
-
-#[derive(Clone)]
-struct RelayerClient {
-    url: String,
-    http: reqwest::Client,
-}
-
-#[derive(Clone)]
 struct ChannelVerifier {
     indexer: IndexerClient,
     transactions: TransactionProofClient,
@@ -223,20 +215,6 @@ struct ErrorResponse {
     error: String,
 }
 
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum RelayerBatchStatus {
-    Finalized {
-        height: u64,
-    },
-    PartiallyFinalized {
-        height: u64,
-        included: Vec<String>,
-        filtered: Vec<String>,
-    },
-    Dropped,
-}
-
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
@@ -250,16 +228,18 @@ async fn main() {
     let receiver_account = AccountKey::from_public_key(&receiver_pk);
     let verifier = ChannelVerifier::new(config.indexer_url, config.qmdb_url);
     let state = AppState {
-        inner: Arc::new(Mutex::new(OperatorState {
-            operator: ChannelOperator::new(config.price),
+        shared: Arc::new(AppShared {
             receiver,
             receiver_pk,
             receiver_account,
-            relayer: RelayerClient::new(config.relayer_url),
+            relayer: Client::new(config.relayer_url.trim_end_matches('/')),
             verifier,
-            nonce: 0,
-            channels: BTreeMap::new(),
-        })),
+            state: Mutex::new(OperatorState {
+                operator: ChannelOperator::new(config.price),
+                nonce: 0,
+                channels: BTreeMap::new(),
+            }),
+        }),
     };
 
     let addr = SocketAddr::new(config.listen_addr, config.port);
@@ -296,12 +276,13 @@ impl OperatorRuntimeConfig {
             let raw = std::fs::read_to_string(config_path).expect("failed to read operator config");
             let config: OperatorConfig =
                 serde_yaml::from_str(&raw).expect("failed to parse operator config");
+            let hosts = cli.hosts.as_deref().map(load_hosts);
             return Self {
                 port: config.http_port,
                 listen_addr: config.listen_addr,
-                relayer_url: resolve_named_http_url(&config.relayer_url, cli.hosts.as_deref()),
-                indexer_url: resolve_named_http_url(&config.indexer_url, cli.hosts.as_deref()),
-                qmdb_url: resolve_named_http_url(&config.qmdb_url, cli.hosts.as_deref()),
+                relayer_url: resolve_named_http_url(&config.relayer_url, hosts.as_ref()),
+                indexer_url: resolve_named_http_url(&config.indexer_url, hosts.as_ref()),
+                qmdb_url: resolve_named_http_url(&config.qmdb_url, hosts.as_ref()),
                 receiver_seed: config.receiver_seed,
                 price: config.price,
             };
@@ -319,18 +300,21 @@ impl OperatorRuntimeConfig {
     }
 }
 
-fn resolve_named_http_url(url: &str, hosts_path: Option<&Path>) -> String {
-    let Some(hosts_path) = hosts_path else {
+/// Loads the deployer-generated hosts file into a name-to-IP map.
+fn load_hosts(path: &Path) -> BTreeMap<String, IpAddr> {
+    let raw = std::fs::read_to_string(path).expect("failed to read hosts file");
+    let hosts: Hosts = serde_yaml::from_str(&raw).expect("failed to parse hosts file");
+    hosts
+        .hosts
+        .into_iter()
+        .map(|host| (host.name, host.ip))
+        .collect()
+}
+
+fn resolve_named_http_url(url: &str, hosts: Option<&BTreeMap<String, IpAddr>>) -> String {
+    let Some(hosts) = hosts else {
         return url.to_string();
     };
-    let raw = std::fs::read_to_string(hosts_path).expect("failed to read hosts file");
-    let hosts: Hosts = serde_yaml::from_str(&raw).expect("failed to parse hosts file");
-    let hosts_by_name = hosts
-        .hosts
-        .iter()
-        .map(|host| (host.name.as_str(), host.ip))
-        .collect::<BTreeMap<_, _>>();
-
     let Some(rest) = url.strip_prefix("http://") else {
         return url.to_string();
     };
@@ -341,7 +325,7 @@ fn resolve_named_http_url(url: &str, hosts_path: Option<&Path>) -> String {
     let Some((host, port)) = authority.rsplit_once(':') else {
         return url.to_string();
     };
-    let Some(ip) = hosts_by_name.get(host) else {
+    let Some(ip) = hosts.get(host) else {
         return url.to_string();
     };
 
@@ -353,10 +337,9 @@ async fn health() -> &'static str {
 }
 
 async fn public_key(State(state): State<AppState>) -> Json<PublicKeyResponse> {
-    let state = state.inner.lock().await;
     Json(PublicKeyResponse {
-        public_key: hex(&state.receiver_pk.encode()),
-        account: state.receiver_account.to_string(),
+        public_key: hex(&state.shared.receiver_pk.encode()),
+        account: state.shared.receiver_account.to_string(),
     })
 }
 
@@ -364,16 +347,16 @@ async fn register_channel(
     State(state): State<AppState>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
-    let channel = decode_account_key("channel", &request.channel)?;
-    let payer = decode_public_key("payer", &request.payer)?;
-    let open_tx_digest = decode_sha256_digest("open_tx_digest", &request.open_tx_digest)?;
+    let channel = decode_field::<AccountKey>("channel", &request.channel)?;
+    let payer = decode_field::<TransactionPublicKey>("payer", &request.payer)?;
+    let open_tx_digest = decode_field::<<Sha256 as commonware_cryptography::Hasher>::Digest>(
+        "open_tx_digest",
+        &request.open_tx_digest,
+    )?;
 
-    let (verifier, receiver_account) = {
-        let state = state.inner.lock().await;
-        (state.verifier.clone(), state.receiver_account)
-    };
-
-    let open = verifier
+    let open = state
+        .shared
+        .verifier
         .verify_open_channel(&open_tx_digest)
         .await
         .map_err(ApiError::bad_request)?;
@@ -383,19 +366,23 @@ async fn register_channel(
     if open.open_nonce != request.open_nonce {
         return Err(ApiError::bad_request("open transaction nonce mismatch"));
     }
-    if open.receiver != receiver_account {
+    if open.receiver != state.shared.receiver_account {
         return Err(ApiError::bad_request("open transaction receiver mismatch"));
     }
 
     let payer_account = AccountKey::from_public_key(&open.payer);
-    let expected = channel_address(&payer_account, &receiver_account, request.open_nonce);
+    let expected = channel_address(
+        &payer_account,
+        &state.shared.receiver_account,
+        request.open_nonce,
+    );
     if expected != channel {
         return Err(ApiError::bad_request(
             "channel address does not match registration",
         ));
     }
 
-    let mut state = state.inner.lock().await;
+    let mut state = state.shared.state.lock().await;
     let state = &mut *state;
     let inserted = register_verified_channel(
         &mut state.operator,
@@ -447,23 +434,21 @@ async fn serve_voucher(
     State(state): State<AppState>,
     Json(request): Json<VoucherRequest>,
 ) -> Result<Json<VoucherResponse>, ApiError> {
-    let channel = decode_account_key("channel", &request.channel)?;
-    let signature = decode_signature("signature", &request.signature)?;
+    let channel = decode_field::<AccountKey>("channel", &request.channel)?;
+    let signature = decode_field::<ed25519::Signature>("signature", &request.signature)?;
     let voucher = Voucher {
         channel,
         cumulative: request.cumulative,
-        signature: signature.clone(),
+        signature,
     };
 
-    let mut state = state.inner.lock().await;
+    let mut state = state.shared.state.lock().await;
+    let state = &mut *state;
     let charged = state.operator.serve(&voucher).map_err(ApiError::serve)?;
     let Some(registered) = state.channels.get_mut(&channel) else {
         return Err(ApiError::bad_request("channel metadata missing"));
     };
-    registered.latest = Some(AcceptedVoucher {
-        cumulative: charged,
-        signature,
-    });
+    registered.latest = Some(voucher);
     Ok(Json(VoucherResponse {
         accepted: true,
         charged,
@@ -474,10 +459,11 @@ async fn settle_channel(
     State(state): State<AppState>,
     Json(request): Json<SettleRequest>,
 ) -> Result<Json<SettleResponse>, ApiError> {
-    let channel = decode_account_key("channel", &request.channel)?;
-    let (relayer, close, cumulative) = {
-        let mut state = state.inner.lock().await;
-        let Some(registered) = state.channels.get(&channel) else {
+    let channel = decode_field::<AccountKey>("channel", &request.channel)?;
+    let (payer, open_nonce, latest, nonce) = {
+        let mut state = state.shared.state.lock().await;
+        let state = &mut *state;
+        let Some(registered) = state.channels.get_mut(&channel) else {
             return Err(ApiError::bad_request("unknown channel"));
         };
         match registered.settlement {
@@ -497,27 +483,32 @@ async fn settle_channel(
         let Some(latest) = registered.latest.clone() else {
             return Err(ApiError::bad_request("channel has no accepted vouchers"));
         };
-        let close = build_close(
-            &state.receiver,
-            &state.receiver_pk,
-            &registered.payer,
-            registered.open_nonce,
-            latest.cumulative,
-            latest.signature,
-            state.nonce,
-        );
-        state.nonce = state.nonce.saturating_add(1);
-        let registered = state
-            .channels
-            .get_mut(&channel)
-            .expect("channel must still exist while lock is held");
         registered.settlement = SettlementState::Settling;
-        (state.relayer.clone(), close, latest.cumulative)
+        let nonce = state.nonce;
+        state.nonce = state.nonce.saturating_add(1);
+        (
+            registered.payer.clone(),
+            registered.open_nonce,
+            latest,
+            nonce,
+        )
     };
 
-    relayer.submit_until_finalized(close).await;
+    // Build and sign the close outside the lock: only the nonce reservation
+    // and settlement flag above need mutual exclusion.
+    let cumulative = latest.cumulative;
+    let close = build_close(
+        &state.shared.receiver,
+        &state.shared.receiver_pk,
+        &payer,
+        open_nonce,
+        cumulative,
+        latest.signature,
+        nonce,
+    );
+    submit_until_finalized(&state.shared.relayer, close).await;
 
-    let mut state = state.inner.lock().await;
+    let mut state = state.shared.state.lock().await;
     if let Some(registered) = state.channels.get_mut(&channel) {
         registered.settlement = SettlementState::Settled;
     }
@@ -560,19 +551,19 @@ impl ChannelVerifier {
         &self,
         digest: &<Sha256 as commonware_cryptography::Hasher>::Digest,
     ) -> Result<VerifiedOpenChannel, String> {
-        let metadata = self
-            .indexer
-            .transaction_metadata::<Sha256>(digest)
-            .await
+        // The metadata and tip lookups are independent round-trips.
+        let certificate_cfg = (ConsensusScheme::certificate_codec_config_unbounded(), ());
+        let (metadata, latest) = tokio::join!(
+            self.indexer.transaction_metadata::<Sha256>(digest),
+            self.indexer
+                .latest_certified_header::<Sha256, ed25519::PublicKey, ConsensusScheme>(
+                    &certificate_cfg
+                ),
+        );
+        let metadata = metadata
             .map_err(|error| format!("open transaction metadata lookup failed: {error}"))?
             .ok_or_else(|| "open transaction is not finalized".to_string())?;
-        let latest = self
-            .indexer
-            .latest_certified_header::<Sha256, ed25519::PublicKey, ConsensusScheme>(&(
-                ConsensusScheme::certificate_codec_config_unbounded(),
-                (),
-            ))
-            .await
+        let latest = latest
             .map_err(|error| format!("latest finalized header lookup failed: {error}"))?
             .ok_or_else(|| "no finalized header available".to_string())?;
         let header = latest.header();
@@ -631,66 +622,35 @@ impl ChannelVerifier {
     }
 }
 
-impl RelayerClient {
-    fn new(url: String) -> Self {
-        Self {
-            url: url.trim_end_matches('/').to_string(),
-            http: reqwest::Client::new(),
-        }
-    }
-
-    async fn submit_until_finalized(&self, close: Tx) {
-        let body = vec![close].encode();
-        loop {
-            match self.submit_encoded(body.clone()).await {
-                Ok(RelayerBatchStatus::Finalized { height }) => {
-                    debug!(height, "operator close finalized");
-                    return;
-                }
-                Ok(RelayerBatchStatus::PartiallyFinalized {
+async fn submit_until_finalized(relayer: &Client, close: Tx) {
+    let batch = [close];
+    loop {
+        match relayer.submit(&batch).await {
+            Ok(TxStatus::Finalized { height }) => {
+                debug!(height, "operator close finalized");
+                return;
+            }
+            Ok(TxStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            }) if !included.is_empty() => {
+                debug!(
                     height,
-                    included,
-                    filtered,
-                }) if !included.is_empty() => {
-                    debug!(
-                        height,
-                        included = included.len(),
-                        filtered = filtered.len(),
-                        "operator close partially finalized"
-                    );
-                    return;
-                }
-                Ok(status) => {
-                    warn!(?status, "operator close not finalized, retrying");
-                }
-                Err(error) => {
-                    warn!(%error, "operator close submit failed, retrying");
-                }
+                    included = included.len(),
+                    filtered = filtered.len(),
+                    "operator close partially finalized"
+                );
+                return;
             }
-            tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
-        }
-    }
-
-    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<RelayerBatchStatus, SubmitError> {
-        let response = self
-            .http
-            .post(format!("{}/transactions", self.url))
-            .header("content-type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await?;
-
-        match response.status().as_u16() {
-            200 => {
-                let bytes = response.bytes().await?;
-                serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)
+            Ok(status) => {
+                warn!(?status, "operator close not finalized, retrying");
             }
-            400 => Err(SubmitError::BadRequest),
-            413 => Err(SubmitError::PayloadTooLarge),
-            500 => Err(SubmitError::InternalServerError),
-            503 => Err(SubmitError::ServiceUnavailable),
-            other => Err(SubmitError::Unexpected(other)),
+            Err(error) => {
+                warn!(%error, "operator close submit failed, retrying");
+            }
         }
+        tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
     }
 }
 
@@ -725,39 +685,10 @@ impl IntoResponse for ApiError {
     }
 }
 
-fn decode_account_key(field: &str, value: &str) -> Result<AccountKey, ApiError> {
-    decode_hex_field(field, value).and_then(|bytes| {
-        AccountKey::decode(bytes.as_slice())
-            .map_err(|_| ApiError::bad_request(format!("bad {field}")))
-    })
-}
-
-fn decode_public_key(field: &str, value: &str) -> Result<TransactionPublicKey, ApiError> {
-    decode_hex_field(field, value).and_then(|bytes| {
-        TransactionPublicKey::decode(bytes.as_slice())
-            .map_err(|_| ApiError::bad_request(format!("bad {field}")))
-    })
-}
-
-fn decode_signature(field: &str, value: &str) -> Result<ed25519::Signature, ApiError> {
-    decode_hex_field(field, value).and_then(|bytes| {
-        ed25519::Signature::decode(bytes.as_slice())
-            .map_err(|_| ApiError::bad_request(format!("bad {field}")))
-    })
-}
-
-fn decode_sha256_digest(
-    field: &str,
-    value: &str,
-) -> Result<<Sha256 as commonware_cryptography::Hasher>::Digest, ApiError> {
-    decode_hex_field(field, value).and_then(|bytes| {
-        <Sha256 as commonware_cryptography::Hasher>::Digest::decode(bytes.as_slice())
-            .map_err(|_| ApiError::bad_request(format!("bad {field}")))
-    })
-}
-
-fn decode_hex_field(field: &str, value: &str) -> Result<Vec<u8>, ApiError> {
-    from_hex(value).ok_or_else(|| ApiError::bad_request(format!("bad {field} hex")))
+/// Decodes a hex-encoded request field into any codec type with no config.
+fn decode_field<T: DecodeExt<()>>(field: &str, value: &str) -> Result<T, ApiError> {
+    let bytes = from_hex(value).ok_or_else(|| ApiError::bad_request(format!("bad {field} hex")))?;
+    T::decode(bytes.as_slice()).map_err(|_| ApiError::bad_request(format!("bad {field}")))
 }
 
 #[cfg(test)]
@@ -806,10 +737,7 @@ mod tests {
         let registered = channels
             .get_mut(&channel)
             .expect("registration metadata should exist");
-        registered.latest = Some(AcceptedVoucher {
-            cumulative: voucher.cumulative,
-            signature: voucher.signature.clone(),
-        });
+        registered.latest = Some(voucher.clone());
         registered.settlement = SettlementState::Settling;
 
         assert!(

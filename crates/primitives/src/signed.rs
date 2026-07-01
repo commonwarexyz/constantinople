@@ -263,7 +263,7 @@ where
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
-        if len < Transaction::<H::Digest>::MIN_SIZE + TransactionSignature::MIN_SIZE {
+        if len < SignedTransaction::<H>::MIN_ENCODED_SIZE {
             return Err(Error::EndOfBuffer);
         }
         if buf.remaining() < len {

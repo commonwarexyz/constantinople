@@ -304,7 +304,7 @@ fn remote_operator_config(
         relayer_url: relayer_url(args, remote, material),
         indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
         qmdb_url: format!("http://{QMDB_INDEXER_HOST}:{}", remote.qmdb_indexer_port),
-        receiver_seed: 2_000_000_000,
+        receiver_seed: crate::default_operator_receiver_seed(),
         price: args.spammer_value,
     })
 }

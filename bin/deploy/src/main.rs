@@ -142,7 +142,7 @@ pub(crate) struct GenerateArgs {
     ///
     /// `0.2` submits `spammer_accounts + rand(0..=floor(spammer_accounts * 0.2))`
     /// txs per batch.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
     spammer_accounts_jitter: f64,
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
@@ -150,7 +150,7 @@ pub(crate) struct GenerateArgs {
     /// Fraction of spammer iterations that run a payment-channel lifecycle
     /// (open -> off-chain vouchers -> close) instead of a transfer batch. `0`
     /// disables channels.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
     spammer_channel_fraction: f64,
     /// Average off-chain vouchers streamed per channel before settling.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_CHANNEL_VOUCHERS, value_parser = parse_channel_vouchers)]
@@ -335,12 +335,14 @@ pub(crate) struct RelayerLeaderConfig {
     pub url: String,
 }
 
-fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
+/// Parses a fraction in `0..=1` (shared by `--spammer-accounts-jitter` and
+/// `--spammer-channel-fraction`).
+fn parse_unit_fraction(value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
-        .map_err(|error| format!("invalid jitter: {error}"))?;
+        .map_err(|error| format!("invalid fraction: {error}"))?;
     if !(0.0..=1.0).contains(&parsed) {
-        return Err("jitter must be between 0 and 1".to_string());
+        return Err("must be between 0 and 1".to_string());
     }
     Ok(parsed)
 }
