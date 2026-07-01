@@ -15,7 +15,7 @@ mod signer;
 mod submitter;
 
 use accounts::{SpamAccount, generate_accounts};
-use channels::ChannelRunner;
+use channels::{ChannelRunner, OperatorClient};
 use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
@@ -46,6 +46,7 @@ fn main() {
         rayon_threads,
         accounts_jitter,
         channel_fraction,
+        channel_operator_url,
         channel_vouchers,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
@@ -69,6 +70,8 @@ fn main() {
             cfg.rayon_threads,
             cfg.accounts_jitter,
             cfg.channel_fraction,
+            cfg.channel_operator_url
+                .map(|url| config::resolve_named_http_url(&url, cli.hosts.as_deref())),
             cfg.channel_vouchers,
         )
     } else {
@@ -85,6 +88,7 @@ fn main() {
             cli.rayon_threads,
             cli.accounts_jitter,
             cli.channel_fraction,
+            cli.channel_operator_url.clone(),
             cli.channel_vouchers,
         )
     };
@@ -107,10 +111,16 @@ fn main() {
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
     );
     if channel_fraction > 0.0 {
+        assert!(
+            channel_operator_url.is_some(),
+            "--channel-fraction > 0 requires --channel-operator-url"
+        );
         // A channel's deposit is `vouchers * value` and is debited from the
         // payer up front; the jittered count peaks at `avg + avg/2`. Keep the
         // peak deposit within the faucet balance so opens don't fail outright.
-        let max_vouchers = channel_vouchers.saturating_add(channel_vouchers / 2);
+        let max_vouchers = channel_vouchers
+            .saturating_add(channel_vouchers / 2)
+            .saturating_add(channels::MAX_REFUND_VOUCHERS);
         let max_deposit = max_vouchers.saturating_mul(value);
         assert!(
             max_deposit <= DEFAULT_ACCOUNT_BALANCE,
@@ -151,6 +161,7 @@ fn main() {
             presigned_batches,
             relayer_targets: primary_validators,
             channel_fraction,
+            channel_operator_url,
             channel_vouchers,
         };
         run_relayer_mode(config, strategy).await;
@@ -169,6 +180,8 @@ struct RelayerModeConfig {
     /// Probability that a submitter iteration runs a channel lifecycle instead
     /// of submitting a transfer batch. `0` disables channels.
     channel_fraction: f64,
+    /// Operator URL used for payment-channel voucher serving and settlement.
+    channel_operator_url: Option<String>,
     /// Average off-chain vouchers streamed per channel before settling.
     channel_vouchers: u64,
 }
@@ -187,6 +200,7 @@ async fn run_relayer_mode(
         presigned_batches,
         relayer_targets,
         channel_fraction,
+        channel_operator_url,
         channel_vouchers,
     } = config;
 
@@ -199,12 +213,29 @@ async fn run_relayer_mode(
         %relayer_url,
         presigned_batches,
         channel_fraction,
+        channel_operator_url = channel_operator_url.as_deref().unwrap_or(""),
         channel_vouchers,
         "starting spammer relayer mode"
     );
 
     let stats = Arc::new(Stats::new());
     let start = Instant::now();
+    let operator = match channel_operator_url {
+        Some(url) if channel_fraction > 0.0 => {
+            let client = OperatorClient::new(url);
+            let public_key = loop {
+                match client.public_key().await {
+                    Ok(public_key) => break public_key,
+                    Err(error) => {
+                        tracing::warn!(%error, "operator public key unavailable, retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            };
+            Some((client, public_key))
+        }
+        _ => None,
+    };
 
     for index in 0..relayer_submitters {
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
@@ -225,8 +256,13 @@ async fn run_relayer_mode(
         let channel_offset = channel_account_offset(seed_offset, index, accounts_count);
         let channel_runner = (channel_fraction > 0.0).then(|| {
             let channel_accounts = generate_accounts(accounts_count, channel_offset);
+            let (operator, operator_pk) = operator
+                .as_ref()
+                .expect("operator configured when channel_fraction > 0");
             ChannelRunner::new(
                 channel_accounts,
+                operator.clone(),
+                operator_pk.clone(),
                 channel_vouchers,
                 value.get(),
                 channel_offset,

@@ -46,6 +46,9 @@ pub struct SpammerConfig {
     /// instead of a transfer batch. `0` disables channels.
     #[serde(default)]
     pub channel_fraction: f64,
+    /// Operator URL used for payment-channel voucher serving and settlement.
+    #[serde(default)]
+    pub channel_operator_url: Option<String>,
     /// Average off-chain vouchers streamed per channel before settling.
     #[serde(default = "default_channel_vouchers")]
     pub channel_vouchers: u64,
@@ -117,6 +120,7 @@ mod tests {
             primary_validators: vec!["deadbeef".to_string()],
             accounts_jitter: 0.25,
             channel_fraction: 0.1,
+            channel_operator_url: Some("http://operator:8093".to_string()),
             channel_vouchers: 12,
         };
         let yaml = serde_yaml::to_string(&config).expect("serialize");
@@ -132,6 +136,7 @@ mod tests {
         assert_eq!(parsed.primary_validators, config.primary_validators);
         assert_eq!(parsed.accounts_jitter, config.accounts_jitter);
         assert_eq!(parsed.channel_fraction, config.channel_fraction);
+        assert_eq!(parsed.channel_operator_url, config.channel_operator_url);
         assert_eq!(parsed.channel_vouchers, config.channel_vouchers);
     }
 
@@ -144,6 +149,7 @@ mod tests {
         assert_eq!(parsed.presigned_batches, DEFAULT_PRESIGNED_BATCHES);
         assert_eq!(parsed.accounts_jitter, 0.0);
         assert_eq!(parsed.channel_fraction, 0.0);
+        assert_eq!(parsed.channel_operator_url, None);
         assert_eq!(parsed.channel_vouchers, DEFAULT_CHANNEL_VOUCHERS);
     }
 

@@ -58,6 +58,10 @@ pub struct Cli {
     #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
     pub channel_fraction: f64,
 
+    /// Operator base URL for payment-channel voucher serving and settlement.
+    #[arg(long)]
+    pub channel_operator_url: Option<String>,
+
     /// Average number of off-chain vouchers streamed per channel before it is
     /// settled — the per-channel payment count. Must be >= 1.
     #[arg(long, default_value_t = crate::config::DEFAULT_CHANNEL_VOUCHERS, value_parser = parse_channel_vouchers)]

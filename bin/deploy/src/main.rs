@@ -39,6 +39,9 @@ const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const VALIDATOR_BINARY_FILE: &str = "validator";
 const SPAMMER_BINARY_FILE: &str = "spammer";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
+const OPERATOR_BINARY_FILE: &str = "operator";
+const OPERATOR_CONFIG_FILE: &str = "operator.yaml";
+const OPERATOR_HOST: &str = "operator";
 const CHAIN_INDEXER_BINARY_FILE: &str = "chain-indexer";
 const CHAIN_INDEXER_CONFIG_FILE: &str = "chain-indexer.yaml";
 const CHAIN_INDEXER_DATA_DIR: &str = "chain-indexer";
@@ -53,6 +56,7 @@ const SIMPLEX_VERIFICATION_MATERIAL_FILE: &str = "simplex-verification-material.
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
+const DEFAULT_OPERATOR_PORT: u16 = 8093;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
@@ -286,9 +290,27 @@ pub(crate) struct SpammerConfig {
     /// instead of a transfer batch. `0` disables channels.
     #[serde(default)]
     pub channel_fraction: f64,
+    /// Operator URL used for payment-channel voucher serving and settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_operator_url: Option<String>,
     /// Average off-chain vouchers streamed per channel before settling.
     #[serde(default = "default_spammer_channel_vouchers")]
     pub channel_vouchers: u64,
+}
+
+/// Operator configuration, written as YAML by deploy and read by the operator binary.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct OperatorConfig {
+    /// Local HTTP port the operator serves on.
+    pub http_port: u16,
+    /// Relayer URL used for close transaction submission.
+    pub relayer_url: String,
+    /// Deterministic receiver key seed.
+    #[serde(default = "default_operator_receiver_seed")]
+    pub receiver_seed: u64,
+    /// Price charged per voucher step.
+    #[serde(default = "default_operator_price")]
+    pub price: u64,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
@@ -520,6 +542,14 @@ const fn default_spammer_channel_vouchers() -> u64 {
     DEFAULT_SPAMMER_CHANNEL_VOUCHERS
 }
 
+const fn default_operator_receiver_seed() -> u64 {
+    2_000_000_000
+}
+
+const fn default_operator_price() -> u64 {
+    1
+}
+
 fn main() {
     init_tracing();
     let cli = Cli::parse();
@@ -596,6 +626,10 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
+    );
+    assert!(
+        args.spammer || args.spammer_channel_fraction == 0.0,
+        "--spammer-channel-fraction > 0 requires --spammer"
     );
 }
 

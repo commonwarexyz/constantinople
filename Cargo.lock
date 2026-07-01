@@ -1835,6 +1835,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-operator"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "bytes",
+ "clap",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-deployer",
+ "commonware-formatting",
+ "constantinople-application",
+ "constantinople-mempool",
+ "constantinople-primitives",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "constantinople-primitives"
 version = "0.0.0"
 dependencies = [

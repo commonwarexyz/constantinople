@@ -1,4 +1,4 @@
-import { fromHex, toArrayBuffer } from './codec';
+import { fromHex, signedTransactionBodyLength, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import {
     SqlClient,
@@ -25,11 +25,6 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const TRANSACTION_PUBLIC_KEY_BYTES = 34;
-const TRANSACTION_VALUE_BYTES = 8;
-const TRANSACTION_NONCE_BYTES = 8;
-const TRANSACTION_BODY_BYTES =
-    TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
 
@@ -318,10 +313,11 @@ async function fetchVerifiedSqlTransactionMetadata(
 
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
     const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
-    if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
+    const bodyLength = signedTransactionBodyLength(signedTransaction);
+    if (signedTransaction.length < bodyLength) {
         throw new Error('SQL transaction body is truncated');
     }
-    const transactionBody = signedTransaction.slice(0, TRANSACTION_BODY_BYTES);
+    const transactionBody = signedTransaction.slice(0, bodyLength);
     const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(transactionBody)));
     if (!bytesEqual(actual, digest)) {
         throw new Error('SQL transaction body does not match transaction digest');

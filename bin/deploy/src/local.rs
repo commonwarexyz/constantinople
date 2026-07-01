@@ -344,6 +344,22 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
+        let operator_url = if args.spammer_channel_fraction > 0.0 {
+            commands.push(format!(
+                "cargo run --release --bin constantinople-operator -- \
+                 --relayer-url http://127.0.0.1:{relayer_port} \
+                 --port {} \
+                 --price {}",
+                crate::DEFAULT_OPERATOR_PORT,
+                args.spammer_value,
+            ));
+            format!(
+                " --channel-operator-url http://127.0.0.1:{}",
+                crate::DEFAULT_OPERATOR_PORT
+            )
+        } else {
+            String::new()
+        };
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
@@ -358,6 +374,7 @@ fn local_run_commands(
              --accounts-jitter {} \
              --presigned-batches {} \
              --channel-fraction {} \
+             {operator_url} \
              --channel-vouchers {}",
             args.spammer_accounts,
             args.spammer_value,
@@ -560,6 +577,27 @@ mod tests {
         );
 
         assert!(commands[3].contains("--rayon-threads 6"));
+    }
+
+    #[test]
+    fn local_channel_spammer_starts_operator() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_channel_fraction = 0.5;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert_eq!(commands.len(), 5);
+        assert!(commands[3].contains("constantinople-operator"));
+        assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
+        assert!(commands[3].contains("--port 8093"));
+        assert!(commands[4].contains("constantinople-spammer"));
+        assert!(commands[4].contains("--channel-operator-url http://127.0.0.1:8093"));
     }
 
     #[test]
