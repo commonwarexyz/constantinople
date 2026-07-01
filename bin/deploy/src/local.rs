@@ -349,6 +349,7 @@ fn local_run_commands(
                 "cargo run --release --bin constantinople-operator -- \
                  --relayer-url http://127.0.0.1:{relayer_port} \
                  --port {} \
+                 --listen-addr 127.0.0.1 \
                  --price {}",
                 crate::DEFAULT_OPERATOR_PORT,
                 args.spammer_value,
@@ -596,6 +597,7 @@ mod tests {
         assert!(commands[3].contains("constantinople-operator"));
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
         assert!(commands[3].contains("--port 8093"));
+        assert!(commands[3].contains("--listen-addr 127.0.0.1"));
         assert!(commands[4].contains("constantinople-spammer"));
         assert!(commands[4].contains("--channel-operator-url http://127.0.0.1:8093"));
     }

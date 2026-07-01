@@ -300,6 +300,7 @@ fn remote_operator_config(
 ) -> Option<OperatorConfig> {
     (args.spammer_channel_fraction > 0.0).then(|| OperatorConfig {
         http_port: remote.http_port,
+        listen_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         relayer_url: relayer_url(args, remote, material),
         receiver_seed: 2_000_000_000,
         price: args.spammer_value,
@@ -758,6 +759,10 @@ mod tests {
         let operator = remote_operator_config(&args, &remote, &material)
             .expect("channel spam should generate operator config");
         let relayer_key = hex(&material.secondary_public_keys[0].encode());
+        assert_eq!(
+            operator.listen_addr,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
         assert_eq!(operator.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(operator.price, args.spammer_value);
     }

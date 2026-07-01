@@ -303,6 +303,9 @@ pub(crate) struct SpammerConfig {
 pub(crate) struct OperatorConfig {
     /// Local HTTP port the operator serves on.
     pub http_port: u16,
+    /// HTTP bind address for the operator server.
+    #[serde(default = "default_operator_listen_addr")]
+    pub listen_addr: std::net::IpAddr,
     /// Relayer URL used for close transaction submission.
     pub relayer_url: String,
     /// Deterministic receiver key seed.
@@ -540,6 +543,10 @@ const fn default_spammer_rayon_threads() -> usize {
 
 const fn default_spammer_channel_vouchers() -> u64 {
     DEFAULT_SPAMMER_CHANNEL_VOUCHERS
+}
+
+const fn default_operator_listen_addr() -> std::net::IpAddr {
+    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
 }
 
 const fn default_operator_receiver_seed() -> u64 {

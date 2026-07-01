@@ -26,7 +26,7 @@ use constantinople_primitives::{
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -53,6 +53,10 @@ struct Cli {
     #[arg(long, default_value_t = 8093)]
     port: u16,
 
+    /// HTTP bind address.
+    #[arg(long, default_value = "127.0.0.1")]
+    listen_addr: IpAddr,
+
     /// Relayer base URL for close transaction submission.
     #[arg(long)]
     relayer_url: Option<String>,
@@ -69,11 +73,17 @@ struct Cli {
 #[derive(Debug, Deserialize)]
 struct OperatorConfig {
     http_port: u16,
+    #[serde(default = "default_listen_addr")]
+    listen_addr: IpAddr,
     relayer_url: String,
     #[serde(default = "default_receiver_seed")]
     receiver_seed: u64,
     #[serde(default = "default_price")]
     price: u64,
+}
+
+const fn default_listen_addr() -> IpAddr {
+    IpAddr::V4(Ipv4Addr::LOCALHOST)
 }
 
 const fn default_receiver_seed() -> u64 {
@@ -203,7 +213,7 @@ async fn main() {
         })),
     };
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], config.port));
+    let addr = SocketAddr::new(config.listen_addr, config.port);
     let app = Router::new()
         .route("/health", get(health))
         .route("/public-key", get(public_key))
@@ -223,6 +233,7 @@ async fn main() {
 
 struct OperatorRuntimeConfig {
     port: u16,
+    listen_addr: IpAddr,
     relayer_url: String,
     receiver_seed: u64,
     price: u64,
@@ -236,6 +247,7 @@ impl OperatorRuntimeConfig {
                 serde_yaml::from_str(&raw).expect("failed to parse operator config");
             return Self {
                 port: config.http_port,
+                listen_addr: config.listen_addr,
                 relayer_url: resolve_named_http_url(&config.relayer_url, cli.hosts.as_deref()),
                 receiver_seed: config.receiver_seed,
                 price: config.price,
@@ -244,6 +256,7 @@ impl OperatorRuntimeConfig {
 
         Self {
             port: cli.port,
+            listen_addr: cli.listen_addr,
             relayer_url: cli.relayer_url.expect("provide --relayer-url or --config"),
             receiver_seed: cli.receiver_seed,
             price: cli.price,
@@ -540,4 +553,18 @@ fn decode_signature(field: &str, value: &str) -> Result<ed25519::Signature, ApiE
 
 fn decode_hex_field(field: &str, value: &str) -> Result<Vec<u8>, ApiError> {
     from_hex(value).ok_or_else(|| ApiError::bad_request(format!("bad {field} hex")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_defaults_to_loopback_listen_addr() {
+        let config: OperatorConfig =
+            serde_yaml::from_str("http_port: 8093\nrelayer_url: http://127.0.0.1:8082\n")
+                .expect("operator config should parse");
+
+        assert_eq!(config.listen_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
 }
