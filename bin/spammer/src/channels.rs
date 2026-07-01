@@ -133,6 +133,7 @@ impl ChannelRunner {
             deposit,
             open_nonce,
         );
+        let open_tx_digest = *open.message_digest();
         if submitter.submit_reporting(vec![open]).await == 0 {
             // Open did not finalize; don't close a channel that doesn't exist.
             return LifecycleStats {
@@ -146,7 +147,7 @@ impl ChannelRunner {
         let channel = channel_address(&payer_account, &self.operator_account, open_nonce);
         if let Err(error) = self
             .operator
-            .register_channel(channel, &payer_pk, open_nonce, deposit_value)
+            .register_channel(channel, &payer_pk, open_nonce, &open_tx_digest)
             .await
         {
             warn!(%error, %channel, "operator channel registration failed");
@@ -220,7 +221,7 @@ struct RegisterRequest {
     channel: String,
     payer: String,
     open_nonce: u64,
-    deposit: u64,
+    open_tx_digest: String,
 }
 
 #[derive(serde::Serialize)]
@@ -270,7 +271,7 @@ impl OperatorClient {
         channel: AccountKey,
         payer: &TransactionPublicKey,
         open_nonce: u64,
-        deposit: u64,
+        open_tx_digest: &<Sha256 as commonware_cryptography::Hasher>::Digest,
     ) -> Result<(), String> {
         self.post_json(
             "/channels",
@@ -278,7 +279,7 @@ impl OperatorClient {
                 channel: channel.to_string(),
                 payer: hex(&payer.encode()),
                 open_nonce,
-                deposit,
+                open_tx_digest: hex(open_tx_digest.as_ref()),
             },
         )
         .await

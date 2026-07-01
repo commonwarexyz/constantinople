@@ -308,6 +308,10 @@ pub(crate) struct OperatorConfig {
     pub listen_addr: std::net::IpAddr,
     /// Relayer URL used for close transaction submission.
     pub relayer_url: String,
+    /// Shared chain-indexer Store URL used for finalized transaction lookup.
+    pub indexer_url: String,
+    /// Shared QMDB facade URL used for transaction inclusion proofs.
+    pub qmdb_url: String,
     /// Deterministic receiver key seed.
     #[serde(default = "default_operator_receiver_seed")]
     pub receiver_seed: u64,
@@ -637,6 +641,10 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     assert!(
         args.spammer || args.spammer_channel_fraction == 0.0,
         "--spammer-channel-fraction > 0 requires --spammer"
+    );
+    assert!(
+        args.indexer || args.spammer_channel_fraction == 0.0,
+        "--spammer-channel-fraction > 0 requires --indexer"
     );
 }
 

@@ -17,7 +17,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction};
 use datafusion::{
-    arrow::array::{Array, StringArray},
+    arrow::array::{Array, StringArray, UInt64Array},
     prelude::SessionContext,
 };
 use exoware_sdk::{ClientError, StoreClient};
@@ -59,6 +59,13 @@ pub enum ReadError {
 pub struct IndexerClient {
     blocks: SimplexClient,
     sql: SessionContext,
+}
+
+/// Metadata needed to authenticate and decode a finalized transaction row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionMetadata {
+    pub qmdb_location: u64,
+    pub bytes: Bytes,
 }
 
 impl std::fmt::Debug for IndexerClient {
@@ -268,8 +275,23 @@ impl IndexerClient {
     where
         H: Hasher,
     {
+        Ok(self
+            .transaction_metadata::<H>(digest)
+            .await?
+            .map(|metadata| metadata.bytes))
+    }
+
+    /// Fetch transaction metadata for `digest`, including its QMDB operation-log
+    /// location and encoded signed transaction bytes.
+    pub async fn transaction_metadata<H>(
+        &self,
+        digest: &H::Digest,
+    ) -> Result<Option<TransactionMetadata>, ReadError>
+    where
+        H: Hasher,
+    {
         let sql = format!(
-            "SELECT body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
+            "SELECT qmdb_location, body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
             hex_lower(digest.as_ref())
         );
         let batches = self.sql.sql(&sql).await?.collect().await?;
@@ -277,8 +299,20 @@ impl IndexerClient {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let body_hex = batch
+            let qmdb_location = batch
                 .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    ReadError::SqlRow("tx_meta.qmdb_location must be UInt64".to_string())
+                })?;
+            if qmdb_location.is_null(0) {
+                return Err(ReadError::SqlRow(
+                    "tx_meta.qmdb_location must not be null".to_string(),
+                ));
+            }
+            let body_hex = batch
+                .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| ReadError::SqlRow("tx_meta.body_hex must be Utf8".to_string()))?;
@@ -289,7 +323,10 @@ impl IndexerClient {
             }
             let bytes = decode_hex(body_hex.value(0))?;
             verify_signed_transaction_digest::<H>(&bytes, digest)?;
-            return Ok(Some(Bytes::from(bytes)));
+            return Ok(Some(TransactionMetadata {
+                qmdb_location: qmdb_location.value(0),
+                bytes: Bytes::from(bytes),
+            }));
         }
         Ok(None)
     }

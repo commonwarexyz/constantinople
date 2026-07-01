@@ -302,6 +302,8 @@ fn remote_operator_config(
         http_port: remote.http_port,
         listen_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
         relayer_url: relayer_url(args, remote, material),
+        indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+        qmdb_url: format!("http://{QMDB_INDEXER_HOST}:{}", remote.qmdb_indexer_port),
         receiver_seed: 2_000_000_000,
         price: args.spammer_value,
     })
@@ -745,6 +747,7 @@ mod tests {
     #[test]
     fn remote_channel_spammer_uses_operator() {
         let mut args = generate_args();
+        args.indexer = true;
         args.spammer = true;
         args.relayer = true;
         args.spammer_channel_fraction = 0.5;
@@ -758,12 +761,14 @@ mod tests {
         );
         let operator = remote_operator_config(&args, &remote, &material)
             .expect("channel spam should generate operator config");
-        let relayer_key = hex(&material.secondary_public_keys[0].encode());
         assert_eq!(
             operator.listen_addr,
             std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
         );
+        let relayer_key = hex(&material.secondary_public_keys[1].encode());
         assert_eq!(operator.relayer_url, format!("http://{relayer_key}:8080"));
+        assert_eq!(operator.indexer_url, "http://chain-indexer:8090");
+        assert_eq!(operator.qmdb_url, "http://qmdb-indexer:8092");
         assert_eq!(operator.price, args.spammer_value);
     }
 

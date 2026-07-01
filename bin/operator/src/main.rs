@@ -14,15 +14,25 @@ use axum::{
 };
 use clap::Parser;
 use commonware_codec::{DecodeExt as _, Encode};
-use commonware_cryptography::{Sha256, Signer as _, ed25519};
+use commonware_cryptography::{
+    Sha256, Signer as _, bls12381::primitives::variant::MinSig, certificate::Verifier as _, ed25519,
+};
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
+use commonware_storage::{
+    merkle::mmr,
+    qmdb::{any::value::FixedEncoding, keyless},
+};
 use constantinople_application::operator::{ChannelOperator, ServeError};
+use constantinople_engine::ThresholdScheme;
+use constantinople_indexer::IndexerClient;
 use constantinople_mempool::webserver::client::SubmitError;
 use constantinople_primitives::{
-    AccountKey, SignedTransaction, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
-    Voucher, channel_address,
+    AccountKey, Operation, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
+    TransactionPublicKey, Voucher, channel_address,
 };
+use exoware_qmdb::{OperationLogClient, proto::qmdb::v1::GetOperationRangeRequest};
+use exoware_sdk::{StoreClient, proto::PreferZstdHttpClient};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -35,6 +45,12 @@ use tokio::sync::Mutex;
 use tracing::{debug, info, warn};
 
 type Tx = SignedTransaction<Sha256>;
+type QmdbFamily = mmr::Family;
+type TransactionEncoding = FixedEncoding<<Sha256 as commonware_cryptography::Hasher>::Digest>;
+type TransactionOperation = keyless::Operation<QmdbFamily, TransactionEncoding>;
+type TransactionProofClient =
+    OperationLogClient<PreferZstdHttpClient, QmdbFamily, Sha256, TransactionOperation>;
+type ConsensusScheme = ThresholdScheme<ed25519::PublicKey, MinSig>;
 
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -61,6 +77,14 @@ struct Cli {
     #[arg(long)]
     relayer_url: Option<String>,
 
+    /// Chain indexer Store base URL.
+    #[arg(long)]
+    indexer_url: Option<String>,
+
+    /// Transaction QMDB proof service base URL.
+    #[arg(long)]
+    qmdb_url: Option<String>,
+
     /// Deterministic receiver key seed.
     #[arg(long, default_value_t = 2_000_000_000)]
     receiver_seed: u64,
@@ -76,6 +100,8 @@ struct OperatorConfig {
     #[serde(default = "default_listen_addr")]
     listen_addr: IpAddr,
     relayer_url: String,
+    indexer_url: String,
+    qmdb_url: String,
     #[serde(default = "default_receiver_seed")]
     receiver_seed: u64,
     #[serde(default = "default_price")]
@@ -105,6 +131,7 @@ struct OperatorState {
     receiver_pk: TransactionPublicKey,
     receiver_account: AccountKey,
     relayer: RelayerClient,
+    verifier: ChannelVerifier,
     nonce: u64,
     channels: BTreeMap<AccountKey, RegisteredChannel>,
 }
@@ -113,7 +140,14 @@ struct RegisteredChannel {
     payer: TransactionPublicKey,
     open_nonce: u64,
     latest: Option<AcceptedVoucher>,
-    settled: bool,
+    settlement: SettlementState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SettlementState {
+    Open,
+    Settling,
+    Settled,
 }
 
 #[derive(Clone)]
@@ -128,6 +162,19 @@ struct RelayerClient {
     http: reqwest::Client,
 }
 
+#[derive(Clone)]
+struct ChannelVerifier {
+    indexer: IndexerClient,
+    transactions: TransactionProofClient,
+}
+
+struct VerifiedOpenChannel {
+    payer: TransactionPublicKey,
+    receiver: AccountKey,
+    open_nonce: u64,
+    deposit: u64,
+}
+
 #[derive(Debug, Serialize)]
 struct PublicKeyResponse {
     public_key: String,
@@ -139,7 +186,7 @@ struct RegisterRequest {
     channel: String,
     payer: String,
     open_nonce: u64,
-    deposit: u64,
+    open_tx_digest: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +248,7 @@ async fn main() {
     let receiver = ed25519::PrivateKey::from_seed(config.receiver_seed);
     let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
     let receiver_account = AccountKey::from_public_key(&receiver_pk);
+    let verifier = ChannelVerifier::new(config.indexer_url, config.qmdb_url);
     let state = AppState {
         inner: Arc::new(Mutex::new(OperatorState {
             operator: ChannelOperator::new(config.price),
@@ -208,6 +256,7 @@ async fn main() {
             receiver_pk,
             receiver_account,
             relayer: RelayerClient::new(config.relayer_url),
+            verifier,
             nonce: 0,
             channels: BTreeMap::new(),
         })),
@@ -235,6 +284,8 @@ struct OperatorRuntimeConfig {
     port: u16,
     listen_addr: IpAddr,
     relayer_url: String,
+    indexer_url: String,
+    qmdb_url: String,
     receiver_seed: u64,
     price: u64,
 }
@@ -249,6 +300,8 @@ impl OperatorRuntimeConfig {
                 port: config.http_port,
                 listen_addr: config.listen_addr,
                 relayer_url: resolve_named_http_url(&config.relayer_url, cli.hosts.as_deref()),
+                indexer_url: resolve_named_http_url(&config.indexer_url, cli.hosts.as_deref()),
+                qmdb_url: resolve_named_http_url(&config.qmdb_url, cli.hosts.as_deref()),
                 receiver_seed: config.receiver_seed,
                 price: config.price,
             };
@@ -258,6 +311,8 @@ impl OperatorRuntimeConfig {
             port: cli.port,
             listen_addr: cli.listen_addr,
             relayer_url: cli.relayer_url.expect("provide --relayer-url or --config"),
+            indexer_url: cli.indexer_url.expect("provide --indexer-url or --config"),
+            qmdb_url: cli.qmdb_url.expect("provide --qmdb-url or --config"),
             receiver_seed: cli.receiver_seed,
             price: cli.price,
         }
@@ -311,32 +366,49 @@ async fn register_channel(
 ) -> Result<Json<RegisterResponse>, ApiError> {
     let channel = decode_account_key("channel", &request.channel)?;
     let payer = decode_public_key("payer", &request.payer)?;
-    if request.deposit == 0 {
-        return Err(ApiError::bad_request("deposit must be > 0"));
+    let open_tx_digest = decode_sha256_digest("open_tx_digest", &request.open_tx_digest)?;
+
+    let (verifier, receiver_account) = {
+        let state = state.inner.lock().await;
+        (state.verifier.clone(), state.receiver_account)
+    };
+
+    let open = verifier
+        .verify_open_channel(&open_tx_digest)
+        .await
+        .map_err(ApiError::bad_request)?;
+    if open.payer != payer {
+        return Err(ApiError::bad_request("open transaction payer mismatch"));
+    }
+    if open.open_nonce != request.open_nonce {
+        return Err(ApiError::bad_request("open transaction nonce mismatch"));
+    }
+    if open.receiver != receiver_account {
+        return Err(ApiError::bad_request("open transaction receiver mismatch"));
     }
 
-    let mut state = state.inner.lock().await;
-    let payer_account = AccountKey::from_public_key(&payer);
-    let expected = channel_address(&payer_account, &state.receiver_account, request.open_nonce);
+    let payer_account = AccountKey::from_public_key(&open.payer);
+    let expected = channel_address(&payer_account, &receiver_account, request.open_nonce);
     if expected != channel {
         return Err(ApiError::bad_request(
             "channel address does not match registration",
         ));
     }
 
+    let mut state = state.inner.lock().await;
     state
         .operator
-        .register_channel(channel, payer.clone(), request.deposit);
+        .register_channel(channel, payer.clone(), open.deposit);
     state.channels.insert(
         channel,
         RegisteredChannel {
             payer,
             open_nonce: request.open_nonce,
             latest: None,
-            settled: false,
+            settlement: SettlementState::Open,
         },
     );
-    debug!(%channel, deposit = request.deposit, "registered channel");
+    debug!(%channel, deposit = open.deposit, "registered channel");
     Ok(Json(RegisterResponse { registered: true }))
 }
 
@@ -377,16 +449,19 @@ async fn settle_channel(
         let Some(registered) = state.channels.get(&channel) else {
             return Err(ApiError::bad_request("unknown channel"));
         };
-        if registered.settled {
-            let cumulative = registered
-                .latest
-                .as_ref()
-                .map(|voucher| voucher.cumulative)
-                .unwrap_or(0);
-            return Ok(Json(SettleResponse {
-                settled: true,
-                cumulative,
-            }));
+        match registered.settlement {
+            SettlementState::Settled | SettlementState::Settling => {
+                let cumulative = registered
+                    .latest
+                    .as_ref()
+                    .map(|voucher| voucher.cumulative)
+                    .unwrap_or(0);
+                return Ok(Json(SettleResponse {
+                    settled: registered.settlement == SettlementState::Settled,
+                    cumulative,
+                }));
+            }
+            SettlementState::Open => {}
         }
         let Some(latest) = registered.latest.clone() else {
             return Err(ApiError::bad_request("channel has no accepted vouchers"));
@@ -401,6 +476,11 @@ async fn settle_channel(
             state.nonce,
         );
         state.nonce = state.nonce.saturating_add(1);
+        let registered = state
+            .channels
+            .get_mut(&channel)
+            .expect("channel must still exist while lock is held");
+        registered.settlement = SettlementState::Settling;
         (state.relayer.clone(), close, latest.cumulative)
     };
 
@@ -408,7 +488,7 @@ async fn settle_channel(
 
     let mut state = state.inner.lock().await;
     if let Some(registered) = state.channels.get_mut(&channel) {
-        registered.settled = true;
+        registered.settlement = SettlementState::Settled;
     }
     Ok(Json(SettleResponse {
         settled: true,
@@ -434,6 +514,90 @@ fn build_close(
         nonce,
     )
     .seal_and_sign(receiver, TRANSACTION_NAMESPACE, &mut Sha256::default())
+}
+
+impl ChannelVerifier {
+    fn new(indexer_url: String, qmdb_url: String) -> Self {
+        let store = StoreClient::new(&indexer_url);
+        Self {
+            indexer: IndexerClient::new(store.clone(), store),
+            transactions: OperationLogClient::plaintext(&qmdb_url, ()),
+        }
+    }
+
+    async fn verify_open_channel(
+        &self,
+        digest: &<Sha256 as commonware_cryptography::Hasher>::Digest,
+    ) -> Result<VerifiedOpenChannel, String> {
+        let metadata = self
+            .indexer
+            .transaction_metadata::<Sha256>(digest)
+            .await
+            .map_err(|error| format!("open transaction metadata lookup failed: {error}"))?
+            .ok_or_else(|| "open transaction is not finalized".to_string())?;
+        let latest = self
+            .indexer
+            .latest_certified_header::<Sha256, ed25519::PublicKey, ConsensusScheme>(&(
+                ConsensusScheme::certificate_codec_config_unbounded(),
+                (),
+            ))
+            .await
+            .map_err(|error| format!("latest finalized header lookup failed: {error}"))?
+            .ok_or_else(|| "no finalized header available".to_string())?;
+        let header = latest.header();
+        let tip = header
+            .transactions_range
+            .end()
+            .checked_sub(1)
+            .ok_or_else(|| "latest finalized transaction range is empty".to_string())?;
+        if metadata.qmdb_location > tip {
+            return Err(
+                "open transaction is beyond the latest finalized transaction tip".to_string(),
+            );
+        }
+        let proof = self
+            .transactions
+            .get_operation_range(
+                GetOperationRangeRequest {
+                    tip,
+                    start_location: metadata.qmdb_location,
+                    max_locations: 1,
+                    ..Default::default()
+                },
+                &header.transactions_root,
+            )
+            .await
+            .map_err(|error| format!("open transaction inclusion proof failed: {error}"))?;
+        let Some((location, operation)) = proof.operations.into_iter().next() else {
+            return Err("open transaction proof returned no operation".to_string());
+        };
+        if location.as_u64() != metadata.qmdb_location {
+            return Err("open transaction proof returned the wrong location".to_string());
+        }
+        if operation.into_value().as_ref() != Some(digest) {
+            return Err("open transaction proof does not contain the requested digest".to_string());
+        }
+
+        let tx = SignedTransaction::<Sha256>::decode(metadata.bytes.as_ref())
+            .map_err(|error| format!("open transaction decode failed: {error}"))?;
+        if tx.message_digest() != digest {
+            return Err("open transaction body digest mismatch".to_string());
+        }
+        let payer = tx
+            .value()
+            .sender()
+            .ok_or_else(|| "open transaction sender did not decode".to_string())?
+            .clone();
+        let Operation::OpenChannel { receiver, deposit } = tx.value().op() else {
+            return Err("open transaction is not an OpenChannel".to_string());
+        };
+        Ok(VerifiedOpenChannel {
+            payer,
+            receiver: *receiver,
+            open_nonce: tx.value().nonce,
+            deposit: deposit.get(),
+        })
+    }
 }
 
 impl RelayerClient {
@@ -551,6 +715,16 @@ fn decode_signature(field: &str, value: &str) -> Result<ed25519::Signature, ApiE
     })
 }
 
+fn decode_sha256_digest(
+    field: &str,
+    value: &str,
+) -> Result<<Sha256 as commonware_cryptography::Hasher>::Digest, ApiError> {
+    decode_hex_field(field, value).and_then(|bytes| {
+        <Sha256 as commonware_cryptography::Hasher>::Digest::decode(bytes.as_slice())
+            .map_err(|_| ApiError::bad_request(format!("bad {field}")))
+    })
+}
+
 fn decode_hex_field(field: &str, value: &str) -> Result<Vec<u8>, ApiError> {
     from_hex(value).ok_or_else(|| ApiError::bad_request(format!("bad {field} hex")))
 }
@@ -562,7 +736,9 @@ mod tests {
     #[test]
     fn config_defaults_to_loopback_listen_addr() {
         let config: OperatorConfig =
-            serde_yaml::from_str("http_port: 8093\nrelayer_url: http://127.0.0.1:8082\n")
+            serde_yaml::from_str(
+                "http_port: 8093\nrelayer_url: http://127.0.0.1:8082\nindexer_url: http://127.0.0.1:8090\nqmdb_url: http://127.0.0.1:8092\n",
+            )
                 .expect("operator config should parse");
 
         assert_eq!(config.listen_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));

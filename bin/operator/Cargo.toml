@@ -15,19 +15,25 @@ workspace = true
 [dependencies]
 # Workspace
 constantinople-application.workspace = true
+constantinople-engine.workspace = true
+constantinople-indexer.workspace = true
 constantinople-mempool.workspace = true
 constantinople-primitives.workspace = true
 
 # Commonware
 commonware-codec.workspace = true
+commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
 commonware-deployer.workspace = true
 commonware-formatting.workspace = true
+commonware-storage.workspace = true
 
 # Other
 axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
+exoware-qmdb.workspace = true
+exoware-sdk.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
