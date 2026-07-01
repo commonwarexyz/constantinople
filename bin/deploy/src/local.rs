@@ -356,13 +356,17 @@ fn local_run_commands(
              --seed-offset {} \
              --rayon-threads {} \
              --accounts-jitter {} \
-             --presigned-batches {}",
+             --presigned-batches {} \
+             --channel-fraction {} \
+             --channel-vouchers {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
+            args.spammer_channel_fraction,
+            args.spammer_channel_vouchers,
         ));
     }
 
@@ -405,6 +409,8 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_channel_fraction: 0.0,
+            spammer_channel_vouchers: crate::DEFAULT_SPAMMER_CHANNEL_VOUCHERS,
             target: GenerateTarget::Local(test_local_args()),
         }
     }

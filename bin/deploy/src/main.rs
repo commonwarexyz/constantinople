@@ -57,6 +57,7 @@ const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
+const DEFAULT_SPAMMER_CHANNEL_VOUCHERS: u64 = 8;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -142,6 +143,14 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Fraction of spammer iterations that run a payment-channel lifecycle
+    /// (open -> off-chain vouchers -> close) instead of a transfer batch. `0`
+    /// disables channels.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    spammer_channel_fraction: f64,
+    /// Average off-chain vouchers streamed per channel before settling.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_CHANNEL_VOUCHERS, value_parser = parse_channel_vouchers)]
+    spammer_channel_vouchers: u64,
 
     /// Deployment target (local or remote).
     #[command(subcommand)]
@@ -273,6 +282,13 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Fraction of submitter iterations that run a payment-channel lifecycle
+    /// instead of a transfer batch. `0` disables channels.
+    #[serde(default)]
+    pub channel_fraction: f64,
+    /// Average off-chain vouchers streamed per channel before settling.
+    #[serde(default = "default_spammer_channel_vouchers")]
+    pub channel_vouchers: u64,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
@@ -296,6 +312,16 @@ fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
         .map_err(|error| format!("invalid jitter: {error}"))?;
     if !(0.0..=1.0).contains(&parsed) {
         return Err("jitter must be between 0 and 1".to_string());
+    }
+    Ok(parsed)
+}
+
+fn parse_channel_vouchers(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid voucher count: {error}"))?;
+    if parsed < 1 {
+        return Err("channel vouchers must be >= 1".to_string());
     }
     Ok(parsed)
 }
@@ -488,6 +514,10 @@ const fn default_spammer_presigned_batches() -> usize {
 
 const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
+}
+
+const fn default_spammer_channel_vouchers() -> u64 {
+    DEFAULT_SPAMMER_CHANNEL_VOUCHERS
 }
 
 fn main() {

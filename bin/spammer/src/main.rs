@@ -8,12 +8,14 @@
 //! latency without queueing multiple batches at a proposer.
 
 mod accounts;
+mod channels;
 mod cli;
 mod config;
 mod signer;
 mod submitter;
 
 use accounts::{SpamAccount, generate_accounts};
+use channels::ChannelRunner;
 use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
@@ -43,6 +45,8 @@ fn main() {
         primary_validators,
         rayon_threads,
         accounts_jitter,
+        channel_fraction,
+        channel_vouchers,
     ) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
@@ -64,6 +68,8 @@ fn main() {
             },
             cfg.rayon_threads,
             cfg.accounts_jitter,
+            cfg.channel_fraction,
+            cfg.channel_vouchers,
         )
     } else {
         (
@@ -78,6 +84,8 @@ fn main() {
             cli.relayer_targets.clone(),
             cli.rayon_threads,
             cli.accounts_jitter,
+            cli.channel_fraction,
+            cli.channel_vouchers,
         )
     };
     assert!(
@@ -85,6 +93,11 @@ fn main() {
         "--accounts-jitter must be between 0 and 1"
     );
     assert!(presigned_batches > 0, "--presigned-batches must be > 0");
+    assert!(
+        (0.0..=1.0).contains(&channel_fraction),
+        "--channel-fraction must be between 0 and 1"
+    );
+    assert!(channel_vouchers >= 1, "--channel-vouchers must be >= 1");
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -93,6 +106,19 @@ fn main() {
         value <= DEFAULT_ACCOUNT_BALANCE,
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
     );
+    if channel_fraction > 0.0 {
+        // A channel's deposit is `vouchers * value` and is debited from the
+        // payer up front; the jittered count peaks at `avg + avg/2`. Keep the
+        // peak deposit within the faucet balance so opens don't fail outright.
+        let max_vouchers = channel_vouchers.saturating_add(channel_vouchers / 2);
+        let max_deposit = max_vouchers.saturating_mul(value);
+        assert!(
+            max_deposit <= DEFAULT_ACCOUNT_BALANCE,
+            "channel deposit (up to {max_vouchers} vouchers x value {value} = {max_deposit}) \
+             must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE}); \
+             lower --channel-vouchers or --value"
+        );
+    }
     let value = NonZeroU64::new(value).expect("checked above");
 
     let runtime_cfg = commonware_runtime::tokio::Config::default();
@@ -124,6 +150,8 @@ fn main() {
             relayer_submitters,
             presigned_batches,
             relayer_targets: primary_validators,
+            channel_fraction,
+            channel_vouchers,
         };
         run_relayer_mode(config, strategy).await;
     });
@@ -138,6 +166,11 @@ struct RelayerModeConfig {
     relayer_submitters: usize,
     presigned_batches: usize,
     relayer_targets: Vec<String>,
+    /// Probability that a submitter iteration runs a channel lifecycle instead
+    /// of submitting a transfer batch. `0` disables channels.
+    channel_fraction: f64,
+    /// Average off-chain vouchers streamed per channel before settling.
+    channel_vouchers: u64,
 }
 
 async fn run_relayer_mode(
@@ -153,6 +186,8 @@ async fn run_relayer_mode(
         relayer_submitters,
         presigned_batches,
         relayer_targets,
+        channel_fraction,
+        channel_vouchers,
     } = config;
 
     info!(
@@ -163,6 +198,8 @@ async fn run_relayer_mode(
         accounts_jitter,
         %relayer_url,
         presigned_batches,
+        channel_fraction,
+        channel_vouchers,
         "starting spammer relayer mode"
     );
 
@@ -183,7 +220,28 @@ async fn run_relayer_mode(
             account_offset,
             presigned_batches,
         );
-        tokio::spawn(submit_presigned_batches(submitter, batches));
+        // Channels use their own account ring (a disjoint seed range) so their
+        // nonces never collide with the transfer presigner's accounts.
+        let channel_offset = channel_account_offset(seed_offset, index, accounts_count);
+        let channel_runner = (channel_fraction > 0.0).then(|| {
+            let channel_accounts = generate_accounts(accounts_count, channel_offset);
+            ChannelRunner::new(
+                channel_accounts,
+                channel_vouchers,
+                value.get(),
+                channel_offset,
+            )
+        });
+        tokio::spawn(run_submitter(
+            submitter,
+            batches,
+            channel_runner,
+            channel_fraction,
+            stats.clone(),
+            // Distinct seed from the runner's own voucher-count RNG so the
+            // channel/transfer coin flip is an independent stream.
+            JitterRng::new(channel_offset.wrapping_add(1)),
+        ));
     }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -193,6 +251,8 @@ async fn run_relayer_mode(
         let filtered = stats.filtered.load(Ordering::Relaxed);
         let dropped = stats.dropped.load(Ordering::Relaxed);
         let errors = stats.errors.load(Ordering::Relaxed);
+        let channel_txs = stats.channel_txs.load(Ordering::Relaxed);
+        let vouchers = stats.vouchers.load(Ordering::Relaxed);
         let elapsed = start.elapsed().as_secs_f64();
         let tps = if elapsed > 0.0 {
             finalized as f64 / elapsed
@@ -204,6 +264,8 @@ async fn run_relayer_mode(
             filtered,
             dropped,
             errors,
+            channel_txs,
+            vouchers,
             tps = format!("{tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"
@@ -248,13 +310,44 @@ where
     receiver
 }
 
-async fn submit_presigned_batches(
+/// Drives one submitter: each iteration either runs a channel lifecycle (with
+/// probability `channel_fraction`, when a runner is present) or submits the next
+/// presigned transfer batch. Channel turns block on open/close finalization, so
+/// they pace themselves while the presigner keeps the transfer queue warm.
+async fn run_submitter(
     submitter: RelayerSubmitter,
     mut batches: mpsc::Receiver<Vec<Tx>>,
+    mut channel_runner: Option<ChannelRunner>,
+    channel_fraction: f64,
+    stats: Arc<Stats>,
+    mut rng: JitterRng,
 ) {
-    while let Some(batch) = batches.recv().await {
-        submitter.submit(batch).await;
+    loop {
+        if let Some(runner) = channel_runner.as_mut()
+            && rng.bernoulli(channel_fraction)
+        {
+            let result = runner.run_once(&submitter).await;
+            stats
+                .channel_txs
+                .fetch_add(result.channel_txs, Ordering::Relaxed);
+            stats.vouchers.fetch_add(result.vouchers, Ordering::Relaxed);
+            continue;
+        }
+        match batches.recv().await {
+            Some(batch) => submitter.submit(batch).await,
+            None => return,
+        }
     }
+}
+
+/// Seed offset for a submitter's channel account ring. Placed far above the
+/// transfer accounts' range (`seed_offset + index * accounts`) so the two never
+/// share keys.
+fn channel_account_offset(seed_offset: u64, index: usize, accounts: u32) -> u64 {
+    const CHANNEL_SEED_BASE: u64 = 1_000_000_000;
+    seed_offset
+        .saturating_add(CHANNEL_SEED_BASE)
+        .saturating_add((index as u64).saturating_mul(u64::from(accounts)))
 }
 
 fn jittered_batch_size(accounts: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {
@@ -311,6 +404,18 @@ impl JitterRng {
         debug_assert!(lo <= hi);
         let span = (hi - lo) as u64 + 1;
         lo + (self.next_u64() % span) as usize
+    }
+
+    /// Returns `true` with probability `p` (clamped to `0..=1`).
+    fn bernoulli(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        if p >= 1.0 {
+            return true;
+        }
+        // Map the draw into the unit interval; xorshift quality is ample here.
+        (self.next_u64() as f64) / (u64::MAX as f64) < p
     }
 }
 

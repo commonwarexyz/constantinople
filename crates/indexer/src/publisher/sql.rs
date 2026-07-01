@@ -47,6 +47,32 @@ impl TxActivityRole {
     }
 }
 
+/// The kind of operation an activity row describes.
+///
+/// Lets the explorer render a transfer, a channel reservation (open), and a
+/// channel settlement (close) differently, since they interpret the
+/// `value`/`counterparty`/`role` columns differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxKind {
+    /// A plain account transfer.
+    Transfer,
+    /// A channel open: the sender reserves `value` for a channel with the
+    /// counterparty (no funds are credited to anyone yet).
+    ChannelOpen,
+    /// A channel settlement: `value` is paid from the payer to the receiver.
+    ChannelClose,
+}
+
+impl TxKind {
+    const fn as_u64(self) -> u64 {
+        match self {
+            Self::Transfer => 0,
+            Self::ChannelOpen => 1,
+            Self::ChannelClose => 2,
+        }
+    }
+}
+
 /// Account-ordered transaction activity row.
 pub(crate) struct TxActivityRow {
     pub account: [u8; 32],
@@ -57,6 +83,7 @@ pub(crate) struct TxActivityRow {
     pub counterparty: [u8; 32],
     pub value: u64,
     pub nonce: u64,
+    pub kind: TxKind,
 }
 
 /// Latest account row stored in `account_meta`.
@@ -118,6 +145,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
             CellValue::FixedBinary(tx.counterparty.to_vec()),
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
+            CellValue::UInt64(tx.kind.as_u64()),
         ],
     }
 }

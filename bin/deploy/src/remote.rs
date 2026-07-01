@@ -279,6 +279,8 @@ fn remote_spammer_config(
         presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
+        channel_fraction: args.spammer_channel_fraction,
+        channel_vouchers: args.spammer_channel_vouchers,
     }
 }
 
@@ -513,6 +515,8 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_channel_fraction: 0.0,
+            spammer_channel_vouchers: crate::DEFAULT_SPAMMER_CHANNEL_VOUCHERS,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,

@@ -4,7 +4,7 @@ use super::{
     Application,
     body::{verify_signatures, wait_for_timestamp},
     execution::{
-        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
+        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy_block,
     },
     reject_verify, time,
 };
@@ -204,8 +204,8 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let (body, digests) = info_span!("application.apply.prepare")
-            .in_scope(|| prepare_lazy(&self.strategy, block.body.as_slice()))
+        let prepared = info_span!("application.apply.prepare")
+            .in_scope(|| prepare_lazy_block(&self.strategy, block.body.as_slice()))
             .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
 
         let (state_batch, transaction_batch) = batches;
@@ -214,8 +214,7 @@ where
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
-            &body,
-            &digests,
+            &prepared,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))

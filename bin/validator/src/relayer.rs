@@ -595,10 +595,11 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
 }
 
 const fn min_signed_transaction_bytes() -> usize {
-    constantinople_primitives::TransactionPublicKey::SIZE
+    // Smallest signed transaction: the common sender + nonce, the smallest
+    // operation (a transfer), and the smallest signature.
+    u64::SIZE
         + constantinople_primitives::TransactionPublicKey::SIZE
-        + 1
-        + 1
+        + constantinople_primitives::Operation::MIN_SIZE
         + constantinople_primitives::TransactionSignature::MIN_SIZE
 }
 

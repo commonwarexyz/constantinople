@@ -2,6 +2,8 @@ const PUBLIC_KEY_BYTES = 34;
 const ACCOUNT_KEY_BYTES = 32;
 const ED25519_SCHEME = 0;
 const U64_BYTES = 8;
+/// Operation tag for a transfer (matches `TRANSFER_TAG` in the Rust codec).
+const TRANSFER_TAG = 0;
 const MAX_U64 = (1n << 64n) - 1n;
 
 export interface TransactionDraft {
@@ -80,11 +82,15 @@ async function encodeTransactionBody(draft: TransactionDraft): Promise<Uint8Arra
     assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
     assertByteLength(draft.toAccountKey, ACCOUNT_KEY_BYTES, 'recipient account key');
 
+    // Wire layout must match the Rust codec (crates/primitives/src/transaction.rs):
+    // sender, nonce, then the tagged operation. A transfer is tag 0 followed by
+    // the recipient account key and the value.
     return bytesConcat(
         draft.senderPublicKey,
+        encodeU64(draft.nonce),
+        Uint8Array.of(TRANSFER_TAG),
         draft.toAccountKey,
         encodeU64(draft.value),
-        encodeU64(draft.nonce),
     );
 }
 

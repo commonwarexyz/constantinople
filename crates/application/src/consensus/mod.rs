@@ -2,9 +2,12 @@
 //!
 //! This module is the boundary between consensus and the application state
 //! transition. Consensus supplies candidate or certified block bodies; the
-//! application prepares those bodies into account transfers, executes them
-//! against QMDB-backed state, appends transaction-history entries, and returns
-//! the commitments consensus proposes, verifies, or applies.
+//! application partitions each body into account transfers and payment-channel
+//! operations, executes both against QMDB-backed state, appends
+//! transaction-history entries, and returns the commitments consensus proposes,
+//! verifies, or applies. Transfers run through the optimized executor below;
+//! channel operations run through a separate sequential lane (the `channel`
+//! module).
 //!
 //! Account execution is based on block-start state. A sender spends only the
 //! balance it had at the start of the block, and credits created by the same
@@ -35,6 +38,7 @@ use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
 mod body;
+mod channel;
 mod db;
 mod execution;
 mod genesis;
@@ -49,7 +53,7 @@ pub use db::{
     Databases, StateBatch, StateDatabase, StateSyncTarget, StateWrites, TransactionDatabase,
     TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
 };
-pub use execution::{compute, prepare_signed};
+pub use execution::{PreparedBatch, compute, prepare_signed_block};
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;

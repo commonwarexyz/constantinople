@@ -16,8 +16,8 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_primitives::{
-    Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
-    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    Account, LazySignedTransaction, Nonce, Operation, PublicKeyCache, SignedTransaction,
+    TransactionPublicKey, TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
 };
 use rand_core::OsRng;
 use std::{fmt::Display, sync::Arc};
@@ -31,9 +31,6 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 
 /// Minimum bytes needed to encode the batch-length prefix.
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
-
-/// Minimum bytes needed to encode a `u64` varint.
-const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, St>
@@ -87,11 +84,9 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
 }
 
 const fn min_signed_transaction_bytes() -> usize {
-    TransactionPublicKey::SIZE
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
-        + MIN_U64_VARINT_BYTES
-        + TransactionSignature::MIN_SIZE
+    // Smallest signed transaction: the common sender + nonce, the smallest
+    // operation (a transfer), and the smallest signature.
+    u64::SIZE + TransactionPublicKey::SIZE + Operation::MIN_SIZE + TransactionSignature::MIN_SIZE
 }
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {

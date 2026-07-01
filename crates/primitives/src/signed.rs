@@ -209,7 +209,8 @@ impl<H> LazySignedTransaction<H>
 where
     H: Hasher,
 {
-    const MAX_ENCODED_SIZE: usize = Transaction::<H::Digest>::SIZE + TransactionSignature::MAX_SIZE;
+    const MAX_ENCODED_SIZE: usize =
+        Transaction::<H::Digest>::MAX_SIZE + TransactionSignature::MAX_SIZE;
 
     /// Creates a lazy transaction from an already decoded value.
     pub fn new(value: SignedTransaction<H>) -> Self {
@@ -262,7 +263,7 @@ where
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
-        if len < Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE {
+        if len < Transaction::<H::Digest>::MIN_SIZE + TransactionSignature::MIN_SIZE {
             return Err(Error::EndOfBuffer);
         }
         if buf.remaining() < len {

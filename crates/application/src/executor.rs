@@ -27,7 +27,7 @@
 
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey, Operation, SignedTransaction};
 use core::marker::PhantomData;
 
 /// Fully loaded base account state for one in-memory execution batch.
@@ -101,13 +101,16 @@ where
 {
     let transfer = transaction.value();
     let sender = AccountKey::from_public_key(transfer.sender_lazy().get()?);
-    let recipient = transfer.to;
+    let Operation::Transfer { to, value } = transfer.op() else {
+        return None;
+    };
+    let recipient = *to;
     Some(PreparedTransfer {
         sender,
         recipient,
         sender_prefix: sender.prefix(),
         recipient_prefix: recipient.prefix(),
-        value: transfer.value.get(),
+        value: value.get(),
         nonce: transfer.nonce,
     })
 }

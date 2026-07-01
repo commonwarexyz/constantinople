@@ -77,6 +77,11 @@ pub const TX_ACTIVITY_COUNTERPARTY: &str = "counterparty";
 pub const TX_ACTIVITY_VALUE: &str = "value";
 /// `tx_activity`: sender nonce.
 pub const TX_ACTIVITY_NONCE: &str = "nonce";
+/// `tx_activity`: operation kind (`0` transfer, `1` channel open, `2` channel
+/// close). Lets the explorer distinguish a transfer from a channel reservation
+/// or settlement; the `value`/`counterparty`/`role` columns are interpreted in
+/// light of it.
+pub const TX_ACTIVITY_KIND: &str = "kind";
 
 // ---------- account_meta columns ----------
 
@@ -163,6 +168,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                     ),
                     TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
                     TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_KIND, DataType::UInt64, false),
                 ],
                 vec![
                     TX_ACTIVITY_ACCOUNT.to_string(),
@@ -258,6 +264,7 @@ mod tests {
         assert_eq!(TX_ACTIVITY_COUNTERPARTY, "counterparty");
         assert_eq!(TX_ACTIVITY_VALUE, "value");
         assert_eq!(TX_ACTIVITY_NONCE, "nonce");
+        assert_eq!(TX_ACTIVITY_KIND, "kind");
         assert_eq!(ACCOUNT_META_ACCOUNT, "account");
         assert_eq!(ACCOUNT_META_BALANCE, "balance");
         assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");

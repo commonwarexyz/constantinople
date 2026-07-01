@@ -369,13 +369,13 @@ async fn time_prepare_compute(
     txs: &[TestTx],
 ) -> (usize, Duration) {
     let start = Instant::now();
-    let (transfers, digests) = consensus::prepare_signed(strategy, txs).expect("prepare");
-    let writes = consensus::compute(batch, strategy, &transfers)
+    let prepared = consensus::prepare_signed_block(strategy, txs).expect("prepare");
+    let writes = consensus::compute(batch, strategy, &prepared.transfers)
         .await
         .expect("compute path");
     let elapsed = start.elapsed();
     let count = writes.len();
-    black_box((&transfers, &digests, &writes));
+    black_box((&prepared.transfers, &prepared.digests, &writes));
     (count, elapsed)
 }
 
