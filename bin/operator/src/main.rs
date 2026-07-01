@@ -4,6 +4,15 @@
 //! off-chain vouchers over HTTP, enforces monotonic/deposit accounting with
 //! [`constantinople_application::operator::ChannelOperator`], and submits the
 //! final close transaction through the relayer.
+//!
+//! Known restart limitation: channel registrations (and their charged/voucher
+//! accounting) live only in memory. Registration verifies that the open
+//! transaction finalized, not that the channel is still live, so after a
+//! restart an already-settled channel can be re-registered and its old
+//! vouchers replayed for free service. Only the operator's own revenue is at
+//! stake, which is acceptable for load-test infrastructure; a durable channel
+//! store (or an account-key state lookup to check the channel still exists)
+//! would be needed to close this.
 
 use axum::{
     Json, Router,
@@ -28,14 +37,14 @@ use constantinople_engine::ThresholdScheme;
 use constantinople_indexer::IndexerClient;
 use constantinople_mempool::webserver::{TxStatus, client::Client};
 use constantinople_primitives::{
-    AccountKey, Operation, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
-    TransactionPublicKey, Voucher, channel_address,
+    AccountKey, NONCE_BITMAP_CAPACITY, Operation, SignedTransaction, TRANSACTION_NAMESPACE,
+    Transaction, TransactionPublicKey, Voucher, channel_address,
 };
 use exoware_qmdb::{OperationLogClient, proto::qmdb::v1::GetOperationRangeRequest};
 use exoware_sdk::{StoreClient, proto::PreferZstdHttpClient};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
@@ -53,6 +62,8 @@ type TransactionProofClient =
 type ConsensusScheme = ThresholdScheme<ed25519::PublicKey, MinSig>;
 
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const STARTUP_FETCH_BACKOFF: Duration = Duration::from_millis(500);
+const NONCE_WINDOW_BACKOFF: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-operator")]
@@ -137,7 +148,18 @@ struct AppShared {
 
 struct OperatorState {
     operator: ChannelOperator,
+    /// Next receiver transaction nonce to reserve for a close.
     nonce: u64,
+    /// Close nonces reserved but not yet finalized. Reservation is windowed
+    /// against the smallest entry so a fast-finalizing close can never jump the
+    /// receiver's nonce base past a still-pending lower nonce (which would
+    /// permanently wedge that settlement).
+    inflight: BTreeSet<u64>,
+    /// Whether the chain's nonce base is known to have caught up to [`Self::nonce`].
+    /// False after recovering from a dirty (mid-settlement crash) bitmap; the
+    /// first close then settles alone so its jump lands before anything runs
+    /// ahead of it.
+    aligned: bool,
     channels: BTreeMap<AccountKey, RegisteredChannel>,
 }
 
@@ -227,16 +249,21 @@ async fn main() {
     let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
     let receiver_account = AccountKey::from_public_key(&receiver_pk);
     let verifier = ChannelVerifier::new(config.indexer_url, config.qmdb_url);
+    let relayer = Client::new(config.relayer_url.trim_end_matches('/'));
+    let (nonce, aligned) = recover_receiver_nonce(&relayer, &receiver_pk).await;
+    info!(nonce, aligned, "recovered receiver nonce from chain");
     let state = AppState {
         shared: Arc::new(AppShared {
             receiver,
             receiver_pk,
             receiver_account,
-            relayer: Client::new(config.relayer_url.trim_end_matches('/')),
+            relayer,
             verifier,
             state: Mutex::new(OperatorState {
                 operator: ChannelOperator::new(config.price),
-                nonce: 0,
+                nonce,
+                inflight: BTreeSet::new(),
+                aligned,
                 channels: BTreeMap::new(),
             }),
         }),
@@ -334,6 +361,40 @@ fn resolve_named_http_url(url: &str, hosts: Option<&BTreeMap<String, IpAddr>>) -
 
 async fn health() -> &'static str {
     "ok"
+}
+
+/// Recovers the receiver's next transaction nonce from committed chain state.
+///
+/// The nonce cannot start at zero: after any prior settlement a fresh process
+/// would reuse a consumed nonce, the close would never finalize, and every
+/// settlement would wedge behind it. Retries until the relayer answers — the
+/// operator cannot safely guess.
+///
+/// Returns the starting nonce plus whether the chain's nonce base is known to
+/// equal it. A clean state (empty run-ahead bitmap) resumes at the base. A
+/// dirty bitmap (crash mid-settlement) resumes one past the run-ahead window,
+/// so the first close jump-clears the leftovers; that close settles alone
+/// (`aligned = false`) so the jump lands before later closes run ahead of it.
+async fn recover_receiver_nonce(
+    relayer: &Client,
+    receiver_pk: &TransactionPublicKey,
+) -> (u64, bool) {
+    loop {
+        match relayer.fetch_account(receiver_pk).await {
+            Ok(None) => return (0, true),
+            Ok(Some(account)) if account.nonce.bitmap == 0 => return (account.nonce.base, true),
+            Ok(Some(account)) => {
+                return (
+                    account.nonce.base.saturating_add(NONCE_BITMAP_CAPACITY + 1),
+                    false,
+                );
+            }
+            Err(error) => {
+                warn!(%error, "receiver account lookup failed, retrying");
+                tokio::time::sleep(STARTUP_FETCH_BACKOFF).await;
+            }
+        }
+    }
 }
 
 async fn public_key(State(state): State<AppState>) -> Json<PublicKeyResponse> {
@@ -444,10 +505,15 @@ async fn serve_voucher(
 
     let mut state = state.shared.state.lock().await;
     let state = &mut *state;
-    let charged = state.operator.serve(&voucher).map_err(ApiError::serve)?;
     let Some(registered) = state.channels.get_mut(&channel) else {
         return Err(ApiError::bad_request("channel metadata missing"));
     };
+    // Once a close has been built, a newer voucher can no longer be settled;
+    // refuse to serve work the submitted close will not pay for.
+    if registered.settlement != SettlementState::Open {
+        return Err(ApiError::bad_request("channel settlement already started"));
+    }
+    let charged = state.operator.serve(&voucher).map_err(ApiError::serve)?;
     registered.latest = Some(voucher);
     Ok(Json(VoucherResponse {
         accepted: true,
@@ -460,38 +526,50 @@ async fn settle_channel(
     Json(request): Json<SettleRequest>,
 ) -> Result<Json<SettleResponse>, ApiError> {
     let channel = decode_field::<AccountKey>("channel", &request.channel)?;
-    let (payer, open_nonce, latest, nonce) = {
-        let mut state = state.shared.state.lock().await;
-        let state = &mut *state;
-        let Some(registered) = state.channels.get_mut(&channel) else {
-            return Err(ApiError::bad_request("unknown channel"));
-        };
-        match registered.settlement {
-            SettlementState::Settled | SettlementState::Settling => {
-                let cumulative = registered
-                    .latest
-                    .as_ref()
-                    .map(|voucher| voucher.cumulative)
-                    .unwrap_or(0);
-                return Ok(Json(SettleResponse {
-                    settled: registered.settlement == SettlementState::Settled,
-                    cumulative,
-                }));
+    let (payer, open_nonce, latest, nonce) = loop {
+        {
+            let mut state = state.shared.state.lock().await;
+            let state = &mut *state;
+            // A close may reserve a nonce at most `NONCE_BITMAP_CAPACITY`
+            // ahead of the oldest unfinalized close. Beyond that, the chain
+            // would consume it as a far jump that clears the run-ahead bitmap
+            // and strands every pending lower nonce.
+            let can_reserve = match state.inflight.first() {
+                None => true,
+                Some(&oldest) => state.aligned && state.nonce - oldest <= NONCE_BITMAP_CAPACITY,
+            };
+            let Some(registered) = state.channels.get_mut(&channel) else {
+                return Err(ApiError::bad_request("unknown channel"));
+            };
+            match registered.settlement {
+                SettlementState::Settled | SettlementState::Settling => {
+                    let cumulative = registered
+                        .latest
+                        .as_ref()
+                        .map(|voucher| voucher.cumulative)
+                        .unwrap_or(0);
+                    return Ok(Json(SettleResponse {
+                        settled: registered.settlement == SettlementState::Settled,
+                        cumulative,
+                    }));
+                }
+                SettlementState::Open => {}
             }
-            SettlementState::Open => {}
+            let Some(latest) = registered.latest.clone() else {
+                return Err(ApiError::bad_request("channel has no accepted vouchers"));
+            };
+            if can_reserve {
+                registered.settlement = SettlementState::Settling;
+                let payer = registered.payer.clone();
+                let open_nonce = registered.open_nonce;
+                let nonce = state.nonce;
+                state.nonce = state.nonce.saturating_add(1);
+                state.inflight.insert(nonce);
+                break (payer, open_nonce, latest, nonce);
+            }
         }
-        let Some(latest) = registered.latest.clone() else {
-            return Err(ApiError::bad_request("channel has no accepted vouchers"));
-        };
-        registered.settlement = SettlementState::Settling;
-        let nonce = state.nonce;
-        state.nonce = state.nonce.saturating_add(1);
-        (
-            registered.payer.clone(),
-            registered.open_nonce,
-            latest,
-            nonce,
-        )
+        // The nonce window is full; wait for an in-flight close to finalize.
+        tokio::time::sleep(NONCE_WINDOW_BACKOFF).await;
     };
 
     // Build and sign the close outside the lock: only the nonce reservation
@@ -509,6 +587,11 @@ async fn settle_channel(
     submit_until_finalized(&state.shared.relayer, close).await;
 
     let mut state = state.shared.state.lock().await;
+    let state = &mut *state;
+    state.inflight.remove(&nonce);
+    // The close consumed its nonce on chain, so the chain's nonce base has
+    // caught up past any startup jump; later closes may run ahead again.
+    state.aligned = true;
     if let Some(registered) = state.channels.get_mut(&channel) {
         registered.settlement = SettlementState::Settled;
     }

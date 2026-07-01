@@ -218,11 +218,115 @@ fn channel_op_keys(channel_ops: &[PreparedChannelOp]) -> Vec<AccountKey> {
     keys
 }
 
+/// Loads every account a batch of channel operations touches, keyed for the
+/// working set.
+async fn load_channel_state<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    channel_ops: &[PreparedChannelOp],
+) -> Pending
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    // Deduplicate before loading: a block may contain several operations that
+    // touch the same account (e.g. two opens from one payer), and `get_many`
+    // expects unique keys, like the transfer lane's deduplicated plan.
+    let mut keys = channel_op_keys(channel_ops);
+    keys.sort_unstable();
+    keys.dedup();
+    let key_refs: Vec<&AccountKey> = keys.iter().collect();
+    let values = batch
+        .get_many(&key_refs)
+        .await
+        .expect("channel state loading must succeed");
+    keys.iter().copied().zip(values).collect()
+}
+
+/// Applies one channel operation to the working set.
+///
+/// Atomic: on any failure (bad nonce, insufficient balance, absent channel, an
+/// unverifiable voucher, or overflow) `pending` is left untouched and `None` is
+/// returned, so a failed operation can be skipped without unwinding.
+fn apply_channel_op(pending: &mut Pending, loaded: &Pending, op: &PreparedChannelOp) -> Option<()> {
+    match &op.kind {
+        PreparedChannelOpKind::Open { receiver, deposit } => {
+            let channel = channel_address(&op.sender, receiver, op.nonce);
+            let mut payer = account_or_default(pending, loaded, &op.sender);
+            if payer.balance < *deposit || !payer.nonce.consume(op.nonce) {
+                return None;
+            }
+            payer.balance -= *deposit;
+            // Add the deposit to the channel's escrow (zero for a fresh
+            // address). Anyone may pay into a channel; those funds simply
+            // become escrow returned to the payer on close.
+            let escrow = channel_escrow(pending, loaded, &channel)
+                .unwrap_or(0)
+                .checked_add(*deposit)?;
+            pending.insert(op.sender, Some(payer));
+            pending.insert(
+                channel,
+                Some(Account {
+                    balance: escrow,
+                    nonce: Nonce::default(),
+                }),
+            );
+        }
+        PreparedChannelOpKind::Close {
+            payer,
+            payer_key,
+            open_nonce,
+            cumulative,
+            voucher,
+        } => {
+            let channel = channel_address(payer_key, &op.sender, *open_nonce);
+            // The channel must exist (it was opened by a prior transaction).
+            let balance = channel_escrow(pending, loaded, &channel)?;
+            // Verify the payer's voucher over (channel, cumulative).
+            if !verify_voucher(payer, &channel, *cumulative, voucher) {
+                return None;
+            }
+            // Can never claim more than what is escrowed.
+            if *cumulative > balance {
+                return None;
+            }
+            let refund = balance - *cumulative;
+
+            // Pay the receiver (the sender of this transaction) and consume
+            // its nonce.
+            let mut receiver = account_or_default(pending, loaded, &op.sender);
+            if !receiver.nonce.consume(op.nonce) {
+                return None;
+            }
+            apply_credit(&mut receiver, *cumulative)?;
+
+            // Return the remainder to the payer. A self-channel's refund lands
+            // on the receiver copy just credited, so the two credits compose;
+            // nothing touches `pending` until every check has passed.
+            if *payer_key == op.sender {
+                apply_credit(&mut receiver, refund)?;
+                pending.insert(op.sender, Some(receiver));
+            } else {
+                let mut payer_account = account_or_default(pending, loaded, payer_key);
+                apply_credit(&mut payer_account, refund)?;
+                pending.insert(op.sender, Some(receiver));
+                pending.insert(*payer_key, Some(payer_account));
+            }
+
+            // Delete the settled channel so it leaves no state.
+            pending.insert(channel, None);
+        }
+    }
+    Some(())
+}
+
 /// Applies a batch of channel operations against block-start state.
 ///
 /// Returns the resulting writes (deletions included), or `None` if any
-/// operation is invalid (bad nonce, insufficient balance, absent channel, or an
-/// unverifiable voucher). Like the transfer lane, execution is all or nothing.
+/// operation is invalid. Like the transfer lane, verification is all or
+/// nothing: a proposed block containing an invalid channel operation is
+/// rejected. Proposers instead build blocks with
+/// [`apply_channel_ops_skipping`], which never includes a failing operation.
 pub(super) async fn apply_channel_ops<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     channel_ops: &[PreparedChannelOp],
@@ -236,84 +340,43 @@ where
         return Some(Vec::new());
     }
 
-    // Deduplicate before loading: a block may contain several operations that
-    // touch the same account (e.g. two opens from one payer), and `get_many`
-    // expects unique keys, like the transfer lane's deduplicated plan.
-    let mut keys = channel_op_keys(channel_ops);
-    keys.sort_unstable();
-    keys.dedup();
-    let key_refs: Vec<&AccountKey> = keys.iter().collect();
-    let values = batch
-        .get_many(&key_refs)
-        .await
-        .expect("channel state loading must succeed");
-    let loaded: Pending = keys.iter().copied().zip(values).collect();
-
+    let loaded = load_channel_state(batch, channel_ops).await;
     let mut pending: Pending = AHashMap::new();
     for op in channel_ops {
-        match &op.kind {
-            PreparedChannelOpKind::Open { receiver, deposit } => {
-                let channel = channel_address(&op.sender, receiver, op.nonce);
-                let mut payer = account_or_default(&pending, &loaded, &op.sender);
-                if payer.balance < *deposit || !payer.nonce.consume(op.nonce) {
-                    return None;
-                }
-                payer.balance -= *deposit;
-                // Add the deposit to the channel's escrow (zero for a fresh
-                // address). Anyone may pay into a channel; those funds simply
-                // become escrow returned to the payer on close.
-                let escrow = channel_escrow(&pending, &loaded, &channel)
-                    .unwrap_or(0)
-                    .checked_add(*deposit)?;
-                pending.insert(op.sender, Some(payer));
-                pending.insert(
-                    channel,
-                    Some(Account {
-                        balance: escrow,
-                        nonce: Nonce::default(),
-                    }),
-                );
-            }
-            PreparedChannelOpKind::Close {
-                payer,
-                payer_key,
-                open_nonce,
-                cumulative,
-                voucher,
-            } => {
-                let channel = channel_address(payer_key, &op.sender, *open_nonce);
-                // The channel must exist (it was opened by a prior transaction).
-                let balance = channel_escrow(&pending, &loaded, &channel)?;
-                // Verify the payer's voucher over (channel, cumulative).
-                if !verify_voucher(payer, &channel, *cumulative, voucher) {
-                    return None;
-                }
-                // Can never claim more than what is escrowed.
-                if *cumulative > balance {
-                    return None;
-                }
-                let refund = balance - *cumulative;
-
-                // Pay the receiver (the sender of this transaction) and consume
-                // its nonce.
-                let mut receiver = account_or_default(&pending, &loaded, &op.sender);
-                if !receiver.nonce.consume(op.nonce) {
-                    return None;
-                }
-                apply_credit(&mut receiver, *cumulative)?;
-                pending.insert(op.sender, Some(receiver));
-
-                // Return the remainder to the payer (read after crediting the
-                // receiver, so a self-channel composes correctly).
-                let mut payer_account = account_or_default(&pending, &loaded, payer_key);
-                apply_credit(&mut payer_account, refund)?;
-                pending.insert(*payer_key, Some(payer_account));
-
-                // Delete the settled channel so it leaves no state.
-                pending.insert(channel, None);
-            }
-        }
+        apply_channel_op(&mut pending, &loaded, op)?;
     }
 
     Some(pending.into_iter().collect())
+}
+
+/// Applies a batch of channel operations, skipping any operation that fails
+/// instead of rejecting the whole batch.
+///
+/// A channel operation's validity can depend on execution-time state the
+/// mempool cannot screen (a voucher is only checkable against live escrow), so
+/// the proposer uses this variant to keep one bad operation from poisoning an
+/// entire proposal. Returns the writes plus one applied/skipped flag per
+/// operation; the proposer drops skipped operations from the body, so verifiers
+/// re-execute exactly the applied sequence.
+pub(super) async fn apply_channel_ops_skipping<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    channel_ops: &[PreparedChannelOp],
+) -> (ChannelWrites, Vec<bool>)
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    if channel_ops.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+
+    let loaded = load_channel_state(batch, channel_ops).await;
+    let mut pending: Pending = AHashMap::new();
+    let applied = channel_ops
+        .iter()
+        .map(|op| apply_channel_op(&mut pending, &loaded, op).is_some())
+        .collect();
+
+    (pending.into_iter().collect(), applied)
 }

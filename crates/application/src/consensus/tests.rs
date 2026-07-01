@@ -847,6 +847,111 @@ fn open_channel_rejects_non_ed25519_payer() {
     });
 }
 
+/// One poison channel operation must not empty an otherwise-valid proposal.
+///
+/// Channel operations can fail in ways the mempool cannot screen (a statically
+/// invalid secp256r1 open passes signature checks; a close's validity depends
+/// on execution-time escrow), so the proposer drops the failing operation
+/// individually instead of collapsing the whole batch to an empty block.
+#[test]
+fn poison_channel_op_does_not_empty_the_proposal() {
+    deterministic::Runner::default().start(|context| async move {
+        let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
+
+        let alice = ed25519::PrivateKey::from_seed(2);
+        let bob = ed25519::PrivateKey::from_seed(3);
+        let payer = ed25519::PrivateKey::from_seed(4);
+        let receiver = ed25519::PrivateKey::from_seed(5);
+        let alice_pk = TransactionPublicKey::ed25519(alice.public_key());
+        let bob_pk = TransactionPublicKey::ed25519(bob.public_key());
+        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
+        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let alice_key = AccountKey::from_public_key(&alice_pk);
+        let bob_key = AccountKey::from_public_key(&bob_pk);
+        let payer_key = AccountKey::from_public_key(&payer_pk);
+        let receiver_key = AccountKey::from_public_key(&receiver_pk);
+
+        // A valid transfer and a valid open, co-batched with the poison ops.
+        let transfer = Transaction::with_op(
+            alice_pk.clone(),
+            0,
+            Operation::Transfer {
+                to: bob_key,
+                value: NonZeroU64::new(PRICE).expect("price is non-zero"),
+            },
+        )
+        .seal_and_sign(&alice, TEST_TX_NS, &mut sha256::Sha256::default());
+        let open = Transaction::open_channel(
+            payer_pk.clone(),
+            receiver_pk.clone(),
+            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            0,
+        )
+        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+
+        // Statically invalid: an open from a secp256r1 payer passes the
+        // mempool's signature check but can never be prepared.
+        let secp = secp256r1::PrivateKey::from_seed(6);
+        let secp_pk = TransactionPublicKey::secp256r1(secp.public_key());
+        let sealed_bad_open = Transaction::<sha256::Digest>::open_channel(
+            secp_pk,
+            receiver_pk.clone(),
+            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            0,
+        )
+        .seal(&mut sha256::Sha256::default());
+        let placeholder = ed25519::PrivateKey::from_seed(99);
+        let signature = TransactionSignature::ed25519(
+            placeholder.sign(TEST_TX_NS, sealed_bad_open.seal().as_ref()),
+        );
+        let bad_open = SignedTransaction::new_unchecked(sealed_bad_open, signature);
+
+        // Semantically invalid: a validly signed close of a channel that was
+        // never opened, only detectable at execution time.
+        let phantom = channel_address(&payer_key, &receiver_key, 7);
+        let voucher = Voucher::sign(&payer, phantom, PRICE);
+        let bad_close = Transaction::close_channel(
+            receiver_pk.clone(),
+            payer_pk.clone(),
+            7,
+            voucher.cumulative,
+            voucher.signature.clone(),
+            0,
+        )
+        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+
+        let (_block, included) = propose_and_finalize(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            vec![transfer, bad_open, bad_close, open],
+        )
+        .await;
+        assert_eq!(included, 2, "only the poison channel ops are dropped");
+
+        // Both valid transactions took effect.
+        assert_eq!(read_account(&dbs, &alice_key).await.balance, 100 - PRICE);
+        assert_eq!(read_account(&dbs, &bob_key).await.balance, 100 + PRICE);
+        assert_eq!(read_account(&dbs, &payer_key).await.balance, 100 - DEPOSIT);
+        assert_eq!(
+            read_account(&dbs, &channel_address(&payer_key, &receiver_key, 0))
+                .await
+                .balance,
+            DEPOSIT
+        );
+        // The skipped ops left no trace: the phantom channel does not exist and
+        // the bad close's nonce was not consumed.
+        assert_eq!(read_raw(&dbs, &phantom).await, None);
+        assert_eq!(
+            read_account(&dbs, &receiver_key).await.nonce.base,
+            0,
+            "skipped close must not consume the receiver's nonce"
+        );
+    });
+}
+
 #[test]
 fn genesis_block_uses_the_initialized_transaction_target() {
     let leader = ed25519::PrivateKey::from_seed(11).public_key();

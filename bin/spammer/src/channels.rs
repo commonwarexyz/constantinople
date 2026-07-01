@@ -7,13 +7,14 @@
 //! behind the same service boundary used in testnet.
 //!
 //! Channels use their own account ring, so their nonces never collide with the
-//! transfer presigner's accounts. Each account is a payer once and a receiver
-//! once per full cycle, and is visited as receiver immediately before it pays
-//! (the cursor advances to the receiver, who becomes the next payer), so a
-//! drained account is topped up just before it has to fund an open. Voucher
-//! counts are jittered independently, though, so per-account net flow is only
-//! roughly zero and balances drift slowly; a drained account simply fails its
-//! open (handled gracefully below) rather than ever going negative.
+//! transfer presigner's accounts. Every channel pays the operator (the
+//! receiver key is the operator's), so ring accounts only ever drain: each
+//! lifecycle costs the payer the settled cumulative, with any extra escrow
+//! refunded on close. Starting from the default account balance an account
+//! funds only a bounded number of lifecycles (about a dozen at the default
+//! voucher count and price) before its opens start failing for insufficient
+//! balance; a drained account simply fails its open (handled gracefully below)
+//! rather than ever going negative.
 
 use crate::{JitterRng, accounts::SpamAccount, signer::Tx, submitter::RelayerSubmitter};
 use commonware_codec::{DecodeExt as _, Encode};
@@ -27,6 +28,8 @@ use tracing::warn;
 
 const PARTIAL_SETTLEMENT_PROBABILITY: f64 = 0.5;
 pub(crate) const MAX_REFUND_VOUCHERS: u64 = 3;
+const REGISTRATION_ATTEMPTS: usize = 10;
+const REGISTRATION_BACKOFF: core::time::Duration = core::time::Duration::from_millis(500);
 
 /// Outcome of one channel lifecycle.
 pub struct LifecycleStats {
@@ -144,12 +147,28 @@ impl ChannelRunner {
         // Off-chain: stream vouchers, verifying each with the shared predicate.
         // These are the payments that never touch the chain.
         let channel = channel_address(&payer_account, &self.operator_account, open_nonce);
-        if let Err(error) = self
-            .operator
-            .register_channel(channel, &payer_pk, open_nonce, &open_tx_digest)
-            .await
-        {
-            warn!(%error, %channel, "operator channel registration failed");
+        // The open is finalized but the operator's indexer may not have
+        // ingested it yet. A registration that never lands strands the deposit
+        // (there is no unilateral withdraw), so retry through transient lag
+        // before abandoning the lifecycle.
+        let mut registered = false;
+        for attempt in 1..=REGISTRATION_ATTEMPTS {
+            match self
+                .operator
+                .register_channel(channel, &payer_pk, open_nonce, &open_tx_digest)
+                .await
+            {
+                Ok(()) => {
+                    registered = true;
+                    break;
+                }
+                Err(error) => {
+                    warn!(%error, %channel, attempt, "operator channel registration failed");
+                    tokio::time::sleep(REGISTRATION_BACKOFF).await;
+                }
+            }
+        }
+        if !registered {
             return stats;
         }
 

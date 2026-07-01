@@ -554,12 +554,89 @@ fn initialized_copy_vec<T: Copy>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
-/// Executes a proposal's candidate transactions all or nothing.
+/// Which lane a proposal candidate routed to, for post-execution filtering.
+enum ProposalLane {
+    Transfer,
+    /// Index into the prepared channel-op vector.
+    Channel(usize),
+}
+
+/// Prepares and executes proposal candidates, dropping invalid ones where the
+/// lane allows it.
 ///
-/// If every candidate executes cleanly the block includes them all. If any
-/// candidate is malformed, fails its nonce or balance check, or overflows a
-/// recipient, the whole batch is dropped and an empty block is proposed so the
-/// chain still makes progress.
+/// Candidates that fail preparation (malformed sender, or a statically invalid
+/// channel operation such as an `OpenChannel` from a non-Ed25519 payer) are
+/// dropped from the proposal. Channel operations that fail execution (say, a
+/// close whose voucher does not match live escrow — unknowable at mempool
+/// admission) are likewise dropped, so one bad channel operation cannot poison
+/// the batch. Transfers still execute all or nothing: `None` means the
+/// transfer lane rejected the batch (or the two lanes conflict) and an empty
+/// block should be proposed.
+async fn execute_proposal_lanes<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transactions: Vec<SignedTransaction<H>>,
+) -> Option<(
+    Vec<SignedTransaction<H>>,
+    Vec<H::Digest>,
+    (db::StateWrites, ChannelWrites),
+)>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    let items = strategy.map_collect_vec(transactions.iter(), |tx| prepare_item(tx));
+
+    // Route each candidate to its lane, remembering the routing (`None` drops
+    // the transaction) so skipped channel ops can be filtered from the body.
+    let mut transfers = Vec::with_capacity(items.len());
+    let mut channel_ops = Vec::new();
+    let mut routes = Vec::with_capacity(items.len());
+    for item in items {
+        routes.push(item.map(|(item, digest)| {
+            let lane = match item {
+                PreparedItem::Transfer(transfer) => {
+                    transfers.push(transfer);
+                    ProposalLane::Transfer
+                }
+                PreparedItem::ChannelOp(op) => {
+                    channel_ops.push(*op);
+                    ProposalLane::Channel(channel_ops.len() - 1)
+                }
+            };
+            (lane, digest)
+        }));
+    }
+
+    let transfer_writes = compute(batch, strategy, &transfers).await?;
+    let (channel_writes, applied) = channel::apply_channel_ops_skipping(batch, &channel_ops).await;
+    if lanes_conflict(&transfer_writes, &channel_writes) {
+        return None;
+    }
+
+    let mut body = Vec::with_capacity(transactions.len());
+    let mut digests = Vec::with_capacity(transactions.len());
+    for (tx, route) in transactions.into_iter().zip(routes) {
+        let Some((lane, digest)) = route else {
+            continue;
+        };
+        if matches!(lane, ProposalLane::Channel(index) if !applied[index]) {
+            continue;
+        }
+        body.push(tx);
+        digests.push(digest);
+    }
+    Some((body, digests, (transfer_writes, channel_writes)))
+}
+
+/// Executes a proposal's candidate transactions.
+///
+/// Channel operations that fail preparation or execution are dropped from the
+/// proposed body individually (see [`execute_proposal_lanes`]). Transfers
+/// execute all or nothing: if any transfer is malformed, fails its nonce or
+/// balance check, or overflows a recipient, the whole batch is dropped and an
+/// empty block is proposed so the chain still makes progress.
 pub(super) async fn execute_proposal<E, C, P, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
@@ -574,17 +651,9 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let prepared = prepare_signed_block(&strategy, &transactions);
-
-    let outcome = match prepared {
-        Some(prepared) if !(prepared.transfers.is_empty() && prepared.channel_ops.is_empty()) => {
-            execute_lanes(&state_batch, &strategy, &prepared)
-                .instrument(info_span!("application.execute.compute"))
-                .await
-                .map(|writes| (transactions, prepared.digests, writes))
-        }
-        _ => None,
-    };
+    let outcome = execute_proposal_lanes(&state_batch, &strategy, transactions)
+        .instrument(info_span!("application.execute.compute"))
+        .await;
 
     let (body, digests, state_batch) = match outcome {
         Some((body, digests, (transfer_writes, channel_writes))) => {
