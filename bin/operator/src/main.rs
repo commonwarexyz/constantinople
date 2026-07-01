@@ -396,20 +396,51 @@ async fn register_channel(
     }
 
     let mut state = state.inner.lock().await;
-    state
-        .operator
-        .register_channel(channel, payer.clone(), open.deposit);
-    state.channels.insert(
+    let state = &mut *state;
+    let inserted = register_verified_channel(
+        &mut state.operator,
+        &mut state.channels,
+        channel,
+        payer,
+        request.open_nonce,
+        open.deposit,
+    )?;
+    if inserted {
+        debug!(%channel, deposit = open.deposit, "registered channel");
+    } else {
+        debug!(%channel, "channel registration replayed");
+    }
+    Ok(Json(RegisterResponse { registered: true }))
+}
+
+fn register_verified_channel(
+    operator: &mut ChannelOperator,
+    channels: &mut BTreeMap<AccountKey, RegisteredChannel>,
+    channel: AccountKey,
+    payer: TransactionPublicKey,
+    open_nonce: u64,
+    deposit: u64,
+) -> Result<bool, ApiError> {
+    if let Some(registered) = channels.get(&channel) {
+        if registered.payer != payer || registered.open_nonce != open_nonce {
+            return Err(ApiError::bad_request(
+                "channel already registered with different metadata",
+            ));
+        }
+        return Ok(false);
+    }
+
+    operator.register_channel(channel, payer.clone(), deposit);
+    channels.insert(
         channel,
         RegisteredChannel {
             payer,
-            open_nonce: request.open_nonce,
+            open_nonce,
             latest: None,
             settlement: SettlementState::Open,
         },
     );
-    debug!(%channel, deposit = open.deposit, "registered channel");
-    Ok(Json(RegisterResponse { registered: true }))
+    Ok(true)
 }
 
 async fn serve_voucher(
@@ -742,5 +773,68 @@ mod tests {
                 .expect("operator config should parse");
 
         assert_eq!(config.listen_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    #[test]
+    fn duplicate_registration_preserves_accepted_voucher_state() {
+        let payer_key = ed25519::PrivateKey::from_seed(42);
+        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
+        let receiver =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(43).public_key());
+        let receiver_account = AccountKey::from_public_key(&receiver);
+        let payer_account = AccountKey::from_public_key(&payer);
+        let open_nonce = 7;
+        let channel = channel_address(&payer_account, &receiver_account, open_nonce);
+        let voucher = Voucher::sign(&payer_key, channel, 10);
+
+        let mut operator = ChannelOperator::new(1);
+        let mut channels = BTreeMap::new();
+        assert!(
+            register_verified_channel(
+                &mut operator,
+                &mut channels,
+                channel,
+                payer.clone(),
+                open_nonce,
+                20,
+            )
+            .expect("initial registration should succeed")
+        );
+        operator
+            .serve(&voucher)
+            .expect("voucher should be accepted before replay");
+        let registered = channels
+            .get_mut(&channel)
+            .expect("registration metadata should exist");
+        registered.latest = Some(AcceptedVoucher {
+            cumulative: voucher.cumulative,
+            signature: voucher.signature.clone(),
+        });
+        registered.settlement = SettlementState::Settling;
+
+        assert!(
+            !register_verified_channel(
+                &mut operator,
+                &mut channels,
+                channel,
+                payer,
+                open_nonce,
+                20,
+            )
+            .expect("duplicate registration should be idempotent")
+        );
+
+        let registered = channels
+            .get(&channel)
+            .expect("registration metadata should remain");
+        assert_eq!(
+            registered.latest.as_ref().map(|latest| latest.cumulative),
+            Some(10)
+        );
+        assert_eq!(registered.settlement, SettlementState::Settling);
+        assert!(
+            operator.serve(&voucher).is_err(),
+            "duplicate registration must not reset charged accounting"
+        );
     }
 }
