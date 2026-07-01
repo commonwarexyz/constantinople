@@ -196,11 +196,11 @@ impl LazyPublisher {
                 return publisher;
             }
 
-            match EnginePublisher::connect(
+            match Box::pin(EnginePublisher::connect(
                 self.context.child("publisher"),
                 &self.store_url,
                 self.buffer,
-            )
+            ))
             .await
             {
                 Ok(publisher) => {
