@@ -37,9 +37,10 @@ use constantinople_engine::ThresholdScheme;
 use constantinople_indexer::IndexerClient;
 use constantinople_mempool::webserver::{TxStatus, client::Client};
 use constantinople_primitives::{
-    AccountKey, NONCE_BITMAP_CAPACITY, Operation, SignedTransaction, TRANSACTION_NAMESPACE,
-    Transaction, TransactionPublicKey, Voucher, channel_address,
+    AccountKey, CHANNEL_NEVER_EXPIRES, NONCE_BITMAP_CAPACITY, Operation, SignedTransaction,
+    TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, Voucher, channel_address,
 };
+use core::num::NonZeroU64;
 use exoware_qmdb::{OperationLogClient, proto::qmdb::v1::GetOperationRangeRequest};
 use exoware_sdk::{StoreClient, proto::PreferZstdHttpClient};
 use serde::{Deserialize, Serialize};
@@ -47,7 +48,10 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     net::{IpAddr, Ipv4Addr, SocketAddr},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 use tokio::sync::Mutex;
@@ -64,6 +68,8 @@ type ConsensusScheme = ThresholdScheme<ed25519::PublicKey, MinSig>;
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 const STARTUP_FETCH_BACKOFF: Duration = Duration::from_millis(500);
 const NONCE_WINDOW_BACKOFF: Duration = Duration::from_millis(100);
+const HEIGHT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const SETTLEMENT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-operator")]
@@ -103,6 +109,14 @@ struct Cli {
     /// Price charged per voucher step.
     #[arg(long, default_value_t = default_price())]
     price: u64,
+
+    /// Minimum blocks between registration and a channel's expiry.
+    #[arg(long, default_value_t = default_min_runway())]
+    min_runway: u64,
+
+    /// Blocks before expiry at which vouchers stop and settlement starts.
+    #[arg(long, default_value_t = default_settle_margin())]
+    settle_margin: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +131,10 @@ struct OperatorConfig {
     receiver_seed: u64,
     #[serde(default = "default_price")]
     price: u64,
+    #[serde(default = "default_min_runway")]
+    min_runway: u64,
+    #[serde(default = "default_settle_margin")]
+    settle_margin: u64,
 }
 
 const fn default_listen_addr() -> IpAddr {
@@ -131,18 +149,34 @@ const fn default_price() -> u64 {
     1
 }
 
+const fn default_min_runway() -> u64 {
+    20
+}
+
+const fn default_settle_margin() -> u64 {
+    10
+}
+
 #[derive(Clone)]
 struct AppState {
     shared: Arc<AppShared>,
 }
 
-/// Read-only after startup, except for the mutable state behind the mutex.
+/// Read-only after startup, except for the mutable state behind the mutex and
+/// the height cache.
 struct AppShared {
     receiver: ed25519::PrivateKey,
     receiver_pk: TransactionPublicKey,
     receiver_account: AccountKey,
     relayer: Client,
     verifier: ChannelVerifier,
+    /// Latest finalized height, refreshed by a background task. All expiry
+    /// decisions read this cache.
+    height: AtomicU64,
+    /// Minimum blocks of runway a channel must have left at registration.
+    min_runway: u64,
+    /// Blocks before expiry at which vouchers stop and settlement starts.
+    settle_margin: u64,
     state: Mutex<OperatorState>,
 }
 
@@ -166,6 +200,8 @@ struct OperatorState {
 struct RegisteredChannel {
     payer: TransactionPublicKey,
     open_nonce: u64,
+    /// Block height after which the payer may reclaim the escrow.
+    expiry: u64,
     latest: Option<Voucher>,
     settlement: SettlementState,
 }
@@ -175,6 +211,9 @@ enum SettlementState {
     Open,
     Settling,
     Settled,
+    /// The close could not finalize before the payer reclaimed the channel;
+    /// its vouchers are forfeited.
+    Abandoned,
 }
 
 struct ChannelVerifier {
@@ -187,12 +226,16 @@ struct VerifiedOpenChannel {
     receiver: AccountKey,
     open_nonce: u64,
     deposit: u64,
+    expiry: u64,
 }
 
 #[derive(Debug, Serialize)]
 struct PublicKeyResponse {
     public_key: String,
     account: String,
+    /// Latest finalized height the operator has observed (0 until the first
+    /// poll lands). Lets clients pick sane channel expiries.
+    height: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -259,6 +302,9 @@ async fn main() {
             receiver_account,
             relayer,
             verifier,
+            height: AtomicU64::new(0),
+            min_runway: config.min_runway,
+            settle_margin: config.settle_margin,
             state: Mutex::new(OperatorState {
                 operator: ChannelOperator::new(config.price),
                 nonce,
@@ -268,6 +314,8 @@ async fn main() {
             }),
         }),
     };
+    tokio::spawn(track_height(state.shared.clone()));
+    tokio::spawn(settlement_sweep(state.shared.clone()));
 
     let addr = SocketAddr::new(config.listen_addr, config.port);
     let app = Router::new()
@@ -295,6 +343,8 @@ struct OperatorRuntimeConfig {
     qmdb_url: String,
     receiver_seed: u64,
     price: u64,
+    min_runway: u64,
+    settle_margin: u64,
 }
 
 impl OperatorRuntimeConfig {
@@ -312,6 +362,8 @@ impl OperatorRuntimeConfig {
                 qmdb_url: resolve_named_http_url(&config.qmdb_url, hosts.as_ref()),
                 receiver_seed: config.receiver_seed,
                 price: config.price,
+                min_runway: config.min_runway,
+                settle_margin: config.settle_margin,
             };
         }
 
@@ -323,6 +375,8 @@ impl OperatorRuntimeConfig {
             qmdb_url: cli.qmdb_url.expect("provide --qmdb-url or --config"),
             receiver_seed: cli.receiver_seed,
             price: cli.price,
+            min_runway: cli.min_runway,
+            settle_margin: cli.settle_margin,
         }
     }
 }
@@ -363,6 +417,53 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Keeps the shared height cache tracking the latest finalized height.
+async fn track_height(shared: Arc<AppShared>) {
+    loop {
+        match shared.verifier.latest_height().await {
+            Ok(Some(height)) => {
+                shared.height.fetch_max(height, Ordering::Relaxed);
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "latest height lookup failed"),
+        }
+        tokio::time::sleep(HEIGHT_POLL_INTERVAL).await;
+    }
+}
+
+/// Force-settles voucher-bearing channels approaching their expiry.
+///
+/// A receiver that misses a channel's expiry forfeits its vouchers (the payer
+/// reclaims the whole escrow), so settlement cannot wait for the payer to ask.
+async fn settlement_sweep(shared: Arc<AppShared>) {
+    loop {
+        tokio::time::sleep(SETTLEMENT_SWEEP_INTERVAL).await;
+        let height = shared.height.load(Ordering::Relaxed);
+        let due: Vec<AccountKey> = {
+            let state = shared.state.lock().await;
+            state
+                .channels
+                .iter()
+                .filter(|(_, registered)| {
+                    registered.settlement == SettlementState::Open
+                        && registered.latest.is_some()
+                        && height.saturating_add(shared.settle_margin) >= registered.expiry
+                })
+                .map(|(channel, _)| *channel)
+                .collect()
+        };
+        for channel in due {
+            info!(%channel, height, "expiry approaching, force-settling channel");
+            let shared = shared.clone();
+            tokio::spawn(async move {
+                if let Err(error) = settle_registered_channel(&shared, channel).await {
+                    warn!(%channel, error = %error.message, "sweep settlement failed");
+                }
+            });
+        }
+    }
+}
+
 /// Recovers the receiver's next transaction nonce from committed chain state.
 ///
 /// The nonce cannot start at zero: after any prior settlement a fresh process
@@ -401,6 +502,7 @@ async fn public_key(State(state): State<AppState>) -> Json<PublicKeyResponse> {
     Json(PublicKeyResponse {
         public_key: hex(&state.shared.receiver_pk.encode()),
         account: state.shared.receiver_account.to_string(),
+        height: state.shared.height.load(Ordering::Relaxed),
     })
 }
 
@@ -430,6 +532,13 @@ async fn register_channel(
     if open.receiver != state.shared.receiver_account {
         return Err(ApiError::bad_request("open transaction receiver mismatch"));
     }
+    // Past the expiry the payer can reclaim the whole escrow, voiding any
+    // unsettled vouchers; refuse channels without enough runway to serve and
+    // settle safely.
+    let height = state.shared.height.load(Ordering::Relaxed);
+    if open.expiry <= height.saturating_add(state.shared.min_runway) {
+        return Err(ApiError::bad_request("channel expires too soon"));
+    }
 
     let payer_account = AccountKey::from_public_key(&open.payer);
     let expected = channel_address(
@@ -452,6 +561,7 @@ async fn register_channel(
         payer,
         request.open_nonce,
         open.deposit,
+        open.expiry,
     )?;
     if inserted {
         debug!(%channel, deposit = open.deposit, "registered channel");
@@ -468,6 +578,7 @@ fn register_verified_channel(
     payer: TransactionPublicKey,
     open_nonce: u64,
     deposit: u64,
+    expiry: u64,
 ) -> Result<bool, ApiError> {
     if let Some(registered) = channels.get(&channel) {
         if registered.payer != payer || registered.open_nonce != open_nonce {
@@ -484,6 +595,7 @@ fn register_verified_channel(
         RegisteredChannel {
             payer,
             open_nonce,
+            expiry,
             latest: None,
             settlement: SettlementState::Open,
         },
@@ -503,6 +615,8 @@ async fn serve_voucher(
         signature,
     };
 
+    let height = state.shared.height.load(Ordering::Relaxed);
+    let settle_margin = state.shared.settle_margin;
     let mut state = state.shared.state.lock().await;
     let state = &mut *state;
     let Some(registered) = state.channels.get_mut(&channel) else {
@@ -512,6 +626,11 @@ async fn serve_voucher(
     // refuse to serve work the submitted close will not pay for.
     if registered.settlement != SettlementState::Open {
         return Err(ApiError::bad_request("channel settlement already started"));
+    }
+    // Near expiry a voucher may not settle before the payer can reclaim the
+    // escrow; stop serving and let the sweep close the channel.
+    if height.saturating_add(settle_margin) >= registered.expiry {
+        return Err(ApiError::bad_request("channel is about to expire"));
     }
     let charged = state.operator.serve(&voucher).map_err(ApiError::serve)?;
     registered.latest = Some(voucher);
@@ -526,9 +645,22 @@ async fn settle_channel(
     Json(request): Json<SettleRequest>,
 ) -> Result<Json<SettleResponse>, ApiError> {
     let channel = decode_field::<AccountKey>("channel", &request.channel)?;
-    let (payer, open_nonce, latest, nonce) = loop {
+    settle_registered_channel(&state.shared, channel)
+        .await
+        .map(Json)
+}
+
+/// Settles a registered channel's latest voucher on chain.
+///
+/// Shared by the `/settle` handler and the expiry sweep; the settlement-state
+/// machine makes concurrent calls for the same channel idempotent.
+async fn settle_registered_channel(
+    shared: &Arc<AppShared>,
+    channel: AccountKey,
+) -> Result<SettleResponse, ApiError> {
+    let (payer, open_nonce, expiry, latest, nonce) = loop {
         {
-            let mut state = state.shared.state.lock().await;
+            let mut state = shared.state.lock().await;
             let state = &mut *state;
             // A close may reserve a nonce at most `NONCE_BITMAP_CAPACITY`
             // ahead of the oldest unfinalized close. Beyond that, the chain
@@ -542,16 +674,18 @@ async fn settle_channel(
                 return Err(ApiError::bad_request("unknown channel"));
             };
             match registered.settlement {
-                SettlementState::Settled | SettlementState::Settling => {
+                SettlementState::Settled
+                | SettlementState::Settling
+                | SettlementState::Abandoned => {
                     let cumulative = registered
                         .latest
                         .as_ref()
                         .map(|voucher| voucher.cumulative)
                         .unwrap_or(0);
-                    return Ok(Json(SettleResponse {
+                    return Ok(SettleResponse {
                         settled: registered.settlement == SettlementState::Settled,
                         cumulative,
-                    }));
+                    });
                 }
                 SettlementState::Open => {}
             }
@@ -562,10 +696,11 @@ async fn settle_channel(
                 registered.settlement = SettlementState::Settling;
                 let payer = registered.payer.clone();
                 let open_nonce = registered.open_nonce;
+                let expiry = registered.expiry;
                 let nonce = state.nonce;
                 state.nonce = state.nonce.saturating_add(1);
                 state.inflight.insert(nonce);
-                break (payer, open_nonce, latest, nonce);
+                break (payer, open_nonce, expiry, latest, nonce);
             }
         }
         // The nonce window is full; wait for an in-flight close to finalize.
@@ -576,29 +711,93 @@ async fn settle_channel(
     // and settlement flag above need mutual exclusion.
     let cumulative = latest.cumulative;
     let close = build_close(
-        &state.shared.receiver,
-        &state.shared.receiver_pk,
+        &shared.receiver,
+        &shared.receiver_pk,
         &payer,
         open_nonce,
         cumulative,
         latest.signature,
         nonce,
     );
-    submit_until_finalized(&state.shared.relayer, close).await;
+    let finalized = submit_close(shared, close, expiry).await;
+    if !finalized {
+        // The channel was reclaimed by the payer, so the close can never
+        // land. Its reserved nonce was never consumed; burn it with a
+        // receiver self-transfer so the in-flight window's invariant (every
+        // nonce below the oldest in-flight one is consumed) stays true.
+        warn!(%channel, "close cannot finalize; burning its nonce and abandoning settlement");
+        let burn = Transaction::new(
+            shared.receiver_pk.clone(),
+            shared.receiver_pk.clone(),
+            NonZeroU64::new(1).expect("burn value is non-zero"),
+            nonce,
+        )
+        .seal_and_sign(
+            &shared.receiver,
+            TRANSACTION_NAMESPACE,
+            &mut Sha256::default(),
+        );
+        submit_until_finalized(&shared.relayer, burn).await;
+    }
 
-    let mut state = state.shared.state.lock().await;
+    let mut state = shared.state.lock().await;
     let state = &mut *state;
     state.inflight.remove(&nonce);
-    // The close consumed its nonce on chain, so the chain's nonce base has
-    // caught up past any startup jump; later closes may run ahead again.
+    // Either the close or its burn consumed the nonce on chain, so the chain's
+    // nonce base has caught up past any startup jump; later closes may run
+    // ahead again.
     state.aligned = true;
     if let Some(registered) = state.channels.get_mut(&channel) {
-        registered.settlement = SettlementState::Settled;
+        registered.settlement = if finalized {
+            SettlementState::Settled
+        } else {
+            SettlementState::Abandoned
+        };
     }
-    Ok(Json(SettleResponse {
-        settled: true,
+    Ok(SettleResponse {
+        settled: finalized,
         cumulative,
-    }))
+    })
+}
+
+/// Submits a close until it finalizes, or gives up once the chain is past the
+/// channel's expiry (the payer may reclaim the channel from that point, after
+/// which the close can never land).
+///
+/// Returns whether the close finalized.
+async fn submit_close(shared: &Arc<AppShared>, close: Tx, expiry: u64) -> bool {
+    let batch = [close];
+    loop {
+        match shared.relayer.submit(&batch).await {
+            Ok(TxStatus::Finalized { height }) => {
+                debug!(height, "operator close finalized");
+                return true;
+            }
+            Ok(TxStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            }) if !included.is_empty() => {
+                debug!(
+                    height,
+                    included = included.len(),
+                    filtered = filtered.len(),
+                    "operator close partially finalized"
+                );
+                return true;
+            }
+            Ok(status) => {
+                warn!(?status, "operator close not finalized, retrying");
+            }
+            Err(error) => {
+                warn!(%error, "operator close submit failed, retrying");
+            }
+        }
+        if expiry != CHANNEL_NEVER_EXPIRES && shared.height.load(Ordering::Relaxed) > expiry {
+            return false;
+        }
+        tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+    }
 }
 
 fn build_close(
@@ -628,6 +827,15 @@ impl ChannelVerifier {
             indexer: IndexerClient::new(store.clone(), store),
             transactions: OperationLogClient::plaintext(&qmdb_url, ()),
         }
+    }
+
+    /// Latest finalized height from the indexer.
+    async fn latest_height(&self) -> Result<Option<u64>, String> {
+        let certificate_cfg = (ConsensusScheme::certificate_codec_config_unbounded(), ());
+        self.indexer
+            .latest_height::<Sha256, ed25519::PublicKey, ConsensusScheme>(&certificate_cfg)
+            .await
+            .map_err(|error| format!("latest height lookup failed: {error}"))
     }
 
     async fn verify_open_channel(
@@ -693,7 +901,12 @@ impl ChannelVerifier {
             .sender()
             .ok_or_else(|| "open transaction sender did not decode".to_string())?
             .clone();
-        let Operation::OpenChannel { receiver, deposit } = tx.value().op() else {
+        let Operation::OpenChannel {
+            receiver,
+            deposit,
+            expiry,
+        } = tx.value().op()
+        else {
             return Err("open transaction is not an OpenChannel".to_string());
         };
         Ok(VerifiedOpenChannel {
@@ -701,6 +914,7 @@ impl ChannelVerifier {
             receiver: *receiver,
             open_nonce: tx.value().nonce,
             deposit: deposit.get(),
+            expiry: *expiry,
         })
     }
 }
@@ -811,6 +1025,7 @@ mod tests {
                 payer.clone(),
                 open_nonce,
                 20,
+                CHANNEL_NEVER_EXPIRES,
             )
             .expect("initial registration should succeed")
         );
@@ -831,6 +1046,7 @@ mod tests {
                 payer,
                 open_nonce,
                 20,
+                CHANNEL_NEVER_EXPIRES,
             )
             .expect("duplicate registration should be idempotent")
         );

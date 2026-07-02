@@ -146,7 +146,9 @@ where
     let digest = *tx.message_digest();
     let item = match tx.value().op() {
         Operation::Transfer { .. } => PreparedItem::Transfer(executor::prepare_transfer(tx)?),
-        Operation::OpenChannel { .. } | Operation::CloseChannel { .. } => {
+        Operation::OpenChannel { .. }
+        | Operation::CloseChannel { .. }
+        | Operation::TimeoutChannel { .. } => {
             PreparedItem::ChannelOp(Box::new(prepare_channel_op(tx)?))
         }
     };
@@ -224,12 +226,15 @@ fn lanes_conflict(transfers: &db::StateWrites, channel_ops: &ChannelWrites) -> b
 
 /// Runs both lanes against block-start state and returns their writes.
 ///
-/// Returns `None` if either lane rejects the batch, or if the two lanes write
-/// the same account in one block (which would race on a single key).
+/// `height` is the height of the block being executed (channel timeouts are
+/// gated on it). Returns `None` if either lane rejects the batch, or if the
+/// two lanes write the same account in one block (which would race on a single
+/// key).
 async fn execute_lanes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     prepared: &PreparedBatch<H>,
+    height: u64,
 ) -> Option<(db::StateWrites, ChannelWrites)>
 where
     E: Storage + Clock + Metrics,
@@ -237,7 +242,7 @@ where
     S: Strategy,
 {
     let transfer_writes = compute(batch, strategy, &prepared.transfers).await?;
-    let channel_writes = channel::apply_channel_ops(batch, &prepared.channel_ops).await?;
+    let channel_writes = channel::apply_channel_ops(batch, &prepared.channel_ops, height).await?;
     if lanes_conflict(&transfer_writes, &channel_writes) {
         return None;
     }
@@ -576,6 +581,7 @@ async fn execute_proposal_lanes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
     transactions: Vec<SignedTransaction<H>>,
+    height: u64,
 ) -> Option<(
     Vec<SignedTransaction<H>>,
     Vec<H::Digest>,
@@ -610,7 +616,8 @@ where
     }
 
     let transfer_writes = compute(batch, strategy, &transfers).await?;
-    let (channel_writes, applied) = channel::apply_channel_ops_skipping(batch, &channel_ops).await;
+    let (channel_writes, applied) =
+        channel::apply_channel_ops_skipping(batch, &channel_ops, height).await;
     if lanes_conflict(&transfer_writes, &channel_writes) {
         return None;
     }
@@ -651,9 +658,14 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let outcome = execute_proposal_lanes(&state_batch, &strategy, transactions)
-        .instrument(info_span!("application.execute.compute"))
-        .await;
+    let outcome = execute_proposal_lanes(
+        &state_batch,
+        &strategy,
+        transactions,
+        parent.header.height + 1,
+    )
+    .instrument(info_span!("application.execute.compute"))
+    .await;
 
     let (body, digests, state_batch) = match outcome {
         Some((body, digests, (transfer_writes, channel_writes))) => {
@@ -697,10 +709,11 @@ where
     let prepared = info_span!("application.execute.prepare")
         .in_scope(|| prepare_lazy_block(&strategy, body.as_ref().as_slice()))?;
 
-    let (transfer_writes, channel_writes) = execute_lanes(&state_batch, &strategy, &prepared)
-        .instrument(info_span!("application.execute.compute"))
-        .await
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let (transfer_writes, channel_writes) =
+        execute_lanes(&state_batch, &strategy, &prepared, parent.header.height + 1)
+            .instrument(info_span!("application.execute.compute"))
+            .await
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let transaction_count = prepared.transfers.len() + prepared.channel_ops.len();
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
@@ -726,16 +739,18 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
     prepared: &PreparedBatch<H>,
+    height: u64,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let (transfer_writes, channel_writes) = execute_lanes(&state_batch, &strategy, prepared)
-        .instrument(info_span!("application.execute.compute"))
-        .await
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let (transfer_writes, channel_writes) =
+        execute_lanes(&state_batch, &strategy, prepared, height)
+            .instrument(info_span!("application.execute.compute"))
+            .await
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
         let state_batch = apply_shard_maps(state_batch, transfer_writes);

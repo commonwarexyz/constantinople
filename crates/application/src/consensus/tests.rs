@@ -29,9 +29,9 @@ use commonware_storage::{
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
-    Account, AccountKey, Block, Header, Operation, PublicKeyCache, Sealable, SealedBlock,
-    SignedTransaction, Transaction, TransactionPublicKey, TransactionSignature, Voucher,
-    channel_address,
+    Account, AccountKey, Block, CHANNEL_NEVER_EXPIRES, Header, Operation, PublicKeyCache, Sealable,
+    SealedBlock, SignedTransaction, Transaction, TransactionPublicKey, TransactionSignature,
+    Voucher, channel_address,
 };
 use std::{num::NonZeroU64, time::Duration};
 
@@ -367,6 +367,7 @@ fn channel_streams_offchain_and_settles_onchain() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -459,6 +460,7 @@ fn chain_rejects_overclaim_voucher() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -507,6 +509,7 @@ fn chain_rejects_forged_voucher() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -555,6 +558,7 @@ fn multiple_opens_in_one_block_compose() {
             payer_pk.clone(),
             recv_a_pk,
             NonZeroU64::new(30).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             0,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -562,6 +566,7 @@ fn multiple_opens_in_one_block_compose() {
             payer_pk.clone(),
             recv_b_pk,
             NonZeroU64::new(20).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             1,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -606,6 +611,7 @@ fn settled_voucher_cannot_be_replayed() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -675,6 +681,7 @@ fn refunding_a_settled_channel_address_enables_replay() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -756,6 +763,7 @@ fn verifier_accepts_a_proposed_channel_block() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -833,6 +841,7 @@ fn open_channel_rejects_non_ed25519_payer() {
             payer_pk,
             receiver_pk,
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             0,
         );
         let sealed = open.seal(&mut sha256::Sha256::default());
@@ -885,6 +894,7 @@ fn poison_channel_op_does_not_empty_the_proposal() {
             payer_pk.clone(),
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             0,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
@@ -897,6 +907,7 @@ fn poison_channel_op_does_not_empty_the_proposal() {
             secp_pk,
             receiver_pk.clone(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            CHANNEL_NEVER_EXPIRES,
             0,
         )
         .seal(&mut sha256::Sha256::default());
@@ -948,6 +959,157 @@ fn poison_channel_op_does_not_empty_the_proposal() {
             read_account(&dbs, &receiver_key).await.nonce.base,
             0,
             "skipped close must not consume the receiver's nonce"
+        );
+    });
+}
+
+/// A timeout is rejected while the channel is unexpired, reclaims the entire
+/// escrow once the block height exceeds the expiry, and leaves nothing for a
+/// late close to settle.
+#[test]
+fn timeout_respects_expiry_then_reclaims() {
+    deterministic::Runner::default().start(|context| async move {
+        let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
+
+        let payer = ed25519::PrivateKey::from_seed(2);
+        let receiver = ed25519::PrivateKey::from_seed(3);
+        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
+        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let payer_key = AccountKey::from_public_key(&payer_pk);
+        let receiver_key = AccountKey::from_public_key(&receiver_pk);
+        let open_nonce: u64 = 0;
+        let channel = channel_address(&payer_key, &receiver_key, open_nonce);
+        // The open lands at height 1, so the channel is expired (reclaimable)
+        // from height 3 on.
+        let expiry = 2;
+
+        let open = Transaction::open_channel(
+            payer_pk.clone(),
+            receiver_pk.clone(),
+            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            expiry,
+            open_nonce,
+        )
+        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let (block, included) =
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
+        assert_eq!(included, 1);
+        // The channel account's (otherwise unusable) nonce slot records the
+        // expiry.
+        let stored = read_raw(&dbs, &channel).await.expect("channel exists");
+        assert_eq!(stored.nonce.base, expiry);
+        assert_eq!(stored.balance, DEPOSIT);
+
+        // The payer signs a voucher off-chain; the receiver will miss the
+        // deadline and forfeit it.
+        let voucher = Voucher::sign(&payer, channel, PRICE);
+
+        let timeout =
+            Transaction::timeout_channel(payer_pk.clone(), receiver_pk.clone(), open_nonce, 1)
+                .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+
+        // Height 2 is not past the expiry; the timeout is rejected and the
+        // channel is untouched.
+        let (block, included) = propose_and_finalize(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &block,
+            vec![timeout.clone()],
+        )
+        .await;
+        assert_eq!(included, 0, "timeout before expiry must be rejected");
+        assert_eq!(read_account(&dbs, &channel).await.balance, DEPOSIT);
+
+        // Height 3 exceeds the expiry; the same transaction now reclaims the
+        // full escrow and deletes the channel.
+        let (block, included) =
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![timeout]).await;
+        assert_eq!(included, 1, "timeout after expiry reclaims the channel");
+        assert_eq!(
+            read_account(&dbs, &payer_key).await.balance,
+            100,
+            "payer reclaimed the entire escrow"
+        );
+        assert_eq!(read_raw(&dbs, &channel).await, None, "channel deleted");
+
+        // The receiver's (still validly signed) voucher is now worthless.
+        let close = Transaction::close_channel(
+            receiver_pk.clone(),
+            payer_pk.clone(),
+            open_nonce,
+            voucher.cumulative,
+            voucher.signature.clone(),
+            0,
+        )
+        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let (_block, included) =
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
+        assert_eq!(included, 0, "close after reclaim must be rejected");
+        assert_eq!(read_account(&dbs, &receiver_key).await.balance, 100);
+    });
+}
+
+/// A close is valid at any height while the channel exists: even past the
+/// expiry, a close that lands before the payer's timeout settles normally and
+/// leaves nothing to reclaim.
+#[test]
+fn close_beats_timeout_after_expiry() {
+    deterministic::Runner::default().start(|context| async move {
+        let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
+
+        let payer = ed25519::PrivateKey::from_seed(2);
+        let receiver = ed25519::PrivateKey::from_seed(3);
+        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
+        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let payer_key = AccountKey::from_public_key(&payer_pk);
+        let receiver_key = AccountKey::from_public_key(&receiver_pk);
+        let open_nonce: u64 = 0;
+        let channel = channel_address(&payer_key, &receiver_key, open_nonce);
+
+        // Expired as soon as the next block: the open lands at height 1 and
+        // the expiry is 1.
+        let open = Transaction::open_channel(
+            payer_pk.clone(),
+            receiver_pk.clone(),
+            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            1,
+            open_nonce,
+        )
+        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let (block, included) =
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
+        assert_eq!(included, 1);
+
+        // The close still settles at height 2 (> expiry) because the channel
+        // exists until someone deletes it.
+        let voucher = Voucher::sign(&payer, channel, PRICE);
+        let close = Transaction::close_channel(
+            receiver_pk.clone(),
+            payer_pk.clone(),
+            open_nonce,
+            voucher.cumulative,
+            voucher.signature.clone(),
+            0,
+        )
+        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let (block, included) =
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
+        assert_eq!(included, 1, "close settles even after expiry");
+        assert_eq!(read_account(&dbs, &receiver_key).await.balance, 100 + PRICE);
+
+        // The payer's timeout finds no channel.
+        let timeout =
+            Transaction::timeout_channel(payer_pk.clone(), receiver_pk.clone(), open_nonce, 1)
+                .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let (_block, included) =
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![timeout]).await;
+        assert_eq!(included, 0, "timeout after close finds no channel");
+        assert_eq!(
+            read_account(&dbs, &payer_key).await.balance,
+            100 - PRICE,
+            "payer keeps only the close refund"
         );
     });
 }

@@ -24,7 +24,9 @@ mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};
 
 mod transaction;
-pub use transaction::{Operation, SignedTransaction, Transaction, VerifiedTransaction};
+pub use transaction::{
+    CHANNEL_NEVER_EXPIRES, Operation, SignedTransaction, Transaction, VerifiedTransaction,
+};
 
 mod channel;
 pub use channel::{VOUCHER_NAMESPACE, Voucher, channel_address, verify_voucher, voucher_message};

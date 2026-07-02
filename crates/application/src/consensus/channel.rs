@@ -9,7 +9,10 @@
 //! Channels are ordinary accounts at a derived, unspendable address (see
 //! [`constantinople_primitives::channel_address`]). Opening a channel debits the
 //! payer and funds the channel account; closing it verifies the payer's voucher
-//! and splits the escrow between receiver and payer. Because a channel is just
+//! and splits the escrow between receiver and payer; once the block height
+//! exceeds the channel's expiry, a timeout lets the payer reclaim the whole
+//! escrow unilaterally. A channel address can never sign a transaction, so the
+//! channel account's nonce slot stores the expiry. Because a channel is just
 //! an account, no new state value type, QMDB schema, or block-header field is
 //! required.
 //!
@@ -38,7 +41,9 @@
 //! it cannot arise in normal operation — only a deliberate transfer to a dead
 //! channel address, where the funder is the only party that can lose. Closing
 //! the gap entirely would need a durable closed-marker, which trades away the
-//! no-residual-state property; see the limitations below.
+//! no-residual-state property; see the limitations below. (A transfer-created
+//! account carries a zero nonce, which reads as expiry 0, so the payer can at
+//! least reclaim such stray escrow with a timeout.)
 //!
 //! Design choices and limitations (candidates for follow-up):
 //! - A channel address is an ordinary account, so anyone may pay into it and an
@@ -51,14 +56,17 @@
 //! - Channel vouchers are Ed25519, so `OpenChannel` rejects a non-Ed25519
 //!   payer: it could never sign a settleable voucher, which would lock the
 //!   deposit.
-//! - Closing deletes the channel account, so a settled channel leaves no state.
-//!   The flip side is the replay caveat above: with no residual marker, a
-//!   re-funded dead address looks like a fresh, live channel. A durable
-//!   closed-marker would close that gap at the cost of per-channel state.
-//! - There is no unilateral timed-withdraw escape yet; a payer relies on the
-//!   receiver to settle. Adding it needs a `withdraw_deadline` on the channel
-//!   account (its otherwise-unused nonce slot suffices, since a channel address
-//!   can never sign a transaction).
+//! - Closing (or timing out) deletes the channel account, so a settled channel
+//!   leaves no state. The flip side is the replay caveat above: with no
+//!   residual marker, a re-funded dead address looks like a fresh, live
+//!   channel. A durable closed-marker would close that gap at the cost of
+//!   per-channel state.
+//! - The channel's expiry is the receiver's settlement deadline: a close is
+//!   valid at any height while the channel exists, a timeout only once
+//!   `height > expiry`, and whichever lands first deletes the channel and
+//!   invalidates the other. A receiver that misses the deadline forfeits its
+//!   unsettled vouchers, so it must settle with margin (the operator stops
+//!   serving vouchers as expiry approaches for exactly this reason).
 
 use super::db::StateBatch;
 use crate::executor::apply_credit;
@@ -102,6 +110,8 @@ pub enum PreparedChannelOpKind {
         receiver: AccountKey,
         /// Amount escrowed.
         deposit: u64,
+        /// Block height after which the payer may reclaim the escrow.
+        expiry: u64,
     },
     /// Close a channel, settling the latest voucher.
     Close {
@@ -115,6 +125,13 @@ pub enum PreparedChannelOpKind {
         cumulative: u64,
         /// Payer's voucher signature.
         voucher: ed25519::Signature,
+    },
+    /// Reclaim an expired channel's escrow for the sender (payer).
+    Timeout {
+        /// Receiver account key (used to derive the channel address).
+        receiver: AccountKey,
+        /// Nonce of the `OpenChannel` that created the channel.
+        open_nonce: u64,
     },
 }
 
@@ -132,7 +149,11 @@ where
     let sender = AccountKey::from_public_key(sender_key);
     let kind = match tx.op() {
         Operation::Transfer { .. } => return None,
-        Operation::OpenChannel { receiver, deposit } => {
+        Operation::OpenChannel {
+            receiver,
+            deposit,
+            expiry,
+        } => {
             // Vouchers are Ed25519, so a non-Ed25519 payer could never sign a
             // voucher the chain accepts at settlement — the deposit would be
             // locked until withdrawal. Refuse to open such a channel.
@@ -142,6 +163,7 @@ where
             PreparedChannelOpKind::Open {
                 receiver: *receiver,
                 deposit: deposit.get(),
+                expiry: *expiry,
             }
         }
         Operation::CloseChannel {
@@ -155,6 +177,13 @@ where
             open_nonce: *open_nonce,
             cumulative: *cumulative,
             voucher: voucher.clone(),
+        },
+        Operation::TimeoutChannel {
+            receiver,
+            open_nonce,
+        } => PreparedChannelOpKind::Timeout {
+            receiver: *receiver,
+            open_nonce: *open_nonce,
         },
     };
     Some(PreparedChannelOp {
@@ -179,21 +208,23 @@ fn account_or_default(pending: &Pending, loaded: &Pending, key: &AccountKey) -> 
     }
 }
 
-/// Returns a channel's current escrow, or `None` if no channel lives at `key`.
+/// Returns the channel account at `key`, or `None` if no channel lives there.
 ///
-/// Unlike [`account_or_default`], a never-funded address contributes no escrow
-/// (not the default account balance), so opening mints nothing and closing a
-/// nonexistent channel is rejected.
-fn channel_escrow(pending: &Pending, loaded: &Pending, key: &AccountKey) -> Option<u64> {
+/// Unlike [`account_or_default`], a never-funded address contributes nothing
+/// (not the funded default account), so opening mints nothing and closing or
+/// timing out a nonexistent channel is rejected. The account's balance is the
+/// escrow; its (otherwise unusable) nonce base stores the channel's expiry.
+fn channel_account(pending: &Pending, loaded: &Pending, key: &AccountKey) -> Option<Account> {
     match pending.get(key) {
-        Some(Some(account)) => Some(account.balance),
+        Some(Some(account)) => Some(*account),
         Some(None) => None,
-        None => loaded
-            .get(key)
-            .copied()
-            .flatten()
-            .map(|account| account.balance),
+        None => loaded.get(key).copied().flatten(),
     }
+}
+
+/// Returns a channel's current escrow, or `None` if no channel lives at `key`.
+fn channel_escrow(pending: &Pending, loaded: &Pending, key: &AccountKey) -> Option<u64> {
+    channel_account(pending, loaded, key).map(|account| account.balance)
 }
 
 /// Collects every account key a batch of channel operations reads or writes.
@@ -212,6 +243,12 @@ fn channel_op_keys(channel_ops: &[PreparedChannelOp]) -> Vec<AccountKey> {
             } => {
                 keys.push(*payer_key);
                 keys.push(channel_address(payer_key, &op.sender, *open_nonce));
+            }
+            PreparedChannelOpKind::Timeout {
+                receiver,
+                open_nonce,
+            } => {
+                keys.push(channel_address(&op.sender, receiver, *open_nonce));
             }
         }
     }
@@ -243,14 +280,25 @@ where
     keys.iter().copied().zip(values).collect()
 }
 
-/// Applies one channel operation to the working set.
+/// Applies one channel operation to the working set. `height` is the height of
+/// the block being executed, which gates timeout eligibility.
 ///
 /// Atomic: on any failure (bad nonce, insufficient balance, absent channel, an
-/// unverifiable voucher, or overflow) `pending` is left untouched and `None` is
-/// returned, so a failed operation can be skipped without unwinding.
-fn apply_channel_op(pending: &mut Pending, loaded: &Pending, op: &PreparedChannelOp) -> Option<()> {
+/// unverifiable voucher, an unexpired timeout, or overflow) `pending` is left
+/// untouched and `None` is returned, so a failed operation can be skipped
+/// without unwinding.
+fn apply_channel_op(
+    pending: &mut Pending,
+    loaded: &Pending,
+    op: &PreparedChannelOp,
+    height: u64,
+) -> Option<()> {
     match &op.kind {
-        PreparedChannelOpKind::Open { receiver, deposit } => {
+        PreparedChannelOpKind::Open {
+            receiver,
+            deposit,
+            expiry,
+        } => {
             let channel = channel_address(&op.sender, receiver, op.nonce);
             let mut payer = account_or_default(pending, loaded, &op.sender);
             if payer.balance < *deposit || !payer.nonce.consume(op.nonce) {
@@ -264,11 +312,13 @@ fn apply_channel_op(pending: &mut Pending, loaded: &Pending, op: &PreparedChanne
                 .unwrap_or(0)
                 .checked_add(*deposit)?;
             pending.insert(op.sender, Some(payer));
+            // A channel address can never sign a transaction, so its nonce
+            // slot is repurposed to store the expiry.
             pending.insert(
                 channel,
                 Some(Account {
                     balance: escrow,
-                    nonce: Nonce::default(),
+                    nonce: Nonce::new(*expiry, 0),
                 }),
             );
         }
@@ -316,6 +366,31 @@ fn apply_channel_op(pending: &mut Pending, loaded: &Pending, op: &PreparedChanne
             // Delete the settled channel so it leaves no state.
             pending.insert(channel, None);
         }
+        PreparedChannelOpKind::Timeout {
+            receiver,
+            open_nonce,
+        } => {
+            let channel = channel_address(&op.sender, receiver, *open_nonce);
+            // The channel must exist and its expiry (stored in the channel
+            // account's nonce base) must have passed. A receiver close that
+            // landed first deleted the channel, so first-to-land wins.
+            let account = channel_account(pending, loaded, &channel)?;
+            if height <= account.nonce.base {
+                return None;
+            }
+
+            // Reclaim the entire escrow for the payer (the sender of this
+            // transaction) and consume its nonce.
+            let mut payer = account_or_default(pending, loaded, &op.sender);
+            if !payer.nonce.consume(op.nonce) {
+                return None;
+            }
+            apply_credit(&mut payer, account.balance)?;
+            pending.insert(op.sender, Some(payer));
+
+            // Delete the reclaimed channel so it leaves no state.
+            pending.insert(channel, None);
+        }
     }
     Some(())
 }
@@ -330,6 +405,7 @@ fn apply_channel_op(pending: &mut Pending, loaded: &Pending, op: &PreparedChanne
 pub(super) async fn apply_channel_ops<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     channel_ops: &[PreparedChannelOp],
+    height: u64,
 ) -> Option<ChannelWrites>
 where
     E: Storage + Clock + Metrics,
@@ -343,7 +419,7 @@ where
     let loaded = load_channel_state(batch, channel_ops).await;
     let mut pending: Pending = AHashMap::new();
     for op in channel_ops {
-        apply_channel_op(&mut pending, &loaded, op)?;
+        apply_channel_op(&mut pending, &loaded, op, height)?;
     }
 
     Some(pending.into_iter().collect())
@@ -361,6 +437,7 @@ where
 pub(super) async fn apply_channel_ops_skipping<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     channel_ops: &[PreparedChannelOp],
+    height: u64,
 ) -> (ChannelWrites, Vec<bool>)
 where
     E: Storage + Clock + Metrics,
@@ -375,7 +452,7 @@ where
     let mut pending: Pending = AHashMap::new();
     let applied = channel_ops
         .iter()
-        .map(|op| apply_channel_op(&mut pending, &loaded, op).is_some())
+        .map(|op| apply_channel_op(&mut pending, &loaded, op, height).is_some())
         .collect();
 
     (pending.into_iter().collect(), applied)

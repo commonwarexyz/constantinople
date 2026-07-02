@@ -6,6 +6,14 @@
 //! owned by the operator so deposit bounds and final cumulative accounting live
 //! behind the same service boundary used in testnet.
 //!
+//! Every open carries an expiry (block height) after which the payer may
+//! reclaim the escrow with a `TimeoutChannel`. A jittered fraction of
+//! lifecycles exercise that path deliberately (short expiry, no registration,
+//! unilateral reclaim); the rest use a generous runway and settle normally. A
+//! lifecycle that strands its deposit (registration or settlement failure) is
+//! queued and reclaimed once its expiry passes, so failures no longer lose
+//! funds permanently.
+//!
 //! Channels use their own account ring, so their nonces never collide with the
 //! transfer presigner's accounts. Every channel pays the operator (the
 //! receiver key is the operator's), so ring accounts only ever drain: each
@@ -30,13 +38,32 @@ const PARTIAL_SETTLEMENT_PROBABILITY: f64 = 0.5;
 pub(crate) const MAX_REFUND_VOUCHERS: u64 = 3;
 const REGISTRATION_ATTEMPTS: usize = 10;
 const REGISTRATION_BACKOFF: core::time::Duration = core::time::Duration::from_millis(500);
+/// Blocks of runway a normal (settled) channel is opened with. Must comfortably
+/// exceed the operator's registration runway plus settle margin.
+const CHANNEL_EXPIRY_RUNWAY: u64 = 128;
+/// Fraction of lifecycles that exercise the payer timeout path instead of
+/// settling through the operator.
+const TIMEOUT_LIFECYCLE_PROBABILITY: f64 = 0.1;
+/// Blocks until a timeout-exercise channel expires.
+const TIMEOUT_EXPIRY_DELTA: u64 = 3;
+/// How many times to resubmit a timeout while waiting for expiry to pass.
+const RECLAIM_ATTEMPTS: usize = 30;
+const RECLAIM_BACKOFF: core::time::Duration = core::time::Duration::from_millis(500);
 
 /// Outcome of one channel lifecycle.
 pub struct LifecycleStats {
-    /// On-chain channel transactions that finalized (open + close).
+    /// On-chain channel transactions that finalized (opens, closes, and
+    /// timeout reclaims).
     pub channel_txs: u64,
     /// Off-chain vouchers streamed and verified.
     pub vouchers: u64,
+}
+
+/// A stranded deposit awaiting reclaim once its channel's expiry passes.
+struct PendingReclaim {
+    payer_i: usize,
+    open_nonce: u64,
+    expiry: u64,
 }
 
 /// Runs channel lifecycles over a dedicated account ring.
@@ -50,12 +77,19 @@ pub struct ChannelRunner {
     avg_vouchers: u64,
     price: u64,
     rng: JitterRng,
+    /// Latest finalized height observed via submissions; expiry selection and
+    /// reclaim due-checks read this.
+    height: u64,
+    /// Deposits stranded by registration or settlement failures, reclaimed
+    /// via timeout once due.
+    reclaims: Vec<PendingReclaim>,
 }
 
 impl ChannelRunner {
     /// Creates a runner over `accounts` (a ring; needs at least two), streaming
     /// on average `avg_vouchers` vouchers per channel at `price` each. `seed`
-    /// seeds the per-channel voucher-count jitter.
+    /// seeds the per-channel voucher-count jitter; `initial_height` seeds the
+    /// height estimate (refined by every finalized submission).
     pub fn new(
         accounts: Vec<SpamAccount>,
         operator: OperatorClient,
@@ -63,6 +97,7 @@ impl ChannelRunner {
         avg_vouchers: u64,
         price: u64,
         seed: u64,
+        initial_height: u64,
     ) -> Self {
         assert!(
             accounts.len() >= 2,
@@ -82,6 +117,14 @@ impl ChannelRunner {
             avg_vouchers,
             price,
             rng: JitterRng::new(seed),
+            height: initial_height,
+            reclaims: Vec::new(),
+        }
+    }
+
+    fn observe_height(&mut self, height: Option<u64>) {
+        if let Some(height) = height {
+            self.height = self.height.max(height);
         }
     }
 
@@ -106,15 +149,25 @@ impl ChannelRunner {
         cumulative.saturating_add(extra_vouchers.saturating_mul(self.price))
     }
 
-    /// Runs one lifecycle: open -> stream vouchers off-chain -> close.
+    /// Runs one lifecycle: open -> stream vouchers off-chain -> close (or, for
+    /// a jittered fraction, open -> wait out expiry -> unilateral timeout).
+    /// Also retries any reclaims whose expiry has passed.
     pub async fn run_once(&mut self, submitter: &RelayerSubmitter) -> LifecycleStats {
         let mut stats = LifecycleStats {
             channel_txs: 0,
             vouchers: 0,
         };
+        self.reclaim_due(submitter, &mut stats).await;
+
         let n = self.accounts.len();
         let payer_i = self.cursor;
         self.cursor = (self.cursor + 1) % n;
+
+        if self.rng.bernoulli(TIMEOUT_LIFECYCLE_PROBABILITY) {
+            self.run_timeout_lifecycle(submitter, payer_i, &mut stats)
+                .await;
+            return stats;
+        }
 
         let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
         let payer_account = AccountKey::from_public_key(&payer_pk);
@@ -127,18 +180,24 @@ impl ChannelRunner {
         };
 
         // On-chain: open the channel. The address derives from this nonce, so
-        // every open is a fresh, never-recurring channel.
+        // every open is a fresh, never-recurring channel. The expiry gives the
+        // operator plenty of runway; if anything below strands the deposit,
+        // the reclaim queue recovers it after this height passes.
         let open_nonce = self.nonces[payer_i];
         self.nonces[payer_i] += 1;
+        let expiry = self.height.saturating_add(CHANNEL_EXPIRY_RUNWAY);
         let open = build_open(
             &self.accounts[payer_i],
             &payer_pk,
             &self.operator_pk,
             deposit,
+            expiry,
             open_nonce,
         );
         let open_tx_digest = *open.message_digest();
-        if submitter.submit_reporting(vec![open]).await == 0 {
+        let (finalized, height) = submitter.submit_reporting_with_height(vec![open]).await;
+        self.observe_height(height);
+        if finalized == 0 {
             // Open did not finalize; don't close a channel that doesn't exist.
             return stats;
         }
@@ -148,9 +207,8 @@ impl ChannelRunner {
         // These are the payments that never touch the chain.
         let channel = channel_address(&payer_account, &self.operator_account, open_nonce);
         // The open is finalized but the operator's indexer may not have
-        // ingested it yet. A registration that never lands strands the deposit
-        // (there is no unilateral withdraw), so retry through transient lag
-        // before abandoning the lifecycle.
+        // ingested it yet. Retry through transient lag; if registration never
+        // lands, queue the deposit for a timeout reclaim.
         let mut registered = false;
         for attempt in 1..=REGISTRATION_ATTEMPTS {
             match self
@@ -169,6 +227,11 @@ impl ChannelRunner {
             }
         }
         if !registered {
+            self.reclaims.push(PendingReclaim {
+                payer_i,
+                open_nonce,
+                expiry,
+            });
             return stats;
         }
 
@@ -184,16 +247,137 @@ impl ChannelRunner {
             }
         }
         if stats.vouchers == 0 {
+            self.reclaims.push(PendingReclaim {
+                payer_i,
+                open_nonce,
+                expiry,
+            });
             return stats;
         }
 
         if let Err(error) = self.operator.settle_channel(channel).await {
             warn!(%error, %channel, "operator settlement failed");
+            self.reclaims.push(PendingReclaim {
+                payer_i,
+                open_nonce,
+                expiry,
+            });
             return stats;
         }
         stats.channel_txs += 1;
 
         stats
+    }
+
+    /// Opens a short-expiry channel, skips the operator entirely, and reclaims
+    /// the deposit with a unilateral timeout once the expiry passes.
+    async fn run_timeout_lifecycle(
+        &mut self,
+        submitter: &RelayerSubmitter,
+        payer_i: usize,
+        stats: &mut LifecycleStats,
+    ) {
+        let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
+        let open_nonce = self.nonces[payer_i];
+        self.nonces[payer_i] += 1;
+        let expiry = self.height.saturating_add(TIMEOUT_EXPIRY_DELTA);
+        let deposit = NonZeroU64::new(self.price).expect("price is >= 1");
+        let open = build_open(
+            &self.accounts[payer_i],
+            &payer_pk,
+            &self.operator_pk,
+            deposit,
+            expiry,
+            open_nonce,
+        );
+        let (finalized, height) = submitter.submit_reporting_with_height(vec![open]).await;
+        self.observe_height(height);
+        if finalized == 0 {
+            return;
+        }
+        stats.channel_txs += 1;
+
+        if self
+            .try_reclaim(submitter, payer_i, open_nonce, expiry)
+            .await
+        {
+            stats.channel_txs += 1;
+        } else {
+            self.reclaims.push(PendingReclaim {
+                payer_i,
+                open_nonce,
+                expiry,
+            });
+        }
+    }
+
+    /// Retries queued reclaims whose expiry has passed (one attempt each).
+    async fn reclaim_due(&mut self, submitter: &RelayerSubmitter, stats: &mut LifecycleStats) {
+        let mut due = Vec::new();
+        let height = self.height;
+        self.reclaims.retain(|reclaim| {
+            if height > reclaim.expiry {
+                due.push((reclaim.payer_i, reclaim.open_nonce, reclaim.expiry));
+                false
+            } else {
+                true
+            }
+        });
+        for (payer_i, open_nonce, expiry) in due {
+            if self
+                .try_reclaim(submitter, payer_i, open_nonce, expiry)
+                .await
+            {
+                stats.channel_txs += 1;
+            } else {
+                // Past expiry a timeout only fails if the channel no longer
+                // exists — the operator's close won the race after all — so
+                // there is nothing left to reclaim.
+                warn!(open_nonce, expiry, "reclaim found no channel; dropping");
+            }
+        }
+    }
+
+    /// Submits a `TimeoutChannel` for the channel, resubmitting the same
+    /// transaction (same nonce) until it lands or attempts run out. Returns
+    /// whether the reclaim finalized.
+    ///
+    /// If the operator's close raced ahead the channel is already gone and the
+    /// timeout can never land; attempts running out then just abandons a
+    /// reclaim that was unnecessary.
+    async fn try_reclaim(
+        &mut self,
+        submitter: &RelayerSubmitter,
+        payer_i: usize,
+        open_nonce: u64,
+        expiry: u64,
+    ) -> bool {
+        let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
+        let nonce = self.nonces[payer_i];
+        self.nonces[payer_i] += 1;
+        let timeout =
+            Transaction::timeout_channel(payer_pk, self.operator_pk.clone(), open_nonce, nonce)
+                .seal_and_sign(
+                    &self.accounts[payer_i].private_key,
+                    TRANSACTION_NAMESPACE,
+                    &mut Sha256::default(),
+                );
+        for _ in 0..RECLAIM_ATTEMPTS {
+            let (finalized, height) = submitter
+                .submit_reporting_with_height(vec![timeout.clone()])
+                .await;
+            self.observe_height(height);
+            if finalized > 0 {
+                return true;
+            }
+            // Not expired yet (or the operator settled first); wait for the
+            // chain to pass the expiry before deciding.
+            if self.height > expiry.saturating_add(TIMEOUT_EXPIRY_DELTA) {
+                return false;
+            }
+            tokio::time::sleep(RECLAIM_BACKOFF).await;
+        }
+        false
     }
 }
 
@@ -202,9 +386,17 @@ fn build_open(
     payer_pk: &TransactionPublicKey,
     receiver_pk: &TransactionPublicKey,
     deposit: NonZeroU64,
+    expiry: u64,
     nonce: u64,
 ) -> Tx {
-    Transaction::open_channel(payer_pk.clone(), receiver_pk.clone(), deposit, nonce).seal_and_sign(
+    Transaction::open_channel(
+        payer_pk.clone(),
+        receiver_pk.clone(),
+        deposit,
+        expiry,
+        nonce,
+    )
+    .seal_and_sign(
         &payer.private_key,
         TRANSACTION_NAMESPACE,
         &mut Sha256::default(),
@@ -220,6 +412,8 @@ pub struct OperatorClient {
 #[derive(serde::Deserialize)]
 struct PublicKeyResponse {
     public_key: String,
+    #[serde(default)]
+    height: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -250,7 +444,9 @@ impl OperatorClient {
         }
     }
 
-    pub async fn public_key(&self) -> Result<TransactionPublicKey, String> {
+    /// Fetches the operator's receiver public key plus its latest observed
+    /// finalized height (used to seed channel expiry selection).
+    pub async fn public_key(&self) -> Result<(TransactionPublicKey, u64), String> {
         let response = self
             .http
             .get(format!("{}/public-key", self.url))
@@ -268,8 +464,9 @@ impl OperatorClient {
             .map_err(|error| format!("operator public-key response invalid: {error}"))?;
         let bytes = from_hex(&public_key.public_key)
             .ok_or_else(|| "operator public key is not hex".to_string())?;
-        TransactionPublicKey::decode(bytes.as_slice())
-            .map_err(|error| format!("operator public key invalid: {error}"))
+        let decoded = TransactionPublicKey::decode(bytes.as_slice())
+            .map_err(|error| format!("operator public key invalid: {error}"))?;
+        Ok((decoded, public_key.height))
     }
 
     async fn register_channel(
@@ -347,7 +544,15 @@ mod tests {
         let operator_pk = constantinople_primitives::TransactionPublicKey::ed25519(
             commonware_cryptography::ed25519::PrivateKey::from_seed(9).public_key(),
         );
-        ChannelRunner::new(accounts, operator, operator_pk, avg_vouchers, price, seed)
+        ChannelRunner::new(
+            accounts,
+            operator,
+            operator_pk,
+            avg_vouchers,
+            price,
+            seed,
+            0,
+        )
     }
 
     #[test]

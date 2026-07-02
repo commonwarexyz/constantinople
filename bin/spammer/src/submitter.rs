@@ -92,13 +92,20 @@ impl RelayerSubmitter {
     /// finalized. Channel lifecycles use this to gate a close on its open
     /// finalizing (a close before its open exists would be rejected).
     pub async fn submit_reporting(&self, batch: Vec<Tx>) -> u64 {
+        self.submit_reporting_with_height(batch).await.0
+    }
+
+    /// Like [`Self::submit_reporting`], but also returns the finalization
+    /// height the relayer reported (if any). Channel lifecycles use it to
+    /// track chain height for expiry selection.
+    pub async fn submit_reporting_with_height(&self, batch: Vec<Tx>) -> (u64, Option<u64>) {
         let count = batch.len() as u64;
         let body = batch.encode();
         match self.submit_encoded(body).await {
             Ok(RelayerBatchStatus::Finalized { height }) => {
                 self.stats.finalized.fetch_add(count, Ordering::Relaxed);
                 debug!(height, count, "relayed batch finalized");
-                count
+                (count, Some(height))
             }
             Ok(RelayerBatchStatus::PartiallyFinalized {
                 height,
@@ -117,12 +124,12 @@ impl RelayerSubmitter {
                     filtered = filtered.len(),
                     "relayed batch partially finalized, advancing"
                 );
-                included.len() as u64
+                (included.len() as u64, Some(height))
             }
             Ok(RelayerBatchStatus::Dropped) => {
                 self.stats.dropped.fetch_add(count, Ordering::Relaxed);
                 debug!(count, "relayed batch dropped, advancing");
-                0
+                (0, None)
             }
             Err(error) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -132,7 +139,7 @@ impl RelayerSubmitter {
                     "relayer submit error, advancing"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
-                0
+                (0, None)
             }
         }
     }

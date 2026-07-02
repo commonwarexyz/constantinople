@@ -212,16 +212,16 @@ async fn run_relayer_mode(
     let operator = match channel_operator_url {
         Some(url) if channel_fraction > 0.0 => {
             let client = OperatorClient::new(url);
-            let public_key = loop {
+            let (public_key, height) = loop {
                 match client.public_key().await {
-                    Ok(public_key) => break public_key,
+                    Ok(response) => break response,
                     Err(error) => {
                         tracing::warn!(%error, "operator public key unavailable, retrying");
                         tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                     }
                 }
             };
-            Some((client, public_key))
+            Some((client, public_key, height))
         }
         _ => None,
     };
@@ -250,7 +250,7 @@ async fn run_relayer_mode(
             // keygen runs concurrently instead of serializing startup.
             let channel_runner = (channel_fraction > 0.0).then(|| {
                 let channel_accounts = generate_accounts(accounts_count, channel_offset);
-                let (operator, operator_pk) = operator
+                let (operator, operator_pk, initial_height) = operator
                     .as_ref()
                     .expect("operator configured when channel_fraction > 0");
                 ChannelRunner::new(
@@ -260,6 +260,7 @@ async fn run_relayer_mode(
                     channel_vouchers,
                     value.get(),
                     channel_offset,
+                    *initial_height,
                 )
             });
             run_submitter(

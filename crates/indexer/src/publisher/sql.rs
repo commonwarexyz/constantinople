@@ -61,6 +61,10 @@ pub(crate) enum TxKind {
     ChannelOpen,
     /// A channel settlement: `value` is paid from the payer to the receiver.
     ChannelClose,
+    /// A channel timeout: the sender (payer) reclaims the expired channel's
+    /// escrow. The reclaimed amount is not in the transaction, so `value` is
+    /// zero.
+    ChannelTimeout,
 }
 
 impl TxKind {
@@ -69,6 +73,7 @@ impl TxKind {
             Self::Transfer => 0,
             Self::ChannelOpen => 1,
             Self::ChannelClose => 2,
+            Self::ChannelTimeout => 3,
         }
     }
 }

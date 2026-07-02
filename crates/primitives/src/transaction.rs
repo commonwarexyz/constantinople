@@ -11,6 +11,10 @@ use core::num::NonZeroU64;
 const TRANSFER_TAG: u8 = 0;
 const OPEN_CHANNEL_TAG: u8 = 1;
 const CLOSE_CHANNEL_TAG: u8 = 2;
+const TIMEOUT_CHANNEL_TAG: u8 = 3;
+
+/// `OpenChannel` expiry meaning the payer can never reclaim unilaterally.
+pub const CHANNEL_NEVER_EXPIRES: u64 = u64::MAX;
 
 /// The operation a [`Transaction`] performs.
 ///
@@ -43,6 +47,12 @@ pub enum Operation {
         receiver: AccountKey,
         /// The amount escrowed into the channel.
         deposit: NonZeroU64,
+        /// Block height after which the payer may unilaterally reclaim the
+        /// escrow with [`Operation::TimeoutChannel`]. The receiver can settle
+        /// with a close at any height while the channel exists, so this is
+        /// effectively the receiver's settlement deadline.
+        /// [`CHANNEL_NEVER_EXPIRES`] disables the timeout path.
+        expiry: u64,
     },
     /// Claim a voucher and settle a payment channel.
     ///
@@ -61,16 +71,33 @@ pub enum Operation {
         /// The payer's voucher signature over `(channel_id, cumulative)`.
         voucher: ed25519::Signature,
     },
+    /// Reclaim an expired payment channel's escrow.
+    ///
+    /// The sender is the payer. The channel address is recomputed from
+    /// `(sender, receiver, open_nonce)`; once the block height exceeds the
+    /// expiry the channel was opened with, the payer reclaims the entire
+    /// escrow (vouchers the receiver failed to settle in time are voided) and
+    /// the channel is deleted. Until then only the receiver's close can move
+    /// the escrow; if a close lands first the channel is gone and the timeout
+    /// is rejected.
+    TimeoutChannel {
+        /// The receiver (service) account key the channel was opened to.
+        receiver: AccountKey,
+        /// The nonce of the `OpenChannel` transaction that created the channel.
+        open_nonce: u64,
+    },
 }
 
 impl Operation {
     /// Encoded size of a transfer: tag, recipient, and value.
     const TRANSFER_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
-    /// Encoded size of a channel open: tag, receiver, and deposit.
-    const OPEN_CHANNEL_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
+    /// Encoded size of a channel open: tag, receiver, deposit, and expiry.
+    const OPEN_CHANNEL_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE + u64::SIZE;
     /// Encoded size of a channel close: tag, payer, open nonce, cumulative, and voucher.
     const CLOSE_CHANNEL_SIZE: usize =
         1 + TransactionPublicKey::SIZE + u64::SIZE + u64::SIZE + ed25519::Signature::SIZE;
+    /// Encoded size of a channel timeout: tag, receiver, and open nonce.
+    const TIMEOUT_CHANNEL_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
     /// Smallest encoded operation (a transfer).
     pub const MIN_SIZE: usize = Self::TRANSFER_SIZE;
     /// Largest encoded operation (a channel close).
@@ -85,10 +112,15 @@ impl Write for Operation {
                 to.write(buf);
                 value.get().write(buf);
             }
-            Self::OpenChannel { receiver, deposit } => {
+            Self::OpenChannel {
+                receiver,
+                deposit,
+                expiry,
+            } => {
                 OPEN_CHANNEL_TAG.write(buf);
                 receiver.write(buf);
                 deposit.get().write(buf);
+                expiry.write(buf);
             }
             Self::CloseChannel {
                 payer,
@@ -102,6 +134,14 @@ impl Write for Operation {
                 cumulative.write(buf);
                 voucher.write(buf);
             }
+            Self::TimeoutChannel {
+                receiver,
+                open_nonce,
+            } => {
+                TIMEOUT_CHANNEL_TAG.write(buf);
+                receiver.write(buf);
+                open_nonce.write(buf);
+            }
         }
     }
 }
@@ -112,6 +152,7 @@ impl EncodeSize for Operation {
             Self::Transfer { .. } => Self::TRANSFER_SIZE,
             Self::OpenChannel { .. } => Self::OPEN_CHANNEL_SIZE,
             Self::CloseChannel { .. } => Self::CLOSE_CHANNEL_SIZE,
+            Self::TimeoutChannel { .. } => Self::TIMEOUT_CHANNEL_SIZE,
         }
     }
 }
@@ -136,7 +177,12 @@ impl Read for Operation {
                 let deposit = u64::read(buf)?;
                 let deposit = NonZeroU64::new(deposit)
                     .ok_or(Error::Invalid("Operation", "deposit must be non-zero"))?;
-                Ok(Self::OpenChannel { receiver, deposit })
+                let expiry = u64::read(buf)?;
+                Ok(Self::OpenChannel {
+                    receiver,
+                    deposit,
+                    expiry,
+                })
             }
             CLOSE_CHANNEL_TAG => {
                 let payer = TransactionPublicKey::read(buf)?;
@@ -148,6 +194,14 @@ impl Read for Operation {
                     open_nonce,
                     cumulative,
                     voucher,
+                })
+            }
+            TIMEOUT_CHANNEL_TAG => {
+                let receiver = AccountKey::read(buf)?;
+                let open_nonce = u64::read(buf)?;
+                Ok(Self::TimeoutChannel {
+                    receiver,
+                    open_nonce,
                 })
             }
             _ => Err(Error::Invalid("Operation", "unknown operation tag")),
@@ -295,10 +349,13 @@ impl<D: Digest> Transaction<D> {
     ///
     /// The channel address is derived from this transaction's `nonce`, so the
     /// receiver settles by passing that same `nonce` to [`Self::close_channel`].
+    /// After block height `expiry` the payer may reclaim the escrow with
+    /// [`Self::timeout_channel`]; pass [`CHANNEL_NEVER_EXPIRES`] to disable.
     pub fn open_channel(
         sender: TransactionPublicKey,
         receiver: TransactionPublicKey,
         deposit: NonZeroU64,
+        expiry: u64,
         nonce: u64,
     ) -> Self {
         Self::with_op(
@@ -307,6 +364,7 @@ impl<D: Digest> Transaction<D> {
             Operation::OpenChannel {
                 receiver: AccountKey::from_public_key(&receiver),
                 deposit,
+                expiry,
             },
         )
     }
@@ -331,6 +389,27 @@ impl<D: Digest> Transaction<D> {
                 open_nonce,
                 cumulative,
                 voucher,
+            },
+        )
+    }
+
+    /// Creates a transaction that reclaims an expired channel's escrow.
+    ///
+    /// The `sender` is the payer; `receiver` and `open_nonce` identify the
+    /// channel exactly as they did at [`Self::open_channel`]. Valid only once
+    /// the block height exceeds the channel's expiry.
+    pub fn timeout_channel(
+        sender: TransactionPublicKey,
+        receiver: TransactionPublicKey,
+        open_nonce: u64,
+        nonce: u64,
+    ) -> Self {
+        Self::with_op(
+            sender,
+            nonce,
+            Operation::TimeoutChannel {
+                receiver: AccountKey::from_public_key(&receiver),
+                open_nonce,
             },
         )
     }
@@ -527,8 +606,22 @@ mod test {
             test_sender(),
             test_sender(),
             NonZeroU64::new(50).expect("deposit must be non-zero"),
+            1_000,
             3,
         );
+
+        let mut buf = Vec::with_capacity(tx.encode_size());
+        tx.write(&mut buf);
+        assert_eq!(buf.len(), tx.encode_size());
+
+        let decoded =
+            Transaction::<sha256::Digest>::decode(&mut &buf[..]).expect("decoding should succeed");
+        assert_eq!(decoded, tx);
+    }
+
+    #[test]
+    fn timeout_channel_roundtrip() {
+        let tx = Transaction::<sha256::Digest>::timeout_channel(test_sender(), test_sender(), 3, 9);
 
         let mut buf = Vec::with_capacity(tx.encode_size());
         tx.write(&mut buf);

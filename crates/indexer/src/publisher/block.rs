@@ -207,7 +207,9 @@ where
             }
             (TxKind::Transfer, activities)
         }
-        Operation::OpenChannel { receiver, deposit } => (
+        Operation::OpenChannel {
+            receiver, deposit, ..
+        } => (
             TxKind::ChannelOpen,
             vec![Activity {
                 account: sender,
@@ -237,6 +239,17 @@ where
             }
             (TxKind::ChannelClose, activities)
         }
+        // The reclaimed escrow amount lives in state, not the transaction, so
+        // the payer's row carries no value.
+        Operation::TimeoutChannel { receiver, .. } => (
+            TxKind::ChannelTimeout,
+            vec![Activity {
+                account: sender,
+                role: TxActivityRole::Sender,
+                counterparty: *receiver,
+                value: 0,
+            }],
+        ),
     };
 
     Some(IndexedTransaction {
@@ -364,6 +377,7 @@ mod tests {
             payer_pk,
             receiver_pk,
             NonZeroU64::new(50).expect("deposit is non-zero"),
+            u64::MAX,
             0,
         )
         .seal_and_sign(&payer, TRANSACTION_NAMESPACE, &mut Sha256::default());

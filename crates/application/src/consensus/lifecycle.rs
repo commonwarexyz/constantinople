@@ -215,6 +215,7 @@ where
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
             &prepared,
+            block.header.height,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))
