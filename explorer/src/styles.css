@@ -20,6 +20,7 @@
     --theme-border: #2a2a2a;
     --theme-accent: #ffb200;
     --theme-success: #3fb950;
+    --theme-danger: #f85149;
     --theme-row-alt: #131415;
     --theme-row-hover: #1c1d1e;
     --theme-scroll-track: #1a1b1c;
@@ -901,6 +902,54 @@ body {
 .account-tx-row__height {
     color: var(--theme-accent);
     flex: 0 0 auto;
+}
+
+/* The kind is a secondary label (neutral); direction carries the strong color. */
+.account-tx-row__kind {
+    flex: 0 0 auto;
+    align-self: center;
+    padding: 0 0.6ch;
+    border: 1px solid var(--theme-border);
+    border-radius: 3px;
+    font-size: 0.82em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    white-space: nowrap;
+    color: var(--theme-text-dim);
+}
+
+/* Direction (from this account's perspective) is the dominant signal: money in
+ * is green, money out is red. A channel open is a reservation — an outflow, but
+ * provisional — so it is de-emphasized rather than colored as a spend. */
+.account-tx-row--in,
+.account-tx-row--out,
+.account-tx-row--reservation {
+    padding-left: 0.8ch;
+    border-left: 2px solid var(--theme-border);
+}
+
+.account-tx-row--in {
+    border-left-color: var(--theme-success);
+}
+
+.account-tx-row--out {
+    border-left-color: var(--theme-danger);
+}
+
+.account-tx-row--reservation {
+    opacity: 0.55;
+}
+
+.account-tx-row__value {
+    font-variant-numeric: tabular-nums;
+}
+
+.account-tx-row--in .account-tx-row__value {
+    color: var(--theme-success);
+}
+
+.account-tx-row--out .account-tx-row__value {
+    color: var(--theme-danger);
 }
 
 .account-tx-row__meta {

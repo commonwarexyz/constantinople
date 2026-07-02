@@ -8,16 +8,16 @@
 
 use crate::{codec, publisher::certificate::CertifiedHeader, sql_schema::build_meta_schema};
 use bytes::Bytes;
-use commonware_codec::{FixedSize as _, Read};
+use commonware_codec::{DecodeExt as _, Read};
 use commonware_consensus::{
     Heightable,
     types::{Height, View, coding::Commitment},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
+use constantinople_primitives::{BlockCfg, SignedTransaction};
 use datafusion::{
-    arrow::array::{Array, StringArray},
+    arrow::array::{Array, StringArray, UInt64Array},
     prelude::SessionContext,
 };
 use exoware_sdk::{ClientError, StoreClient};
@@ -59,6 +59,13 @@ pub enum ReadError {
 pub struct IndexerClient {
     blocks: SimplexClient,
     sql: SessionContext,
+}
+
+/// Metadata needed to authenticate and decode a finalized transaction row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionMetadata {
+    pub qmdb_location: u64,
+    pub bytes: Bytes,
 }
 
 impl std::fmt::Debug for IndexerClient {
@@ -268,8 +275,23 @@ impl IndexerClient {
     where
         H: Hasher,
     {
+        Ok(self
+            .transaction_metadata::<H>(digest)
+            .await?
+            .map(|metadata| metadata.bytes))
+    }
+
+    /// Fetch transaction metadata for `digest`, including its QMDB operation-log
+    /// location and encoded signed transaction bytes.
+    pub async fn transaction_metadata<H>(
+        &self,
+        digest: &H::Digest,
+    ) -> Result<Option<TransactionMetadata>, ReadError>
+    where
+        H: Hasher,
+    {
         let sql = format!(
-            "SELECT body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
+            "SELECT qmdb_location, body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
             hex_lower(digest.as_ref())
         );
         let batches = self.sql.sql(&sql).await?.collect().await?;
@@ -277,8 +299,20 @@ impl IndexerClient {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let body_hex = batch
+            let qmdb_location = batch
                 .column(0)
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    ReadError::SqlRow("tx_meta.qmdb_location must be UInt64".to_string())
+                })?;
+            if qmdb_location.is_null(0) {
+                return Err(ReadError::SqlRow(
+                    "tx_meta.qmdb_location must not be null".to_string(),
+                ));
+            }
+            let body_hex = batch
+                .column(1)
                 .as_any()
                 .downcast_ref::<StringArray>()
                 .ok_or_else(|| ReadError::SqlRow("tx_meta.body_hex must be Utf8".to_string()))?;
@@ -289,7 +323,10 @@ impl IndexerClient {
             }
             let bytes = decode_hex(body_hex.value(0))?;
             verify_signed_transaction_digest::<H>(&bytes, digest)?;
-            return Ok(Some(Bytes::from(bytes)));
+            return Ok(Some(TransactionMetadata {
+                qmdb_location: qmdb_location.value(0),
+                bytes: Bytes::from(bytes),
+            }));
         }
         Ok(None)
     }
@@ -400,18 +437,14 @@ fn verify_signed_transaction_digest<H>(bytes: &[u8], digest: &H::Digest) -> Resu
 where
     H: Hasher,
 {
-    let body_len = Transaction::<H::Digest>::SIZE;
-    if bytes.len() < body_len {
-        return Err(ReadError::SqlRow(format!(
-            "tx_meta.body_hex signed transaction is {} bytes, shorter than {body_len}-byte transaction body",
-            bytes.len()
-        )));
-    }
-
-    let mut hasher = H::new();
-    hasher.update(&bytes[..body_len]);
-    let actual = hasher.finalize();
-    if actual.as_ref() != digest.as_ref() {
+    // Transactions are variable-size, so decode the signed transaction and
+    // compare its sealed digest rather than hashing a fixed-width prefix.
+    let signed = SignedTransaction::<H>::decode(bytes).map_err(|error| {
+        ReadError::SqlRow(format!(
+            "tx_meta.body_hex failed to decode signed transaction: {error}"
+        ))
+    })?;
+    if signed.message_digest().as_ref() != digest.as_ref() {
         return Err(ReadError::SqlRow(
             "tx_meta.body_hex transaction body does not match tx_digest".to_string(),
         ));
@@ -422,35 +455,60 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{sha256, sha256::Sha256};
+    use commonware_cryptography::{Signer as _, ed25519, sha256::Sha256};
+    use commonware_math::algebra::Random as _;
+    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
+    use core::num::NonZeroU64;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    fn signed_transaction() -> (Vec<u8>, <Sha256 as Hasher>::Digest) {
+        use commonware_codec::Encode as _;
+        let key = ed25519::PrivateKey::random(&mut StdRng::from_seed([5u8; 32]));
+        let public_key = TransactionPublicKey::ed25519(key.public_key());
+        let signed = Transaction::<<Sha256 as Hasher>::Digest>::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(10).expect("non-zero"),
+            0,
+        )
+        .seal_and_sign(&key, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        (signed.encode().to_vec(), *signed.message_digest())
+    }
 
     #[test]
     fn verifies_signed_transaction_bytes_against_digest() {
-        let mut bytes = vec![7u8; Transaction::<sha256::Digest>::SIZE + 1];
-        let digest = digest_transaction_body(&bytes);
+        let (bytes, digest) = signed_transaction();
 
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest).expect("digest matches");
 
-        bytes[0] ^= 1;
-        let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
-            .expect_err("mutated body should be rejected");
+        let (other_bytes, _) = {
+            let key = ed25519::PrivateKey::random(&mut StdRng::from_seed([6u8; 32]));
+            let public_key = TransactionPublicKey::ed25519(key.public_key());
+            use commonware_codec::Encode as _;
+            let signed = Transaction::<<Sha256 as Hasher>::Digest>::new(
+                public_key.clone(),
+                public_key,
+                NonZeroU64::new(11).expect("non-zero"),
+                0,
+            )
+            .seal_and_sign(&key, TRANSACTION_NAMESPACE, &mut Sha256::default());
+            (signed.encode().to_vec(), *signed.message_digest())
+        };
+
+        let error = verify_signed_transaction_digest::<Sha256>(&other_bytes, &digest)
+            .expect_err("mismatched transaction should be rejected");
         assert!(matches!(error, ReadError::SqlRow(message) if message.contains("does not match")));
     }
 
     #[test]
     fn rejects_signed_transaction_bytes_without_full_body() {
-        let bytes = vec![0u8; Transaction::<sha256::Digest>::SIZE - 1];
-        let digest = digest_transaction_body(&bytes);
+        let (bytes, digest) = signed_transaction();
+        let truncated = &bytes[..bytes.len() - 1];
 
-        let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
+        let error = verify_signed_transaction_digest::<Sha256>(truncated, &digest)
             .expect_err("truncated body should be rejected");
-        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("shorter")));
-    }
-
-    fn digest_transaction_body(bytes: &[u8]) -> sha256::Digest {
-        let body_len = Transaction::<sha256::Digest>::SIZE.min(bytes.len());
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes[..body_len]);
-        hasher.finalize()
+        assert!(
+            matches!(error, ReadError::SqlRow(message) if message.contains("failed to decode"))
+        );
     }
 }

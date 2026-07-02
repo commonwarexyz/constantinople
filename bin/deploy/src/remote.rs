@@ -3,7 +3,8 @@ use crate::{
     CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
     DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
     INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
-    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
+    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, OPERATOR_BINARY_FILE,
+    OPERATOR_CONFIG_FILE, OPERATOR_HOST, OperatorConfig, QMDB_INDEXER_BINARY_FILE,
     QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
@@ -64,6 +65,9 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         let spammer_config = remote_spammer_config(args, remote, &material);
         write_yaml_config(&output_dir.join(SPAMMER_CONFIG_FILE), &spammer_config);
     }
+    if let Some(config) = remote_operator_config(args, remote, &material) {
+        write_yaml_config(&output_dir.join(OPERATOR_CONFIG_FILE), &config);
+    }
     write_simplex_verification_material(&output_dir, &material);
 
     let copied_dashboard = output_dir.join(DASHBOARD_FILE);
@@ -118,6 +122,9 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     }
     if args.spammer {
         binaries.push(output_dir.join(SPAMMER_BINARY_FILE).display().to_string());
+    }
+    if args.spammer_channel_fraction > 0.0 {
+        binaries.push(output_dir.join(OPERATOR_BINARY_FILE).display().to_string());
     }
     info!(
         ?binaries,
@@ -279,7 +286,27 @@ fn remote_spammer_config(
         presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
+        channel_fraction: args.spammer_channel_fraction,
+        channel_operator_url: (args.spammer_channel_fraction > 0.0)
+            .then(|| format!("http://operator:{}", remote.http_port)),
+        channel_vouchers: args.spammer_channel_vouchers,
     }
+}
+
+fn remote_operator_config(
+    args: &GenerateArgs,
+    remote: &RemoteArgs,
+    material: &ClusterMaterial,
+) -> Option<OperatorConfig> {
+    (args.spammer_channel_fraction > 0.0).then(|| OperatorConfig {
+        http_port: remote.http_port,
+        listen_addr: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+        relayer_url: relayer_url(args, remote, material),
+        indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+        qmdb_url: format!("http://{QMDB_INDEXER_HOST}:{}", remote.qmdb_indexer_port),
+        receiver_seed: crate::default_operator_receiver_seed(),
+        price: args.spammer_value,
+    })
 }
 
 fn relayer_url(args: &GenerateArgs, remote: &RemoteArgs, material: &ClusterMaterial) -> String {
@@ -410,6 +437,24 @@ fn build_deployer_config(
     }
 
     if args.spammer {
+        if args.spammer_channel_fraction > 0.0 {
+            instances.push(aws::InstanceConfig {
+                name: OPERATOR_HOST.to_string(),
+                region: regions[0].clone(),
+                availability_zone_group: None,
+                instance_type: remote
+                    .spammer_instance_type
+                    .clone()
+                    .unwrap_or_else(|| remote.instance_type.clone()),
+                storage_size: remote.spammer_storage_size,
+                storage_class: STORAGE_CLASS.to_string(),
+                storage_iops: None,
+                storage_throughput: None,
+                binary: OPERATOR_BINARY_FILE.to_string(),
+                config: OPERATOR_CONFIG_FILE.to_string(),
+                profiling: false,
+            });
+        }
         instances.push(aws::InstanceConfig {
             name: "spammer".to_string(),
             region: regions[0].clone(),
@@ -481,15 +526,19 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, port_configs, remote_operator_config,
+        remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-        GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
-        RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries, validate_generate_args,
+        GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, OPERATOR_BINARY_FILE,
+        OPERATOR_CONFIG_FILE, QMDB_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS,
+        StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
+        default_max_propose_bytes, default_public_key_cache_size, generate_local_cluster_material,
+        total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -513,6 +562,8 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_channel_fraction: 0.0,
+            spammer_channel_vouchers: crate::DEFAULT_SPAMMER_CHANNEL_VOUCHERS,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -658,6 +709,21 @@ mod tests {
     }
 
     #[test]
+    fn remote_channel_fraction_requires_spammer() {
+        let mut args = generate_args();
+        args.spammer_channel_fraction = 0.5;
+
+        let panic = std::panic::catch_unwind(|| validate_generate_args(&args))
+            .expect_err("channel spam without spammer should fail validation");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .expect("panic should carry validation message");
+        assert!(message.contains("--spammer-channel-fraction > 0 requires --spammer"));
+    }
+
+    #[test]
     fn remote_spammer_config_uses_relayer() {
         let mut args = generate_args();
         args.spammer = true;
@@ -675,6 +741,67 @@ mod tests {
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
         );
+        assert_eq!(relayed.channel_operator_url, None);
+    }
+
+    #[test]
+    fn remote_channel_spammer_uses_operator() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_channel_fraction = 0.5;
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let config = remote_spammer_config(&args, &remote, &material);
+
+        assert_eq!(
+            config.channel_operator_url,
+            Some("http://operator:8080".to_string())
+        );
+        let operator = remote_operator_config(&args, &remote, &material)
+            .expect("channel spam should generate operator config");
+        assert_eq!(
+            operator.listen_addr,
+            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
+        );
+        let relayer_key = hex(&material.secondary_public_keys[1].encode());
+        assert_eq!(operator.relayer_url, format!("http://{relayer_key}:8080"));
+        assert_eq!(operator.indexer_url, "http://chain-indexer:8090");
+        assert_eq!(operator.qmdb_url, "http://qmdb-indexer:8092");
+        assert_eq!(operator.price, args.spammer_value);
+    }
+
+    #[test]
+    fn remote_channel_deployer_includes_operator_instance() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_channel_fraction = 0.5;
+        let remote = remote_args();
+        let validators = vec![validator(0), validator(1), validator(2)];
+        let secondaries = vec![super::GeneratedValidator {
+            public_key_hex: "secondary-0".to_string(),
+            config_name: "secondary-0.yaml".to_string(),
+            config_file: PathBuf::from("/tmp/secondary-0.yaml"),
+            config: validator(0).config,
+        }];
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &secondaries,
+        );
+
+        let operator = config
+            .instances
+            .iter()
+            .find(|instance| instance.name == "operator")
+            .expect("operator instance should exist");
+        assert_eq!(operator.binary, OPERATOR_BINARY_FILE);
+        assert_eq!(operator.config, OPERATOR_CONFIG_FILE);
     }
 
     #[test]

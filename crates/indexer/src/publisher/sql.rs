@@ -47,6 +47,52 @@ impl TxActivityRole {
     }
 }
 
+/// The kind of operation an activity row describes.
+///
+/// Lets the explorer render a transfer, a channel reservation (open), and a
+/// channel settlement (close) differently, since they interpret the
+/// `value`/`counterparty`/`role` columns differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxKind {
+    /// A plain account transfer.
+    Transfer,
+    /// A channel open: the sender reserves `value` for a channel with the
+    /// counterparty (no funds are credited to anyone yet).
+    ChannelOpen,
+    /// A channel settlement: `value` is paid from the payer to the receiver.
+    ChannelClose,
+    /// A channel timeout: the sender (payer) reclaims the expired channel's
+    /// escrow. The reclaimed amount is not in the transaction, so `value` is
+    /// zero.
+    ChannelTimeout,
+}
+
+impl TxKind {
+    const fn as_u64(self) -> u64 {
+        match self {
+            Self::Transfer => 0,
+            Self::ChannelOpen => 1,
+            Self::ChannelClose => 2,
+            Self::ChannelTimeout => 3,
+        }
+    }
+}
+
+/// The single exhaustive `Operation` -> [`TxKind`] mapping: a new operation
+/// variant fails to compile here until it is assigned a kind (and a number in
+/// [`TxKind::as_u64`] above).
+impl From<&constantinople_primitives::Operation> for TxKind {
+    fn from(op: &constantinople_primitives::Operation) -> Self {
+        use constantinople_primitives::Operation;
+        match op {
+            Operation::Transfer { .. } => Self::Transfer,
+            Operation::OpenChannel { .. } => Self::ChannelOpen,
+            Operation::CloseChannel { .. } => Self::ChannelClose,
+            Operation::TimeoutChannel { .. } => Self::ChannelTimeout,
+        }
+    }
+}
+
 /// Account-ordered transaction activity row.
 pub(crate) struct TxActivityRow {
     pub account: [u8; 32],
@@ -57,6 +103,7 @@ pub(crate) struct TxActivityRow {
     pub counterparty: [u8; 32],
     pub value: u64,
     pub nonce: u64,
+    pub kind: TxKind,
 }
 
 /// Latest account row stored in `account_meta`.
@@ -118,6 +165,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
             CellValue::FixedBinary(tx.counterparty.to_vec()),
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
+            CellValue::UInt64(tx.kind.as_u64()),
         ],
     }
 }

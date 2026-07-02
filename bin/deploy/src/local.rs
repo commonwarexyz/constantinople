@@ -344,6 +344,27 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
+        let operator_url = if args.spammer_channel_fraction > 0.0 {
+            commands.push(format!(
+                "cargo run --release --bin constantinople-operator -- \
+                 --relayer-url http://127.0.0.1:{relayer_port} \
+                 --indexer-url http://127.0.0.1:{} \
+                 --qmdb-url http://127.0.0.1:{} \
+                 --port {} \
+                 --listen-addr 127.0.0.1 \
+                 --price {}",
+                local.chain_indexer_port,
+                local.qmdb_indexer_port,
+                crate::DEFAULT_OPERATOR_PORT,
+                args.spammer_value,
+            ));
+            format!(
+                " --channel-operator-url http://127.0.0.1:{}",
+                crate::DEFAULT_OPERATOR_PORT
+            )
+        } else {
+            String::new()
+        };
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
@@ -356,13 +377,18 @@ fn local_run_commands(
              --seed-offset {} \
              --rayon-threads {} \
              --accounts-jitter {} \
-             --presigned-batches {}",
+             --presigned-batches {} \
+             --channel-fraction {} \
+             {operator_url} \
+             --channel-vouchers {}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
+            args.spammer_channel_fraction,
+            args.spammer_channel_vouchers,
         ));
     }
 
@@ -405,6 +431,8 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_channel_fraction: 0.0,
+            spammer_channel_vouchers: crate::DEFAULT_SPAMMER_CHANNEL_VOUCHERS,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -554,6 +582,37 @@ mod tests {
         );
 
         assert!(commands[3].contains("--rayon-threads 6"));
+    }
+
+    #[test]
+    fn local_channel_spammer_starts_operator() {
+        let mut args = test_args(true);
+        args.indexer = true;
+        args.relayer = true;
+        args.spammer_channel_fraction = 0.5;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let operator = commands
+            .iter()
+            .find(|command| command.contains("constantinople-operator"))
+            .expect("operator command should be present");
+        assert!(operator.contains("--relayer-url http://127.0.0.1:8083"));
+        assert!(operator.contains("--indexer-url http://127.0.0.1:8090"));
+        assert!(operator.contains("--qmdb-url http://127.0.0.1:8092"));
+        assert!(operator.contains("--port 8093"));
+        assert!(operator.contains("--listen-addr 127.0.0.1"));
+
+        let spammer = commands
+            .iter()
+            .find(|command| command.contains("constantinople-spammer"))
+            .expect("spammer command should be present");
+        assert!(spammer.contains("--channel-operator-url http://127.0.0.1:8093"));
     }
 
     #[test]

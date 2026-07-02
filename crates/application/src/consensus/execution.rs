@@ -5,6 +5,13 @@
 //! account and transaction-history updates into QMDB batches, and returns the
 //! merkleized commitments that consensus proposes, verifies, or applies.
 //!
+//! Preparation partitions a body into two lanes: transfers, executed by the
+//! transfer executor described below, and payment-channel operations, executed
+//! by the `channel` lane. Both run against block-start state and their writes
+//! are folded into the same state batch; a block whose two lanes write the same
+//! account is rejected (see `lanes_conflict`). The rest of this module's
+//! documentation describes the transfer lane.
+//!
 //! The important invariant is that account execution is based on block-start
 //! state. Nonces and spends are sender-local, and credits from this block are
 //! not available for spending until the block has finished executing. Because of
@@ -87,7 +94,11 @@
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
-    db::{self, StateBatch, TransactionBatch, apply_shard_maps, apply_transaction_digests},
+    channel::{self, ChannelWrites, PreparedChannelOp, prepare_channel_op},
+    db::{
+        self, StateBatch, TransactionBatch, apply_channel_writes, apply_shard_maps,
+        apply_transaction_digests,
+    },
     history::parent_transactions_inactivity_floor,
     reject_verify,
 };
@@ -99,10 +110,179 @@ use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
-    Account, AccountKey, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
+    Account, AccountKey, Header, LazySignedTransaction, Operation, SealedBlock, SignedTransaction,
 };
 use core::{mem::MaybeUninit, ops::Range};
+use std::collections::HashSet;
 use tracing::{Instrument as _, info_span};
+
+/// A block body prepared into its two execution lanes.
+///
+/// `digests` holds every transaction's sealed digest in block order (both
+/// lanes), so transaction history is appended in order regardless of lane.
+pub struct PreparedBatch<H: Hasher> {
+    pub transfers: Vec<PreparedTransfer>,
+    pub channel_ops: Vec<PreparedChannelOp>,
+    pub digests: Vec<H::Digest>,
+}
+
+/// One prepared transaction, routed to its execution lane.
+///
+/// The channel variant is boxed because channel operations are rare and much
+/// larger than a transfer; boxing keeps the common transfer case small in the
+/// prepared-item vector.
+enum PreparedItem {
+    Transfer(PreparedTransfer),
+    ChannelOp(Box<PreparedChannelOp>),
+}
+
+/// Prepares one transaction into its lane plus its sealed digest.
+///
+/// Returns `None` if the sender key fails to decode (malformed).
+fn prepare_item<H>(tx: &SignedTransaction<H>) -> Option<(PreparedItem, H::Digest)>
+where
+    H: Hasher,
+{
+    let digest = *tx.message_digest();
+    let item = match tx.value().op() {
+        Operation::Transfer { .. } => PreparedItem::Transfer(executor::prepare_transfer(tx)?),
+        Operation::OpenChannel { .. }
+        | Operation::CloseChannel { .. }
+        | Operation::TimeoutChannel { .. } => {
+            PreparedItem::ChannelOp(Box::new(prepare_channel_op(tx)?))
+        }
+    };
+    Some((item, digest))
+}
+
+/// Splits prepared items into the transfer and channel lanes, preserving block
+/// order for digests.
+fn partition<H: Hasher>(items: Vec<(PreparedItem, H::Digest)>) -> PreparedBatch<H> {
+    // The common block is all transfers; preallocate that lane. Channel ops are
+    // rare, so leave their lane to grow from empty.
+    let mut transfers = Vec::with_capacity(items.len());
+    let mut channel_ops = Vec::new();
+    let mut digests = Vec::with_capacity(items.len());
+    for (item, digest) in items {
+        digests.push(digest);
+        match item {
+            PreparedItem::Transfer(transfer) => transfers.push(transfer),
+            PreparedItem::ChannelOp(op) => channel_ops.push(*op),
+        }
+    }
+    PreparedBatch {
+        transfers,
+        channel_ops,
+        digests,
+    }
+}
+
+/// Prepares an already materialized block body into both lanes.
+pub fn prepare_signed_block<H, S>(
+    strategy: &S,
+    txs: &[SignedTransaction<H>],
+) -> Option<PreparedBatch<H>>
+where
+    H: Hasher,
+    S: Strategy,
+{
+    let items: Option<Vec<(PreparedItem, H::Digest)>> = strategy
+        .map_collect_vec(txs.iter(), |tx| prepare_item(tx))
+        .into_iter()
+        .collect();
+    items.map(partition)
+}
+
+/// Prepares a lazily-encoded block body into both lanes.
+pub(super) fn prepare_lazy_block<H, S>(
+    strategy: &S,
+    body: &[LazySignedTransaction<H>],
+) -> Result<PreparedBatch<H>>
+where
+    H: Hasher,
+    S: Strategy,
+{
+    let items: Option<Vec<(PreparedItem, H::Digest)>> = strategy
+        .map_collect_vec(body.iter(), |lazy| prepare_item(lazy.get()?))
+        .into_iter()
+        .collect();
+    items.map(partition).ok_or(MALFORMED_TRANSACTION)
+}
+
+/// Whether any account key is written by both lanes (a same-block conflict).
+fn lanes_conflict(transfers: &db::StateWrites, channel_ops: &ChannelWrites) -> bool {
+    if channel_ops.is_empty() {
+        return false;
+    }
+    // Channel ops are rare; probe the small channel key set with the (much
+    // larger) transfer write set instead of materializing the latter.
+    let channel_keys: HashSet<&AccountKey> = channel_ops.iter().map(|(key, _)| key).collect();
+    transfers
+        .shards
+        .iter()
+        .flatten()
+        .any(|(key, _)| channel_keys.contains(key))
+}
+
+/// Runs both lanes concurrently against block-start state.
+///
+/// `height` is the height of the block being executed (channel timeouts are
+/// gated on it). Returns `None` if the transfer lane rejects the batch or the
+/// two lanes write the same account in one block (which would race on a single
+/// key). Channel-op failures are reported per-op in the returned flags; the
+/// caller sets the policy — proposers drop skipped ops from the body,
+/// verification rejects the block (see [`execute_lanes`]).
+async fn execute_lanes_skipping<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transfers: &[PreparedTransfer],
+    channel_ops: &[PreparedChannelOp],
+    height: u64,
+) -> Option<(db::StateWrites, ChannelWrites, Vec<bool>)>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    // Both lanes only read block-start state, so their state loads overlap.
+    let (transfer_writes, (channel_writes, applied)) = futures::join!(
+        compute(batch, strategy, transfers),
+        channel::apply_channel_ops_skipping(batch, channel_ops, height),
+    );
+    let transfer_writes = transfer_writes?;
+    if lanes_conflict(&transfer_writes, &channel_writes) {
+        return None;
+    }
+    Some((transfer_writes, channel_writes, applied))
+}
+
+/// Runs both lanes all or nothing: any skipped channel operation rejects the
+/// whole batch. Used by verification and certified apply, so a proposed block
+/// containing an invalid channel operation is rejected.
+async fn execute_lanes<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    prepared: &PreparedBatch<H>,
+    height: u64,
+) -> Option<(db::StateWrites, ChannelWrites)>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    let (transfer_writes, channel_writes, applied) = execute_lanes_skipping(
+        batch,
+        strategy,
+        &prepared.transfers,
+        &prepared.channel_ops,
+        height,
+    )
+    .await?;
+    applied
+        .iter()
+        .all(|&applied| applied)
+        .then_some((transfer_writes, channel_writes))
+}
 
 pub(super) struct ProposalExecution<E, H, S>
 where
@@ -395,198 +575,6 @@ fn chunk_ranges(items: usize, chunks: usize) -> Vec<Range<usize>> {
         .collect()
 }
 
-pub fn prepare_signed<H, S>(
-    strategy: &S,
-    txs: &[SignedTransaction<H>],
-) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    if chunk_count(strategy, txs.len()) > 1 {
-        return prepare_signed_chunks(strategy, txs);
-    }
-
-    let mut transfers = Vec::with_capacity(txs.len());
-    let mut digests = Vec::with_capacity(txs.len());
-    for tx in txs {
-        transfers.push(executor::prepare_transfer(tx)?);
-        digests.push(*tx.message_digest());
-    }
-    Some((transfers, digests))
-}
-
-fn prepare_signed_chunks<H, S>(
-    strategy: &S,
-    txs: &[SignedTransaction<H>],
-) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let mut transfers = uninit_vec(txs.len());
-    let mut digests = uninit_vec(txs.len());
-    let chunks = chunk_count(strategy, txs.len());
-    if !prepare_signed_into(strategy, txs, &mut transfers, &mut digests, chunks) {
-        return None;
-    }
-
-    Some((
-        initialized_copy_vec(transfers),
-        initialized_copy_vec(digests),
-    ))
-}
-
-fn prepare_signed_into<H, S>(
-    strategy: &S,
-    txs: &[SignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-    chunks: usize,
-) -> bool
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let ranges = chunk_ranges(txs.len(), chunks);
-    let mut remaining_transfers = transfers;
-    let mut remaining_digests = digests;
-    let mut work = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let len = range.end - range.start;
-        let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
-        let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
-        work.push((&txs[range], chunk_transfers, chunk_digests));
-        remaining_transfers = rest_transfers;
-        remaining_digests = rest_digests;
-    }
-    assert!(remaining_transfers.is_empty());
-    assert!(remaining_digests.is_empty());
-
-    strategy
-        .map_collect_vec(work, |(txs, transfers, digests)| {
-            prepare_signed_chunk(txs, transfers, digests)
-        })
-        .into_iter()
-        .all(core::convert::identity)
-}
-
-fn prepare_signed_chunk<H>(
-    txs: &[SignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-) -> bool
-where
-    H: Hasher,
-{
-    for ((tx, transfer), digest) in txs.iter().zip(transfers).zip(digests) {
-        let Some(prepared) = executor::prepare_transfer(tx) else {
-            return false;
-        };
-        transfer.write(prepared);
-        digest.write(*tx.message_digest());
-    }
-    true
-}
-
-pub(super) fn prepare_lazy<H, S>(
-    strategy: &S,
-    body: &[LazySignedTransaction<H>],
-) -> core::result::Result<(Vec<PreparedTransfer>, Vec<H::Digest>), &'static str>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    if chunk_count(strategy, body.len()) > 1 {
-        return prepare_lazy_chunks(strategy, body);
-    }
-
-    let mut transfers = Vec::with_capacity(body.len());
-    let mut digests = Vec::with_capacity(body.len());
-    for lazy in body.iter() {
-        let tx = lazy.get().ok_or(MALFORMED_TRANSACTION)?;
-        transfers.push(executor::prepare_transfer(tx).ok_or(MALFORMED_TRANSACTION)?);
-        digests.push(*tx.message_digest());
-    }
-    Ok((transfers, digests))
-}
-
-fn prepare_lazy_chunks<H, S>(
-    strategy: &S,
-    body: &[LazySignedTransaction<H>],
-) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let mut transfers = uninit_vec(body.len());
-    let mut digests = uninit_vec(body.len());
-    let chunks = chunk_count(strategy, body.len());
-    if !prepare_lazy_into(strategy, body, &mut transfers, &mut digests, chunks) {
-        return Err(MALFORMED_TRANSACTION);
-    }
-
-    Ok((
-        initialized_copy_vec(transfers),
-        initialized_copy_vec(digests),
-    ))
-}
-
-fn prepare_lazy_into<H, S>(
-    strategy: &S,
-    body: &[constantinople_primitives::LazySignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-    chunks: usize,
-) -> bool
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let ranges = chunk_ranges(body.len(), chunks);
-    let mut remaining_transfers = transfers;
-    let mut remaining_digests = digests;
-    let mut work = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let len = range.end - range.start;
-        let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
-        let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
-        work.push((&body[range], chunk_transfers, chunk_digests));
-        remaining_transfers = rest_transfers;
-        remaining_digests = rest_digests;
-    }
-    assert!(remaining_transfers.is_empty());
-    assert!(remaining_digests.is_empty());
-
-    strategy
-        .map_collect_vec(work, |(body, transfers, digests)| {
-            prepare_lazy_chunk(body, transfers, digests)
-        })
-        .into_iter()
-        .all(core::convert::identity)
-}
-
-fn prepare_lazy_chunk<H>(
-    body: &[constantinople_primitives::LazySignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-) -> bool
-where
-    H: Hasher,
-{
-    for ((lazy, transfer), digest) in body.iter().zip(transfers).zip(digests) {
-        let Some(tx) = lazy.get() else {
-            return false;
-        };
-        let Some(prepared) = executor::prepare_transfer(tx) else {
-            return false;
-        };
-        transfer.write(prepared);
-        digest.write(*tx.message_digest());
-    }
-    true
-}
-
 fn uninit_vec<T>(len: usize) -> Vec<MaybeUninit<T>> {
     let mut values = Vec::with_capacity(len);
     // SAFETY: `MaybeUninit<T>` does not need initialization.
@@ -606,12 +594,84 @@ fn initialized_copy_vec<T: Copy>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
-/// Executes a proposal's candidate transactions all or nothing.
+/// Prepares and executes proposal candidates, dropping invalid ones where the
+/// lane allows it.
 ///
-/// If every candidate executes cleanly the block includes them all. If any
-/// candidate is malformed, fails its nonce or balance check, or overflows a
-/// recipient, the whole batch is dropped and an empty block is proposed so the
-/// chain still makes progress.
+/// Candidates that fail preparation (malformed sender, or a statically invalid
+/// channel operation such as an `OpenChannel` from a non-Ed25519 payer) are
+/// dropped from the proposal. Channel operations that fail execution (say, a
+/// close whose voucher does not match live escrow — unknowable at mempool
+/// admission) are likewise dropped, so one bad channel operation cannot poison
+/// the batch. Transfers still execute all or nothing: `None` means the
+/// transfer lane rejected the batch (or the two lanes conflict) and an empty
+/// block should be proposed.
+async fn execute_proposal_lanes<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transactions: Vec<SignedTransaction<H>>,
+    height: u64,
+) -> Option<(
+    Vec<SignedTransaction<H>>,
+    Vec<H::Digest>,
+    (db::StateWrites, ChannelWrites),
+)>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    let items = strategy.map_collect_vec(transactions.iter(), |tx| prepare_item(tx));
+
+    // Route each candidate to its lane, remembering per candidate whether it
+    // routed to the channel lane (`None` drops the transaction) so skipped
+    // channel ops can be filtered from the body afterwards.
+    let mut transfers = Vec::with_capacity(items.len());
+    let mut channel_ops = Vec::new();
+    let mut routes = Vec::with_capacity(items.len());
+    for item in items {
+        routes.push(item.map(|(item, digest)| {
+            let is_channel = match item {
+                PreparedItem::Transfer(transfer) => {
+                    transfers.push(transfer);
+                    false
+                }
+                PreparedItem::ChannelOp(op) => {
+                    channel_ops.push(*op);
+                    true
+                }
+            };
+            (is_channel, digest)
+        }));
+    }
+
+    let (transfer_writes, channel_writes, applied) =
+        execute_lanes_skipping(batch, strategy, &transfers, &channel_ops, height).await?;
+
+    // Rebuild the body, walking the applied flags in the same block order the
+    // channel ops were routed in.
+    let mut body = Vec::with_capacity(transactions.len());
+    let mut digests = Vec::with_capacity(transactions.len());
+    let mut applied = applied.into_iter();
+    for (tx, route) in transactions.into_iter().zip(routes) {
+        let Some((is_channel, digest)) = route else {
+            continue;
+        };
+        if is_channel && !applied.next().expect("one flag per channel op") {
+            continue;
+        }
+        body.push(tx);
+        digests.push(digest);
+    }
+    Some((body, digests, (transfer_writes, channel_writes)))
+}
+
+/// Executes a proposal's candidate transactions.
+///
+/// Channel operations that fail preparation or execution are dropped from the
+/// proposed body individually (see [`execute_proposal_lanes`]). Transfers
+/// execute all or nothing: if any transfer is malformed, fails its nonce or
+/// balance check, or overflows a recipient, the whole batch is dropped and an
+/// empty block is proposed so the chain still makes progress.
 pub(super) async fn execute_proposal<E, C, P, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
@@ -626,21 +686,20 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let prepared = prepare_signed(&strategy, &transactions);
-
-    let outcome = match prepared {
-        Some((transfers, digests)) if !transfers.is_empty() => {
-            compute(&state_batch, &strategy, &transfers)
-                .instrument(info_span!("application.execute.compute"))
-                .await
-                .map(|shard_maps| (transactions, digests, shard_maps))
-        }
-        _ => None,
-    };
+    let outcome = execute_proposal_lanes(
+        &state_batch,
+        &strategy,
+        transactions,
+        parent.header.height + 1,
+    )
+    .instrument(info_span!("application.execute.compute"))
+    .await;
 
     let (body, digests, state_batch) = match outcome {
-        Some((body, digests, shard_maps)) => {
-            (body, digests, apply_shard_maps(state_batch, shard_maps))
+        Some((body, digests, (transfer_writes, channel_writes))) => {
+            let state_batch = apply_shard_maps(state_batch, transfer_writes);
+            let state_batch = apply_channel_writes(state_batch, channel_writes);
+            (body, digests, state_batch)
         }
         None => (Vec::new(), Vec::new(), state_batch),
     };
@@ -675,17 +734,20 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let (transfers, digests) = info_span!("application.execute.prepare")
-        .in_scope(|| prepare_lazy(&strategy, body.as_ref().as_slice()))?;
+    let prepared = info_span!("application.execute.prepare")
+        .in_scope(|| prepare_lazy_block(&strategy, body.as_ref().as_slice()))?;
 
-    let shard_maps = compute(&state_batch, &strategy, &transfers)
-        .instrument(info_span!("application.execute.compute"))
-        .await
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let (transfer_writes, channel_writes) =
+        execute_lanes(&state_batch, &strategy, &prepared, parent.header.height + 1)
+            .instrument(info_span!("application.execute.compute"))
+            .await
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
 
+    let transaction_count = prepared.transfers.len() + prepared.channel_ops.len();
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let state_batch = apply_shard_maps(state_batch, shard_maps);
-        let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
+        let state_batch = apply_shard_maps(state_batch, transfer_writes);
+        let state_batch = apply_channel_writes(state_batch, channel_writes);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &prepared.digests);
         (state_batch, transaction_batch)
     });
 
@@ -693,7 +755,7 @@ where
         state_batch,
         transaction_batch,
         parent,
-        transfers.len(),
+        transaction_count,
         "database merkleization during verification must succeed",
     )
     .await)
@@ -704,22 +766,24 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
-    transfers: &[PreparedTransfer],
-    digests: &[H::Digest],
+    prepared: &PreparedBatch<H>,
+    height: u64,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let shard_maps = compute(&state_batch, &strategy, transfers)
-        .instrument(info_span!("application.execute.compute"))
-        .await
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+    let (transfer_writes, channel_writes) =
+        execute_lanes(&state_batch, &strategy, prepared, height)
+            .instrument(info_span!("application.execute.compute"))
+            .await
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
 
     let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let state_batch = apply_shard_maps(state_batch, shard_maps);
-        let transaction_batch = apply_transaction_digests(transaction_batch, digests)
+        let state_batch = apply_shard_maps(state_batch, transfer_writes);
+        let state_batch = apply_channel_writes(state_batch, channel_writes);
+        let transaction_batch = apply_transaction_digests(transaction_batch, &prepared.digests)
             .with_inactivity_floor(transaction_floor);
         (state_batch, transaction_batch)
     });

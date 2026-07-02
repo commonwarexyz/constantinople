@@ -1,4 +1,4 @@
-import { fromHex, toArrayBuffer } from './codec';
+import { fromHex, signedTransactionBodyLength, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import {
     SqlClient,
@@ -25,11 +25,6 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const TRANSACTION_PUBLIC_KEY_BYTES = 34;
-const TRANSACTION_VALUE_BYTES = 8;
-const TRANSACTION_NONCE_BYTES = 8;
-const TRANSACTION_BODY_BYTES =
-    TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
 
@@ -47,8 +42,12 @@ const TX_ACTIVITY_DIGEST = 'tx_digest';
 const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
 const TX_ACTIVITY_VALUE = 'value';
 const TX_ACTIVITY_NONCE = 'nonce';
+const TX_ACTIVITY_KIND = 'kind';
 const TX_ACTIVITY_ROLE_SENDER = 0n;
 const TX_ACTIVITY_ROLE_RECEIVER = 1n;
+const TX_ACTIVITY_KIND_CHANNEL_OPEN = 1n;
+const TX_ACTIVITY_KIND_CHANNEL_CLOSE = 2n;
+const TX_ACTIVITY_KIND_CHANNEL_TIMEOUT = 3n;
 
 const ACCOUNT_META_TABLE = 'account_meta';
 const ACCOUNT_META_ACCOUNT = 'account';
@@ -90,8 +89,12 @@ export interface LatestProofTarget extends FinalizedTransactionTarget {}
 
 export type AccountActivityMode = 'all' | 'sent' | 'received';
 
+// The kind of operation an activity row describes.
+export type TransactionKind = 'transfer' | 'channel-open' | 'channel-close' | 'channel-timeout';
+
 export interface AccountTransactionRow {
     readonly digest: string;
+    readonly kind: TransactionKind;
     readonly direction: 'sent' | 'received';
     readonly counterparty: string;
     readonly value: bigint;
@@ -311,10 +314,11 @@ async function fetchVerifiedSqlTransactionMetadata(
 
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
     const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
-    if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
+    const bodyLength = signedTransactionBodyLength(signedTransaction);
+    if (signedTransaction.length < bodyLength) {
         throw new Error('SQL transaction body is truncated');
     }
-    const transactionBody = signedTransaction.slice(0, TRANSACTION_BODY_BYTES);
+    const transactionBody = signedTransaction.slice(0, bodyLength);
     const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(transactionBody)));
     if (!bytesEqual(actual, digest)) {
         throw new Error('SQL transaction body does not match transaction digest');
@@ -637,7 +641,8 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE}
+                ${TX_ACTIVITY_NONCE},
+                ${TX_ACTIVITY_KIND}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
             ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
@@ -657,8 +662,10 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         TX_ACTIVITY_COUNTERPARTY,
         ACCOUNT_KEY_BYTES,
     );
+    const kind = expectBigint(row.values[TX_ACTIVITY_KIND], TX_ACTIVITY_KIND);
     return {
         digest: toHex(digest),
+        kind: decodeTransactionKind(kind),
         direction: role === TX_ACTIVITY_ROLE_RECEIVER ? 'received' : 'sent',
         counterparty: toHex(counterparty),
         value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
@@ -666,6 +673,13 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
         blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
     };
+}
+
+function decodeTransactionKind(kind: bigint): TransactionKind {
+    if (kind === TX_ACTIVITY_KIND_CHANNEL_OPEN) return 'channel-open';
+    if (kind === TX_ACTIVITY_KIND_CHANNEL_CLOSE) return 'channel-close';
+    if (kind === TX_ACTIVITY_KIND_CHANNEL_TIMEOUT) return 'channel-timeout';
+    return 'transfer';
 }
 
 async function fetchAccountProofRow(

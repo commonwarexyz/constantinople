@@ -21,6 +21,11 @@ pub struct Stats {
     pub filtered: AtomicU64,
     pub dropped: AtomicU64,
     pub errors: AtomicU64,
+    /// On-chain channel transactions finalized (opens + closes).
+    pub channel_txs: AtomicU64,
+    /// Off-chain vouchers streamed and verified — the per-payment count that
+    /// never touches the chain.
+    pub vouchers: AtomicU64,
 }
 
 impl Stats {
@@ -30,6 +35,8 @@ impl Stats {
             filtered: AtomicU64::new(0),
             dropped: AtomicU64::new(0),
             errors: AtomicU64::new(0),
+            channel_txs: AtomicU64::new(0),
+            vouchers: AtomicU64::new(0),
         }
     }
 }
@@ -78,12 +85,21 @@ impl RelayerSubmitter {
     /// Submits a signed batch once. Failed or dropped batches are abandoned so
     /// the next outer loop iteration uses a fresh nonce set.
     pub async fn submit(&self, batch: Vec<Tx>) {
+        let _ = self.submit_reporting_with_height(batch).await;
+    }
+
+    /// Like [`Self::submit`], but returns the number of transactions that
+    /// finalized plus the finalization height the relayer reported (if any).
+    /// Channel lifecycles use the count to gate a close on its open finalizing
+    /// and the height to track the chain for expiry selection.
+    pub async fn submit_reporting_with_height(&self, batch: Vec<Tx>) -> (u64, Option<u64>) {
         let count = batch.len() as u64;
         let body = batch.encode();
         match self.submit_encoded(body).await {
             Ok(RelayerBatchStatus::Finalized { height }) => {
                 self.stats.finalized.fetch_add(count, Ordering::Relaxed);
                 debug!(height, count, "relayed batch finalized");
+                (count, Some(height))
             }
             Ok(RelayerBatchStatus::PartiallyFinalized {
                 height,
@@ -102,10 +118,12 @@ impl RelayerSubmitter {
                     filtered = filtered.len(),
                     "relayed batch partially finalized, advancing"
                 );
+                (included.len() as u64, Some(height))
             }
             Ok(RelayerBatchStatus::Dropped) => {
                 self.stats.dropped.fetch_add(count, Ordering::Relaxed);
                 debug!(count, "relayed batch dropped, advancing");
+                (0, None)
             }
             Err(error) => {
                 self.stats.errors.fetch_add(1, Ordering::Relaxed);
@@ -115,6 +133,7 @@ impl RelayerSubmitter {
                     "relayer submit error, advancing"
                 );
                 tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                (0, None)
             }
         }
     }

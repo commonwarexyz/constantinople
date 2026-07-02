@@ -3,7 +3,7 @@
 use crate::publisher::{
     SqlRow,
     sql::{
-        BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, encode_block_meta_row,
+        BlockMetaRow, TxActivityRole, TxActivityRow, TxKind, TxMetaRow, encode_block_meta_row,
         encode_tx_activity_row, encode_tx_meta_row,
     },
 };
@@ -11,9 +11,8 @@ use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
-    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
+    AccountKey, LazySignedTransaction, Operation, TransactionPublicKey,
 };
-use std::array::TryFromSliceError;
 use tracing::warn;
 
 /// Encoded block rows split by index surface.
@@ -28,10 +27,17 @@ struct IndexedTransaction<D: Digest> {
     block_index: usize,
     digest: D,
     bytes: Vec<u8>,
-    sender: AccountKey,
-    to: [u8; AccountKey::SIZE],
-    value: u64,
     nonce: u64,
+    kind: TxKind,
+    activities: Vec<Activity>,
+}
+
+/// One account's involvement in a transaction, as an activity row.
+struct Activity {
+    account: AccountKey,
+    role: TxActivityRole,
+    counterparty: AccountKey,
+    value: u64,
 }
 
 /// Build every row for a finalized block, partitioned by destination store.
@@ -91,34 +97,26 @@ where
         let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
         let mut digest = [0u8; 32];
         digest.copy_from_slice(tx.digest.as_ref());
-        let mut sender = [0u8; AccountKey::SIZE];
-        sender.copy_from_slice(tx.sender.as_ref());
-        let receiver = tx.to;
         sql.push(encode_tx_meta_row(TxMetaRow {
             digest,
             qmdb_location,
             body: tx.bytes,
         }));
-        sql.push(encode_tx_activity_row(TxActivityRow {
-            account: sender,
-            role: TxActivityRole::Sender,
-            height,
-            index: idx_u32,
-            digest,
-            counterparty: receiver,
-            value: tx.value,
-            nonce: tx.nonce,
-        }));
-        if receiver != sender {
+        for activity in &tx.activities {
+            let mut account = [0u8; AccountKey::SIZE];
+            account.copy_from_slice(activity.account.as_ref());
+            let mut counterparty = [0u8; AccountKey::SIZE];
+            counterparty.copy_from_slice(activity.counterparty.as_ref());
             sql.push(encode_tx_activity_row(TxActivityRow {
-                account: receiver,
-                role: TxActivityRole::Receiver,
+                account,
+                role: activity.role,
                 height,
                 index: idx_u32,
                 digest,
-                counterparty: sender,
-                value: tx.value,
+                counterparty,
+                value: activity.value,
                 nonce: tx.nonce,
+                kind: tx.kind,
             }));
         }
     }
@@ -153,21 +151,18 @@ where
     H: Hasher,
 {
     let signed_bytes = transaction.encoded_signed_transaction();
-    let transaction_size = Transaction::<H::Digest>::SIZE;
-    if signed_bytes.len() < transaction_size {
+    // Derive the sender account from the raw key bytes (the transaction's first
+    // field) without validating the curve point or materializing the sender, so
+    // an account whose key is not a valid curve point is still indexed.
+    if signed_bytes.len() < TransactionPublicKey::SIZE {
         warn!(
             height,
-            block_index,
-            signed_len = signed_bytes.len(),
-            transaction_size,
-            "indexer: skipping transaction with truncated signed payload"
+            block_index, "indexer: skipping transaction with truncated payload"
         );
         return None;
     }
-
-    let transaction_bytes = &signed_bytes[..transaction_size];
     let Some(sender) =
-        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
+        AccountKey::from_public_key_bytes(&signed_bytes[..TransactionPublicKey::SIZE])
     else {
         warn!(
             height,
@@ -176,42 +171,90 @@ where
         return None;
     };
 
-    let to_start = TransactionPublicKey::SIZE;
-    let to_end = to_start + AccountKey::SIZE;
-    let value_start = to_end;
-    let value_end = value_start + u64::SIZE;
-    let nonce_start = value_end;
-    let nonce_end = nonce_start + u64::SIZE;
-    let value = read_u64(&transaction_bytes[value_start..value_end])
-        .expect("transaction value slice has fixed width");
-    if value == 0 {
+    // Decoding leaves the sender lazy (unvalidated); only the nonce and
+    // operation are needed below, neither of which depends on the sender key.
+    let Some(signed) = transaction.get() else {
         warn!(
             height,
-            block_index, "indexer: skipping transaction with zero value"
+            block_index, "indexer: skipping transaction that fails to decode"
         );
         return None;
-    }
+    };
+    let tx = signed.value();
 
-    let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
-        .expect("transaction nonce slice has fixed width");
-    let mut to = [0u8; AccountKey::SIZE];
-    to.copy_from_slice(&transaction_bytes[to_start..to_end]);
+    // Build the activity rows for this operation. A transfer credits the
+    // recipient; a channel open is a *reservation* by the sender (no funds are
+    // credited to anyone, so only the sender gets a row); a channel close is a
+    // settlement that pays `cumulative` from the payer to the receiver (the
+    // transaction's sender); a channel timeout is the payer reclaiming escrow
+    // whose amount lives in state, not the transaction, so its row carries no
+    // value. The `kind` column (see `TxKind::from`) tells the explorer which
+    // is which, so a reservation is not misread as a payment.
+    let kind = TxKind::from(tx.op());
+    let activities = match tx.op() {
+        Operation::Transfer { to, value } => {
+            let value = value.get();
+            let mut activities = vec![Activity {
+                account: sender,
+                role: TxActivityRole::Sender,
+                counterparty: *to,
+                value,
+            }];
+            if *to != sender {
+                activities.push(Activity {
+                    account: *to,
+                    role: TxActivityRole::Receiver,
+                    counterparty: sender,
+                    value,
+                });
+            }
+            activities
+        }
+        Operation::OpenChannel {
+            receiver, deposit, ..
+        } => vec![Activity {
+            account: sender,
+            role: TxActivityRole::Sender,
+            counterparty: *receiver,
+            value: deposit.get(),
+        }],
+        Operation::CloseChannel {
+            payer, cumulative, ..
+        } => {
+            let payer = AccountKey::from_public_key(payer);
+            // The transaction sender is the receiver being paid.
+            let mut activities = vec![Activity {
+                account: sender,
+                role: TxActivityRole::Receiver,
+                counterparty: payer,
+                value: *cumulative,
+            }];
+            if payer != sender {
+                activities.push(Activity {
+                    account: payer,
+                    role: TxActivityRole::Sender,
+                    counterparty: sender,
+                    value: *cumulative,
+                });
+            }
+            activities
+        }
+        Operation::TimeoutChannel { receiver, .. } => vec![Activity {
+            account: sender,
+            role: TxActivityRole::Sender,
+            counterparty: *receiver,
+            value: 0,
+        }],
+    };
 
-    let mut hasher = H::new();
-    hasher.update(transaction_bytes);
     Some(IndexedTransaction {
         block_index,
-        digest: hasher.finalize(),
+        digest: *signed.message_digest(),
         bytes: signed_bytes.to_vec(),
-        sender,
-        to,
-        value,
-        nonce,
+        nonce: tx.nonce,
+        kind,
+        activities,
     })
-}
-
-fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
-    Ok(u64::from_be_bytes(bytes.try_into()?))
 }
 
 #[cfg(test)]
@@ -306,6 +349,125 @@ mod tests {
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_tx_meta_body(&rows.sql, &transaction);
+    }
+
+    fn activity_rows(rows: &[SqlRow]) -> Vec<&SqlRow> {
+        rows.iter()
+            .filter(|row| row.table == TX_ACTIVITY_TABLE)
+            .collect()
+    }
+
+    #[test]
+    fn open_channel_indexes_a_single_reservation_row() {
+        let mut rng = StdRng::from_seed([5; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let payer = ed25519::PrivateKey::random(&mut rng);
+        let receiver = ed25519::PrivateKey::random(&mut rng);
+        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
+        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let payer_account = AccountKey::from_public_key(&payer_pk);
+        let receiver_account = AccountKey::from_public_key(&receiver_pk);
+
+        let tx = Transaction::<sha256::Digest>::open_channel(
+            payer_pk,
+            receiver_pk,
+            NonZeroU64::new(50).expect("deposit is non-zero"),
+            u64::MAX,
+            0,
+        )
+        .seal_and_sign(&payer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let block = Block::<Commitment, PublicKey, Sha256>::new(
+            test_header(consensus_key.public_key(), 1),
+            vec![tx],
+        )
+        .seal(&mut Sha256::default());
+
+        let rows = encode_indexed_block_rows(&block);
+        let activity = activity_rows(&rows.sql);
+        // An open is a reservation: only the payer gets a row, so the payee is
+        // never shown as having received the deposit.
+        assert_eq!(activity.len(), 1, "open indexes a single reservation row");
+        let row = activity[0];
+        let CellValue::FixedBinary(account) = &row.values[0] else {
+            panic!("account is fixed binary");
+        };
+        assert_eq!(account.as_slice(), payer_account.as_ref());
+        assert!(
+            matches!(row.values[3], CellValue::UInt64(0)),
+            "role = sender"
+        );
+        let CellValue::FixedBinary(counterparty) = &row.values[5] else {
+            panic!("counterparty is fixed binary");
+        };
+        assert_eq!(counterparty.as_slice(), receiver_account.as_ref());
+        assert!(
+            matches!(row.values[6], CellValue::UInt64(50)),
+            "value = deposit"
+        );
+        assert!(matches!(row.values[8], CellValue::UInt64(1)), "kind = open");
+    }
+
+    #[test]
+    fn close_channel_indexes_payer_to_receiver_settlement() {
+        let mut rng = StdRng::from_seed([6; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let payer = ed25519::PrivateKey::random(&mut rng);
+        let receiver = ed25519::PrivateKey::random(&mut rng);
+        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
+        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let payer_account = AccountKey::from_public_key(&payer_pk);
+        let receiver_account = AccountKey::from_public_key(&receiver_pk);
+
+        // The indexer does not verify the voucher, so any signature works here.
+        let voucher = payer.sign(b"voucher", b"message");
+        let tx =
+            Transaction::<sha256::Digest>::close_channel(receiver_pk, payer_pk, 0, 20, voucher, 0)
+                .seal_and_sign(&receiver, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let block = Block::<Commitment, PublicKey, Sha256>::new(
+            test_header(consensus_key.public_key(), 1),
+            vec![tx],
+        )
+        .seal(&mut Sha256::default());
+
+        let rows = encode_indexed_block_rows(&block);
+        let activity = activity_rows(&rows.sql);
+        assert_eq!(activity.len(), 2, "close indexes both settlement sides");
+
+        // Receiver is credited the claimed amount.
+        let received = activity
+            .iter()
+            .find(|row| matches!(row.values[3], CellValue::UInt64(1)))
+            .expect("receiver row");
+        let CellValue::FixedBinary(account) = &received.values[0] else {
+            panic!("account is fixed binary");
+        };
+        assert_eq!(account.as_slice(), receiver_account.as_ref());
+        let CellValue::FixedBinary(counterparty) = &received.values[5] else {
+            panic!("counterparty is fixed binary");
+        };
+        assert_eq!(counterparty.as_slice(), payer_account.as_ref());
+        assert!(
+            matches!(received.values[6], CellValue::UInt64(20)),
+            "value = cumulative"
+        );
+        assert!(
+            matches!(received.values[8], CellValue::UInt64(2)),
+            "kind = close"
+        );
+
+        // Payer is debited the claimed amount.
+        let paid = activity
+            .iter()
+            .find(|row| matches!(row.values[3], CellValue::UInt64(0)))
+            .expect("payer row");
+        let CellValue::FixedBinary(account) = &paid.values[0] else {
+            panic!("account is fixed binary");
+        };
+        assert_eq!(account.as_slice(), payer_account.as_ref());
+        assert!(
+            matches!(paid.values[8], CellValue::UInt64(2)),
+            "kind = close"
+        );
     }
 
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {

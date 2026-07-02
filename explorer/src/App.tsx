@@ -31,6 +31,7 @@ import {
     type AccountActivityMode,
     type AccountTransactionRow,
     type LatestProofTarget,
+    type TransactionKind,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
@@ -986,9 +987,23 @@ function AccountPage({
                 {!activityError && transactions.length === 0 && (
                     <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
                 )}
-                {transactions.map(({ row, proof: txProof }) => (
-                    <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
+                {transactions.map(({ row, proof: txProof }) => {
+                    // Direction drives the row color; a channel open is a
+                    // provisional reservation and a timeout releases one (the
+                    // reclaimed amount lives in state, not the transaction),
+                    // so both are dimmed instead.
+                    const tone =
+                        row.kind === 'channel-open' || row.kind === 'channel-timeout'
+                            ? 'reservation'
+                            : row.direction === 'received'
+                              ? 'in'
+                              : 'out';
+                    return (
+                    <div className={`account-tx-row account-tx-row--${tone}`} key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
+                            <span className={`account-tx-row__kind account-tx-row__kind--${row.kind}`}>
+                                {txKindLabel(row.kind)}
+                            </span>
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue value={row.digest} onCopy={onCopy} />
                             <span>from</span>
@@ -1007,17 +1022,48 @@ function AccountPage({
                             />
                         </div>
                         <div className="account-tx-row__meta">
-                            <span>value {row.value.toString()}</span>
+                            <span className="account-tx-row__value">{txValueLabel(row.kind)} {row.value.toString()}</span>
                             <span>nonce {row.nonce.toString()}</span>
                             <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
                             <span>proof</span>
                             <ProofMark proof={txProof} />
                         </div>
                     </div>
-                ))}
+                    );
+                })}
             </div>
         </section>
     );
+}
+
+function txKindLabel(kind: TransactionKind): string {
+    switch (kind) {
+        case 'channel-open':
+            return 'channel open';
+        case 'channel-close':
+            return 'channel close';
+        case 'channel-timeout':
+            return 'channel timeout';
+        default:
+            return 'transfer';
+    }
+}
+
+// The value column means different things per kind: a transfer's amount, the
+// escrow a channel open reserves, the amount a channel close pays out, or a
+// timeout's reclaim (always indexed as 0 — the reclaimed escrow lives in
+// state, not the transaction).
+function txValueLabel(kind: TransactionKind): string {
+    switch (kind) {
+        case 'channel-open':
+            return 'reserve';
+        case 'channel-close':
+            return 'settle';
+        case 'channel-timeout':
+            return 'reclaim';
+        default:
+            return 'value';
+    }
 }
 
 function ProofDatum({ label, value }: { label: string; value: string }) {

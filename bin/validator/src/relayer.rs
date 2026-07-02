@@ -590,16 +590,8 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
 
 fn max_transaction_count(body_len: usize) -> Option<usize> {
     let payload_len = body_len.saturating_sub(MIN_BATCH_LENGTH_PREFIX_BYTES);
-    let max_transactions = payload_len / min_signed_transaction_bytes();
+    let max_transactions = payload_len / SignedTransaction::<sha256::Sha256>::MIN_ENCODED_SIZE;
     (max_transactions > 0).then_some(max_transactions)
-}
-
-const fn min_signed_transaction_bytes() -> usize {
-    constantinople_primitives::TransactionPublicKey::SIZE
-        + constantinople_primitives::TransactionPublicKey::SIZE
-        + 1
-        + 1
-        + constantinople_primitives::TransactionSignature::MIN_SIZE
 }
 
 fn batch_id(body: &Bytes) -> String {
