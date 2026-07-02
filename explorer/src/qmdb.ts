@@ -47,6 +47,7 @@ const TX_ACTIVITY_ROLE_SENDER = 0n;
 const TX_ACTIVITY_ROLE_RECEIVER = 1n;
 const TX_ACTIVITY_KIND_CHANNEL_OPEN = 1n;
 const TX_ACTIVITY_KIND_CHANNEL_CLOSE = 2n;
+const TX_ACTIVITY_KIND_CHANNEL_TIMEOUT = 3n;
 
 const ACCOUNT_META_TABLE = 'account_meta';
 const ACCOUNT_META_ACCOUNT = 'account';
@@ -89,7 +90,7 @@ export interface LatestProofTarget extends FinalizedTransactionTarget {}
 export type AccountActivityMode = 'all' | 'sent' | 'received';
 
 // The kind of operation an activity row describes.
-export type TransactionKind = 'transfer' | 'channel-open' | 'channel-close';
+export type TransactionKind = 'transfer' | 'channel-open' | 'channel-close' | 'channel-timeout';
 
 export interface AccountTransactionRow {
     readonly digest: string;
@@ -677,6 +678,7 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
 function decodeTransactionKind(kind: bigint): TransactionKind {
     if (kind === TX_ACTIVITY_KIND_CHANNEL_OPEN) return 'channel-open';
     if (kind === TX_ACTIVITY_KIND_CHANNEL_CLOSE) return 'channel-close';
+    if (kind === TX_ACTIVITY_KIND_CHANNEL_TIMEOUT) return 'channel-timeout';
     return 'transfer';
 }
 

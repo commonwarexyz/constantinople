@@ -989,9 +989,11 @@ function AccountPage({
                 )}
                 {transactions.map(({ row, proof: txProof }) => {
                     // Direction drives the row color; a channel open is a
-                    // provisional reservation, so it is dimmed instead.
+                    // provisional reservation and a timeout releases one (the
+                    // reclaimed amount lives in state, not the transaction),
+                    // so both are dimmed instead.
                     const tone =
-                        row.kind === 'channel-open'
+                        row.kind === 'channel-open' || row.kind === 'channel-timeout'
                             ? 'reservation'
                             : row.direction === 'received'
                               ? 'in'
@@ -1040,19 +1042,25 @@ function txKindLabel(kind: TransactionKind): string {
             return 'channel open';
         case 'channel-close':
             return 'channel close';
+        case 'channel-timeout':
+            return 'channel timeout';
         default:
             return 'transfer';
     }
 }
 
 // The value column means different things per kind: a transfer's amount, the
-// escrow a channel open reserves, or the amount a channel close pays out.
+// escrow a channel open reserves, the amount a channel close pays out, or a
+// timeout's reclaim (always indexed as 0 — the reclaimed escrow lives in
+// state, not the transaction).
 function txValueLabel(kind: TransactionKind): string {
     switch (kind) {
         case 'channel-open':
             return 'reserve';
         case 'channel-close':
             return 'settle';
+        case 'channel-timeout':
+            return 'reclaim';
         default:
             return 'value';
     }

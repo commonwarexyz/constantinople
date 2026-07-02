@@ -7,6 +7,7 @@ const VOUCHER_SIGNATURE_BYTES = 64;
 const TRANSFER_TAG = 0;
 const OPEN_CHANNEL_TAG = 1;
 const CLOSE_CHANNEL_TAG = 2;
+const TIMEOUT_CHANNEL_TAG = 3;
 const MAX_U64 = (1n << 64n) - 1n;
 
 export interface TransactionDraft {
@@ -88,9 +89,14 @@ export function signedTransactionBodyLength(bytes: Uint8Array): number {
     }
 
     switch (bytes[common]) {
+        // Transfer: recipient account key + value.
+        // TimeoutChannel: receiver account key + open nonce.
         case TRANSFER_TAG:
-        case OPEN_CHANNEL_TAG:
+        case TIMEOUT_CHANNEL_TAG:
             return common + 1 + ACCOUNT_KEY_BYTES + U64_BYTES;
+        // OpenChannel: receiver account key + deposit + expiry.
+        case OPEN_CHANNEL_TAG:
+            return common + 1 + ACCOUNT_KEY_BYTES + U64_BYTES + U64_BYTES;
         case CLOSE_CHANNEL_TAG:
             return common + 1 + PUBLIC_KEY_BYTES + U64_BYTES + U64_BYTES + VOUCHER_SIGNATURE_BYTES;
         default:

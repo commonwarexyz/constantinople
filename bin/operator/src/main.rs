@@ -227,6 +227,10 @@ struct VerifiedOpenChannel {
     open_nonce: u64,
     deposit: u64,
     expiry: u64,
+    /// Height of the latest certified header the verification ran against;
+    /// used to keep expiry checks honest even before the height poller's
+    /// first result lands.
+    tip_height: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -436,24 +440,37 @@ async fn track_height(shared: Arc<AppShared>) {
 /// A receiver that misses a channel's expiry forfeits its vouchers (the payer
 /// reclaims the whole escrow), so settlement cannot wait for the payer to ask.
 async fn settlement_sweep(shared: Arc<AppShared>) {
+    // Channels with a settle task already spawned by this sweep. A spawned
+    // task can wait on the nonce window with the channel still `Open`, so
+    // without this a channel would get one more task per tick until it flips
+    // to `Settling`.
+    let mut spawned: BTreeSet<AccountKey> = BTreeSet::new();
     loop {
         tokio::time::sleep(SETTLEMENT_SWEEP_INTERVAL).await;
         let height = shared.height.load(Ordering::Relaxed);
         let due: Vec<AccountKey> = {
             let state = shared.state.lock().await;
+            spawned.retain(|channel| {
+                state
+                    .channels
+                    .get(channel)
+                    .is_some_and(|registered| registered.settlement == SettlementState::Open)
+            });
             state
                 .channels
                 .iter()
-                .filter(|(_, registered)| {
+                .filter(|(channel, registered)| {
                     registered.settlement == SettlementState::Open
                         && registered.latest.is_some()
                         && height.saturating_add(shared.settle_margin) >= registered.expiry
+                        && !spawned.contains(channel)
                 })
                 .map(|(channel, _)| *channel)
                 .collect()
         };
         for channel in due {
             info!(%channel, height, "expiry approaching, force-settling channel");
+            spawned.insert(channel);
             let shared = shared.clone();
             tokio::spawn(async move {
                 if let Err(error) = settle_registered_channel(&shared, channel).await {
@@ -534,7 +551,13 @@ async fn register_channel(
     }
     // Past the expiry the payer can reclaim the whole escrow, voiding any
     // unsettled vouchers; refuse channels without enough runway to serve and
-    // settle safely.
+    // settle safely. The verification above ran against a certified header,
+    // so its height also seeds the cache — the check cannot be fooled by a
+    // cache still at zero right after startup.
+    state
+        .shared
+        .height
+        .fetch_max(open.tip_height, Ordering::Relaxed);
     let height = state.shared.height.load(Ordering::Relaxed);
     if open.expiry <= height.saturating_add(state.shared.min_runway) {
         return Err(ApiError::bad_request("channel expires too soon"));
@@ -719,13 +742,16 @@ async fn settle_registered_channel(
         latest.signature,
         nonce,
     );
-    let finalized = submit_close(shared, close, expiry).await;
+    let close_digest = *close.message_digest();
+    let mut finalized = submit_close(shared, close, expiry).await;
     if !finalized {
-        // The channel was reclaimed by the payer, so the close can never
-        // land. Its reserved nonce was never consumed; burn it with a
-        // receiver self-transfer so the in-flight window's invariant (every
-        // nonce below the oldest in-flight one is consumed) stays true.
-        warn!(%channel, "close cannot finalize; burning its nonce and abandoning settlement");
+        // Giving up does not mean the close is dead: an earlier submission
+        // may still be queued at a validator and finalize later. Race a
+        // same-nonce burn (a receiver self-transfer) against it — exactly one
+        // of the two can consume the reserved nonce — so the in-flight
+        // window's invariant (every nonce below the oldest in-flight one is
+        // consumed) stays true whichever wins.
+        warn!(%channel, "close did not finalize before expiry; racing a nonce burn against it");
         let burn = Transaction::new(
             shared.receiver_pk.clone(),
             shared.receiver_pk.clone(),
@@ -737,7 +763,7 @@ async fn settle_registered_channel(
             TRANSACTION_NAMESPACE,
             &mut Sha256::default(),
         );
-        submit_until_finalized(&shared.relayer, burn).await;
+        finalized = resolve_abandoned_close(shared, burn, &close_digest).await;
     }
 
     let mut state = shared.state.lock().await;
@@ -764,11 +790,18 @@ async fn settle_registered_channel(
 /// channel's expiry (the payer may reclaim the channel from that point, after
 /// which the close can never land).
 ///
+/// A close stays valid on-chain at any height while the channel exists, so
+/// giving up requires more than the clock: the relayer must have processed a
+/// submission to a definitive non-inclusion (the proposer filtered the close,
+/// which past expiry means the channel is likely reclaimed). A transport error
+/// proves nothing about the channel and always retries — abandoning on it
+/// would forfeit vouchers a live channel could still settle.
+///
 /// Returns whether the close finalized.
 async fn submit_close(shared: &Arc<AppShared>, close: Tx, expiry: u64) -> bool {
     let batch = [close];
     loop {
-        match shared.relayer.submit(&batch).await {
+        let definitive = match shared.relayer.submit(&batch).await {
             Ok(TxStatus::Finalized { height }) => {
                 debug!(height, "operator close finalized");
                 return true;
@@ -788,12 +821,17 @@ async fn submit_close(shared: &Arc<AppShared>, close: Tx, expiry: u64) -> bool {
             }
             Ok(status) => {
                 warn!(?status, "operator close not finalized, retrying");
+                true
             }
             Err(error) => {
                 warn!(%error, "operator close submit failed, retrying");
+                false
             }
-        }
-        if expiry != CHANNEL_NEVER_EXPIRES && shared.height.load(Ordering::Relaxed) > expiry {
+        };
+        if definitive
+            && expiry != CHANNEL_NEVER_EXPIRES
+            && shared.height.load(Ordering::Relaxed) > expiry
+        {
             return false;
         }
         tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
@@ -858,6 +896,7 @@ impl ChannelVerifier {
             .map_err(|error| format!("latest finalized header lookup failed: {error}"))?
             .ok_or_else(|| "no finalized header available".to_string())?;
         let header = latest.header();
+        let tip_height = header.height;
         let tip = header
             .transactions_range
             .end()
@@ -915,37 +954,76 @@ impl ChannelVerifier {
             open_nonce: tx.value().nonce,
             deposit: deposit.get(),
             expiry: *expiry,
+            tip_height,
         })
     }
 }
 
-async fn submit_until_finalized(relayer: &Client, close: Tx) {
-    let batch = [close];
+/// Resolves an abandoned close by racing a same-nonce burn against it.
+///
+/// The close may still finalize after [`submit_close`] gives up (a submission
+/// can sit in a validator mempool through a transport error), and the burn is
+/// signed with the same nonce, so exactly one of the two can ever consume it.
+/// Submits the burn until either transaction is observed finalized: the burn
+/// landing abandons the settlement, the close landing completes it. Without
+/// this check a blind burn retry would spin forever once the close won the
+/// race, pinning the nonce in the in-flight set and wedging all settlements.
+///
+/// Returns whether the close finalized.
+async fn resolve_abandoned_close(
+    shared: &Arc<AppShared>,
+    burn: Tx,
+    close_digest: &<Sha256 as commonware_cryptography::Hasher>::Digest,
+) -> bool {
+    let burn_digest = *burn.message_digest();
+    let batch = [burn];
     loop {
-        match relayer.submit(&batch).await {
+        match shared.relayer.submit(&batch).await {
             Ok(TxStatus::Finalized { height }) => {
-                debug!(height, "operator close finalized");
-                return;
+                debug!(height, "abandoned close's nonce burned");
+                return false;
             }
             Ok(TxStatus::PartiallyFinalized {
-                height,
-                included,
-                filtered,
+                height, included, ..
             }) if !included.is_empty() => {
-                debug!(
-                    height,
-                    included = included.len(),
-                    filtered = filtered.len(),
-                    "operator close partially finalized"
-                );
-                return;
+                debug!(height, "abandoned close's nonce burned");
+                return false;
             }
             Ok(status) => {
-                warn!(?status, "operator close not finalized, retrying");
+                warn!(?status, "nonce burn not finalized, retrying");
             }
             Err(error) => {
-                warn!(%error, "operator close submit failed, retrying");
+                warn!(%error, "nonce burn submit failed, retrying");
             }
+        }
+        // The burn stays filtered while the close still owns the nonce (and a
+        // finalized burn's acknowledgement can itself be lost to a transport
+        // error), so consult the indexer for whichever actually landed.
+        match shared
+            .verifier
+            .indexer
+            .transaction_metadata::<Sha256>(close_digest)
+            .await
+        {
+            Ok(Some(_)) => {
+                info!("abandoned close finalized after all; settlement complete");
+                return true;
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "close lookup failed while burning its nonce"),
+        }
+        match shared
+            .verifier
+            .indexer
+            .transaction_metadata::<Sha256>(&burn_digest)
+            .await
+        {
+            Ok(Some(_)) => {
+                debug!("abandoned close's nonce burned");
+                return false;
+            }
+            Ok(None) => {}
+            Err(error) => warn!(%error, "burn lookup failed while burning the close's nonce"),
         }
         tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
     }

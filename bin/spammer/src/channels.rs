@@ -105,6 +105,10 @@ impl ChannelRunner {
         );
         assert!(avg_vouchers >= 1, "average vouchers must be >= 1");
         assert!(price >= 1, "voucher price must be >= 1");
+        // Like the transfer presigner, the spammer assumes a fresh chain per
+        // run: accounts are seed-derived and nonces restart at zero, so
+        // rerunning against a chain that already consumed them makes every
+        // lifecycle no-op at proposal.
         let nonces = vec![0; accounts.len()];
         let operator_account = AccountKey::from_public_key(&operator_pk);
         Self {
@@ -297,17 +301,21 @@ impl ChannelRunner {
         }
         stats.channel_txs += 1;
 
-        if self
+        match self
             .try_reclaim(submitter, payer_i, open_nonce, expiry)
             .await
         {
-            stats.channel_txs += 1;
-        } else {
-            self.reclaims.push(PendingReclaim {
+            ReclaimOutcome::Reclaimed => stats.channel_txs += 1,
+            // No close can exist for an unregistered channel, so a definitive
+            // rejection here is unexpected; drop rather than retry forever.
+            ReclaimOutcome::ChannelGone => {
+                warn!(open_nonce, expiry, "timeout-exercise channel vanished");
+            }
+            ReclaimOutcome::Transient => self.reclaims.push(PendingReclaim {
                 payer_i,
                 open_nonce,
                 expiry,
-            });
+            }),
         }
     }
 
@@ -324,34 +332,38 @@ impl ChannelRunner {
             }
         });
         for (payer_i, open_nonce, expiry) in due {
-            if self
+            match self
                 .try_reclaim(submitter, payer_i, open_nonce, expiry)
                 .await
             {
-                stats.channel_txs += 1;
-            } else {
-                // Past expiry a timeout only fails if the channel no longer
-                // exists — the operator's close won the race after all — so
-                // there is nothing left to reclaim.
-                warn!(open_nonce, expiry, "reclaim found no channel; dropping");
+                ReclaimOutcome::Reclaimed => stats.channel_txs += 1,
+                ReclaimOutcome::ChannelGone => {
+                    // The chain processed the timeout past expiry and skipped
+                    // it, so the channel no longer exists — the operator's
+                    // close won the race and there is nothing left to reclaim.
+                    warn!(open_nonce, expiry, "reclaim found no channel; dropping");
+                }
+                // A transport failure proves nothing about the channel; keep
+                // the deposit queued rather than stranding it.
+                ReclaimOutcome::Transient => self.reclaims.push(PendingReclaim {
+                    payer_i,
+                    open_nonce,
+                    expiry,
+                }),
             }
         }
     }
 
     /// Submits a `TimeoutChannel` for the channel, resubmitting the same
-    /// transaction (same nonce) until it lands or attempts run out. Returns
-    /// whether the reclaim finalized.
-    ///
-    /// If the operator's close raced ahead the channel is already gone and the
-    /// timeout can never land; attempts running out then just abandons a
-    /// reclaim that was unnecessary.
+    /// transaction (same nonce) until it lands, is definitively rejected, or
+    /// attempts run out.
     async fn try_reclaim(
         &mut self,
         submitter: &RelayerSubmitter,
         payer_i: usize,
         open_nonce: u64,
         expiry: u64,
-    ) -> bool {
+    ) -> ReclaimOutcome {
         let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
         let nonce = self.nonces[payer_i];
         self.nonces[payer_i] += 1;
@@ -368,17 +380,30 @@ impl ChannelRunner {
                 .await;
             self.observe_height(height);
             if finalized > 0 {
-                return true;
+                return ReclaimOutcome::Reclaimed;
             }
-            // Not expired yet (or the operator settled first); wait for the
-            // chain to pass the expiry before deciding.
-            if self.height > expiry.saturating_add(TIMEOUT_EXPIRY_DELTA) {
-                return false;
+            // Only a response carrying a finalization height proves the chain
+            // actually processed (and skipped) the timeout; a transport error
+            // or dropped batch proves nothing about the channel.
+            if height.is_some_and(|height| height > expiry) {
+                return ReclaimOutcome::ChannelGone;
             }
             tokio::time::sleep(RECLAIM_BACKOFF).await;
         }
-        false
+        ReclaimOutcome::Transient
     }
+}
+
+/// Outcome of a [`ChannelRunner::try_reclaim`] attempt.
+enum ReclaimOutcome {
+    /// The timeout finalized; the deposit is back with the payer.
+    Reclaimed,
+    /// The chain processed the timeout past the expiry and skipped it: the
+    /// channel no longer exists (a close landed first).
+    ChannelGone,
+    /// Nothing definitive happened (transport errors, dropped batches, or the
+    /// expiry has not passed on chain yet); worth retrying later.
+    Transient,
 }
 
 fn build_open(
