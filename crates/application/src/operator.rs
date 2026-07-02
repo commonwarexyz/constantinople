@@ -116,12 +116,10 @@ mod tests {
     use super::*;
     use commonware_codec::FixedSize as _;
     use commonware_cryptography::{Signer as _, ed25519};
-    use commonware_math::algebra::Random as _;
     use constantinople_primitives::channel_address;
-    use rand::{SeedableRng, rngs::StdRng};
 
     fn setup() -> (ed25519::PrivateKey, AccountKey, ChannelOperator) {
-        let payer = ed25519::PrivateKey::random(&mut StdRng::from_seed([1u8; 32]));
+        let payer = ed25519::PrivateKey::from_seed(1);
         let payer_key =
             AccountKey::from_public_key(&TransactionPublicKey::ed25519(payer.public_key()));
         let receiver = AccountKey::from([2u8; AccountKey::SIZE]);
@@ -169,7 +167,7 @@ mod tests {
     #[test]
     fn rejects_forged_voucher() {
         let (_payer, channel, mut operator) = setup();
-        let attacker = ed25519::PrivateKey::random(&mut StdRng::from_seed([9u8; 32]));
+        let attacker = ed25519::PrivateKey::from_seed(9);
         assert_eq!(
             operator.serve(&Voucher::sign(&attacker, channel, 10)),
             Err(ServeError::BadSignature)
@@ -178,7 +176,7 @@ mod tests {
 
     #[test]
     fn rejects_voucher_when_charge_threshold_overflows() {
-        let payer = ed25519::PrivateKey::random(&mut StdRng::from_seed([3u8; 32]));
+        let payer = ed25519::PrivateKey::from_seed(3);
         let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
         let payer_account = AccountKey::from_public_key(&payer_pk);
         let receiver = AccountKey::from([4u8; AccountKey::SIZE]);

@@ -186,9 +186,12 @@ where
     // recipient; a channel open is a *reservation* by the sender (no funds are
     // credited to anyone, so only the sender gets a row); a channel close is a
     // settlement that pays `cumulative` from the payer to the receiver (the
-    // transaction's sender). The `kind` column tells the explorer which is
-    // which, so a reservation is not misread as a payment.
-    let (kind, activities) = match tx.op() {
+    // transaction's sender); a channel timeout is the payer reclaiming escrow
+    // whose amount lives in state, not the transaction, so its row carries no
+    // value. The `kind` column (see `TxKind::from`) tells the explorer which
+    // is which, so a reservation is not misread as a payment.
+    let kind = TxKind::from(tx.op());
+    let activities = match tx.op() {
         Operation::Transfer { to, value } => {
             let value = value.get();
             let mut activities = vec![Activity {
@@ -205,19 +208,16 @@ where
                     value,
                 });
             }
-            (TxKind::Transfer, activities)
+            activities
         }
         Operation::OpenChannel {
             receiver, deposit, ..
-        } => (
-            TxKind::ChannelOpen,
-            vec![Activity {
-                account: sender,
-                role: TxActivityRole::Sender,
-                counterparty: *receiver,
-                value: deposit.get(),
-            }],
-        ),
+        } => vec![Activity {
+            account: sender,
+            role: TxActivityRole::Sender,
+            counterparty: *receiver,
+            value: deposit.get(),
+        }],
         Operation::CloseChannel {
             payer, cumulative, ..
         } => {
@@ -237,19 +237,14 @@ where
                     value: *cumulative,
                 });
             }
-            (TxKind::ChannelClose, activities)
+            activities
         }
-        // The reclaimed escrow amount lives in state, not the transaction, so
-        // the payer's row carries no value.
-        Operation::TimeoutChannel { receiver, .. } => (
-            TxKind::ChannelTimeout,
-            vec![Activity {
-                account: sender,
-                role: TxActivityRole::Sender,
-                counterparty: *receiver,
-                value: 0,
-            }],
-        ),
+        Operation::TimeoutChannel { receiver, .. } => vec![Activity {
+            account: sender,
+            role: TxActivityRole::Sender,
+            counterparty: *receiver,
+            value: 0,
+        }],
     };
 
     Some(IndexedTransaction {

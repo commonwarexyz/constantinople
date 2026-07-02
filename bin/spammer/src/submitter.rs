@@ -85,19 +85,13 @@ impl RelayerSubmitter {
     /// Submits a signed batch once. Failed or dropped batches are abandoned so
     /// the next outer loop iteration uses a fresh nonce set.
     pub async fn submit(&self, batch: Vec<Tx>) {
-        let _ = self.submit_reporting(batch).await;
+        let _ = self.submit_reporting_with_height(batch).await;
     }
 
     /// Like [`Self::submit`], but returns the number of transactions that
-    /// finalized. Channel lifecycles use this to gate a close on its open
-    /// finalizing (a close before its open exists would be rejected).
-    pub async fn submit_reporting(&self, batch: Vec<Tx>) -> u64 {
-        self.submit_reporting_with_height(batch).await.0
-    }
-
-    /// Like [`Self::submit_reporting`], but also returns the finalization
-    /// height the relayer reported (if any). Channel lifecycles use it to
-    /// track chain height for expiry selection.
+    /// finalized plus the finalization height the relayer reported (if any).
+    /// Channel lifecycles use the count to gate a close on its open finalizing
+    /// and the height to track the chain for expiry selection.
     pub async fn submit_reporting_with_height(&self, batch: Vec<Tx>) -> (u64, Option<u64>) {
         let count = batch.len() as u64;
         let body = batch.encode();

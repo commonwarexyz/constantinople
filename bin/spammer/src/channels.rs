@@ -132,6 +132,26 @@ impl ChannelRunner {
         }
     }
 
+    fn payer_pk(&self, payer_i: usize) -> TransactionPublicKey {
+        TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone())
+    }
+
+    /// Reserves the payer's next transaction nonce.
+    fn next_nonce(&mut self, payer_i: usize) -> u64 {
+        let nonce = self.nonces[payer_i];
+        self.nonces[payer_i] += 1;
+        nonce
+    }
+
+    /// Queues a stranded deposit for a timeout reclaim once `expiry` passes.
+    fn queue_reclaim(&mut self, payer_i: usize, open_nonce: u64, expiry: u64) {
+        self.reclaims.push(PendingReclaim {
+            payer_i,
+            open_nonce,
+            expiry,
+        });
+    }
+
     /// Voucher count for the next channel, jittered around the average so
     /// channel lifetimes vary. Uniform in `[ceil(avg/2), avg + avg/2]`.
     fn next_voucher_count(&mut self) -> u64 {
@@ -173,7 +193,7 @@ impl ChannelRunner {
             return stats;
         }
 
-        let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
+        let payer_pk = self.payer_pk(payer_i);
         let payer_account = AccountKey::from_public_key(&payer_pk);
 
         let vouchers = self.next_voucher_count();
@@ -187,8 +207,7 @@ impl ChannelRunner {
         // every open is a fresh, never-recurring channel. The expiry gives the
         // operator plenty of runway; if anything below strands the deposit,
         // the reclaim queue recovers it after this height passes.
-        let open_nonce = self.nonces[payer_i];
-        self.nonces[payer_i] += 1;
+        let open_nonce = self.next_nonce(payer_i);
         let expiry = self.height.saturating_add(CHANNEL_EXPIRY_RUNWAY);
         let open = build_open(
             &self.accounts[payer_i],
@@ -231,11 +250,7 @@ impl ChannelRunner {
             }
         }
         if !registered {
-            self.reclaims.push(PendingReclaim {
-                payer_i,
-                open_nonce,
-                expiry,
-            });
+            self.queue_reclaim(payer_i, open_nonce, expiry);
             return stats;
         }
 
@@ -251,21 +266,13 @@ impl ChannelRunner {
             }
         }
         if stats.vouchers == 0 {
-            self.reclaims.push(PendingReclaim {
-                payer_i,
-                open_nonce,
-                expiry,
-            });
+            self.queue_reclaim(payer_i, open_nonce, expiry);
             return stats;
         }
 
         if let Err(error) = self.operator.settle_channel(channel).await {
             warn!(%error, %channel, "operator settlement failed");
-            self.reclaims.push(PendingReclaim {
-                payer_i,
-                open_nonce,
-                expiry,
-            });
+            self.queue_reclaim(payer_i, open_nonce, expiry);
             return stats;
         }
         stats.channel_txs += 1;
@@ -281,9 +288,8 @@ impl ChannelRunner {
         payer_i: usize,
         stats: &mut LifecycleStats,
     ) {
-        let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
-        let open_nonce = self.nonces[payer_i];
-        self.nonces[payer_i] += 1;
+        let payer_pk = self.payer_pk(payer_i);
+        let open_nonce = self.next_nonce(payer_i);
         let expiry = self.height.saturating_add(TIMEOUT_EXPIRY_DELTA);
         let deposit = NonZeroU64::new(self.price).expect("price is >= 1");
         let open = build_open(
@@ -311,29 +317,25 @@ impl ChannelRunner {
             ReclaimOutcome::ChannelGone => {
                 warn!(open_nonce, expiry, "timeout-exercise channel vanished");
             }
-            ReclaimOutcome::Transient => self.reclaims.push(PendingReclaim {
-                payer_i,
-                open_nonce,
-                expiry,
-            }),
+            ReclaimOutcome::Transient => self.queue_reclaim(payer_i, open_nonce, expiry),
         }
     }
 
     /// Retries queued reclaims whose expiry has passed (one attempt each).
     async fn reclaim_due(&mut self, submitter: &RelayerSubmitter, stats: &mut LifecycleStats) {
-        let mut due = Vec::new();
         let height = self.height;
-        self.reclaims.retain(|reclaim| {
-            if height > reclaim.expiry {
-                due.push((reclaim.payer_i, reclaim.open_nonce, reclaim.expiry));
-                false
-            } else {
-                true
-            }
-        });
-        for (payer_i, open_nonce, expiry) in due {
+        let (due, pending): (Vec<_>, Vec<_>) = core::mem::take(&mut self.reclaims)
+            .into_iter()
+            .partition(|reclaim| height > reclaim.expiry);
+        self.reclaims = pending;
+        for reclaim in due {
             match self
-                .try_reclaim(submitter, payer_i, open_nonce, expiry)
+                .try_reclaim(
+                    submitter,
+                    reclaim.payer_i,
+                    reclaim.open_nonce,
+                    reclaim.expiry,
+                )
                 .await
             {
                 ReclaimOutcome::Reclaimed => stats.channel_txs += 1,
@@ -341,15 +343,15 @@ impl ChannelRunner {
                     // The chain processed the timeout past expiry and skipped
                     // it, so the channel no longer exists — the operator's
                     // close won the race and there is nothing left to reclaim.
-                    warn!(open_nonce, expiry, "reclaim found no channel; dropping");
+                    warn!(
+                        open_nonce = reclaim.open_nonce,
+                        expiry = reclaim.expiry,
+                        "reclaim found no channel; dropping"
+                    );
                 }
                 // A transport failure proves nothing about the channel; keep
                 // the deposit queued rather than stranding it.
-                ReclaimOutcome::Transient => self.reclaims.push(PendingReclaim {
-                    payer_i,
-                    open_nonce,
-                    expiry,
-                }),
+                ReclaimOutcome::Transient => self.reclaims.push(reclaim),
             }
         }
     }
@@ -364,9 +366,8 @@ impl ChannelRunner {
         open_nonce: u64,
         expiry: u64,
     ) -> ReclaimOutcome {
-        let payer_pk = TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone());
-        let nonce = self.nonces[payer_i];
-        self.nonces[payer_i] += 1;
+        let payer_pk = self.payer_pk(payer_i);
+        let nonce = self.next_nonce(payer_i);
         let timeout =
             Transaction::timeout_channel(payer_pk, self.operator_pk.clone(), open_nonce, nonce)
                 .seal_and_sign(

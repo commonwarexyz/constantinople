@@ -162,6 +162,19 @@ struct AppState {
     shared: Arc<AppShared>,
 }
 
+/// Where a channel stands relative to its expiry under this operator's
+/// margins. The single home for the expiry arithmetic (including the
+/// [`CHANNEL_NEVER_EXPIRES`] sentinel) so handlers cannot drift.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExpiryPhase {
+    /// Far enough from expiry to serve vouchers.
+    Serving,
+    /// Within the settle margin: stop serving and settle now.
+    Settling,
+    /// Past the expiry: the payer may reclaim the escrow at any moment.
+    Expired,
+}
+
 /// Read-only after startup, except for the mutable state behind the mutex and
 /// the height cache.
 struct AppShared {
@@ -178,6 +191,28 @@ struct AppShared {
     /// Blocks before expiry at which vouchers stop and settlement starts.
     settle_margin: u64,
     state: Mutex<OperatorState>,
+}
+
+impl AppShared {
+    /// Classifies `expiry` against `height` under this operator's settle
+    /// margin.
+    const fn expiry_phase(&self, height: u64, expiry: u64) -> ExpiryPhase {
+        if expiry == CHANNEL_NEVER_EXPIRES {
+            ExpiryPhase::Serving
+        } else if height > expiry {
+            ExpiryPhase::Expired
+        } else if height.saturating_add(self.settle_margin) >= expiry {
+            ExpiryPhase::Settling
+        } else {
+            ExpiryPhase::Serving
+        }
+    }
+
+    /// Whether a channel expiring at `expiry` still has the registration
+    /// runway required to serve and settle it safely.
+    const fn has_runway(&self, height: u64, expiry: u64) -> bool {
+        expiry > height.saturating_add(self.min_runway)
+    }
 }
 
 struct OperatorState {
@@ -289,7 +324,7 @@ async fn main() {
     let cli = Cli::parse();
     tracing_subscriber::fmt().init();
 
-    let config = OperatorRuntimeConfig::from_cli(cli);
+    let config = OperatorConfig::from_cli(cli);
     assert!(config.price > 0, "--price must be > 0");
 
     let receiver = ed25519::PrivateKey::from_seed(config.receiver_seed);
@@ -321,7 +356,7 @@ async fn main() {
     tokio::spawn(track_height(state.shared.clone()));
     tokio::spawn(settlement_sweep(state.shared.clone()));
 
-    let addr = SocketAddr::new(config.listen_addr, config.port);
+    let addr = SocketAddr::new(config.listen_addr, config.http_port);
     let app = Router::new()
         .route("/health", get(health))
         .route("/public-key", get(public_key))
@@ -339,40 +374,23 @@ async fn main() {
         .expect("operator HTTP failed");
 }
 
-struct OperatorRuntimeConfig {
-    port: u16,
-    listen_addr: IpAddr,
-    relayer_url: String,
-    indexer_url: String,
-    qmdb_url: String,
-    receiver_seed: u64,
-    price: u64,
-    min_runway: u64,
-    settle_margin: u64,
-}
-
-impl OperatorRuntimeConfig {
+impl OperatorConfig {
+    /// Resolves the runtime configuration: the YAML file (with hosts-file URL
+    /// resolution) when `--config` is given, bare CLI flags otherwise.
     fn from_cli(cli: Cli) -> Self {
         if let Some(config_path) = cli.config {
             let raw = std::fs::read_to_string(config_path).expect("failed to read operator config");
-            let config: OperatorConfig =
+            let mut config: Self =
                 serde_yaml::from_str(&raw).expect("failed to parse operator config");
             let hosts = cli.hosts.as_deref().map(load_hosts);
-            return Self {
-                port: config.http_port,
-                listen_addr: config.listen_addr,
-                relayer_url: resolve_named_http_url(&config.relayer_url, hosts.as_ref()),
-                indexer_url: resolve_named_http_url(&config.indexer_url, hosts.as_ref()),
-                qmdb_url: resolve_named_http_url(&config.qmdb_url, hosts.as_ref()),
-                receiver_seed: config.receiver_seed,
-                price: config.price,
-                min_runway: config.min_runway,
-                settle_margin: config.settle_margin,
-            };
+            config.relayer_url = resolve_named_http_url(&config.relayer_url, hosts.as_ref());
+            config.indexer_url = resolve_named_http_url(&config.indexer_url, hosts.as_ref());
+            config.qmdb_url = resolve_named_http_url(&config.qmdb_url, hosts.as_ref());
+            return config;
         }
 
         Self {
-            port: cli.port,
+            http_port: cli.port,
             listen_addr: cli.listen_addr,
             relayer_url: cli.relayer_url.expect("provide --relayer-url or --config"),
             indexer_url: cli.indexer_url.expect("provide --indexer-url or --config"),
@@ -462,7 +480,7 @@ async fn settlement_sweep(shared: Arc<AppShared>) {
                 .filter(|(channel, registered)| {
                     registered.settlement == SettlementState::Open
                         && registered.latest.is_some()
-                        && height.saturating_add(shared.settle_margin) >= registered.expiry
+                        && shared.expiry_phase(height, registered.expiry) != ExpiryPhase::Serving
                         && !spawned.contains(channel)
                 })
                 .map(|(channel, _)| *channel)
@@ -559,7 +577,7 @@ async fn register_channel(
         .height
         .fetch_max(open.tip_height, Ordering::Relaxed);
     let height = state.shared.height.load(Ordering::Relaxed);
-    if open.expiry <= height.saturating_add(state.shared.min_runway) {
+    if !state.shared.has_runway(height, open.expiry) {
         return Err(ApiError::bad_request("channel expires too soon"));
     }
 
@@ -639,8 +657,8 @@ async fn serve_voucher(
     };
 
     let height = state.shared.height.load(Ordering::Relaxed);
-    let settle_margin = state.shared.settle_margin;
-    let mut state = state.shared.state.lock().await;
+    let shared = state.shared.clone();
+    let mut state = shared.state.lock().await;
     let state = &mut *state;
     let Some(registered) = state.channels.get_mut(&channel) else {
         return Err(ApiError::bad_request("channel metadata missing"));
@@ -652,7 +670,7 @@ async fn serve_voucher(
     }
     // Near expiry a voucher may not settle before the payer can reclaim the
     // escrow; stop serving and let the sweep close the channel.
-    if height.saturating_add(settle_margin) >= registered.expiry {
+    if shared.expiry_phase(height, registered.expiry) != ExpiryPhase::Serving {
         return Err(ApiError::bad_request("channel is about to expire"));
     }
     let charged = state.operator.serve(&voucher).map_err(ApiError::serve)?;
@@ -797,29 +815,28 @@ async fn settle_registered_channel(
 /// proves nothing about the channel and always retries — abandoning on it
 /// would forfeit vouchers a live channel could still settle.
 ///
+/// Height at which a single-transaction batch (fully or partially) finalized,
+/// or `None` if the submission concluded without including it.
+const fn included_height(status: &TxStatus) -> Option<u64> {
+    match status {
+        TxStatus::Finalized { height } => Some(*height),
+        TxStatus::PartiallyFinalized {
+            height, included, ..
+        } if !included.is_empty() => Some(*height),
+        _ => None,
+    }
+}
+
 /// Returns whether the close finalized.
 async fn submit_close(shared: &Arc<AppShared>, close: Tx, expiry: u64) -> bool {
     let batch = [close];
     loop {
         let definitive = match shared.relayer.submit(&batch).await {
-            Ok(TxStatus::Finalized { height }) => {
-                debug!(height, "operator close finalized");
-                return true;
-            }
-            Ok(TxStatus::PartiallyFinalized {
-                height,
-                included,
-                filtered,
-            }) if !included.is_empty() => {
-                debug!(
-                    height,
-                    included = included.len(),
-                    filtered = filtered.len(),
-                    "operator close partially finalized"
-                );
-                return true;
-            }
             Ok(status) => {
+                if let Some(height) = included_height(&status) {
+                    debug!(height, "operator close finalized");
+                    return true;
+                }
                 warn!(?status, "operator close not finalized, retrying");
                 true
             }
@@ -829,8 +846,8 @@ async fn submit_close(shared: &Arc<AppShared>, close: Tx, expiry: u64) -> bool {
             }
         };
         if definitive
-            && expiry != CHANNEL_NEVER_EXPIRES
-            && shared.height.load(Ordering::Relaxed) > expiry
+            && shared.expiry_phase(shared.height.load(Ordering::Relaxed), expiry)
+                == ExpiryPhase::Expired
         {
             return false;
         }
@@ -979,17 +996,11 @@ async fn resolve_abandoned_close(
     let batch = [burn];
     loop {
         match shared.relayer.submit(&batch).await {
-            Ok(TxStatus::Finalized { height }) => {
-                debug!(height, "abandoned close's nonce burned");
-                return false;
-            }
-            Ok(TxStatus::PartiallyFinalized {
-                height, included, ..
-            }) if !included.is_empty() => {
-                debug!(height, "abandoned close's nonce burned");
-                return false;
-            }
             Ok(status) => {
+                if let Some(height) = included_height(&status) {
+                    debug!(height, "abandoned close's nonce burned");
+                    return false;
+                }
                 warn!(?status, "nonce burn not finalized, retrying");
             }
             Err(error) => {
@@ -998,34 +1009,42 @@ async fn resolve_abandoned_close(
         }
         // The burn stays filtered while the close still owns the nonce (and a
         // finalized burn's acknowledgement can itself be lost to a transport
-        // error), so consult the indexer for whichever actually landed.
-        match shared
-            .verifier
-            .indexer
-            .transaction_metadata::<Sha256>(close_digest)
-            .await
-        {
-            Ok(Some(_)) => {
-                info!("abandoned close finalized after all; settlement complete");
-                return true;
-            }
-            Ok(None) => {}
-            Err(error) => warn!(%error, "close lookup failed while burning its nonce"),
+        // error), so consult the indexer for whichever actually landed. The
+        // lookups are independent round-trips.
+        let (close_landed, burn_landed) = tokio::join!(
+            observed_finalized(shared, close_digest, "close"),
+            observed_finalized(shared, &burn_digest, "burn"),
+        );
+        if close_landed {
+            info!("abandoned close finalized after all; settlement complete");
+            return true;
         }
-        match shared
-            .verifier
-            .indexer
-            .transaction_metadata::<Sha256>(&burn_digest)
-            .await
-        {
-            Ok(Some(_)) => {
-                debug!("abandoned close's nonce burned");
-                return false;
-            }
-            Ok(None) => {}
-            Err(error) => warn!(%error, "burn lookup failed while burning the close's nonce"),
+        if burn_landed {
+            debug!("abandoned close's nonce burned");
+            return false;
         }
         tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+    }
+}
+
+/// Whether the indexer has observed `digest` finalized. Lookup errors are
+/// logged and read as "not yet" — the caller retries.
+async fn observed_finalized(
+    shared: &Arc<AppShared>,
+    digest: &<Sha256 as commonware_cryptography::Hasher>::Digest,
+    what: &'static str,
+) -> bool {
+    match shared
+        .verifier
+        .indexer
+        .transaction_metadata::<Sha256>(digest)
+        .await
+    {
+        Ok(observed) => observed.is_some(),
+        Err(error) => {
+            warn!(%error, what, "transaction lookup failed while resolving abandoned close");
+            false
+        }
     }
 }
 

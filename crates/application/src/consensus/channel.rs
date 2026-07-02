@@ -154,12 +154,11 @@ where
             deposit,
             expiry,
         } => {
-            // Vouchers are Ed25519, so a non-Ed25519 payer could never sign a
-            // voucher the chain accepts at settlement — the deposit would be
-            // locked until withdrawal. Refuse to open such a channel.
-            if !matches!(sender_key, TransactionPublicKey::Ed25519 { .. }) {
-                return None;
-            }
+            // Vouchers are Ed25519 (the same predicate `verify_voucher` uses
+            // at settlement), so a non-Ed25519 payer could never sign a
+            // voucher the chain accepts — the deposit would be locked until
+            // withdrawal. Refuse to open such a channel.
+            sender_key.as_ed25519()?;
             PreparedChannelOpKind::Open {
                 receiver: *receiver,
                 deposit: deposit.get(),
@@ -395,45 +394,20 @@ fn apply_channel_op(
     Some(())
 }
 
-/// Applies a batch of channel operations against block-start state.
+/// Applies a batch of channel operations against block-start state, skipping
+/// any operation that fails instead of rejecting the whole batch.
 ///
-/// Returns the resulting writes (deletions included), or `None` if any
-/// operation is invalid. Like the transfer lane, verification is all or
-/// nothing: a proposed block containing an invalid channel operation is
-/// rejected. Proposers instead build blocks with
-/// [`apply_channel_ops_skipping`], which never includes a failing operation.
-pub(super) async fn apply_channel_ops<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    channel_ops: &[PreparedChannelOp],
-    height: u64,
-) -> Option<ChannelWrites>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    if channel_ops.is_empty() {
-        return Some(Vec::new());
-    }
-
-    let loaded = load_channel_state(batch, channel_ops).await;
-    let mut pending: Pending = AHashMap::new();
-    for op in channel_ops {
-        apply_channel_op(&mut pending, &loaded, op, height)?;
-    }
-
-    Some(pending.into_iter().collect())
-}
-
-/// Applies a batch of channel operations, skipping any operation that fails
-/// instead of rejecting the whole batch.
+/// This is the single execution semantics for the channel lane; whether a
+/// skipped operation is tolerated is the caller's policy. A channel
+/// operation's validity can depend on execution-time state the mempool cannot
+/// screen (a voucher is only checkable against live escrow), so the proposer
+/// uses the flags to drop failing operations from the body — one bad operation
+/// cannot poison an entire proposal — while verification rejects any block
+/// whose flags are not all set (see `execution::execute_lanes`). Verifiers
+/// therefore re-execute exactly the applied sequence the proposer kept.
 ///
-/// A channel operation's validity can depend on execution-time state the
-/// mempool cannot screen (a voucher is only checkable against live escrow), so
-/// the proposer uses this variant to keep one bad operation from poisoning an
-/// entire proposal. Returns the writes plus one applied/skipped flag per
-/// operation; the proposer drops skipped operations from the body, so verifiers
-/// re-execute exactly the applied sequence.
+/// Returns the resulting writes (deletions included) plus one applied/skipped
+/// flag per operation.
 pub(super) async fn apply_channel_ops_skipping<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     channel_ops: &[PreparedChannelOp],

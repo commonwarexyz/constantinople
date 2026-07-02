@@ -78,6 +78,21 @@ impl TxKind {
     }
 }
 
+/// The single exhaustive `Operation` -> [`TxKind`] mapping: a new operation
+/// variant fails to compile here until it is assigned a kind (and a number in
+/// [`TxKind::as_u64`] above).
+impl From<&constantinople_primitives::Operation> for TxKind {
+    fn from(op: &constantinople_primitives::Operation) -> Self {
+        use constantinople_primitives::Operation;
+        match op {
+            Operation::Transfer { .. } => Self::Transfer,
+            Operation::OpenChannel { .. } => Self::ChannelOpen,
+            Operation::CloseChannel { .. } => Self::ChannelClose,
+            Operation::TimeoutChannel { .. } => Self::ChannelTimeout,
+        }
+    }
+}
+
 /// Account-ordered transaction activity row.
 pub(crate) struct TxActivityRow {
     pub account: [u8; 32],

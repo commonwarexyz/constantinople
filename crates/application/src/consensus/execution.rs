@@ -224,12 +224,41 @@ fn lanes_conflict(transfers: &db::StateWrites, channel_ops: &ChannelWrites) -> b
         .any(|(key, _)| channel_keys.contains(key))
 }
 
-/// Runs both lanes against block-start state and returns their writes.
+/// Runs both lanes concurrently against block-start state.
 ///
 /// `height` is the height of the block being executed (channel timeouts are
-/// gated on it). Returns `None` if either lane rejects the batch, or if the
+/// gated on it). Returns `None` if the transfer lane rejects the batch or the
 /// two lanes write the same account in one block (which would race on a single
-/// key).
+/// key). Channel-op failures are reported per-op in the returned flags; the
+/// caller sets the policy — proposers drop skipped ops from the body,
+/// verification rejects the block (see [`execute_lanes`]).
+async fn execute_lanes_skipping<E, H, S>(
+    batch: &StateBatch<E, H, EightCap, S>,
+    strategy: &S,
+    transfers: &[PreparedTransfer],
+    channel_ops: &[PreparedChannelOp],
+    height: u64,
+) -> Option<(db::StateWrites, ChannelWrites, Vec<bool>)>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    // Both lanes only read block-start state, so their state loads overlap.
+    let (transfer_writes, (channel_writes, applied)) = futures::join!(
+        compute(batch, strategy, transfers),
+        channel::apply_channel_ops_skipping(batch, channel_ops, height),
+    );
+    let transfer_writes = transfer_writes?;
+    if lanes_conflict(&transfer_writes, &channel_writes) {
+        return None;
+    }
+    Some((transfer_writes, channel_writes, applied))
+}
+
+/// Runs both lanes all or nothing: any skipped channel operation rejects the
+/// whole batch. Used by verification and certified apply, so a proposed block
+/// containing an invalid channel operation is rejected.
 async fn execute_lanes<E, H, S>(
     batch: &StateBatch<E, H, EightCap, S>,
     strategy: &S,
@@ -241,12 +270,18 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let transfer_writes = compute(batch, strategy, &prepared.transfers).await?;
-    let channel_writes = channel::apply_channel_ops(batch, &prepared.channel_ops, height).await?;
-    if lanes_conflict(&transfer_writes, &channel_writes) {
-        return None;
-    }
-    Some((transfer_writes, channel_writes))
+    let (transfer_writes, channel_writes, applied) = execute_lanes_skipping(
+        batch,
+        strategy,
+        &prepared.transfers,
+        &prepared.channel_ops,
+        height,
+    )
+    .await?;
+    applied
+        .iter()
+        .all(|&applied| applied)
+        .then_some((transfer_writes, channel_writes))
 }
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -559,13 +594,6 @@ fn initialized_copy_vec<T: Copy>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
     unsafe { Vec::from_raw_parts(ptr, len, capacity) }
 }
 
-/// Which lane a proposal candidate routed to, for post-execution filtering.
-enum ProposalLane {
-    Transfer,
-    /// Index into the prepared channel-op vector.
-    Channel(usize),
-}
-
 /// Prepares and executes proposal candidates, dropping invalid ones where the
 /// lane allows it.
 ///
@@ -594,41 +622,41 @@ where
 {
     let items = strategy.map_collect_vec(transactions.iter(), |tx| prepare_item(tx));
 
-    // Route each candidate to its lane, remembering the routing (`None` drops
-    // the transaction) so skipped channel ops can be filtered from the body.
+    // Route each candidate to its lane, remembering per candidate whether it
+    // routed to the channel lane (`None` drops the transaction) so skipped
+    // channel ops can be filtered from the body afterwards.
     let mut transfers = Vec::with_capacity(items.len());
     let mut channel_ops = Vec::new();
     let mut routes = Vec::with_capacity(items.len());
     for item in items {
         routes.push(item.map(|(item, digest)| {
-            let lane = match item {
+            let is_channel = match item {
                 PreparedItem::Transfer(transfer) => {
                     transfers.push(transfer);
-                    ProposalLane::Transfer
+                    false
                 }
                 PreparedItem::ChannelOp(op) => {
                     channel_ops.push(*op);
-                    ProposalLane::Channel(channel_ops.len() - 1)
+                    true
                 }
             };
-            (lane, digest)
+            (is_channel, digest)
         }));
     }
 
-    let transfer_writes = compute(batch, strategy, &transfers).await?;
-    let (channel_writes, applied) =
-        channel::apply_channel_ops_skipping(batch, &channel_ops, height).await;
-    if lanes_conflict(&transfer_writes, &channel_writes) {
-        return None;
-    }
+    let (transfer_writes, channel_writes, applied) =
+        execute_lanes_skipping(batch, strategy, &transfers, &channel_ops, height).await?;
 
+    // Rebuild the body, walking the applied flags in the same block order the
+    // channel ops were routed in.
     let mut body = Vec::with_capacity(transactions.len());
     let mut digests = Vec::with_capacity(transactions.len());
+    let mut applied = applied.into_iter();
     for (tx, route) in transactions.into_iter().zip(routes) {
-        let Some((lane, digest)) = route else {
+        let Some((is_channel, digest)) = route else {
             continue;
         };
-        if matches!(lane, ProposalLane::Channel(index) if !applied[index]) {
+        if is_channel && !applied.next().expect("one flag per channel op") {
             continue;
         }
         body.push(tx);

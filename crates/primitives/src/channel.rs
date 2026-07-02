@@ -121,11 +121,9 @@ impl Voucher {
 mod tests {
     use super::*;
     use commonware_cryptography::{Signer as _, ed25519};
-    use commonware_math::algebra::Random as _;
-    use rand::{SeedableRng, rngs::StdRng};
 
-    fn payer_key(seed: u8) -> ed25519::PrivateKey {
-        ed25519::PrivateKey::random(&mut StdRng::from_seed([seed; 32]))
+    fn payer_key(seed: u64) -> ed25519::PrivateKey {
+        ed25519::PrivateKey::from_seed(seed)
     }
 
     #[test]
