@@ -152,8 +152,8 @@ where
             .expect("queued finalized upload stores a validated transaction cursor")
     }
 
-    pub fn block(&self) -> &EngineBlock<H, P> {
-        self.block.as_ref()
+    pub fn block(&self) -> Arc<EngineBlock<H, P>> {
+        Arc::clone(&self.block)
     }
 }
 
@@ -452,8 +452,8 @@ where
         let state_end = block.header.state_range.end();
         validate_writer_range(state_writer_next, state_end, block.header.height)?;
         transaction_upload_end(transaction_writer_next, block)?;
-        let block = block.clone();
-        let state_block = block.clone();
+        let block = Arc::new(block.clone());
+        let state_block = Arc::clone(&block);
         let state_db = databases.0.clone();
         let state_delta = context
             .child("state_delta")
@@ -465,7 +465,7 @@ where
             .expect("QMDB state queue task exited")?;
 
         Ok(QueuedFinalizedUpload {
-            block: Arc::new(block),
+            block,
             finalized_ts_micros: current_time_micros(),
             state_start: state_writer_next,
             transaction_start: transaction_writer_next,

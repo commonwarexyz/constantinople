@@ -578,8 +578,9 @@ fn encode_pending(batch: &DecodedBatch, pending: &HashSet<String>) -> Bytes {
     batch
         .transactions
         .iter()
-        .filter(|transaction| pending.contains(&transaction.message_digest().to_string()))
-        .cloned()
+        .zip(&batch.digests)
+        .filter(|(_, digest)| pending.contains(*digest))
+        .map(|(transaction, _)| transaction)
         .collect::<Vec<_>>()
         .encode()
 }

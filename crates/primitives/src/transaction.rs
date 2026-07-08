@@ -89,6 +89,26 @@ where
     }
 }
 
+// Encoding borrowed transactions lets collections like `Vec<&SignedTransaction>`
+// encode without cloning each transaction first.
+impl<H> Write for &SignedTransaction<H>
+where
+    H: Hasher,
+{
+    fn write(&self, buf: &mut impl BufMut) {
+        (**self).write(buf);
+    }
+}
+
+impl<H> EncodeSize for &SignedTransaction<H>
+where
+    H: Hasher,
+{
+    fn encode_size(&self) -> usize {
+        (**self).encode_size()
+    }
+}
+
 impl<H> Read for SignedTransaction<H>
 where
     H: Hasher,

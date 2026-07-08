@@ -7,6 +7,7 @@ use crate::publisher::{
         encode_tx_activity_row, encode_tx_meta_row,
     },
 };
+use bytes::Bytes;
 use commonware_codec::FixedSize;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_engine::types::EngineBlock;
@@ -27,7 +28,7 @@ pub(crate) struct IndexedBlockRows<D: Digest> {
 struct IndexedTransaction<D: Digest> {
     block_index: usize,
     digest: D,
-    bytes: Vec<u8>,
+    bytes: Bytes,
     sender: AccountKey,
     to: [u8; AccountKey::SIZE],
     value: u64,
@@ -202,7 +203,7 @@ where
     Some(IndexedTransaction {
         block_index,
         digest: hasher.finalize(),
-        bytes: signed_bytes.to_vec(),
+        bytes: signed_bytes,
         sender,
         to,
         value,

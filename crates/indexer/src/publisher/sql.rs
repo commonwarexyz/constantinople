@@ -1,6 +1,7 @@
 //! SQL row encoding shared by the combined publisher.
 
 use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
+use bytes::Bytes;
 use exoware_sql::CellValue;
 
 /// One row destined for a SQL metadata table.
@@ -28,7 +29,7 @@ pub(crate) struct BlockMetaRow {
 pub(crate) struct TxMetaRow {
     pub digest: [u8; 32],
     pub qmdb_location: u64,
-    pub body: Vec<u8>,
+    pub body: Bytes,
 }
 
 /// Transaction activity role stored in `tx_activity`.

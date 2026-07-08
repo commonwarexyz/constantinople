@@ -232,6 +232,19 @@ where
             .as_ref()
     }
 
+    /// Consumes the lazy transaction, returning the decoded value if decoding
+    /// succeeds.
+    ///
+    /// Moves the cached value out when this handle is its only owner; clones
+    /// only when the decoded value is still shared with another handle.
+    pub fn into_value(self) -> Option<SignedTransaction<H>> {
+        self.get()?;
+        match Arc::try_unwrap(self.value) {
+            Ok(value) => value.into_inner().flatten(),
+            Err(shared) => shared.get().expect("value was forced above").clone(),
+        }
+    }
+
     /// Returns the encoded signed transaction bytes without the lazy length prefix.
     ///
     /// If this value came from block decoding, this clones the deferred bytes and
@@ -341,7 +354,7 @@ where
     St: Strategy,
 {
     strategy
-        .map_collect_vec(transactions, |lazy| lazy.get().cloned())
+        .map_collect_vec(transactions, LazySignedTransaction::into_value)
         .into_iter()
         .collect()
 }
@@ -503,7 +516,7 @@ where
     // Each lazy was forced during verification above, so materialization cannot fail here.
     transactions
         .into_iter()
-        .map(|lazy| lazy.get().cloned())
+        .map(LazySignedTransaction::into_value)
         .collect()
 }
 
