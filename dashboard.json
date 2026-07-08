@@ -4887,7 +4887,7 @@
           },
           "direction": "backward",
           "editorMode": "builder",
-          "expr": "{deployer_arch=\"arm64\"} | json",
+          "expr": "{deployer_name=~\"$Validator\"} | json",
           "queryType": "range",
           "refId": "A"
         }
