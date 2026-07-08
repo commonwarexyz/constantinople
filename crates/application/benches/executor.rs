@@ -9,6 +9,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rand::{SeedableRng, rngs::StdRng};
 use std::hint::black_box;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
 type Transfers = Vec<PreparedTransfer>;
