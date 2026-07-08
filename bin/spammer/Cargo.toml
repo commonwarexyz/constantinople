@@ -30,6 +30,7 @@ commonware-utils.workspace = true
 ahash.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 bytes.workspace = true
+mimalloc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["full"] }

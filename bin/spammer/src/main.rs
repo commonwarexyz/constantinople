@@ -29,6 +29,9 @@ use submitter::{RelayerSubmitter, Stats};
 use tokio::sync::mpsc;
 use tracing::info;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 fn main() {
     let cli = Cli::parse();
 

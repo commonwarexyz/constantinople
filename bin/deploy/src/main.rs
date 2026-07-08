@@ -27,6 +27,9 @@ use std::{
 use tracing::Level;
 use tracing_subscriber::fmt;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const STORAGE_CLASS: &str = "gp3";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;

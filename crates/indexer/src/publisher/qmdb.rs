@@ -116,11 +116,11 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    block: EngineBlock<H, P>,
+    block: Arc<EngineBlock<H, P>>,
     finalized_ts_micros: i64,
     state_start: u64,
     transaction_start: u64,
-    state_delta: Vec<StateOperation>,
+    state_delta: Arc<Vec<StateOperation>>,
 }
 
 impl<H, P> QueuedFinalizedUpload<H, P>
@@ -149,8 +149,8 @@ where
             .expect("queued finalized upload stores a validated transaction cursor")
     }
 
-    pub const fn block(&self) -> &EngineBlock<H, P> {
-        &self.block
+    pub fn block(&self) -> Arc<EngineBlock<H, P>> {
+        Arc::clone(&self.block)
     }
 }
 
@@ -197,11 +197,11 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
-            block: EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?,
+            block: Arc::new(EngineBlock::<H, P>::read_cfg(buf, &cfg.block)?),
             finalized_ts_micros: i64::read(buf)?,
             state_start: u64::read(buf)?,
             transaction_start: u64::read(buf)?,
-            state_delta: Vec::<StateOperation>::read_cfg(buf, &(cfg.state_ops, ()))?,
+            state_delta: Arc::new(Vec::<StateOperation>::read_cfg(buf, &(cfg.state_ops, ()))?),
         })
     }
 }
@@ -254,7 +254,7 @@ where
 {
     height: u64,
     block_rows: IndexedBlockRows<H::Digest>,
-    state_delta: Vec<StateOperation>,
+    state_delta: Arc<Vec<StateOperation>>,
     account_rows: Vec<super::SqlRow>,
     transaction_ops: Vec<TransactionOperation<H>>,
     completion: oneshot::Sender<()>,
@@ -450,8 +450,8 @@ where
         let state_end = block.header.state_range.end();
         validate_writer_range(state_writer_next, state_end, block.header.height)?;
         transaction_upload_end(transaction_writer_next, block)?;
-        let block = block.clone();
-        let state_block = block.clone();
+        let block = Arc::new(block.clone());
+        let state_block = Arc::clone(&block);
         let state_db = databases.0.clone();
         let state_delta = context
             .child("state_delta")
@@ -467,7 +467,7 @@ where
             finalized_ts_micros: current_time_micros(),
             state_start: state_writer_next,
             transaction_start: transaction_writer_next,
-            state_delta,
+            state_delta: Arc::new(state_delta),
         })
     }
 
@@ -2450,11 +2450,11 @@ mod tests {
         ];
 
         QueuedFinalizedUpload {
-            block,
+            block: Arc::new(block),
             finalized_ts_micros: 1_000,
             state_start: 0,
             transaction_start: 0,
-            state_delta,
+            state_delta: Arc::new(state_delta),
         }
     }
 }

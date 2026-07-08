@@ -19,7 +19,7 @@ use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
 use tracing::{debug, warn};
 
@@ -59,12 +59,12 @@ where
 
     /// Queue a finalized block for digest-addressed block upload and later
     /// certificate pairing.
-    pub async fn publish_block(&self, block: &EngineBlock<H, P>)
+    pub async fn publish_block(&self, block: Arc<EngineBlock<H, P>>)
     where
         H: Hasher,
         P: PublicKey,
     {
-        let _ = self.tx.send(SimplexInput::Block(block.clone())).await;
+        let _ = self.tx.send(SimplexInput::Block(block)).await;
     }
 }
 
@@ -127,7 +127,7 @@ where
     P: PublicKey,
     S: Scheme,
 {
-    Block(EngineBlock<H, P>),
+    Block(Arc<EngineBlock<H, P>>),
     Notarization(simplex::types::Notarization<S, Commitment>),
     Finalization(simplex::types::Finalization<S, Commitment>),
 }
@@ -138,7 +138,7 @@ where
     P: PublicKey,
     S: Scheme,
 {
-    block: Option<EngineBlock<H, P>>,
+    block: Option<Arc<EngineBlock<H, P>>>,
     notarization: Option<simplex::types::Notarization<S, Commitment>>,
     finalization: Option<simplex::types::Finalization<S, Commitment>>,
 }
@@ -243,13 +243,13 @@ where
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send + Sync,
 {
-    let Some(block) = entry.block.clone() else {
+    let Some(block) = entry.block.as_deref() else {
         return false;
     };
     let mut prepared = PreparedUpload::new();
 
     if let Some(notarization) = entry.notarization.take() {
-        let certified = CertifiedHeader::new(notarization.proposal.payload, block.clone());
+        let certified = CertifiedHeader::new(notarization.proposal.payload, block);
         let notarized =
             Notarized::new(notarization, certified).expect("notarization matches certified header");
         prepared.extend(
@@ -334,7 +334,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    fn new(commitment: Commitment, block: EngineBlock<H, P>) -> Self {
+    fn new(commitment: Commitment, block: &EngineBlock<H, P>) -> Self {
         debug_assert_eq!(commitment.block::<H::Digest>(), *block.seal());
         let header = EngineHeader::<H, P>::new_unchecked(block.header.clone(), *block.seal());
         Self { commitment, header }
