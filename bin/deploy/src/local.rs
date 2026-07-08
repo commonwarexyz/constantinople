@@ -302,11 +302,16 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
+        let db_parallelism = local
+            .chain_indexer_db_parallelism
+            .map(|jobs| format!(" --db-parallelism {jobs}"))
+            .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
+            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             data_dir.display(),
+            db_parallelism,
         ));
         // `metadata-indexer`: exposes Constantinople's `block_meta` /
         // `tx_meta` tables over `store.sql.v1.Service`. The explorer
@@ -415,6 +420,7 @@ mod tests {
             base_http_port: 8080,
             base_metrics_port: 9090,
             chain_indexer_port: 8090,
+            chain_indexer_db_parallelism: None,
             metadata_indexer_port: 8091,
             qmdb_indexer_port: 8092,
         }

@@ -292,6 +292,7 @@ fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<Chai
     indexer_enabled(args).then(|| ChainIndexerConfig {
         port: remote.chain_indexer_port,
         data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
+        db_parallelism: remote.chain_indexer_db_parallelism,
     })
 }
 
@@ -518,6 +519,7 @@ mod tests {
                 base_http_port: 8080,
                 base_metrics_port: 9090,
                 chain_indexer_port: 8090,
+                chain_indexer_db_parallelism: None,
                 metadata_indexer_port: 8091,
                 qmdb_indexer_port: 8092,
             }),
@@ -539,6 +541,7 @@ mod tests {
             http_port: 8080,
             http_cidrs: vec!["198.51.100.4/32".to_string()],
             chain_indexer_port: 8090,
+            chain_indexer_db_parallelism: None,
             metadata_indexer_port: 8091,
             qmdb_indexer_port: 8092,
             profiling: true,

@@ -171,6 +171,10 @@ pub(crate) struct LocalArgs {
     /// Local `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
+    /// RocksDB parallelism for the local `chain-indexer` store. Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[arg(long = "chain-indexer-db-parallelism")]
+    chain_indexer_db_parallelism: Option<i32>,
     /// Local `metadata-indexer` read-service port.
     /// The explorer reads from this port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
@@ -221,6 +225,10 @@ pub(crate) struct RemoteArgs {
     /// Shared `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
+    /// RocksDB parallelism for the shared `chain-indexer` store. Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[arg(long = "chain-indexer-db-parallelism")]
+    chain_indexer_db_parallelism: Option<i32>,
     /// Shared `metadata-indexer` query/stream port.
     #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
@@ -399,6 +407,10 @@ pub(crate) struct ChainIndexerConfig {
     pub port: u16,
     /// Directory for chain-indexer data.
     pub data_dir: PathBuf,
+    /// RocksDB parallelism (background compaction/flush jobs). Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_parallelism: Option<i32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

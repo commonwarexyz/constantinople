@@ -24,7 +24,6 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const ROCKS_BACKGROUND_JOBS: i32 = 16;
 const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
 const ROCKS_WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
 const ROCKS_DB_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024 * 1024;
@@ -70,12 +69,20 @@ struct Cli {
     /// Path to the deployer-provided chain-indexer config YAML.
     #[arg(long, requires = "hosts", conflicts_with = "data_dir")]
     config: Option<PathBuf>,
+
+    /// RocksDB parallelism (background compaction/flush jobs). Leaves
+    /// RocksDB's stock parallelism when omitted.
+    #[arg(long, conflicts_with_all = ["hosts", "config"])]
+    db_parallelism: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DeployerConfig {
     port: u16,
     data_dir: PathBuf,
+    /// Leaves RocksDB's stock parallelism when omitted.
+    #[serde(default)]
+    db_parallelism: Option<i32>,
 }
 
 fn load_deployer_config(path: &Path) -> DeployerConfig {
@@ -94,16 +101,21 @@ fn resolve_data_dir(config_path: &Path, data_dir: PathBuf) -> PathBuf {
         .join(data_dir)
 }
 
-fn load_settings(cli: Cli) -> (PathBuf, u16) {
+fn load_settings(cli: Cli) -> (PathBuf, u16, Option<i32>) {
     if let Some(config_path) = cli.config {
         let config = load_deployer_config(&config_path);
-        return (resolve_data_dir(&config_path, config.data_dir), config.port);
+        return (
+            resolve_data_dir(&config_path, config.data_dir),
+            config.port,
+            config.db_parallelism,
+        );
     }
 
     (
         cli.data_dir
             .expect("clap should require --data-dir or --hosts"),
         cli.port,
+        cli.db_parallelism,
     )
 }
 
@@ -120,11 +132,17 @@ fn block_based_options(block_cache: &Cache) -> BlockBasedOptions {
     opts
 }
 
-fn write_heavy_options(block_cache: &Cache, blob_cache: &Cache) -> Options {
+fn write_heavy_options(
+    db_parallelism: Option<i32>,
+    block_cache: &Cache,
+    blob_cache: &Cache,
+) -> Options {
     let mut opts = Options::default();
     let block_opts = block_based_options(block_cache);
-    opts.increase_parallelism(ROCKS_BACKGROUND_JOBS);
-    opts.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
+    if let Some(jobs) = db_parallelism {
+        opts.increase_parallelism(jobs);
+        opts.set_max_background_jobs(jobs);
+    }
     opts.set_max_subcompactions(ROCKS_MAX_SUBCOMPACTIONS);
     opts.set_block_based_table_factory(&block_opts);
     opts.optimize_universal_style_compaction(ROCKS_MEMTABLE_MEMORY_BUDGET);
@@ -155,15 +173,12 @@ fn write_heavy_options(block_cache: &Cache, blob_cache: &Cache) -> Options {
     opts
 }
 
-fn chain_indexer_rocks_config() -> RocksConfig {
+fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
     let block_cache = Cache::new_lru_cache(ROCKS_BLOCK_CACHE_SIZE);
     let blob_cache = Cache::new_lru_cache(ROCKS_BLOB_CACHE_SIZE);
 
     RocksConfig {
-        db_options: write_heavy_options(&block_cache, &blob_cache),
-        default_cf_options: write_heavy_options(&block_cache, &blob_cache),
-        meta_cf_options: Options::default(),
-        log_cf_options: write_heavy_options(&block_cache, &blob_cache),
+        db_options: write_heavy_options(db_parallelism, &block_cache, &blob_cache),
         write_pipeline: RocksWritePipelineConfig {
             max_commit_batch_bytes: NonZeroUsize::new(ROCKS_MAX_COMMIT_BATCH_BYTES)
                 .expect("rocks write commit batch byte limit must be nonzero"),
@@ -171,10 +186,14 @@ fn chain_indexer_rocks_config() -> RocksConfig {
     }
 }
 
-async fn run(data_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run(
+    data_dir: &Path,
+    port: u16,
+    db_parallelism: Option<i32>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let engine = Arc::new(RocksStore::open(
         data_dir,
-        Some(chain_indexer_rocks_config()),
+        Some(chain_indexer_rocks_config(db_parallelism)),
     )?);
     let connect = connect_stack(AppState::new(engine));
     let app = Router::new()
@@ -191,7 +210,7 @@ async fn run(data_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error
 
 fn main() {
     let cli = Cli::parse();
-    let (data_dir, port) = load_settings(cli);
+    let (data_dir, port, db_parallelism) = load_settings(cli);
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -204,7 +223,7 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async move {
-        if let Err(error) = run(&data_dir, port).await {
+        if let Err(error) = run(&data_dir, port, db_parallelism).await {
             eprintln!("chain-indexer exited with error: {error}");
             std::process::exit(1);
         }
@@ -277,9 +296,10 @@ mod tests {
         ])
         .expect("deployer invocation should parse");
 
-        let (data_dir, port) = load_settings(cli);
+        let (data_dir, port, db_parallelism) = load_settings(cli);
 
         assert_eq!(port, 18_090);
+        assert_eq!(db_parallelism, None);
         assert_eq!(
             data_dir,
             config_path.parent().unwrap().join("chain-indexer")

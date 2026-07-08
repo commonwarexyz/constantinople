@@ -63,7 +63,6 @@ commonware-math.workspace = true
 criterion.workspace = true
 rand.workspace = true
 rand_core.workspace = true
-tempfile = "3"
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 

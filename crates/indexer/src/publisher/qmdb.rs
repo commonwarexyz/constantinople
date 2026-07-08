@@ -1733,8 +1733,7 @@ mod tests {
     #[test]
     fn grouped_watermark_flush_completes_multiple_uploads() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
@@ -1847,8 +1846,7 @@ mod tests {
     #[test]
     fn out_of_order_store_commits_do_not_publish_past_prefix_holes() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
@@ -1970,8 +1968,7 @@ mod tests {
     #[test]
     fn queued_upload_completes_through_publisher() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
@@ -1996,8 +1993,7 @@ mod tests {
     #[test]
     fn queued_upload_roots_match_application_roots() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let client = StoreClient::new(&url);
@@ -2085,8 +2081,7 @@ mod tests {
     #[test]
     fn qmdb_publisher_shutdown_joins_background_workers() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let dir = tempfile::TempDir::new().expect("tempdir");
-            let (handle, url) = exoware_simulator::spawn_for_test(dir.path())
+            let (handle, url) = exoware_simulator::open_temp()
                 .await
                 .expect("spawn simulator");
             let publisher = Publisher::<
