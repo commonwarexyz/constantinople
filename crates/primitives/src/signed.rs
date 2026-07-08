@@ -430,11 +430,12 @@ where
         return true;
     }
 
-    // Queueing is cheap: transactions are preloaded and sender keys resolve
-    // through the decompression cache. The expensive per-signature challenge
-    // hashing and the serial-vs-parallel split happen inside `verify`, which
-    // shards the batch across `signature_strategy` internally.
-    let mut verifier = TransactionBatchVerifier::new(transactions.len());
+    // Resolve every sender's decompressed key on the strategy: cache hits
+    // share the read lock, and misses pay their curve decompression in
+    // parallel instead of serially in the queueing loop below. When the
+    // active account set exceeds the cache capacity, misses dominate and
+    // would otherwise stall the batch on one thread.
+    let mut senders = Vec::with_capacity(transactions.len());
     for lazy in transactions {
         let Some(transaction) = lazy.get() else {
             return false;
@@ -442,12 +443,26 @@ where
         let Some(sender) = transaction.value().sender() else {
             return false;
         };
+        senders.push(sender);
+    }
+    let Some(keys) = cache.decompress(&senders, signature_strategy) else {
+        return false;
+    };
+
+    // Queueing is cheap: transactions are preloaded and sender keys were
+    // resolved above. The expensive per-signature challenge hashing and the
+    // serial-vs-parallel split happen inside `verify`, which shards the batch
+    // across `signature_strategy` internally.
+    let mut verifier = TransactionBatchVerifier::new(transactions.len());
+    for (lazy, key) in transactions.iter().zip(&keys) {
+        let Some(transaction) = lazy.get() else {
+            return false;
+        };
         if !verifier.add(
             namespace,
             transaction.message_digest().as_ref(),
-            sender,
+            key,
             transaction.signature(),
-            cache,
         ) {
             return false;
         }
@@ -589,19 +604,20 @@ mod test {
 
             assert_eq!(signed.value().sender(), Some(&public_key));
 
+            let sender = signed
+                .value()
+                .sender()
+                .expect("signed sender should decode");
+            let keys = cache
+                .decompress(&[sender], &Sequential)
+                .expect("valid sender key");
             let mut verifier = TransactionBatchVerifier::new(1);
-            assert!(
-                verifier.add(
-                    NAMESPACE,
-                    signed.message_digest().as_ref(),
-                    signed
-                        .value()
-                        .sender()
-                        .expect("signed sender should decode"),
-                    signed.signature(),
-                    &cache,
-                )
-            );
+            assert!(verifier.add(
+                NAMESPACE,
+                signed.message_digest().as_ref(),
+                &keys[0],
+                signed.signature(),
+            ));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
         });
     }

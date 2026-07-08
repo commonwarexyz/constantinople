@@ -25,6 +25,7 @@ commonware-runtime.workspace = true
 # Other
 bytes.workspace = true
 p256.workspace = true
+tracing.workspace = true
 rand = { workspace = true, features = ["std_rng"] }
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 derive_more = { workspace = true, features = ["full"] }

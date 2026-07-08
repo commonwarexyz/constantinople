@@ -3,14 +3,21 @@
 use crate::TransactionPublicKey;
 use commonware_codec::{FixedSize as _, ReadExt as _};
 use commonware_cryptography::{ed25519, secp256r1::standard as secp256r1};
+use commonware_parallel::Strategy;
 use commonware_runtime::{
     Metrics,
-    telemetry::metrics::{Counter, MetricsExt as _},
+    telemetry::{
+        metrics::{Counter, MetricsExt as _},
+        traces::TracedExt as _,
+    },
 };
 use commonware_utils::{cache::Clock, sync::RwLock};
 use core::num::NonZeroUsize;
 use p256::ecdsa::VerifyingKey;
-use std::sync::Arc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
+};
 
 /// A public key decompressed into the form used by signature verification.
 ///
@@ -43,21 +50,56 @@ impl PublicKeyCache {
         }
     }
 
-    /// Returns the decompressed key for `key`, computing and caching it on a
-    /// miss. Returns `None` if `key` does not encode a valid curve point.
-    pub fn decompress(&self, key: &TransactionPublicKey) -> Option<DecompressedPublicKey> {
-        if let Some(decompressed) = self.inner.read().get(key).cloned() {
-            return Some(decompressed);
+    /// Resolves every key in `keys` to its decompressed form: hits share the
+    /// read lock, misses are decompressed on `strategy` and inserted under a
+    /// single write lock, so a miss-heavy batch pays neither serial curve
+    /// arithmetic nor per-key lock traffic.
+    ///
+    /// Returns `None` if any key does not encode a valid curve point.
+    pub fn decompress(
+        &self,
+        keys: &[&TransactionPublicKey],
+        strategy: &impl Strategy,
+    ) -> Option<Vec<DecompressedPublicKey>> {
+        let span = tracing::info_span!(
+            "primitives.public_key_cache.decompress",
+            keys = keys.len().traced(),
+            misses = tracing::field::Empty,
+        );
+        let _guard = span.enter();
+
+        let missed = AtomicU64::new(0);
+        let resolved: Vec<(DecompressedPublicKey, bool)> = strategy
+            .try_map_collect_vec(keys, |&key| {
+                if let Some(hit) = self.inner.read().get(key).cloned() {
+                    return Ok((hit, false));
+                }
+                let decompressed = Self::decompress_uncached(key).ok_or(())?;
+                missed.fetch_add(1, Ordering::Relaxed);
+                Ok::<_, ()>((decompressed, true))
+            })
+            .ok()?;
+
+        // Insert all misses under one write lock; a pure-hit batch never
+        // takes it.
+        let missed = missed.into_inner();
+        span.record("misses", missed.traced());
+        if missed > 0 {
+            self.misses.inc_by(missed);
+            let mut cache = self.inner.write();
+            for (key, (decompressed, miss)) in keys.iter().zip(&resolved) {
+                if *miss {
+                    cache.put((*key).clone(), decompressed.clone());
+                }
+            }
         }
 
-        // The hit path takes only a shared read lock, so concurrent verification
-        // shards look keys up in parallel. The read lock is released before the
-        // caller uses the returned key, so the expensive per-signature work never
-        // runs under the lock.
-        let decompressed = Self::decompress_uncached(key)?;
-        self.misses.inc();
-        self.inner.write().put(key.clone(), decompressed.clone());
-        Some(decompressed)
+        Some(
+            resolved
+                .into_iter()
+                .map(|(decompressed, _)| decompressed)
+                .collect(),
+        )
     }
 
     /// Decompresses `key` without consulting or populating the cache.
@@ -106,6 +148,15 @@ mod tests {
     use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
     use commonware_utils::{NZUsize, test_rng};
 
+    fn decompress_one(
+        cache: &PublicKeyCache,
+        key: &TransactionPublicKey,
+    ) -> Option<DecompressedPublicKey> {
+        cache
+            .decompress(&[key], &commonware_parallel::Sequential)
+            .map(|mut keys| keys.remove(0))
+    }
+
     fn ed25519_key(seed: u64) -> TransactionPublicKey {
         let mut rng = test_rng();
         for _ in 0..seed {
@@ -130,7 +181,7 @@ mod tests {
             assert!(cache.is_empty());
 
             let DecompressedPublicKey::Ed25519(decompressed) =
-                cache.decompress(&key).expect("valid key decompresses")
+                decompress_one(&cache, &key).expect("valid key decompresses")
             else {
                 panic!("ed25519 key should decompress to ed25519");
             };
@@ -142,7 +193,7 @@ mod tests {
             assert!(cache.contains(&key));
 
             // Hit path: no growth.
-            assert!(cache.decompress(&key).is_some());
+            assert!(decompress_one(&cache, &key).is_some());
             assert_eq!(cache.len(), 1);
         });
     }
@@ -154,7 +205,7 @@ mod tests {
             let key = secp256r1_key(0);
 
             let DecompressedPublicKey::Secp256r1(decompressed) =
-                cache.decompress(&key).expect("valid key decompresses")
+                decompress_one(&cache, &key).expect("valid key decompresses")
             else {
                 panic!("secp256r1 key should decompress to secp256r1");
             };
@@ -165,7 +216,7 @@ mod tests {
             assert_eq!(cache.len(), 1);
             assert!(cache.contains(&key));
 
-            assert!(cache.decompress(&key).is_some());
+            assert!(decompress_one(&cache, &key).is_some());
             assert_eq!(cache.len(), 1);
         });
     }
@@ -178,11 +229,11 @@ mod tests {
             let r1 = secp256r1_key(0);
 
             assert!(matches!(
-                cache.decompress(&ed),
+                decompress_one(&cache, &ed),
                 Some(DecompressedPublicKey::Ed25519(_))
             ));
             assert!(matches!(
-                cache.decompress(&r1),
+                decompress_one(&cache, &r1),
                 Some(DecompressedPublicKey::Secp256r1(_))
             ));
             assert_eq!(cache.len(), 2);
@@ -199,8 +250,8 @@ mod tests {
             let key_b = ed25519_key(1);
             assert_ne!(key_a, key_b);
 
-            assert!(cache.decompress(&key_a).is_some());
-            assert!(cache.decompress(&key_b).is_some());
+            assert!(decompress_one(&cache, &key_a).is_some());
+            assert!(decompress_one(&cache, &key_b).is_some());
             assert_eq!(cache.len(), 1);
             assert!(cache.contains(&key_b));
             assert!(!cache.contains(&key_a));
@@ -225,7 +276,7 @@ mod tests {
                 .expect("decode no longer validates the point");
             assert_eq!(encoded.len(), TransactionPublicKey::SIZE);
 
-            assert!(cache.decompress(&key).is_none());
+            assert!(decompress_one(&cache, &key).is_none());
             assert!(cache.is_empty());
         });
     }
@@ -235,9 +286,9 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(4));
             let key = ed25519_key(0);
-            assert!(cache.decompress(&key).is_some()); // miss
-            assert!(cache.decompress(&key).is_some()); // hit (not counted)
-            assert!(cache.decompress(&key).is_some()); // hit (not counted)
+            assert!(decompress_one(&cache, &key).is_some()); // miss
+            assert!(decompress_one(&cache, &key).is_some()); // hit (not counted)
+            assert!(decompress_one(&cache, &key).is_some()); // hit (not counted)
 
             let encoded = context.encode();
             assert!(
