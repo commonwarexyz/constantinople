@@ -19,7 +19,7 @@ use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
     TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
 };
-use rand_core::OsRng;
+use rand::rng;
 use std::{fmt::Display, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
 
@@ -237,7 +237,7 @@ where
     let transactions = tokio::task::spawn_blocking(move || {
         verify_transaction_chunks::<H, _>(
             namespace,
-            &mut OsRng,
+            &mut rng(),
             &public_key_cache,
             signed_lazy,
             &strategy,

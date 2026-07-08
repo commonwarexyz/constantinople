@@ -18,7 +18,7 @@ use commonware_codec::{
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.
@@ -417,7 +417,7 @@ where
 /// `false` otherwise.
 pub fn verify_transaction_batch<H, St>(
     namespace: &[u8],
-    rng: &mut impl CryptoRngCore,
+    rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
     transactions: &[LazySignedTransaction<H>],
     signature_strategy: &St,
@@ -462,7 +462,7 @@ where
 /// `strategy`. Returns `None` if any transaction is invalid or undecodable.
 pub fn verify_transaction_chunks<H, St>(
     namespace: &'static [u8],
-    rng: &mut impl CryptoRngCore,
+    rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
     transactions: Vec<LazySignedTransaction<H>>,
     strategy: &St,
@@ -526,7 +526,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_ed25519() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -535,7 +535,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_secp256r1() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = secp256r1::PrivateKey::random(&mut test_rng());
+        let private_key = secp256r1::PrivateKey::random(test_rng());
         let signed = MockValue([5, 6, 7, 8]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -544,7 +544,7 @@ mod test {
     #[test]
     fn signed_into_inner_returns_sealed() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let signed = MockValue([9, 10, 11, 12]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         let seal = *signed.message_digest();
@@ -557,7 +557,7 @@ mod test {
     #[test]
     fn wrong_namespace_fails_verification() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(!signed.verify(b"wrong namespace", &private_key.public_key()));
@@ -577,7 +577,7 @@ mod test {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let hasher = &mut sha256::Sha256::default();
-            let private_key = ed25519::PrivateKey::random(&mut test_rng());
+            let private_key = ed25519::PrivateKey::random(test_rng());
             let public_key = TransactionPublicKey::ed25519(private_key.public_key());
             let signed = Transaction::new(
                 public_key.clone(),
@@ -609,7 +609,7 @@ mod test {
     #[test]
     fn preload_transaction_chunks_forces_nested_signature_inputs() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),
@@ -643,7 +643,7 @@ mod test {
     #[test]
     fn lazy_signed_transaction_exposes_pending_bytes_without_materializing() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),

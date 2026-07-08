@@ -13,11 +13,11 @@ use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
 use futures::{Stream, StreamExt};
 use rand::Rng;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
 where
-    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
     C: Digest,
     S: Scheme<PublicKey = P>,

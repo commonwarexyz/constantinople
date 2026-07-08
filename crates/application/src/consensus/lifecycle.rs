@@ -21,7 +21,7 @@ use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 use rand::Rng;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use std::sync::Arc;
 use tracing::{Instrument as _, info, info_span, warn};
 
@@ -55,7 +55,7 @@ where
         input: &mut I,
     ) -> Option<Proposed<Self, E>>
     where
-        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
@@ -124,7 +124,7 @@ where
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
-        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
@@ -199,7 +199,7 @@ where
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
     where
-        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRngCore,
+        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,

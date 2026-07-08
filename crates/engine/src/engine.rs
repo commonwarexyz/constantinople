@@ -63,7 +63,7 @@ use constantinople_application::consensus::{
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
-use rand_core::CryptoRngCore;
+use rand_core::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
     time::{Duration, Instant},
@@ -191,7 +191,7 @@ where
 /// Fully assembled validator engine.
 pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -238,7 +238,7 @@ where
 
 impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
@@ -710,7 +710,7 @@ async fn init_finalizations_archive<E, H, P, V>(
     partition_prefix: &str,
 ) -> PrunableArchive<EightCap, E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
     V: Variant,
@@ -744,7 +744,7 @@ async fn init_finalized_blocks_archive<E, H, P>(
     block_codec: &BlockCfg,
 ) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>
 where
-    E: BufferPooler + Spawner + Metrics + CryptoRngCore + Clock + Storage + Network,
+    E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
     P: PublicKey,
 {

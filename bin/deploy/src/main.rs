@@ -16,7 +16,8 @@ use commonware_cryptography::{
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, TryCollect};
-use rand_core::OsRng;
+use rand::rngs::SysRng;
+use rand_core::UnwrapErr;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -605,21 +606,22 @@ pub(crate) fn generate_remote_cluster_material(
     validators: u32,
     secondaries: u32,
 ) -> ClusterMaterial {
+    let mut rng = UnwrapErr(SysRng);
     let mut signers = (0..validators)
-        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .map(|_| ed25519::PrivateKey::random(rng))
         .collect::<Vec<_>>();
     signers.sort_by_key(Signer::public_key);
     let mut secondary_signers = (0..secondaries)
-        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .map(|_| ed25519::PrivateKey::random(rng))
         .collect::<Vec<_>>();
     secondary_signers.sort_by_key(Signer::public_key);
-    build_cluster_material(signers, secondary_signers, &mut OsRng)
+    build_cluster_material(signers, secondary_signers, &mut rng)
 }
 
 fn build_cluster_material(
     signers: Vec<ed25519::PrivateKey>,
     secondary_signers: Vec<ed25519::PrivateKey>,
-    rng: &mut impl rand_core::CryptoRngCore,
+    rng: &mut impl rand::CryptoRng,
 ) -> ClusterMaterial {
     let public_keys = signers.iter().map(Signer::public_key).collect::<Vec<_>>();
     let secondary_public_keys = secondary_signers

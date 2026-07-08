@@ -145,7 +145,7 @@ struct TestSigner {
 
 impl TestSigner {
     fn new(index: u64) -> Self {
-        let key = ed25519::PrivateKey::random(&mut StdRng::seed_from_u64(index));
+        let key = ed25519::PrivateKey::random(StdRng::seed_from_u64(index));
         let public_key = key.public_key();
         Self { key, public_key }
     }
