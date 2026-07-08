@@ -22,6 +22,9 @@ use std::{
 };
 use tracing::info;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 #[derive(Parser, Debug)]
 #[command(
     name = "metadata-indexer",

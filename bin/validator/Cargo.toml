@@ -50,6 +50,7 @@ rand_core.workspace = true
 serde_yaml.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
+mimalloc.workspace = true
 
 [dev-dependencies]
 # Other

@@ -377,7 +377,7 @@ fn decode_hex(value: &str) -> Result<Vec<u8>, ReadError> {
         return Err(ReadError::Hex("odd number of hex characters".to_string()));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.chunks_exact(2) {
+    for pair in bytes.as_chunks::<2>().0 {
         let high = decode_hex_nibble(pair[0])?;
         let low = decode_hex_nibble(pair[1])?;
         out.push((high << 4) | low);
