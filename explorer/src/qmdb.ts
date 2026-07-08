@@ -21,8 +21,6 @@ import {
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
-// Store namespace for Simplex block and certificate rows. Must match the
-// assignment in `constantinople_indexer::namespaces`.
 const STORE_PREFIX_RESERVED_BITS = 4;
 const SIMPLEX_STORE_PREFIX = 0xa;
 const ACCOUNT_PAGE_SIZE = 10;
