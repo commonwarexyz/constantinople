@@ -6,6 +6,7 @@ import {
     type DecodedQueryResult,
     type DecodedRow,
 } from '@exowarexyz/sql';
+import { Client, StoreKeyPrefix } from '@exowarexyz/sdk';
 import {
     SimplexClient,
     type VerifiedSimplexCertificate,
@@ -20,6 +21,10 @@ import {
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
+// Store namespace for Simplex block and certificate rows. Must match the
+// assignment in `constantinople_indexer::namespaces`.
+const STORE_PREFIX_RESERVED_BITS = 4;
+const SIMPLEX_STORE_PREFIX = 0xa;
 const ACCOUNT_PAGE_SIZE = 10;
 const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
@@ -474,7 +479,10 @@ async function verifiedSimplexClient(
     if (simplexVerificationMaterial.trim().length === 0) {
         throw new Error('Simplex verification material is not configured');
     }
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(trimTrailingSlash(storeUrl), {
+    const store = new Client(trimTrailingSlash(storeUrl)).store(
+        new StoreKeyPrefix(STORE_PREFIX_RESERVED_BITS, SIMPLEX_STORE_PREFIX),
+    );
+    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(store, {
         verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
     });
 }

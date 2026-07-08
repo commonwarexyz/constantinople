@@ -6,7 +6,12 @@
 //! path without fetching the full body. Transaction bodies and lookup metadata
 //! are stored in SQL `tx_meta` rows.
 
-use crate::{codec, publisher::certificate::CertifiedHeader, sql_schema::build_meta_schema};
+use crate::{
+    codec,
+    namespaces::{simplex_client, sql_meta_client},
+    publisher::certificate::CertifiedHeader,
+    sql_schema::build_meta_schema,
+};
 use bytes::Bytes;
 use commonware_codec::{FixedSize as _, Read};
 use commonware_consensus::{
@@ -79,11 +84,11 @@ impl IndexerClient {
     /// Wrap existing [`StoreClient`]s for block and SQL metadata families.
     pub fn try_new(blocks: StoreClient, metadata: StoreClient) -> Result<Self, ReadError> {
         let sql = SessionContext::new();
-        build_meta_schema(metadata)
+        build_meta_schema(sql_meta_client(&metadata).map_err(ClientError::from)?)
             .map_err(ReadError::SqlSchema)?
             .register_all(&sql)?;
         Ok(Self {
-            blocks: SimplexClient::from_client(blocks),
+            blocks: SimplexClient::new(simplex_client(&blocks).map_err(ClientError::from)?),
             sql,
         })
     }

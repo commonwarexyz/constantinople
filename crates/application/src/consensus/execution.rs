@@ -1,9 +1,9 @@
 //! Execution and commitment checks for consensus blocks.
 //!
 //! This module is the consensus-facing wrapper around the account executor. It
-//! prepares block bodies, loads the state needed for account execution, writes
-//! account and transaction-history updates into QMDB batches, and returns the
-//! merkleized commitments that consensus proposes, verifies, or applies.
+//! prepares block bodies, stages the state needed for account execution,
+//! computes final account values and transaction-history updates, and returns
+//! the merkleized commitments that consensus proposes, verifies, or applies.
 //!
 //! The important invariant is that account execution is based on block-start
 //! state. Nonces and spends are sender-local, and credits from this block are
@@ -26,18 +26,18 @@
 //!        v                                                       |
 //! build account-touch execution plan                             |
 //!        |                                                       |
-//!        +--> discrete lane -- load unique senders/recipients    |
-//!        |                   -- check nonce/debit, apply credits |
+//!        v                                                       |
+//! stage unique senders/recipients/general accounts               |
 //!        |                                                       |
-//!        +--> general lane -- aggregate account effects          |
-//!        |                  -- get_many affected accounts        |
-//!        |                  -- check/apply each account once     |
+//!        +--> discrete lane -- check nonce/debit, apply credits  |
+//!        |                                                       |
+//!        +--> general lane -- check/apply each account once      |
 //!        |                                                       |
 //!        v                                                       |
-//! StateWrites ---------------------------------------------------+
+//! indexed StateUpdates -------------------------------------------+
 //!        |
 //!        v
-//! state batch + transaction-history batch
+//! staged state batch + transaction-history batch
 //!        |
 //!        v
 //! merkleized commitments
@@ -51,15 +51,16 @@
 //! self-transfer affordability floor, and recipient credit total. The account is
 //! loaded once, checked once, and written once. Credits are added after debit
 //! affordability is checked, so an in-block credit cannot fund an in-block
-//! spend. Account values are loaded with awaited QMDB `get_many` calls before
-//! `Strategy` workers split CPU-only account mutation. If any debit check or
-//! credit addition fails in either lane, the whole batch is rejected; there is no
-//! partial execution state to reconcile.
+//! spend. If any debit check or credit addition fails in either lane, the whole
+//! batch is rejected; there is no partial execution state to reconcile.
 //!
-//! A single execution plan separates the workload into these lanes before any
-//! state is loaded. This keeps independent work on the cheap path even in mixed
-//! blocks, while any contended sender or recipient is handled by the general
-//! aggregation rules.
+//! Account state is loaded with one awaited QMDB `stage` call, which returns
+//! the loaded values plus a staged batch that retains each key's resolved
+//! location. Every staged account produces exactly one final value, so the
+//! writes are `(staged read index, account)` updates that skip key
+//! re-resolution when the staged batch merkleizes. Transaction history is
+//! append-only: transaction digests are appended in block order, so the
+//! transaction-history commitment still reflects block order.
 //!
 //! Proposing, verifying, and applying certified blocks all use this same
 //! transition. `execute_proposal` prepares locally selected transactions and
@@ -73,35 +74,33 @@
 //! materializes the transaction computes that seal once and caches the decoded
 //! transaction for the other consumers.
 //!
-//! State writes are returned as independent shard write vectors. For the
-//! unordered state database, the state root depends on the final key/value set,
-//! not on the order in which these vectors are folded into the QMDB batch.
-//! Transaction history is different: transaction digests are appended in block
-//! order, so the transaction-history commitment still reflects block order.
-//!
-//! Parallel fan-out comes from the supplied `Strategy`, so this file avoids
-//! fixed worker counts. The same strategy drives preparation, CPU account
-//! mutation, and QMDB merkleization beneath the batch APIs. QMDB reads stay on
-//! the async path and are not run inside `Strategy` workers.
+//! Parallel fan-out comes from the supplied `Strategy`, which decides per
+//! operation whether fanning out beats staying serial. The strategy drives
+//! preparation and QMDB merkleization beneath the batch APIs; per-account
+//! mutation is a few instructions per account, so it runs as one serial pass.
+//! QMDB reads stay on the async path and are not run inside `Strategy`
+//! workers. The state and transaction-history merkleizations run on separate
+//! tasks so their CPU work overlaps.
 
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
-    db::{self, StateBatch, TransactionBatch, apply_shard_maps, apply_transaction_digests},
+    db::{
+        self, StateBatch, StateStaged, StateUpdates, TransactionBatch, apply_transaction_digests,
+    },
     history::parent_transactions_inactivity_floor,
     reject_verify,
 };
-use crate::executor::{self, PreparedTransfer, ShardWrites};
+use crate::executor::{self, PreparedTransfer};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Storage};
+use commonware_runtime::{Clock, Metrics, Spawner, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
-    Account, AccountKey, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
+    Account, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
 };
-use core::{mem::MaybeUninit, ops::Range};
 use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -138,61 +137,77 @@ where
     }
 }
 
-/// Loads and executes a batch from a deterministic account-touch plan.
+/// Stages and executes a batch from a deterministic account-touch plan.
 ///
-/// Unique transfers use the discrete lane. Transfers touching contended
-/// accounts use the general lane, which loads each affected account once and
-/// applies its accumulated effect. Returns `None` if any transfer fails its
-/// nonce or balance check or overflows a recipient (the whole batch is
-/// rejected). The batch is only borrowed for reads, so the caller may move it
-/// afterward to apply the writes.
+/// Consumes the batch to stage every account the plan touches, then computes
+/// each staged account's final value. Unique transfers use the discrete lane.
+/// Transfers touching contended accounts use the general lane, which loads each
+/// affected account once and applies its accumulated effect. Returns the staged
+/// batch alongside `None` if any transfer fails its nonce or balance check or
+/// overflows a recipient (the whole batch is rejected).
 pub async fn compute<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
-    strategy: &S,
+    batch: StateBatch<E, H, EightCap, S>,
     transfers: &[PreparedTransfer],
-) -> Option<db::StateWrites>
+) -> (StateStaged<E, H, EightCap, S>, Option<StateUpdates>)
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    if transfers.is_empty() {
-        return Some(db::StateWrites::new(Vec::new()));
-    }
+    let Some(plan) = executor::execution_plan(transfers) else {
+        return (stage_empty(batch).await, None);
+    };
+    let (staged, values) = load_accounts(batch, &plan.discrete, &plan.general).await;
+    let updates = build_updates(&plan, transfers, &values);
+    (staged, updates)
+}
 
-    let plan = executor::execution_plan(transfers)?;
-    let executor::ExecutionPlan { discrete, general } = &plan;
-    let values = load_accounts(batch, discrete, general).await;
-    let mut writes = Vec::new();
-    if !discrete.transfers.is_empty() {
-        writes.extend(apply_discrete(
-            strategy,
-            discrete,
-            &values.senders,
-            &values.recipients,
-        )?);
-    }
-    if !general.is_empty() {
-        writes.push(executor::apply_general_accounts(
-            values.general,
-            general,
-            transfers,
-        )?);
-    }
-    Some(db::StateWrites::new(writes))
+/// Stages a batch with no reads, for paths that reject or skip execution.
+pub(super) async fn stage_empty<E, H, S>(
+    batch: StateBatch<E, H, EightCap, S>,
+) -> StateStaged<E, H, EightCap, S>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    let (_, staged) = batch
+        .stage(&[])
+        .await
+        .expect("staging no reads must succeed");
+    staged
 }
 
 struct LoadedAccounts {
-    senders: Vec<Option<Account>>,
-    recipients: Vec<Option<Account>>,
-    general: Vec<Option<Account>>,
+    /// Staged values in read order: senders, then recipients, then general.
+    values: Vec<Option<Account>>,
+    sender_len: usize,
+    recipient_len: usize,
+}
+
+impl LoadedAccounts {
+    const fn len(&self) -> usize {
+        self.values.len()
+    }
+
+    fn senders(&self) -> &[Option<Account>] {
+        &self.values[..self.sender_len]
+    }
+
+    fn recipients(&self) -> &[Option<Account>] {
+        &self.values[self.sender_len..self.sender_len + self.recipient_len]
+    }
+
+    fn general(&self) -> &[Option<Account>] {
+        &self.values[self.sender_len + self.recipient_len..]
+    }
 }
 
 async fn load_accounts<E, H, S>(
-    batch: &StateBatch<E, H, EightCap, S>,
+    batch: StateBatch<E, H, EightCap, S>,
     discrete: &executor::DiscreteWorkload<'_>,
     general: &executor::GeneralWorkload<'_>,
-) -> LoadedAccounts
+) -> (StateStaged<E, H, EightCap, S>, LoadedAccounts)
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
@@ -209,190 +224,76 @@ where
         .copied()
         .collect::<Vec<_>>();
 
-    // One QMDB read lets the storage layer sort and batch journal positions
-    // across both lanes.
-    let values = batch
-        .get_many(keys.as_slice())
+    // One staged QMDB read lets the storage layer sort and batch journal
+    // positions across all lanes, and each key's resolved location is reused
+    // when the staged batch merkleizes.
+    let (values, staged) = batch
+        .stage(keys.as_slice())
         .await
         .expect("account state loading must succeed");
-    let mut values = values.into_iter();
-    let senders = values.by_ref().take(sender_len).collect();
-    let recipients = values.by_ref().take(recipient_len).collect();
-    let general = values.by_ref().take(general_len).collect();
-    assert_eq!(values.len(), 0);
-    LoadedAccounts {
-        senders,
-        recipients,
-        general,
-    }
+    assert_eq!(values.len(), sender_len + recipient_len + general_len);
+    (
+        staged,
+        LoadedAccounts {
+            values,
+            sender_len,
+            recipient_len,
+        },
+    )
 }
 
-fn apply_discrete<S>(
-    strategy: &S,
-    plan: &executor::DiscreteWorkload<'_>,
-    sender_values: &[Option<Account>],
-    recipient_values: &[Option<Account>],
-) -> Option<Vec<ShardWrites>>
-where
-    S: Strategy,
-{
-    let sender_writes = apply_writes(
-        strategy,
-        plan.transfers.as_slice(),
-        sender_values,
-        apply_senders,
-    )?;
+/// Computes the final value of every staged account.
+///
+/// Update indices follow the staged read order (discrete senders, discrete
+/// recipients, then general accounts), and every staged account produces
+/// exactly one final value, so the writes enumerate directly into indexed
+/// updates. The per-account arithmetic is a few instructions, so one serial
+/// pass into the updates vector beats parallel fan-out and its intermediate
+/// buffers.
+fn build_updates(
+    plan: &executor::ExecutionPlan<'_>,
+    transfers: &[PreparedTransfer],
+    values: &LoadedAccounts,
+) -> Option<StateUpdates> {
+    let executor::ExecutionPlan { discrete, general } = plan;
+    let mut updates = StateUpdates::with_capacity(values.len());
 
-    let mut writes = vec![sender_writes];
-    if !plan.recipient_keys.is_empty() {
-        let dense = plan.recipient_keys.len() == plan.transfers.len();
-        let recipient_writes = if dense {
-            apply_writes(
-                strategy,
-                plan.transfers.as_slice(),
-                recipient_values,
-                apply_dense_recipients,
-            )
-        } else {
-            apply_sparse_recipients(plan.transfers.as_slice(), recipient_values)
-        }?;
-        writes.push(recipient_writes);
-    }
-
-    Some(writes)
-}
-
-// Shared sender/recipient callback shape used after QMDB values are loaded.
-// `Strategy` workers only apply CPU mutations; they never block on DB reads.
-type ApplyFn =
-    fn(&[&PreparedTransfer], &[Option<Account>], &mut [MaybeUninit<(AccountKey, Account)>]) -> bool;
-
-fn apply_writes<S>(
-    strategy: &S,
-    transfers: &[&PreparedTransfer],
-    values: &[Option<Account>],
-    apply: ApplyFn,
-) -> Option<ShardWrites>
-where
-    S: Strategy,
-{
-    let chunks = chunk_count(strategy, transfers.len());
-    assert_eq!(values.len(), transfers.len());
-
-    let mut writes = uninit_vec(transfers.len());
-    let valid = if chunks <= 1 {
-        apply(transfers, values, &mut writes)
-    } else {
-        apply_write_chunks(strategy, transfers, values, &mut writes, chunks, apply)
-    };
-    valid.then(|| initialized_copy_vec(writes))
-}
-
-fn apply_write_chunks<S>(
-    strategy: &S,
-    transfers: &[&PreparedTransfer],
-    values: &[Option<Account>],
-    writes: &mut [MaybeUninit<(AccountKey, Account)>],
-    chunks: usize,
-    apply: ApplyFn,
-) -> bool
-where
-    S: Strategy,
-{
-    assert_eq!(transfers.len(), values.len());
-    assert_eq!(transfers.len(), writes.len());
-
-    let ranges = chunk_ranges(transfers.len(), chunks);
-    let mut remaining_writes = writes;
-    let mut work = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let len = range.end - range.start;
-        let (chunk_writes, rest) = remaining_writes.split_at_mut(len);
-        work.push((&transfers[range.clone()], &values[range], chunk_writes));
-        remaining_writes = rest;
-    }
-    assert!(remaining_writes.is_empty());
-
-    strategy
-        .map_collect_vec(work, |(transfers, values, writes)| {
-            apply(transfers, values, writes)
-        })
-        .into_iter()
-        .all(core::convert::identity)
-}
-
-fn apply_senders(
-    transfers: &[&PreparedTransfer],
-    values: &[Option<Account>],
-    writes: &mut [MaybeUninit<(AccountKey, Account)>],
-) -> bool {
-    for ((transfer, value), write) in transfers.iter().zip(values).zip(writes) {
-        let mut account = (*value).unwrap_or_default();
+    // Discrete senders: one write per transfer, in transfer order.
+    for (transfer, value) in discrete.transfers.iter().zip(values.senders()) {
+        let mut account = value.unwrap_or_default();
         if account.balance < transfer.value || !account.nonce.consume(transfer.nonce) {
-            return false;
+            return None;
         }
         if transfer.sender != transfer.recipient {
             account.balance -= transfer.value;
         }
-        write.write((transfer.sender, account));
+        updates.push((updates.len(), Some(account)));
     }
-    true
-}
 
-fn apply_dense_recipients(
-    transfers: &[&PreparedTransfer],
-    values: &[Option<Account>],
-    writes: &mut [MaybeUninit<(AccountKey, Account)>],
-) -> bool {
-    for ((transfer, value), write) in transfers.iter().zip(values).zip(writes) {
-        let mut account = (*value).unwrap_or_default();
-        if executor::apply_credit(&mut account, transfer.value).is_none() {
-            return false;
-        }
-        write.write((transfer.recipient, account));
-    }
-    true
-}
-
-fn apply_sparse_recipients(
-    transfers: &[&PreparedTransfer],
-    values: &[Option<Account>],
-) -> Option<ShardWrites> {
-    let mut values = values.iter();
-    let mut writes = ShardWrites::with_capacity(values.size_hint().0);
-    for transfer in transfers {
-        if transfer.sender == transfer.recipient {
-            continue;
-        }
-        let value = values.next().expect("one value per non-self recipient");
-        let mut account = (*value).unwrap_or_default();
+    // Discrete recipients: one write per non-self transfer, in transfer
+    // order. The zip is exhaustive because recipient_keys was built from
+    // exactly the non-self transfers (asserted against the staged read count
+    // in load_accounts).
+    let non_self = discrete
+        .transfers
+        .iter()
+        .filter(|transfer| transfer.sender != transfer.recipient);
+    for (transfer, value) in non_self.zip(values.recipients()) {
+        let mut account = value.unwrap_or_default();
         executor::apply_credit(&mut account, transfer.value)?;
-        writes.push((transfer.recipient, account));
-    }
-    assert!(values.next().is_none());
-    Some(writes)
-}
-
-fn chunk_count<S>(strategy: &S, items: usize) -> usize
-where
-    S: Strategy,
-{
-    strategy.parallelism_hint().max(1).min(items.max(1))
-}
-
-fn chunk_ranges(items: usize, chunks: usize) -> Vec<Range<usize>> {
-    if items == 0 {
-        return Vec::new();
+        updates.push((updates.len(), Some(account)));
     }
 
-    let chunks = chunks.max(1).min(items);
-    (0..chunks)
-        .map(|chunk| {
-            let start = items * chunk / chunks;
-            let end = items * (chunk + 1) / chunks;
-            start..end
-        })
-        .collect()
+    // General lane: one write per affected account, in account order.
+    if !general.is_empty() {
+        let written = executor::apply_general_accounts(values.general(), general, transfers)?;
+        for account in written {
+            updates.push((updates.len(), Some(account)));
+        }
+    }
+
+    assert_eq!(updates.len(), values.len());
+    Some(updates)
 }
 
 pub fn prepare_signed<H, S>(
@@ -403,115 +304,17 @@ where
     H: Hasher,
     S: Strategy,
 {
-    if chunk_count(strategy, txs.len()) > 1 {
-        return prepare_signed_chunks(strategy, txs);
-    }
-
-    let mut transfers = Vec::with_capacity(txs.len());
-    let mut digests = Vec::with_capacity(txs.len());
-    for tx in txs {
-        transfers.push(executor::prepare_transfer(tx)?);
-        digests.push(*tx.message_digest());
-    }
-    Some((transfers, digests))
-}
-
-fn prepare_signed_chunks<H, S>(
-    strategy: &S,
-    txs: &[SignedTransaction<H>],
-) -> Option<(Vec<PreparedTransfer>, Vec<H::Digest>)>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let mut transfers = uninit_vec(txs.len());
-    let mut digests = uninit_vec(txs.len());
-    let chunks = chunk_count(strategy, txs.len());
-    if !prepare_signed_into(strategy, txs, &mut transfers, &mut digests, chunks) {
-        return None;
-    }
-
-    Some((
-        initialized_copy_vec(transfers),
-        initialized_copy_vec(digests),
-    ))
-}
-
-fn prepare_signed_into<H, S>(
-    strategy: &S,
-    txs: &[SignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-    chunks: usize,
-) -> bool
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let ranges = chunk_ranges(txs.len(), chunks);
-    let mut remaining_transfers = transfers;
-    let mut remaining_digests = digests;
-    let mut work = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let len = range.end - range.start;
-        let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
-        let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
-        work.push((&txs[range], chunk_transfers, chunk_digests));
-        remaining_transfers = rest_transfers;
-        remaining_digests = rest_digests;
-    }
-    assert!(remaining_transfers.is_empty());
-    assert!(remaining_digests.is_empty());
-
     strategy
-        .map_collect_vec(work, |(txs, transfers, digests)| {
-            prepare_signed_chunk(txs, transfers, digests)
+        .try_map_collect_vec(txs, |tx| {
+            executor::prepare_transfer(tx)
+                .map(|transfer| (transfer, *tx.message_digest()))
+                .ok_or(())
         })
-        .into_iter()
-        .all(core::convert::identity)
-}
-
-fn prepare_signed_chunk<H>(
-    txs: &[SignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-) -> bool
-where
-    H: Hasher,
-{
-    for ((tx, transfer), digest) in txs.iter().zip(transfers).zip(digests) {
-        let Some(prepared) = executor::prepare_transfer(tx) else {
-            return false;
-        };
-        transfer.write(prepared);
-        digest.write(*tx.message_digest());
-    }
-    true
+        .ok()
+        .map(|prepared| prepared.into_iter().unzip())
 }
 
 pub(super) fn prepare_lazy<H, S>(
-    strategy: &S,
-    body: &[LazySignedTransaction<H>],
-) -> core::result::Result<(Vec<PreparedTransfer>, Vec<H::Digest>), &'static str>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    if chunk_count(strategy, body.len()) > 1 {
-        return prepare_lazy_chunks(strategy, body);
-    }
-
-    let mut transfers = Vec::with_capacity(body.len());
-    let mut digests = Vec::with_capacity(body.len());
-    for lazy in body.iter() {
-        let tx = lazy.get().ok_or(MALFORMED_TRANSACTION)?;
-        transfers.push(executor::prepare_transfer(tx).ok_or(MALFORMED_TRANSACTION)?);
-        digests.push(*tx.message_digest());
-    }
-    Ok((transfers, digests))
-}
-
-fn prepare_lazy_chunks<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
 ) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
@@ -519,91 +322,13 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let mut transfers = uninit_vec(body.len());
-    let mut digests = uninit_vec(body.len());
-    let chunks = chunk_count(strategy, body.len());
-    if !prepare_lazy_into(strategy, body, &mut transfers, &mut digests, chunks) {
-        return Err(MALFORMED_TRANSACTION);
-    }
-
-    Ok((
-        initialized_copy_vec(transfers),
-        initialized_copy_vec(digests),
-    ))
-}
-
-fn prepare_lazy_into<H, S>(
-    strategy: &S,
-    body: &[constantinople_primitives::LazySignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-    chunks: usize,
-) -> bool
-where
-    H: Hasher,
-    S: Strategy,
-{
-    let ranges = chunk_ranges(body.len(), chunks);
-    let mut remaining_transfers = transfers;
-    let mut remaining_digests = digests;
-    let mut work = Vec::with_capacity(ranges.len());
-    for range in ranges {
-        let len = range.end - range.start;
-        let (chunk_transfers, rest_transfers) = remaining_transfers.split_at_mut(len);
-        let (chunk_digests, rest_digests) = remaining_digests.split_at_mut(len);
-        work.push((&body[range], chunk_transfers, chunk_digests));
-        remaining_transfers = rest_transfers;
-        remaining_digests = rest_digests;
-    }
-    assert!(remaining_transfers.is_empty());
-    assert!(remaining_digests.is_empty());
-
     strategy
-        .map_collect_vec(work, |(body, transfers, digests)| {
-            prepare_lazy_chunk(body, transfers, digests)
+        .try_map_collect_vec(body, |lazy| {
+            let tx = lazy.get().ok_or(MALFORMED_TRANSACTION)?;
+            let transfer = executor::prepare_transfer(tx).ok_or(MALFORMED_TRANSACTION)?;
+            Ok((transfer, *tx.message_digest()))
         })
-        .into_iter()
-        .all(core::convert::identity)
-}
-
-fn prepare_lazy_chunk<H>(
-    body: &[constantinople_primitives::LazySignedTransaction<H>],
-    transfers: &mut [MaybeUninit<PreparedTransfer>],
-    digests: &mut [MaybeUninit<H::Digest>],
-) -> bool
-where
-    H: Hasher,
-{
-    for ((lazy, transfer), digest) in body.iter().zip(transfers).zip(digests) {
-        let Some(tx) = lazy.get() else {
-            return false;
-        };
-        let Some(prepared) = executor::prepare_transfer(tx) else {
-            return false;
-        };
-        transfer.write(prepared);
-        digest.write(*tx.message_digest());
-    }
-    true
-}
-
-fn uninit_vec<T>(len: usize) -> Vec<MaybeUninit<T>> {
-    let mut values = Vec::with_capacity(len);
-    // SAFETY: `MaybeUninit<T>` does not need initialization.
-    unsafe {
-        values.set_len(len);
-    }
-    values
-}
-
-fn initialized_copy_vec<T: Copy>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
-    let ptr = values.as_mut_ptr().cast::<T>();
-    let len = values.len();
-    let capacity = values.capacity();
-    core::mem::forget(values);
-    // SAFETY: callers only reach this after every slot has been initialized,
-    // and `T: Copy` cannot require drop glue for partially initialized failure paths.
-    unsafe { Vec::from_raw_parts(ptr, len, capacity) }
+        .map(|prepared| prepared.into_iter().unzip())
 }
 
 /// Executes a proposal's candidate transactions all or nothing.
@@ -613,6 +338,7 @@ fn initialized_copy_vec<T: Copy>(mut values: Vec<MaybeUninit<T>>) -> Vec<T> {
 /// recipient, the whole batch is dropped and an empty block is proposed so the
 /// chain still makes progress.
 pub(super) async fn execute_proposal<E, C, P, H, S>(
+    runtime: E,
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -620,7 +346,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     transactions: Vec<SignedTransaction<H>>,
 ) -> ProposalExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics + Spawner,
     C: Digest,
     H: Hasher,
     P: PublicKey,
@@ -628,29 +354,29 @@ where
 {
     let prepared = prepare_signed(&strategy, &transactions);
 
-    let outcome = match prepared {
+    let (staged, outcome) = match prepared {
         Some((transfers, digests)) if !transfers.is_empty() => {
-            compute(&state_batch, &strategy, &transfers)
+            let (staged, updates) = compute(state_batch, &transfers)
                 .instrument(info_span!("application.execute.compute"))
-                .await
-                .map(|shard_maps| (transactions, digests, shard_maps))
+                .await;
+            (
+                staged,
+                updates.map(|updates| (transactions, digests, updates)),
+            )
         }
-        _ => None,
+        _ => (stage_empty(state_batch).await, None),
     };
 
-    let (body, digests, state_batch) = match outcome {
-        Some((body, digests, shard_maps)) => {
-            (body, digests, apply_shard_maps(state_batch, shard_maps))
-        }
-        None => (Vec::new(), Vec::new(), state_batch),
-    };
+    let (body, digests, state_updates) = outcome.unwrap_or_default();
 
     let transaction_batch = info_span!("application.execute.apply")
         .in_scope(|| apply_transaction_digests(transaction_batch, &digests));
 
     ProposalExecution {
         block: finalize_child(
-            state_batch,
+            runtime,
+            staged,
+            state_updates,
             transaction_batch,
             parent,
             body.len(),
@@ -662,6 +388,7 @@ where
 }
 
 pub(super) async fn execute_body<E, C, P, H, S>(
+    runtime: E,
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -669,7 +396,7 @@ pub(super) async fn execute_body<E, C, P, H, S>(
     body: PreparedBody<H>,
 ) -> Result<BlockExecution<E, H, S>>
 where
-    E: Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics + Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -678,19 +405,18 @@ where
     let (transfers, digests) = info_span!("application.execute.prepare")
         .in_scope(|| prepare_lazy(&strategy, body.as_ref().as_slice()))?;
 
-    let shard_maps = compute(&state_batch, &strategy, &transfers)
+    let (staged, updates) = compute(state_batch, &transfers)
         .instrument(info_span!("application.execute.compute"))
-        .await
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+        .await;
+    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let state_batch = apply_shard_maps(state_batch, shard_maps);
-        let transaction_batch = apply_transaction_digests(transaction_batch, &digests);
-        (state_batch, transaction_batch)
-    });
+    let transaction_batch = info_span!("application.execute.apply")
+        .in_scope(|| apply_transaction_digests(transaction_batch, &digests));
 
     Ok(finalize_child(
-        state_batch,
+        runtime,
+        staged,
+        state_updates,
         transaction_batch,
         parent,
         transfers.len(),
@@ -700,7 +426,7 @@ where
 }
 
 pub(super) async fn apply_prepared_body<E, H, S>(
-    strategy: S,
+    runtime: E,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
@@ -708,23 +434,21 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     digests: &[H::Digest],
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
-    E: Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics + Spawner,
     H: Hasher,
     S: Strategy,
 {
-    let shard_maps = compute(&state_batch, &strategy, transfers)
+    let (staged, updates) = compute(state_batch, transfers)
         .instrument(info_span!("application.execute.compute"))
-        .await
-        .ok_or(STATIC_INVALID_TRANSACTION)?;
+        .await;
+    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    let (state_batch, transaction_batch) = info_span!("application.execute.apply").in_scope(|| {
-        let state_batch = apply_shard_maps(state_batch, shard_maps);
-        let transaction_batch = apply_transaction_digests(transaction_batch, digests)
-            .with_inactivity_floor(transaction_floor);
-        (state_batch, transaction_batch)
+    let transaction_batch = info_span!("application.execute.apply").in_scope(|| {
+        apply_transaction_digests(transaction_batch, digests)
+            .with_inactivity_floor(transaction_floor)
     });
 
-    db::finalize_execution(state_batch, transaction_batch)
+    db::finalize_execution(runtime, staged, state_updates, transaction_batch)
         .await
         .map_err(|_| STATIC_INVALID_TRANSACTION)
 }
@@ -762,14 +486,16 @@ where
 
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
 async fn finalize_child<E, C, P, H, S>(
-    state_batch: StateBatch<E, H, EightCap, S>,
+    runtime: E,
+    state_staged: StateStaged<E, H, EightCap, S>,
+    state_updates: StateUpdates,
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     transaction_count: usize,
     expect_message: &'static str,
 ) -> BlockExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: Storage + Clock + Metrics + Spawner,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -777,9 +503,10 @@ where
 {
     let transaction_batch =
         transaction_batch.with_inactivity_floor(parent_transactions_inactivity_floor(parent));
-    let (state, transactions) = db::finalize_execution(state_batch, transaction_batch)
-        .await
-        .expect(expect_message);
+    let (state, transactions) =
+        db::finalize_execution(runtime, state_staged, state_updates, transaction_batch)
+            .await
+            .expect(expect_message);
     let state_sync_range = range_from_bounds(state.bounds());
     let transactions_range = range_from_bounds(transactions.bounds());
 
@@ -801,7 +528,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{chunk_ranges, range_from_bounds};
+    use super::range_from_bounds;
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
 
@@ -816,12 +543,5 @@ mod tests {
         };
 
         assert_eq!(range_from_bounds(&bounds), non_empty_range!(11, 15));
-    }
-
-    #[test]
-    fn flat_chunk_ranges_cover_items_once() {
-        assert_eq!(chunk_ranges(0, 4), Vec::<core::ops::Range<usize>>::new());
-        assert_eq!(chunk_ranges(2, 8), vec![0..1, 1..2]);
-        assert_eq!(chunk_ranges(10, 3), vec![0..3, 3..6, 6..10]);
     }
 }

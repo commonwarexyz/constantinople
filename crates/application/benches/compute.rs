@@ -1,7 +1,7 @@
 use ahash::{AHashMap, AHashSet};
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
-use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
-use commonware_parallel::{Rayon, Strategy as _};
+use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
+use commonware_parallel::Rayon;
 use commonware_runtime::{Runner as _, buffer::paged::CacheRef, tokio};
 use commonware_storage::{
     journal::contiguous::fixed::Config as FixedJournalConfig, merkle::full::Config as MmrConfig,
@@ -20,6 +20,9 @@ use std::{
     hint::black_box,
     time::{Duration, Instant},
 };
+
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 type Db = StateDatabase<tokio::Context, Sha256, EightCap, Rayon>;
 type Batch = StateBatch<tokio::Context, Sha256, EightCap, Rayon>;
@@ -116,6 +119,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             write_buffer: NZUsize!(1 << 20),
         },
         translator: EightCap,
+        init_cache_size: Some(NZUsize!(1 << 18)),
     }
 }
 
@@ -292,18 +296,22 @@ fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
 }
 
 async fn time_compute(
-    batch: &Batch,
-    strategy: &Rayon,
+    batch: Batch,
     transfers: &[PreparedTransfer],
-) -> (usize, Duration) {
+) -> (usize, Duration, Duration, String) {
     let start = Instant::now();
-    let writes = consensus::compute(batch, strategy, transfers)
+    let (staged, updates) = consensus::compute(batch, transfers).await;
+    let updates = updates.expect("compute path");
+    let compute_elapsed = start.elapsed();
+    let count = updates.len();
+    let merkleized = staged
+        .merkleize(updates, Vec::new())
         .await
-        .expect("compute path");
-    let elapsed = start.elapsed();
-    let count = writes.len();
-    black_box(&writes);
-    (count, elapsed)
+        .expect("merkleize");
+    let root = format!("{}", merkleized.root());
+    black_box(&merkleized);
+    let total = start.elapsed();
+    (count, compute_elapsed, total - compute_elapsed, root)
 }
 
 async fn load_discrete(batch: &Batch, plan: &LoadPlan<'_>) {
@@ -363,19 +371,14 @@ async fn time_combined_load(batch: &Batch, plan: &LoadPlan<'_>) -> Duration {
     start.elapsed()
 }
 
-async fn time_prepare_compute(
-    batch: &Batch,
-    strategy: &Rayon,
-    txs: &[TestTx],
-) -> (usize, Duration) {
+async fn time_prepare_compute(batch: Batch, strategy: &Rayon, txs: &[TestTx]) -> (usize, Duration) {
     let start = Instant::now();
     let (transfers, digests) = consensus::prepare_signed(strategy, txs).expect("prepare");
-    let writes = consensus::compute(batch, strategy, &transfers)
-        .await
-        .expect("compute path");
+    let (staged, updates) = consensus::compute(batch, &transfers).await;
+    let updates = updates.expect("compute path");
     let elapsed = start.elapsed();
-    let count = writes.len();
-    black_box((&transfers, &digests, &writes));
+    let count = updates.len();
+    black_box((&transfers, &digests, &staged, &updates));
     (count, elapsed)
 }
 
@@ -478,7 +481,7 @@ fn main() {
                     println!(
                         "loads    {n} txs / {ACCOUNTS} accounts / {} / {} shards\n  sequential: {:?}\n  overlap:    {:?}\n  combined:   {:?}",
                         fixture.name(),
-                        strategy.parallelism_hint().max(1),
+                        workers,
                         seq_total / iters,
                         overlap_total / iters,
                         combined_total / iters,
@@ -486,22 +489,27 @@ fn main() {
                 }
 
                 let mut total = Duration::ZERO;
+                let mut merk_total = Duration::ZERO;
                 let mut writes = 0usize;
+                let mut root = String::new();
                 for iter in 0..(warmup + iters) {
                     let batch = db.new_batches().await;
-                    let (count, elapsed) = time_compute(&batch, &strategy, &transfers).await;
+                    let (count, compute_t, merk_t, r) = time_compute(batch, &transfers).await;
                     writes = count;
+                    root = r;
                     if iter >= warmup {
-                        total += elapsed;
+                        total += compute_t;
+                        merk_total += merk_t;
                     }
                 }
 
                 let avg = total / iters;
-                let tps = n as f64 / avg.as_secs_f64() / 1e6;
+                let merk_avg = merk_total / iters;
+                let pipeline = avg + merk_avg;
+                let tps = n as f64 / pipeline.as_secs_f64() / 1e6;
                 println!(
-                    "compute  {n} txs / {ACCOUNTS} accounts / {} / {} shards\n  compute: {avg:?}  ({tps:.2} Melem/s) / {writes} writes",
+                    "pipeline {n} txs / {ACCOUNTS} accounts / {} / {workers} workers\n  compute: {avg:?}  merkleize: {merk_avg:?}  total: {pipeline:?}  ({tps:.2} Melem/s) / {writes} writes\n  root: {root}",
                     fixture.name(),
-                    strategy.parallelism_hint().max(1),
                 );
 
                 if bench_prepare {
@@ -510,7 +518,7 @@ fn main() {
                     let mut writes = 0usize;
                     for iter in 0..(warmup + iters) {
                         let batch = db.new_batches().await;
-                        let (count, elapsed) = time_prepare_compute(&batch, &strategy, &txs).await;
+                        let (count, elapsed) = time_prepare_compute(batch, &strategy, &txs).await;
                         writes = count;
                         if iter >= warmup {
                             total += elapsed;
@@ -522,7 +530,7 @@ fn main() {
                     println!(
                         "prepare+compute  {n} txs / {ACCOUNTS} accounts / {} / {} shards\n  compute: {avg:?}  ({tps:.2} Melem/s) / {writes} writes",
                         fixture.name(),
-                        strategy.parallelism_hint().max(1),
+                        workers,
                     );
                 }
             }

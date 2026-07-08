@@ -21,7 +21,9 @@
 //! checked credit addition, the whole block body is invalid and no partial state
 //! is applied.
 //!
-//! State writes are folded into the unordered state QMDB, whose commitment
+//! Touched accounts are staged out of the unordered state QMDB in one read,
+//! and final account values are recorded against the staged read indices, so
+//! merkleization reuses each key's resolved location. The state commitment
 //! depends on the final key/value set. Transaction history is append-only, so
 //! transaction digests are still appended in block order.
 
@@ -46,8 +48,9 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, StateBatch, StateDatabase, StateSyncTarget, StateWrites, TransactionDatabase,
-    TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
+    Databases, StateBatch, StateDatabase, StateStaged, StateSyncTarget, StateUpdates,
+    TransactionDatabase, TransactionHistoryDb, TransactionHistoryOperation,
+    TransactionHistoryTarget,
 };
 pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};

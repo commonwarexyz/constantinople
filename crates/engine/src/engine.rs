@@ -89,6 +89,7 @@ const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
+const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
@@ -405,7 +406,7 @@ where
                 .await
                 .expect("state db must initialize for genesis target");
                 let genesis_state_target =
-                    <StateDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_state_db).await;
+                    <StateDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_state_db);
                 let genesis_transaction_db = TransactionDb::<E, H, St>::init(
                     context.child("genesis_transactions"),
                     transaction_db_config.clone(),
@@ -413,8 +414,7 @@ where
                 .await
                 .expect("transaction history db must initialize for genesis target");
                 let genesis_transactions_target =
-                    <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_transaction_db)
-                        .await;
+                    <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&genesis_transaction_db);
                 let genesis_block =
                     constantinople_application::consensus::genesis_block_with_parent(
                         &mut H::default(),
@@ -794,6 +794,7 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
+        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
     }
 }
 

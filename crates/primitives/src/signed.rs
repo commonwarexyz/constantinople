@@ -17,8 +17,7 @@ use commonware_codec::{
     types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
-use commonware_parallel::{Sequential, Strategy};
-use rand::{SeedableRng, rngs::StdRng};
+use commonware_parallel::Strategy;
 use rand_core::CryptoRngCore;
 use std::sync::{Arc, OnceLock};
 
@@ -418,43 +417,12 @@ where
         return true;
     }
 
-    // Build and verify independent sub-batches in parallel. The serial per
-    // signature work (cache decompression, the SHA-512 challenge hash, and the
-    // coalescing map) runs inside each shard rather than ahead of a single
-    // batch, so it scales with the strategy instead of bottlenecking on one
-    // thread. Each shard draws its batch-verification randomness from a seed
-    // generated here, since the source rng cannot be shared across threads.
-    let parallelism = signature_strategy.parallelism_hint().max(1);
-    let shard_size = transactions.len().div_ceil(parallelism).max(1);
-    let shards: Vec<(&[LazySignedTransaction<H>], [u8; 32])> = transactions
-        .chunks(shard_size)
-        .map(|shard| {
-            let mut seed = [0u8; 32];
-            rng.fill_bytes(&mut seed);
-            (shard, seed)
-        })
-        .collect();
-
-    signature_strategy.fold(
-        shards,
-        || true,
-        |valid, (shard, seed)| valid && verify_shard(namespace, cache, shard, seed),
-        |left, right| left && right,
-    )
-}
-
-/// Builds and verifies a single sub-batch sequentially.
-fn verify_shard<H>(
-    namespace: &[u8],
-    cache: &PublicKeyCache,
-    shard: &[LazySignedTransaction<H>],
-    seed: [u8; 32],
-) -> bool
-where
-    H: Hasher,
-{
-    let mut verifier = TransactionBatchVerifier::new();
-    for lazy in shard {
+    // Queueing is cheap: transactions are preloaded and sender keys resolve
+    // through the decompression cache. The expensive per-signature challenge
+    // hashing and the serial-vs-parallel split happen inside `verify`, which
+    // shards the batch across `signature_strategy` internally.
+    let mut verifier = TransactionBatchVerifier::new(transactions.len());
+    for lazy in transactions {
         let Some(transaction) = lazy.get() else {
             return false;
         };
@@ -471,7 +439,7 @@ where
             return false;
         }
     }
-    verifier.verify(&mut StdRng::from_seed(seed), &Sequential)
+    verifier.verify(rng, signature_strategy)
 }
 
 /// Verifies lazily-encoded transactions.
@@ -608,7 +576,7 @@ mod test {
 
             assert_eq!(signed.value().sender(), Some(&public_key));
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(
                 verifier.add(
                     NAMESPACE,

@@ -1,4 +1,5 @@
-use super::{Changeset, State, compute, prepare_transfer};
+use super::{Changeset, PreparedTransfer, State, compute, prepare_transfer};
+use commonware_codec::FixedSize as _;
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
     Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
@@ -419,4 +420,54 @@ fn failed_debit_rejects_batch() {
     let transfers = prepared(&transactions);
 
     assert!(compute(&accounts, &transfers).is_none());
+}
+
+#[test]
+fn prefix_collision_only_demotes_to_the_general_lane() {
+    // Touch counting keys accounts by their 64-bit prefix, so two distinct
+    // keys sharing a prefix look contended and route to the general lane.
+    // That demotion must not change the computed accounts.
+    let key = |bytes: [u8; 2]| {
+        let mut raw = [0u8; AccountKey::SIZE];
+        raw[..8].copy_from_slice(&[7; 8]);
+        raw[8..10].copy_from_slice(&bytes);
+        AccountKey::from(raw)
+    };
+    let sender_a = key([1, 0]);
+    let sender_b = key([2, 0]);
+    assert_ne!(sender_a, sender_b);
+    assert_eq!(sender_a.prefix(), sender_b.prefix());
+    let recipient_a = AccountKey::from([3; AccountKey::SIZE]);
+    let recipient_b = AccountKey::from([4; AccountKey::SIZE]);
+
+    let transfer = |sender: AccountKey, recipient: AccountKey, value, nonce| PreparedTransfer {
+        sender,
+        recipient,
+        sender_prefix: sender.prefix(),
+        recipient_prefix: recipient.prefix(),
+        value,
+        nonce,
+    };
+    let transfers = [
+        transfer(sender_a, recipient_a, 3, 0),
+        transfer(sender_b, recipient_b, 5, 0),
+    ];
+
+    let mut accounts = State::new();
+    accounts.insert(sender_a, account(10, 0));
+    accounts.insert(sender_b, account(20, 0));
+
+    let changeset = compute(&accounts, &transfers).expect("collision batch executes");
+
+    let balance = |key: AccountKey| {
+        changeset
+            .iter()
+            .find_map(|(candidate, account)| (*candidate == key).then_some(account.balance))
+            .expect("account should be in changeset")
+    };
+    assert_eq!(changeset.len(), 4);
+    assert_eq!(balance(sender_a), 7);
+    assert_eq!(balance(sender_b), 15);
+    assert_eq!(balance(recipient_a), DEFAULT_ACCOUNT_BALANCE + 3);
+    assert_eq!(balance(recipient_b), DEFAULT_ACCOUNT_BALANCE + 5);
 }

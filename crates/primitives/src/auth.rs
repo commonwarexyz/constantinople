@@ -370,10 +370,11 @@ struct Secp256r1Item {
 }
 
 impl TransactionBatchVerifier {
-    /// Creates an empty transaction batch verifier.
-    pub fn new() -> Self {
+    /// Creates an empty transaction batch verifier with capacity for at least
+    /// `capacity` signatures.
+    pub fn new(capacity: usize) -> Self {
         Self {
-            ed25519: ed25519::Batch::new(),
+            ed25519: ed25519::Batch::new(capacity),
             secp256r1: Vec::new(),
         }
     }
@@ -440,7 +441,7 @@ impl TransactionBatchVerifier {
 
 impl Default for TransactionBatchVerifier {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -582,7 +583,7 @@ mod tests {
             let r1_message = sha256::Sha256::hash(b"secp256r1").to_vec();
             let (r1_public_key, r1_signature) = webauthn_signature(&r1_message);
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(verifier.add(
                 NAMESPACE,
                 &ed_message,
@@ -613,7 +614,7 @@ mod tests {
             let message = sha256::Sha256::hash(b"message").to_vec();
             let (_, signature) = webauthn_signature(&message);
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(!verifier.add(
                 NAMESPACE,
                 &message,
@@ -632,7 +633,7 @@ mod tests {
             let wrong_message = sha256::Sha256::hash(b"wrong").to_vec();
             let (public_key, signature) = webauthn_signature(&wrong_message);
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
             assert!(!verifier.verify(&mut test_rng(), &Sequential));
         });
@@ -658,7 +659,7 @@ mod tests {
                 TransactionSignature::secp256r1(inner, authenticator_data, client_data_json)
                     .unwrap();
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
             assert!(!verifier.verify(&mut test_rng(), &Sequential));
         });
@@ -700,14 +701,14 @@ mod tests {
             let message = sha256::Sha256::hash(b"secp256r1").to_vec();
             let (public_key, signature) = webauthn_signature(&message);
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
             assert_eq!(cache.len(), 1);
             assert!(cache.contains(&public_key));
 
             // A second verification of the same key reuses the cached decompression.
-            let mut verifier = TransactionBatchVerifier::new();
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
             assert_eq!(cache.len(), 1);

@@ -67,6 +67,7 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             write_buffer: NZUsize!(4096),
         },
         translator: EightCap,
+        init_cache_size: Some(NZUsize!(1024)),
     }
 }
 

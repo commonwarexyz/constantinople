@@ -49,6 +49,7 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 # Other
 rand.workspace = true
 criterion.workspace = true
+mimalloc.workspace = true
 
 [[bench]]
 name = "executor"
@@ -56,4 +57,8 @@ harness = false
 
 [[bench]]
 name = "compute"
+harness = false
+
+[[bench]]
+name = "finalize"
 harness = false

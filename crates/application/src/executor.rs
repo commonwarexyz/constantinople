@@ -36,9 +36,6 @@ pub type State = AHashMap<AccountKey, Account>;
 /// Deterministic account writes produced by execution.
 pub type Changeset = Vec<(AccountKey, Account)>;
 
-/// One independently applicable group of account writes.
-pub(crate) type ShardWrites = Vec<(AccountKey, Account)>;
-
 /// Account execution plan for one batch.
 pub(crate) struct ExecutionPlan<'a> {
     /// Transfers whose non-self account touches are unique in the block.
@@ -253,12 +250,18 @@ impl<'a> GeneralBuilder<'a> {
 
 /// Builds the execution plan used by both DB-backed and in-memory execution.
 pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<ExecutionPlan<'_>> {
-    let mut touches: AHashMap<&AccountKey, usize> =
+    // Count account touches by each key's precomputed 64-bit prefix instead
+    // of rehashing full 32-byte keys. A prefix collision between distinct
+    // keys only merges their counts, which can only demote transfers to the
+    // general lane; that lane deduplicates by full key and applies the same
+    // per-account checks as the discrete lane, so routing stays
+    // consensus-neutral.
+    let mut touches: AHashMap<u64, u32> =
         AHashMap::with_capacity(transfers.len().saturating_mul(2));
     for transfer in transfers {
-        *touches.entry(&transfer.sender).or_default() += 1;
+        *touches.entry(transfer.sender_prefix).or_default() += 1;
         if transfer.sender != transfer.recipient {
-            *touches.entry(&transfer.recipient).or_default() += 1;
+            *touches.entry(transfer.recipient_prefix).or_default() += 1;
         }
     }
 
@@ -270,10 +273,14 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<Execution
     };
 
     for (index, transfer) in transfers.iter().enumerate() {
-        let sender_is_unique = touches.get(&transfer.sender).copied().unwrap_or_default() == 1;
+        let sender_is_unique = touches
+            .get(&transfer.sender_prefix)
+            .copied()
+            .unwrap_or_default()
+            == 1;
         let recipient_is_unique = transfer.sender == transfer.recipient
             || touches
-                .get(&transfer.recipient)
+                .get(&transfer.recipient_prefix)
                 .copied()
                 .unwrap_or_default()
                 == 1;
@@ -317,21 +324,18 @@ pub(crate) fn apply_credit(account: &mut Account, value: u64) -> Option<()> {
 }
 
 /// Applies account-owned effects to loaded accounts.
+///
+/// Returns one final account per workload entry, in `account_keys` order.
 pub(crate) fn apply_general_accounts(
-    values: Vec<Option<Account>>,
+    values: &[Option<Account>],
     workload: &GeneralWorkload<'_>,
     transfers: &[PreparedTransfer],
-) -> Option<ShardWrites> {
+) -> Option<Vec<Account>> {
     assert_eq!(values.len(), workload.account_keys.len());
     assert_eq!(values.len(), workload.effects.len());
 
-    let mut writes = ShardWrites::with_capacity(workload.account_keys.len());
-    for ((key, effect), value) in workload
-        .account_keys
-        .iter()
-        .zip(&workload.effects)
-        .zip(values)
-    {
+    let mut writes = Vec::with_capacity(workload.effects.len());
+    for (effect, value) in workload.effects.iter().zip(values) {
         let mut account = value.unwrap_or_default();
         for index in &effect.sent {
             let transfer = &transfers[*index as usize];
@@ -344,7 +348,7 @@ pub(crate) fn apply_general_accounts(
         }
         account.balance -= effect.debit;
         apply_credit(&mut account, effect.credit)?;
-        writes.push((**key, account));
+        writes.push(account);
     }
     Some(writes)
 }
@@ -384,13 +388,20 @@ pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changese
     let plan = execution_plan(transfers)?;
     let mut changeset = execute_discrete(state, &plan.discrete)?;
     if !plan.general.is_empty() {
-        let accounts = plan
+        let accounts: Vec<Option<Account>> = plan
             .general
             .account_keys()
             .iter()
             .map(|key| state.get(*key).copied())
             .collect();
-        changeset.extend(apply_general_accounts(accounts, &plan.general, transfers)?);
+        let written = apply_general_accounts(&accounts, &plan.general, transfers)?;
+        changeset.extend(
+            plan.general
+                .account_keys()
+                .iter()
+                .map(|key| **key)
+                .zip(written),
+        );
     }
     changeset.sort_unstable_by_key(|(key, _)| *key);
     Some(changeset)

@@ -48,7 +48,10 @@ where
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
-        let client = SimplexClient::new(store_url);
+        let client = SimplexClient::new(
+            crate::namespaces::simplex_client(&StoreClient::new(store_url))
+                .expect("simplex namespace prefix must be valid"),
+        );
         let (tx, rx) = mpsc::channel(buffer);
         let join = tokio::spawn(run_uploader::<H, P, S>(client, rx));
         (Self { tx }, join)
@@ -213,7 +216,7 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex block upload must stage");
-    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let seq = commit_with_retry(client.store_client().client(), &batch).await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
@@ -277,7 +280,7 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex upload must stage");
-    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let seq = commit_with_retry(client.store_client().client(), &batch).await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
