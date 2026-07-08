@@ -13,6 +13,10 @@ pub struct Cli {
     #[arg(long)]
     pub hosts: Option<PathBuf>,
 
+    /// Port for the Prometheus metrics endpoint.
+    #[arg(long, default_value_t = commonware_deployer::aws::METRICS_PORT)]
+    pub metrics_port: u16,
+
     /// Relayer base URL for transaction submission.
     #[arg(long)]
     pub relayer_url: Option<String>,
