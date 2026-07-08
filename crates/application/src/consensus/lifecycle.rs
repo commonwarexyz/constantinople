@@ -67,7 +67,6 @@ where
 
         let (state_batch, transaction_batch) = batches;
         let execution = execute_proposal(
-            runtime.child("execute"),
             self.strategy.clone(),
             state_batch,
             transaction_batch,
@@ -153,7 +152,6 @@ where
             self.strategy.clone(),
         );
         let execution = execute_body(
-            runtime.child("execute"),
             self.strategy.clone(),
             state_batch,
             transaction_batch,
@@ -196,7 +194,7 @@ where
     )]
     pub async fn apply_certified(
         &mut self,
-        (runtime, _): (E, Context<C, P>),
+        (_, _): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
@@ -212,7 +210,6 @@ where
 
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body::<E, H, St>(
-            runtime,
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),

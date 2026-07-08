@@ -1,9 +1,11 @@
-//! Measures the dual-merkleize scheduling in `finalize_execution`: given both
-//! databases share one Rayon pool, does spawning the transaction-history
-//! merkleize on its own task beat `futures::join!` or running the two back to
-//! back? The state merkleize has long single-threaded phases that leave pool
-//! workers idle, so the spawned variant wins (~1ms at 32k txs) despite the
-//! shared pool. Also asserts all three schedules produce identical roots.
+//! Measures the dual-merkleize scheduling in `finalize_execution`: sequential
+//! awaits versus `futures::join!` versus spawning the transaction-history
+//! merkleize on its own task. The spawned variant measures ~1ms faster at 32k
+//! txs (the state merkleize has long single-threaded phases that leave pool
+//! workers idle), but production runs the merkleizes back to back: a spawned
+//! child makes glue's verify cancellation observable mid-finalize, and the
+//! gain is too small to carry that hazard. Asserts all three schedules
+//! produce identical roots.
 
 use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};

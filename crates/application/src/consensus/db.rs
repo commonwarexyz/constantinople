@@ -6,7 +6,7 @@ use commonware_glue::stateful::db::{
     any::{AnyStaged, AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
@@ -102,27 +102,17 @@ where
 }
 
 pub(super) async fn finalize_execution<E, H, S>(
-    runtime: E,
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
     transaction_batch: TransactionBatch<E, H, S>,
 ) -> Result<MerkleizedDatabases<E, H, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where
-    E: Storage + Clock + Metrics + Spawner,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    // Both merkleizations are synchronous CPU work once their reads hit the
-    // page cache, so polling them on one task would run them back to back.
-    // Spawning the transaction-history merkleize lets it overlap the state
-    // merkleize.
-    let transaction_merkleized = runtime
-        .shared(true)
-        .spawn(move |_| async move { transaction_batch.merkleize().await });
     let state_merkleized = state_staged.merkleize(state_updates, Vec::new()).await?;
-    let transaction_merkleized = transaction_merkleized
-        .await
-        .expect("transaction merkleize task must complete")?;
+    let transaction_merkleized = transaction_batch.merkleize().await?;
     Ok((state_merkleized, transaction_merkleized))
 }
 

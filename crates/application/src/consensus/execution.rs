@@ -79,8 +79,7 @@
 //! preparation and QMDB merkleization beneath the batch APIs; per-account
 //! mutation is a few instructions per account, so it runs as one serial pass.
 //! QMDB reads stay on the async path and are not run inside `Strategy`
-//! workers. The state and transaction-history merkleizations run on separate
-//! tasks so their CPU work overlaps.
+//! workers.
 
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
@@ -95,7 +94,7 @@ use crate::executor::{self, PreparedTransfer};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
@@ -338,7 +337,6 @@ where
 /// recipient, the whole batch is dropped and an empty block is proposed so the
 /// chain still makes progress.
 pub(super) async fn execute_proposal<E, C, P, H, S>(
-    runtime: E,
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -346,7 +344,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     transactions: Vec<SignedTransaction<H>>,
 ) -> ProposalExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics + Spawner,
+    E: Storage + Clock + Metrics,
     C: Digest,
     H: Hasher,
     P: PublicKey,
@@ -374,7 +372,6 @@ where
 
     ProposalExecution {
         block: finalize_child(
-            runtime,
             staged,
             state_updates,
             transaction_batch,
@@ -388,7 +385,6 @@ where
 }
 
 pub(super) async fn execute_body<E, C, P, H, S>(
-    runtime: E,
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -396,7 +392,7 @@ pub(super) async fn execute_body<E, C, P, H, S>(
     body: PreparedBody<H>,
 ) -> Result<BlockExecution<E, H, S>>
 where
-    E: Storage + Clock + Metrics + Spawner,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -414,7 +410,6 @@ where
         .in_scope(|| apply_transaction_digests(transaction_batch, &digests));
 
     Ok(finalize_child(
-        runtime,
         staged,
         state_updates,
         transaction_batch,
@@ -426,7 +421,6 @@ where
 }
 
 pub(super) async fn apply_prepared_body<E, H, S>(
-    runtime: E,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
@@ -434,7 +428,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     digests: &[H::Digest],
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
-    E: Storage + Clock + Metrics + Spawner,
+    E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -448,7 +442,7 @@ where
             .with_inactivity_floor(transaction_floor)
     });
 
-    db::finalize_execution(runtime, staged, state_updates, transaction_batch)
+    db::finalize_execution(staged, state_updates, transaction_batch)
         .await
         .map_err(|_| STATIC_INVALID_TRANSACTION)
 }
@@ -486,7 +480,6 @@ where
 
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
 async fn finalize_child<E, C, P, H, S>(
-    runtime: E,
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -495,7 +488,7 @@ async fn finalize_child<E, C, P, H, S>(
     expect_message: &'static str,
 ) -> BlockExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics + Spawner,
+    E: Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -504,7 +497,7 @@ where
     let transaction_batch =
         transaction_batch.with_inactivity_floor(parent_transactions_inactivity_floor(parent));
     let (state, transactions) =
-        db::finalize_execution(runtime, state_staged, state_updates, transaction_batch)
+        db::finalize_execution(state_staged, state_updates, transaction_batch)
             .await
             .expect(expect_message);
     let state_sync_range = range_from_bounds(state.bounds());
