@@ -12,8 +12,7 @@ use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
 use futures::{Stream, StreamExt};
-use rand::Rng;
-use rand_core::CryptoRng;
+use rand::{CryptoRng, Rng};
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
 where

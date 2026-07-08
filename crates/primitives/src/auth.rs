@@ -14,7 +14,7 @@ use core::{
     ops::Deref,
 };
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey, signature::Verifier as _};
-use rand_core::CryptoRng;
+use rand::CryptoRng;
 
 pub(crate) const ED25519_SCHEME: u8 = 0;
 pub(crate) const SECP256R1_SCHEME: u8 = 1;

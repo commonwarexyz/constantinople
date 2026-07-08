@@ -7,7 +7,7 @@ use commonware_runtime::{Clock, Spawner, telemetry::traces::TracedExt as _};
 use constantinople_primitives::{
     LazySignedTransaction, PublicKeyCache, preload_transaction_slice, verify_transaction_batch,
 };
-use rand_core::CryptoRng;
+use rand::CryptoRng;
 use std::sync::Arc;
 use tracing::{Instrument, info_span};
 

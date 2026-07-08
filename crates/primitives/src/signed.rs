@@ -18,7 +18,7 @@ use commonware_codec::{
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
-use rand_core::CryptoRng;
+use rand::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.

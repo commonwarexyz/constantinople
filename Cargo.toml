@@ -89,7 +89,6 @@ futures = { version = "0.3.31", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 arbitrary = { version = "1.4.2", features = ["derive"] }
 ahash = "0.8.12"
-rand_core = "0.10.1"
 reqwest = { version = "0.13.4", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }

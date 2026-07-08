@@ -1569,7 +1569,6 @@ dependencies = [
  "mimalloc",
  "prometheus-client",
  "rand 0.10.2",
- "rand_core 0.10.1",
  "tracing",
 ]
 
@@ -1618,7 +1617,6 @@ dependencies = [
  "futures",
  "prometheus-client",
  "rand 0.10.2",
- "rand_core 0.10.1",
  "thiserror",
  "tracing",
  "tracing-subscriber",
@@ -1660,7 +1658,6 @@ dependencies = [
  "futures",
  "mimalloc",
  "rand 0.10.2",
- "rand_core 0.10.1",
  "serde",
  "serde_yaml",
  "thiserror",
@@ -1718,7 +1715,6 @@ dependencies = [
  "derive_more",
  "p256",
  "rand 0.10.2",
- "rand_core 0.10.1",
  "serde_json",
 ]
 
@@ -1775,7 +1771,6 @@ dependencies = [
  "constantinople-primitives",
  "futures",
  "mimalloc",
- "rand_core 0.10.1",
  "reqwest",
  "serde",
  "serde_json",

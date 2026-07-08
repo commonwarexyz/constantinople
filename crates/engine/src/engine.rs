@@ -63,7 +63,7 @@ use constantinople_application::consensus::{
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
-use rand_core::CryptoRng;
+use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
     time::{Duration, Instant},

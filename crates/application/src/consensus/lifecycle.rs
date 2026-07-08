@@ -20,8 +20,7 @@ use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::Tr
 use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
-use rand::Rng;
-use rand_core::CryptoRng;
+use rand::{CryptoRng, Rng};
 use std::sync::Arc;
 use tracing::{Instrument as _, info, info_span, warn};
 
