@@ -45,6 +45,7 @@ axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
+mimalloc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
 thiserror.workspace = true

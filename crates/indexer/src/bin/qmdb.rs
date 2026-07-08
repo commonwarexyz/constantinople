@@ -28,6 +28,9 @@ use std::{
 };
 use tracing::info;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type AccountValue = FixedBytes<{ Account::SIZE }>;
 type StateClient =
     UnorderedClient<mmr::Family, Sha256, AccountKey, AccountValue, FixedEncoding<AccountValue>>;
