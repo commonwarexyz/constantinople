@@ -53,3 +53,9 @@ rand.workspace = true
 bytes.workspace = true
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true, features = ["executor"] }
+criterion.workspace = true
+mimalloc.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false

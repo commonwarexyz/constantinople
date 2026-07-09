@@ -28,7 +28,6 @@
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
 use constantinople_primitives::{Account, AccountKey, SignedTransaction};
-use core::marker::PhantomData;
 
 /// Fully loaded base account state for one in-memory execution batch.
 pub type State = AHashMap<AccountKey, Account>;
@@ -37,39 +36,39 @@ pub type State = AHashMap<AccountKey, Account>;
 pub type Changeset = Vec<(AccountKey, Account)>;
 
 /// Account execution plan for one batch.
-pub(crate) struct ExecutionPlan<'a> {
+pub(crate) struct ExecutionPlan {
     /// Transfers whose non-self account touches are unique in the block.
-    pub(crate) discrete: DiscreteWorkload<'a>,
+    pub(crate) discrete: DiscreteWorkload,
     /// Account-owned effects for the remaining transfers.
-    pub(crate) general: GeneralWorkload<'a>,
+    pub(crate) general: GeneralWorkload,
 }
 
 /// Transfers that can produce direct sender and recipient writes.
-pub(crate) struct DiscreteWorkload<'a> {
-    /// Transfers, in block order.
-    pub(crate) transfers: Vec<&'a PreparedTransfer>,
+pub(crate) struct DiscreteWorkload {
+    /// Indices into the original transfer list, in block order.
+    pub(crate) transfers: Vec<usize>,
     /// Sender account keys, in transfer order.
-    pub(crate) sender_keys: Vec<&'a AccountKey>,
+    pub(crate) sender_keys: Vec<AccountKey>,
     /// Non-self recipient account keys, in transfer order.
-    pub(crate) recipient_keys: Vec<&'a AccountKey>,
+    pub(crate) recipient_keys: Vec<AccountKey>,
 }
 
 /// Account-owned effects for transfers that touch contended accounts.
-pub(crate) struct GeneralWorkload<'a> {
+pub(crate) struct GeneralWorkload {
     /// Account keys to load, deduplicated exactly.
-    account_keys: Vec<&'a AccountKey>,
+    account_keys: Vec<AccountKey>,
     /// Effects to apply to each loaded account.
     effects: Vec<AccountEffect>,
 }
 
-impl<'a> GeneralWorkload<'a> {
+impl GeneralWorkload {
     /// Whether the general lane has no account effects.
     pub(crate) const fn is_empty(&self) -> bool {
         self.account_keys.is_empty()
     }
 
     /// Account keys to load for the general lane.
-    pub(crate) fn account_keys(&self) -> &[&'a AccountKey] {
+    pub(crate) fn account_keys(&self) -> &[AccountKey] {
         &self.account_keys
     }
 }
@@ -121,37 +120,35 @@ pub(crate) struct AccountEffect {
     credit: u64,
 }
 
-struct AccountIndexTable<'a> {
+struct AccountIndexTable {
     slots: Vec<AccountIndexSlot>,
     mask: usize,
     len: usize,
-    _marker: PhantomData<&'a AccountKey>,
 }
 
 #[derive(Clone, Copy)]
 struct AccountIndexSlot {
-    key: *const AccountKey,
+    key: Option<AccountKey>,
     index: u32,
 }
 
-impl<'a> AccountIndexTable<'a> {
+impl AccountIndexTable {
     fn with_capacity(capacity: usize) -> Self {
         let slots = capacity.saturating_mul(2).next_power_of_two().max(16);
         Self {
             slots: vec![
                 AccountIndexSlot {
-                    key: core::ptr::null(),
-                    index: 0,
+                    key: None,
+                    index: 0
                 };
                 slots
             ],
             mask: slots - 1,
             len: 0,
-            _marker: PhantomData,
         }
     }
 
-    fn get_or_insert(&mut self, prefix: u64, key: &'a AccountKey, index: u32) -> (u32, bool) {
+    fn get_or_insert(&mut self, prefix: u64, key: AccountKey, index: u32) -> (u32, bool) {
         if self.len.saturating_mul(2) >= self.slots.len() {
             self.grow();
         }
@@ -159,14 +156,15 @@ impl<'a> AccountIndexTable<'a> {
         let mut slot = (prefix as usize) & self.mask;
         loop {
             let entry = self.slots[slot];
-            if entry.key.is_null() {
-                self.slots[slot] = AccountIndexSlot { key, index };
+            if entry.key.is_none() {
+                self.slots[slot] = AccountIndexSlot {
+                    key: Some(key),
+                    index,
+                };
                 self.len += 1;
                 return (index, true);
             }
-            // SAFETY: keys are pointers to accounts borrowed from `transfers`,
-            // which outlive the table through `'a`.
-            if unsafe { *entry.key == *key } {
+            if entry.key == Some(key) {
                 return (entry.index, false);
             }
             slot = (slot + 1) & self.mask;
@@ -179,8 +177,8 @@ impl<'a> AccountIndexTable<'a> {
             &mut self.slots,
             vec![
                 AccountIndexSlot {
-                    key: core::ptr::null(),
-                    index: 0,
+                    key: None,
+                    index: 0
                 };
                 new_slots
             ],
@@ -189,37 +187,38 @@ impl<'a> AccountIndexTable<'a> {
         self.len = 0;
 
         for slot in old_slots {
-            if !slot.key.is_null() {
-                // SAFETY: keys are pointers to accounts borrowed from `transfers`,
-                // which outlive the table through `'a`.
-                self.insert_unique(unsafe { &*slot.key }, slot.index);
+            if let Some(key) = slot.key {
+                self.insert_unique(key, slot.index);
             }
         }
     }
 
-    fn insert_unique(&mut self, key: &'a AccountKey, index: u32) {
+    fn insert_unique(&mut self, key: AccountKey, index: u32) {
         let mut slot = (key.prefix() as usize) & self.mask;
-        while !self.slots[slot].key.is_null() {
+        while self.slots[slot].key.is_some() {
             slot = (slot + 1) & self.mask;
         }
-        self.slots[slot] = AccountIndexSlot { key, index };
+        self.slots[slot] = AccountIndexSlot {
+            key: Some(key),
+            index,
+        };
         self.len += 1;
     }
 }
 
 /// Builder for the general lane's dense account-effect table.
 ///
-/// Account keys are borrowed from the prepared transfer slice and deduplicated by
+/// Account keys are copied from the prepared transfer slice and deduplicated by
 /// value. The prefix only seeds the probe position; equality still compares the
 /// full account key, so equal keys from different transfer slots share one
 /// effect.
-struct GeneralBuilder<'a> {
-    account_keys: Vec<&'a AccountKey>,
+struct GeneralBuilder {
+    account_keys: Vec<AccountKey>,
     effects: Vec<AccountEffect>,
-    indices: AccountIndexTable<'a>,
+    indices: AccountIndexTable,
 }
 
-impl<'a> GeneralBuilder<'a> {
+impl GeneralBuilder {
     fn new(transfers: usize) -> Self {
         let expected_accounts = transfers.saturating_mul(2).max(16);
         Self {
@@ -229,18 +228,18 @@ impl<'a> GeneralBuilder<'a> {
         }
     }
 
-    fn account(&mut self, prefix: u64, key: &'a AccountKey) -> &mut AccountEffect {
+    fn account(&mut self, prefix: u64, key: &AccountKey) -> &mut AccountEffect {
         let (account, inserted) =
             self.indices
-                .get_or_insert(prefix, key, self.account_keys.len() as u32);
+                .get_or_insert(prefix, *key, self.account_keys.len() as u32);
         if inserted {
-            self.account_keys.push(key);
+            self.account_keys.push(*key);
             self.effects.push(AccountEffect::default());
         }
         &mut self.effects[account as usize]
     }
 
-    fn into_workload(self) -> GeneralWorkload<'a> {
+    fn into_workload(self) -> GeneralWorkload {
         GeneralWorkload {
             account_keys: self.account_keys,
             effects: self.effects,
@@ -249,7 +248,7 @@ impl<'a> GeneralBuilder<'a> {
 }
 
 /// Builds the execution plan used by both DB-backed and in-memory execution.
-pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<ExecutionPlan<'_>> {
+pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<ExecutionPlan> {
     // Count account touches by each key's precomputed 64-bit prefix instead
     // of rehashing full 32-byte keys. A prefix collision between distinct
     // keys only merges their counts, which can only demote transfers to the
@@ -285,10 +284,10 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<Execution
                 .unwrap_or_default()
                 == 1;
         if sender_is_unique && recipient_is_unique {
-            discrete.transfers.push(transfer);
-            discrete.sender_keys.push(&transfer.sender);
+            discrete.transfers.push(index);
+            discrete.sender_keys.push(transfer.sender);
             if transfer.sender != transfer.recipient {
-                discrete.recipient_keys.push(&transfer.recipient);
+                discrete.recipient_keys.push(transfer.recipient);
             }
             continue;
         }
@@ -328,7 +327,7 @@ pub(crate) fn apply_credit(account: &mut Account, value: u64) -> Option<()> {
 /// Returns one final account per workload entry, in `account_keys` order.
 pub(crate) fn apply_general_accounts(
     values: &[Option<Account>],
-    workload: &GeneralWorkload<'_>,
+    workload: &GeneralWorkload,
     transfers: &[PreparedTransfer],
 ) -> Option<Vec<Account>> {
     assert_eq!(values.len(), workload.account_keys.len());
@@ -353,11 +352,16 @@ pub(crate) fn apply_general_accounts(
     Some(writes)
 }
 
-fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Changeset> {
+fn execute_discrete(
+    state: &State,
+    plan: &DiscreteWorkload,
+    transfers: &[PreparedTransfer],
+) -> Option<Changeset> {
     assert_eq!(plan.sender_keys.len(), plan.transfers.len());
     let mut changeset =
         Changeset::with_capacity(plan.sender_keys.len() + plan.recipient_keys.len());
-    for (sender_key, transfer) in plan.sender_keys.iter().zip(&plan.transfers) {
+    for (sender_key, transfer_index) in plan.sender_keys.iter().zip(&plan.transfers) {
+        let transfer = &transfers[*transfer_index];
         let mut sender = state.get(&transfer.sender).copied().unwrap_or_default();
         if sender.balance < transfer.value || !sender.nonce.consume(transfer.nonce) {
             return None;
@@ -365,10 +369,11 @@ fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Change
         if transfer.sender != transfer.recipient {
             sender.balance -= transfer.value;
         }
-        changeset.push((**sender_key, sender));
+        changeset.push((*sender_key, sender));
     }
 
-    for transfer in &plan.transfers {
+    for transfer_index in &plan.transfers {
+        let transfer = &transfers[*transfer_index];
         if transfer.sender == transfer.recipient {
             continue;
         }
@@ -386,22 +391,16 @@ fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Change
 /// balance check or any recipient credit overflows.
 pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset> {
     let plan = execution_plan(transfers)?;
-    let mut changeset = execute_discrete(state, &plan.discrete)?;
+    let mut changeset = execute_discrete(state, &plan.discrete, transfers)?;
     if !plan.general.is_empty() {
         let accounts: Vec<Option<Account>> = plan
             .general
             .account_keys()
             .iter()
-            .map(|key| state.get(*key).copied())
+            .map(|key| state.get(key).copied())
             .collect();
         let written = apply_general_accounts(&accounts, &plan.general, transfers)?;
-        changeset.extend(
-            plan.general
-                .account_keys()
-                .iter()
-                .map(|key| **key)
-                .zip(written),
-        );
+        changeset.extend(plan.general.account_keys().iter().copied().zip(written));
     }
     changeset.sort_unstable_by_key(|(key, _)| *key);
     Some(changeset)

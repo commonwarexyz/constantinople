@@ -21,7 +21,7 @@ use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 use rand::{CryptoRng, Rng};
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 use tracing::{Instrument as _, info, info_span, warn};
 
 impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
@@ -49,7 +49,7 @@ where
     pub async fn propose_child(
         &mut self,
         (runtime, context): (E, Context<C, P>),
-        parent: &SealedBlock<C, P, H>,
+        parent: SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut I,
     ) -> Option<Proposed<Self, E>>
@@ -64,12 +64,14 @@ where
             .instrument(info_span!("application.propose.input"))
             .await;
 
+        let parent_digest = parent.digest();
+        let parent_height = parent.header.height;
         let (state_batch, transaction_batch) = batches;
         let execution = execute_proposal(
             self.strategy.clone(),
             state_batch,
             transaction_batch,
-            parent,
+            &parent,
             body,
         )
         .await;
@@ -79,8 +81,8 @@ where
 
         let header = Header {
             context,
-            parent: parent.digest(),
-            height: parent.header.height + 1,
+            parent: parent_digest,
+            height: parent_height + 1,
             timestamp: time::timestamp_ms(&runtime),
             state_root: execution.block.state.root(),
             state_range: execution.block.state_sync_range.clone(),
@@ -104,7 +106,7 @@ where
         })
     }
 
-    /// Verifies a child block against an already fetched parent.
+    /// Verifies a child block against a parent that may still be in flight.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(
@@ -112,14 +114,14 @@ where
         skip_all,
         fields(
             height = block.header.height.traced(),
-            parent_height = parent.header.height.traced(),
+            parent_height = tracing::field::Empty,
         )
     )]
     pub async fn verify_child(
         &mut self,
         (runtime, _context): (E, Context<C, P>),
         block: SealedBlock<C, P, H>,
-        parent: &SealedBlock<C, P, H>,
+        parent: impl Future<Output = Option<SealedBlock<C, P, H>>> + Send,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
@@ -129,6 +131,23 @@ where
         St: Strategy,
     {
         let Block { header, body } = block.into_inner();
+
+        // Signature verification needs only the block body, so it starts
+        // immediately and overlaps the parent fetch below.
+        let body = Arc::new(body);
+        let (state_batch, transaction_batch) = batches;
+        let signatures = verify_signatures::<E, H, St>(
+            runtime.child("verify_signatures"),
+            self.transaction_namespace,
+            self.public_key_cache.clone(),
+            Arc::clone(&body),
+            &self.strategy,
+        );
+
+        let parent = parent
+            .instrument(info_span!("application.verify.parent"))
+            .await?;
+        tracing::Span::current().record("parent_height", parent.header.height.traced());
 
         if !time::is_valid_child_timestamp(parent.header.timestamp, header.timestamp) {
             warn!(
@@ -141,21 +160,15 @@ where
             return None;
         }
 
-        let body = Arc::new(body);
-        let (state_batch, transaction_batch) = batches;
-        let signatures = verify_signatures::<E, H, St>(
-            runtime.child("verify_signatures"),
-            self.transaction_namespace,
-            self.public_key_cache.clone(),
-            Arc::clone(&body),
-            self.strategy.clone(),
-        );
+        // Execution stays on this async task; CPU-heavy stages are dispatched
+        // to the strategy's pool, so a failure surfaces as a graceful
+        // rejection below.
         let execution = execute_body(
             self.strategy.clone(),
             state_batch,
             transaction_batch,
-            parent,
-            Arc::clone(&body),
+            &parent,
+            body,
         );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
@@ -203,8 +216,12 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let (body, digests) = info_span!("application.apply.prepare")
-            .in_scope(|| prepare_lazy(&self.strategy, block.body.as_slice()))
+        let strategy = self.strategy.clone();
+        let body = block.body.clone();
+        let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
+        let (body, digests) = strategy
+            .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, &body)))
+            .await
             .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
 
         let (state_batch, transaction_batch) = batches;
@@ -212,8 +229,9 @@ where
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
-            &body,
-            &digests,
+            body,
+            digests,
+            strategy,
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"))

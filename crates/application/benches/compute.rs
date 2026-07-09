@@ -18,6 +18,7 @@ use constantinople_primitives::{
 use core::num::{NonZeroU64, NonZeroUsize};
 use std::{
     hint::black_box,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -297,10 +298,11 @@ fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
 
 async fn time_compute(
     batch: Batch,
-    transfers: &[PreparedTransfer],
+    transfers: Arc<Vec<PreparedTransfer>>,
+    strategy: &Rayon,
 ) -> (usize, Duration, Duration, String) {
     let start = Instant::now();
-    let (staged, updates) = consensus::compute(batch, transfers).await;
+    let (staged, updates) = consensus::compute(batch, transfers, strategy).await;
     let updates = updates.expect("compute path");
     let compute_elapsed = start.elapsed();
     let count = updates.len();
@@ -374,7 +376,8 @@ async fn time_combined_load(batch: &Batch, plan: &LoadPlan<'_>) -> Duration {
 async fn time_prepare_compute(batch: Batch, strategy: &Rayon, txs: &[TestTx]) -> (usize, Duration) {
     let start = Instant::now();
     let (transfers, digests) = consensus::prepare_signed(strategy, txs).expect("prepare");
-    let (staged, updates) = consensus::compute(batch, &transfers).await;
+    let transfers = Arc::new(transfers);
+    let (staged, updates) = consensus::compute(batch, transfers.clone(), strategy).await;
     let updates = updates.expect("compute path");
     let elapsed = start.elapsed();
     let count = updates.len();
@@ -458,7 +461,7 @@ fn main() {
                     continue;
                 }
 
-                let transfers = transfers(fixture, n);
+                let transfers = Arc::new(transfers(fixture, n));
                 if bench_loads {
                     let plan = load_plan(&transfers);
                     let mut seq_total = Duration::ZERO;
@@ -494,7 +497,8 @@ fn main() {
                 let mut root = String::new();
                 for iter in 0..(warmup + iters) {
                     let batch = db.new_batches().await;
-                    let (count, compute_t, merk_t, r) = time_compute(batch, &transfers).await;
+                    let (count, compute_t, merk_t, r) =
+                        time_compute(batch, Arc::clone(&transfers), &strategy).await;
                     writes = count;
                     root = r;
                     if iter >= warmup {

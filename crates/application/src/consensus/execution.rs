@@ -94,13 +94,14 @@ use crate::executor::{self, PreparedTransfer};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Storage};
+use commonware_runtime::{Clock, Metrics, Storage, telemetry::traces::TracedExt as _};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
     Account, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
 };
-use tracing::{Instrument as _, info_span};
+use std::sync::Arc;
+use tracing::info_span;
 
 pub(super) struct ProposalExecution<E, H, S>
 where
@@ -144,20 +145,28 @@ where
 /// affected account once and applies its accumulated effect. Returns the staged
 /// batch alongside `None` if any transfer fails its nonce or balance check or
 /// overflows a recipient (the whole batch is rejected).
+#[tracing::instrument(name = "application.execute.compute", level = "info", skip_all)]
 pub async fn compute<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
-    transfers: &[PreparedTransfer],
+    transfers: Arc<Vec<PreparedTransfer>>,
+    strategy: &S,
 ) -> (StateStaged<E, H, EightCap, S>, Option<StateUpdates>)
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let Some(plan) = executor::execution_plan(transfers) else {
+    let Some(plan) = executor::execution_plan(&transfers) else {
         return (stage_empty(batch).await, None);
     };
     let (staged, values) = load_accounts(batch, &plan.discrete, &plan.general).await;
-    let updates = build_updates(&plan, transfers, &values);
+    let build_span = info_span!(
+        "application.execute.build",
+        accounts = values.len().traced()
+    );
+    let updates = strategy
+        .spawn(move |_: S| build_span.in_scope(|| build_updates(plan, transfers, values)))
+        .await;
     (staged, updates)
 }
 
@@ -204,8 +213,8 @@ impl LoadedAccounts {
 
 async fn load_accounts<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
-    discrete: &executor::DiscreteWorkload<'_>,
-    general: &executor::GeneralWorkload<'_>,
+    discrete: &executor::DiscreteWorkload,
+    general: &executor::GeneralWorkload,
 ) -> (StateStaged<E, H, EightCap, S>, LoadedAccounts)
 where
     E: Storage + Clock + Metrics,
@@ -220,7 +229,6 @@ where
         .iter()
         .chain(&discrete.recipient_keys)
         .chain(general.account_keys())
-        .copied()
         .collect::<Vec<_>>();
 
     // One staged QMDB read lets the storage layer sort and batch journal
@@ -250,15 +258,16 @@ where
 /// pass into the updates vector beats parallel fan-out and its intermediate
 /// buffers.
 fn build_updates(
-    plan: &executor::ExecutionPlan<'_>,
-    transfers: &[PreparedTransfer],
-    values: &LoadedAccounts,
+    plan: executor::ExecutionPlan,
+    transfers: Arc<Vec<PreparedTransfer>>,
+    values: LoadedAccounts,
 ) -> Option<StateUpdates> {
-    let executor::ExecutionPlan { discrete, general } = plan;
+    let executor::ExecutionPlan { discrete, general } = &plan;
     let mut updates = StateUpdates::with_capacity(values.len());
 
     // Discrete senders: one write per transfer, in transfer order.
-    for (transfer, value) in discrete.transfers.iter().zip(values.senders()) {
+    for (transfer_index, value) in discrete.transfers.iter().zip(values.senders()) {
+        let transfer = &transfers[*transfer_index];
         let mut account = value.unwrap_or_default();
         if account.balance < transfer.value || !account.nonce.consume(transfer.nonce) {
             return None;
@@ -273,11 +282,11 @@ fn build_updates(
     // order. The zip is exhaustive because recipient_keys was built from
     // exactly the non-self transfers (asserted against the staged read count
     // in load_accounts).
-    let non_self = discrete
-        .transfers
-        .iter()
-        .filter(|transfer| transfer.sender != transfer.recipient);
-    for (transfer, value) in non_self.zip(values.recipients()) {
+    let non_self = discrete.transfers.iter().filter(|&&transfer_index| {
+        transfers[transfer_index].sender != transfers[transfer_index].recipient
+    });
+    for (transfer_index, value) in non_self.zip(values.recipients()) {
+        let transfer = &transfers[*transfer_index];
         let mut account = value.unwrap_or_default();
         executor::apply_credit(&mut account, transfer.value)?;
         updates.push((updates.len(), Some(account)));
@@ -285,7 +294,7 @@ fn build_updates(
 
     // General lane: one write per affected account, in account order.
     if !general.is_empty() {
-        let written = executor::apply_general_accounts(values.general(), general, transfers)?;
+        let written = executor::apply_general_accounts(values.general(), general, &transfers)?;
         for account in written {
             updates.push((updates.len(), Some(account)));
         }
@@ -336,6 +345,7 @@ where
 /// candidate is malformed, fails its nonce or balance check, or overflows a
 /// recipient, the whole batch is dropped and an empty block is proposed so the
 /// chain still makes progress.
+#[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
@@ -350,13 +360,23 @@ where
     P: PublicKey,
     S: Strategy,
 {
-    let prepared = prepare_signed(&strategy, &transactions);
+    let prepare_span = info_span!(
+        "application.execute.prepare",
+        txs = transactions.len().traced()
+    );
+    let prepared = strategy
+        .spawn(move |s| {
+            prepare_span.in_scope(|| {
+                prepare_signed(&s, &transactions)
+                    .map(|(transfers, digests)| (transfers, digests, transactions))
+            })
+        })
+        .await;
 
     let (staged, outcome) = match prepared {
-        Some((transfers, digests)) if !transfers.is_empty() => {
-            let (staged, updates) = compute(state_batch, &transfers)
-                .instrument(info_span!("application.execute.compute"))
-                .await;
+        Some((transfers, digests, transactions)) if !transfers.is_empty() => {
+            let transfers = Arc::new(transfers);
+            let (staged, updates) = compute(state_batch, transfers, &strategy).await;
             (
                 staged,
                 updates.map(|updates| (transactions, digests, updates)),
@@ -367,8 +387,12 @@ where
 
     let (body, digests, state_updates) = outcome.unwrap_or_default();
 
-    let transaction_batch = info_span!("application.execute.apply")
-        .in_scope(|| apply_transaction_digests(transaction_batch, &digests));
+    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
+    let transaction_batch = strategy
+        .spawn(move |_: S| {
+            apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
+        })
+        .await;
 
     ProposalExecution {
         block: finalize_child(
@@ -384,6 +408,7 @@ where
     }
 }
 
+#[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_body<E, C, P, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
@@ -398,49 +423,61 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let (transfers, digests) = info_span!("application.execute.prepare")
-        .in_scope(|| prepare_lazy(&strategy, body.as_ref().as_slice()))?;
+    let prepare_span = info_span!("application.execute.prepare", txs = body.len().traced());
+    let (transfers, digests) = strategy
+        .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice())))
+        .await?;
 
-    let (staged, updates) = compute(state_batch, &transfers)
-        .instrument(info_span!("application.execute.compute"))
-        .await;
+    let transaction_count = transfers.len();
+    let transfers = Arc::new(transfers);
+    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    let transaction_batch = info_span!("application.execute.apply")
-        .in_scope(|| apply_transaction_digests(transaction_batch, &digests));
+    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
+    let transaction_batch = strategy
+        .spawn(move |_: S| {
+            apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
+        })
+        .await;
 
     Ok(finalize_child(
         staged,
         state_updates,
         transaction_batch,
         parent,
-        transfers.len(),
+        transaction_count,
         "database merkleization during verification must succeed",
     )
     .await)
 }
 
+#[tracing::instrument(name = "application.apply.body", level = "info", skip_all)]
 pub(super) async fn apply_prepared_body<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     transaction_floor: mmr::Location,
-    transfers: &[PreparedTransfer],
-    digests: &[H::Digest],
+    transfers: Vec<PreparedTransfer>,
+    digests: Vec<H::Digest>,
+    strategy: S,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
     E: Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let (staged, updates) = compute(state_batch, transfers)
-        .instrument(info_span!("application.execute.compute"))
-        .await;
+    let transfers = Arc::new(transfers);
+    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    let transaction_batch = info_span!("application.execute.apply").in_scope(|| {
-        apply_transaction_digests(transaction_batch, digests)
-            .with_inactivity_floor(transaction_floor)
-    });
+    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
+    let transaction_batch = strategy
+        .spawn(move |_: S| {
+            apply_span.in_scope(|| {
+                apply_transaction_digests(transaction_batch, &digests)
+                    .with_inactivity_floor(transaction_floor)
+            })
+        })
+        .await;
 
     db::finalize_execution(staged, state_updates, transaction_batch)
         .await

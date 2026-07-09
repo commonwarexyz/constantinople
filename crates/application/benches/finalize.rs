@@ -28,7 +28,10 @@ use constantinople_application::{
 };
 use constantinople_primitives::{Account, AccountKey, Nonce};
 use core::num::NonZeroUsize;
-use std::time::{Duration, Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -126,7 +129,7 @@ fn main() {
             let transactions = transaction_batch.merkleize().await.expect("seed txs");
             dbs.finalize((state, transactions)).await;
 
-            let transfers = transfers();
+            let transfers = Arc::new(transfers());
             let digests: Vec<_> = (0..TXS as u64)
                 .map(|i| Sha256::hash(&(u64::MAX - i).to_le_bytes()))
                 .collect();
@@ -136,7 +139,8 @@ fn main() {
             for iter in 0..(WARMUP + ITERS) {
                 for variant in 0..3 {
                     let (state_batch, mut transaction_batch) = dbs.new_batches().await;
-                    let (staged, updates) = consensus::compute(state_batch, &transfers).await;
+                    let (staged, updates) =
+                        consensus::compute(state_batch, Arc::clone(&transfers), &strategy).await;
                     let updates = updates.expect("compute");
                     for digest in &digests {
                         transaction_batch = transaction_batch.append(*digest);

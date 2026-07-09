@@ -15,6 +15,7 @@ use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
+use commonware_runtime::telemetry::traces::TracedExt as _;
 use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
     TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
@@ -22,6 +23,7 @@ use constantinople_primitives::{
 use rand::rng;
 use std::{fmt::Display, sync::Arc};
 use tower_http::cors::{Any, CorsLayer};
+use tracing::info_span;
 
 /// Maximum bytes needed to encode the batch-length prefix.
 ///
@@ -100,6 +102,15 @@ fn max_transaction_count(body_len: usize) -> Option<usize> {
     (max_transactions > 0).then_some(max_transactions)
 }
 
+/// Serializes a JSON response body, mapping the (practically impossible)
+/// serialization failure to a 500 instead of panicking.
+fn ok_json<T: serde::Serialize>(value: &T) -> (StatusCode, String) {
+    serde_json::to_string(value)
+        .map_or((StatusCode::INTERNAL_SERVER_ERROR, String::new()), |body| {
+            (StatusCode::OK, body)
+        })
+}
+
 /// Accepts a batch of signed transactions as a commonware-codec length-prefixed
 /// vector.
 ///
@@ -122,7 +133,6 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let batch_id = H::hash(&body).to_string();
     let batch = match verify_body::<P, H, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
@@ -130,7 +140,7 @@ where
 
     // Phase 3: Submit to actor and await result.
     let Some(result_rx) = state.mailbox.try_submit(
-        batch_id,
+        batch.batch_id,
         batch.digests,
         batch.transactions,
         batch.total_bytes,
@@ -140,12 +150,7 @@ where
 
     result_rx.await.map_or_else(
         |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-        |status| {
-            (
-                StatusCode::OK,
-                serde_json::to_string(&status).expect("TxStatus serialization cannot fail"),
-            )
-        },
+        |status| ok_json(&status),
     )
 }
 
@@ -164,15 +169,37 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let batch_id = H::hash(&body).to_string();
     let batch = match verify_body::<P, H, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
-    let digests = batch.digests.iter().map(ToString::to_string).collect();
+
+    // Hex-encoding thousands of digests into the JSON response is nontrivial
+    // formatting work, so build the response body on the strategy's pool
+    // instead of a core worker. Pool threads have an empty tracing context,
+    // so pass the request's span explicitly to keep ingress spans stitched to
+    // it.
+    let parent = tracing::Span::current();
+    let respond = state.strategy.spawn(move |_| {
+        info_span!(
+            parent: &parent,
+            "mempool.ingress.respond",
+            txs = batch.digests.len().traced()
+        )
+        .in_scope(|| {
+            serde_json::to_string(&IngestResponse {
+                digests: batch.digests.iter().map(ToString::to_string).collect(),
+            })
+        })
+        .map(|response| (batch, response))
+    });
+    let (batch, response) = match respond.await {
+        Ok(result) => result,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+    };
 
     let Some(result_rx) = state.mailbox.try_ingest(
-        batch_id,
+        batch.batch_id,
         batch.digests,
         batch.transactions,
         batch.total_bytes,
@@ -186,17 +213,14 @@ where
         Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
     }
 
-    let response = IngestResponse { digests };
-    (
-        StatusCode::ACCEPTED,
-        serde_json::to_string(&response).expect("ingest response serialization cannot fail"),
-    )
+    (StatusCode::ACCEPTED, response)
 }
 
 struct VerifiedBatch<H>
 where
     H: Hasher,
 {
+    batch_id: String,
     transactions: Vec<VerifiedTransaction<H>>,
     digests: Vec<H::Digest>,
     total_bytes: usize,
@@ -218,44 +242,74 @@ where
     let Some(max_transactions) = max_transaction_count(body.len()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
-    let cfg = (RangeCfg::new(1..=max_transactions), ());
-    let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
-        .map_err(|_| StatusCode::BAD_REQUEST)?;
-    let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
 
-    if total_bytes > state.max_batch_bytes {
-        return Err(StatusCode::PAYLOAD_TOO_LARGE);
-    }
-
-    let strategy = state.strategy.clone();
+    // Hashing, decoding, and verifying a relayer batch is milliseconds of CPU
+    // work at production sizes, so all of it runs on the strategy's pool
+    // instead of a core worker; only the cheap length checks above stay
+    // inline. Hosting the job on a pool member (rather than a blocking
+    // thread) also lets it work-steal during the nested parallel signature
+    // verification instead of parking. Pool threads have an empty tracing
+    // context, so pass the request's span explicitly to keep ingress spans
+    // stitched to it.
+    let parent = tracing::Span::current();
+    let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
-    let signed_lazy = signed
-        .into_iter()
-        .map(LazySignedTransaction::new)
-        .collect::<Vec<_>>();
-    let transactions = tokio::task::spawn_blocking(move || {
-        verify_transaction_chunks::<H, _>(
+    let verified = state.strategy.spawn(move |strategy| {
+        let batch_id = H::hash(&body).to_string();
+
+        let decode = info_span!(
+            parent: &parent,
+            "mempool.ingress.decode",
+            bytes = body.len().traced(),
+            txs = tracing::field::Empty,
+        )
+        .entered();
+        let cfg = (RangeCfg::new(1..=max_transactions), ());
+        let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
+            .map_err(|_| StatusCode::BAD_REQUEST)?;
+        decode.record("txs", signed.len().traced());
+        drop(decode);
+
+        let total_bytes: usize = signed.iter().map(EncodeSize::encode_size).sum();
+        if total_bytes > max_batch_bytes {
+            return Err(StatusCode::PAYLOAD_TOO_LARGE);
+        }
+
+        let verify = info_span!(
+            parent: &parent,
+            "mempool.ingress.verify",
+            txs = signed.len().traced(),
+            bytes = total_bytes.traced(),
+        )
+        .entered();
+        let signed_lazy = signed
+            .into_iter()
+            .map(LazySignedTransaction::new)
+            .collect::<Vec<_>>();
+        let transactions = verify_transaction_chunks::<H, _>(
             namespace,
             &mut rng(),
             &public_key_cache,
             signed_lazy,
             &strategy,
         )
-    })
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-    .ok_or(StatusCode::BAD_REQUEST)?;
-    let digests = transactions
-        .iter()
-        .map(|transaction| *transaction.message_digest())
-        .collect();
+        .ok_or(StatusCode::BAD_REQUEST)?;
+        drop(verify);
 
-    Ok(VerifiedBatch {
-        transactions,
-        digests,
-        total_bytes,
-    })
+        let digests = transactions
+            .iter()
+            .map(|transaction| *transaction.message_digest())
+            .collect();
+
+        Ok(VerifiedBatch {
+            batch_id,
+            transactions,
+            digests,
+            total_bytes,
+        })
+    });
+    verified.await
 }
 
 #[derive(serde::Serialize)]
@@ -281,12 +335,7 @@ where
 {
     state.mailbox.query_status(batch_id).await.map_or_else(
         || (StatusCode::NOT_FOUND, String::new()),
-        |status| {
-            (
-                StatusCode::OK,
-                serde_json::to_string(&status).expect("batch status serialization cannot fail"),
-            )
-        },
+        |status| ok_json(&status),
     )
 }
 
@@ -302,13 +351,7 @@ where
 {
     state.mailbox.query_consensus_round().await.map_or_else(
         || (StatusCode::SERVICE_UNAVAILABLE, String::new()),
-        |round| {
-            (
-                StatusCode::OK,
-                serde_json::to_string(&ConsensusRoundResponse { round })
-                    .expect("consensus round serialization cannot fail"),
-            )
-        },
+        |round| ok_json(&ConsensusRoundResponse { round }),
     )
 }
 
@@ -346,13 +389,7 @@ where
 
     reader.get(public_key).await.map_or_else(
         || (StatusCode::NOT_FOUND, String::new()),
-        |account| {
-            (
-                StatusCode::OK,
-                serde_json::to_string(&AccountResponse::from(account))
-                    .expect("account serialization cannot fail"),
-            )
-        },
+        |account| ok_json(&AccountResponse::from(account)),
     )
 }
 

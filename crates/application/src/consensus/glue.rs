@@ -70,11 +70,14 @@ where
     ) -> Option<Proposed<Self, E>> {
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        let result = self.propose_child(context, &parent, batches, input).await;
-        let cleanup = tracing::info_span!("application.propose.cleanup").entered();
-        drop(parent);
-        drop(ancestry);
-        drop(cleanup);
+        let result = self.propose_child(context, parent, batches, input).await;
+        // The parent moved into propose_child's execution task, so only the
+        // drained ancestry stream remains. Keep the span so before/after traces
+        // stay comparable.
+        {
+            let _cleanup = tracing::info_span!("application.propose.cleanup").entered();
+            drop(ancestry);
+        }
         result
     }
 
@@ -86,12 +89,19 @@ where
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let mut ancestry = Box::pin(ancestry);
         let block = ancestry.next().await?;
-        let parent = ancestry.next().await?;
-        let result = self.verify_child(context, block, &parent, batches).await;
-        let cleanup = tracing::info_span!("application.verify.cleanup").entered();
-        drop(parent);
-        drop(ancestry);
-        drop(cleanup);
+        // The parent fetch is passed as a future so verify_child can start
+        // signature verification (which needs only the block body) while the
+        // parent is still in flight.
+        let result = self
+            .verify_child(context, block, ancestry.next(), batches)
+            .await;
+        // The block body and parent moved into verify_child's offloaded
+        // tasks, so only the drained ancestry stream remains. Keep the span
+        // so before/after traces stay comparable.
+        {
+            let _cleanup = tracing::info_span!("application.verify.cleanup").entered();
+            drop(ancestry);
+        }
         result
     }
 

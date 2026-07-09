@@ -67,7 +67,7 @@ pub type FinalizedHookFn<E, C, H, P, St> = Arc<
 type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
-const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
+
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 

@@ -174,7 +174,7 @@ fn verify_rejects_invalid_body() {
             .verify_child(
                 (context.child("verify"), consensus_context),
                 block,
-                &parent,
+                std::future::ready(Some(parent)),
                 dbs.new_batches().await,
             )
             .await;
