@@ -13,17 +13,18 @@ use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCf
 use commonware_consensus::{Reporter, Viewable};
 use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed25519, sha256};
 use commonware_formatting::from_hex;
+use commonware_parallel::Strategy;
 use constantinople_engine::types::EngineActivity;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
 use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
 use futures::future::join_all;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::watch;
+use tokio::sync::{Semaphore, watch};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
@@ -33,6 +34,15 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
 const PINNED_SUBMIT_RETRIES: usize = 3;
+
+/// Maximum batches admitted to CPU decoding concurrently.
+///
+/// Batch decoding seal-hashes every transaction on the strategy's pool, which
+/// the co-located validator engine also depends on; admitting one batch at a
+/// time keeps client bursts from queueing CPU ahead of consensus work. The
+/// owned permit moves into the pool job, so a client disconnect cannot
+/// release it while the job runs.
+const MAX_CONCURRENT_DECODES: usize = 1;
 
 type Activity = EngineActivity<ed25519::PublicKey, MinSig>;
 
@@ -91,21 +101,24 @@ fn activity_view(activity: &Activity) -> u64 {
 }
 
 #[derive(Clone)]
-pub struct ServerConfig {
+pub struct ServerConfig<St: Strategy> {
     pub listen: SocketAddr,
     pub relayer: RelayerConfig,
     pub account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     pub view_clock: ViewClock,
+    pub strategy: St,
 }
 
 #[derive(Clone)]
-struct AppState {
+struct AppState<St: Strategy> {
     leaders: Arc<Vec<Leader>>,
     max_retry_views: u64,
     max_batch_bytes: usize,
     account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     view_clock: ViewClock,
     http: reqwest::Client,
+    strategy: St,
+    decode_permits: Arc<Semaphore>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,28 +131,26 @@ struct Leader {
 #[derive(Debug)]
 struct DecodedBatch {
     transactions: Vec<SignedTransaction<sha256::Sha256>>,
-    digests: Vec<String>,
+    /// Hex digest -> every position in `transactions` carrying it (duplicate
+    /// digests map to all copies), for matching status-API digest lists back
+    /// to local transactions.
+    digest_index: HashMap<String, Vec<usize>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 #[serde(tag = "status")]
 enum BatchStatus {
-    Accepted {
-        digests: Vec<String>,
-    },
+    Accepted,
     Finalized {
         height: u64,
-        included: Vec<String>,
     },
     PartiallyFinalized {
         height: u64,
         included: Vec<String>,
         filtered: Vec<String>,
     },
-    Dropped {
-        filtered: Vec<String>,
-    },
+    Dropped,
 }
 
 #[derive(Debug)]
@@ -149,7 +160,7 @@ enum ForwardResult {
     Transient { leader: Leader },
 }
 
-pub async fn serve(config: ServerConfig) {
+pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
     let state = AppState {
         leaders: Arc::new(normalize_leaders(config.relayer.leaders)),
         max_retry_views: config.relayer.max_retry_views,
@@ -157,6 +168,8 @@ pub async fn serve(config: ServerConfig) {
         account_reader: config.account_reader,
         view_clock: config.view_clock,
         http: reqwest::Client::new(),
+        strategy: config.strategy,
+        decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
     };
     let listen = config.listen;
     let app = router(state);
@@ -168,18 +181,17 @@ pub async fn serve(config: ServerConfig) {
         .expect("relayer HTTP server exited");
 }
 
-fn router(state: AppState) -> Router {
+fn router<St: Strategy>(state: AppState<St>) -> Router {
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods([Method::GET, Method::POST])
         .allow_headers([CONTENT_TYPE]);
 
     Router::new()
-        .route("/transactions", post(submit_transactions))
-        .route("/transactions/{batch_id}", get(transaction_status))
-        .route("/account/{public_key}", get(account))
+        .route("/transactions", post(submit_transactions::<St>))
+        .route("/account/{public_key}", get(account::<St>))
         .route("/health", get(health))
-        .route("/ready", get(ready))
+        .route("/ready", get(ready::<St>))
         .layer(DefaultBodyLimit::max(max_request_bytes(
             state.max_batch_bytes,
         )))
@@ -187,8 +199,8 @@ fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn submit_transactions(
-    State(state): State<AppState>,
+async fn submit_transactions<St: Strategy>(
+    State(state): State<AppState<St>>,
     headers: HeaderMap,
     body: Bytes,
 ) -> (StatusCode, String) {
@@ -202,16 +214,34 @@ async fn submit_transactions(
         return submit_to_pinned_leader(&state, body, &target).await;
     }
 
-    let batch = match decode_batch(&body, state.max_batch_bytes) {
-        Ok(batch) => batch,
+    // Decoding seal-hashes every transaction, so it runs on the strategy's
+    // pool along with hashing the batch id. The owned permit rides in the
+    // job to bound concurrent decode CPU (the pool is shared with the
+    // co-located engine).
+    let Ok(permit) = state.decode_permits.clone().acquire_owned().await else {
+        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
+    };
+    let max_batch_bytes = state.max_batch_bytes;
+    let decoded = state
+        .strategy
+        .spawn(move |_: St| {
+            let _permit = permit;
+            decode_batch(&body, max_batch_bytes).map(|batch| {
+                let id = batch_id(&body);
+                (batch, body, id)
+            })
+        })
+        .await;
+    let (batch, body, original_batch_id) = match decoded {
+        Ok(parts) => parts,
         Err(status) => return (status, String::new()),
     };
 
-    submit_with_retries(&state, batch).await
+    submit_with_retries(&state, batch, body, original_batch_id).await
 }
 
-async fn submit_to_pinned_leader(
-    state: &AppState,
+async fn submit_to_pinned_leader<St: Strategy>(
+    state: &AppState<St>,
     body: Bytes,
     target: &str,
 ) -> (StatusCode, String) {
@@ -221,13 +251,21 @@ async fn submit_to_pinned_leader(
     submit_blocking_to_leader(&state.http, &leader, body).await
 }
 
-async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCode, String) {
+async fn submit_with_retries<St: Strategy>(
+    state: &AppState<St>,
+    batch: DecodedBatch,
+    body: Bytes,
+    original_batch_id: String,
+) -> (StatusCode, String) {
     if state.leaders.is_empty() {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     }
 
-    let mut pending = batch.digests.iter().cloned().collect::<HashSet<_>>();
-    let mut included = HashSet::new();
+    let batch = Arc::new(batch);
+    let total = batch.transactions.len();
+    let mut pending: HashSet<usize> = (0..total).collect();
+    let mut included: HashSet<usize> = HashSet::new();
+    let mut sent: HashMap<String, Vec<usize>> = HashMap::new();
     let mut height = 0;
     let mut accepted_any = false;
     let mut attempts = Vec::<(String, Leader)>::new();
@@ -235,8 +273,25 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
     let mut view = *views.borrow();
 
     for retry in 0..=state.max_retry_views {
-        let body = encode_pending(&batch, &pending);
-        let sent_batch_id = batch_id(&body);
+        // Until something resolves, resends reuse the original request bytes;
+        // once the pending set shrinks, the subset is re-encoded and hashed
+        // on the strategy's pool.
+        let (send_body, sent_batch_id) = if pending.len() == total {
+            (body.clone(), original_batch_id.clone())
+        } else {
+            let batch = Arc::clone(&batch);
+            let pending = pending.clone();
+            state
+                .strategy
+                .spawn(move |_: St| {
+                    let body = encode_pending(&batch, &pending);
+                    let id = batch_id(&body);
+                    (body, id)
+                })
+                .await
+        };
+        sent.entry(sent_batch_id.clone())
+            .or_insert_with(|| pending.iter().copied().collect());
         for target in next_two_leaders(&state.leaders, view) {
             attempts.push((sent_batch_id.clone(), target));
         }
@@ -245,14 +300,14 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
             .filter(|(batch_id, _)| batch_id == &sent_batch_id)
             .map(|(_, leader)| leader.clone())
             .collect::<Vec<_>>();
-        let result = forward_to_targets(&state.http, &targets, body).await;
+        let result = forward_to_targets(&state.http, &targets, send_body).await;
         if let Some(status) = result.deterministic {
             return (status, String::new());
         }
         accepted_any |= result.accepted;
 
-        merge_statuses(state, &attempts, &mut included, &mut height).await;
-        pending.retain(|digest| !included.contains(digest));
+        merge_statuses(state, &attempts, &sent, &batch, &mut included, &mut height).await;
+        pending.retain(|index| !included.contains(index));
         if pending.is_empty() {
             return json_response(TxStatus::Finalized { height });
         }
@@ -261,13 +316,13 @@ async fn submit_with_retries(state: &AppState, batch: DecodedBatch) -> (StatusCo
             if !accepted_any {
                 return (StatusCode::SERVICE_UNAVAILABLE, String::new());
             }
-            return json_response(best_effort_status(&batch.digests, &included, height));
+            return json_response(best_effort_status(total, included.len(), height));
         }
 
         wait_for_view_advance(&mut views, &mut view).await;
     }
 
-    json_response(best_effort_status(&batch.digests, &included, height))
+    json_response(best_effort_status(total, included.len(), height))
 }
 
 struct ForwardSummary {
@@ -308,10 +363,12 @@ async fn forward_to_targets(
     }
 }
 
-async fn merge_statuses(
-    state: &AppState,
+async fn merge_statuses<St: Strategy>(
+    state: &AppState<St>,
     attempts: &[(String, Leader)],
-    included: &mut HashSet<String>,
+    sent: &HashMap<String, Vec<usize>>,
+    batch: &DecodedBatch,
+    included: &mut HashSet<usize>,
     height: &mut u64,
 ) {
     for (batch_id, leader) in attempts {
@@ -319,20 +376,29 @@ async fn merge_statuses(
             continue;
         };
         match status {
-            BatchStatus::Accepted { .. } => {}
+            BatchStatus::Accepted | BatchStatus::Dropped => {}
+            // A fully finalized batch includes everything that was sent
+            // under that batch id.
             BatchStatus::Finalized {
                 height: finalized_height,
-                included: leader_included,
+            } => {
+                *height = (*height).max(finalized_height);
+                if let Some(indices) = sent.get(batch_id) {
+                    included.extend(indices.iter().copied());
+                }
             }
-            | BatchStatus::PartiallyFinalized {
+            BatchStatus::PartiallyFinalized {
                 height: finalized_height,
                 included: leader_included,
                 ..
             } => {
                 *height = (*height).max(finalized_height);
-                included.extend(leader_included);
+                for digest in leader_included {
+                    if let Some(indices) = batch.digest_index.get(&digest) {
+                        included.extend(indices.iter().copied());
+                    }
+                }
             }
-            BatchStatus::Dropped { .. } => {}
         }
     }
 }
@@ -350,27 +416,17 @@ async fn wait_for_view_advance(views: &mut watch::Receiver<u64>, current: &mut u
     }
 }
 
-fn best_effort_status(digests: &[String], included: &HashSet<String>, height: u64) -> TxStatus {
-    if included.is_empty() {
+const fn best_effort_status(total: usize, included: usize, height: u64) -> TxStatus {
+    if included == 0 {
         return TxStatus::Dropped;
     }
-    let filtered = digests
-        .iter()
-        .filter(|digest| !included.contains(*digest))
-        .cloned()
-        .collect::<Vec<_>>();
-    if filtered.is_empty() {
+    if included == total {
         return TxStatus::Finalized { height };
     }
-    let included = digests
-        .iter()
-        .filter(|digest| included.contains(*digest))
-        .cloned()
-        .collect();
     TxStatus::PartiallyFinalized {
         height,
-        included,
-        filtered,
+        included: included as u64,
+        filtered: (total - included) as u64,
     }
 }
 
@@ -381,12 +437,8 @@ fn json_response(status: TxStatus) -> (StatusCode, String) {
     )
 }
 
-async fn transaction_status() -> (StatusCode, String) {
-    (StatusCode::NOT_FOUND, String::new())
-}
-
-async fn account(
-    State(state): State<AppState>,
+async fn account<St: Strategy>(
+    State(state): State<AppState<St>>,
     Path(public_key): Path<String>,
 ) -> (StatusCode, String) {
     let Some(bytes) = from_hex(&public_key) else {
@@ -448,7 +500,7 @@ async fn health() -> StatusCode {
     StatusCode::OK
 }
 
-async fn ready(State(state): State<AppState>) -> StatusCode {
+async fn ready<St: Strategy>(State(state): State<AppState<St>>) -> StatusCode {
     if state.leaders.is_empty() {
         return StatusCode::SERVICE_UNAVAILABLE;
     }
@@ -549,24 +601,27 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<DecodedBatch, St
     if total_bytes > max_batch_bytes {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let digests = transactions
-        .iter()
-        .map(|transaction| transaction.message_digest().to_string())
-        .collect();
+    let mut digest_index: HashMap<String, Vec<usize>> = HashMap::new();
+    for (index, transaction) in transactions.iter().enumerate() {
+        digest_index
+            .entry(transaction.message_digest().to_string())
+            .or_default()
+            .push(index);
+    }
 
     Ok(DecodedBatch {
         transactions,
-        digests,
+        digest_index,
     })
 }
 
-fn encode_pending(batch: &DecodedBatch, pending: &HashSet<String>) -> Bytes {
+fn encode_pending(batch: &DecodedBatch, pending: &HashSet<usize>) -> Bytes {
     batch
         .transactions
         .iter()
-        .zip(&batch.digests)
-        .filter(|(_, digest)| pending.contains(*digest))
-        .map(|(transaction, _)| transaction)
+        .enumerate()
+        .filter(|(index, _)| pending.contains(index))
+        .map(|(_, transaction)| transaction)
         .collect::<Vec<_>>()
         .encode()
 }
@@ -665,6 +720,38 @@ mod tests {
         }
     }
 
+    fn signed_transfer(seed: u64, nonce: u64) -> SignedTransaction<sha256::Sha256> {
+        use commonware_cryptography::Signer as _;
+        use constantinople_primitives::Transaction;
+        let sender = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 1).public_key();
+        Transaction::new(
+            TransactionPublicKey::ed25519(sender.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            core::num::NonZeroU64::new(1).expect("non-zero"),
+            nonce,
+        )
+        .seal_and_sign(&sender, b"relayer-test", &mut sha256::Sha256::default())
+    }
+
+    #[test]
+    fn decode_batch_maps_duplicate_digests_to_all_positions() {
+        let unique = signed_transfer(1, 0);
+        let duplicate = signed_transfer(2, 0);
+        let body = vec![unique.clone(), duplicate.clone(), duplicate.clone()].encode();
+
+        let batch = decode_batch(&body, DEFAULT_MAX_BATCH_BYTES).expect("decode");
+
+        let unique_positions = &batch.digest_index[&unique.message_digest().to_string()];
+        let duplicate_positions = &batch.digest_index[&duplicate.message_digest().to_string()];
+        assert_eq!(unique_positions, &vec![0]);
+        assert_eq!(duplicate_positions, &vec![1, 2]);
+
+        // Re-encoding the remaining subset preserves original order.
+        let pending: HashSet<usize> = [0].into_iter().collect();
+        assert_eq!(encode_pending(&batch, &pending), vec![unique].encode());
+    }
+
     async fn spawn_mock_leader(mock: Router) -> String {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -678,7 +765,7 @@ mod tests {
         leader_url
     }
 
-    fn pinned_state(leader_url: String) -> AppState {
+    fn pinned_state(leader_url: String) -> AppState<commonware_parallel::Sequential> {
         let (_, view_clock) = Observer::new();
         AppState {
             leaders: Arc::new(vec![Leader {
@@ -691,6 +778,8 @@ mod tests {
             account_reader: Arc::new(OnceLock::new()),
             view_clock,
             http: reqwest::Client::new(),
+            strategy: commonware_parallel::Sequential,
+            decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
         }
     }
 
@@ -727,17 +816,14 @@ mod tests {
 
     #[test]
     fn retry_budget_returns_partial_status() {
-        let digests = vec!["aa".to_string(), "bb".to_string()];
-        let included = HashSet::from(["aa".to_string()]);
-
-        let status = best_effort_status(&digests, &included, 7);
+        let status = best_effort_status(2, 1, 7);
 
         assert_eq!(
             status,
             TxStatus::PartiallyFinalized {
                 height: 7,
-                included: vec!["aa".to_string()],
-                filtered: vec!["bb".to_string()]
+                included: 1,
+                filtered: 1
             }
         );
     }

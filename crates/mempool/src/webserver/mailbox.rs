@@ -1,6 +1,6 @@
 //! Mailbox for the mempool webserver actor.
 
-use super::actor::{BatchStatus, IngestStatus, TxStatus};
+use super::actor::{IngestStatus, StoredBatchStatus, TxStatus};
 use crate::TransactionSource;
 use commonware_actor::Feedback;
 use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
@@ -41,10 +41,8 @@ where
     /// HTTP asks for the latest known batch status.
     QueryStatus {
         batch_id: String,
-        response: oneshot::Sender<Option<BatchStatus>>,
+        response: oneshot::Sender<Option<StoredBatchStatus<H::Digest>>>,
     },
-    /// HTTP asks for the highest locally observed consensus round.
-    QueryConsensusRound { response: oneshot::Sender<u64> },
     /// Consensus requests transactions for the next proposal.
     Propose {
         height: u64,
@@ -149,18 +147,14 @@ where
     }
 
     /// Returns the latest known status for a submitted batch.
-    pub async fn query_status(&self, batch_id: String) -> Option<BatchStatus> {
+    pub(super) async fn query_status(
+        &self,
+        batch_id: String,
+    ) -> Option<StoredBatchStatus<H::Digest>> {
         self.sender
             .request(|response| Message::QueryStatus { batch_id, response })
             .await
             .flatten()
-    }
-
-    /// Returns the highest finalized consensus round observed by this mempool.
-    pub async fn query_consensus_round(&self) -> Option<u64> {
-        self.sender
-            .request(|response| Message::QueryConsensusRound { response })
-            .await
     }
 }
 

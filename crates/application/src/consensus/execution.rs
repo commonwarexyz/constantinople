@@ -63,8 +63,9 @@
 //! transaction-history commitment still reflects block order.
 //!
 //! Proposing, verifying, and applying certified blocks all use this same
-//! transition. `execute_proposal` prepares locally selected transactions and
-//! falls back to an empty proposal if the selected body is malformed or invalid.
+//! transition. `execute_proposal` prepares locally selected transactions,
+//! proposing an empty block for an empty selection and dropping the proposal
+//! (so consensus skips the view) if the selected body is malformed or invalid.
 //! `execute_body` prepares a proposed body, recomputes execution, and compares
 //! the resulting commitments to the header. Certified apply shallow-clones the
 //! block's lazy body (per-transaction handles whose decode cache stays shared)
@@ -348,10 +349,11 @@ where
 
 /// Executes a proposal's candidate transactions all or nothing.
 ///
-/// If every candidate executes cleanly the block includes them all. If any
-/// candidate is malformed, fails its nonce or balance check, or overflows a
-/// recipient, the whole batch is dropped and an empty block is proposed so the
-/// chain still makes progress.
+/// If every candidate executes cleanly the block includes them all. An empty
+/// selection proposes an empty block so an idle chain keeps making progress.
+/// If any candidate is malformed, fails its nonce or balance check, or
+/// overflows a recipient, the proposal is dropped (`None`) and consensus
+/// skips the view.
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S>(
     strategy: S,
@@ -359,7 +361,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
     parent: &SealedBlock<C, P, H>,
     transactions: Vec<SignedTransaction<H>>,
-) -> ProposalExecution<E, H, S>
+) -> Option<ProposalExecution<E, H, S>>
 where
     E: Storage + Clock + Metrics,
     C: Digest,
@@ -378,30 +380,32 @@ where
                     .map(|(transfers, digests)| (transfers, digests, transactions))
             })
         })
-        .await;
+        .await?;
 
-    let (staged, outcome) = match prepared {
-        Some((transfers, digests, transactions)) if !transfers.is_empty() => {
+    let (staged, transaction_batch, outcome) = match prepared {
+        (transfers, digests, transactions) if !transfers.is_empty() => {
             let transfers = Arc::new(transfers);
+            // The transaction-history append has no dependency on state
+            // execution, so it runs on the pool concurrently with compute; a
+            // rejected candidate drops the whole proposal, so the appended
+            // batch is discarded, never reused.
+            let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
+            let apply = strategy.spawn(move |_: S| {
+                apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
+            });
             let (staged, updates) = compute(state_batch, transfers, &strategy).await;
-            (
-                staged,
-                updates.map(|updates| (transactions, digests, updates)),
-            )
+            let transaction_batch = apply.await;
+            let updates = updates?;
+            (staged, transaction_batch, Some((transactions, updates)))
         }
-        _ => (stage_empty(state_batch).await, None),
+        // Appending zero digests is an identity, so the empty selection
+        // skips the pool round-trip entirely.
+        _ => (stage_empty(state_batch).await, transaction_batch, None),
     };
 
-    let (body, digests, state_updates) = outcome.unwrap_or_default();
+    let (body, state_updates) = outcome.unwrap_or_default();
 
-    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let transaction_batch = strategy
-        .spawn(move |_: S| {
-            apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
-        })
-        .await;
-
-    ProposalExecution {
+    Some(ProposalExecution {
         block: finalize_child(
             staged,
             state_updates,
@@ -412,7 +416,7 @@ where
         )
         .await,
         body,
-    }
+    })
 }
 
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
@@ -437,15 +441,17 @@ where
 
     let transaction_count = transfers.len();
     let transfers = Arc::new(transfers);
-    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
-    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
-
+    // The transaction-history append has no dependency on state execution, so
+    // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let transaction_batch = strategy
-        .spawn(move |_: S| {
-            apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
-        })
-        .await;
+    let apply = strategy.spawn(move |_: S| {
+        apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
+    });
+    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
+    // Join the append before surfacing a rejection so its panics propagate
+    // and no job outlives this call.
+    let transaction_batch = apply.await;
+    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
     Ok(finalize_child(
         staged,
@@ -473,18 +479,20 @@ where
     S: Strategy,
 {
     let transfers = Arc::new(transfers);
-    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
-    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
-
+    // The transaction-history append has no dependency on state execution, so
+    // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let transaction_batch = strategy
-        .spawn(move |_: S| {
-            apply_span.in_scope(|| {
-                apply_transaction_digests(transaction_batch, &digests)
-                    .with_inactivity_floor(transaction_floor)
-            })
+    let apply = strategy.spawn(move |_: S| {
+        apply_span.in_scope(|| {
+            apply_transaction_digests(transaction_batch, &digests)
+                .with_inactivity_floor(transaction_floor)
         })
-        .await;
+    });
+    let (staged, updates) = compute(state_batch, transfers, &strategy).await;
+    // Join the append before surfacing a rejection so its panics propagate
+    // and no job outlives this call.
+    let transaction_batch = apply.await;
+    let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
     db::finalize_execution(staged, state_updates, transaction_batch)
         .await

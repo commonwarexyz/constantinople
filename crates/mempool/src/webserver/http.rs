@@ -90,10 +90,6 @@ where
         .route("/transactions/ingest", post(ingest_batch::<C, P, H, St>))
         .route("/transactions/{batch_id}", get(fetch_status::<C, P, H, St>))
         .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
-        .route(
-            "/consensus/round",
-            get(fetch_consensus_round::<C, P, H, St>),
-        )
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(cors)
         .with_state(state)
@@ -312,11 +308,6 @@ where
     verified.await
 }
 
-#[derive(serde::Serialize)]
-struct ConsensusRoundResponse {
-    round: u64,
-}
-
 /// Returns the latest known status for a submitted batch.
 async fn fetch_status<C, P, H, St>(
     State(state): State<SharedState<C, P, H, St>>,
@@ -328,26 +319,20 @@ where
     H: Hasher,
     St: Strategy,
 {
-    state.mailbox.query_status(batch_id).await.map_or_else(
-        || (StatusCode::NOT_FOUND, String::new()),
-        |status| ok_json(&status),
-    )
-}
+    let Some(status) = state.mailbox.query_status(batch_id).await else {
+        return (StatusCode::NOT_FOUND, String::new());
+    };
 
-/// Returns the highest consensus round observed by this validator.
-async fn fetch_consensus_round<C, P, H, St>(
-    State(state): State<SharedState<C, P, H, St>>,
-) -> (StatusCode, String)
-where
-    C: Digest,
-    P: PublicKey,
-    H: Hasher,
-    St: Strategy,
-{
-    state.mailbox.query_consensus_round().await.map_or_else(
-        || (StatusCode::SERVICE_UNAVAILABLE, String::new()),
-        |round| ok_json(&ConsensusRoundResponse { round }),
-    )
+    // Hex-encoding digest lists (partially finalized batches only) is O(txs)
+    // formatting, so it runs on the strategy's pool; every other status is
+    // constant-size.
+    if status.has_digest_lists() {
+        return state
+            .strategy
+            .spawn(move |_| ok_json(&status.to_wire()))
+            .await;
+    }
+    ok_json(&status.to_wire())
 }
 
 /// Returns the committed account for the hex-encoded public key.

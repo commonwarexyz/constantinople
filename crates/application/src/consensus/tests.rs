@@ -276,6 +276,45 @@ fn verify_rejects_missing_parent() {
 }
 
 #[test]
+fn propose_drops_proposal_on_rejected_batch() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            recipient,
+        } = verify_harness(&context).await;
+
+        context.sleep(Duration::from_millis(10)).await;
+
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        // Both transfers consume the same nonce, so execution rejects the
+        // candidate batch and the proposal is dropped: consensus skips the
+        // view instead of receiving a block whose commitments could carry
+        // the rejected digests.
+        let mut input = StaticTransactionSource::new(vec![vec![
+            transfer(&sender, &recipient, 1),
+            transfer(&sender, &recipient, 2),
+        ]]);
+        let proposed = app
+            .propose_child(
+                (context.child("propose"), consensus_context),
+                parent,
+                dbs.new_batches().await,
+                &mut input,
+            )
+            .await;
+        assert!(proposed.is_none());
+    });
+}
+
+#[test]
 fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {

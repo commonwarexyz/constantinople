@@ -7,7 +7,7 @@
 use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
 use ahash::{AHashMap, AHashSet};
 use commonware_codec::EncodeSize;
-use commonware_consensus::{marshal::Update, types::Round};
+use commonware_consensus::marshal::Update;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
@@ -31,15 +31,38 @@ const MAX_STATUS_ENTRIES: usize = 1_000_000;
 pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
 
 /// Outcome of a submitted batch, delivered when the result is known.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Submitters already know their batch's digests, so partial finalization
+/// reports counts rather than digest lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxStatus {
     /// The batch's block was finalized.
     Finalized { height: u64 },
     /// The batch's block was finalized, but some transactions were filtered.
-    ///
-    /// The `included` and `filtered` digests are hex-encoded transaction
-    /// message digests in the original batch order.
+    PartiallyFinalized {
+        height: u64,
+        included: u64,
+        filtered: u64,
+    },
+    /// The batch was proposed but its block was not finalized.
+    Dropped,
+}
+
+/// Latest known status for a submitted batch, as served by the status API.
+///
+/// Fully finalized, dropped, and accepted batches are described by the status
+/// alone (the submitter knows which digests it sent); only partial
+/// finalization carries hex-encoded digest lists, so callers can tell which
+/// transactions landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BatchStatus {
+    /// The batch is accepted by this validator but has not resolved yet.
+    Accepted,
+    /// The batch's block was finalized.
+    Finalized { height: u64 },
+    /// The batch's block was finalized, but some transactions were filtered.
     PartiallyFinalized {
         height: u64,
         included: Vec<String>,
@@ -49,22 +72,47 @@ pub enum TxStatus {
     Dropped,
 }
 
-/// Latest known status for a submitted batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum BatchStatus {
-    /// The batch is accepted by this validator but has not resolved yet.
-    Accepted { digests: Vec<String> },
-    /// The batch's block was finalized.
-    Finalized { height: u64, included: Vec<String> },
-    /// The batch's block was finalized, but some transactions were filtered.
+/// Actor-internal batch status.
+///
+/// Digests stay raw so the actor's bookkeeping never formats hex strings;
+/// [`StoredBatchStatus::to_wire`] converts at the HTTP boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StoredBatchStatus<D> {
+    Accepted,
+    Finalized {
+        height: u64,
+    },
     PartiallyFinalized {
         height: u64,
-        included: Vec<String>,
-        filtered: Vec<String>,
+        included: Vec<D>,
+        filtered: Vec<D>,
     },
-    /// The batch was proposed but its block was not finalized.
-    Dropped { filtered: Vec<String> },
+    Dropped,
+}
+
+impl<D: Display> StoredBatchStatus<D> {
+    /// Converts to the wire form, hex-encoding any digest lists.
+    pub(super) fn to_wire(&self) -> BatchStatus {
+        match self {
+            Self::Accepted => BatchStatus::Accepted,
+            Self::Finalized { height } => BatchStatus::Finalized { height: *height },
+            Self::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            } => BatchStatus::PartiallyFinalized {
+                height: *height,
+                included: included.iter().map(ToString::to_string).collect(),
+                filtered: filtered.iter().map(ToString::to_string).collect(),
+            },
+            Self::Dropped => BatchStatus::Dropped,
+        }
+    }
+
+    /// Whether the wire form carries digest lists (nontrivial to encode).
+    pub(super) const fn has_digest_lists(&self) -> bool {
+        matches!(self, Self::PartiallyFinalized { .. })
+    }
 }
 
 /// Mempool actor configuration.
@@ -116,24 +164,24 @@ fn status_for_finalized_block<D>(
     finalized: &AHashSet<D>,
 ) -> Option<TxStatus>
 where
-    D: Copy + Display + Eq + Hash,
+    D: Copy + Eq + Hash,
 {
-    let mut included = Vec::new();
-    let mut filtered = Vec::new();
+    let mut included = 0;
+    let mut filtered = 0;
 
     for digest in digests {
         if finalized.contains(digest) {
-            included.push(digest.to_string());
+            included += 1;
         } else {
-            filtered.push(digest.to_string());
+            filtered += 1;
         }
     }
 
-    if included.is_empty() {
+    if included == 0 {
         return None;
     }
 
-    if filtered.is_empty() {
+    if filtered == 0 {
         return Some(TxStatus::Finalized { height });
     }
 
@@ -147,9 +195,9 @@ where
 fn batch_status_from_outcomes<D>(
     digests: &[D],
     outcomes: &AHashMap<D, DigestOutcome>,
-) -> Option<BatchStatus>
+) -> Option<StoredBatchStatus<D>>
 where
-    D: Copy + Display + Eq + Hash,
+    D: Copy + Eq + Hash,
 {
     let mut included = Vec::new();
     let mut filtered = Vec::new();
@@ -159,65 +207,55 @@ where
         match outcomes.get(digest) {
             Some(DigestOutcome::Finalized { height }) => {
                 finalized_height = finalized_height.max(*height);
-                included.push(digest.to_string());
+                included.push(*digest);
             }
-            Some(DigestOutcome::Dropped) => filtered.push(digest.to_string()),
+            Some(DigestOutcome::Dropped) => filtered.push(*digest),
             None => return None,
         }
     }
 
     if included.is_empty() {
-        return Some(BatchStatus::Dropped { filtered });
+        return Some(StoredBatchStatus::Dropped);
     }
 
     if filtered.is_empty() {
-        return Some(BatchStatus::Finalized {
+        return Some(StoredBatchStatus::Finalized {
             height: finalized_height,
-            included,
         });
     }
 
-    Some(BatchStatus::PartiallyFinalized {
+    Some(StoredBatchStatus::PartiallyFinalized {
         height: finalized_height,
         included,
         filtered,
     })
 }
 
-fn tx_status_from_batch(status: &BatchStatus) -> Option<TxStatus> {
+const fn tx_status_from_batch<D>(status: &StoredBatchStatus<D>) -> Option<TxStatus> {
     match status {
-        BatchStatus::Accepted { .. } => None,
-        BatchStatus::Finalized { height, .. } => Some(TxStatus::Finalized { height: *height }),
-        BatchStatus::PartiallyFinalized {
+        StoredBatchStatus::Accepted => None,
+        StoredBatchStatus::Finalized { height } => Some(TxStatus::Finalized { height: *height }),
+        StoredBatchStatus::PartiallyFinalized {
             height,
             included,
             filtered,
         } => Some(TxStatus::PartiallyFinalized {
             height: *height,
-            included: included.clone(),
-            filtered: filtered.clone(),
+            included: included.len() as u64,
+            filtered: filtered.len() as u64,
         }),
-        BatchStatus::Dropped { .. } => Some(TxStatus::Dropped),
+        StoredBatchStatus::Dropped => Some(TxStatus::Dropped),
     }
 }
 
-fn accepted_status<D>(digests: &[D]) -> BatchStatus
-where
-    D: Display,
-{
-    BatchStatus::Accepted {
-        digests: digests.iter().map(ToString::to_string).collect(),
-    }
-}
-
-fn remember_status(
-    statuses: &mut AHashMap<String, BatchStatus>,
-    status_order: &mut VecDeque<String>,
-    batch_id: String,
-    status: BatchStatus,
-) -> Vec<String> {
+fn remember_status<D>(
+    statuses: &mut AHashMap<Arc<str>, StoredBatchStatus<D>>,
+    status_order: &mut VecDeque<Arc<str>>,
+    batch_id: Arc<str>,
+    status: StoredBatchStatus<D>,
+) -> Vec<Arc<str>> {
     if !statuses.contains_key(&batch_id) {
-        status_order.push_back(batch_id.clone());
+        status_order.push_back(Arc::clone(&batch_id));
     }
     statuses.insert(batch_id, status);
 
@@ -232,10 +270,10 @@ fn remember_status(
     expired
 }
 
-fn send_pending_waiters(
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+fn send_pending_waiters<D>(
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
     batch_id: &str,
-    status: &BatchStatus,
+    status: &StoredBatchStatus<D>,
 ) {
     let Some(status) = tx_status_from_batch(status) else {
         return;
@@ -244,11 +282,11 @@ fn send_pending_waiters(
         return;
     };
     for waiter in waiters {
-        let _ = waiter.send(status.clone());
+        let _ = waiter.send(status);
     }
 }
 
-fn watch_batch<D>(batch_id: &str, digests: &[D], watchers: &mut AHashMap<D, Vec<String>>)
+fn watch_batch<D>(batch_id: &Arc<str>, digests: &[D], watchers: &mut AHashMap<D, Vec<Arc<str>>>)
 where
     D: Copy + Eq + Hash,
 {
@@ -260,16 +298,16 @@ where
         watchers
             .entry(*digest)
             .or_default()
-            .push(batch_id.to_string());
+            .push(Arc::clone(batch_id));
     }
 }
 
 fn forget_batch<D>(
     batch_id: &str,
-    batch_digests: &mut AHashMap<String, Vec<D>>,
-    watchers: &mut AHashMap<D, Vec<String>>,
+    batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+    watchers: &mut AHashMap<D, Vec<Arc<str>>>,
     outcomes: &mut AHashMap<D, DigestOutcome>,
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Eq + Hash,
 {
@@ -286,7 +324,7 @@ fn forget_batch<D>(
         let Some(batch_ids) = watchers.get_mut(&digest) else {
             continue;
         };
-        batch_ids.retain(|known| known != batch_id);
+        batch_ids.retain(|known| known.as_ref() != batch_id);
         if batch_ids.is_empty() {
             watchers.remove(&digest);
             outcomes.remove(&digest);
@@ -295,11 +333,11 @@ fn forget_batch<D>(
 }
 
 fn forget_expired_batches<D>(
-    expired: Vec<String>,
-    batch_digests: &mut AHashMap<String, Vec<D>>,
-    watchers: &mut AHashMap<D, Vec<String>>,
+    expired: Vec<Arc<str>>,
+    batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+    watchers: &mut AHashMap<D, Vec<Arc<str>>>,
     outcomes: &mut AHashMap<D, DigestOutcome>,
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Eq + Hash,
 {
@@ -314,11 +352,14 @@ fn forget_expired_batches<D>(
     }
 }
 
-fn watched_batches_for<D>(digests: &[D], watchers: &AHashMap<D, Vec<String>>) -> AHashSet<String>
+fn watched_batches_for<D>(
+    digests: &[D],
+    watchers: &AHashMap<D, Vec<Arc<str>>>,
+) -> AHashSet<Arc<str>>
 where
     D: Copy + Eq + Hash,
 {
-    let mut affected: AHashSet<String> = AHashSet::new();
+    let mut affected: AHashSet<Arc<str>> = AHashSet::new();
     for digest in digests {
         let Some(batch_ids) = watchers.get(digest) else {
             continue;
@@ -329,29 +370,29 @@ where
 }
 
 fn resolve_batch_if_terminal<D>(
-    batch_id: &str,
-    statuses: &mut AHashMap<String, BatchStatus>,
-    status_order: &mut VecDeque<String>,
-    batch_digests: &mut AHashMap<String, Vec<D>>,
-    digest_watchers: &mut AHashMap<D, Vec<String>>,
+    batch_id: &Arc<str>,
+    statuses: &mut AHashMap<Arc<str>, StoredBatchStatus<D>>,
+    status_order: &mut VecDeque<Arc<str>>,
+    batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+    digest_watchers: &mut AHashMap<D, Vec<Arc<str>>>,
     digest_outcomes: &mut AHashMap<D, DigestOutcome>,
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
 ) where
-    D: Copy + Display + Eq + Hash,
+    D: Copy + Eq + Hash,
 {
-    let Some(digests) = batch_digests.get(batch_id) else {
+    let Some(digests) = batch_digests.get(batch_id.as_ref()) else {
         return;
     };
     let Some(status) = batch_status_from_outcomes(digests, digest_outcomes) else {
         return;
     };
 
-    let expired = remember_status(statuses, status_order, batch_id.to_string(), status);
-    if let Some(status) = statuses.get(batch_id) {
-        send_pending_waiters(pending_waiters, batch_id, status);
+    let expired = remember_status(statuses, status_order, Arc::clone(batch_id), status);
+    if let Some(status) = statuses.get(batch_id.as_ref()) {
+        send_pending_waiters(pending_waiters, batch_id.as_ref(), status);
     }
     forget_batch(
-        batch_id,
+        batch_id.as_ref(),
         batch_digests,
         digest_watchers,
         digest_outcomes,
@@ -401,10 +442,6 @@ where
     H: Hasher,
 {
     transactions.iter().map(EncodeSize::encode_size).sum()
-}
-
-const fn rotation_round(round: Round) -> u64 {
-    round.epoch().get().wrapping_add(round.view().get())
 }
 
 /// The mempool actor.
@@ -499,7 +536,7 @@ where
             mailbox,
             namespace,
             max_batch_bytes: max_propose_bytes,
-            strategy,
+            strategy: strategy.clone(),
             public_key_cache,
             account_reader,
             ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
@@ -510,14 +547,14 @@ where
         });
 
         let mut proposed: VecDeque<ProposedBatch<H>> = VecDeque::new();
-        let mut statuses: AHashMap<String, BatchStatus> = AHashMap::new();
+        let mut statuses: AHashMap<Arc<str>, StoredBatchStatus<H::Digest>> = AHashMap::new();
         let mut status_order = VecDeque::new();
-        let mut batch_digests: AHashMap<String, Vec<H::Digest>> = AHashMap::new();
-        let mut digest_watchers: AHashMap<H::Digest, Vec<String>> = AHashMap::new();
+        let mut batch_digests: AHashMap<Arc<str>, Vec<H::Digest>> = AHashMap::new();
+        let mut digest_watchers: AHashMap<H::Digest, Vec<Arc<str>>> = AHashMap::new();
         let mut digest_outcomes: AHashMap<H::Digest, DigestOutcome> = AHashMap::new();
-        let mut pending_waiters: AHashMap<String, Vec<oneshot::Sender<TxStatus>>> = AHashMap::new();
+        let mut pending_waiters: AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>> =
+            AHashMap::new();
         let mut known_digests: AHashSet<H::Digest> = AHashSet::new();
-        let mut highest_consensus_round = 0;
 
         while let Some(message) = rx.recv().await {
             match message {
@@ -529,7 +566,8 @@ where
                     result,
                     ingest_result,
                 } => {
-                    if let Some(status) = statuses.get(&batch_id) {
+                    let batch_id: Arc<str> = batch_id.into();
+                    if let Some(status) = statuses.get(batch_id.as_ref()) {
                         if let Some(ingest_result) = ingest_result {
                             let _ = ingest_result.send(IngestStatus::Accepted);
                         }
@@ -559,11 +597,11 @@ where
                     let expired = remember_status(
                         &mut statuses,
                         &mut status_order,
-                        batch_id.clone(),
-                        accepted_status(&digests),
+                        Arc::clone(&batch_id),
+                        StoredBatchStatus::Accepted,
                     );
-                    batch_digests.insert(batch_id.clone(), digests.clone());
                     watch_batch(&batch_id, &digests, &mut digest_watchers);
+                    batch_digests.insert(Arc::clone(&batch_id), digests);
                     forget_expired_batches(
                         expired,
                         &mut batch_digests,
@@ -573,7 +611,7 @@ where
                     );
                     if let Some(result) = result {
                         pending_waiters
-                            .entry(batch_id.clone())
+                            .entry(Arc::clone(&batch_id))
                             .or_default()
                             .push(result);
                     }
@@ -589,10 +627,7 @@ where
                     }
                 }
                 Message::QueryStatus { batch_id, response } => {
-                    let _ = response.send(statuses.get(&batch_id).cloned());
-                }
-                Message::QueryConsensusRound { response } => {
-                    let _ = response.send(highest_consensus_round);
+                    let _ = response.send(statuses.get(batch_id.as_str()).cloned());
                 }
                 Message::Propose { height, response } => {
                     let mut batch_txs = Vec::new();
@@ -617,14 +652,20 @@ where
                     response.send_lossy(batch_txs);
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
-                    highest_consensus_round =
-                        highest_consensus_round.max(rotation_round(block.header.context.round));
                     let height = block.header.height;
-                    let finalized: AHashSet<H::Digest> = block
-                        .body
-                        .iter()
-                        .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
-                        .collect();
+                    // Deriving the finalized set decodes any transaction the
+                    // application has not already materialized, so it runs on
+                    // the strategy's pool (which also releases the block
+                    // there).
+                    let finalized: AHashSet<H::Digest> = strategy
+                        .spawn(move |_: St| {
+                            block
+                                .body
+                                .iter()
+                                .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
+                                .collect()
+                        })
+                        .await;
 
                     let mut remaining = VecDeque::new();
                     for batch in proposed.drain(..) {
@@ -678,9 +719,7 @@ where
 
                     acknowledgement.acknowledge();
                 }
-                Message::Report(Update::Tip(round, ..)) => {
-                    highest_consensus_round = highest_consensus_round.max(rotation_round(round));
-                }
+                Message::Report(Update::Tip(..)) => {}
             }
         }
         warn!("mempool actor stopped: all senders dropped");
@@ -690,7 +729,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchStatus, DigestOutcome, TxStatus, batch_status_from_outcomes, new_transactions,
+        DigestOutcome, StoredBatchStatus, TxStatus, batch_status_from_outcomes, new_transactions,
         status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
@@ -715,8 +754,8 @@ mod tests {
             status,
             Some(TxStatus::PartiallyFinalized {
                 height: 42,
-                included: vec![first.to_string(), third.to_string()],
-                filtered: vec![second.to_string()],
+                included: 2,
+                filtered: 1,
             }),
         );
     }
@@ -790,10 +829,10 @@ mod tests {
 
         assert_eq!(
             status,
-            Some(BatchStatus::PartiallyFinalized {
+            Some(StoredBatchStatus::PartiallyFinalized {
                 height: 7,
-                included: vec![first.to_string()],
-                filtered: vec![second.to_string()],
+                included: vec![first],
+                filtered: vec![second],
             }),
         );
     }

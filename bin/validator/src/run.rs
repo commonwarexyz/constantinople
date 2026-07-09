@@ -843,6 +843,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 relayer: relayer_config,
                 account_reader: account_reader.clone(),
                 view_clock,
+                strategy: strategy.clone(),
             }))
         } else {
             info!("secondary node: skipping mempool webserver");

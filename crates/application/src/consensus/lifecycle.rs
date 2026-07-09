@@ -84,6 +84,9 @@ where
                 .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
         );
 
+        // A rejected candidate drops the proposal; consensus skips the view.
+        let execution = execution?;
+
         self.proposed_transactions
             .inc_by(execution.block.transaction_count as u64);
 
