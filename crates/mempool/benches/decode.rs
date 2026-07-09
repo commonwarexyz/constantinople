@@ -1,8 +1,8 @@
 //! Measures `Vec::<SignedTransaction>::decode_cfg` on realistic relayer batch
-//! sizes. This is the ingress decode that `verify_body` runs on the blocking
-//! pool: at production batch sizes it is milliseconds of CPU work (dominated
-//! by per-transaction seal hashing) that previously ran on a core tokio
-//! worker.
+//! sizes. This is the ingress decode that `verify_body` runs on the strategy's
+//! worker pool: at production batch sizes it is milliseconds of CPU work
+//! (dominated by per-transaction seal hashing) that once ran inline on a core
+//! tokio worker.
 
 use commonware_codec::{Decode as _, Encode as _, RangeCfg};
 use commonware_cryptography::{Signer as _, ed25519, sha256};

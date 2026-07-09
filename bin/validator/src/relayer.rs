@@ -149,11 +149,6 @@ enum ForwardResult {
     Transient { leader: Leader },
 }
 
-#[derive(Debug, Deserialize)]
-struct IngestResponse {
-    digests: Vec<String>,
-}
-
 pub async fn serve(config: ServerConfig) {
     let state = AppState {
         leaders: Arc::new(normalize_leaders(config.relayer.leaders)),
@@ -469,15 +464,6 @@ async fn forward_to_leader(http: &reqwest::Client, leader: Leader, body: Bytes) 
         .await
     {
         Ok(response) if response.status() == StatusCode::ACCEPTED => {
-            let Ok(bytes) = response.bytes().await else {
-                return ForwardResult::Transient { leader };
-            };
-            let Ok(ack) = serde_json::from_slice::<IngestResponse>(&bytes) else {
-                return ForwardResult::Transient { leader };
-            };
-            if ack.digests.is_empty() {
-                return ForwardResult::Transient { leader };
-            }
             ForwardResult::Accepted { leader }
         }
         Ok(response)

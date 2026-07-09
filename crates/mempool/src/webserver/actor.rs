@@ -20,7 +20,7 @@ use std::{
     hash::Hash,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::warn;
 
 const MAX_STATUS_ENTRIES: usize = 1_000_000;
@@ -502,6 +502,7 @@ where
             strategy,
             public_key_cache,
             account_reader,
+            ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
         });
         let app = http::router::<C, P, H, St>(app_state);
         let _http_handle = context.as_present().child("http").spawn(|_| async {

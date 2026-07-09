@@ -76,6 +76,14 @@ where
         )
         .await;
 
+        // The parent (a full block of decoded transactions) is released on
+        // the strategy's pool so the drop stays off the propose path.
+        let drop_span = info_span!("application.propose.drop_parent");
+        drop(
+            self.strategy
+                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
+        );
+
         self.proposed_transactions
             .inc_by(execution.block.transaction_count as u64);
 
@@ -133,7 +141,9 @@ where
         let Block { header, body } = block.into_inner();
 
         // Signature verification needs only the block body, so it starts
-        // immediately and overlaps the parent fetch below.
+        // immediately and overlaps the parent fetch below. The child context
+        // serves only as an owned CryptoRng for the pool job; no runtime task
+        // is spawned under its label.
         let body = Arc::new(body);
         let (state_batch, transaction_batch) = batches;
         let signatures = verify_signatures::<E, H, St>(
@@ -172,7 +182,17 @@ where
         );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
-        let execution = match futures::try_join!(signatures, execution, wait) {
+        let result = futures::try_join!(signatures, execution, wait);
+
+        // The parent (a full block of decoded transactions) is released on
+        // the strategy's pool so the drop stays off the verify path.
+        let drop_span = info_span!("application.verify.drop_parent");
+        drop(
+            self.strategy
+                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
+        );
+
+        let execution = match result {
             Ok(((), execution, ())) => execution,
             Err(reason) => {
                 reject_verify(header.height, reason);

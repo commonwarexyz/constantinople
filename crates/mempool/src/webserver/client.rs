@@ -94,11 +94,10 @@ impl Client {
     /// Submits a batch and returns after validator verification plus enqueue.
     ///
     /// The batch is encoded as a commonware-codec length-prefixed vector and
-    /// sent to `POST /transactions/ingest`.
-    pub async fn ingest<H>(
-        &self,
-        transactions: &[SignedTransaction<H>],
-    ) -> Result<IngestView, SubmitError>
+    /// sent to `POST /transactions/ingest`. Acceptance is signaled by the
+    /// status alone; transaction digests are derivable from the submitted
+    /// batch.
+    pub async fn ingest<H>(&self, transactions: &[SignedTransaction<H>]) -> Result<(), SubmitError>
     where
         H: Hasher,
     {
@@ -106,7 +105,7 @@ impl Client {
     }
 
     /// Submits an already codec-encoded batch to the fast ingest endpoint.
-    pub async fn ingest_encoded(&self, body: bytes::Bytes) -> Result<IngestView, SubmitError> {
+    pub async fn ingest_encoded(&self, body: bytes::Bytes) -> Result<(), SubmitError> {
         let response = self
             .http
             .post(format!("{}/transactions/ingest", self.url))
@@ -116,10 +115,7 @@ impl Client {
             .await?;
 
         match response.status().as_u16() {
-            202 => {
-                let bytes = response.bytes().await?;
-                serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)
-            }
+            202 => Ok(()),
             400 => Err(SubmitError::BadRequest),
             413 => Err(SubmitError::PayloadTooLarge),
             500 => Err(SubmitError::InternalServerError),
@@ -170,10 +166,4 @@ pub struct AccountView {
 pub struct NonceView {
     pub base: u64,
     pub bitmap: u64,
-}
-
-/// Fast-ingest acknowledgement returned by validators.
-#[derive(Debug, Clone, Deserialize)]
-pub struct IngestView {
-    pub digests: Vec<String>,
 }

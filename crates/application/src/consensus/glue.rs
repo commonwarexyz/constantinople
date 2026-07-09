@@ -71,9 +71,9 @@ where
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
         let result = self.propose_child(context, parent, batches, input).await;
-        // The parent moved into propose_child's execution task, so only the
-        // drained ancestry stream remains. Keep the span so before/after traces
-        // stay comparable.
+        // propose_child releases the parent on the strategy's pool, so only
+        // the drained ancestry stream remains. Keep the span so before/after
+        // traces stay comparable.
         {
             let _cleanup = tracing::info_span!("application.propose.cleanup").entered();
             drop(ancestry);
@@ -95,9 +95,11 @@ where
         let result = self
             .verify_child(context, block, ancestry.next(), batches)
             .await;
-        // The block body and parent moved into verify_child's offloaded
-        // tasks, so only the drained ancestry stream remains. Keep the span
-        // so before/after traces stay comparable.
+        // On completed verifications the block body's references die in
+        // verify_child's offloaded tasks and the parent is released on the
+        // strategy's pool; early rejections drop what they hold inline.
+        // Either way only the drained ancestry stream remains here. Keep the
+        // span so before/after traces stay comparable.
         {
             let _cleanup = tracing::info_span!("application.verify.cleanup").entered();
             drop(ancestry);

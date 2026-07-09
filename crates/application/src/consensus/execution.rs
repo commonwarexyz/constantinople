@@ -66,9 +66,10 @@
 //! transition. `execute_proposal` prepares locally selected transactions and
 //! falls back to an empty proposal if the selected body is malformed or invalid.
 //! `execute_body` prepares a proposed body, recomputes execution, and compares
-//! the resulting commitments to the header. Certified apply prepares from the
-//! block's lazy body by reference, so it does not clone the block body or build
-//! an intermediate materialized transaction vector. Preparing a transfer does
+//! the resulting commitments to the header. Certified apply shallow-clones the
+//! block's lazy body (per-transaction handles whose decode cache stays shared)
+//! to move it into the pool's prepare job, without building an intermediate
+//! materialized transaction vector. Preparing a transfer does
 //! not invent a second transaction identifier: it reads the transaction's sealed
 //! message digest. For lazily encoded block bodies, whichever consumer first
 //! materializes the transaction computes that seal once and caches the decoded
@@ -156,7 +157,13 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let Some(plan) = executor::execution_plan(&transfers) else {
+    let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
+    let plan = {
+        let transfers = Arc::clone(&transfers);
+        strategy.spawn(move |_: S| plan_span.in_scope(|| executor::execution_plan(&transfers)))
+    }
+    .await;
+    let Some(plan) = plan else {
         return (stage_empty(batch).await, None);
     };
     let (staged, values) = load_accounts(batch, &plan.discrete, &plan.general).await;

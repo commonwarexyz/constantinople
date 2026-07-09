@@ -222,7 +222,10 @@ where
     pub fn get(&self) -> Option<&SignedTransaction<H>> {
         self.value
             .get_or_init(|| {
-                let bytes = self.pending.as_ref()?;
+                let bytes = self
+                    .pending
+                    .as_ref()
+                    .expect("pending bytes must exist when value is absent");
                 SignedTransaction::decode(bytes.clone()).ok()
             })
             .as_ref()

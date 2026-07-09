@@ -22,6 +22,7 @@ use constantinople_primitives::{
 };
 use rand::rng;
 use std::{fmt::Display, sync::Arc};
+use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::info_span;
 
@@ -37,6 +38,19 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 /// Minimum bytes needed to encode a `u64` varint.
 const MIN_U64_VARINT_BYTES: usize = 1;
 
+/// Maximum ingress batches admitted to CPU verification concurrently, shared
+/// across both POST endpoints.
+///
+/// Ingress decode and verification run on the strategy's worker pool, which
+/// consensus execution and block verification also depend on. Admitting one
+/// batch at a time keeps a burst of relayer posts from queueing CPU work ahead
+/// of consensus-critical jobs; excess requests wait cheaply on the semaphore
+/// in the async layer instead. The owned permit is acquired in `verify_body`
+/// -- after the request body is buffered, before the pool job dispatches --
+/// and moves into the job itself, so slow uploads and mailbox waits never
+/// hold it and a client disconnect cannot release it while the job runs.
+pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
+
 /// Shared state for HTTP handlers.
 pub(super) struct AppState<C, P, H, St>
 where
@@ -51,6 +65,7 @@ where
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub account_reader: AccountReaderCell,
+    pub ingress_permits: Arc<Semaphore>,
 }
 
 type SharedState<C, P, H, St> = Arc<AppState<C, P, H, St>>;
@@ -157,8 +172,9 @@ where
 /// Accepts a verified transaction batch without waiting for finalization.
 ///
 /// This endpoint is intended for relayers. It uses the same body format and
-/// validation path as [`submit_batch`], but returns as soon as the actor has
-/// accepted the batch for proposal.
+/// validation path as [`submit_batch`], but returns an empty `202 Accepted`
+/// as soon as the actor has accepted the batch for proposal; callers derive
+/// transaction digests locally from the batch they signed.
 async fn ingest_batch<C, P, H, St>(
     State(state): State<SharedState<C, P, H, St>>,
     body: Bytes,
@@ -174,30 +190,6 @@ where
         Err(status) => return (status, String::new()),
     };
 
-    // Hex-encoding thousands of digests into the JSON response is nontrivial
-    // formatting work, so build the response body on the strategy's pool
-    // instead of a core worker. Pool threads have an empty tracing context,
-    // so pass the request's span explicitly to keep ingress spans stitched to
-    // it.
-    let parent = tracing::Span::current();
-    let respond = state.strategy.spawn(move |_| {
-        info_span!(
-            parent: &parent,
-            "mempool.ingress.respond",
-            txs = batch.digests.len().traced()
-        )
-        .in_scope(|| {
-            serde_json::to_string(&IngestResponse {
-                digests: batch.digests.iter().map(ToString::to_string).collect(),
-            })
-        })
-        .map(|response| (batch, response))
-    });
-    let (batch, response) = match respond.await {
-        Ok(result) => result,
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-    };
-
     let Some(result_rx) = state.mailbox.try_ingest(
         batch.batch_id,
         batch.digests,
@@ -208,12 +200,10 @@ where
     };
 
     match result_rx.await {
-        Ok(IngestStatus::Accepted) => {}
-        Ok(IngestStatus::Dropped) => return (StatusCode::SERVICE_UNAVAILABLE, String::new()),
-        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+        Ok(IngestStatus::Accepted) => (StatusCode::ACCEPTED, String::new()),
+        Ok(IngestStatus::Dropped) => (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+        Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
     }
-
-    (StatusCode::ACCEPTED, response)
 }
 
 struct VerifiedBatch<H>
@@ -243,19 +233,29 @@ where
         return Err(StatusCode::BAD_REQUEST);
     };
 
+    // Admission control: the owned permit moves into the pool job below, so
+    // it is held for exactly the job's lifetime -- a client disconnect drops
+    // the handler future but cannot release the permit while the
+    // (uncancellable) job still occupies the pool.
+    let Ok(permit) = state.ingress_permits.clone().acquire_owned().await else {
+        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+    };
+
     // Hashing, decoding, and verifying a relayer batch is milliseconds of CPU
     // work at production sizes, so all of it runs on the strategy's pool
     // instead of a core worker; only the cheap length checks above stay
     // inline. Hosting the job on a pool member (rather than a blocking
     // thread) also lets it work-steal during the nested parallel signature
     // verification instead of parking. Pool threads have an empty tracing
-    // context, so pass the request's span explicitly to keep ingress spans
-    // stitched to it.
+    // context, so capture the caller's span explicitly; handlers currently
+    // run without a request-level span (making these spans trace roots), but
+    // the stitching holds if one is added.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
     let verified = state.strategy.spawn(move |strategy| {
+        let _permit = permit;
         let batch_id = H::hash(&body).to_string();
 
         let decode = info_span!(
@@ -310,11 +310,6 @@ where
         })
     });
     verified.await
-}
-
-#[derive(serde::Serialize)]
-struct IngestResponse {
-    digests: Vec<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -425,7 +420,7 @@ impl From<Nonce> for NonceResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, PublicKeyCache, router};
+    use super::{AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router};
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
@@ -448,6 +443,7 @@ mod tests {
             strategy: Sequential,
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
             account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
+            ingress_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS)),
         });
 
         router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state)
