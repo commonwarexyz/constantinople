@@ -133,6 +133,8 @@ where
     hits: Counter,
     reuses: Counter,
     discards: Counter,
+    empty_seeds: Counter,
+    dead_seeds: Counter,
 }
 
 impl<E, H, I, St> Speculator<E, H, I, St>
@@ -162,6 +164,14 @@ where
             discards: context.counter(
                 "discards",
                 "Speculative pre-builds replaced before any proposal consumed them",
+            ),
+            empty_seeds: context.counter(
+                "empty_seeds",
+                "Pre-builds abandoned because the mempool had nothing to select",
+            ),
+            dead_seeds: context.counter(
+                "dead_seeds",
+                "Pre-builds abandoned because every selected transaction failed to apply on the speculated parent",
             ),
         }
     }
@@ -222,6 +232,8 @@ where
         let parent_header = parent_header.clone();
         let input = Arc::clone(&self.input);
         let strategy = strategy.clone();
+        let empty_seeds = self.empty_seeds.clone();
+        let dead_seeds = self.dead_seeds.clone();
         let span = info_span!(
             "application.speculate",
             height = (parent_header.height + 1).traced()
@@ -246,6 +258,7 @@ where
                     // Nothing was consumed from the mempool; leave the slot
                     // empty so propose takes the fresh path (and picks up any
                     // transactions that arrive in the meantime).
+                    empty_seeds.inc();
                     let _ = result.send(None);
                     return;
                 }
@@ -267,9 +280,12 @@ where
                 .await;
                 if execution.body.is_empty() {
                     // Every seed transaction dropped against the guessed
-                    // parent: an empty pre-build would later propose an empty
-                    // block without ever consulting the mempool, so leave the
-                    // slot empty and let propose take the fresh path.
+                    // parent (typically all duplicates of the block being
+                    // verified): an empty pre-build would later propose an
+                    // empty block without ever consulting the mempool, so
+                    // leave the slot empty and let propose take the fresh
+                    // path.
+                    dead_seeds.inc();
                     let _ = result.send(None);
                     return;
                 }

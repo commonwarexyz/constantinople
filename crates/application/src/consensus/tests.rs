@@ -815,6 +815,76 @@ fn speculation_empty_selection_falls_back_to_fresh_input() {
         );
         assert!(metrics.contains("speculation_hits_total 0"), "{metrics}");
         assert!(metrics.contains("speculation_reuses_total 0"), "{metrics}");
+        assert!(
+            metrics.contains("speculation_empty_seeds_total 1"),
+            "{metrics}"
+        );
+    });
+}
+
+#[test]
+fn speculation_abandons_fully_stale_seed() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let tx1 = transfer(&harness.sender, &harness.recipient, 1);
+        // The speculative selection is exactly the transaction the verified
+        // block already contains, so the pre-build dies on the parent's
+        // state and propose must fall back to the live mempool.
+        let mut app = make_app(
+            &context,
+            &harness,
+            "spec_dead",
+            Some(vec![vec![tx1.clone()]]),
+        );
+        let mut builder = make_app(&context, &harness, "spec_dead_builder", None);
+
+        context.sleep(Duration::from_millis(10)).await;
+        let ctx1 = consensus_context(1, &harness.leader, 0, &harness.parent);
+        let mut b_input: TestSource = StaticTransactionSource::new(vec![vec![tx1.clone()]]);
+        let proposed_b = builder
+            .propose_child(
+                (context.child("propose_b"), ctx1.clone()),
+                harness.parent.clone(),
+                harness.dbs.new_batches().await,
+                &mut b_input,
+            )
+            .await
+            .expect("B must build");
+        let block_b = proposed_b.block.clone();
+        let b_merkleized = app
+            .verify_child(
+                (context.child("verify_b"), ctx1),
+                block_b.clone(),
+                ready(Some(harness.parent.clone())),
+                harness.dbs.new_batches().await,
+            )
+            .await
+            .expect("B must verify");
+        context.sleep(Duration::from_millis(10)).await;
+
+        let fresh_tx = transfer(&harness.alt_sender, &harness.recipient, 2);
+        let mut fresh: TestSource = StaticTransactionSource::new(vec![vec![fresh_tx.clone()]]);
+        let ctx2 = consensus_context(2, &harness.leader, 1, &block_b);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_after_dead"), ctx2),
+                block_b,
+                TestDbs::fork_batches(&b_merkleized),
+                &mut fresh,
+            )
+            .await
+            .expect("fresh proposal must succeed");
+
+        assert_eq!(
+            body_digests(&proposed.block),
+            vec![*fresh_tx.message_digest()]
+        );
+        let metrics = context.encode();
+        assert!(
+            metrics.contains("speculation_dead_seeds_total 1"),
+            "{metrics}"
+        );
+        assert!(metrics.contains("speculation_hits_total 0"), "{metrics}");
     });
 }
 

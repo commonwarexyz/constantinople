@@ -4958,7 +4958,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "How proposals were served across the fleet: hits reuse the pre-built execution outright, reuses re-execute the pre-built selection on an unexpected parent, discards were replaced before any proposal consumed them. hits + reuses approaching the propose rate means speculation is paying off.",
+      "description": "How pre-builds resolve: hits reuse the pre-built execution outright, reuses re-execute the selection on an unexpected parent, discards were replaced unconsumed, empty seeds found nothing in the mempool at verify time, and dead seeds lost every selected transaction to the speculated parent's state (duplicate delivery). hits + reuses approaching the propose rate means speculation is paying off; empty/dead seeds dominating points at relayer timing or duplicate targeting.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5080,6 +5080,36 @@
           "range": true,
           "refId": "C",
           "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(engine_application_speculation_empty_seeds_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "empty seeds",
+          "range": true,
+          "refId": "D",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
+          "expr": "sum(rate(engine_application_speculation_dead_seeds_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "legendFormat": "dead seeds",
+          "range": true,
+          "refId": "E",
+          "useBackend": false
         }
       ],
       "title": "Speculation Outcomes per Second",
@@ -5091,7 +5121,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Exact-parent hits as a share of pre-builds started. The gap to 1.0 is nullified views (reuse/discard) plus pre-builds whose selection came back empty (an idle mempool counts a pre-build but can never hit). Persistent low values under load with healthy view latency suggest the leader oracle and consensus disagree on leadership.",
+      "description": "Exact-parent hits as a share of pre-builds started. The gap to 1.0 is nullified views (reuse/discard) plus abandoned pre-builds (empty or dead seeds \u2014 see Speculation Outcomes). Persistent low values under load with healthy view latency and few abandonments suggest the leader oracle and consensus disagree on leadership.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5196,7 +5226,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Pre-builds started per validator (one per verified block whose next view this node leads). Fleet-wide this should track views per second; a flat-lined validator is never electing itself.",
+      "description": "Pre-builds started per validator over each interval (one per verified block whose next view this node leads). Fleet-wide the sum tracks views; a flat-lined validator is never electing itself.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5281,7 +5311,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum by(deployer_name, deployer_ip) (rate(engine_application_speculation_prebuilds_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum by(deployer_name, deployer_ip) (increase(engine_application_speculation_prebuilds_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "__auto",
@@ -5290,7 +5320,7 @@
           "useBackend": false
         }
       ],
-      "title": "Pre-Builds per Second",
+      "title": "Pre-Builds",
       "transparent": true,
       "type": "timeseries"
     },
@@ -6048,7 +6078,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate({__name__=~\".+_cache_hits_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / (sum(rate({__name__=~\".+_cache_hits_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) + sum(rate({__name__=~\".+_cache_misses_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "expr": "sum(rate((label_replace({__name__=~\".+_cache_hits_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, \"journal\", \"$1\", \"__name__\", \"(.+)\"))[$__rate_interval:])) / (sum(rate((label_replace({__name__=~\".+_cache_hits_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, \"journal\", \"$1\", \"__name__\", \"(.+)\"))[$__rate_interval:])) + sum(rate((label_replace({__name__=~\".+_cache_misses_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, \"journal\", \"$1\", \"__name__\", \"(.+)\"))[$__rate_interval:])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "hit rate",
