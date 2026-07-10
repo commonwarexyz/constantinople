@@ -18,7 +18,7 @@ use commonware_cryptography::{
     sha256::Sha256,
 };
 use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
-use commonware_runtime::{Clock, Metrics, Quota, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Quota, Storage};
 use commonware_storage::metadata::{Config as MetadataConfig, Metadata};
 use commonware_utils::{Acknowledgement, N3f1, TryCollect, channel::mpsc, sequence::U64, test_rng};
 use std::collections::BTreeMap;
@@ -154,7 +154,7 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
 }
 
 pub(crate) async fn state_sync_done(
-    context: &(impl Storage + Clock + Metrics),
+    context: &(impl BufferPooler + Storage + Clock + Metrics),
     partition_prefix: &str,
 ) -> bool {
     let metadata = Metadata::<_, U64, bool>::init(
