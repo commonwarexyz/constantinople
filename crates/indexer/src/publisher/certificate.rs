@@ -17,7 +17,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use exoware_sdk::{StoreClient, StoreWriteBatch};
+use exoware_sdk::{PrefixedStoreClient, StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::{sync::Arc, time::Duration};
 use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
@@ -216,7 +216,7 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex block upload must stage");
-    let seq = commit_with_retry(client.store_client().client(), &batch).await;
+    let seq = commit_with_retry(client.store_client(), &batch).await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
@@ -280,7 +280,7 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex upload must stage");
-    let seq = commit_with_retry(client.store_client().client(), &batch).await;
+    let seq = commit_with_retry(client.store_client(), &batch).await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
@@ -292,7 +292,11 @@ where
     uploaded_finalization
 }
 
-async fn commit_with_retry(client: &StoreClient, batch: &StoreWriteBatch) -> u64 {
+async fn commit_with_retry(client: &PrefixedStoreClient, batch: &StoreWriteBatch) -> u64 {
+    // Rows are prefix-encoded as they are staged (a shared batch may span
+    // namespaces), so the batch commit is namespace-agnostic and the SDK
+    // only exposes it on the underlying client.
+    let client = client.client();
     let mut attempt = 0u32;
     loop {
         match batch.commit(client).await {

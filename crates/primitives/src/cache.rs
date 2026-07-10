@@ -68,10 +68,13 @@ impl PublicKeyCache {
         );
         let _guard = span.enter();
 
+        // One read guard shared across the pool: acquiring the lock per key
+        // ping-pongs its cache line across threads on a hit-heavy batch.
+        let cache = self.inner.read();
         let missed = AtomicU64::new(0);
         let resolved: Vec<(DecompressedPublicKey, bool)> = strategy
             .try_map_collect_vec(keys, |&key| {
-                if let Some(hit) = self.inner.read().get(key).cloned() {
+                if let Some(hit) = cache.get(key).cloned() {
                     return Ok((hit, false));
                 }
                 let decompressed = Self::decompress_uncached(key).ok_or(())?;
@@ -79,6 +82,7 @@ impl PublicKeyCache {
                 Ok::<_, ()>((decompressed, true))
             })
             .ok()?;
+        drop(cache);
 
         // Insert all misses under one write lock; a pure-hit batch never
         // takes it.
