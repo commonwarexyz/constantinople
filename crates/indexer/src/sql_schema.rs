@@ -41,6 +41,16 @@ pub const BLOCK_META_HEIGHT: &str = "height";
 pub const BLOCK_META_DIGEST: &str = "digest";
 /// `block_meta`: number of transactions contained in the block.
 pub const BLOCK_META_TX_COUNT: &str = "tx_count";
+/// `block_meta`: plain transfers in the block.
+pub const BLOCK_META_TRANSFERS: &str = "transfers";
+/// `block_meta`: channel opens in the block.
+pub const BLOCK_META_CHANNEL_OPENS: &str = "channel_opens";
+/// `block_meta`: channel closes in the block.
+pub const BLOCK_META_CHANNEL_CLOSES: &str = "channel_closes";
+/// `block_meta`: channel timeouts in the block.
+pub const BLOCK_META_CHANNEL_TIMEOUTS: &str = "channel_timeouts";
+/// `block_meta`: mints in the block.
+pub const BLOCK_META_MINTS: &str = "mints";
 /// `block_meta`: root of the transaction-hash QMDB operation log at this block.
 pub const BLOCK_META_TRANSACTIONS_ROOT: &str = "transactions_root";
 /// `block_meta`: latest transaction-hash QMDB operation location at this block.
@@ -67,8 +77,13 @@ pub const TX_ACTIVITY_ACCOUNT: &str = "account";
 pub const TX_ACTIVITY_HEIGHT: &str = "height";
 /// `tx_activity`: transaction index within the finalized block.
 pub const TX_ACTIVITY_INDEX: &str = "index";
-/// `tx_activity`: role of this account in the transaction (`0` sender, `1` receiver).
+/// `tx_activity`: role of this account in the transaction (see the
+/// `TX_ACTIVITY_ROLE_*` values).
 pub const TX_ACTIVITY_ROLE: &str = "role";
+/// `tx_activity.role` value: this account sent the transaction.
+pub const TX_ACTIVITY_ROLE_SENDER: u64 = 0;
+/// `tx_activity.role` value: this account received the transaction.
+pub const TX_ACTIVITY_ROLE_RECEIVER: u64 = 1;
 /// `tx_activity`: 32-byte transaction digest, fixed-size binary.
 pub const TX_ACTIVITY_DIGEST: &str = "tx_digest";
 /// `tx_activity`: other account involved in the transfer.
@@ -77,8 +92,29 @@ pub const TX_ACTIVITY_COUNTERPARTY: &str = "counterparty";
 pub const TX_ACTIVITY_VALUE: &str = "value";
 /// `tx_activity`: sender nonce.
 pub const TX_ACTIVITY_NONCE: &str = "nonce";
+/// `tx_activity`: operation kind (see the `TX_ACTIVITY_KIND_*` values). Lets
+/// the explorer distinguish a transfer from a channel reservation, settlement,
+/// reclaim, or mint; the `value`/`counterparty`/`role` columns are interpreted
+/// in light of it.
+pub const TX_ACTIVITY_KIND: &str = "kind";
+/// `tx_activity.kind` value: a plain account transfer.
+pub const TX_ACTIVITY_KIND_TRANSFER: u64 = 0;
+/// `tx_activity.kind` value: a channel open (escrow reservation).
+pub const TX_ACTIVITY_KIND_CHANNEL_OPEN: u64 = 1;
+/// `tx_activity.kind` value: a channel close (voucher settlement).
+pub const TX_ACTIVITY_KIND_CHANNEL_CLOSE: u64 = 2;
+/// `tx_activity.kind` value: a channel timeout (escrow reclaim).
+pub const TX_ACTIVITY_KIND_CHANNEL_TIMEOUT: u64 = 3;
+/// `tx_activity.kind` value: a mint.
+pub const TX_ACTIVITY_KIND_MINT: u64 = 4;
 
 // ---------- account_meta columns ----------
+//
+// Deletion marker: the store only supports upserts, so a deleted account
+// (a settled or timed-out channel) is written as a row with `deleted` set
+// to 1, the balance/nonce columns zeroed, and `qmdb_location` pointing at
+// the delete operation. Consumers must treat such a row as "account does
+// not exist" and must not expect an update proof at its location.
 
 /// `account_meta`: account key (primary key), fixed-size binary.
 pub const ACCOUNT_META_ACCOUNT: &str = "account";
@@ -88,8 +124,13 @@ pub const ACCOUNT_META_BALANCE: &str = "balance";
 pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 /// `account_meta`: indexed account run-ahead nonce bitmap.
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
-/// `account_meta`: account-state QMDB operation location.
+/// `account_meta`: account-state QMDB operation location (for a deleted
+/// account, the location of the delete operation — see the deletion note
+/// above).
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
+/// `account_meta`: 1 if the account was deleted (a settled or timed-out
+/// channel), 0 for a live account — see the deletion note above.
+pub const ACCOUNT_META_DELETED: &str = "deleted";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
@@ -113,6 +154,11 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                 TableColumnConfig::new(BLOCK_META_HEIGHT, DataType::UInt64, false),
                 TableColumnConfig::new(BLOCK_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(BLOCK_META_TX_COUNT, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_TRANSFERS, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_CHANNEL_OPENS, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_CHANNEL_CLOSES, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_CHANNEL_TIMEOUTS, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_MINTS, DataType::UInt64, false),
                 TableColumnConfig::new(
                     BLOCK_META_TRANSACTIONS_ROOT,
                     DataType::FixedSizeBinary(32),
@@ -163,6 +209,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                     ),
                     TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
                     TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_ACTIVITY_KIND, DataType::UInt64, false),
                 ],
                 vec![
                     TX_ACTIVITY_ACCOUNT.to_string(),
@@ -186,6 +233,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
                     TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
+                    TableColumnConfig::new(ACCOUNT_META_DELETED, DataType::UInt64, false),
                 ],
                 vec![ACCOUNT_META_ACCOUNT.to_string()],
                 vec![],
@@ -258,10 +306,12 @@ mod tests {
         assert_eq!(TX_ACTIVITY_COUNTERPARTY, "counterparty");
         assert_eq!(TX_ACTIVITY_VALUE, "value");
         assert_eq!(TX_ACTIVITY_NONCE, "nonce");
+        assert_eq!(TX_ACTIVITY_KIND, "kind");
         assert_eq!(ACCOUNT_META_ACCOUNT, "account");
         assert_eq!(ACCOUNT_META_BALANCE, "balance");
         assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");
         assert_eq!(ACCOUNT_META_NONCE_BITMAP, "nonce_bitmap");
         assert_eq!(ACCOUNT_META_QMDB_LOCATION, "qmdb_location");
+        assert_eq!(ACCOUNT_META_DELETED, "deleted");
     }
 }

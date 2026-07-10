@@ -2,7 +2,18 @@ const PUBLIC_KEY_BYTES = 34;
 const ACCOUNT_KEY_BYTES = 32;
 const ED25519_SCHEME = 0;
 const U64_BYTES = 8;
+const VOUCHER_SIGNATURE_BYTES = 64;
+/// Operation tag for a transfer (matches `TRANSFER_TAG` in the Rust codec).
+const TRANSFER_TAG = 0;
+const OPEN_CHANNEL_TAG = 1;
+const CLOSE_CHANNEL_TAG = 2;
+const TIMEOUT_CHANNEL_TAG = 3;
+const MINT_TAG = 4;
 const MAX_U64 = (1n << 64n) - 1n;
+/// Largest amount a single mint may credit (matches
+/// `Operation::MAX_MINT_AMOUNT` in the Rust codec); the chain rejects
+/// larger mints at decode.
+export const MAX_MINT_AMOUNT = 1_000_000n;
 
 export interface TransactionDraft {
     readonly senderPublicKey: Uint8Array;
@@ -54,12 +65,52 @@ export async function encodeSignedTransaction(
     };
 }
 
+export interface MintDraft {
+    readonly senderPublicKey: Uint8Array;
+    readonly amount: bigint;
+    readonly nonce: bigint;
+}
+
+// A mint credits the sender out of thin air — the chain's only token source
+// (accounts start empty). Wire layout matches the Rust codec: sender, nonce,
+// tag, amount.
+export async function encodeSignedMintTransaction(
+    draft: MintDraft,
+    sign: (message: Uint8Array) => Promise<Uint8Array>,
+): Promise<EncodedTransaction> {
+    if (draft.amount === 0n) {
+        throw new Error('mint amount must be greater than zero');
+    }
+    if (draft.amount > MAX_MINT_AMOUNT) {
+        throw new Error(`mint amount must be at most ${MAX_MINT_AMOUNT}`);
+    }
+    assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
+
+    const body = bytesConcat(
+        draft.senderPublicKey,
+        encodeU64(draft.nonce),
+        Uint8Array.of(MINT_TAG),
+        encodeU64(draft.amount),
+    );
+    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body)));
+    const signature = await sign(digest);
+
+    return {
+        digestHex: toHex(digest),
+        bytes: bytesConcat(body, signature),
+    };
+}
+
 export function encodeTransactionBatch(transactions: Uint8Array[]): Uint8Array {
     return bytesConcat(encodeUsize(transactions.length), ...transactions);
 }
 
 export function toHex(bytes: Uint8Array): string {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+}
+
+export function trimTrailingSlash(value: string): string {
+    return value.replace(/\/+$/, '');
 }
 
 export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
@@ -76,15 +127,55 @@ export function fromHex(value: string): Uint8Array {
     return bytes;
 }
 
+export function signedTransactionBodyLength(bytes: Uint8Array): number {
+    const common = PUBLIC_KEY_BYTES + U64_BYTES;
+    if (bytes.length <= common) {
+        throw new Error('SQL transaction body is truncated');
+    }
+
+    switch (bytes[common]) {
+        // Transfer: recipient account key + value.
+        case TRANSFER_TAG:
+            return common + 1 + ACCOUNT_KEY_BYTES + U64_BYTES;
+        // TimeoutChannel: receiver account key + operator account key + open nonce.
+        case TIMEOUT_CHANNEL_TAG:
+            return common + 1 + ACCOUNT_KEY_BYTES + ACCOUNT_KEY_BYTES + U64_BYTES;
+        // OpenChannel: receiver account key + operator account key + deposit + expiry.
+        case OPEN_CHANNEL_TAG:
+            return common + 1 + ACCOUNT_KEY_BYTES + ACCOUNT_KEY_BYTES + U64_BYTES + U64_BYTES;
+        // Mint: amount only.
+        case MINT_TAG:
+            return common + 1 + U64_BYTES;
+        // CloseChannel: payer public key + receiver account key + open nonce +
+        // cumulative + voucher signature.
+        case CLOSE_CHANNEL_TAG:
+            return (
+                common +
+                1 +
+                PUBLIC_KEY_BYTES +
+                ACCOUNT_KEY_BYTES +
+                U64_BYTES +
+                U64_BYTES +
+                VOUCHER_SIGNATURE_BYTES
+            );
+        default:
+            throw new Error('SQL transaction body has unknown operation tag');
+    }
+}
+
 async function encodeTransactionBody(draft: TransactionDraft): Promise<Uint8Array> {
     assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
     assertByteLength(draft.toAccountKey, ACCOUNT_KEY_BYTES, 'recipient account key');
 
+    // Wire layout must match the Rust codec (crates/primitives/src/transaction.rs):
+    // sender, nonce, then the tagged operation. A transfer is tag 0 followed by
+    // the recipient account key and the value.
     return bytesConcat(
         draft.senderPublicKey,
+        encodeU64(draft.nonce),
+        Uint8Array.of(TRANSFER_TAG),
         draft.toAccountKey,
         encodeU64(draft.value),
-        encodeU64(draft.nonce),
     );
 }
 

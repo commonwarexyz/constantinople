@@ -54,12 +54,16 @@ cargo run --bin constantinople-deploy -- generate \
   --relayer \
   --output-dir ./local \
   --spammer --spammer-accounts 4096 --spammer-accounts-jitter 0.1 \
+  --spammer-channel-fraction 0.5 \
   local
 ```
 
-The command prints an `mprocs` invocation that starts the generated local
-network. See [`bin/deploy/README.md`](./bin/deploy/README.md) for port and
-service details.
+The command writes a `local/mprocs.yaml` with one named process per service
+and prints the `mprocs --config` invocation that starts the network. `--spammer-channel-fraction` makes a fraction of spammer traffic
+exercise **payment channels** — it also starts the channel operator process
+that serves off-chain vouchers and settles channels on-chain. See
+[`bin/deploy/README.md`](./bin/deploy/README.md) for port, service, and
+channel-flag details.
 
 ## Deployment
 

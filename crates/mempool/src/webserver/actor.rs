@@ -737,7 +737,7 @@ mod tests {
     fn new_transactions_filters_duplicate_digests() {
         let signer = ed25519::PrivateKey::from_seed(1);
         let recipient = ed25519::PrivateKey::from_seed(2).public_key();
-        let transaction = Transaction::new(
+        let transaction = Transaction::transfer(
             TransactionPublicKey::ed25519(signer.public_key()),
             TransactionPublicKey::ed25519(recipient),
             NonZeroU64::new(1).expect("non-zero"),

@@ -1387,17 +1387,32 @@ const fn validate_writer_range(
 fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::SqlRow> {
     let mut rows = Vec::new();
     for (offset, operation) in delta.iter().enumerate() {
-        let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
-            continue;
-        };
         let location = start_location + u64::try_from(offset).expect("state op offset fits u64");
-        rows.push(encode_account_meta_row(AccountMetaRow {
-            account: account_key_array(key),
-            balance: account_value_balance(account),
-            nonce_base: account_value_nonce_base(account),
-            nonce_bitmap: account_value_nonce_bitmap(account),
-            qmdb_location: location,
-        }));
+        let row = match operation {
+            AnyOperation::Update(UnorderedUpdate(key, account)) => AccountMetaRow {
+                account: account_key_array(key),
+                balance: account_value_balance(account),
+                nonce_base: account_value_nonce_base(account),
+                nonce_bitmap: account_value_nonce_bitmap(account),
+                qmdb_location: location,
+                deleted: false,
+            },
+            // A deleted account (a settled or timed-out channel) is
+            // indistinguishable on-chain from one that never existed, so
+            // overwrite its latest row with a deletion marker — the table
+            // only supports upserts, and leaving the pre-delete row in place
+            // would show the channel's escrow as live forever.
+            AnyOperation::Delete(key) => AccountMetaRow {
+                account: account_key_array(key),
+                balance: 0,
+                nonce_base: 0,
+                nonce_bitmap: 0,
+                qmdb_location: location,
+                deleted: true,
+            },
+            _ => continue,
+        };
+        rows.push(encode_account_meta_row(row));
     }
     rows
 }
@@ -1665,6 +1680,12 @@ mod tests {
                     CellValue::UInt64(1),
                     CellValue::FixedBinary(vec![1u8; 32]),
                     CellValue::UInt64(1),
+                    // Per-kind counts: one transfer, no channel ops or mints.
+                    CellValue::UInt64(1),
+                    CellValue::UInt64(0),
+                    CellValue::UInt64(0),
+                    CellValue::UInt64(0),
+                    CellValue::UInt64(0),
                     CellValue::FixedBinary(vec![2u8; 32]),
                     CellValue::UInt64(2),
                     CellValue::UInt64(0),
@@ -1690,6 +1711,44 @@ mod tests {
         // One block_meta row and one digest-keyed tx_meta row.
         assert_eq!(batch.len(), 2);
         assert_eq!(prepared.entry_count(), 2);
+    }
+
+    #[test]
+    fn account_rows_mark_deleted_accounts() {
+        let updated = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+            ed25519::PrivateKey::from_seed(1).public_key(),
+        ));
+        let deleted = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+            ed25519::PrivateKey::from_seed(2).public_key(),
+        ));
+        let account = Account {
+            balance: 7,
+            nonce: Nonce::new(3, 0),
+        };
+        let delta: Vec<StateOperation> = vec![
+            encode_account_operation(AnyOperation::Update(UnorderedUpdate(updated, account))),
+            encode_account_operation(AnyOperation::Delete(deleted)),
+        ];
+
+        let rows = account_rows(&delta, 10);
+
+        // A settled/timed-out channel deletes its account; the latest row
+        // must be overwritten with the deletion marker set, not left showing
+        // the pre-delete escrow. (CellValue lacks PartialEq; Debug covers
+        // length, variants, and values.)
+        assert_eq!(rows.len(), 2);
+        let expected = encode_account_meta_row(AccountMetaRow {
+            account: account_key_array(&deleted),
+            balance: 0,
+            nonce_base: 0,
+            nonce_bitmap: 0,
+            qmdb_location: 11,
+            deleted: true,
+        });
+        assert_eq!(
+            format!("{:?}", rows[1].values),
+            format!("{:?}", expected.values)
+        );
     }
 
     #[test]
@@ -2407,7 +2466,7 @@ mod tests {
     fn signed_transaction(seed: u64, nonce: u64) -> SignedTransaction<Sha256> {
         let sender = ed25519::PrivateKey::from_seed(seed);
         let recipient = ed25519::PrivateKey::from_seed(seed + 100).public_key();
-        Transaction::new(
+        Transaction::transfer(
             TransactionPublicKey::ed25519(sender.public_key()),
             TransactionPublicKey::ed25519(recipient),
             StdNonZeroU64::new(1).expect("test value is non-zero"),

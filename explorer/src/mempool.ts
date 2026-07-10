@@ -1,4 +1,4 @@
-import { toArrayBuffer } from './codec';
+import { toArrayBuffer, trimTrailingSlash } from './codec';
 
 export interface AccountView {
     readonly balance: number;
@@ -62,6 +62,3 @@ export async function fetchTransactionStatus(baseUrl: string, batchId: string): 
     return response.json();
 }
 
-function trimTrailingSlash(value: string): string {
-    return value.replace(/\/+$/, '');
-}

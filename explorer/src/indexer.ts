@@ -9,20 +9,24 @@
 // lookup queries use SQL too; submitted-transaction proofs use the QMDB and
 // Simplex clients in `qmdb.ts`.
 //
-// Column names mirror `crates/indexer/src/sql_schema.rs` and must stay in
-// sync with `BLOCK_META_*` constants there.
+// Table/column names come from `sqlContract.ts`, the explorer's tested copy
+// of `crates/indexer/src/sql_schema.rs`.
 
 import { Code, ConnectError } from '@connectrpc/connect';
 import { type DecodedSubscribeFrame, SqlClient } from '@exowarexyz/sql';
 import { collectLiveBlocks, createBlockSequenceCursor } from './blockSequence';
+import {
+    BLOCK_META_CHANNEL_CLOSES,
+    BLOCK_META_CHANNEL_OPENS,
+    BLOCK_META_CHANNEL_TIMEOUTS,
+    BLOCK_META_DIGEST,
+    BLOCK_META_HEIGHT,
+    BLOCK_META_MINTS,
+    BLOCK_META_TABLE,
+    BLOCK_META_TRANSFERS,
+    BLOCK_META_TX_COUNT,
+} from './sqlContract';
 
-/** `block_meta` column names (mirror `crates/indexer/src/sql_schema.rs`). */
-const COL_HEIGHT = 'height';
-const COL_DIGEST = 'digest';
-const COL_TX_COUNT = 'tx_count';
-
-/** The SQL table the explorer subscribes to. */
-const BLOCK_META_TABLE = 'block_meta';
 const NETWORK_RECONNECT_DELAY_MS = 5_000;
 
 /** Aggregate summary of one finalized block as observed on the live stream. */
@@ -33,10 +37,21 @@ export interface ObservedBlock {
     readonly digest: Uint8Array;
     /** Number of transactions contained in the block. */
     readonly txCount: number;
+    /** Per-kind transaction counts for the block. */
+    readonly kinds: BlockKindCounts;
     /** Wall-clock arrival time on this client, in epoch milliseconds. */
     readonly arrivedAt: number;
     /** Underlying store batch sequence number. Multiple rows may share it. */
     readonly sequence: bigint;
+}
+
+/** Per-kind transaction counts streamed with each `block_meta` row. */
+export interface BlockKindCounts {
+    readonly transfers: number;
+    readonly channelOpens: number;
+    readonly channelCloses: number;
+    readonly channelTimeouts: number;
+    readonly mints: number;
 }
 
 export interface SubscribeBlocksOptions {
@@ -126,9 +141,14 @@ export async function* subscribeBlocks(
  * the server batches rows differently in the future.
  */
 function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
-    const heightIdx = frame.columns.indexOf(COL_HEIGHT);
-    const digestIdx = frame.columns.indexOf(COL_DIGEST);
-    const txCountIdx = frame.columns.indexOf(COL_TX_COUNT);
+    const heightIdx = frame.columns.indexOf(BLOCK_META_HEIGHT);
+    const digestIdx = frame.columns.indexOf(BLOCK_META_DIGEST);
+    const txCountIdx = frame.columns.indexOf(BLOCK_META_TX_COUNT);
+    const transfersIdx = frame.columns.indexOf(BLOCK_META_TRANSFERS);
+    const channelOpensIdx = frame.columns.indexOf(BLOCK_META_CHANNEL_OPENS);
+    const channelClosesIdx = frame.columns.indexOf(BLOCK_META_CHANNEL_CLOSES);
+    const channelTimeoutsIdx = frame.columns.indexOf(BLOCK_META_CHANNEL_TIMEOUTS);
+    const mintsIdx = frame.columns.indexOf(BLOCK_META_MINTS);
     if (heightIdx < 0 || digestIdx < 0 || txCountIdx < 0) {
         // Server schema diverged from the explorer's compile-time
         // expectations — surface as zero rows so the UI keeps streaming
@@ -137,6 +157,11 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
     }
     const arrivedAt = Date.now();
     const blocks: ObservedBlock[] = [];
+    // A kind column absent from the frame (older server schema) reads as 0.
+    const kindAt = (row: (typeof frame.rows)[number], idx: number): number => {
+        const cell = idx < 0 ? undefined : row.cells[idx];
+        return typeof cell === 'bigint' ? Number(cell) : 0;
+    };
     for (const row of frame.rows) {
         const heightCell = row.cells[heightIdx];
         const digestCell = row.cells[digestIdx];
@@ -154,6 +179,13 @@ function* decodeFrame(frame: DecodedSubscribeFrame): Generator<ObservedBlock> {
             height: heightCell,
             digest: digestCell,
             txCount: Number(txCountCell),
+            kinds: {
+                transfers: kindAt(row, transfersIdx),
+                channelOpens: kindAt(row, channelOpensIdx),
+                channelCloses: kindAt(row, channelClosesIdx),
+                channelTimeouts: kindAt(row, channelTimeoutsIdx),
+                mints: kindAt(row, mintsIdx),
+            },
             arrivedAt,
             sequence: frame.sequenceNumber,
         });

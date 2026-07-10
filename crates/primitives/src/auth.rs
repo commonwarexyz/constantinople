@@ -67,6 +67,16 @@ impl TransactionPublicKey {
         encoded[1..].copy_from_slice(key.as_ref());
         Self::Secp256r1 { encoded }
     }
+
+    /// Returns the decoded Ed25519 public key, or `None` for other schemes.
+    ///
+    /// The shared voucher predicate uses this: vouchers are Ed25519-only.
+    pub fn as_ed25519(&self) -> Option<ed25519::PublicKey> {
+        let Self::Ed25519 { encoded } = self else {
+            return None;
+        };
+        ed25519::PublicKey::try_from(&encoded[1..1 + ed25519::PublicKey::SIZE]).ok()
+    }
 }
 
 impl Write for TransactionPublicKey {

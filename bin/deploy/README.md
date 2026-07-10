@@ -26,7 +26,9 @@ This writes:
 When secondary roles are enabled, this also writes `secondary-0.yaml`,
 `secondary-1.yaml`, ...
 
-It also prints an `mprocs` command that starts the whole local cluster.
+It also writes an `mprocs.yaml` (one named process per service) into the
+output directory and prints the `mprocs --config` command that starts the
+whole local cluster.
 
 Run a single validator directly:
 
@@ -36,8 +38,8 @@ cargo run --bin constantinople -- \
   --peers ./local/peers.yaml
 ```
 
-Run the whole local cluster with the printed `mprocs` command, or start each validator in a
-separate terminal:
+Run the whole local cluster with the printed `mprocs --config` command, or start each
+validator in a separate terminal:
 
 ```sh
 cargo run --bin constantinople -- --config ./local/validator-0.yaml --peers ./local/peers.yaml
@@ -86,6 +88,23 @@ locally per submitter. The spammer still submits only one batch at a time to eac
 `spammer_accounts * relayer_submitters`.
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
+
+Add `--spammer-channel-fraction F` (default `0`, channels off) to make a
+fraction of spammer iterations exercise **payment channels** instead of
+transfers: open a channel on-chain, stream `--spammer-channel-vouchers V`
+(default `8`) vouchers off-chain (signed by the payer, verified with the chain's
+own predicate — no transaction per payment), then settle with a single on-chain
+close. The spammer log's `channel_txs` (on-chain opens+closes) and `vouchers`
+(off-chain payments) counters show the throughput split. Keep
+`channel_vouchers * value` within the warm-up mint amount every spammer account
+starts with (`RING_MINT_AMOUNT` in the spammer) so opens succeed.
+
+```sh
+cargo run --bin constantinople-deploy -- generate \
+  --validators 4 --indexer --relayer --output-dir ./local \
+  --spammer --spammer-channel-fraction 0.5 --spammer-channel-vouchers 5 \
+  local
+```
 
 You can also run the spammer manually against an existing local cluster:
 

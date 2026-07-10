@@ -8,14 +8,17 @@ import {
 } from 'react';
 import {
     accountKeyFromPublicKey,
+    encodeSignedMintTransaction,
     encodeSignedTransaction,
     encodeTransactionBatch,
     parseAccountKeyHex,
     parseU64,
     toHex,
+    trimTrailingSlash,
+    type EncodedTransaction,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
-import { type ObservedBlock, subscribeBlocks } from './indexer';
+import { type BlockKindCounts, type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
     submitTransactions,
@@ -31,6 +34,7 @@ import {
     type AccountActivityMode,
     type AccountTransactionRow,
     type LatestProofTarget,
+    type TransactionKind,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
 } from './qmdb';
@@ -87,6 +91,9 @@ const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
 const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
 const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
+// Optional: the channel operator's HTTP base. When set, the stats strip shows
+// the off-chain voucher count next to the on-chain settlement count.
+const operatorUrl: string = import.meta.env.VITE_OPERATOR_URL ?? '';
 const verifyCertificates = parseBooleanEnv(import.meta.env.VITE_VERIFY_CERTIFICATES, true);
 
 function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
@@ -96,9 +103,49 @@ function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
     return fallback;
 }
 
+/** How often to refresh the operator's self-reported counters. */
+const OPERATOR_STATS_POLL_MS = 2_000;
+
+// Display labels per transaction kind, in stats-row order. The exhaustive
+// Record ties the list to `BlockKindCounts`, so the zero record, the
+// accumulator, and the expanded stats row all follow a new kind from here.
+const KIND_LABELS: Record<keyof BlockKindCounts, string> = {
+    transfers: 'transfers',
+    channelOpens: 'channel opens',
+    channelCloses: 'channel closes',
+    channelTimeouts: 'channel timeouts',
+    mints: 'mints',
+};
+const KIND_KEYS = Object.keys(KIND_LABELS) as ReadonlyArray<keyof BlockKindCounts>;
+
+function buildKindCounts(count: (key: keyof BlockKindCounts) => number): BlockKindCounts {
+    return {
+        transfers: count('transfers'),
+        channelOpens: count('channelOpens'),
+        channelCloses: count('channelCloses'),
+        channelTimeouts: count('channelTimeouts'),
+        mints: count('mints'),
+    };
+}
+
+const ZERO_KIND_COUNTS = buildKindCounts(() => 0);
+
+function addKindCounts(total: BlockKindCounts, block: ObservedBlock): BlockKindCounts {
+    return buildKindCounts((key) => total[key] + block.kinds[key]);
+}
+
+// The `/stats` body carries more counters; the explorer only reads the
+// off-chain one the stream can't provide.
+interface OperatorStatsSnapshot {
+    readonly vouchers: number;
+}
+
 interface SubmittedTransaction {
     readonly sender: string;
     readonly digest: string;
+    // What the wallet submitted; history stored before this field existed
+    // only held transfers, so absent normalizes to 'transfer'.
+    readonly kind: TransactionKind;
     readonly to: string;
     readonly value: string;
     readonly nonce: string;
@@ -170,6 +217,12 @@ export default function App() {
     // roll off the histogram buffer.
     const [totalTxObserved, setTotalTxObserved] = useState(0);
     const [totalBlocksObserved, setTotalBlocksObserved] = useState(0);
+    const [totalKinds, setTotalKinds] = useState<BlockKindCounts>(ZERO_KIND_COUNTS);
+    // Vouchers served since this page loaded, so the stat is comparable with
+    // the (equally session-scoped) transaction counters. The operator reports
+    // lifetime totals; the first poll sets the baseline.
+    const [sessionVouchers, setSessionVouchers] = useState<number | null>(null);
+    const voucherBaselineRef = useRef<number | null>(null);
     const [observedRateWindow, setObservedRateWindow] = useState<ObservedRateWindow>({
         firstBlockAt: null,
         latestBlockAt: null,
@@ -252,6 +305,7 @@ export default function App() {
                 (current) =>
                     current + flushed.reduce((total, block) => total + block.txCount, 0),
             );
+            setTotalKinds((current) => flushed.reduce(addKindCounts, current));
             setTotalBlocksObserved((current) => current + flushed.length);
             setObservedRateWindow((current) => ({
                 firstBlockAt: current.firstBlockAt ?? flushed[0].arrivedAt,
@@ -260,6 +314,39 @@ export default function App() {
             setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
         }, BLOCK_FLUSH_INTERVAL_MS);
     };
+
+    // Poll the operator's self-reported counters; unlike everything else on
+    // the page they are not proof-verified, and the strip labels them so.
+    useEffect(() => {
+        if (!operatorUrl) return;
+        const base = trimTrailingSlash(operatorUrl);
+        let cancelled = false;
+        const poll = async () => {
+            try {
+                const response = await fetch(`${base}/stats`);
+                if (!response.ok) return;
+                const stats: OperatorStatsSnapshot = await response.json();
+                if (cancelled) return;
+                const baseline = voucherBaselineRef.current;
+                if (baseline === null) {
+                    voucherBaselineRef.current = stats.vouchers;
+                } else if (stats.vouchers < baseline) {
+                    // The operator restarted (its lifetime count reset);
+                    // restart the session count with it.
+                    voucherBaselineRef.current = 0;
+                }
+                setSessionVouchers(stats.vouchers - (voucherBaselineRef.current ?? 0));
+            } catch {
+                // Operator not up yet (or between restarts); keep polling.
+            }
+        };
+        void poll();
+        const interval = window.setInterval(() => void poll(), OPERATOR_STATS_POLL_MS);
+        return () => {
+            cancelled = true;
+            window.clearInterval(interval);
+        };
+    }, []);
 
     useEffect(() => {
         const restoredWallet = restoreWalletSession();
@@ -426,21 +513,29 @@ export default function App() {
                 setAccountNextCursor(page.nextCursor);
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
-                    proof: { status: 'waiting', detail: 'waiting for latest finalization' },
-                })));
-                if (!accountTarget) return;
-
-                setAccountTransactions(page.rows.map((row) => ({
-                    row,
                     proof: { status: 'fetching', detail: 'fetching transaction proof' },
                 })));
+
+                // Verify rows against a certified target fetched with the
+                // page, not the one pinned when the account was first looked
+                // up: rows indexed after that pin would read as beyond its
+                // finalized range until a full page reload.
+                const target = await retryAccountPageStep(
+                    () => fetchLatestProofTarget({
+                        storeUrl,
+                        simplexVerificationMaterial,
+                        signal: controller.signal,
+                    }),
+                    controller.signal,
+                );
+                if (controller.signal.aborted) return;
                 const results = await Promise.allSettled(
                     page.rows.map((row) =>
                         retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
                             qmdbUrl,
                             sqlUrl: indexerUrl,
                             row,
-                            target: accountTarget,
+                            target,
                             signal: controller.signal,
                         }), controller.signal),
                     ),
@@ -466,7 +561,7 @@ export default function App() {
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode]);
 
     useEffect(() => {
         const signedInSender = signedInAccountKey;
@@ -570,7 +665,7 @@ export default function App() {
                 setAccountMessage(
                     nextAccount
                         ? 'committed account loaded'
-                        : 'no committed account yet; default balance applies',
+                        : 'no committed account yet; mint to fund it',
                 );
             })
             .catch((error) => {
@@ -592,7 +687,7 @@ export default function App() {
             setAccount(nextAccount);
             mergeLocalNonceState(accountNonceState(nextAccount));
             setAccountMessage(
-                nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
+                nextAccount ? 'committed account loaded' : 'no committed account yet; mint to fund it',
             );
         } catch (error) {
             setAccountMessage(error instanceof Error ? error.message : String(error));
@@ -710,7 +805,27 @@ export default function App() {
         }
     };
 
-    const submitTransfer = async () => {
+    /**
+     * Shared submit flow: reserve the next nonce (rolled back if nothing was
+     * submitted), let `form` parse the inputs and sign the transaction, then
+     * record it in history and submit it to the mempool. `form` receives the
+     * reserved nonce plus the active wallet and its account key (narrowed —
+     * the guards below already ran) and returns the encoded transaction plus
+     * the recipient/value to show in history.
+     */
+    const submitSigned = async (
+        formingMessage: string,
+        form: (
+            nonce: bigint,
+            activeWallet: ActiveWallet,
+            senderAccountKey: string,
+        ) => Promise<{
+            encoded: EncodedTransaction;
+            kind: TransactionKind;
+            to: string;
+            value: bigint;
+        }>,
+    ) => {
         if (!wallet) return;
         if (!walletAccountKey) {
             setSubmitMessage('loading account address');
@@ -718,11 +833,9 @@ export default function App() {
         }
 
         setPendingSubmissionCount((count) => count + 1);
-        setSubmitMessage('forming transaction');
+        setSubmitMessage(formingMessage);
         let reservation: { previous: NonceState; next: NonceState } | null = null;
         try {
-            const parsedToKey = parseAccountKeyHex(toKey);
-            const parsedValue = parseU64(value, 'value');
             const previousNonce = nextNonceRef.current;
             const parsedNonce = nextAvailableNonce(previousNonce);
             const nextNonce = consumeNonce(previousNonce, parsedNonce);
@@ -732,20 +845,13 @@ export default function App() {
             setLocalNonceState(nextNonce);
             reservation = { previous: previousNonce, next: nextNonce };
 
-            const encoded = await encodeSignedTransaction(
-                {
-                    senderPublicKey: wallet.publicKey,
-                    toAccountKey: parsedToKey,
-                    value: parsedValue,
-                    nonce: parsedNonce,
-                },
-                wallet.sign,
-            );
+            const { encoded, kind, to, value: sentValue } = await form(parsedNonce, wallet, walletAccountKey);
             const pending: SubmittedTransaction = {
                 sender: walletAccountKey,
                 digest: encoded.digestHex,
-                to: toHex(parsedToKey),
-                value: parsedValue.toString(),
+                kind,
+                to,
+                value: sentValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
                 finalizedInMs: null,
@@ -779,6 +885,37 @@ export default function App() {
             setPendingSubmissionCount((count) => Math.max(0, count - 1));
         }
     };
+
+    const submitTransfer = () =>
+        submitSigned('forming transaction', async (nonce, activeWallet) => {
+            const parsedToKey = parseAccountKeyHex(toKey);
+            const parsedValue = parseU64(value, 'value');
+            const encoded = await encodeSignedTransaction(
+                {
+                    senderPublicKey: activeWallet.publicKey,
+                    toAccountKey: parsedToKey,
+                    value: parsedValue,
+                    nonce,
+                },
+                activeWallet.sign,
+            );
+            return { encoded, kind: 'transfer' as const, to: toHex(parsedToKey), value: parsedValue };
+        });
+
+    const submitMint = () =>
+        submitSigned('forming mint', async (nonce, activeWallet, senderAccountKey) => {
+            const parsedAmount = parseU64(value, 'amount');
+            const encoded = await encodeSignedMintTransaction(
+                {
+                    senderPublicKey: activeWallet.publicKey,
+                    amount: parsedAmount,
+                    nonce,
+                },
+                activeWallet.sign,
+            );
+            // A mint credits the wallet itself; record it as self-addressed.
+            return { encoded, kind: 'mint' as const, to: senderAccountKey, value: parsedAmount };
+        });
 
     return (
         <div className="app">
@@ -837,6 +974,8 @@ export default function App() {
                                     observedRateWindow={observedRateWindow}
                                     totalBlocksObserved={totalBlocksObserved}
                                     totalTxObserved={totalTxObserved}
+                                    totalKinds={totalKinds}
+                                    sessionVouchers={sessionVouchers}
                                 />
                                 <BlockLog blocks={blocks} />
                             </>
@@ -867,6 +1006,7 @@ export default function App() {
                             onToKeyChange={setToKey}
                             onValueChange={setValue}
                             onSubmit={submitTransfer}
+                            onMint={submitMint}
                         />
                         <TransactionHistory
                             transactions={history}
@@ -986,9 +1126,23 @@ function AccountPage({
                 {!activityError && transactions.length === 0 && (
                     <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
                 )}
-                {transactions.map(({ row, proof: txProof }) => (
-                    <div className="account-tx-row" key={`${row.height.toString()}-${row.blockIndex}`}>
+                {transactions.map(({ row, proof: txProof }) => {
+                    // Direction drives the row color; a channel open is a
+                    // provisional reservation and a timeout releases one (the
+                    // reclaimed amount lives in state, not the transaction),
+                    // so both are dimmed instead.
+                    const tone =
+                        row.kind === 'channel-open' || row.kind === 'channel-timeout'
+                            ? 'reservation'
+                            : row.direction === 'received'
+                              ? 'in'
+                              : 'out';
+                    return (
+                    <div className={`account-tx-row account-tx-row--${tone}`} key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
+                            <span className={`account-tx-row__kind account-tx-row__kind--${row.kind}`}>
+                                {txKindLabel(row.kind)}
+                            </span>
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue value={row.digest} onCopy={onCopy} />
                             <span>from</span>
@@ -1007,17 +1161,42 @@ function AccountPage({
                             />
                         </div>
                         <div className="account-tx-row__meta">
-                            <span>value {row.value.toString()}</span>
+                            <span className="account-tx-row__value">{txValueText(row.kind, row.value)}</span>
                             <span>nonce {row.nonce.toString()}</span>
                             <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
                             <span>proof</span>
                             <ProofMark proof={txProof} />
                         </div>
                     </div>
-                ))}
+                    );
+                })}
             </div>
         </section>
     );
+}
+
+// Kind ids read as labels once the hyphen becomes a space.
+function txKindLabel(kind: TransactionKind): string {
+    return kind.replace('-', ' ');
+}
+
+// The value column means different things per kind: a transfer's amount, the
+// escrow a channel open reserves, or the amount a channel close pays out. A
+// timeout's reclaimed amount lives in state, not the transaction (the indexer
+// stores 0), so it renders as intent rather than a bogus number.
+function txValueText(kind: TransactionKind, value: bigint): string {
+    switch (kind) {
+        case 'channel-open':
+            return `reserve ${value.toString()}`;
+        case 'channel-close':
+            return `settle ${value.toString()}`;
+        case 'channel-timeout':
+            return 'reclaims escrow';
+        case 'mint':
+            return `mint ${value.toString()}`;
+        default:
+            return `value ${value.toString()}`;
+    }
 }
 
 function ProofDatum({ label, value }: { label: string; value: string }) {
@@ -1172,6 +1351,7 @@ function WalletPanel({
     onToKeyChange,
     onValueChange,
     onSubmit,
+    onMint,
 }: {
     wallet: ActiveWallet | null;
     walletAccountKey: string | null;
@@ -1194,8 +1374,9 @@ function WalletPanel({
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
     onSubmit: () => void;
+    onMint: () => void;
 }) {
-    const balance = account?.balance ?? 100;
+    const balance = account?.balance ?? 0;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
     const isAccountLoading = accountMessage === 'loading account metadata';
     const walletAccountDisplay = walletAccountKey?.toLowerCase() ?? 'not authenticated';
@@ -1274,6 +1455,15 @@ function WalletPanel({
                 </label>
                 <button className="transfer__submit" disabled={!wallet} type="submit">
                     submit
+                </button>
+                <button
+                    className="transfer__submit"
+                    disabled={!wallet}
+                    onClick={onMint}
+                    title="mint the amount to this wallet (accounts start empty)"
+                    type="button"
+                >
+                    mint
                 </button>
             </form>
             {isSubmitting && submitMessage && (
@@ -1479,7 +1669,7 @@ function TransactionRecord({
                     value={tx.to}
                     onOpenAddress={onOpenAddress}
                 />
-                <span className="tx-record__nonce">value {tx.value}</span>
+                <span className="tx-record__nonce">{txValueText(tx.kind, BigInt(tx.value))}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
                 <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
             </div>
@@ -1898,6 +2088,7 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
     return {
         digest: transaction.digest,
         sender: transaction.sender,
+        kind: normalizeTransactionKind(transaction.kind),
         to: transaction.to,
         value: transaction.value,
         nonce: transaction.nonce,
@@ -1909,6 +2100,19 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
         proof: normalizeTransactionProof(transaction.proof),
     };
+}
+
+// History stored before the kind field existed only held transfers.
+function normalizeTransactionKind(value: unknown): TransactionKind {
+    switch (value) {
+        case 'channel-open':
+        case 'channel-close':
+        case 'channel-timeout':
+        case 'mint':
+            return value;
+        default:
+            return 'transfer';
+    }
 }
 
 function isAccountKeyHex(value: string): boolean {
@@ -2012,34 +2216,80 @@ const ExplorerStats = memo(function ExplorerStats({
     blocks,
     totalBlocksObserved,
     totalTxObserved,
+    totalKinds,
+    sessionVouchers,
     observedRateWindow,
 }: {
     blocks: ObservedBlock[];
     totalBlocksObserved: number;
     totalTxObserved: number;
+    totalKinds: BlockKindCounts;
+    sessionVouchers: number | null;
     observedRateWindow: ObservedRateWindow;
 }) {
     const stats = useMemo(
         () => buildExplorerStats(blocks, totalBlocksObserved, totalTxObserved),
         [blocks, totalBlocksObserved, totalTxObserved],
     );
+    const [kindsOpen, setKindsOpen] = useState(false);
+    const count = (value: number) => (totalTxObserved === 0 ? '—' : value.toLocaleString());
     return (
-        <dl className="observed-stats" aria-label="explorer statistics">
-            <ExplorerStat label="latest height" value={stats.latestHeight} />
-            <ExplorerStat
-                label="observed tx/sec"
-                value={formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
-            />
-            <ExplorerStat label="total txs observed" value={stats.totalTxObserved} />
-            <ExplorerStat label="peak tx/block" value={stats.peakTxPerBlock} />
-            <ExplorerStat label="avg tx/block" value={stats.avgTxPerBlock} />
-        </dl>
+        <>
+            <dl className="observed-stats" aria-label="explorer statistics">
+                <ExplorerStat label="height" value={stats.latestHeight} />
+                <ExplorerStat
+                    label="tx/sec"
+                    value={formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
+                />
+                <div className="observed-stat">
+                    <dt className="observed-stat__label">
+                        <button
+                            className="observed-stat__toggle"
+                            type="button"
+                            aria-expanded={kindsOpen}
+                            title="break down by transaction kind"
+                            onClick={() => setKindsOpen((open) => !open)}
+                        >
+                            tx seen {kindsOpen ? '▾' : '▸'}
+                        </button>
+                    </dt>
+                    <dd className="observed-stat__value">{stats.totalTxObserved}</dd>
+                </div>
+                <ExplorerStat label="tx/block" value={stats.avgTxPerBlock} />
+                {sessionVouchers !== null && (
+                    <ExplorerStat
+                        label="vouchers*"
+                        value={sessionVouchers.toLocaleString()}
+                        title={OPERATOR_REPORTED_NOTE}
+                    />
+                )}
+            </dl>
+            {kindsOpen && (
+                <dl
+                    className="observed-stats observed-stats--kinds"
+                    aria-label="transactions by kind"
+                >
+                    {KIND_KEYS.map((key) => (
+                        <ExplorerStat
+                            key={key}
+                            label={KIND_LABELS[key]}
+                            value={count(totalKinds[key])}
+                        />
+                    ))}
+                </dl>
+            )}
+        </>
     );
 });
 
-function ExplorerStat({ label, value }: { label: string; value: string }) {
+// Hover text for the operator-reported stats — the one pair of numbers on
+// the page that is not proof-verified.
+const OPERATOR_REPORTED_NOTE =
+    'Served since this page loaded, as reported by the channel operator — off-chain payments never touch the chain, which is the point.';
+
+function ExplorerStat({ label, value, title }: { label: string; value: string; title?: string }) {
     return (
-        <div className="observed-stat">
+        <div className="observed-stat" title={title}>
             <dt className="observed-stat__label">{label}</dt>
             <dd className="observed-stat__value">{value}</dd>
         </div>
@@ -2053,17 +2303,12 @@ function buildExplorerStats(
 ): {
     latestHeight: string;
     totalTxObserved: string;
-    peakTxPerBlock: string;
     avgTxPerBlock: string;
 } {
     let latest: bigint | null = null;
-    let peak = 0;
     for (const block of blocks) {
         if (latest === null || block.height > latest) {
             latest = block.height;
-        }
-        if (block.txCount > peak) {
-            peak = block.txCount;
         }
     }
 
@@ -2071,7 +2316,6 @@ function buildExplorerStats(
     return {
         latestHeight: latest?.toString() ?? '—',
         totalTxObserved: totalTxObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
-        peakTxPerBlock: peak === 0 ? '—' : peak.toLocaleString(),
         avgTxPerBlock: totalBlocksObserved === 0 ? '—' : Math.round(avg).toLocaleString(),
     };
 }

@@ -1,5 +1,32 @@
-import { fromHex, toArrayBuffer } from './codec';
+import { fromHex, signedTransactionBodyLength, toArrayBuffer, trimTrailingSlash } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
+import {
+    ACCOUNT_META_ACCOUNT,
+    ACCOUNT_META_BALANCE,
+    ACCOUNT_META_DELETED,
+    ACCOUNT_META_NONCE_BASE,
+    ACCOUNT_META_NONCE_BITMAP,
+    ACCOUNT_META_QMDB_LOCATION,
+    ACCOUNT_META_TABLE,
+    QMDB_STATE_ROUTE,
+    QMDB_TRANSACTIONS_ROUTE,
+    TX_ACTIVITY_ACCOUNT,
+    TX_ACTIVITY_COUNTERPARTY,
+    TX_ACTIVITY_DIGEST,
+    TX_ACTIVITY_HEIGHT,
+    TX_ACTIVITY_INDEX,
+    TX_ACTIVITY_KIND,
+    TX_ACTIVITY_KINDS,
+    TX_ACTIVITY_NONCE,
+    TX_ACTIVITY_ROLE,
+    TX_ACTIVITY_ROLES,
+    TX_ACTIVITY_TABLE,
+    TX_ACTIVITY_VALUE,
+    TX_META_BODY_HEX,
+    TX_META_DIGEST,
+    TX_META_QMDB_LOCATION,
+    TX_META_TABLE,
+} from './sqlContract';
 import {
     SqlClient,
     type CellValue,
@@ -25,37 +52,8 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const TRANSACTION_PUBLIC_KEY_BYTES = 34;
-const TRANSACTION_VALUE_BYTES = 8;
-const TRANSACTION_NONCE_BYTES = 8;
-const TRANSACTION_BODY_BYTES =
-    TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
-
-const TX_META_TABLE = 'tx_meta';
-const TX_META_DIGEST = 'tx_digest';
-const TX_META_QMDB_LOCATION = 'qmdb_location';
-const TX_META_BODY_HEX = 'body_hex';
-
-const TX_ACTIVITY_TABLE = 'tx_activity';
-const TX_ACTIVITY_ACCOUNT = 'account';
-const TX_ACTIVITY_HEIGHT = 'height';
-const TX_ACTIVITY_INDEX = 'index';
-const TX_ACTIVITY_ROLE = 'role';
-const TX_ACTIVITY_DIGEST = 'tx_digest';
-const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
-const TX_ACTIVITY_VALUE = 'value';
-const TX_ACTIVITY_NONCE = 'nonce';
-const TX_ACTIVITY_ROLE_SENDER = 0n;
-const TX_ACTIVITY_ROLE_RECEIVER = 1n;
-
-const ACCOUNT_META_TABLE = 'account_meta';
-const ACCOUNT_META_ACCOUNT = 'account';
-const ACCOUNT_META_BALANCE = 'balance';
-const ACCOUNT_META_NONCE_BASE = 'nonce_base';
-const ACCOUNT_META_NONCE_BITMAP = 'nonce_bitmap';
-const ACCOUNT_META_QMDB_LOCATION = 'qmdb_location';
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -90,8 +88,17 @@ export interface LatestProofTarget extends FinalizedTransactionTarget {}
 
 export type AccountActivityMode = 'all' | 'sent' | 'received';
 
+// The kind of operation an activity row describes.
+export type TransactionKind =
+    | 'transfer'
+    | 'channel-open'
+    | 'channel-close'
+    | 'channel-timeout'
+    | 'mint';
+
 export interface AccountTransactionRow {
     readonly digest: string;
+    readonly kind: TransactionKind;
     readonly direction: 'sent' | 'received';
     readonly counterparty: string;
     readonly value: bigint;
@@ -149,7 +156,7 @@ export async function fetchAndVerifyTransactionProof({
     let verification: VerifiedFixedKeylessAppendProof;
     try {
         verification = await fetchFixedKeylessAppendProof(
-            `${trimTrailingSlash(qmdbUrl)}/transactions`,
+            `${trimTrailingSlash(qmdbUrl)}${QMDB_TRANSACTIONS_ROUTE}`,
             metadata.location,
             tip,
             target.transactionsRoot,
@@ -224,7 +231,7 @@ export async function fetchAndVerifyAccountProof({
 
     const tip = transactionProofTip(stateEnd);
     const verification = await fetchFixedUnorderedUpdateProof(
-        `${trimTrailingSlash(qmdbUrl)}/state`,
+        `${trimTrailingSlash(qmdbUrl)}${QMDB_STATE_ROUTE}`,
         row.location,
         tip,
         target.stateRoot,
@@ -272,7 +279,7 @@ export async function fetchAndVerifyTransactionRowProof({
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
-        `${trimTrailingSlash(qmdbUrl)}/transactions`,
+        `${trimTrailingSlash(qmdbUrl)}${QMDB_TRANSACTIONS_ROUTE}`,
         metadata.location,
         tip,
         target.transactionsRoot,
@@ -311,10 +318,11 @@ async function fetchVerifiedSqlTransactionMetadata(
 
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
     const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
-    if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
+    const bodyLength = signedTransactionBodyLength(signedTransaction);
+    if (signedTransaction.length < bodyLength) {
         throw new Error('SQL transaction body is truncated');
     }
-    const transactionBody = signedTransaction.slice(0, TRANSACTION_BODY_BYTES);
+    const transactionBody = signedTransaction.slice(0, bodyLength);
     const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(transactionBody)));
     if (!bytesEqual(actual, digest)) {
         throw new Error('SQL transaction body does not match transaction digest');
@@ -637,7 +645,8 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE}
+                ${TX_ACTIVITY_NONCE},
+                ${TX_ACTIVITY_KIND}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
             ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
@@ -657,15 +666,25 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         TX_ACTIVITY_COUNTERPARTY,
         ACCOUNT_KEY_BYTES,
     );
+    const kind = expectBigint(row.values[TX_ACTIVITY_KIND], TX_ACTIVITY_KIND);
     return {
         digest: toHex(digest),
-        direction: role === TX_ACTIVITY_ROLE_RECEIVER ? 'received' : 'sent',
+        kind: decodeTransactionKind(kind),
+        direction: role === TX_ACTIVITY_ROLES.receiver ? 'received' : 'sent',
         counterparty: toHex(counterparty),
         value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
         nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
         height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
         blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
     };
+}
+
+function decodeTransactionKind(kind: bigint): TransactionKind {
+    if (kind === TX_ACTIVITY_KINDS.channelOpen) return 'channel-open';
+    if (kind === TX_ACTIVITY_KINDS.channelClose) return 'channel-close';
+    if (kind === TX_ACTIVITY_KINDS.channelTimeout) return 'channel-timeout';
+    if (kind === TX_ACTIVITY_KINDS.mint) return 'mint';
+    return 'transfer';
 }
 
 async function fetchAccountProofRow(
@@ -680,7 +699,8 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_BALANCE},
                 ${ACCOUNT_META_NONCE_BASE},
                 ${ACCOUNT_META_NONCE_BITMAP},
-                ${ACCOUNT_META_QMDB_LOCATION}
+                ${ACCOUNT_META_QMDB_LOCATION},
+                ${ACCOUNT_META_DELETED}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
             LIMIT 1
@@ -691,7 +711,7 @@ async function fetchAccountProofRow(
     if (!row) {
         throw new Error(`account ${shortHex(toHex(account))} is not indexed`);
     }
-    return {
+    const decoded = {
         balance: expectBigint(row.values[ACCOUNT_META_BALANCE], ACCOUNT_META_BALANCE),
         nonce: expectBigint(row.values[ACCOUNT_META_NONCE_BASE], ACCOUNT_META_NONCE_BASE),
         nonceBitmap: expectBigint(
@@ -700,6 +720,16 @@ async function fetchAccountProofRow(
         ),
         location: expectBigint(row.values[ACCOUNT_META_QMDB_LOCATION], ACCOUNT_META_QMDB_LOCATION),
     };
+    // The indexer marks an account deletion (a settled or timed-out channel)
+    // with the `deleted` column; the row's location points at the delete
+    // operation. There is no update proof at that location, so surface the
+    // account as gone instead of attempting one.
+    if (expectBigint(row.values[ACCOUNT_META_DELETED], ACCOUNT_META_DELETED) !== 0n) {
+        throw new Error(
+            `account ${shortHex(toHex(account))} was deleted (a settled or expired channel)`,
+        );
+    }
+    return decoded;
 }
 
 function shortHex(value: string): string {
@@ -720,8 +750,8 @@ function fixedBinaryLiteral(bytes: Uint8Array): string {
 }
 
 function activityModeRole(mode: AccountActivityMode): bigint | null {
-    if (mode === 'sent') return TX_ACTIVITY_ROLE_SENDER;
-    if (mode === 'received') return TX_ACTIVITY_ROLE_RECEIVER;
+    if (mode === 'sent') return TX_ACTIVITY_ROLES.sender;
+    if (mode === 'received') return TX_ACTIVITY_ROLES.receiver;
     return null;
 }
 
@@ -854,9 +884,6 @@ function toHex(bytes: Uint8Array): string {
     return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
-function trimTrailingSlash(value: string): string {
-    return value.replace(/\/+$/, '');
-}
 
 interface AccountProofRow {
     readonly balance: bigint;

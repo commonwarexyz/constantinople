@@ -1,0 +1,336 @@
+//! HTTP wire types shared by the channel operator and its clients.
+//!
+//! The operator's API and the spammer's client used to hand-copy these
+//! request/response shapes (and their hex conventions) and had already
+//! drifted once; this module is the single definition both sides build
+//! against. Every chain type crosses the wire hex-encoded via its codec
+//! encoding, so the typed constructors and accessors here are the only
+//! places that encode or parse fields.
+
+use crate::{AccountKey, TransactionPublicKey, Voucher};
+use commonware_codec::{DecodeExt, Encode};
+use commonware_cryptography::ed25519;
+use commonware_formatting::{from_hex, hex};
+use serde::{Deserialize, Serialize};
+
+/// A wire field that failed to parse back into its chain type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldError {
+    /// Name of the offending field.
+    pub field: &'static str,
+}
+
+impl core::fmt::Display for FieldError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "bad {}", self.field)
+    }
+}
+
+impl core::error::Error for FieldError {}
+
+/// Hex-encodes a codec value for the wire.
+fn encode_field<T: Encode>(value: &T) -> String {
+    hex(&value.encode())
+}
+
+/// Decodes a hex-encoded wire field into any codec type with no config.
+fn decode_field<T: DecodeExt<()>>(field: &'static str, value: &str) -> Result<T, FieldError> {
+    let bytes = from_hex(value).ok_or(FieldError { field })?;
+    T::decode(bytes.as_slice()).map_err(|_| FieldError { field })
+}
+
+/// Response to `GET /public-key`: the operator's identity (the key that
+/// settles channels; in a payee-run deployment it is also the receiver).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PublicKeyResponse {
+    /// Hex-encoded operator transaction public key.
+    pub public_key: String,
+    /// Hex-encoded operator account key (derived from `public_key`; provided
+    /// for display and tooling, not parsed by clients).
+    pub account: String,
+    /// Latest finalized height the operator has observed (0 until its first
+    /// poll lands). Lets clients pick sane channel expiries.
+    pub height: u64,
+    /// Minimum blocks between registration and a channel's expiry; the
+    /// operator refuses channels with less runway. Advertised so clients
+    /// derive expiries from the operator's actual configuration instead of
+    /// agreeing with it by convention.
+    pub min_runway: u64,
+    /// Blocks before expiry at which the operator stops serving vouchers and
+    /// force-settles.
+    pub settle_margin: u64,
+}
+
+impl PublicKeyResponse {
+    pub fn new(
+        public_key: &TransactionPublicKey,
+        height: u64,
+        min_runway: u64,
+        settle_margin: u64,
+    ) -> Self {
+        Self {
+            public_key: encode_field(public_key),
+            account: encode_field(&AccountKey::from_public_key(public_key)),
+            height,
+            min_runway,
+            settle_margin,
+        }
+    }
+
+    /// Parses the operator transaction public key.
+    pub fn public_key(&self) -> Result<TransactionPublicKey, FieldError> {
+        decode_field("public_key", &self.public_key)
+    }
+}
+
+/// Request to `POST /channels`: register a finalized channel open.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterRequest {
+    /// Hex-encoded channel account key.
+    pub channel: String,
+    /// Hex-encoded payer transaction public key.
+    pub payer: String,
+    /// Nonce of the `OpenChannel` transaction (the channel address derives
+    /// from it).
+    pub open_nonce: u64,
+    /// Hex-encoded digest of the finalized `OpenChannel` transaction.
+    pub open_tx_digest: String,
+}
+
+impl RegisterRequest {
+    pub fn new<D: Encode>(
+        channel: &AccountKey,
+        payer: &TransactionPublicKey,
+        open_nonce: u64,
+        open_tx_digest: &D,
+    ) -> Self {
+        Self {
+            channel: encode_field(channel),
+            payer: encode_field(payer),
+            open_nonce,
+            open_tx_digest: encode_field(open_tx_digest),
+        }
+    }
+
+    pub fn channel(&self) -> Result<AccountKey, FieldError> {
+        decode_field("channel", &self.channel)
+    }
+
+    pub fn payer(&self) -> Result<TransactionPublicKey, FieldError> {
+        decode_field("payer", &self.payer)
+    }
+
+    /// Parses the open transaction digest (generic: the wire does not fix the
+    /// chain's hash function).
+    pub fn open_tx_digest<D: DecodeExt<()>>(&self) -> Result<D, FieldError> {
+        decode_field("open_tx_digest", &self.open_tx_digest)
+    }
+}
+
+/// Response to `POST /channels`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    /// Whether this request newly registered the channel. `false` is still
+    /// success: the channel was already registered with matching metadata (an
+    /// idempotent replay, e.g. a retry after a lost response). Failures are
+    /// HTTP errors, never `registered: false`.
+    pub registered: bool,
+}
+
+/// Request to `POST /vouchers`: one off-chain payment step.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VoucherRequest {
+    /// Hex-encoded channel account key.
+    pub channel: String,
+    /// Cumulative amount the voucher signs over.
+    pub cumulative: u64,
+    /// Hex-encoded payer signature over `(channel, cumulative)`.
+    pub signature: String,
+}
+
+impl VoucherRequest {
+    pub fn new(voucher: &Voucher) -> Self {
+        Self {
+            channel: encode_field(&voucher.channel),
+            cumulative: voucher.cumulative,
+            signature: encode_field(&voucher.signature),
+        }
+    }
+
+    /// Reassembles the voucher this request carries.
+    pub fn voucher(&self) -> Result<Voucher, FieldError> {
+        Ok(Voucher {
+            channel: decode_field("channel", &self.channel)?,
+            cumulative: self.cumulative,
+            signature: decode_field::<ed25519::Signature>("signature", &self.signature)?,
+        })
+    }
+}
+
+/// Response to `POST /vouchers`. Failures surface as HTTP errors, so a `200`
+/// body means the voucher was accepted.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VoucherResponse {
+    /// Cumulative amount the channel has paid for after accepting this
+    /// voucher (the voucher's own cumulative).
+    pub cumulative: u64,
+}
+
+/// Request to `POST /settle`: close the channel on-chain now.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SettleRequest {
+    /// Hex-encoded channel account key.
+    pub channel: String,
+}
+
+impl SettleRequest {
+    pub fn new(channel: &AccountKey) -> Self {
+        Self {
+            channel: encode_field(channel),
+        }
+    }
+
+    pub fn channel(&self) -> Result<AccountKey, FieldError> {
+        decode_field("channel", &self.channel)
+    }
+}
+
+/// Response to `POST /settle`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SettleResponse {
+    /// Whether the close finalized (false: abandoned, vouchers forfeited).
+    pub settled: bool,
+    /// The cumulative amount the settlement covered.
+    pub cumulative: u64,
+}
+
+/// Response to `GET /stats`: the operator's lifetime counters. `vouchers` is
+/// the off-chain payment count the chain never sees; alongside `settled` it
+/// is the payments-per-settlement story in two numbers. Self-reported by the
+/// operator (unlike chain data, not proof-verified).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StatsResponse {
+    /// Channels registered (lifetime).
+    pub channels: u64,
+    /// Channels whose close finalized.
+    pub settled: u64,
+    /// Channels whose close was abandoned.
+    pub abandoned: u64,
+    /// Vouchers accepted off-chain.
+    pub vouchers: u64,
+    /// Latest finalized height the operator has observed.
+    pub height: u64,
+}
+
+/// Error body every operator failure responds with.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ErrorResponse {
+    pub error: String,
+}
+
+/// Why an operator request failed, split by what a retry can fix.
+///
+/// This is the retry contract of the operator API: the HTTP surface maps
+/// `Rejected` to `400` and `Unavailable` to `503`, and clients map those
+/// statuses back, so both sides share one classification instead of
+/// hand-synchronizing it across the wire.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum OperatorError {
+    /// The request itself is invalid; retrying it will keep failing.
+    Rejected(String),
+    /// A dependency (indexer, relayer) has not caught up or could not be
+    /// reached; the same request may succeed shortly.
+    Unavailable(String),
+}
+
+impl OperatorError {
+    /// A permanent rejection of the request itself.
+    pub fn rejected(message: impl Into<String>) -> Self {
+        Self::Rejected(message.into())
+    }
+
+    /// A transient dependency failure worth retrying.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::Unavailable(message.into())
+    }
+}
+
+impl core::fmt::Display for OperatorError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Rejected(message) | Self::Unavailable(message) => f.write_str(message),
+        }
+    }
+}
+
+impl core::error::Error for OperatorError {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::channel_address;
+    use commonware_cryptography::Signer as _;
+
+    #[test]
+    fn register_request_roundtrips_typed_fields() {
+        let payer_key = ed25519::PrivateKey::from_seed(1);
+        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
+        let payer_account = AccountKey::from_public_key(&payer);
+        let receiver = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+            ed25519::PrivateKey::from_seed(2).public_key(),
+        ));
+        let channel = channel_address(&payer_account, &receiver, &receiver, 7);
+        let digest = commonware_cryptography::sha256::Digest::from([3u8; 32]);
+
+        let request = RegisterRequest::new(&channel, &payer, 7, &digest);
+        assert_eq!(request.channel().expect("channel parses"), channel);
+        assert_eq!(request.payer().expect("payer parses"), payer);
+        assert_eq!(
+            request
+                .open_tx_digest::<commonware_cryptography::sha256::Digest>()
+                .expect("digest parses"),
+            digest
+        );
+    }
+
+    #[test]
+    fn voucher_request_roundtrips_the_voucher() {
+        let payer_key = ed25519::PrivateKey::from_seed(4);
+        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
+        let payer_account = AccountKey::from_public_key(&payer);
+        let receiver = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+            ed25519::PrivateKey::from_seed(5).public_key(),
+        ));
+        let channel = channel_address(&payer_account, &receiver, &receiver, 0);
+        let voucher = Voucher::sign(&payer_key, channel, 25);
+
+        let request = VoucherRequest::new(&voucher);
+        assert_eq!(request.voucher().expect("voucher parses"), voucher);
+    }
+
+    /// An advertisement missing a knob must fail to parse rather than
+    /// silently defaulting to zero margins.
+    #[test]
+    fn public_key_response_rejects_missing_advertised_knobs() {
+        let payer_key = ed25519::PrivateKey::from_seed(6);
+        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
+        let response = PublicKeyResponse::new(&payer, 42, 20, 10);
+
+        let partial_wire = format!(
+            r#"{{"public_key":"{}","account":"{}"}}"#,
+            response.public_key, response.account
+        );
+        serde_json::from_str::<PublicKeyResponse>(&partial_wire)
+            .expect_err("advertisement without margins must not parse");
+    }
+
+    #[test]
+    fn bad_hex_names_the_field() {
+        let request = SettleRequest {
+            channel: "zz".to_string(),
+        };
+        let error = request.channel().expect_err("bad hex must fail");
+        assert_eq!(error.field, "channel");
+        assert_eq!(error.to_string(), "bad channel");
+    }
+}

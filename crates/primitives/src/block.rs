@@ -459,7 +459,7 @@ mod tests {
         let mut rng = StdRng::from_seed([9u8; 32]);
         let signer = secp256r1::PrivateKey::random(&mut rng);
         let public_key = crate::TransactionPublicKey::secp256r1(signer.public_key());
-        let transaction = crate::Transaction::<sha256::Digest>::new(
+        let transaction = crate::Transaction::<sha256::Digest>::transfer(
             public_key.clone(),
             public_key,
             core::num::NonZeroU64::new(1).expect("test value should be non-zero"),

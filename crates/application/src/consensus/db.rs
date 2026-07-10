@@ -112,6 +112,36 @@ where
     })
 }
 
+/// Applies the channel lane's writes to a state batch.
+///
+/// Unlike [`apply_shard_maps`], a write value of `None` deletes the account,
+/// which is how a settled channel is removed so it leaves no state.
+pub(super) fn apply_channel_writes<E, H, S>(
+    batch: StateBatch<E, H, EightCap, S>,
+    writes: super::channel::ChannelWrites,
+) -> StateBatch<E, H, EightCap, S>
+where
+    E: Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    writes
+        .into_iter()
+        .fold(batch, |batch, (account_key, value)| {
+            // A live account must never be written empty — deletion is
+            // `None`, and an empty write would materialize an account that
+            // holds nothing and owes nothing. Every current write upholds
+            // this (payer and operator consume a nonce; a receiver is only
+            // written when credited), so a future zero-credit path tripping
+            // this assert is a bug in the caller.
+            debug_assert!(
+                value != Some(Account::default()),
+                "channel lane wrote an empty account for {account_key:?}"
+            );
+            batch.write(account_key, value)
+        })
+}
+
 pub(super) fn apply_transaction_digests<E, H, S>(
     batch: TransactionBatch<E, H, S>,
     digests: &[H::Digest],

@@ -49,8 +49,16 @@ qmdb-indexer-graviton-binary: build-graviton-image prepare-docker-cache
     -e OUTPUT_NAME=qmdb-indexer \
     constantinople-builder:graviton-local
 
+# Build the ARM64 operator binary into deploy/
+operator-graviton-binary: build-graviton-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-operator \
+    -e BINARY_NAME=constantinople-operator \
+    -e OUTPUT_NAME=operator \
+    constantinople-builder:graviton-local
+
 # Build all ARM64 binaries into deploy/
-graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-indexer-graviton-binary metadata-indexer-graviton-binary qmdb-indexer-graviton-binary
+graviton-binaries: validator-graviton-binary spammer-graviton-binary operator-graviton-binary chain-indexer-graviton-binary metadata-indexer-graviton-binary qmdb-indexer-graviton-binary
 
 # Build the Intel/C8i Docker builder image
 build-intel-image:
@@ -96,5 +104,13 @@ qmdb-indexer-intel-binary: build-intel-image prepare-docker-cache
     -e OUTPUT_NAME=qmdb-indexer \
     constantinople-builder:intel-local
 
+# Build the Intel operator binary into deploy/
+operator-intel-binary: build-intel-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-operator \
+    -e BINARY_NAME=constantinople-operator \
+    -e OUTPUT_NAME=operator \
+    constantinople-builder:intel-local
+
 # Build all Intel binaries into deploy/
-intel-binaries: validator-intel-binary spammer-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary qmdb-indexer-intel-binary
+intel-binaries: validator-intel-binary spammer-intel-binary operator-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary qmdb-indexer-intel-binary

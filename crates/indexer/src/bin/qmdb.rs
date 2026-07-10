@@ -13,7 +13,7 @@ use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
 use constantinople_indexer::publisher::qmdb::{state_qmdb_client, transactions_qmdb_client};
-use constantinople_primitives::{Account, AccountKey};
+use constantinople_primitives::{Account, AccountKey, resolve_named_http_url};
 use exoware_qmdb::{
     KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
     unordered_operation_log_connect_stack,
@@ -85,24 +85,6 @@ fn load_deployer_config(path: &Path) -> DeployerConfig {
     serde_yaml::from_str(&raw).expect("failed to parse qmdb-indexer config")
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return url.to_string();
-    };
-    let (authority, suffix) = match rest.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{suffix}")),
-        None => (rest, String::new()),
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return url.to_string();
-    };
-    let Some(ip) = hosts_by_name.get(host) else {
-        return url.to_string();
-    };
-
-    format!("http://{ip}:{port}{suffix}")
-}
-
 fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
     if let Some(config_path) = cli.config {
         let config = load_deployer_config(&config_path);
@@ -116,7 +98,9 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
             .iter()
             .map(|host| (host.name.as_str(), host.ip))
             .collect::<AHashMap<_, _>>();
-        let store_url = resolve_named_http_url(&config.chain_indexer_url, &hosts_by_name);
+        let store_url = resolve_named_http_url(&config.chain_indexer_url, |name| {
+            hosts_by_name.get(name).copied()
+        });
         return (store_url, cli.host, config.port);
     }
 
@@ -138,9 +122,12 @@ fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send
 
     Ok(Router::new()
         .route("/health", get(health))
-        .nest_service("/state", unordered_operation_log_connect_stack(state))
         .nest_service(
-            "/transactions",
+            constantinople_indexer::QMDB_STATE_ROUTE,
+            unordered_operation_log_connect_stack(state),
+        )
+        .nest_service(
+            constantinople_indexer::QMDB_TRANSACTIONS_ROUTE,
             keyless_operation_log_connect_stack(transactions),
         )
         .layer(tower_http::cors::CorsLayer::very_permissive()))

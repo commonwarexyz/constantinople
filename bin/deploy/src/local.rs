@@ -52,7 +52,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
     write_simplex_verification_material(&output_dir, &material);
 
-    print_local_run_commands(
+    write_mprocs_config(
         &output_dir,
         args,
         local,
@@ -241,7 +241,13 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     }
 }
 
-fn print_local_run_commands(
+/// Name of the generated mprocs config (inside the gitignored output dir).
+const MPROCS_CONFIG_FILE: &str = "mprocs.yaml";
+
+/// Writes an `mprocs.yaml` with one named process per service, so the local
+/// cluster starts with `mprocs --config <output_dir>/mprocs.yaml` and every
+/// pane carries its service's name instead of a raw command line.
+fn write_mprocs_config(
     output_dir: &Path,
     args: &GenerateArgs,
     local: &LocalArgs,
@@ -255,11 +261,19 @@ fn print_local_run_commands(
         relayer_targets,
         simplex_verification_material,
     );
-    let mprocs = commands
-        .iter()
-        .map(|command| format!("\"{command}\""))
-        .collect::<Vec<_>>()
-        .join(" ");
+    // serde_yaml mappings preserve insertion order, so the panes appear in
+    // service order.
+    let mut procs = serde_yaml::Mapping::new();
+    for (name, command) in commands {
+        let mut proc = serde_yaml::Mapping::new();
+        proc.insert("shell".into(), command.into());
+        let previous = procs.insert(name.clone().into(), proc.into());
+        assert!(previous.is_none(), "duplicate mprocs proc name: {name}");
+    }
+    let mut config = serde_yaml::Mapping::new();
+    config.insert("procs".into(), procs.into());
+    let path = output_dir.join(MPROCS_CONFIG_FILE);
+    write_yaml_config(&path, &config);
 
     info!(
         output_dir = %output_dir.display(),
@@ -268,59 +282,83 @@ fn print_local_run_commands(
         relayer = args.relayer,
         "generated local deployment bundle"
     );
-    info!(command = %format!("mprocs {mprocs}"), "start local deployment");
+    info!(command = %format!("mprocs --config {}", path.display()), "start local deployment");
 }
 
+/// Builds the `(process name, command)` list for the local cluster.
 fn local_run_commands(
     output_dir: &Path,
     args: &GenerateArgs,
     local: &LocalArgs,
     relayer_targets: &[String],
     simplex_verification_material: &str,
-) -> Vec<String> {
+) -> Vec<(String, String)> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
-    let mut commands: Vec<String> = (0..args.validators)
+    // The channel operator (and everything that points at it: the spammer's
+    // settlement flag, the explorer's voucher stats) exists exactly when the
+    // spammer runs channel traffic.
+    let operator_url = (args.spammer && args.spammer_channel_fraction > 0.0)
+        .then(|| format!("http://127.0.0.1:{}", crate::DEFAULT_OPERATOR_PORT));
+    let mut commands: Vec<(String, String)> = (0..args.validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
-            format!(
-                "cargo run --release --bin constantinople -- --config {} --peers {}",
-                path.display(),
-                peers_path.display()
+            (
+                format!("validator-{index}"),
+                format!(
+                    "cargo run --release --bin constantinople -- --config {} --peers {}",
+                    path.display(),
+                    peers_path.display()
+                ),
             )
         })
         .collect();
 
-    let total_secondaries = total_secondaries(args);
-    for index in 0..total_secondaries {
+    for (index, role) in secondary_roles(args).into_iter().enumerate() {
         let path = output_dir.join(format!("secondary-{index}.yaml"));
-        commands.push(format!(
-            "cargo run --release --bin constantinople -- --config {} --peers {}",
-            path.display(),
-            peers_path.display()
+        let name = match role {
+            SecondaryRole::Indexer => "indexer-secondary",
+            SecondaryRole::Relayer => "relayer",
+        };
+        commands.push((
+            name.to_string(),
+            format!(
+                "cargo run --release --bin constantinople -- --config {} --peers {}",
+                path.display(),
+                peers_path.display()
+            ),
         ));
     }
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
-        commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
-            CHAIN_INDEXER_BINARY_FILE,
-            local.chain_indexer_port,
-            data_dir.display(),
+        commands.push((
+            "chain-indexer".to_string(),
+            format!(
+                "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
+                CHAIN_INDEXER_BINARY_FILE,
+                local.chain_indexer_port,
+                data_dir.display(),
+            ),
         ));
         // `metadata-indexer`: exposes Constantinople's `block_meta` /
         // `tx_meta` tables over `store.sql.v1.Service`. The explorer
         // subscribes to this service (not the raw store) for live block
         // metadata.
-        commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
-             --store-url http://127.0.0.1:{} --port {}",
-            METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
+        commands.push((
+            "metadata-indexer".to_string(),
+            format!(
+                "cargo run --release -p constantinople-indexer --bin {} -- \
+                 --store-url http://127.0.0.1:{} --port {}",
+                METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
+            ),
         ));
-        commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
-             --store-url http://127.0.0.1:{} --port {}",
-            QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
+        commands.push((
+            "qmdb-indexer".to_string(),
+            format!(
+                "cargo run --release -p constantinople-indexer --bin {} -- \
+                 --store-url http://127.0.0.1:{} --port {}",
+                QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
+            ),
         ));
         // Bring up the React explorer dev server alongside the metadata and
         // QMDB facades so operators get a live view and browser-verified
@@ -330,13 +368,23 @@ fn local_run_commands(
         let relayer_env = relayer_http_port(args, local)
             .map(|port| format!(" VITE_MEMPOOL_URL=http://127.0.0.1:{port}"))
             .unwrap_or_default();
-        commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev",
-            local.metadata_indexer_port,
-            local.qmdb_indexer_port,
-            local.chain_indexer_port,
-            simplex_verification_material,
-            relayer_env,
+        // Point the explorer at the operator's /stats so it can show the
+        // off-chain voucher count next to the on-chain settlement count.
+        let operator_env = operator_url
+            .as_ref()
+            .map(|url| format!(" VITE_OPERATOR_URL={url}"))
+            .unwrap_or_default();
+        commands.push((
+            "explorer".to_string(),
+            format!(
+                "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{}{} npm --prefix explorer run dev",
+                local.metadata_indexer_port,
+                local.qmdb_indexer_port,
+                local.chain_indexer_port,
+                simplex_verification_material,
+                relayer_env,
+                operator_env,
+            ),
         ));
     }
 
@@ -344,25 +392,53 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
+        if operator_url.is_some() {
+            commands.push((
+                "operator".to_string(),
+                format!(
+                    "cargo run --release --bin constantinople-operator -- \
+                     --relayer-url http://127.0.0.1:{relayer_port} \
+                     --indexer-url http://127.0.0.1:{} \
+                     --qmdb-url http://127.0.0.1:{} \
+                     --port {} \
+                     --listen-addr 127.0.0.1",
+                    local.chain_indexer_port,
+                    local.qmdb_indexer_port,
+                    crate::DEFAULT_OPERATOR_PORT,
+                ),
+            ));
+        }
+        let operator_flag = operator_url
+            .as_ref()
+            .map(|url| format!(" --channel-operator-url {url}"))
+            .unwrap_or_default();
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
         );
-        commands.push(format!(
-            "cargo run --release --bin constantinople-spammer -- \
-             {network_source} \
-             --accounts {} \
-             --value {} \
-             --seed-offset {} \
-             --rayon-threads {} \
-             --accounts-jitter {} \
-             --presigned-batches {}",
-            args.spammer_accounts,
-            args.spammer_value,
-            args.spammer_seed_offset,
-            args.spammer_rayon_threads,
-            args.spammer_accounts_jitter,
-            args.spammer_presigned_batches,
+        commands.push((
+            "spammer".to_string(),
+            format!(
+                "cargo run --release --bin constantinople-spammer -- \
+                 {network_source} \
+                 --accounts {} \
+                 --value {} \
+                 --seed-offset {} \
+                 --rayon-threads {} \
+                 --accounts-jitter {} \
+                 --presigned-batches {} \
+                 --channel-fraction {} \
+                 {operator_flag} \
+                 --channel-vouchers {}",
+                args.spammer_accounts,
+                args.spammer_value,
+                args.spammer_seed_offset,
+                args.spammer_rayon_threads,
+                args.spammer_accounts_jitter,
+                args.spammer_presigned_batches,
+                args.spammer_channel_fraction,
+                args.spammer_channel_vouchers,
+            ),
         ));
     }
 
@@ -405,6 +481,8 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_channel_fraction: 0.0,
+            spammer_channel_vouchers: crate::DEFAULT_SPAMMER_CHANNEL_VOUCHERS,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -441,7 +519,11 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 2);
-        assert!(commands.iter().all(|command| !command.contains("spammer")));
+        assert!(
+            commands
+                .iter()
+                .all(|(_, command)| !command.contains("spammer"))
+        );
     }
 
     #[test]
@@ -457,15 +539,19 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 4);
-        assert!(commands[2].contains("secondary-0.yaml"));
-        assert!(commands[3].contains("constantinople-spammer"));
-        assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
-        assert!(commands[3].contains("--relayer-submitters 2"));
-        assert!(commands[3].contains("--accounts 10"));
-        assert!(commands[3].contains("--value 1"));
-        assert!(commands[3].contains("--seed-offset 1000"));
-        assert!(commands[3].contains("--rayon-threads 2"));
-        assert!(commands[3].contains("--accounts-jitter 0"));
+        assert!(commands[2].1.contains("secondary-0.yaml"));
+        assert!(commands[3].1.contains("constantinople-spammer"));
+        assert!(
+            commands[3]
+                .1
+                .contains("--relayer-url http://127.0.0.1:8082")
+        );
+        assert!(commands[3].1.contains("--relayer-submitters 2"));
+        assert!(commands[3].1.contains("--accounts 10"));
+        assert!(commands[3].1.contains("--value 1"));
+        assert!(commands[3].1.contains("--seed-offset 1000"));
+        assert!(commands[3].1.contains("--rayon-threads 2"));
+        assert!(commands[3].1.contains("--accounts-jitter 0"));
     }
 
     #[test]
@@ -481,8 +567,8 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 3);
-        assert!(commands[2].contains("constantinople"));
-        assert!(commands[2].contains("secondary-0.yaml"));
+        assert!(commands[2].1.contains("constantinople"));
+        assert!(commands[2].1.contains("secondary-0.yaml"));
     }
 
     #[test]
@@ -499,13 +585,17 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 4);
-        assert!(commands[2].contains("secondary-0.yaml"));
-        assert!(commands[3].contains("constantinople-spammer"));
-        assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
-        assert!(commands[3].contains("--relayer-submitters 2"));
-        assert!(commands[3].contains("--relayer-targets aa,bb"));
-        assert!(commands[3].contains("--presigned-batches 16"));
-        assert!(!commands[3].contains("--peers"));
+        assert!(commands[2].1.contains("secondary-0.yaml"));
+        assert!(commands[3].1.contains("constantinople-spammer"));
+        assert!(
+            commands[3]
+                .1
+                .contains("--relayer-url http://127.0.0.1:8082")
+        );
+        assert!(commands[3].1.contains("--relayer-submitters 2"));
+        assert!(commands[3].1.contains("--relayer-targets aa,bb"));
+        assert!(commands[3].1.contains("--presigned-batches 16"));
+        assert!(!commands[3].1.contains("--peers"));
     }
 
     #[test]
@@ -521,7 +611,7 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert!(commands[3].contains("--accounts-jitter 0.25"));
+        assert!(commands[3].1.contains("--accounts-jitter 0.25"));
     }
 
     #[test]
@@ -537,7 +627,7 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert!(commands[3].contains("--presigned-batches 32"));
+        assert!(commands[3].1.contains("--presigned-batches 32"));
     }
 
     #[test]
@@ -553,7 +643,49 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert!(commands[3].contains("--rayon-threads 6"));
+        assert!(commands[3].1.contains("--rayon-threads 6"));
+    }
+
+    #[test]
+    fn local_channel_spammer_starts_operator() {
+        let mut args = test_args(true);
+        args.indexer = true;
+        args.relayer = true;
+        args.spammer_channel_fraction = 0.5;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let (operator_name, operator) = commands
+            .iter()
+            .find(|(_, command)| command.contains("constantinople-operator"))
+            .expect("operator command should be present");
+        assert_eq!(operator_name, "operator");
+        assert!(operator.contains("--relayer-url http://127.0.0.1:8083"));
+        assert!(operator.contains("--indexer-url http://127.0.0.1:8090"));
+        assert!(operator.contains("--qmdb-url http://127.0.0.1:8092"));
+        assert!(operator.contains("--port 8093"));
+        assert!(operator.contains("--listen-addr 127.0.0.1"));
+
+        let (spammer_name, spammer) = commands
+            .iter()
+            .find(|(_, command)| command.contains("constantinople-spammer"))
+            .expect("spammer command should be present");
+        assert_eq!(spammer_name, "spammer");
+        assert!(spammer.contains("--channel-operator-url http://127.0.0.1:8093"));
+
+        let (_, explorer) = commands
+            .iter()
+            .find(|(_, command)| command.contains("npm --prefix explorer"))
+            .expect("explorer command should be present");
+        assert!(
+            explorer.contains("VITE_OPERATOR_URL=http://127.0.0.1:8093"),
+            "explorer must learn the operator URL for its voucher stats"
+        );
     }
 
     #[test]
@@ -570,8 +702,8 @@ mod tests {
         );
 
         assert_eq!(commands.len(), 8);
-        assert!(commands[2].contains("secondary-0.yaml"));
-        assert!(commands[3].contains("secondary-1.yaml"));
+        assert!(commands[2].1.contains("secondary-0.yaml"));
+        assert!(commands[3].1.contains("secondary-1.yaml"));
     }
 
     #[test]
@@ -588,7 +720,9 @@ mod tests {
         );
 
         assert!(
-            commands.iter().all(|command| !command.contains("sleep ")),
+            commands
+                .iter()
+                .all(|(_, command)| !command.contains("sleep ")),
             "local commands should start directly: {commands:?}"
         );
     }
@@ -619,9 +753,9 @@ mod tests {
 
         // 2 validators + 1 indexer secondary + 1 relayer secondary + store/sql/qmdb + explorer.
         assert_eq!(commands.len(), 8);
-        let indexer_cmd = commands
+        let (_, indexer_cmd) = commands
             .iter()
-            .find(|c| c.contains("--bin chain-indexer"))
+            .find(|(_, c)| c.contains("--bin chain-indexer"))
             .expect("chain-indexer command should be present");
         assert!(indexer_cmd.contains("--port 8090"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
@@ -641,9 +775,9 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        let metadata_cmd = commands
+        let (_, metadata_cmd) = commands
             .iter()
-            .find(|c| c.contains("--bin metadata-indexer"))
+            .find(|(_, c)| c.contains("--bin metadata-indexer"))
             .expect("metadata-indexer command should be present");
         // The metadata service reads from the store and serves on its own port.
         assert!(metadata_cmd.contains("--store-url http://127.0.0.1:8090"));
@@ -664,9 +798,9 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        let qmdb_cmd = commands
+        let (_, qmdb_cmd) = commands
             .iter()
-            .find(|c| c.contains("--bin qmdb-indexer"))
+            .find(|(_, c)| c.contains("--bin qmdb-indexer"))
             .expect("qmdb-indexer command should be present");
         assert!(qmdb_cmd.contains("--store-url http://127.0.0.1:8090"));
         assert!(qmdb_cmd.contains("--port 8092"));
@@ -686,9 +820,9 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        let explorer_cmd = commands
+        let (_, explorer_cmd) = commands
             .iter()
-            .find(|c| c.contains("npm --prefix explorer"))
+            .find(|(_, c)| c.contains("npm --prefix explorer"))
             .expect("explorer dev server command should be present");
         assert!(explorer_cmd.contains("VITE_SQL_URL=http://127.0.0.1:18091"));
         assert!(explorer_cmd.contains("VITE_QMDB_URL=http://127.0.0.1:18092"));
@@ -713,7 +847,7 @@ mod tests {
         assert!(
             commands
                 .iter()
-                .all(|c| !c.contains("npm --prefix explorer")),
+                .all(|(_, c)| !c.contains("npm --prefix explorer")),
             "explorer must only launch when indexer is enabled: {commands:?}"
         );
     }

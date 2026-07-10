@@ -18,6 +18,7 @@ members = [
   "crates/mempool",
   "crates/primitives",
   "bin/deploy",
+  "bin/operator",
   "bin/spammer",
   "bin/validator",
 ]

@@ -11,6 +11,7 @@ use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
 use commonware_deployer::aws::Hosts;
 use constantinople_indexer::sql_schema::build_meta_schema;
+use constantinople_primitives::resolve_named_http_url;
 use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
 use serde::Deserialize;
@@ -69,24 +70,6 @@ fn load_deployer_config(path: &Path) -> DeployerConfig {
     serde_yaml::from_str(&raw).expect("failed to parse metadata-indexer config")
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return url.to_string();
-    };
-    let (authority, suffix) = match rest.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{suffix}")),
-        None => (rest, String::new()),
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return url.to_string();
-    };
-    let Some(ip) = hosts_by_name.get(host) else {
-        return url.to_string();
-    };
-
-    format!("http://{ip}:{port}{suffix}")
-}
-
 fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
     if let Some(config_path) = cli.config {
         let config = load_deployer_config(&config_path);
@@ -100,7 +83,9 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
             .iter()
             .map(|host| (host.name.as_str(), host.ip))
             .collect::<AHashMap<_, _>>();
-        let store_url = resolve_named_http_url(&config.chain_indexer_url, &hosts_by_name);
+        let store_url = resolve_named_http_url(&config.chain_indexer_url, |name| {
+            hosts_by_name.get(name).copied()
+        });
         return (store_url, cli.host, config.port);
     }
 

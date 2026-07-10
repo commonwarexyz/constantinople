@@ -209,7 +209,8 @@ impl<H> LazySignedTransaction<H>
 where
     H: Hasher,
 {
-    const MAX_ENCODED_SIZE: usize = Transaction::<H::Digest>::SIZE + TransactionSignature::MAX_SIZE;
+    const MAX_ENCODED_SIZE: usize =
+        Transaction::<H::Digest>::MAX_SIZE + TransactionSignature::MAX_SIZE;
 
     /// Creates a lazy transaction from an already decoded value.
     pub fn new(value: SignedTransaction<H>) -> Self {
@@ -275,7 +276,7 @@ where
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
-        if len < Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE {
+        if len < SignedTransaction::<H>::MIN_ENCODED_SIZE {
             return Err(Error::EndOfBuffer);
         }
         if buf.remaining() < len {
@@ -611,7 +612,7 @@ mod test {
             let hasher = &mut sha256::Sha256::default();
             let private_key = ed25519::PrivateKey::random(&mut test_rng());
             let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-            let signed = Transaction::new(
+            let signed = Transaction::transfer(
                 public_key.clone(),
                 public_key.clone(),
                 NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -643,7 +644,7 @@ mod test {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
+        let signed = Transaction::transfer(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),
@@ -677,7 +678,7 @@ mod test {
         let hasher = &mut sha256::Sha256::default();
         let private_key = ed25519::PrivateKey::random(&mut test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
-        let signed = Transaction::new(
+        let signed = Transaction::transfer(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),

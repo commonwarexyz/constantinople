@@ -1,8 +1,8 @@
 use super::{Changeset, State, compute, prepare_transfer};
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
-    Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
-    TransactionPublicKey, VerifiedTransaction,
+    Account, AccountKey, NONCE_BITMAP_CAPACITY, Nonce, Transaction, TransactionPublicKey,
+    VerifiedTransaction,
 };
 use core::num::NonZeroU64;
 use std::collections::HashSet;
@@ -26,7 +26,7 @@ impl TestSigner {
     }
 
     fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
-        Transaction::new(
+        Transaction::transfer(
             TransactionPublicKey::ed25519(self.key.public_key()),
             TransactionPublicKey::ed25519(to),
             NonZeroU64::new(value).expect("test values must be non-zero"),
@@ -85,7 +85,7 @@ fn executes_run_ahead_nonces() {
     let recipient = changeset_account(&changeset, recipient.public_key);
     assert_eq!(sender.balance, 1);
     assert_eq!(sender.nonce.base, 3);
-    assert_eq!(recipient.balance, DEFAULT_ACCOUNT_BALANCE + 9);
+    assert_eq!(recipient.balance, 9);
 }
 
 #[test]
@@ -235,15 +235,47 @@ fn rejects_unfunded_self_transfer() {
 }
 
 #[test]
-fn rejects_recipient_overflow() {
+fn saturates_recipient_credit() {
+    // A saturated recipient must not reject the batch: a third party can
+    // mint any account toward `u64::MAX`, so a checked credit would let it
+    // grief every batch that pays the account. The excess is forfeited.
     let signer = TestSigner::from_seed(40);
     let recipient = TestSigner::from_seed(41);
     let mut accounts = State::new();
     accounts.insert(account_key(&signer.public_key), account(10, 0));
     accounts.insert(account_key(&recipient.public_key), account(u64::MAX, 0));
 
-    let transactions = vec![signer.sign(recipient.public_key, 1, 0)];
-    assert!(run(&accounts, &transactions).is_none());
+    let transactions = vec![signer.sign(recipient.public_key.clone(), 1, 0)];
+    let changeset = run(&accounts, &transactions).expect("credit saturates, not fails");
+    assert_eq!(
+        changeset_account(&changeset, recipient.public_key).balance,
+        u64::MAX
+    );
+    assert_eq!(changeset_account(&changeset, signer.public_key).balance, 9);
+}
+
+#[test]
+fn saturates_contended_recipient_credit() {
+    // The general (contended) lane accumulates credits per account before
+    // applying them; the accumulated total saturates the same way.
+    let first = TestSigner::from_seed(42);
+    let second = TestSigner::from_seed(43);
+    let recipient = TestSigner::from_seed(44);
+    let mut accounts = State::new();
+    accounts.insert(account_key(&first.public_key), account(10, 0));
+    accounts.insert(account_key(&second.public_key), account(10, 0));
+    accounts.insert(account_key(&recipient.public_key), account(u64::MAX - 1, 0));
+
+    let transactions = [
+        first.sign(recipient.public_key.clone(), 1, 0),
+        second.sign(recipient.public_key.clone(), 1, 0),
+    ];
+    let transfers = prepared(&transactions);
+    let changeset = compute(&accounts, &transfers).expect("credit saturates, not fails");
+    assert_eq!(
+        changeset_account(&changeset, recipient.public_key).balance,
+        u64::MAX
+    );
 }
 
 fn contended_accounts(account_count: usize) -> (State, Vec<TestSigner>) {
