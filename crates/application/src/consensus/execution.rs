@@ -104,7 +104,7 @@ use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, transla
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -349,10 +349,13 @@ where
         .map(|prepared| prepared.into_iter().unzip())
 }
 
-/// Mempool refill rounds a proposal may attempt after dropping inapplicable
-/// candidates. Bounds propose latency; transactions dropped in the final
-/// round age out of the mempool like any unfinalized proposal.
-const MAX_REFILL_ROUNDS: usize = 3;
+/// Wall-clock budget for building one proposal. Refill rounds keep running
+/// while block headroom remains and this deadline has not passed; a round in
+/// flight always completes (popped transactions must be executed or they
+/// would strand), so the deadline gates starting another refill, not
+/// finishing one. Transactions dropped in the final round age out of the
+/// mempool like any unfinalized proposal.
+const BUILD_TIMEOUT: Duration = Duration::from_millis(100);
 
 /// Executes a proposal's candidate transactions best effort.
 ///
@@ -362,12 +365,15 @@ const MAX_REFILL_ROUNDS: usize = 3;
 /// transaction that does not apply — malformed encoding, stale nonce
 /// (typically a transaction that already landed in an ancestor block),
 /// unaffordable value, or credit overflow — is dropped instead of dooming the
-/// proposal. Dropped bytes are refilled from the mempool, with `stage` +
-/// `expand` loading each round's new accounts incrementally, until the
-/// selection applies cleanly, the mempool runs dry, the round bound hits, or
-/// no refill source was supplied (`input: None`, the speculative pre-build
-/// path). The surviving body re-executes cleanly under all-or-nothing
-/// verification with identical account writes.
+/// proposal. Each refill asks the mempool for the block's remaining headroom
+/// (it knows the proposal budget; we report the bytes already included), so
+/// the block fills toward the budget even when the seed was small — e.g. a
+/// reused pre-build that shrank. `stage` + `expand` load each round's new
+/// accounts incrementally. The loop ends when the mempool has nothing left
+/// that fits, the build deadline passes, or no refill source was supplied
+/// (`input: None`, the speculative pre-build path). The surviving body
+/// re-executes cleanly under all-or-nothing verification with identical
+/// account writes.
 ///
 /// The transaction-history append is ordered after selection settles (the
 /// final body is unknown until then), unlike verification where it overlaps
@@ -378,6 +384,7 @@ const MAX_REFILL_ROUNDS: usize = 3;
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     strategy: S,
+    clock: &impl Clock,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
     parent_floor: mmr::Location,
@@ -399,9 +406,11 @@ where
     let mut selector = executor::SelectiveExecutor::new();
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
     let mut digests: Vec<H::Digest> = Vec::new();
+    let mut included_bytes = 0usize;
     let mut candidates = candidates;
+    let deadline = clock.current() + BUILD_TIMEOUT;
 
-    for refills in 0.. {
+    loop {
         if candidates.is_empty() {
             break;
         }
@@ -475,6 +484,7 @@ where
         let mut dropped_bytes = 0;
         for ((_, digest, transaction), applied) in prepared.into_iter().zip(applied) {
             if applied {
+                included_bytes += transaction.encode_size();
                 digests.push(digest);
                 body.push(transaction);
             } else {
@@ -482,16 +492,18 @@ where
             }
         }
         select_span.record("dropped", dropped_bytes.traced());
-        if dropped_bytes == 0 || refills >= MAX_REFILL_ROUNDS {
+        if clock.current() >= deadline {
             break;
         }
         let Some(input) = input.as_mut() else {
             break;
         };
 
-        // Replace the dropped bytes from the live mempool.
+        // Top the block up toward the mempool's proposal budget; an empty
+        // response means nothing fits in the remaining headroom (or the pool
+        // is dry) and ends the loop.
         candidates = input
-            .propose(parent_header, round, Some(dropped_bytes))
+            .propose(parent_header, round, included_bytes)
             .instrument(info_span!("application.execute.refill"))
             .await;
     }

@@ -198,7 +198,6 @@ fn make_app(
     let speculation = speculative_batches.map(|batches| SpeculationConfig {
         input: StaticTransactionSource::new(batches),
         is_leader: Arc::new(|_| true),
-        max_reuse_views: 8,
     });
     TestApp::new(
         context.child(label),
@@ -1016,10 +1015,10 @@ impl constantinople_mempool::TransactionSource<sha256::Digest, ed25519::PublicKe
         &mut self,
         parent: &Header<sha256::Digest, sha256::Digest, ed25519::PublicKey>,
         round: Round,
-        limit: Option<usize>,
+        filled: usize,
     ) -> Vec<constantinople_primitives::VerifiedTransaction<sha256::Sha256>> {
         self.context.sleep(self.delay).await;
-        self.inner.propose(parent, round, limit).await
+        self.inner.propose(parent, round, filled).await
     }
 }
 
@@ -1063,7 +1062,6 @@ fn speculation_survives_cancelled_propose() {
             Some(SpeculationConfig {
                 input: delayed(Duration::from_millis(200), vec![vec![tx.clone()]]),
                 is_leader: Arc::new(|_| true),
-                max_reuse_views: 8,
             }),
         );
 
@@ -1138,15 +1136,20 @@ fn speculation_survives_cancelled_propose() {
 }
 
 #[test]
-fn speculation_discards_prebuild_older_than_reuse_window() {
+fn speculation_reuse_survives_any_view_distance() {
     deterministic::Runner::default().start(|context| async move {
         let harness = verify_harness(&context).await;
         let tx1 = transfer(&harness.sender, &harness.recipient, 1);
-        let mut app = make_app(&context, &harness, "spec_aged", Some(vec![vec![tx1]]));
+        let mut app = make_app(
+            &context,
+            &harness,
+            "spec_aged",
+            Some(vec![vec![tx1.clone()]]),
+        );
 
         context.sleep(Duration::from_millis(10)).await;
         // Arm a pre-build targeting view 2.
-        let (_block_b, b_merkleized) = build_and_verify_empty_child(
+        let (_block_b, _b_merkleized) = build_and_verify_empty_child(
             &context,
             &mut app,
             &harness.parent,
@@ -1158,12 +1161,12 @@ fn speculation_discards_prebuild_older_than_reuse_window() {
         .await;
         context.sleep(Duration::from_millis(10)).await;
 
-        // A mismatched-parent request far beyond the reuse window (many
-        // nullified views later) must not reuse the selection: at that
-        // distance its mempool bookkeeping may already have resolved. The
-        // pre-build is discarded and the live mempool serves the proposal.
-        let fresh_tx = transfer(&harness.alt_sender, &harness.recipient, 5);
-        let mut fresh: TestSource = StaticTransactionSource::new(vec![vec![fresh_tx.clone()]]);
+        // A mismatched-parent request many nullified views later still
+        // reuses the selection: the pre-build has no expiry, and execution
+        // against the actual parent decides what applies. The block also
+        // tops up from the live mempool.
+        let tx2 = transfer(&harness.alt_sender, &harness.recipient, 5);
+        let mut fresh: TestSource = StaticTransactionSource::new(vec![vec![tx2.clone()]]);
         let ctx_late = consensus_context(50, &harness.leader, 0, &harness.parent);
         let proposed = app
             .propose_child(
@@ -1173,22 +1176,20 @@ fn speculation_discards_prebuild_older_than_reuse_window() {
                 &mut fresh,
             )
             .await
-            .expect("fresh proposal must succeed");
+            .expect("late reuse must succeed");
 
         assert_eq!(proposed.block.header.height, 1);
         assert_eq!(
             body_digests(&proposed.block),
-            vec![*fresh_tx.message_digest()]
+            vec![*tx1.message_digest(), *tx2.message_digest()]
         );
 
         let metrics = context.encode();
+        assert!(metrics.contains("speculation_reuses_total 1"), "{metrics}");
         assert!(
-            metrics.contains("speculation_discards_total 1"),
+            metrics.contains("speculation_discards_total 0"),
             "{metrics}"
         );
-        assert!(metrics.contains("speculation_hits_total 0"), "{metrics}");
-        assert!(metrics.contains("speculation_reuses_total 0"), "{metrics}");
-        drop(b_merkleized);
     });
 }
 
@@ -1239,5 +1240,55 @@ fn speculation_hit_survives_any_view_distance() {
             metrics.contains("speculation_discards_total 0"),
             "{metrics}"
         );
+    });
+}
+
+#[test]
+fn speculation_reuse_tops_up_underfull_seed() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let tx1 = transfer(&harness.sender, &harness.recipient, 1);
+        let mut app = make_app(
+            &context,
+            &harness,
+            "spec_topup",
+            Some(vec![vec![tx1.clone()]]),
+        );
+
+        context.sleep(Duration::from_millis(10)).await;
+        let (_block_b, _b_merkleized) = build_and_verify_empty_child(
+            &context,
+            &mut app,
+            &harness.parent,
+            harness.dbs.new_batches().await,
+            harness.dbs.new_batches().await,
+            1,
+            &harness.leader,
+        )
+        .await;
+        context.sleep(Duration::from_millis(10)).await;
+
+        // The reused seed applies cleanly on the unexpected parent, but it is
+        // far below the block budget: the proposal still tops up from the
+        // live mempool instead of shipping an underfull block.
+        let tx2 = transfer(&harness.alt_sender, &harness.recipient, 2);
+        let mut fresh: TestSource = StaticTransactionSource::new(vec![vec![tx2.clone()]]);
+        let ctx2 = consensus_context(2, &harness.leader, 0, &harness.parent);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_topup"), ctx2),
+                harness.parent.clone(),
+                harness.dbs.new_batches().await,
+                &mut fresh,
+            )
+            .await
+            .expect("topped-up reuse must succeed");
+
+        assert_eq!(
+            body_digests(&proposed.block),
+            vec![*tx1.message_digest(), *tx2.message_digest()]
+        );
+        let metrics = context.encode();
+        assert!(metrics.contains("speculation_reuses_total 1"), "{metrics}");
     });
 }

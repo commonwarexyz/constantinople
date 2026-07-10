@@ -57,8 +57,6 @@ where
 {
     /// Digest of the parent block the execution extends.
     pub(super) parent: H::Digest,
-    /// The round the pre-build targeted, used to age it out of reuse.
-    pub(super) round: Round,
     /// The completed execution (merkleized databases plus the block body).
     pub(super) execution: ProposalExecution<E, H, St>,
 }
@@ -131,11 +129,6 @@ where
     input: Arc<AsyncMutex<I>>,
     /// Returns whether the local signer leads `round`.
     is_leader: Arc<dyn Fn(Round) -> bool + Send + Sync>,
-    /// Maximum view distance at which a pre-build may still seed a proposal.
-    /// Bounds how far a reused selection can drift from the height its
-    /// mempool bookkeeping was recorded at, keeping inclusion within the
-    /// mempool's drop-grace window so batch statuses stay truthful.
-    max_reuse_views: u64,
     slot: Mutex<Slot<E, H, St>>,
     prebuilds: Counter,
     hits: Counter,
@@ -156,12 +149,10 @@ where
         context: impl Metrics,
         input: I,
         is_leader: Arc<dyn Fn(Round) -> bool + Send + Sync>,
-        max_reuse_views: u64,
     ) -> Self {
         Self {
             input: Arc::new(AsyncMutex::new(input)),
             is_leader,
-            max_reuse_views,
             slot: Mutex::new(None),
             prebuilds: context.counter("prebuilds", "Speculative proposal pre-builds started"),
             hits: context.counter(
@@ -231,7 +222,7 @@ where
             "application.speculate",
             height = (parent_header.height + 1).traced()
         );
-        drop(runtime.child("speculation").spawn(move |_| {
+        drop(runtime.child("speculation").spawn(move |clock| {
             async move {
                 // Consume from the mempool only while someone can still use
                 // the result: a replaced task stops before selecting. The
@@ -243,7 +234,7 @@ where
                         return;
                     }
                     input
-                        .propose(&parent_header, next, None)
+                        .propose(&parent_header, next, 0)
                         .instrument(info_span!("application.speculate.input"))
                         .await
                 };
@@ -260,6 +251,7 @@ where
                 // at its seed selection.
                 let execution = execute_proposal::<E, C, P, H, St, I>(
                     strategy,
+                    &clock,
                     state_batch,
                     transaction_batch,
                     parent_floor,
@@ -271,7 +263,6 @@ where
                 .await;
                 let _ = result.send(Some(PreBuilt {
                     parent: parent_digest,
-                    round: next,
                     execution,
                 }));
             }
@@ -279,48 +270,22 @@ where
         }));
     }
 
-    /// Takes the current pre-build for a proposal at `round` extending
-    /// `parent`, waiting for an in-flight one to finish.
+    /// Takes the current pre-build, waiting for an in-flight one to finish.
+    /// A pre-build has no expiry: it waits here until the next proposal
+    /// attempt consumes it (or a fresher verify replaces it), and execution
+    /// against the actual parent decides what still applies.
     ///
-    /// An exact-parent pre-build is handed out at any age: a hit means the
-    /// chain never finalized past the height its mempool bookkeeping was
-    /// recorded at, so that bookkeeping is still live. A mismatched pre-build
-    /// older than the reuse window is instead discarded (off the propose
-    /// path, on `strategy`'s pool): reusing its transactions at a much later
-    /// height could land them beyond the mempool's drop-grace horizon, where
-    /// their batch statuses have already resolved as dropped.
-    ///
-    /// Returns `None` when no pre-build was started, when it aged out, when
-    /// selection came back empty, or when the pre-build task failed. If the
-    /// caller is cancelled while waiting, the pre-build is restored for the
-    /// next proposal.
-    pub(super) async fn take(
-        &self,
-        round: Round,
-        parent: &H::Digest,
-        strategy: &St,
-    ) -> Option<PreBuilt<E, H, St>> {
+    /// Returns `None` when no pre-build was started, when selection came back
+    /// empty, or when the pre-build task failed. If the caller is cancelled
+    /// while waiting, the pre-build is restored for the next proposal.
+    pub(super) async fn take(&self) -> Option<PreBuilt<E, H, St>> {
         let receiver = self.slot.lock().take()?;
-        let prebuilt = RestoreOnCancel {
+        RestoreOnCancel {
             slot: &self.slot,
             receiver: Some(receiver),
         }
         .recv()
-        .await?;
-        if prebuilt.parent == *parent {
-            return Some(prebuilt);
-        }
-        let age = round
-            .view()
-            .get()
-            .saturating_sub(prebuilt.round.view().get());
-        if round.epoch() != prebuilt.round.epoch() || age > self.max_reuse_views {
-            self.discards.inc();
-            let drop_span = info_span!("application.propose.drop_speculation");
-            drop(strategy.spawn(move |_: St| drop_span.in_scope(|| drop(prebuilt))));
-            return None;
-        }
-        Some(prebuilt)
+        .await
     }
 
     pub(super) fn record_hit(&self) {

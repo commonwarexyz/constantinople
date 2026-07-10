@@ -50,12 +50,12 @@ where
     H: Hasher + Send + 'static,
     H::Digest: Send,
 {
-    // The byte limit is ignored: static batches are returned as queued.
+    // The byte budget is ignored: static batches are returned as queued.
     fn propose(
         &mut self,
         _parent: &Header<C, H::Digest, P>,
         _round: Round,
-        _limit: Option<usize>,
+        _filled: usize,
     ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
         ready(self.proposals.pop_front().unwrap_or_default())
     }
@@ -140,9 +140,9 @@ mod tests {
         };
 
         let round = Round::new(Epoch::zero(), View::zero());
-        let first = futures::executor::block_on(source.propose(&parent, round, None));
-        let second = futures::executor::block_on(source.propose(&parent, round, None));
-        let third = futures::executor::block_on(source.propose(&parent, round, None));
+        let first = futures::executor::block_on(source.propose(&parent, round, 0));
+        let second = futures::executor::block_on(source.propose(&parent, round, 0));
+        let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].value().nonce, tx1.value().nonce);

@@ -78,11 +78,6 @@ pub struct SpeculationConfig<I> {
     pub input: I,
     /// Returns whether the local signer leads a given round.
     pub is_leader: LeaderOracle,
-    /// Maximum view distance at which a pre-build may still seed a proposal.
-    /// Must stay well inside the mempool's drop-grace window (in blocks) so
-    /// reused transactions land before their batch statuses resolve; one
-    /// validator rotation is a sound default against a two-rotation grace.
-    pub max_reuse_views: u64,
 }
 
 const INVALID_SIGNATURE: &str = "invalid signature";
@@ -174,7 +169,6 @@ where
                 context.child("speculation"),
                 config.input,
                 config.is_leader,
-                config.max_reuse_views,
             ))
         });
 

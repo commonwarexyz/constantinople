@@ -77,11 +77,7 @@ where
         // balance check and is dropped, and the dropped bytes are refilled
         // from the mempool.
         let speculation = match &self.speculator {
-            Some(speculator) => {
-                speculator
-                    .take(context.round, &parent_digest, &self.strategy)
-                    .await
-            }
+            Some(speculator) => speculator.take().await,
             None => None,
         };
         let (execution, batches) = match speculation {
@@ -112,7 +108,7 @@ where
                     }
                     None => {
                         input
-                            .propose(&parent.header, context.round, None)
+                            .propose(&parent.header, context.round, 0)
                             .instrument(info_span!("application.propose.input"))
                             .await
                     }
@@ -120,6 +116,7 @@ where
                 let (state_batch, transaction_batch) = batches;
                 let execution = execute_proposal(
                     self.strategy.clone(),
+                    &runtime,
                     state_batch,
                     transaction_batch,
                     parent_transactions_inactivity_floor(&parent),

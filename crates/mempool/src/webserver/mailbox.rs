@@ -43,11 +43,12 @@ where
         batch_id: String,
         response: oneshot::Sender<Option<StoredBatchStatus<H::Digest>>>,
     },
-    /// Consensus requests transactions for the next proposal, optionally
-    /// under a strict byte budget (refills replacing dropped transactions).
+    /// Consensus requests transactions for the next proposal. `filled` is
+    /// the encoded size the proposal already holds; the served batch stays
+    /// within the remaining budget (strictly, once the block is non-empty).
     Propose {
         height: u64,
-        limit: Option<usize>,
+        filled: usize,
         response: oneshot::Sender<Vec<VerifiedTransaction<H>>>,
     },
     /// Consensus reports a finalized or tip block.
@@ -170,13 +171,13 @@ where
         &mut self,
         parent: &Header<C, H::Digest, P>,
         _round: Round,
-        limit: Option<usize>,
+        filled: usize,
     ) -> Vec<VerifiedTransaction<H>> {
         let height = parent.height + 1;
         self.sender
             .request(|response| Message::Propose {
                 height,
-                limit,
+                filled,
                 response,
             })
             .await

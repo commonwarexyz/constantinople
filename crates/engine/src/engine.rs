@@ -515,10 +515,6 @@ where
                 is_leader: Arc::new(move |round| {
                     me.is_some_and(|me| elector.lock().elect(round, None) == me)
                 }),
-                // One rotation: comfortably inside the mempool's drop-grace
-                // window (two rotations of blocks), so reused pre-built
-                // transactions always land before their statuses resolve.
-                max_reuse_views: scheme.participants().len() as u64,
             }
         };
         let application = Application::new(

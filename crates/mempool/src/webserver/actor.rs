@@ -371,25 +371,24 @@ where
 
 /// Pops pool entries for a proposal at `height`, recording each served batch.
 ///
-/// A caller-supplied `limit` is a strict refill budget capped by
-/// `max_propose_bytes`: it is never overshot, so a refill replacing dropped
-/// transactions cannot inflate the block. The default budget
-/// (`limit == None`) may overshoot by one entry so an oversized head entry
-/// cannot wedge the pool.
+/// `filled` is the encoded size the proposal already holds, so the served
+/// batch stays within `max_propose_bytes - filled`. A refill for a non-empty
+/// block (`filled > 0`) never overshoots that headroom, so refills cannot
+/// inflate the block; an initial selection (`filled == 0`) may overshoot by
+/// one entry so an oversized head entry cannot wedge the pool.
 fn pop_proposal<H>(
     pool: &mut VecDeque<PoolEntry<H>>,
     pool_bytes: &mut usize,
     proposed: &mut VecDeque<ProposedBatch<H::Digest>>,
     height: u64,
-    limit: Option<usize>,
+    filled: usize,
     max_propose_bytes: usize,
 ) -> Vec<VerifiedTransaction<H>>
 where
     H: Hasher,
 {
-    let (budget, strict) = limit.map_or((max_propose_bytes, false), |limit| {
-        (limit.min(max_propose_bytes), true)
-    });
+    let budget = max_propose_bytes.saturating_sub(filled);
+    let strict = filled > 0;
     let mut batch_txs = Vec::new();
     let mut batch_bytes = 0;
 
@@ -732,7 +731,7 @@ where
                 }
                 Message::Propose {
                     height,
-                    limit,
+                    filled,
                     response,
                 } => {
                     let batch_txs = pop_proposal(
@@ -740,7 +739,7 @@ where
                         &mut pool_bytes,
                         &mut proposed,
                         height,
-                        limit,
+                        filled,
                         max_propose_bytes,
                     );
                     response.send_lossy(batch_txs);
@@ -1108,58 +1107,37 @@ mod tests {
         }
     }
 
-    /// A strict refill budget is never overshot, even by the head entry; the
-    /// default budget may overshoot by exactly one entry.
+    /// A refill for a non-empty block never overshoots the remaining
+    /// headroom; an initial selection may overshoot by exactly one entry.
     #[test]
-    fn pop_proposal_respects_strict_budget() {
+    fn pop_proposal_respects_remaining_headroom() {
         let mut pool = VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]);
         let mut pool_bytes = 900;
         let mut proposed = VecDeque::new();
 
-        // Strict budget below the head entry: nothing is served.
-        let txs = pop_proposal(
-            &mut pool,
-            &mut pool_bytes,
-            &mut proposed,
-            5,
-            Some(500),
-            1_000,
-        );
+        // Refill headroom (1_000 - 500) below the head entry: nothing served.
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 500, 1_000);
         assert!(txs.is_empty());
         assert_eq!(pool.len(), 2);
         assert_eq!(pool_bytes, 900);
         assert!(proposed.is_empty());
 
-        // Strict budget covering only the head entry stops before the next.
-        let txs = pop_proposal(
-            &mut pool,
-            &mut pool_bytes,
-            &mut proposed,
-            5,
-            Some(700),
-            1_000,
-        );
+        // Headroom covering only the head entry stops before the next.
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 1_000);
         assert_eq!(txs.len(), 2);
         assert_eq!(pool.len(), 1);
         assert_eq!(pool_bytes, 300);
         assert_eq!(proposed.len(), 1);
 
-        // The strict budget is additionally capped by the default maximum.
+        // A full block has no headroom and nothing is served.
         let mut pool = VecDeque::from([pool_entry(3, 1, 400)]);
         let mut pool_bytes = 400;
-        let txs = pop_proposal(
-            &mut pool,
-            &mut pool_bytes,
-            &mut proposed,
-            5,
-            Some(10_000),
-            300,
-        );
-        assert!(txs.is_empty(), "strict budget capped below the entry");
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 300);
+        assert!(txs.is_empty(), "no headroom left");
 
-        // The default budget overshoots by one entry so an oversized head
+        // An initial selection overshoots by one entry so an oversized head
         // cannot wedge the pool.
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, None, 300);
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 0, 300);
         assert_eq!(txs.len(), 1);
         assert!(pool.is_empty());
         assert_eq!(pool_bytes, 0);

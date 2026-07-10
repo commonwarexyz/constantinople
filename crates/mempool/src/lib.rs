@@ -20,15 +20,17 @@ where
     /// pre-builds call this before the round is entered, so implementations
     /// must not assume the round is live.
     ///
-    /// `limit` caps the returned batch in encoded bytes. `None` uses the
-    /// implementation's default proposal budget; `Some` is a strict cap used
-    /// by refills that replace dropped transactions, so implementations must
-    /// not overshoot it.
+    /// `filled` is the encoded size of the transactions the proposal already
+    /// holds: the implementation serves at most its proposal budget minus
+    /// `filled`. A refill for a partially built block (`filled > 0`) must
+    /// never overshoot that headroom; an initial selection (`filled == 0`)
+    /// may overshoot by one entry so an oversized head entry cannot wedge
+    /// the queue.
     fn propose(
         &mut self,
         parent: &Header<C, H::Digest, P>,
         round: Round,
-        limit: Option<usize>,
+        filled: usize,
     ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send;
 }
 
