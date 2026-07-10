@@ -357,14 +357,13 @@ async fn register_channel(
     State(service): State<Arc<Service>>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
-    let channel = request.channel().map_err(ApiError::bad_request)?;
-    let payer = request.payer().map_err(ApiError::bad_request)?;
     let open_tx_digest = request
         .open_tx_digest::<Digest>()
         .map_err(ApiError::bad_request)?;
+    let zero_voucher = request.zero_voucher().map_err(ApiError::bad_request)?;
 
-    let registered = service
-        .register_channel(channel, payer, request.open_nonce, &open_tx_digest)
+    let (_channel, registered) = service
+        .register_channel(&open_tx_digest, zero_voucher)
         .await?;
     Ok(Json(RegisterResponse { registered }))
 }
@@ -730,11 +729,12 @@ impl ChainReader for ChannelVerifier {
         let payer = tx
             .value()
             .sender()
-            .ok_or_else(|| OperatorError::rejected("open transaction sender did not decode"))?
-            .clone();
+            .ok_or_else(|| OperatorError::rejected("open transaction sender did not decode"))?;
+        let payer = constantinople_primitives::AccountKey::from_public_key(payer);
         let Operation::OpenChannel {
             receiver,
             operator,
+            voucher_key,
             deposit,
             expiry,
         } = tx.value().op()
@@ -746,6 +746,7 @@ impl ChainReader for ChannelVerifier {
         Ok(VerifiedOpenChannel {
             payer,
             receiver: *receiver,
+            voucher_key: voucher_key.clone(),
             operator: *operator,
             open_nonce: tx.value().nonce,
             deposit: *deposit,

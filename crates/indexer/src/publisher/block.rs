@@ -231,7 +231,7 @@ where
             cumulative,
             ..
         } => {
-            let payer = AccountKey::from_public_key(payer);
+            let payer = *payer;
             // The settlement pays the named receiver; the operator that
             // signed the close moves no funds of its own and gets no row.
             // A zero-cumulative close (a cooperative early cancel) pays the
@@ -406,6 +406,7 @@ mod tests {
             payer_pk,
             receiver_account,
             receiver_account,
+            payer.public_key(),
             NonZeroU64::new(50).expect("deposit is non-zero"),
             u64::MAX,
             0,
@@ -457,8 +458,9 @@ mod tests {
         let voucher = payer.sign(b"voucher", b"message");
         let tx = Transaction::<sha256::Digest>::close_channel(
             receiver_pk,
-            payer_pk,
+            payer_account,
             receiver_account,
+            payer.public_key(),
             0,
             20,
             voucher,
@@ -527,6 +529,7 @@ mod tests {
             payer_pk,
             receiver_account,
             receiver_account,
+            payer.public_key(),
             0,
             1,
         )

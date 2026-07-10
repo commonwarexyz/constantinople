@@ -35,16 +35,17 @@ shows a checkmark after browser-side QMDB and Simplex verification succeeds.
 
 With `VITE_OPERATOR_URL` set, the header gains a **paid stream** view: an
 end-to-end metered-service demo against the channel operator's `GET /stream`
-endpoint. The passkey wallet funds an in-browser WebCrypto ed25519 *session
-key* (vouchers are ed25519-only, so the secp256r1 passkey cannot pay a channel
-directly), the session key opens a payment channel naming the operator as both
-payee and settler, and the operator then streams an essay token by token over
+endpoint. The passkey wallet signs a single `OpenChannel` that escrows the
+deposit and delegates voucher signing to a fresh in-browser WebCrypto ed25519
+*voucher key* (one user ceremony per channel; the key can sign vouchers and
+nothing else), and the operator then streams an essay token by token over
 SSE while the page signs a voucher whenever the unpaid debt reaches half the
 operator's advertised credit window. A "stop paying" toggle demonstrates
 enforcement — the stream pauses at the debt limit and hangs up after a grace
 window — and "settle on-chain" collapses the whole session into a single close
-transaction, linked from the channel's account page. The session key and
-channel survive page reloads via `localStorage`; the byte formats it signs are
+transaction that refunds the deposit remainder straight to the wallet, linked
+from the channel's account page. The channel record (voucher key included)
+survives page reloads via `localStorage`; the byte formats the page signs are
 locked to the Rust codec by `tests/fixtures/wire.json` (including
 deterministic ed25519 signature reproduction).
 

@@ -58,6 +58,8 @@ interface ChannelFixture {
     readonly payerAccountHex: string;
     readonly receiverAccountHex: string;
     readonly operatorAccountHex: string;
+    readonly voucherPrivateKeyHex: string;
+    readonly voucherPublicKeyHex: string;
     readonly openNonce: string;
     readonly addressHex: string;
     readonly transactionNamespace: string;
@@ -65,6 +67,7 @@ interface ChannelFixture {
     readonly voucherCumulative: string;
     readonly voucherMessageHex: string;
     readonly voucherSignatureHex: string;
+    readonly zeroVoucherSignatureHex: string;
 }
 
 interface StreamFixture {
@@ -170,6 +173,7 @@ test('open channel encoding is byte-identical to the Rust codec', async () => {
             senderPublicKey: fromHex(tx.senderPublicKeyHex),
             receiverAccountKey: fromHex(tx.receiverAccountKeyHex ?? ''),
             operatorAccountKey: fromHex(tx.operatorAccountKeyHex ?? ''),
+            voucherPublicKey: fromHex(fixture.channel.voucherPublicKeyHex),
             deposit: BigInt(tx.deposit ?? ''),
             expiry: BigInt(tx.expiry ?? ''),
             nonce: BigInt(tx.nonce),
@@ -190,6 +194,7 @@ test('timeout channel encoding is byte-identical to the Rust codec', async () =>
             senderPublicKey: fromHex(tx.senderPublicKeyHex),
             receiverAccountKey: fromHex(channel.receiverAccountHex),
             operatorAccountKey: fromHex(channel.operatorAccountHex),
+            voucherPublicKey: fromHex(channel.voucherPublicKeyHex),
             openNonce: BigInt(channel.openNonce),
             nonce: BigInt(tx.nonce),
         },
@@ -205,6 +210,7 @@ test('channel address derivation matches the Rust codec', async () => {
         fromHex(channel.payerAccountHex),
         fromHex(channel.receiverAccountHex),
         fromHex(channel.operatorAccountHex),
+        fromHex(channel.voucherPublicKeyHex),
         BigInt(channel.openNonce),
     );
     assert.equal(toHex(address), channel.addressHex);
@@ -243,10 +249,8 @@ test('operator request bodies match the Rust wire types', () => {
     assert.deepEqual(
         JSON.parse(
             registerRequestBody({
-                channelHex: channel.addressHex,
-                payerHex: open.senderPublicKeyHex,
-                openNonce: BigInt(channel.openNonce),
                 openTxDigestHex: open.digestHex,
+                zeroVoucherSignatureHex: channel.zeroVoucherSignatureHex,
             }),
         ),
         JSON.parse(fixture.requests.registerSample),
@@ -267,15 +271,16 @@ test('operator request bodies match the Rust wire types', () => {
     );
 });
 
-// The fixture carries the payer's raw ed25519 key, so the whole in-browser
-// signing path — namespace framing included — can be exercised end to end:
-// ed25519 is deterministic, so re-signing must reproduce the fixture bytes
-// exactly. This is the test that catches "signed the wrong bytes" mistakes a
-// correct-looking encoder byte-compare cannot.
-async function importFixturePayerKey(): Promise<CryptoKey> {
+// The fixture carries the payer's and the voucher key's raw ed25519 seeds,
+// so both in-browser signing paths — namespace framing included — can be
+// exercised end to end: ed25519 is deterministic, so re-signing must
+// reproduce the fixture bytes exactly. This is the test that catches
+// "signed the wrong bytes" mistakes a correct-looking encoder byte-compare
+// cannot.
+async function importFixtureKey(seedHex: string): Promise<CryptoKey> {
     // Wrap the raw 32-byte seed in the fixed PKCS8 Ed25519 envelope.
     const pkcs8Prefix = fromHex('302e020100300506032b657004220420');
-    const seed = fromHex(fixture.channel.payerPrivateKeyHex);
+    const seed = fromHex(seedHex);
     const pkcs8 = new Uint8Array([...pkcs8Prefix, ...seed]);
     return webcrypto.subtle.importKey('pkcs8', pkcs8, 'Ed25519', false, ['sign']);
 }
@@ -289,19 +294,28 @@ test('voucher signing reproduces the Rust signature byte-for-byte', async () => 
     // The payload embeds the fixture's pre-namespace message verbatim.
     assert.ok(toHex(payload).endsWith(channel.voucherMessageHex));
 
-    const key = await importFixturePayerKey();
+    const key = await importFixtureKey(channel.voucherPrivateKeyHex);
     const signature = new Uint8Array(await webcrypto.subtle.sign('Ed25519', key, payload));
     assert.equal(toHex(signature), channel.voucherSignatureHex);
+
+    // The zero voucher registration carries signs (channel, 0) with the
+    // same key.
+    const zeroPayload = voucherSigningPayload(fromHex(channel.addressHex), 0n);
+    const zeroSignature = new Uint8Array(
+        await webcrypto.subtle.sign('Ed25519', key, zeroPayload),
+    );
+    assert.equal(toHex(zeroSignature), channel.zeroVoucherSignatureHex);
 });
 
 test('ed25519 transaction signing reproduces the Rust signature byte-for-byte', async () => {
     const tx = entry('open_channel');
-    const key = await importFixturePayerKey();
+    const key = await importFixtureKey(fixture.channel.payerPrivateKeyHex);
     const encoded = await encodeSignedOpenChannelTransaction(
         {
             senderPublicKey: fromHex(tx.senderPublicKeyHex),
             receiverAccountKey: fromHex(tx.receiverAccountKeyHex ?? ''),
             operatorAccountKey: fromHex(tx.operatorAccountKeyHex ?? ''),
+            voucherPublicKey: fromHex(fixture.channel.voucherPublicKeyHex),
             deposit: BigInt(tx.deposit ?? ''),
             expiry: BigInt(tx.expiry ?? ''),
             nonce: BigInt(tx.nonce),

@@ -31,10 +31,7 @@ pub use transaction::{
 pub mod operator_api;
 
 mod channel;
-pub use channel::{
-    VOUCHER_NAMESPACE, Voucher, channel_address, verify_voucher, verify_voucher_key,
-    voucher_message,
-};
+pub use channel::{VOUCHER_NAMESPACE, Voucher, channel_address, verify_voucher, voucher_message};
 
 mod url;
 pub use url::resolve_named_http_url;

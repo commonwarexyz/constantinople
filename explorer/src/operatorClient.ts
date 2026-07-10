@@ -65,21 +65,20 @@ export async function fetchAdvertisement(operatorUrl: string): Promise<OperatorA
     return parseAdvertisement(body);
 }
 
-/// Registers a finalized channel open, retrying through indexer lag.
+/// Registers a finalized channel open, retrying through indexer lag. The
+/// operator derives the channel from the verified open; the zero-voucher
+/// signature proves this client holds the channel's voucher key and gives
+/// the operator a starting voucher.
 export async function registerChannel(
     operatorUrl: string,
     request: {
-        channel: Uint8Array;
-        payerPublicKey: Uint8Array;
-        openNonce: bigint;
         openTxDigestHex: string;
+        zeroVoucherSignature: Uint8Array;
     },
 ): Promise<void> {
     const payload = registerRequestBody({
-        channelHex: toHex(request.channel),
-        payerHex: toHex(request.payerPublicKey),
-        openNonce: request.openNonce,
         openTxDigestHex: request.openTxDigestHex,
+        zeroVoucherSignatureHex: toHex(request.zeroVoucherSignature),
     });
     for (let attempt = 1; ; attempt++) {
         try {

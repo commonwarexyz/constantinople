@@ -88,38 +88,18 @@ export function voucherTopUp(inputs: VoucherPolicyInputs): bigint | null {
     return target;
 }
 
-/// An account's nonce state, as the relayer facade reports it.
-export interface NonceState {
-    readonly base: bigint;
-    /// Used future nonces relative to `base`: bit 0 records `base + 1`, bit
-    /// 63 records `base + 64` (the mirror of `Nonce` in `account.rs`).
-    readonly bitmap: bigint;
-}
-
-/// Whether `nonce` has already been consumed by the account: below the base,
-/// or recorded in the run-ahead bitmap (the mirror of `Nonce::is_consumed`).
-export function nonceConsumed(state: NonceState, nonce: bigint): boolean {
-    if (nonce < state.base) {
-        return true;
-    }
-    const delta = nonce - state.base;
-    return delta !== 0n && delta <= 64n && ((state.bitmap >> (delta - 1n)) & 1n) === 1n;
-}
-
 /// Serializes the `POST /channels` body (`RegisterRequest` in
 /// `operator_api.rs`); pinned to the Rust wire contract by the fixture
-/// suite, like the parsers below.
+/// suite, like the parsers below. The registration carries only the open's
+/// digest and the initial zero-value voucher signature — the operator
+/// derives everything else from the verified open.
 export function registerRequestBody(request: {
-    readonly channelHex: string;
-    readonly payerHex: string;
-    readonly openNonce: bigint;
     readonly openTxDigestHex: string;
+    readonly zeroVoucherSignatureHex: string;
 }): string {
     return JSON.stringify({
-        channel: request.channelHex,
-        payer: request.payerHex,
-        open_nonce: wireU64('open_nonce', request.openNonce),
         open_tx_digest: request.openTxDigestHex,
+        zero_voucher: request.zeroVoucherSignatureHex,
     });
 }
 

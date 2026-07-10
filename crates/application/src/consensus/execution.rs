@@ -139,9 +139,8 @@ enum PreparedItem {
 
 /// Prepares one transaction into its lane plus its sealed digest.
 ///
-/// Returns `None` if the sender key fails to decode (malformed) or the
-/// operation is statically invalid (an `OpenChannel` from a non-Ed25519 payer;
-/// see `prepare_channel_op`).
+/// Returns `None` if the sender key fails to decode (malformed); see
+/// `prepare_channel_op` for the channel-lane preparation.
 fn prepare_item<H>(tx: &SignedTransaction<H>) -> Option<(PreparedItem, H::Digest)>
 where
     H: Hasher,

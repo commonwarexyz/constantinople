@@ -8,8 +8,9 @@
 //!
 //! Channels are ordinary accounts at a derived, unspendable address (see
 //! [`constantinople_primitives::channel_address`]). Opening a channel debits the
-//! payer and funds the channel account; closing it verifies the payer's voucher
-//! and splits the escrow between receiver and payer; once the block height
+//! payer and funds the channel account; closing it verifies a voucher signed
+//! by the channel's delegated voucher key and splits the escrow between
+//! receiver and payer; once the block height
 //! exceeds the channel's expiry, a timeout lets the payer reclaim the whole
 //! escrow unilaterally. A channel address can never sign a transaction, so the
 //! channel account's nonce slot stores the expiry. Because a channel is just
@@ -23,7 +24,8 @@
 //! account, so the two lanes never race on a write.
 //!
 //! The channel address is derived from the payer's `OpenChannel` nonce
-//! (`H(domain || payer || receiver || operator || open_nonce)`). Because account nonces are
+//! (`H(domain || payer || receiver || operator || voucher_key || open_nonce)`).
+//! Because account nonces are
 //! monotonic and never reused, every open yields a unique address that no later
 //! `OpenChannel` can recreate. That gives three properties: a settled channel
 //! can be deleted, an old voucher can never be replayed against a *different*
@@ -53,9 +55,11 @@
 //!   close. (The one exception is an adversary pre-funding the derived address
 //!   so the open's escrow would overflow `u64`, which rejects the open; that
 //!   needs a balance near `u64::MAX`, far above any real supply.)
-//! - Channel vouchers are Ed25519, so `OpenChannel` rejects a non-Ed25519
-//!   payer: it could never sign a settleable voucher, which would lock the
-//!   deposit.
+//! - Vouchers are signed by the delegated Ed25519 `voucher_key` an open
+//!   names, so any account — including one whose own key cannot sign
+//!   unattended (a WebAuthn passkey) — can be a payer. An open naming a key
+//!   nobody controls locks its deposit until the expiry timeout; that is the
+//!   payer's own mistake to make.
 //! - Closing (or timing out) deletes the channel account, so a settled channel
 //!   leaves no state. The flip side is the replay caveat above: with no
 //!   residual marker, a re-funded dead address looks like a fresh, live
@@ -76,8 +80,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{Clock, Metrics, Storage};
 use commonware_storage::translator::EightCap;
 use constantinople_primitives::{
-    Account, AccountKey, Nonce, Operation, SignedTransaction, TransactionPublicKey,
-    channel_address, verify_voucher,
+    Account, AccountKey, Nonce, Operation, SignedTransaction, channel_address, verify_voucher,
 };
 
 /// Account writes a channel-operation batch produces, in no particular order.
@@ -105,6 +108,10 @@ pub struct PreparedChannelOp {
 /// that merely feed the channel-address derivation (receiver, operator, and
 /// the open nonce) are consumed at preparation time and travel on as the
 /// derived `channel` — the address commits to all of them.
+// The size skew (a close carries a key and a signature, a mint a u64) is
+// accepted: prepared ops live in a short per-block scratch vec, so boxing
+// the close would trade a few stack bytes for an allocation per operation.
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone)]
 pub enum PreparedChannelOpKind {
     /// Open a channel from the sender (payer).
@@ -119,15 +126,15 @@ pub enum PreparedChannelOpKind {
     /// Close a channel, settling the latest voucher. The sender is the
     /// operator; the cumulative is paid to `receiver`.
     Close {
-        /// Payer public key (used to verify the voucher).
-        payer: TransactionPublicKey,
         /// Payer account key (the refund destination).
-        payer_key: AccountKey,
+        payer: AccountKey,
         /// Receiver (payee) account key the cumulative is paid to.
         receiver: AccountKey,
+        /// Delegated voucher key the signature is verified against.
+        voucher_key: ed25519::PublicKey,
         /// Cumulative amount claimed.
         cumulative: u64,
-        /// Payer's voucher signature.
+        /// Voucher key's signature.
         voucher: ed25519::Signature,
         /// Derived channel address, computed once at preparation.
         channel: AccountKey,
@@ -147,9 +154,10 @@ pub enum PreparedChannelOpKind {
 
 /// Prepares a channel operation from a signed transaction.
 ///
-/// Returns `None` if the sender public key fails to decode, the transaction is
-/// a transfer (which belongs to the other lane), or the operation is statically
-/// invalid (an `OpenChannel` from a non-Ed25519 payer; see below).
+/// Returns `None` if the sender public key fails to decode or the transaction
+/// is a transfer (which belongs to the other lane). Any account may open a
+/// channel: vouchers are signed by the delegated `voucher_key` the open
+/// names, not by the payer's own key.
 pub fn prepare_channel_op<H>(transaction: &SignedTransaction<H>) -> Option<PreparedChannelOp>
 where
     H: Hasher,
@@ -162,43 +170,36 @@ where
         Operation::OpenChannel {
             receiver,
             operator,
+            voucher_key,
             deposit,
             expiry,
-        } => {
-            // Vouchers are Ed25519 (the same predicate `verify_voucher` uses
-            // at settlement), so a non-Ed25519 payer could never sign a
-            // voucher the chain accepts — the deposit would be locked until
-            // withdrawal. Refuse to open such a channel.
-            sender_key.as_ed25519()?;
-            PreparedChannelOpKind::Open {
-                deposit: deposit.get(),
-                expiry: *expiry,
-                channel: channel_address(&sender, receiver, operator, tx.nonce),
-            }
-        }
+        } => PreparedChannelOpKind::Open {
+            deposit: deposit.get(),
+            expiry: *expiry,
+            channel: channel_address(&sender, receiver, operator, voucher_key, tx.nonce),
+        },
         Operation::CloseChannel {
             payer,
             receiver,
+            voucher_key,
             open_nonce,
             cumulative,
             voucher,
-        } => {
-            let payer_key = AccountKey::from_public_key(payer);
-            PreparedChannelOpKind::Close {
-                payer: payer.clone(),
-                payer_key,
-                receiver: *receiver,
-                cumulative: *cumulative,
-                voucher: voucher.clone(),
-                channel: channel_address(&payer_key, receiver, &sender, *open_nonce),
-            }
-        }
+        } => PreparedChannelOpKind::Close {
+            payer: *payer,
+            receiver: *receiver,
+            voucher_key: voucher_key.clone(),
+            cumulative: *cumulative,
+            voucher: voucher.clone(),
+            channel: channel_address(payer, receiver, &sender, voucher_key, *open_nonce),
+        },
         Operation::TimeoutChannel {
             receiver,
             operator,
+            voucher_key,
             open_nonce,
         } => PreparedChannelOpKind::Timeout {
-            channel: channel_address(&sender, receiver, operator, *open_nonce),
+            channel: channel_address(&sender, receiver, operator, voucher_key, *open_nonce),
         },
         Operation::Mint { amount } => PreparedChannelOpKind::Mint {
             amount: amount.get(),
@@ -252,12 +253,12 @@ impl PreparedChannelOp {
                 keys.push(*channel);
             }
             PreparedChannelOpKind::Close {
-                payer_key,
+                payer,
                 receiver,
                 channel,
                 ..
             } => {
-                keys.push(*payer_key);
+                keys.push(*payer);
                 keys.push(*receiver);
                 keys.push(*channel);
             }
@@ -348,8 +349,8 @@ fn apply_channel_op(
         }
         PreparedChannelOpKind::Close {
             payer,
-            payer_key,
             receiver,
+            voucher_key,
             cumulative,
             voucher,
             channel,
@@ -357,11 +358,12 @@ fn apply_channel_op(
         } => {
             // The channel must exist (it was opened by a prior transaction).
             let balance = channel_escrow(pending, loaded, channel)?;
-            // Verify the payer's voucher over (channel, cumulative). The
-            // address commits to (payer, receiver, operator, open_nonce), so
-            // a valid voucher also proves this close's sender is the channel's
-            // operator and its receiver field is the channel's payee.
-            if !verify_voucher(payer, channel, *cumulative, voucher) {
+            // Verify the voucher over (channel, cumulative). The address
+            // commits to (payer, receiver, operator, voucher_key, open_nonce),
+            // so a valid voucher also proves this close's sender is the
+            // channel's operator, its receiver field is the channel's payee,
+            // and its voucher key is the one the payer delegated.
+            if !verify_voucher(voucher_key, channel, *cumulative, voucher) {
                 return None;
             }
             // Can never claim more than what is escrowed.
@@ -394,9 +396,9 @@ fn apply_channel_op(
                 pending.insert(*receiver, Some(receiver_account));
             }
 
-            let mut payer_account = account_or_default(pending, loaded, payer_key);
+            let mut payer_account = account_or_default(pending, loaded, payer);
             saturating_credit(&mut payer_account, refund);
-            pending.insert(*payer_key, Some(payer_account));
+            pending.insert(*payer, Some(payer_account));
 
             // Delete the settled channel so it leaves no state.
             pending.insert(*channel, None);

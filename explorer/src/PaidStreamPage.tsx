@@ -1,29 +1,16 @@
 // The paid-stream demo view: an x402-style metered service driven end to end
-// from the browser. The passkey wallet funds an ed25519 session key, the
-// session key opens a payment channel to the operator (who is also the
-// payee), and the operator's `/stream` endpoint then sells an essay token by
-// token while this page signs vouchers to keep the debt under the advertised
-// limit. Stop paying and the stream pauses, then hangs up — enforcement is
-// the demo.
-//
-// The fund and open transactions are deliberately submitted sequentially
-// (each awaited to finality): the transfer credits the session account that
-// the OpenChannel debits, and same-block cross-lane writes to one account
-// conflict — batching them would drop one.
+// from the browser. The passkey wallet signs one OpenChannel that escrows the
+// deposit and delegates voucher signing to a fresh per-channel ed25519 key;
+// that key then pays the operator's `/stream` endpoint token by token while
+// the essay renders. Stop paying and the stream pauses, then hangs up —
+// enforcement is the demo. The close (or a post-expiry timeout reclaim)
+// refunds the deposit remainder straight back to the wallet.
 
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 
 import { AddressValue } from './AddressValue';
-import {
-    channelAddress,
-    encodeSignedOpenChannelTransaction,
-    encodeSignedTimeoutChannelTransaction,
-    encodeTransactionBatch,
-    fromHex,
-    parseAccountKeyHex,
-    toHex,
-} from './codec';
-import { fetchAccount, statusHasHeight, submitTransactions } from './mempool';
+import { encodeTransactionBatch, fromHex, parseAccountKeyHex, toHex } from './codec';
+import { statusHasHeight, submitTransactions, type TxStatus } from './mempool';
 import {
     OperatorRequestError,
     fetchAdvertisement,
@@ -34,30 +21,25 @@ import {
 } from './operatorClient';
 import {
     channelExpiry,
-    nonceConsumed,
     voucherTopUp,
     type OperatorAdvertisement,
     type StreamEnd,
     type StreamMeter,
 } from './paidStream';
-import { loadOrCreateSessionKey, type SessionKey } from './sessionKey';
-import { readStoredJson, shortHex, sleep } from './util';
+import { createVoucherKey, importVoucherKey, type VoucherKey } from './voucherKey';
+import { readStoredJson, shortHex } from './util';
 
-/// Tokens of content a session's deposit buys (the essay is shorter, so a
+/// Tokens of content a channel's deposit buys (the essay is shorter, so a
 /// paying session ends with `complete`, not `deposit_exhausted`).
 const DEPOSIT_TOKENS = 600n;
-/// How long to wait for the funding transfer to land in the session
-/// account's committed balance.
-const FUNDING_POLL_ATTEMPTS = 20;
-const FUNDING_POLL_MS = 500;
 /// Retry delay for a transiently failed voucher post — well inside the
 /// operator's grace window, so a blip cannot kill a paying stream.
 const VOUCHER_RETRY_MS = 1_000;
-/// The page tracks one outstanding channel: the record lands here before the
-/// open is submitted and stays until a close or a timeout reclaim resolves
-/// the escrow — the only two ways a channel's funds move, so the record is
-/// never deleted while they haven't.
-const CHANNEL_STORAGE_KEY = 'constantinople.stream-channel.v1';
+/// The page tracks one outstanding channel: the record lands here after the
+/// wallet signs the open (before submission) and stays until a close or a
+/// timeout reclaim resolves the escrow — the only two ways the funds move,
+/// so the record is never deleted while they haven't.
+const CHANNEL_STORAGE_KEY = 'constantinople.stream-channel.v2';
 
 interface ChannelRecord {
     readonly channelHex: string;
@@ -65,34 +47,62 @@ interface ChannelRecord {
     readonly deposit: string;
     readonly openTxDigestHex: string;
     /// The exact signed open transaction. Persisted before the first
-    /// submission and resubmitted verbatim until it lands: the session key
-    /// then signs exactly one transaction per nonce, which is what makes the
-    /// nonce check in `confirmOpen` definitive.
+    /// submission and resubmitted verbatim on retries: the bytes carry the
+    /// wallet nonce they were signed with, so a copy can never land twice
+    /// and retrying is always safe.
     readonly signedOpenTxHex: string;
     /// The receiver/operator account and expiry the channel was opened with
     /// (a timeout reclaim must reconstruct the channel address from them).
     readonly operatorHex: string;
     readonly expiry: string;
+    /// The channel's delegated voucher key: the raw public key the channel
+    /// address commits to, and the private half (an extractable JWK — see
+    /// voucherKey.ts for the demo-posture tradeoff).
+    readonly voucherPublicKeyHex: string;
+    readonly voucherKeyJwk: JsonWebKey;
 }
 
-type Phase =
-    | 'unsupported'
-    | 'idle'
-    | 'opening'
-    | 'ready'
-    | 'streaming'
-    | 'ended'
-    | 'settling'
-    | 'settled';
+/// What the wallet hands back for persistence after signing the open,
+/// before submitting it.
+export interface PendingOpen {
+    readonly channelHex: string;
+    readonly openNonce: string;
+    readonly openTxDigestHex: string;
+    readonly signedOpenTxHex: string;
+}
+
+/// The page's ask to the wallet: sign and submit one OpenChannel. `persist`
+/// MUST be called after signing and before submission, so a lost response
+/// cannot orphan the escrow.
+export interface OpenStreamChannelRequest {
+    readonly operatorHex: string;
+    readonly voucherPublicKeyHex: string;
+    readonly deposit: bigint;
+    readonly expiry: bigint;
+    readonly persist: (pending: PendingOpen) => void;
+}
+
+/// The page's ask to the wallet: sign and submit one TimeoutChannel
+/// reclaiming an expired channel's escrow.
+export interface ReclaimStreamChannelRequest {
+    readonly channelHex: string;
+    readonly operatorHex: string;
+    readonly voucherPublicKeyHex: string;
+    readonly openNonce: string;
+}
+
+type Phase = 'idle' | 'opening' | 'ready' | 'streaming' | 'ended' | 'settling' | 'settled';
 
 export interface PaidStreamPageProps {
     readonly operatorUrl: string;
     readonly mempoolUrl: string;
     readonly walletReady: boolean;
     readonly walletBalance: number | null;
-    /// Transfers `amount` from the passkey wallet to the session account and
-    /// resolves true once the transfer finalized.
-    readonly onFundSession: (accountKeyHex: string, amount: bigint) => Promise<boolean>;
+    /// Signs and submits the OpenChannel with the passkey (one user ceremony
+    /// per channel — the delegation the voucher key operates under).
+    readonly onOpenChannel: (request: OpenStreamChannelRequest) => Promise<TxStatus | null>;
+    /// Signs and submits a post-expiry TimeoutChannel with the passkey.
+    readonly onReclaimChannel: (request: ReclaimStreamChannelRequest) => Promise<TxStatus | null>;
     readonly onOpenWallet: () => void;
     readonly onOpenAddress: (accountHex: string) => void;
     readonly onCopy: (value: string) => void;
@@ -105,21 +115,20 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     mempoolUrl,
     walletReady,
     walletBalance,
-    onFundSession,
+    onOpenChannel,
+    onReclaimChannel,
     onOpenWallet,
     onOpenAddress,
     onCopy,
 }: PaidStreamPageProps) {
     const [phase, setPhase] = useState<Phase>('idle');
     const [note, setNote] = useState('');
-    const [session, setSession] = useState<SessionKey | null>(null);
-    const [sessionBalance, setSessionBalance] = useState<number | null>(null);
     const [advertisement, setAdvertisement] = useState<OperatorAdvertisement | null>(null);
     const [channel, setChannel] = useState<ChannelRecord | null>(() => readChannelRecord());
     const [text, setText] = useState('');
     const [meter, setMeter] = useState<StreamMeter>({ served: 0n, paid: 0n });
     const [paying, setPaying] = useState(true);
-    // Signed cumulatives, newest first (strictly monotonic per session, so
+    // Signed cumulatives, newest first (strictly monotonic per channel, so
     // the values key the log rows).
     const [payments, setPayments] = useState<bigint[]>([]);
     const [endReason, setEndReason] = useState<StreamEnd['reason'] | null>(null);
@@ -134,8 +143,11 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     /// inside it). `updateMeter` is the only writer of either.
     const meterRef = useRef<StreamMeter>({ served: 0n, paid: 0n });
     /// Bumped by `resetSession` so a voucher post that resolves after a
-    /// reset cannot write the old session's cumulative into the new one.
+    /// reset cannot write the old channel's cumulative into the new one.
     const sessionGenerationRef = useRef(0);
+    /// The active channel's voucher signer, created at open or reactivated
+    /// from the persisted record on load.
+    const voucherKeyRef = useRef<VoucherKey | null>(null);
     const closeStreamRef = useRef<(() => void) | null>(null);
     const textRef = useRef<HTMLPreElement | null>(null);
 
@@ -150,58 +162,35 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         [channel],
     );
 
-    // Boot: restore/create the session key while the operator advertisement
-    // fetch runs alongside. Key generation failing is the WebCrypto
-    // ed25519-support probe.
+    // Boot: fetch the operator advertisement, and reactivate a restored
+    // channel's voucher key so a reloaded page can keep paying.
     useEffect(() => {
         let cancelled = false;
+        fetchAdvertisement(operatorUrl).then(
+            (ad) => {
+                if (!cancelled) setAdvertisement(ad);
+            },
+            (error) => {
+                if (!cancelled) setNote(`operator unreachable: ${String(error)}`);
+            },
+        );
         void (async () => {
-            const advertisementPromise = fetchAdvertisement(operatorUrl);
-            advertisementPromise.then(
-                (ad) => {
-                    if (!cancelled) setAdvertisement(ad);
-                },
-                (error) => {
-                    if (!cancelled) setNote(`operator unreachable: ${String(error)}`);
-                },
-            );
+            const restored = readChannelRecord();
+            if (!restored) return;
             try {
-                const key = await loadOrCreateSessionKey();
-                if (!cancelled) setSession(key);
+                const key = await importVoucherKey(
+                    restored.voucherKeyJwk,
+                    restored.voucherPublicKeyHex,
+                );
+                if (!cancelled) voucherKeyRef.current = key;
             } catch (error) {
-                // Usually missing WebCrypto ed25519 support, but storage
-                // being disabled lands here too — surface the real error.
-                if (!cancelled) {
-                    setNote(String(error));
-                    setPhase('unsupported');
-                }
+                if (!cancelled) setNote(`stored voucher key failed to import: ${String(error)}`);
             }
         })();
         return () => {
             cancelled = true;
         };
     }, [operatorUrl]);
-
-    // Track the session account's committed balance. Paused while streaming:
-    // vouchers are off-chain, so the balance cannot move until settlement.
-    useEffect(() => {
-        if (!session || phase === 'streaming') return;
-        let cancelled = false;
-        const poll = async () => {
-            try {
-                const view = await fetchAccount(mempoolUrl, toHex(session.publicKey));
-                if (!cancelled) setSessionBalance(view?.balance ?? 0);
-            } catch {
-                // The relayer facade may not be up yet; keep polling.
-            }
-        };
-        void poll();
-        const interval = window.setInterval(() => void poll(), 2_000);
-        return () => {
-            cancelled = true;
-            window.clearInterval(interval);
-        };
-    }, [session, mempoolUrl, phase]);
 
     /// Closes a live stream, if any. Nulling the ref matters: the voucher
     /// retry timer reads `closeStreamRef.current !== null` as "stream is
@@ -234,7 +223,8 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     /// every stream event; a ref guards against overlapping posts.
     const maybePay = () => {
         if (!payingRef.current || voucherInflightRef.current) return;
-        if (!session || !advertisement || !channel || !channelKey) return;
+        const voucherKey = voucherKeyRef.current;
+        if (!voucherKey || !advertisement || !channel || !channelKey) return;
         const target = voucherTopUp({
             served: meterRef.current.served,
             paid: meterRef.current.paid,
@@ -248,7 +238,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         const generation = sessionGenerationRef.current;
         void (async () => {
             try {
-                const signature = await session.signVoucher(channelKey, target);
+                const signature = await voucherKey.signVoucher(channelKey, target);
                 await postVoucher(operatorUrl, { channel: channelKey, cumulative: target, signature });
                 if (generation !== sessionGenerationRef.current) return;
                 lastSignedRef.current = target;
@@ -269,45 +259,38 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                     if (closeStreamRef.current !== null) maybePay();
                 }, VOUCHER_RETRY_MS);
             } finally {
-                voucherInflightRef.current = false;
+                // A post stalled across a reset must not clear the NEW
+                // session's inflight flag out from under it.
+                if (generation === sessionGenerationRef.current) {
+                    voucherInflightRef.current = false;
+                }
             }
         })();
     };
 
-    /// Resubmits the persisted open verbatim and throws unless it landed.
-    /// Verbatim resubmission is what makes the nonce check definitive: this
-    /// is the only transaction the session key ever signed with `openNonce`,
-    /// so the nonce being consumed proves this open consumed it — and the
-    /// nonce being free proves the escrow does not exist yet. The record is
-    /// therefore never discarded on an unconfirmed open; retrying is always
-    /// safe and always converges. Idempotent and cheap, so every session
-    /// start re-runs it instead of trusting persisted state.
-    const confirmOpen = async (record: ChannelRecord, sessionPublicKeyHex: string) => {
+    /// Resubmits the persisted open verbatim. Advisory rather than
+    /// authoritative: the registration that follows verifies the open by
+    /// digest against the chain, so an unresolved status here just falls
+    /// through. (Known demo edge: if the open's response was lost AND the
+    /// wallet reused the rolled-back nonce on another transaction before a
+    /// retry, this open can never land and registration will keep answering
+    /// 503 — recover by clearing the stream channel from localStorage.)
+    const resubmitOpen = async (record: ChannelRecord) => {
         const status = await submitTransactions(
             mempoolUrl,
             encodeTransactionBatch([fromHex(record.signedOpenTxHex)]),
         );
         if (!statusHasHeight(status)) {
-            const view = await fetchAccount(mempoolUrl, sessionPublicKeyHex);
-            const consumed =
-                view !== null &&
-                nonceConsumed(
-                    { base: BigInt(view.nonce.base), bitmap: BigInt(view.nonce.bitmap) },
-                    BigInt(record.openNonce),
-                );
-            if (!consumed) {
-                throw new Error(
-                    `channel open was ${status.status} — start the session again to retry`,
-                );
-            }
+            // A duplicate of an already-finalized open reports dropped; the
+            // registration below is the check that actually decides.
         }
     };
 
-    /// Fund the session account, open the channel, and register it.
+    /// Open the channel from the wallet (one passkey ceremony) and register
+    /// it with the operator.
     const startSession = async () => {
-        if (!session) return;
         if (!walletReady) {
-            setNote('sign in with the wallet first — it funds the session key');
+            setNote('sign in with the wallet first — it signs the channel open');
             onOpenWallet();
             return;
         }
@@ -316,107 +299,96 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         // Tracked outside the try so a failure never re-creates a record
         // the flow already persisted.
         let record = channel;
+        // Another tab may have persisted a channel since this page mounted.
+        // The record guards live escrow (it is the only copy of the signed
+        // open and the voucher key), so never clobber it — adopt it.
+        const stored = readChannelRecord();
+        if (stored && stored.channelHex !== record?.channelHex) {
+            record = stored;
+            setChannel(stored);
+            voucherKeyRef.current = null;
+        }
         try {
-            // Fresh advertisement (the expiry derives from the operator's
-            // current height), fetched alongside the session account view —
-            // the two are independent.
-            const sessionPublicKeyHex = toHex(session.publicKey);
-            const [ad, initialView] = await Promise.all([
-                fetchAdvertisement(operatorUrl),
-                fetchAccount(mempoolUrl, sessionPublicKeyHex),
-            ]);
+            // Fresh advertisement: the expiry derives from the operator's
+            // current height.
+            const ad = await fetchAdvertisement(operatorUrl);
             setAdvertisement(ad);
-            const price = ad.pricePerToken > 0n ? ad.pricePerToken : 1n;
-            const deposit = DEPOSIT_TOKENS * price;
-            const operatorAccount = parseAccountKeyHex(ad.accountHex);
 
             if (!record) {
-                // Step 1: the wallet funds the session account (sequential —
-                // see the module comment on cross-lane conflicts).
-                let view = initialView;
-                let balance = BigInt(view?.balance ?? 0);
-                if (balance < deposit) {
-                    const needed = deposit - balance;
-                    if (walletBalance === null || BigInt(walletBalance) < needed) {
-                        throw new Error(
-                            `wallet balance too low to fund the session (needs ${needed}); mint to the wallet first`,
-                        );
-                    }
-                    setNote(`funding session account (${needed} from the wallet)…`);
-                    if (!(await onFundSession(toHex(session.accountKey), needed))) {
-                        throw new Error('funding transfer did not finalize');
-                    }
-                    for (let attempt = 0; balance < deposit; attempt++) {
-                        if (attempt >= FUNDING_POLL_ATTEMPTS) {
-                            throw new Error('funding transfer not visible in the session account yet; retry shortly');
-                        }
-                        await sleep(FUNDING_POLL_MS);
-                        view = await fetchAccount(mempoolUrl, sessionPublicKeyHex);
-                        balance = BigInt(view?.balance ?? 0);
-                    }
+                const price = ad.pricePerToken > 0n ? ad.pricePerToken : 1n;
+                const deposit = DEPOSIT_TOKENS * price;
+                if (walletBalance === null || BigInt(walletBalance) < deposit) {
+                    throw new Error(
+                        `wallet balance too low for the ${deposit} deposit; mint to the wallet first`,
+                    );
                 }
-
-                // Step 2: the session key signs the channel open. The
-                // operator is both the settling key and the payee (a
-                // payee-run operator). The last fetched view's nonce is
-                // current: the funding transfer is inbound and cannot
-                // advance it.
-                const openNonce = BigInt(view?.nonce.base ?? 0);
+                // A fresh delegated key per channel; generating it doubles
+                // as the WebCrypto ed25519 support probe (needs Chrome 137+,
+                // Safari 17+, or Firefox 130+).
+                const voucherKey = await createVoucherKey();
+                voucherKeyRef.current = voucherKey;
                 const expiry = channelExpiry(ad);
-                const encoded = await encodeSignedOpenChannelTransaction(
-                    {
-                        senderPublicKey: session.publicKey,
-                        receiverAccountKey: operatorAccount,
-                        operatorAccountKey: operatorAccount,
-                        deposit,
-                        expiry,
-                        nonce: openNonce,
-                    },
-                    session.signTransaction,
-                );
-                const address = await channelAddress(
-                    session.accountKey,
-                    operatorAccount,
-                    operatorAccount,
-                    openNonce,
-                );
-                // Persisted BEFORE submission: if the response is lost after
-                // the open finalized, this record is the only way back to
-                // the escrow. `confirmOpen` below reconciles either way.
-                record = {
-                    channelHex: toHex(address),
-                    openNonce: openNonce.toString(),
-                    deposit: deposit.toString(),
-                    openTxDigestHex: encoded.digestHex,
-                    signedOpenTxHex: toHex(encoded.bytes),
+                const voucherPublicKeyHex = toHex(voucherKey.publicKey);
+                setNote('approve the channel open in the wallet…');
+                await onOpenChannel({
                     operatorHex: ad.accountHex,
-                    expiry: expiry.toString(),
-                };
-                persistChannel(record);
-                setChannel(record);
+                    voucherPublicKeyHex,
+                    deposit,
+                    expiry,
+                    // Runs after signing, before submission: from here the
+                    // escrow can always be found again.
+                    persist: (pending) => {
+                        record = {
+                            ...pending,
+                            deposit: deposit.toString(),
+                            operatorHex: ad.accountHex,
+                            expiry: expiry.toString(),
+                            voucherPublicKeyHex,
+                            voucherKeyJwk: voucherKey.privateJwk,
+                        };
+                        persistChannel(record);
+                        setChannel(record);
+                    },
+                });
+                if (!record) {
+                    throw new Error('channel open was not signed');
+                }
+            } else {
+                // A restored or retried record: make sure its voucher key is
+                // active and its open is on-chain (verbatim resubmission is
+                // idempotent).
+                if (!voucherKeyRef.current) {
+                    voucherKeyRef.current = await importVoucherKey(
+                        record.voucherKeyJwk,
+                        record.voucherPublicKeyHex,
+                    );
+                }
+                setNote('confirming the channel open on-chain…');
+                await resubmitOpen(record);
             }
 
-            // Step 3: submit the open (a first submission and a retry are
-            // the same verbatim resubmission) until it is known finalized.
-            setNote('opening the channel on-chain…');
-            await confirmOpen(record, sessionPublicKeyHex);
-
-            // Step 4: register with the operator (idempotent, retried
-            // through indexer lag).
+            // Register with the operator (idempotent, retried through
+            // indexer lag). The zero voucher proves this browser holds the
+            // channel's voucher key and makes the channel closeable from
+            // the very first moment.
             setNote('registering the channel with the operator…');
+            const voucherKey = voucherKeyRef.current;
+            if (!voucherKey) throw new Error('voucher key unavailable');
+            const zeroVoucherSignature = await voucherKey.signVoucher(
+                parseAccountKeyHex(record.channelHex),
+                0n,
+            );
             await registerChannel(operatorUrl, {
-                channel: parseAccountKeyHex(record.channelHex),
-                payerPublicKey: session.publicKey,
-                openNonce: BigInt(record.openNonce),
                 openTxDigestHex: record.openTxDigestHex,
+                zeroVoucherSignature,
             });
             setNote('channel registered — start the stream');
             setPhase('ready');
         } catch (error) {
             setNote(error instanceof Error ? error.message : String(error));
             // Every failure returns to 'idle': the start button is the
-            // retry path — it skips funding when a record exists and re-runs
-            // the idempotent confirm and registration steps.
+            // retry path — it reuses a persisted record and re-runs the
+            // idempotent resubmit and registration steps.
             setPhase('idle');
         }
     };
@@ -465,13 +437,19 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     const settle = async () => {
         if (!channelKey) return;
         closeStream();
+        // A failure returns to the phase the action started from ('ended'
+        // when it started mid-stream: the stream was just closed). Landing
+        // anywhere else strands the user — notably in 'ended' from 'idle',
+        // where the start button (the only path that registers a restored
+        // channel) no longer renders.
+        const origin: Phase = phase === 'streaming' ? 'ended' : phase;
         setPhase('settling');
         setNote('closing the channel on-chain…');
         try {
             const outcome = await settleChannel(operatorUrl, channelKey);
             setNote(
                 outcome.settled
-                    ? `settled: one close paid ${outcome.cumulative} for ${payments.length ? 'all the vouchers you watched' : 'the session'}`
+                    ? `settled: one close paid ${outcome.cumulative} for ${payments.length ? 'all the vouchers you watched' : 'the session'} — the remainder refunded to the wallet`
                     : 'close abandoned — the channel expired first',
             );
             // Settled is the one outcome that may forget the channel: the
@@ -482,19 +460,21 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             setPhase('settled');
         } catch (error) {
             setNote(`settlement failed: ${String(error)}`);
-            setPhase('ended');
+            setPhase(origin);
         }
     };
 
     /// Reclaims an expired channel's escrow with a TimeoutChannel signed by
-    /// the session key — the exit for a channel the operator will never
-    /// close (its sweep ignores voucherless channels, and settle rejects
-    /// them). The chain refuses the reclaim until the block height passes
-    /// the channel's expiry, so the operator's advertised height gates the
-    /// attempt with a useful message instead of a doomed submission.
+    /// the wallet — the exit for a channel the operator will never close
+    /// (e.g. one whose registration never completed). The chain refuses the
+    /// reclaim until the block height passes the channel's expiry, so the
+    /// operator's advertised height gates the attempt with a useful message
+    /// instead of a doomed submission.
     const reclaimDeposit = async () => {
-        if (!session || !channel) return;
+        if (!channel) return;
         closeStream();
+        // See `settle`: failure must return whence it came.
+        const origin: Phase = phase === 'streaming' ? 'ended' : phase;
         setPhase('settling');
         setNote('reclaiming the deposit…');
         try {
@@ -505,44 +485,37 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                     `channel not expired yet — reclaimable after block ${expiry} (chain is at ${ad.height})`,
                 );
             }
-            const view = await fetchAccount(mempoolUrl, toHex(session.publicKey));
-            const operatorAccount = parseAccountKeyHex(channel.operatorHex);
-            const encoded = await encodeSignedTimeoutChannelTransaction(
-                {
-                    senderPublicKey: session.publicKey,
-                    receiverAccountKey: operatorAccount,
-                    operatorAccountKey: operatorAccount,
-                    openNonce: BigInt(channel.openNonce),
-                    nonce: BigInt(view?.nonce.base ?? 0),
-                },
-                session.signTransaction,
-            );
-            const status = await submitTransactions(
-                mempoolUrl,
-                encodeTransactionBatch([encoded.bytes]),
-            );
-            if (!statusHasHeight(status)) {
+            setNote('approve the reclaim in the wallet…');
+            const status = await onReclaimChannel({
+                channelHex: channel.channelHex,
+                operatorHex: channel.operatorHex,
+                voucherPublicKeyHex: channel.voucherPublicKeyHex,
+                openNonce: channel.openNonce,
+            });
+            if (status === null || !statusHasHeight(status)) {
                 throw new Error(
-                    `timeout reclaim was ${status.status} — the channel may already be closed`,
+                    `timeout reclaim was ${status?.status ?? 'not signed'} — the channel may already be closed`,
                 );
             }
             localStorage.removeItem(CHANNEL_STORAGE_KEY);
             setChannel(null);
-            setNote('deposit reclaimed — the escrow returned to the session account');
+            setNote('deposit reclaimed — the escrow returned to the wallet');
             setPhase('settled');
         } catch (error) {
             setNote(error instanceof Error ? error.message : String(error));
-            setPhase('ended');
+            setPhase(origin);
         }
     };
 
     /// Starts over after the previous channel resolved (settled close or
-    /// timeout reclaim — the record is gone either way). Deliberately keeps
-    /// the session key: the resolution refunds the deposit remainder to its
-    /// account, so the balance carries into the next session (and the next
-    /// open just uses the account's next nonce).
+    /// timeout reclaim — the record is gone either way, and the refund
+    /// landed back in the wallet).
     const resetSession = () => {
         sessionGenerationRef.current += 1;
+        voucherKeyRef.current = null;
+        // The generation bump above stops any straggling post from clearing
+        // this, so the reset clears it itself.
+        voucherInflightRef.current = false;
         setText('');
         updateMeter({ served: 0n, paid: 0n });
         setPayments([]);
@@ -564,17 +537,6 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             </div>
         );
     }
-    if (phase === 'unsupported') {
-        return (
-            <div className="paid-stream">
-                <p className="paid-stream__note">
-                    could not create the session key ({note}) — typically the browser's WebCrypto
-                    cannot generate ed25519 keys (needs Chrome 137+, Safari 17+, or Firefox 130+),
-                    or storage is disabled.
-                </p>
-            </div>
-        );
-    }
 
     const debtLimit = advertisement?.debtLimit ?? 0n;
     const debt = meter.served > meter.paid ? meter.served - meter.paid : 0n;
@@ -586,25 +548,13 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             <div className="paid-stream__intro">
                 <p>
                     an x402-style metered service: the operator sells an essay token by token, paid
-                    through a payment channel. the chain sees two transactions — the open and the
-                    close — no matter how many vouchers stream in between.
+                    through a payment channel. the wallet signs one open delegating payment to a
+                    disposable voucher key — the chain sees two transactions (open and close) no
+                    matter how many vouchers stream in between.
                 </p>
             </div>
 
             <dl className="paid-stream__facts">
-                <div>
-                    <dt>session account</dt>
-                    <dd>
-                        {session ? (
-                            <SessionAddress hex={toHex(session.accountKey)} onOpenAddress={onOpenAddress} />
-                        ) : (
-                            '…'
-                        )}{' '}
-                        <span className="paid-stream__fact-note">
-                            balance {sessionBalance ?? '…'}
-                        </span>
-                    </dd>
-                </div>
                 <div>
                     <dt>channel</dt>
                     <dd>
@@ -615,6 +565,21 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                         )}
                         {channel && (
                             <span className="paid-stream__fact-note"> deposit {channel.deposit}</span>
+                        )}
+                    </dd>
+                </div>
+                <div>
+                    <dt>voucher key</dt>
+                    <dd>
+                        {channel ? (
+                            <span title={channel.voucherPublicKeyHex}>
+                                {shortHex(channel.voucherPublicKeyHex)}
+                            </span>
+                        ) : (
+                            'created at open'
+                        )}
+                        {channel && (
+                            <span className="paid-stream__fact-note"> signs vouchers only</span>
                         )}
                     </dd>
                 </div>
@@ -643,7 +608,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 {phase === 'idle' && (
                     <button
                         className="transfer__submit"
-                        disabled={!session || !advertisement}
+                        disabled={!advertisement}
                         onClick={() => void startSession()}
                         type="button"
                     >
@@ -768,7 +733,10 @@ function isChannelRecord(value: unknown): value is ChannelRecord {
         typeof record.openTxDigestHex === 'string' &&
         typeof record.signedOpenTxHex === 'string' &&
         typeof record.operatorHex === 'string' &&
-        typeof record.expiry === 'string'
+        typeof record.expiry === 'string' &&
+        typeof record.voucherPublicKeyHex === 'string' &&
+        typeof record.voucherKeyJwk === 'object' &&
+        record.voucherKeyJwk !== null
     );
 }
 
@@ -779,4 +747,3 @@ function readChannelRecord(): ChannelRecord | null {
 function persistChannel(record: ChannelRecord): void {
     localStorage.setItem(CHANNEL_STORAGE_KEY, JSON.stringify(record));
 }
-

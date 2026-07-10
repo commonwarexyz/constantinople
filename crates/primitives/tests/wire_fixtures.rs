@@ -79,14 +79,19 @@ struct StreamFixture {
 #[serde(rename_all = "camelCase")]
 struct ChannelFixture {
     /// The payer's raw 32-byte ed25519 private key. Lets the TS suite
-    /// re-sign the open transaction and the voucher from scratch and assert
-    /// byte-identity with the fixtures.
+    /// re-sign the open transaction from scratch and assert byte-identity
+    /// with the fixtures.
     payer_private_key_hex: String,
     payer_account_hex: String,
     receiver_account_hex: String,
     operator_account_hex: String,
+    /// The channel's delegated voucher key (raw 32-byte ed25519 private key
+    /// plus its public key). Distinct from the payer: delegation is the
+    /// point, and the TS suite re-signs vouchers with it.
+    voucher_private_key_hex: String,
+    voucher_public_key_hex: String,
     open_nonce: String,
-    /// `channel_address(payer, receiver, operator, open_nonce)`.
+    /// `channel_address(payer, receiver, operator, voucher_key, open_nonce)`.
     address_hex: String,
     /// The namespaces the two ed25519 signing paths must prefix (via the
     /// commonware `union_unique` framing) to what they sign.
@@ -96,6 +101,9 @@ struct ChannelFixture {
     /// `voucher_message(address, cumulative)`: the pre-namespace preimage.
     voucher_message_hex: String,
     voucher_signature_hex: String,
+    /// The voucher key's signature over `(address, 0)` — the initial
+    /// zero-value voucher registration carries.
+    zero_voucher_signature_hex: String,
 }
 
 #[derive(Serialize, Default)]
@@ -152,6 +160,7 @@ fn fixture_entry(kind: &'static str, tx: &Tx) -> TransactionFixture {
 fn build_fixture() -> Fixture {
     let payer = ed25519::PrivateKey::from_seed(1);
     let receiver = ed25519::PrivateKey::from_seed(2);
+    let voucher_key = ed25519::PrivateKey::from_seed(3);
     let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
     let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
     let payer_account = AccountKey::from_public_key(&payer_pk);
@@ -173,6 +182,7 @@ fn build_fixture() -> Fixture {
             payer_pk.clone(),
             receiver_account,
             receiver_account,
+            voucher_key.public_key(),
             nz(50),
             424_242,
             open_nonce,
@@ -183,14 +193,18 @@ fn build_fixture() -> Fixture {
         &payer_account,
         &receiver_account,
         &receiver_account,
+        &voucher_key.public_key(),
         open_nonce,
     );
-    let voucher = Voucher::sign(&payer, channel, 35);
+    let voucher = Voucher::sign(&voucher_key, channel, 35);
+    let zero_voucher = Voucher::sign(&voucher_key, channel, 0);
     let channel_fixture = ChannelFixture {
         payer_private_key_hex: hex(&payer.encode()),
         payer_account_hex: hex(payer_account.as_ref()),
         receiver_account_hex: hex(receiver_account.as_ref()),
         operator_account_hex: hex(receiver_account.as_ref()),
+        voucher_private_key_hex: hex(&voucher_key.encode()),
+        voucher_public_key_hex: hex(&voucher_key.public_key().encode()),
         open_nonce: open_nonce.to_string(),
         address_hex: hex(channel.as_ref()),
         transaction_namespace: String::from_utf8(TRANSACTION_NAMESPACE.to_vec())
@@ -200,13 +214,12 @@ fn build_fixture() -> Fixture {
         voucher_cumulative: voucher.cumulative.to_string(),
         voucher_message_hex: hex(&voucher_message(&channel, voucher.cumulative)),
         voucher_signature_hex: hex(&voucher.signature.encode()),
+        zero_voucher_signature_hex: hex(&zero_voucher.signature.encode()),
     };
     let request_fixture = RequestFixture {
         register_sample: serde_json::to_string(&RegisterRequest::new(
-            &channel,
-            &payer_pk,
-            open_nonce,
             open.message_digest(),
+            &zero_voucher.signature,
         ))
         .expect("register request serializes"),
         voucher_sample: serde_json::to_string(&VoucherRequest::new(&voucher))
@@ -218,8 +231,9 @@ fn build_fixture() -> Fixture {
         &receiver,
         Transaction::close_channel(
             receiver_pk,
-            payer_pk.clone(),
+            payer_account,
             receiver_account,
+            voucher_key.public_key(),
             open_nonce,
             voucher.cumulative,
             voucher.signature,
@@ -233,6 +247,7 @@ fn build_fixture() -> Fixture {
             payer_pk.clone(),
             receiver_account,
             receiver_account,
+            voucher_key.public_key(),
             open_nonce,
             2,
         ),

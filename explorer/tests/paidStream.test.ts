@@ -4,7 +4,6 @@ import test from 'node:test';
 import {
     CHANNEL_EXPIRY_SLACK,
     channelExpiry,
-    nonceConsumed,
     parseAdvertisement,
     parseStreamChunk,
     parseStreamEnd,
@@ -79,18 +78,6 @@ test('voucher top-up never re-signs a rejected cumulative', () => {
     assert.equal(voucherTopUp({ served: 16n, deadTarget: 32n, ...inputs }), null);
     // A different target is still signable.
     assert.equal(voucherTopUp({ served: 17n, deadTarget: 32n, ...inputs }), 33n);
-});
-
-test('nonce consumption covers the base and the run-ahead bitmap', () => {
-    // Mirrors Nonce::is_consumed in account.rs: bit 0 records base + 1.
-    const state = { base: 10n, bitmap: 0b101n };
-    assert.equal(nonceConsumed(state, 9n), true, 'below base is stale');
-    assert.equal(nonceConsumed(state, 10n), false, 'base itself is the next free nonce');
-    assert.equal(nonceConsumed(state, 11n), true, 'bit 0 set');
-    assert.equal(nonceConsumed(state, 12n), false, 'bit 1 clear');
-    assert.equal(nonceConsumed(state, 13n), true, 'bit 2 set');
-    assert.equal(nonceConsumed(state, 75n), false, 'beyond the run-ahead window is unrecorded');
-    assert.equal(nonceConsumed({ base: 10n, bitmap: 1n << 63n }, 74n), true, 'bit 63 set');
 });
 
 test('stream payloads parse and reject malformed data', () => {

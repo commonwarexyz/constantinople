@@ -41,7 +41,7 @@ use crate::{
     signer::{Tx, sign_mint_batches},
     submitter::{RelayerSubmitter, Stats},
 };
-use commonware_cryptography::{Hasher as _, Sha256, sha256};
+use commonware_cryptography::{Hasher as _, Sha256, ed25519, sha256};
 use commonware_parallel::Sequential;
 use constantinople_primitives::{
     AccountKey, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, Voucher, channel_address,
@@ -330,6 +330,13 @@ impl ChannelRunner {
         TransactionPublicKey::ed25519(self.accounts[payer_i].public_key.clone())
     }
 
+    /// The payer's channel voucher key: its own ring key (self-delegation —
+    /// the ring account is already an unattended ed25519 signer, so no
+    /// separate delegated key is needed).
+    fn voucher_pk(&self, payer_i: usize) -> ed25519::PublicKey {
+        self.accounts[payer_i].public_key.clone()
+    }
+
     /// Seals and signs `tx` with the payer's key.
     fn sign_as(&self, payer_i: usize, tx: Transaction<sha256::Digest>) -> Tx {
         tx.seal_and_sign(
@@ -417,11 +424,13 @@ impl ChannelRunner {
         // Off-chain: stream vouchers, verifying each with the shared predicate.
         // These are the payments that never touch the chain.
         // Delegated topology: the payout goes to the payer's keyless
-        // receiver; the operator only settles.
+        // receiver; the operator only settles. The ring key doubles as the
+        // channel's voucher key (self-delegation).
         let channel = channel_address(
             &payer_account,
             &self.receivers[payer_i],
             &self.operator.account,
+            &self.voucher_pk(payer_i),
             open_nonce,
         );
         // The open is finalized but the operator's indexer may not have
@@ -429,10 +438,12 @@ impl ChannelRunner {
         // rejection will keep failing, so go straight to the timeout reclaim.
         let mut registered = false;
         for attempt in 1..=REGISTRATION_ATTEMPTS {
+            let zero_voucher =
+                Voucher::sign(&self.accounts[payer_i].private_key, channel, 0).signature;
             match self
                 .operator
                 .client
-                .register_channel(channel, &payer_pk, open_nonce, &open_tx_digest)
+                .register_channel(&open_tx_digest, zero_voucher)
                 .await
             {
                 Ok(()) => {
@@ -504,6 +515,7 @@ impl ChannelRunner {
                 payer_pk.clone(),
                 self.receivers[payer_i],
                 self.operator.account,
+                self.voucher_pk(payer_i),
                 deposit,
                 expiry,
                 open_nonce,
@@ -613,6 +625,7 @@ impl ChannelRunner {
                     payer_pk,
                     self.receivers[payer_i],
                     self.operator.account,
+                    self.voucher_pk(payer_i),
                     reclaim.open_nonce,
                     nonce,
                 ),
@@ -704,14 +717,12 @@ impl OperatorClient {
 
     async fn register_channel(
         &self,
-        channel: AccountKey,
-        payer: &TransactionPublicKey,
-        open_nonce: u64,
         open_tx_digest: &sha256::Digest,
+        zero_voucher: ed25519::Signature,
     ) -> Result<(), OperatorError> {
         self.post_json(
             "/channels",
-            &RegisterRequest::new(&channel, payer, open_nonce, open_tx_digest),
+            &RegisterRequest::new(open_tx_digest, &zero_voucher),
         )
         .await
         .map(|_| ())

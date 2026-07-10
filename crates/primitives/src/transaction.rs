@@ -37,9 +37,10 @@ pub enum Operation {
     /// settled by `operator`.
     ///
     /// The channel account address is derived from
-    /// `(sender, receiver, operator, open_nonce)`, where `open_nonce` is this
-    /// transaction's own nonce. Because account nonces are monotonic and never
-    /// reused, every open yields a unique, never-recurring channel address, so
+    /// `(sender, receiver, operator, voucher_key, open_nonce)`, where
+    /// `open_nonce` is this transaction's own nonce. Because account nonces
+    /// are monotonic and never reused, every open yields a unique,
+    /// never-recurring channel address, so
     /// the address is reconstructible without being stored, a settled channel
     /// can be deleted, and old vouchers can never be replayed against a new
     /// channel. The sender is debited `deposit`, which is added to the
@@ -55,6 +56,12 @@ pub enum Operation {
         receiver: AccountKey,
         /// The account whose key may settle the channel with a close.
         operator: AccountKey,
+        /// The delegated Ed25519 key that signs this channel's vouchers. An
+        /// authority, not an account: it can authorize payments from this
+        /// channel's escrow to `receiver`, and nothing else. Naming it here
+        /// is what lets any account — including one whose own key demands a
+        /// user ceremony per signature — pay through a channel.
+        voucher_key: ed25519::PublicKey,
         /// The amount escrowed into the channel.
         deposit: NonZeroU64,
         /// Block height after which the payer may unilaterally reclaim the
@@ -67,38 +74,44 @@ pub enum Operation {
     /// Claim a voucher and settle a payment channel.
     ///
     /// The sender is the operator. The channel address is recomputed from
-    /// `(payer, receiver, sender, open_nonce)`; `cumulative` of the escrow is
-    /// paid to `receiver` and the remainder is returned to the payer, closing
-    /// the channel. `voucher` is the payer's signature over the voucher
-    /// message (see [`crate::voucher_message`]) — the address it signs commits
-    /// to all three participants, so a voucher cannot be redirected to a
-    /// different payee or settler.
+    /// `(payer, receiver, sender, voucher_key, open_nonce)`; `cumulative` of
+    /// the escrow is paid to `receiver` and the remainder is returned to the
+    /// payer, closing the channel. `voucher` is the voucher key's signature
+    /// over the voucher message (see [`crate::voucher_message`]) — the address
+    /// it signs commits to the participants and the key, so a voucher cannot
+    /// be redirected to a different payee or settler, and a closer cannot
+    /// substitute a voucher key it controls.
     CloseChannel {
-        /// The payer's public key (authenticated by the channel address).
-        payer: TransactionPublicKey,
+        /// The payer's account key (authenticated by the channel address);
+        /// the escrow remainder refunds here.
+        payer: AccountKey,
         /// The receiver (payee) account key the cumulative is paid to.
         receiver: AccountKey,
+        /// The delegated voucher key the channel was opened with.
+        voucher_key: ed25519::PublicKey,
         /// The nonce of the `OpenChannel` transaction that created the channel.
         open_nonce: u64,
         /// The cumulative amount claimed for the receiver.
         cumulative: u64,
-        /// The payer's voucher signature over `(channel_id, cumulative)`.
+        /// The voucher key's signature over `(channel_id, cumulative)`.
         voucher: ed25519::Signature,
     },
     /// Reclaim an expired payment channel's escrow.
     ///
     /// The sender is the payer. The channel address is recomputed from
-    /// `(sender, receiver, operator, open_nonce)`; once the block height
-    /// exceeds the expiry the channel was opened with, the payer reclaims the
-    /// entire escrow (vouchers the operator failed to settle in time are
-    /// voided) and the channel is deleted. Until then only the operator's
-    /// close can move the escrow; if a close lands first the channel is gone
-    /// and the timeout is rejected.
+    /// `(sender, receiver, operator, voucher_key, open_nonce)`; once the block
+    /// height exceeds the expiry the channel was opened with, the payer
+    /// reclaims the entire escrow (vouchers the operator failed to settle in
+    /// time are voided) and the channel is deleted. Until then only the
+    /// operator's close can move the escrow; if a close lands first the
+    /// channel is gone and the timeout is rejected.
     TimeoutChannel {
         /// The receiver (payee) account key the channel was opened to.
         receiver: AccountKey,
         /// The operator account key the channel was opened with.
         operator: AccountKey,
+        /// The delegated voucher key the channel was opened with.
+        voucher_key: ed25519::PublicKey,
         /// The nonce of the `OpenChannel` transaction that created the channel.
         open_nonce: u64,
     },
@@ -124,21 +137,23 @@ impl Operation {
     pub const MAX_MINT_AMOUNT: u64 = 1_000_000;
     /// Encoded size of a transfer: tag, recipient, and value.
     const TRANSFER_SIZE: usize = 1 + AccountKey::SIZE + u64::SIZE;
-    /// Encoded size of a channel open: tag, receiver, operator, deposit, and
-    /// expiry.
+    /// Encoded size of a channel open: tag, receiver, operator, voucher key,
+    /// deposit, and expiry.
     const OPEN_CHANNEL_SIZE: usize =
-        1 + AccountKey::SIZE + AccountKey::SIZE + u64::SIZE + u64::SIZE;
-    /// Encoded size of a channel close: tag, payer, receiver, open nonce,
-    /// cumulative, and voucher.
+        1 + AccountKey::SIZE + AccountKey::SIZE + ed25519::PublicKey::SIZE + u64::SIZE + u64::SIZE;
+    /// Encoded size of a channel close: tag, payer, receiver, voucher key,
+    /// open nonce, cumulative, and voucher.
     const CLOSE_CHANNEL_SIZE: usize = 1
-        + TransactionPublicKey::SIZE
         + AccountKey::SIZE
+        + AccountKey::SIZE
+        + ed25519::PublicKey::SIZE
         + u64::SIZE
         + u64::SIZE
         + ed25519::Signature::SIZE;
-    /// Encoded size of a channel timeout: tag, receiver, operator, and open
-    /// nonce.
-    const TIMEOUT_CHANNEL_SIZE: usize = 1 + AccountKey::SIZE + AccountKey::SIZE + u64::SIZE;
+    /// Encoded size of a channel timeout: tag, receiver, operator, voucher
+    /// key, and open nonce.
+    const TIMEOUT_CHANNEL_SIZE: usize =
+        1 + AccountKey::SIZE + AccountKey::SIZE + ed25519::PublicKey::SIZE + u64::SIZE;
     /// Encoded size of a mint: tag and amount.
     const MINT_SIZE: usize = 1 + u64::SIZE;
     /// Smallest encoded operation (a mint).
@@ -158,18 +173,21 @@ impl Write for Operation {
             Self::OpenChannel {
                 receiver,
                 operator,
+                voucher_key,
                 deposit,
                 expiry,
             } => {
                 OPEN_CHANNEL_TAG.write(buf);
                 receiver.write(buf);
                 operator.write(buf);
+                voucher_key.write(buf);
                 deposit.get().write(buf);
                 expiry.write(buf);
             }
             Self::CloseChannel {
                 payer,
                 receiver,
+                voucher_key,
                 open_nonce,
                 cumulative,
                 voucher,
@@ -177,6 +195,7 @@ impl Write for Operation {
                 CLOSE_CHANNEL_TAG.write(buf);
                 payer.write(buf);
                 receiver.write(buf);
+                voucher_key.write(buf);
                 open_nonce.write(buf);
                 cumulative.write(buf);
                 voucher.write(buf);
@@ -184,11 +203,13 @@ impl Write for Operation {
             Self::TimeoutChannel {
                 receiver,
                 operator,
+                voucher_key,
                 open_nonce,
             } => {
                 TIMEOUT_CHANNEL_TAG.write(buf);
                 receiver.write(buf);
                 operator.write(buf);
+                voucher_key.write(buf);
                 open_nonce.write(buf);
             }
             Self::Mint { amount } => {
@@ -229,6 +250,7 @@ impl Read for Operation {
             OPEN_CHANNEL_TAG => {
                 let receiver = AccountKey::read(buf)?;
                 let operator = AccountKey::read(buf)?;
+                let voucher_key = ed25519::PublicKey::read(buf)?;
                 let deposit = u64::read(buf)?;
                 let deposit = NonZeroU64::new(deposit)
                     .ok_or(Error::Invalid("Operation", "deposit must be non-zero"))?;
@@ -236,21 +258,24 @@ impl Read for Operation {
                 Ok(Self::OpenChannel {
                     receiver,
                     operator,
+                    voucher_key,
                     deposit,
                     expiry,
                 })
             }
             CLOSE_CHANNEL_TAG => {
-                let payer = TransactionPublicKey::read(buf)?;
+                let payer = AccountKey::read(buf)?;
                 let receiver = AccountKey::read(buf)?;
+                let voucher_key = ed25519::PublicKey::read(buf)?;
                 let open_nonce = u64::read(buf)?;
-                // `cumulative` may be zero: a payer-signed zero voucher is a
-                // cooperative early cancel (full refund, no payment).
+                // `cumulative` may be zero: a zero voucher is a cooperative
+                // early cancel (full refund, no payment).
                 let cumulative = u64::read(buf)?;
                 let voucher = ed25519::Signature::read(buf)?;
                 Ok(Self::CloseChannel {
                     payer,
                     receiver,
+                    voucher_key,
                     open_nonce,
                     cumulative,
                     voucher,
@@ -259,10 +284,12 @@ impl Read for Operation {
             TIMEOUT_CHANNEL_TAG => {
                 let receiver = AccountKey::read(buf)?;
                 let operator = AccountKey::read(buf)?;
+                let voucher_key = ed25519::PublicKey::read(buf)?;
                 let open_nonce = u64::read(buf)?;
                 Ok(Self::TimeoutChannel {
                     receiver,
                     operator,
+                    voucher_key,
                     open_nonce,
                 })
             }
@@ -440,6 +467,8 @@ impl<D: Digest> Transaction<D> {
     ///
     /// `receiver` is an account key, not a public key: a payee that only ever
     /// gets paid (the operator settles on its behalf) needs no key at all.
+    /// `voucher_key` is the delegated Ed25519 key that will sign this
+    /// channel's vouchers — the sender itself may be any scheme.
     ///
     /// The channel address is derived from this transaction's `nonce`, so the
     /// operator settles by passing that same `nonce` to [`Self::close_channel`].
@@ -449,6 +478,7 @@ impl<D: Digest> Transaction<D> {
         sender: TransactionPublicKey,
         receiver: AccountKey,
         operator: AccountKey,
+        voucher_key: ed25519::PublicKey,
         deposit: NonZeroU64,
         expiry: u64,
         nonce: u64,
@@ -459,6 +489,7 @@ impl<D: Digest> Transaction<D> {
             Operation::OpenChannel {
                 receiver,
                 operator,
+                voucher_key,
                 deposit,
                 expiry,
             },
@@ -467,13 +498,18 @@ impl<D: Digest> Transaction<D> {
 
     /// Creates a transaction that claims a voucher and settles a channel.
     ///
-    /// The `sender` is the operator; `payer` is the channel's payer;
-    /// `receiver` is the payee the cumulative is paid to; and `open_nonce` is
-    /// the nonce of the `OpenChannel` that created the channel.
+    /// The `sender` is the operator; `payer` is the channel's payer account;
+    /// `receiver` is the payee the cumulative is paid to; `voucher_key` and
+    /// `open_nonce` identify the channel exactly as they did at
+    /// [`Self::open_channel`].
+    // One parameter per wire field of `Operation::CloseChannel` (plus sender
+    // and nonce); grouping them would just restate the operation struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn close_channel(
         sender: TransactionPublicKey,
-        payer: TransactionPublicKey,
+        payer: AccountKey,
         receiver: AccountKey,
+        voucher_key: ed25519::PublicKey,
         open_nonce: u64,
         cumulative: u64,
         voucher: ed25519::Signature,
@@ -485,6 +521,7 @@ impl<D: Digest> Transaction<D> {
             Operation::CloseChannel {
                 payer,
                 receiver,
+                voucher_key,
                 open_nonce,
                 cumulative,
                 voucher,
@@ -494,13 +531,15 @@ impl<D: Digest> Transaction<D> {
 
     /// Creates a transaction that reclaims an expired channel's escrow.
     ///
-    /// The `sender` is the payer; `receiver`, `operator`, and `open_nonce`
-    /// identify the channel exactly as they did at [`Self::open_channel`].
-    /// Valid only once the block height exceeds the channel's expiry.
+    /// The `sender` is the payer; `receiver`, `operator`, `voucher_key`, and
+    /// `open_nonce` identify the channel exactly as they did at
+    /// [`Self::open_channel`]. Valid only once the block height exceeds the
+    /// channel's expiry.
     pub fn timeout_channel(
         sender: TransactionPublicKey,
         receiver: AccountKey,
         operator: AccountKey,
+        voucher_key: ed25519::PublicKey,
         open_nonce: u64,
         nonce: u64,
     ) -> Self {
@@ -510,6 +549,7 @@ impl<D: Digest> Transaction<D> {
             Operation::TimeoutChannel {
                 receiver,
                 operator,
+                voucher_key,
                 open_nonce,
             },
         )
@@ -700,12 +740,18 @@ mod test {
         ));
     }
 
+    fn test_voucher_key() -> ed25519::PrivateKey {
+        let mut rng = StdRng::from_seed([5u8; 32]);
+        ed25519::PrivateKey::random(&mut rng)
+    }
+
     #[test]
     fn open_channel_roundtrip() {
         assert_roundtrip(Transaction::<sha256::Digest>::open_channel(
             test_sender(),
             AccountKey::from_public_key(&test_sender()),
             AccountKey::from_public_key(&test_sender()),
+            test_voucher_key().public_key(),
             NonZeroU64::new(50).expect("deposit must be non-zero"),
             1_000,
             3,
@@ -752,6 +798,7 @@ mod test {
             test_sender(),
             AccountKey::from_public_key(&test_sender()),
             AccountKey::from_public_key(&test_sender()),
+            test_voucher_key().public_key(),
             3,
             9,
         ));
@@ -759,13 +806,13 @@ mod test {
 
     #[test]
     fn close_channel_roundtrip() {
-        let mut rng = StdRng::from_seed([3u8; 32]);
-        let payer = ed25519::PrivateKey::random(&mut rng);
-        let voucher = payer.sign(b"voucher", b"message");
+        let key = test_voucher_key();
+        let voucher = key.sign(b"voucher", b"message");
         assert_roundtrip(Transaction::<sha256::Digest>::close_channel(
             test_sender(),
-            TransactionPublicKey::ed25519(payer.public_key()),
             AccountKey::from_public_key(&test_sender()),
+            AccountKey::from_public_key(&test_sender()),
+            key.public_key(),
             11,
             42,
             voucher,
@@ -777,13 +824,13 @@ mod test {
     fn zero_cumulative_close_roundtrips() {
         // A zero-cumulative close is a cooperative early cancel; it must stay
         // decodable (the execution lane skips the empty receiver credit).
-        let mut rng = StdRng::from_seed([4u8; 32]);
-        let payer = ed25519::PrivateKey::random(&mut rng);
-        let voucher = payer.sign(b"voucher", b"message");
+        let key = test_voucher_key();
+        let voucher = key.sign(b"voucher", b"message");
         assert_roundtrip(Transaction::<sha256::Digest>::close_channel(
             test_sender(),
-            TransactionPublicKey::ed25519(payer.public_key()),
             AccountKey::from_public_key(&test_sender()),
+            AccountKey::from_public_key(&test_sender()),
+            key.public_key(),
             11,
             0,
             voucher,

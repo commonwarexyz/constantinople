@@ -95,46 +95,40 @@ impl PublicKeyResponse {
 }
 
 /// Request to `POST /channels`: register a finalized channel open.
+///
+/// Deliberately minimal: the operator derives the payer, participants,
+/// voucher key, and channel address from the verified open transaction, so
+/// the request carries nothing the client could assert incorrectly. The
+/// initial zero-value voucher (a signature over `(channel, 0)`) proves the
+/// registrant holds the channel's voucher key and gives the operator a
+/// starting voucher, making every registered channel closeable — including
+/// one that never pays.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RegisterRequest {
-    /// Hex-encoded channel account key.
-    pub channel: String,
-    /// Hex-encoded payer transaction public key.
-    pub payer: String,
-    /// Nonce of the `OpenChannel` transaction (the channel address derives
-    /// from it).
-    pub open_nonce: u64,
     /// Hex-encoded digest of the finalized `OpenChannel` transaction.
     pub open_tx_digest: String,
+    /// Hex-encoded voucher-key signature over `(channel, 0)` — the channel's
+    /// initial zero-value voucher.
+    pub zero_voucher: String,
 }
 
 impl RegisterRequest {
-    pub fn new<D: Encode>(
-        channel: &AccountKey,
-        payer: &TransactionPublicKey,
-        open_nonce: u64,
-        open_tx_digest: &D,
-    ) -> Self {
+    pub fn new<D: Encode>(open_tx_digest: &D, zero_voucher: &ed25519::Signature) -> Self {
         Self {
-            channel: encode_field(channel),
-            payer: encode_field(payer),
-            open_nonce,
             open_tx_digest: encode_field(open_tx_digest),
+            zero_voucher: encode_field(zero_voucher),
         }
-    }
-
-    pub fn channel(&self) -> Result<AccountKey, FieldError> {
-        parse_channel(&self.channel)
-    }
-
-    pub fn payer(&self) -> Result<TransactionPublicKey, FieldError> {
-        decode_field("payer", &self.payer)
     }
 
     /// Parses the open transaction digest (generic: the wire does not fix the
     /// chain's hash function).
     pub fn open_tx_digest<D: DecodeExt<()>>(&self) -> Result<D, FieldError> {
         decode_field("open_tx_digest", &self.open_tx_digest)
+    }
+
+    /// Parses the initial zero-voucher signature.
+    pub fn zero_voucher(&self) -> Result<ed25519::Signature, FieldError> {
+        decode_field("zero_voucher", &self.zero_voucher)
     }
 }
 
@@ -349,40 +343,42 @@ impl core::error::Error for OperatorError {}
 mod tests {
     use super::*;
     use crate::channel_address;
+    use commonware_codec::FixedSize as _;
     use commonware_cryptography::Signer as _;
 
     #[test]
     fn register_request_roundtrips_typed_fields() {
-        let payer_key = ed25519::PrivateKey::from_seed(1);
-        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
-        let payer_account = AccountKey::from_public_key(&payer);
-        let receiver = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
-            ed25519::PrivateKey::from_seed(2).public_key(),
-        ));
-        let channel = channel_address(&payer_account, &receiver, &receiver, 7);
+        let voucher_key = ed25519::PrivateKey::from_seed(1);
         let digest = commonware_cryptography::sha256::Digest::from([3u8; 32]);
+        let channel = AccountKey::from([7u8; AccountKey::SIZE]);
+        let zero_voucher = Voucher::sign(&voucher_key, channel, 0);
 
-        let request = RegisterRequest::new(&channel, &payer, 7, &digest);
-        assert_eq!(request.channel().expect("channel parses"), channel);
-        assert_eq!(request.payer().expect("payer parses"), payer);
+        let request = RegisterRequest::new(&digest, &zero_voucher.signature);
         assert_eq!(
             request
                 .open_tx_digest::<commonware_cryptography::sha256::Digest>()
                 .expect("digest parses"),
             digest
         );
+        assert_eq!(
+            request.zero_voucher().expect("signature parses"),
+            zero_voucher.signature
+        );
     }
 
     #[test]
     fn voucher_request_roundtrips_the_voucher() {
-        let payer_key = ed25519::PrivateKey::from_seed(4);
-        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
-        let payer_account = AccountKey::from_public_key(&payer);
-        let receiver = AccountKey::from_public_key(&TransactionPublicKey::ed25519(
-            ed25519::PrivateKey::from_seed(5).public_key(),
-        ));
-        let channel = channel_address(&payer_account, &receiver, &receiver, 0);
-        let voucher = Voucher::sign(&payer_key, channel, 25);
+        let voucher_key = ed25519::PrivateKey::from_seed(4);
+        let payer_account = AccountKey::from([4u8; AccountKey::SIZE]);
+        let receiver = AccountKey::from([5u8; AccountKey::SIZE]);
+        let channel = channel_address(
+            &payer_account,
+            &receiver,
+            &receiver,
+            &voucher_key.public_key(),
+            0,
+        );
+        let voucher = Voucher::sign(&voucher_key, channel, 25);
 
         let request = VoucherRequest::new(&voucher);
         assert_eq!(request.voucher().expect("voucher parses"), voucher);

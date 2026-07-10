@@ -14,7 +14,7 @@ use commonware_utils::NZU64;
 use constantinople_primitives::{
     AccountKey, CHANNEL_NEVER_EXPIRES, NONCE_BITMAP_CAPACITY, Nonce, SignedTransaction,
     TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, Voucher, channel_address,
-    verify_voucher_key,
+    verify_voucher,
 };
 use core::num::NonZeroU64;
 use futures::lock::Mutex;
@@ -84,10 +84,12 @@ impl Margins {
 /// An `OpenChannel` transaction the chain reader verified as finalized.
 #[derive(Clone, Debug)]
 pub struct VerifiedOpenChannel {
-    /// The payer that signed the open.
-    pub payer: TransactionPublicKey,
+    /// The payer account that signed and funded the open.
+    pub payer: AccountKey,
     /// The receiver (payee) account the channel pays out to.
     pub receiver: AccountKey,
+    /// The delegated Ed25519 key that signs this channel's vouchers.
+    pub voucher_key: ed25519::PublicKey,
     /// The operator account named in the open (whose key settles the channel).
     pub operator: AccountKey,
     /// The open transaction's nonce (the channel address derives from it).
@@ -197,14 +199,10 @@ pub enum ConsumeOutcome {
 /// A verified channel the operator serves vouchers against: the registration
 /// metadata plus the per-channel meter (the latest-voucher accounting).
 pub(crate) struct RegisteredChannel {
-    payer: TransactionPublicKey,
-    /// Payer key, decoded once at registration so the per-payment path skips
-    /// the curve-point decode. `None` for a non-Ed25519 payer, whose vouchers
-    /// can never verify.
-    payer_key: Option<ed25519::PublicKey>,
-    /// Digest of the verified `OpenChannel` transaction, kept so a replayed
-    /// registration can be answered without re-verifying against the chain.
-    open_digest: Digest,
+    /// The payer account the close refunds the escrow remainder to.
+    payer: AccountKey,
+    /// The delegated key this channel's vouchers verify against.
+    voucher_key: ed25519::PublicKey,
     /// The receiver (payee) account the settled cumulative is paid to.
     receiver: AccountKey,
     open_nonce: u64,
@@ -216,31 +214,26 @@ pub(crate) struct RegisteredChannel {
     /// side of the accounting; vouchers pay it down). In-memory only, like
     /// the voucher state.
     served: u64,
-    latest: Option<Voucher>,
+    /// The latest accepted voucher. Never absent: registration requires an
+    /// initial zero-value voucher, so every registered channel is closeable
+    /// — including one that never pays.
+    latest: Voucher,
     settlement: SettlementState,
 }
 
 impl RegisteredChannel {
-    /// A freshly registered channel: no vouchers served, nothing settled.
-    pub(crate) fn new(
-        payer: TransactionPublicKey,
-        open_digest: Digest,
-        receiver: AccountKey,
-        open_nonce: u64,
-        deposit: NonZeroU64,
-        expiry: u64,
-    ) -> Self {
-        let payer_key = payer.as_ed25519();
+    /// A freshly registered channel: nothing served, the initial (zero)
+    /// voucher as its starting settlement, nothing settled.
+    pub(crate) fn new(open: &VerifiedOpenChannel, initial: Voucher) -> Self {
         Self {
-            payer,
-            payer_key,
-            open_digest,
-            receiver,
-            open_nonce,
-            deposit,
-            expiry,
+            payer: open.payer,
+            voucher_key: open.voucher_key.clone(),
+            receiver: open.receiver,
+            open_nonce: open.open_nonce,
+            deposit: open.deposit,
+            expiry: open.expiry,
             served: 0,
-            latest: None,
+            latest: initial,
             settlement: SettlementState::Open,
         }
     }
@@ -252,8 +245,8 @@ impl RegisteredChannel {
     /// deposit — tokens beyond the deposit could not be settled even with a
     /// voucher in hand. Refusals do not advance the meter, so a `cost` of
     /// zero is a free probe of the channel's credit.
-    pub(crate) fn consume(&mut self, cost: u64, debt_limit: u64) -> ConsumeOutcome {
-        let paid = self.latest.as_ref().map_or(0, |latest| latest.cumulative);
+    pub(crate) const fn consume(&mut self, cost: u64, debt_limit: u64) -> ConsumeOutcome {
+        let paid = self.latest.cumulative;
         let next = self.served.saturating_add(cost);
         if next > self.deposit.get() {
             return ConsumeOutcome::DepositExhausted(MeterSnapshot {
@@ -275,30 +268,27 @@ impl RegisteredChannel {
     ///
     /// On success, stores the voucher as the channel's latest and returns
     /// the accepted cumulative. Applies exactly the checks the chain would:
-    /// a valid payer signature and `cumulative <= deposit`, plus the
+    /// a valid voucher-key signature and `cumulative <= deposit`, plus the
     /// off-chain-only monotonicity rule that the cumulative strictly exceeds
-    /// the already-served total (a replayed/stale voucher buys nothing).
+    /// the latest accepted one (a replayed/stale voucher buys nothing).
     pub(crate) fn serve(&mut self, voucher: Voucher) -> Result<u64, ServeError> {
-        let verified = self.payer_key.as_ref().is_some_and(|payer| {
-            verify_voucher_key(
-                payer,
-                &voucher.channel,
-                voucher.cumulative,
-                &voucher.signature,
-            )
-        });
-        if !verified {
+        if !verify_voucher(
+            &self.voucher_key,
+            &voucher.channel,
+            voucher.cumulative,
+            &voucher.signature,
+        ) {
             return Err(ServeError::BadSignature);
         }
         if voucher.cumulative > self.deposit.get() {
             return Err(ServeError::Overdraft);
         }
-        if voucher.cumulative <= self.latest.as_ref().map_or(0, |latest| latest.cumulative) {
+        if voucher.cumulative <= self.latest.cumulative {
             return Err(ServeError::Stale);
         }
 
         let cumulative = voucher.cumulative;
-        self.latest = Some(voucher);
+        self.latest = voucher;
         Ok(cumulative)
     }
 }
@@ -357,6 +347,7 @@ impl OperatorState {
     ) -> Result<bool, OperatorError> {
         if let Some(registered) = self.channels.get(&channel) {
             if registered.payer != registration.payer
+                || registered.voucher_key != registration.voucher_key
                 || registered.open_nonce != registration.open_nonce
                 || registered.receiver != registration.receiver
                 || registered.deposit != registration.deposit
@@ -568,87 +559,78 @@ where
 
     /// Verifies and registers a channel opened to this operator.
     ///
-    /// Returns whether the channel was newly inserted: a matching replay is
-    /// `Ok(false)`, a replay with mismatched metadata is an error.
+    /// The registration names only the open transaction and the channel's
+    /// initial zero-value voucher; everything else — the payer, receiver,
+    /// voucher key, and the channel address itself — is derived from the
+    /// verified open, so the request carries nothing a client could assert
+    /// incorrectly. The zero voucher must verify against the open's voucher
+    /// key: it proves the registrant holds that key and becomes the
+    /// channel's starting voucher, so every registered channel is closeable.
+    ///
+    /// Returns the channel address and whether it was newly inserted: a
+    /// matching replay is `Ok((_, false))`, a replay with mismatched
+    /// metadata is an error. A replay re-verifies the open against the
+    /// chain (the indexer has necessarily ingested it, though a transport
+    /// blip can still answer a retryable unavailable) and skips the runway
+    /// gate, so a lost registration response stays recoverable even after
+    /// the height drifts inside the margin.
     pub async fn register_channel(
         &self,
-        channel: AccountKey,
-        payer: TransactionPublicKey,
-        open_nonce: u64,
         open_tx_digest: &Digest,
-    ) -> Result<bool, OperatorError> {
-        // Replays are a supported path (clients retry registration on
-        // transient errors), so answer a registration that matches the
-        // stored verified one without repaying the chain verification below.
-        // Anything that does not match exactly falls through to the full
-        // verification, which reports the same errors it always has. The
-        // lock is scoped: it must not be held across the verification await.
-        {
-            let state = self.state.lock().await;
-            if let Some(registered) = state.channels.get(&channel)
-                && registered.payer == payer
-                && registered.open_nonce == open_nonce
-                && registered.open_digest == *open_tx_digest
-            {
-                debug!(%channel, "channel registration replayed");
-                return Ok(false);
-            }
-        }
-
+        zero_voucher: ed25519::Signature,
+    ) -> Result<(AccountKey, bool), OperatorError> {
         let open = self.chain.verify_open_channel(open_tx_digest).await?;
-        if open.payer != payer {
-            return Err(OperatorError::rejected("open transaction payer mismatch"));
-        }
-        if open.open_nonce != open_nonce {
-            return Err(OperatorError::rejected("open transaction nonce mismatch"));
-        }
         if open.operator != self.operator_account {
             return Err(OperatorError::rejected(
                 "open transaction names a different operator",
             ));
         }
-        // Past the expiry the payer can reclaim the whole escrow, voiding any
-        // unsettled vouchers; refuse channels without enough runway to serve
-        // and settle safely. The verification above ran against a certified
-        // header, so its height also seeds the cache — the check cannot be
+        // The verification above ran against a certified header, so its
+        // height also seeds the cache — the runway check below cannot be
         // fooled by a cache still at zero right after startup.
         self.height.fetch_max(open.tip_height, Ordering::Relaxed);
-        let height = self.height();
-        if !self.margins.has_runway(height, open.expiry) {
-            return Err(OperatorError::rejected("channel expires too soon"));
-        }
 
-        let payer_account = AccountKey::from_public_key(&open.payer);
-        let expected = channel_address(
-            &payer_account,
+        let channel = channel_address(
+            &open.payer,
             &open.receiver,
             &self.operator_account,
-            open_nonce,
+            &open.voucher_key,
+            open.open_nonce,
         );
-        if expected != channel {
+        let initial = Voucher {
+            channel,
+            cumulative: 0,
+            signature: zero_voucher,
+        };
+        if !verify_voucher(&open.voucher_key, &channel, 0, &initial.signature) {
             return Err(OperatorError::rejected(
-                "channel address does not match registration",
+                "initial zero voucher does not verify against the channel's voucher key",
             ));
         }
 
         let mut state = self.state.lock().await;
-        let inserted = state.register_verified_channel(
-            channel,
-            RegisteredChannel::new(
-                payer,
-                *open_tx_digest,
-                open.receiver,
-                open_nonce,
-                open.deposit,
-                open.expiry,
-            ),
-        )?;
+        // Runway gates NEW registrations only, and is checked after the
+        // replay lookup: a client whose successful registration's response
+        // was lost may retry after the height drifted inside the margin, and
+        // that replay must stay idempotent — the operator already committed
+        // to serving and settling this channel.
+        if !state.channels.contains_key(&channel) {
+            // Past the expiry the payer can reclaim the whole escrow,
+            // voiding any unsettled vouchers; refuse channels without
+            // enough runway to serve and settle safely.
+            let height = self.height();
+            if !self.margins.has_runway(height, open.expiry) {
+                return Err(OperatorError::rejected("channel expires too soon"));
+            }
+        }
+        let inserted =
+            state.register_verified_channel(channel, RegisteredChannel::new(&open, initial))?;
         if inserted {
             debug!(%channel, deposit = open.deposit.get(), "registered channel");
         } else {
             debug!(%channel, "channel registration replayed");
         }
-        Ok(inserted)
+        Ok((channel, inserted))
     }
 
     /// Verifies a voucher and serves one request against it, returning the
@@ -713,9 +695,11 @@ where
         }
     }
 
-    /// Voucher-bearing channels whose expiry is near enough that settlement
-    /// must start now. Each channel is returned once: the service remembers
-    /// what it has handed out until that settlement moves past `Open`.
+    /// Channels whose expiry is near enough that settlement must start now
+    /// (every registered channel is voucher-bearing: registration installed
+    /// the initial zero voucher). Each channel is returned once: the service
+    /// remembers what it has handed out until that settlement moves past
+    /// `Open`.
     ///
     /// An operator that misses a channel's expiry forfeits its receiver's
     /// vouchers (the payer reclaims the whole escrow), so settlement cannot
@@ -740,7 +724,6 @@ where
             .iter()
             .filter(|(channel, registered)| {
                 registered.settlement == SettlementState::Open
-                    && registered.latest.is_some()
                     && self.margins.expiry_phase(height, registered.expiry) != ExpiryPhase::Serving
                     && !sweep_claimed.contains(channel)
             })
@@ -766,7 +749,7 @@ where
         &self,
         channel: AccountKey,
     ) -> Result<SettleOutcome, OperatorError> {
-        let (payer, receiver, open_nonce, expiry, latest, nonce) = loop {
+        let (payer, receiver, voucher_key, open_nonce, expiry, latest, nonce) = loop {
             {
                 let mut guard = self.state.lock().await;
                 // Split the borrow so the nonce reservation below can run
@@ -784,11 +767,7 @@ where
                 };
                 match registered.settlement {
                     SettlementState::Settled | SettlementState::Abandoned => {
-                        let cumulative = registered
-                            .latest
-                            .as_ref()
-                            .map(|voucher| voucher.cumulative)
-                            .unwrap_or(0);
+                        let cumulative = registered.latest.cumulative;
                         return Ok(SettleOutcome {
                             settled: registered.settlement == SettlementState::Settled,
                             cumulative,
@@ -800,19 +779,15 @@ where
                     // indistinguishable from an abandonment.
                     SettlementState::Settling => {}
                     SettlementState::Open => {
-                        let Some(latest) = registered.latest.clone() else {
-                            return Err(OperatorError::rejected(
-                                "channel has no accepted vouchers",
-                            ));
-                        };
                         if let Some(nonce) = try_reserve_nonce(next_nonce, inflight, *aligned) {
                             registered.settlement = SettlementState::Settling;
                             break (
-                                registered.payer.clone(),
+                                registered.payer,
                                 registered.receiver,
+                                registered.voucher_key.clone(),
                                 registered.open_nonce,
                                 registered.expiry,
-                                latest,
+                                registered.latest.clone(),
                                 nonce,
                             );
                         }
@@ -831,6 +806,7 @@ where
             self.operator_pk.clone(),
             payer,
             receiver,
+            voucher_key,
             open_nonce,
             cumulative,
             latest.signature,
@@ -1052,23 +1028,32 @@ mod tests {
     use commonware_codec::FixedSize as _;
     use commonware_cryptography::Signer as _;
 
-    /// A registered channel with deposit 50, plus the payer key that signs
-    /// its vouchers.
+    /// A registered channel with deposit 50, plus the delegated voucher key
+    /// that signs its vouchers.
     fn metered_channel() -> (ed25519::PrivateKey, AccountKey, RegisteredChannel) {
-        let payer = ed25519::PrivateKey::from_seed(1);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let payer_account = AccountKey::from_public_key(&payer_pk);
+        let voucher_key = ed25519::PrivateKey::from_seed(1);
+        let payer_account = AccountKey::from([1u8; AccountKey::SIZE]);
         let receiver = AccountKey::from([2u8; AccountKey::SIZE]);
-        let channel = channel_address(&payer_account, &receiver, &receiver, 0);
-        let registered = RegisteredChannel::new(
-            payer_pk,
-            Digest::from([1u8; 32]),
-            receiver,
+        let channel = channel_address(
+            &payer_account,
+            &receiver,
+            &receiver,
+            &voucher_key.public_key(),
             0,
-            NZU64!(50),
-            CHANNEL_NEVER_EXPIRES,
         );
-        (payer, channel, registered)
+        let open = VerifiedOpenChannel {
+            payer: payer_account,
+            receiver,
+            voucher_key: voucher_key.public_key(),
+            operator: receiver,
+            open_nonce: 0,
+            deposit: NZU64!(50),
+            expiry: CHANNEL_NEVER_EXPIRES,
+            tip_height: 0,
+        };
+        let initial = Voucher::sign(&voucher_key, channel, 0);
+        let registered = RegisteredChannel::new(&open, initial);
+        (voucher_key, channel, registered)
     }
 
     #[test]
@@ -1078,10 +1063,7 @@ mod tests {
             let voucher = Voucher::sign(&payer, channel, i * 5);
             assert_eq!(registered.serve(voucher), Ok(i * 5));
         }
-        assert_eq!(
-            registered.latest.as_ref().map(|latest| latest.cumulative),
-            Some(20)
-        );
+        assert_eq!(registered.latest.cumulative, 20);
         // Each serve requires a strictly larger cumulative: replaying the
         // last accepted voucher buys nothing.
         assert_eq!(
@@ -1230,35 +1212,36 @@ mod tests {
 
     #[test]
     fn duplicate_registration_preserves_accepted_voucher_state() {
-        let payer_key = ed25519::PrivateKey::from_seed(42);
-        let payer = TransactionPublicKey::ed25519(payer_key.public_key());
-        let receiver =
-            TransactionPublicKey::ed25519(ed25519::PrivateKey::from_seed(43).public_key());
-        let receiver_account = AccountKey::from_public_key(&receiver);
-        let payer_account = AccountKey::from_public_key(&payer);
+        let voucher_key = ed25519::PrivateKey::from_seed(42);
+        let payer_account = AccountKey::from([42u8; AccountKey::SIZE]);
+        let receiver_account = AccountKey::from([43u8; AccountKey::SIZE]);
         let open_nonce = 7;
         let channel = channel_address(
             &payer_account,
             &receiver_account,
             &receiver_account,
+            &voucher_key.public_key(),
             open_nonce,
         );
-        let voucher = Voucher::sign(&payer_key, channel, 10);
+        let open = |deposit: NonZeroU64| VerifiedOpenChannel {
+            payer: payer_account,
+            receiver: receiver_account,
+            voucher_key: voucher_key.public_key(),
+            operator: receiver_account,
+            open_nonce,
+            deposit,
+            expiry: CHANNEL_NEVER_EXPIRES,
+            tip_height: 0,
+        };
+        let initial = Voucher::sign(&voucher_key, channel, 0);
+        let voucher = Voucher::sign(&voucher_key, channel, 10);
 
         let mut state = OperatorState::new(0, true);
-        let open_digest = Digest::from([7u8; 32]);
         assert!(
             state
                 .register_verified_channel(
                     channel,
-                    RegisteredChannel::new(
-                        payer.clone(),
-                        open_digest,
-                        receiver_account,
-                        open_nonce,
-                        NZU64!(20),
-                        CHANNEL_NEVER_EXPIRES,
-                    ),
+                    RegisteredChannel::new(&open(NZU64!(20)), initial.clone()),
                 )
                 .expect("initial registration should succeed")
         );
@@ -1275,14 +1258,7 @@ mod tests {
             !state
                 .register_verified_channel(
                     channel,
-                    RegisteredChannel::new(
-                        payer.clone(),
-                        open_digest,
-                        receiver_account,
-                        open_nonce,
-                        NZU64!(20),
-                        CHANNEL_NEVER_EXPIRES,
-                    ),
+                    RegisteredChannel::new(&open(NZU64!(20)), initial.clone()),
                 )
                 .expect("duplicate registration should be idempotent")
         );
@@ -1290,14 +1266,7 @@ mod tests {
             state
                 .register_verified_channel(
                     channel,
-                    RegisteredChannel::new(
-                        payer,
-                        open_digest,
-                        receiver_account,
-                        open_nonce,
-                        NZU64!(21),
-                        CHANNEL_NEVER_EXPIRES,
-                    ),
+                    RegisteredChannel::new(&open(NZU64!(21)), initial),
                 )
                 .is_err(),
             "mismatched metadata must be rejected"
@@ -1307,10 +1276,7 @@ mod tests {
             .channels
             .get_mut(&channel)
             .expect("registration metadata should remain");
-        assert_eq!(
-            registered.latest.as_ref().map(|latest| latest.cumulative),
-            Some(10)
-        );
+        assert_eq!(registered.latest.cumulative, 10);
         assert_eq!(registered.settlement, SettlementState::Settling);
         assert_eq!(
             registered.serve(voucher),

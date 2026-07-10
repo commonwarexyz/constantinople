@@ -141,10 +141,14 @@ impl ChainReader for MockChain {
 
 /// A payer driving the client side of the lifecycle: funds itself, opens
 /// channels, signs vouchers, and reclaims timeouts — the spammer's role.
+/// Its account key and voucher key are deliberately distinct: delegation is
+/// the design, so the tests exercise it.
 struct Payer {
     key: ed25519::PrivateKey,
     pk: TransactionPublicKey,
     account: AccountKey,
+    /// The delegated voucher key the payer's channels name.
+    voucher_key: ed25519::PrivateKey,
     nonce: u64,
 }
 
@@ -157,6 +161,7 @@ impl Payer {
             key,
             pk,
             account,
+            voucher_key: ed25519::PrivateKey::from_seed(seed + 1_000),
             nonce: 0,
         }
     }
@@ -172,7 +177,12 @@ impl Payer {
     }
 
     fn voucher(&self, channel: AccountKey, cumulative: u64) -> Voucher {
-        Voucher::sign(&self.key, channel, cumulative)
+        Voucher::sign(&self.voucher_key, channel, cumulative)
+    }
+
+    /// The initial zero-value voucher registration carries.
+    fn zero_voucher(&self, channel: AccountKey) -> ed25519::Signature {
+        Voucher::sign(&self.voucher_key, channel, 0).signature
     }
 
     fn timeout(&mut self, receiver: AccountKey, open_nonce: u64) -> Tx {
@@ -183,6 +193,7 @@ impl Payer {
             self.pk.clone(),
             receiver,
             receiver,
+            self.voucher_key.public_key(),
             open_nonce,
             nonce,
         ))
@@ -216,11 +227,13 @@ impl Payer {
         let open_nonce = self.nonce;
         self.nonce += 1;
         let deposit = NZU64!(deposit);
-        let channel = channel_address(&self.account, &receiver, &operator, open_nonce);
+        let voucher_pk = self.voucher_key.public_key();
+        let channel = channel_address(&self.account, &receiver, &operator, &voucher_pk, open_nonce);
         let open = self.sign(Transaction::open_channel(
             self.pk.clone(),
             receiver,
             operator,
+            voucher_pk.clone(),
             deposit,
             expiry,
             open_nonce,
@@ -233,8 +246,9 @@ impl Payer {
         harness.opens.insert(
             digest,
             VerifiedOpenChannel {
-                payer: self.pk.clone(),
+                payer: self.account,
                 receiver,
+                voucher_key: voucher_pk,
                 operator,
                 open_nonce,
                 deposit,
@@ -306,39 +320,41 @@ fn operator_settles_and_abandons_against_live_chain() {
 
         // --- Happy path: open, register, stream, settle. ---
         let expiry = chain.0.lock().await.height() + 100;
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, expiry)
             .await;
 
         // Registration validates the verified open and is idempotent.
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true)),
+            "the operator derives the channel address the payer derived"
         );
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(false),
+            Ok((channel, false)),
             "matching replay is a no-op"
         );
 
-        // A registration whose channel address does not match the open is
-        // refused, as is one for an open the chain never finalized.
-        let bogus = channel_address(&payer.account, &receiver_account, &receiver_account, 99);
+        // A zero voucher signed by a key other than the open's voucher key is
+        // refused, as is a registration for an open the chain never
+        // finalized.
+        let forged = Voucher::sign(&payer.key, channel, 0).signature;
         assert!(
             service
-                .register_channel(bogus, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, forged)
                 .await
                 .is_err(),
-            "mismatched channel address must be refused"
+            "zero voucher from the wrong key must be refused"
         );
         let unknown = sha256::Digest::from([9u8; 32]);
         assert!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &unknown)
+                .register_channel(&unknown, payer.zero_voucher(channel))
                 .await
                 .is_err(),
             "unverified open must be refused"
@@ -406,12 +422,12 @@ fn operator_settles_and_abandons_against_live_chain() {
 
         // --- Runway: a channel expiring too soon is refused at registration. ---
         let height = chain.0.lock().await.height();
-        let (short_channel, short_digest, short_nonce) = payer
+        let (short_channel, short_digest, _) = payer
             .open_channel(&chain, receiver_account, STEP, height + MARGINS.min_runway)
             .await;
         assert!(
             service
-                .register_channel(short_channel, payer.pk.clone(), short_nonce, &short_digest)
+                .register_channel(&short_digest, payer.zero_voucher(short_channel))
                 .await
                 .is_err(),
             "channel without runway must be refused"
@@ -424,9 +440,9 @@ fn operator_settles_and_abandons_against_live_chain() {
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
         assert_eq!(
             service.serve_voucher(payer.voucher(channel, STEP)).await,
@@ -484,14 +500,14 @@ fn operator_settles_and_abandons_against_live_chain() {
 
         // --- The abandon must not wedge later settlements. ---
         let expiry = chain.0.lock().await.height() + 100;
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, expiry)
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
         assert_eq!(
             service.serve_voucher(payer.voucher(channel, STEP)).await,
@@ -525,18 +541,24 @@ fn stream_meter_paces_content_against_vouchers() {
         const LIMIT: u64 = 4;
 
         // Metering an unregistered channel is refused outright.
-        let bogus = channel_address(&payer.account, &receiver_account, &receiver_account, 99);
+        let bogus = channel_address(
+            &payer.account,
+            &receiver_account,
+            &receiver_account,
+            &payer.voucher_key.public_key(),
+            99,
+        );
         assert!(service.consume(&bogus, 1, LIMIT).await.is_err());
 
         let expiry = chain.0.lock().await.height() + 100;
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, expiry)
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
 
         // An unpaid channel streams a debt limit's worth, then pauses; a
@@ -607,17 +629,18 @@ fn sweep_marks_expiring_channels_due_once() {
         let receiver_account = *service.operator_account();
 
         let expiry = chain.0.lock().await.height() + 8;
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, expiry)
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
 
-        // No voucher yet: nothing to settle even near expiry.
+        // Far from expiry: nothing is due (every registered channel carries
+        // its initial zero voucher, so nearness to expiry is the only gate).
         assert!(service.due_settlements().await.is_empty());
 
         assert_eq!(
@@ -673,15 +696,15 @@ fn delegated_operator_pays_the_named_receiver() {
         assert_ne!(receiver_account, operator_account);
 
         let expiry = chain.0.lock().await.height() + 100;
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel_via(&chain, receiver_account, operator_account, DEPOSIT, expiry)
             .await;
 
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
         for i in 1..=2 {
             assert_eq!(
@@ -736,14 +759,14 @@ fn settlement_abandons_a_nonce_consumed_by_another_transaction() {
         let (chain, mut payer, service) = setup(&context).await;
         let receiver_account = *service.operator_account();
 
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, CHANNEL_NEVER_EXPIRES)
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
         assert_eq!(
             service.serve_voucher(payer.voucher(channel, STEP)).await,
@@ -782,14 +805,14 @@ fn settlement_abandons_a_nonce_consumed_by_another_transaction() {
 
         // The abandoned nonce left the in-flight window: a second channel
         // settles normally on the next nonce.
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, CHANNEL_NEVER_EXPIRES)
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
         assert_eq!(
             service.serve_voucher(payer.voucher(channel, STEP)).await,
@@ -801,6 +824,111 @@ fn settlement_abandons_a_nonce_consumed_by_another_transaction() {
                 settled: true,
                 cumulative: STEP,
             })
+        );
+    });
+}
+
+/// A registration replay stays idempotent even after the chain drifts
+/// inside the runway margin: the client whose successful registration's
+/// response was lost must get `Ok((_, false))` on retry, not a permanent
+/// "expires too soon" — the operator already committed to the channel.
+#[test]
+fn registration_replay_survives_runway_drift() {
+    deterministic::Runner::default().start(|context| async move {
+        let (chain, mut payer, service) = setup(&context).await;
+        let receiver_account = *service.operator_account();
+
+        // Just enough runway to register now, but not after a few blocks.
+        let expiry = chain.0.lock().await.height() + MARGINS.min_runway + 3;
+        let (channel, open_digest, _open_nonce) = payer
+            .open_channel(&chain, receiver_account, DEPOSIT, expiry)
+            .await;
+        assert_eq!(
+            service
+                .register_channel(&open_digest, payer.zero_voucher(channel))
+                .await,
+            Ok((channel, true))
+        );
+
+        // Advance the chain until a fresh registration would be refused.
+        for _ in 0..4 {
+            let mint = payer.mint(1);
+            chain.0.lock().await.commit(vec![mint]).await;
+        }
+        service.refresh_height().await.expect("height refresh");
+        // Prove the drift consumed the runway: a NEW channel with the same
+        // expiry is refused...
+        let (fresh_channel, fresh_digest, _open_nonce) = payer
+            .open_channel(&chain, receiver_account, DEPOSIT, expiry)
+            .await;
+        assert!(
+            service
+                .register_channel(&fresh_digest, payer.zero_voucher(fresh_channel))
+                .await
+                .is_err(),
+            "a fresh registration inside the margin must be refused"
+        );
+
+        // ...while the replay (lost-response retry) is still answered
+        // idempotently.
+        assert_eq!(
+            service
+                .register_channel(&open_digest, payer.zero_voucher(channel))
+                .await,
+            Ok((channel, false)),
+            "a matching replay must not be re-gated on runway"
+        );
+    });
+}
+
+/// The zero-voucher registration's promise, end to end: a channel that never
+/// pays is still closeable. Settling it submits a cumulative-0 close (the
+/// cooperative cancel), the payer gets the whole escrow back, the receiver
+/// is never written, and the channel leaves no state.
+#[test]
+fn never_paid_channel_settles_with_a_zero_close() {
+    deterministic::Runner::default().start(|context| async move {
+        let (chain, mut payer, service) = setup(&context).await;
+        let receiver_account = *service.operator_account();
+
+        let expiry = chain.0.lock().await.height() + 100;
+        let (channel, open_digest, _open_nonce) = payer
+            .open_channel(&chain, receiver_account, DEPOSIT, expiry)
+            .await;
+        assert_eq!(
+            service
+                .register_channel(&open_digest, payer.zero_voucher(channel))
+                .await,
+            Ok((channel, true))
+        );
+
+        // No voucher is ever served; the settle claims the initial zero.
+        let outcome = service.settle_channel(channel).await.expect("settle");
+        assert_eq!(
+            outcome,
+            SettleOutcome {
+                settled: true,
+                cumulative: 0,
+            }
+        );
+
+        let harness = chain.0.lock().await;
+        assert_eq!(
+            read_account(&harness.dbs, &payer.account).await.balance,
+            FUNDED,
+            "the whole escrow refunds to the payer"
+        );
+        // The receiver (here also the close-signing operator, whose nonce
+        // consumption writes its account) is paid nothing.
+        assert_eq!(
+            read_account(&harness.dbs, &receiver_account).await.balance,
+            0,
+            "a zero-cumulative close pays the receiver nothing"
+        );
+        assert_eq!(
+            read_raw(&harness.dbs, &channel).await,
+            None,
+            "settled channel is deleted"
         );
     });
 }
@@ -846,14 +974,14 @@ fn settlement_survives_a_lost_close_acknowledgement() {
         .await;
         let receiver_account = *service.operator_account();
 
-        let (channel, open_digest, open_nonce) = payer
+        let (channel, open_digest, _open_nonce) = payer
             .open_channel(&chain, receiver_account, DEPOSIT, CHANNEL_NEVER_EXPIRES)
             .await;
         assert_eq!(
             service
-                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .register_channel(&open_digest, payer.zero_voucher(channel))
                 .await,
-            Ok(true)
+            Ok((channel, true))
         );
         assert_eq!(
             service.serve_voucher(payer.voucher(channel, STEP)).await,

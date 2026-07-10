@@ -10,9 +10,13 @@ import {
 import { AddressValue } from './AddressValue';
 import {
     accountKeyFromPublicKey,
+    channelAddress,
     encodeSignedMintTransaction,
+    encodeSignedOpenChannelTransaction,
+    encodeSignedTimeoutChannelTransaction,
     encodeSignedTransaction,
     encodeTransactionBatch,
+    fromHex,
     parseAccountKeyHex,
     parseU64,
     toHex,
@@ -60,7 +64,11 @@ import {
     signInWithPasskey,
     type ActiveWallet,
 } from './wallet';
-import { PaidStreamPage } from './PaidStreamPage';
+import {
+    PaidStreamPage,
+    type OpenStreamChannelRequest,
+    type ReclaimStreamChannelRequest,
+} from './PaidStreamPage';
 import { shortHex, sleep, trimTrailingSlash } from './util';
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
@@ -921,24 +929,81 @@ export default function App() {
             transferBuilder(toKey, parseU64(value, 'value'))(nonce, activeWallet),
         );
 
-    /// Funds the paid-stream session account from the passkey wallet. The
-    /// stream page awaits finality before opening the channel — never batch
-    /// the two: the transfer and the open write the same account across
-    /// lanes and would conflict in one block.
-    const fundStreamSessionNow = async (accountKeyHex: string, amount: bigint): Promise<boolean> => {
-        const status = await submitSigned(
-            'funding stream session',
-            transferBuilder(accountKeyHex, amount),
-        );
-        return status !== null && statusHasHeight(status);
-    };
-    // Stable identity over the freshest closure: `submitSigned` (and so
-    // `fundStreamSessionNow`) is rebuilt every render, but the memoized
+    /// Signs and submits the paid stream's OpenChannel from the passkey
+    /// wallet (payee-run topology: the operator is also the receiver).
+    /// `request.persist` runs after signing and BEFORE submission, so a lost
+    /// response can never orphan the escrow — the stream page persists the
+    /// pending record there.
+    const openStreamChannelNow = (request: OpenStreamChannelRequest): Promise<TxStatus | null> =>
+        submitSigned('opening stream channel', async (nonce, activeWallet, senderAccountKey) => {
+            const operatorAccount = parseAccountKeyHex(request.operatorHex);
+            const voucherPublicKey = fromHex(request.voucherPublicKeyHex);
+            const encoded = await encodeSignedOpenChannelTransaction(
+                {
+                    senderPublicKey: activeWallet.publicKey,
+                    receiverAccountKey: operatorAccount,
+                    operatorAccountKey: operatorAccount,
+                    voucherPublicKey,
+                    deposit: request.deposit,
+                    expiry: request.expiry,
+                    nonce,
+                },
+                activeWallet.sign,
+            );
+            const channel = await channelAddress(
+                parseAccountKeyHex(senderAccountKey),
+                operatorAccount,
+                operatorAccount,
+                voucherPublicKey,
+                nonce,
+            );
+            const channelHex = toHex(channel);
+            request.persist({
+                channelHex,
+                openNonce: nonce.toString(),
+                openTxDigestHex: encoded.digestHex,
+                signedOpenTxHex: toHex(encoded.bytes),
+            });
+            return { encoded, kind: 'channel-open' as const, to: channelHex, value: request.deposit };
+        });
+    /// Signs and submits a post-expiry TimeoutChannel reclaiming a stream
+    /// channel's escrow for the wallet.
+    const reclaimStreamChannelNow = (
+        request: ReclaimStreamChannelRequest,
+    ): Promise<TxStatus | null> =>
+        submitSigned('reclaiming stream deposit', async (nonce, activeWallet) => {
+            const operatorAccount = parseAccountKeyHex(request.operatorHex);
+            const encoded = await encodeSignedTimeoutChannelTransaction(
+                {
+                    senderPublicKey: activeWallet.publicKey,
+                    receiverAccountKey: operatorAccount,
+                    operatorAccountKey: operatorAccount,
+                    voucherPublicKey: fromHex(request.voucherPublicKeyHex),
+                    openNonce: BigInt(request.openNonce),
+                    nonce,
+                },
+                activeWallet.sign,
+            );
+            return {
+                encoded,
+                kind: 'channel-timeout' as const,
+                to: request.channelHex,
+                value: 0n,
+            };
+        });
+    // Stable identities over the freshest closures: `submitSigned` (and so
+    // both builders above) is rebuilt every render, but the memoized
     // PaidStreamPage must not re-render for that.
-    const fundStreamSessionRef = useRef(fundStreamSessionNow);
-    fundStreamSessionRef.current = fundStreamSessionNow;
-    const fundStreamSession = useCallback(
-        (accountKeyHex: string, amount: bigint) => fundStreamSessionRef.current(accountKeyHex, amount),
+    const openStreamChannelRef = useRef(openStreamChannelNow);
+    openStreamChannelRef.current = openStreamChannelNow;
+    const openStreamChannel = useCallback(
+        (request: OpenStreamChannelRequest) => openStreamChannelRef.current(request),
+        [],
+    );
+    const reclaimStreamChannelRef = useRef(reclaimStreamChannelNow);
+    reclaimStreamChannelRef.current = reclaimStreamChannelNow;
+    const reclaimStreamChannel = useCallback(
+        (request: ReclaimStreamChannelRequest) => reclaimStreamChannelRef.current(request),
         [],
     );
 
@@ -1011,7 +1076,8 @@ export default function App() {
                                 mempoolUrl={mempoolUrl}
                                 walletReady={wallet !== null && walletAccountKey !== null}
                                 walletBalance={account?.balance ?? null}
-                                onFundSession={fundStreamSession}
+                                onOpenChannel={openStreamChannel}
+                                onReclaimChannel={reclaimStreamChannel}
                                 onOpenWallet={openWalletDialog}
                                 onOpenAddress={openAccountPage}
                                 onCopy={copyValue}

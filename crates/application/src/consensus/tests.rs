@@ -2,7 +2,7 @@ use super::{
     Application, Databases, StateSyncTarget, TransactionHistoryTarget, genesis_block,
     history::parent_transactions_inactivity_floor,
 };
-use crate::operator::service::RegisteredChannel;
+use crate::operator::service::{RegisteredChannel, VerifiedOpenChannel};
 use commonware_consensus::{
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
@@ -390,7 +390,13 @@ fn channel_streams_offchain_and_settles_onchain() {
         // derived.
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let mut chain_txs = 0;
 
@@ -399,12 +405,12 @@ fn channel_streams_offchain_and_settles_onchain() {
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
-        let open_digest = *open.message_digest();
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
         assert_eq!(included, 1, "opening a channel is one on-chain transaction");
@@ -419,12 +425,17 @@ fn channel_streams_offchain_and_settles_onchain() {
 
         // --- Off-chain: stream PAYMENTS vouchers, verified locally. No chain txs. ---
         let mut meter = RegisteredChannel::new(
-            payer_pk.clone(),
-            open_digest,
-            receiver_key,
-            open_nonce,
-            NZU64!(DEPOSIT),
-            CHANNEL_NEVER_EXPIRES,
+            &VerifiedOpenChannel {
+                payer: payer_key,
+                receiver: receiver_key,
+                voucher_key: payer.public_key(),
+                operator: receiver_key,
+                open_nonce,
+                deposit: NZU64!(DEPOSIT),
+                expiry: CHANNEL_NEVER_EXPIRES,
+                tip_height: 0,
+            },
+            Voucher::sign(&payer, channel, 0),
         );
         let mut latest = None;
         for i in 1..=PAYMENTS {
@@ -442,8 +453,9 @@ fn channel_streams_offchain_and_settles_onchain() {
         // --- On-chain: settle the latest voucher with a single transaction. ---
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             latest.cumulative,
             latest.signature.clone(),
@@ -550,12 +562,19 @@ fn chain_rejects_overclaim_voucher() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
@@ -569,8 +588,9 @@ fn chain_rejects_overclaim_voucher() {
         let overclaim = Voucher::sign(&payer, channel, DEPOSIT + 10);
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             overclaim.cumulative,
             overclaim.signature.clone(),
@@ -602,12 +622,19 @@ fn chain_rejects_forged_voucher() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
@@ -621,8 +648,9 @@ fn chain_rejects_forged_voucher() {
         let forged = Voucher::sign(&attacker, channel, STEP);
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             forged.cumulative,
             forged.signature.clone(),
@@ -658,12 +686,14 @@ fn multiple_opens_in_one_block_compose() {
             &payer_key,
             &AccountKey::from_public_key(&recv_a_pk),
             &AccountKey::from_public_key(&recv_a_pk),
+            &payer.public_key(),
             1,
         );
         let channel_b = channel_address(
             &payer_key,
             &AccountKey::from_public_key(&recv_b_pk),
             &AccountKey::from_public_key(&recv_b_pk),
+            &payer.public_key(),
             2,
         );
 
@@ -671,6 +701,7 @@ fn multiple_opens_in_one_block_compose() {
             payer_pk.clone(),
             AccountKey::from_public_key(&recv_a_pk),
             AccountKey::from_public_key(&recv_a_pk),
+            payer.public_key(),
             NonZeroU64::new(30).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             1,
@@ -680,6 +711,7 @@ fn multiple_opens_in_one_block_compose() {
             payer_pk.clone(),
             AccountKey::from_public_key(&recv_b_pk),
             AccountKey::from_public_key(&recv_b_pk),
+            payer.public_key(),
             NonZeroU64::new(20).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             2,
@@ -724,12 +756,19 @@ fn settled_voucher_cannot_be_replayed() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
@@ -744,8 +783,9 @@ fn settled_voucher_cannot_be_replayed() {
         let close = |nonce: u64| {
             Transaction::close_channel(
                 receiver_pk.clone(),
-                payer_pk.clone(),
+                payer_key,
                 AccountKey::from_public_key(&receiver_pk),
+                payer.public_key(),
                 open_nonce,
                 voucher.cumulative,
                 voucher.signature.clone(),
@@ -797,12 +837,19 @@ fn refunding_a_settled_channel_address_enables_replay() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
@@ -815,8 +862,9 @@ fn refunding_a_settled_channel_address_enables_replay() {
         let close = |nonce: u64| {
             Transaction::close_channel(
                 receiver_pk.clone(),
-                payer_pk.clone(),
+                payer_key,
                 AccountKey::from_public_key(&receiver_pk),
+                payer.public_key(),
                 open_nonce,
                 voucher.cumulative,
                 voucher.signature.clone(),
@@ -882,12 +930,19 @@ fn verifier_accepts_a_proposed_channel_block() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
@@ -903,8 +958,9 @@ fn verifier_accepts_a_proposed_channel_block() {
         let voucher = Voucher::sign(&payer, channel, STEP);
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             voucher.cumulative,
             voucher.signature.clone(),
@@ -948,19 +1004,49 @@ fn verifier_accepts_a_proposed_channel_block() {
     });
 }
 
-/// A channel opened by a non-Ed25519 (secp256r1) payer is rejected. Vouchers
-/// are Ed25519, so such a channel could never be settled and its deposit would
-/// be locked; the chain refuses to create it.
+/// A channel opened by a non-Ed25519 (secp256r1) payer is accepted. Vouchers
+/// are signed by the delegated Ed25519 voucher key named in the open, not by
+/// the payer's transaction key, so a secp256r1 (passkey-style) account can
+/// open channels by delegating voucher signing to an Ed25519 key.
 #[test]
-fn open_channel_rejects_non_ed25519_payer() {
+fn open_channel_accepts_non_ed25519_payer() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
         let payer = secp256r1::PrivateKey::from_seed(2);
         let receiver = ed25519::PrivateKey::from_seed(3);
+        let funder = ed25519::PrivateKey::from_seed(4);
+        // The delegated Ed25519 key that will sign this channel's vouchers on
+        // the secp256r1 payer's behalf.
+        let voucher_signer = ed25519::PrivateKey::from_seed(5);
         let payer_pk = TransactionPublicKey::secp256r1(payer.public_key());
         let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let funder_pk = TransactionPublicKey::ed25519(funder.public_key());
+        let payer_key = AccountKey::from_public_key(&payer_pk);
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
+
+        // Fund the secp256r1 payer with an ordinary transfer (`mint_tx` and
+        // `seal_and_sign` are Ed25519-only, but any account can be credited).
+        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&funder]).await;
+        let fund_payer = Transaction::with_op(
+            funder_pk.clone(),
+            1,
+            Operation::Transfer {
+                to: payer_key,
+                value: NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
+            },
+        )
+        .seal_and_sign(&funder, TEST_TX_NS, &mut sha256::Sha256::default());
+        let (block, included) = propose_and_finalize(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            vec![fund_payer],
+        )
+        .await;
+        assert_eq!(included, 1, "funding transfer must land");
 
         // `seal_and_sign` only supports Ed25519 transaction signatures, and the
         // propose path does not verify the transaction signature, so build the
@@ -969,6 +1055,7 @@ fn open_channel_rejects_non_ed25519_payer() {
             payer_pk,
             receiver_key,
             receiver_key,
+            voucher_signer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             0,
@@ -980,8 +1067,22 @@ fn open_channel_rejects_non_ed25519_payer() {
         let signed = SignedTransaction::new_unchecked(sealed, signature);
 
         let (_block, included) =
-            propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![signed]).await;
-        assert_eq!(included, 0, "a non-Ed25519-payer open must be rejected");
+            propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![signed]).await;
+        assert_eq!(
+            included, 1,
+            "a non-Ed25519 payer's open with a delegated voucher key must execute"
+        );
+
+        // The deposit moved from the secp256r1 payer into the channel escrow.
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &voucher_signer.public_key(),
+            0,
+        );
+        assert_eq!(read_account(&dbs, &channel).await.balance, DEPOSIT);
+        assert_eq!(read_account(&dbs, &payer_key).await.balance, 0);
     });
 }
 
@@ -1034,20 +1135,23 @@ fn poison_channel_op_does_not_empty_the_proposal() {
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             1,
         )
         .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
 
-        // Statically invalid: an open from a secp256r1 payer passes the
-        // mempool's signature check but can never be prepared.
+        // Semantically invalid: an open from an unfunded secp256r1 payer
+        // prepares fine (the voucher key is delegated, so the payer's scheme
+        // no longer matters) but fails at execution for lack of balance.
         let secp = secp256r1::PrivateKey::from_seed(6);
         let secp_pk = TransactionPublicKey::secp256r1(secp.public_key());
         let sealed_bad_open = Transaction::<sha256::Digest>::open_channel(
             secp_pk,
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             0,
@@ -1061,12 +1165,19 @@ fn poison_channel_op_does_not_empty_the_proposal() {
 
         // Semantically invalid: a validly signed close of a channel that was
         // never opened, only detectable at execution time.
-        let phantom = channel_address(&payer_key, &receiver_key, &receiver_key, 7);
+        let phantom = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            7,
+        );
         let voucher = Voucher::sign(&payer, phantom, STEP);
         let bad_close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             7,
             voucher.cumulative,
             voucher.signature.clone(),
@@ -1095,7 +1206,13 @@ fn poison_channel_op_does_not_empty_the_proposal() {
         assert_eq!(
             read_account(
                 &dbs,
-                &channel_address(&payer_key, &receiver_key, &receiver_key, 1)
+                &channel_address(
+                    &payer_key,
+                    &receiver_key,
+                    &receiver_key,
+                    &payer.public_key(),
+                    1
+                )
             )
             .await
             .balance,
@@ -1128,7 +1245,13 @@ fn timeout_respects_expiry_then_reclaims() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
         // The funding mint lands at height 1 and the open at height 2, so the
         // channel is expired (reclaimable) from height 4 on.
         let expiry = 3;
@@ -1137,6 +1260,7 @@ fn timeout_respects_expiry_then_reclaims() {
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             expiry,
             open_nonce,
@@ -1159,6 +1283,7 @@ fn timeout_respects_expiry_then_reclaims() {
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             open_nonce,
             2,
         )
@@ -1193,8 +1318,9 @@ fn timeout_respects_expiry_then_reclaims() {
         // The receiver's (still validly signed) voucher is now worthless.
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             voucher.cumulative,
             voucher.signature.clone(),
@@ -1224,7 +1350,13 @@ fn close_beats_timeout_after_expiry() {
         let receiver_key = AccountKey::from_public_key(&receiver_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         // Expired as soon as the next block: the open lands at height 2 and
         // the expiry is 2.
@@ -1232,6 +1364,7 @@ fn close_beats_timeout_after_expiry() {
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             2,
             open_nonce,
@@ -1246,8 +1379,9 @@ fn close_beats_timeout_after_expiry() {
         let voucher = Voucher::sign(&payer, channel, STEP);
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             voucher.cumulative,
             voucher.signature.clone(),
@@ -1264,6 +1398,7 @@ fn close_beats_timeout_after_expiry() {
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             open_nonce,
             2,
         )
@@ -1299,12 +1434,19 @@ fn zero_cumulative_close_cancels_without_writing_the_receiver() {
         let operator_key = AccountKey::from_public_key(&operator_pk);
         let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &operator_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &operator_key,
+            &payer.public_key(),
+            open_nonce,
+        );
 
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             operator_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             1_000,
             open_nonce,
@@ -1318,8 +1460,9 @@ fn zero_cumulative_close_cancels_without_writing_the_receiver() {
         let voucher = Voucher::sign(&payer, channel, 0);
         let close = Transaction::close_channel(
             operator_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             receiver_key,
+            payer.public_key(),
             open_nonce,
             voucher.cumulative,
             voucher.signature.clone(),
@@ -1419,11 +1562,18 @@ fn saturated_receiver_still_settles_and_mints() {
         // Open a channel to the saturated receiver and settle it: the
         // receiver's credit saturates rather than failing the close.
         let open_nonce: u64 = 1;
-        let channel = channel_address(&payer_key, &receiver_key, &receiver_key, open_nonce);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
         let open = Transaction::open_channel(
             payer_pk.clone(),
             receiver_key,
             receiver_key,
+            payer.public_key(),
             NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
             CHANNEL_NEVER_EXPIRES,
             open_nonce,
@@ -1437,8 +1587,9 @@ fn saturated_receiver_still_settles_and_mints() {
         let voucher = Voucher::sign(&payer, channel, cumulative);
         let close = Transaction::close_channel(
             receiver_pk.clone(),
-            payer_pk.clone(),
+            payer_key,
             AccountKey::from_public_key(&receiver_pk),
+            payer.public_key(),
             open_nonce,
             cumulative,
             voucher.signature.clone(),
