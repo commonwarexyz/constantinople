@@ -86,17 +86,25 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-// Shards are up to 1 MiB of payload plus envelope, so a 1 MiB cap pushed
-// every shard transfer into an unpooled heap allocation (visible as
-// buffer_pool_oversized). 4 MiB keeps them pooled with room for growth.
-const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(4 * 1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(8_192);
-// The engine runs two 512 MiB page caches (2 x 65,536 pages of 8 KiB), all
-// drawing from this one pool; a 1,024-per-class cap pinned the 8 KiB class
-// and forced every page fill into an unpooled allocation (visible as
-// buffer_pool_exhausted). Demand is bounded by the cache capacities, so the
-// cap only needs to sit above them with churn headroom.
-const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(262_144);
+// Pooled buffers are retained forever, so every size class's worst-case
+// memory is max_per_class * class_size and the cap must be cheap even when
+// a class pins it: at 110k TPS the 512 KiB class alone retained ~20 GiB
+// under a 65,536 cap and OOM'd 30 GiB hosts. Block-sized payloads (~6 MiB
+// marshal backfill) stay unpooled (buffer_pool_oversized) by design — they
+// are rare and transient, while a pooled class sized for them would retain
+// gigabytes after any burst.
+const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
+// Worst case ~4 GiB across the 1 KiB..2 MiB classes (sum ~4 MiB * 1,024).
+// The 1 KiB vote class exhausts even at a 65,536 cap (demand is effectively
+// unbounded at 51 peers and 100k+ TPS), so exhaustion fallback to unpooled
+// allocation is its normal steady state and not worth buying with memory.
+const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+// Worst case ~2 GiB across the 4 KiB..8 MiB classes (sum ~16 MiB * 128). At
+// 110k TPS the 1 MiB class retained 4.1 GiB and the 8 MiB class 2.1 GiB
+// under a 262,144 cap. The two 512 MiB page caches hold their pages either
+// way — a page served from exhaustion fallback costs one unpooled 8 KiB
+// allocation, the same memory without idle pool retention on top.
+const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
