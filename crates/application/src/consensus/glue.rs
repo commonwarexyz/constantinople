@@ -6,7 +6,7 @@ use super::{
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, qmdb::sync::Target as AnyTarget, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
@@ -16,7 +16,7 @@ use rand::{CryptoRng, Rng};
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
 where
-    E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
+    E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
     C: Digest,
     S: Scheme<PublicKey = P>,

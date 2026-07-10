@@ -16,7 +16,7 @@ mod submitter;
 use accounts::{SpamAccount, generate_accounts};
 use clap::Parser;
 use cli::Cli;
-use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
+use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
@@ -118,9 +118,7 @@ fn main() {
             None,
         );
 
-        let strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create parallel strategy");
+        let strategy = context.strategy(NZUsize!(rayon_threads));
 
         let config = RelayerModeConfig {
             relayer_url,

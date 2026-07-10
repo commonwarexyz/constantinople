@@ -6,7 +6,7 @@ use commonware_glue::stateful::db::{
     any::{AnyStaged, AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use commonware_storage::{
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
@@ -92,7 +92,7 @@ pub(super) fn apply_transaction_digests<E, H, S>(
     digests: &[H::Digest],
 ) -> TransactionBatch<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -107,13 +107,19 @@ pub(super) async fn finalize_execution<E, H, S>(
     transaction_batch: TransactionBatch<E, H, S>,
 ) -> Result<MerkleizedDatabases<E, H, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let state_merkleized = state_staged.merkleize(state_updates, Vec::new()).await?;
-    let transaction_merkleized = transaction_batch.merkleize().await?;
-    Ok((state_merkleized, transaction_merkleized))
+    // The two batches own separate databases and locks, and each merkleize
+    // dispatches its CPU to the strategy's pool internally, so joining the
+    // futures runs the state and transaction-history merkleizes
+    // concurrently.
+    let (state_merkleized, transaction_merkleized) = futures::join!(
+        state_staged.merkleize(state_updates, Vec::new()),
+        transaction_batch.merkleize(),
+    );
+    Ok((state_merkleized?, transaction_merkleized?))
 }
 
 #[cfg(test)]

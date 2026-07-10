@@ -13,7 +13,7 @@ use commonware_codec::{
 };
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_storage::{
     merkle::{Location, mmr},
     qmdb::{
@@ -444,7 +444,7 @@ where
     ) -> Result<QueuedFinalizedUpload<H, P>, PublishError>
     where
         Cx: Spawner,
-        E: Storage + Clock + Metrics + Send + Sync + 'static,
+        E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
         S: Strategy + Send + Sync + 'static,
     {
         let state_end = block.header.state_range.end();
@@ -1325,7 +1325,7 @@ async fn build_state_delta<E, H, P, S>(
     state_db: &StateDatabase<E, H, commonware_storage::translator::EightCap, S>,
 ) -> Result<Vec<StateOperation>, PublishError>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     P: PublicKey,
     S: Strategy,
@@ -1417,7 +1417,7 @@ async fn load_state_ops<E, H, S>(
     end: u64,
 ) -> Result<Vec<StateOperation>, PublishError>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -2165,7 +2165,7 @@ mod tests {
         transactions: Vec<SignedTransaction<Sha256>>,
     ) -> EngineBlock<Sha256, ed25519::PublicKey>
     where
-        E: Storage + Clock + Metrics + Send + Sync + 'static,
+        E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     {
         let (state_batch, transaction_batch) = databases.new_batches().await;
         let state_batch = state_updates
@@ -2226,7 +2226,7 @@ mod tests {
         block: &EngineBlock<Sha256, ed25519::PublicKey>,
     ) where
         Cx: Spawner,
-        E: Storage + Clock + Metrics + Send + Sync + 'static,
+        E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
     {
         let (state_next, transaction_next) = publisher.next_locations().await;
         let upload = Publisher::build_queued_finalized_upload_with_context(

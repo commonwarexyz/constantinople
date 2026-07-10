@@ -16,7 +16,9 @@ use commonware_glue::stateful::{
 };
 use commonware_macros::boxed;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::traces::TracedExt as _,
+};
 use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
@@ -26,7 +28,7 @@ use tracing::{Instrument as _, info, info_span, warn};
 
 impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
 where
-    E: Storage + Metrics + Clock,
+    E: BufferPooler + Storage + Metrics + Clock,
     C: Digest,
     H: Hasher,
     P: PublicKey,
@@ -54,7 +56,7 @@ where
         input: &mut I,
     ) -> Option<Proposed<Self, E>>
     where
-        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
+        E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
@@ -136,7 +138,7 @@ where
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
-        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
+        E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
@@ -234,7 +236,7 @@ where
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
     where
-        E: Rng + Spawner + Storage + Metrics + Clock + CryptoRng,
+        E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,

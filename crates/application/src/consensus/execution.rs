@@ -96,7 +96,9 @@ use crate::executor::{self, PreparedTransfer};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Storage, telemetry::traces::TracedExt as _};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
+};
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_primitives::{
@@ -107,7 +109,7 @@ use tracing::info_span;
 
 pub(super) struct ProposalExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -117,7 +119,7 @@ where
 
 pub(super) struct BlockExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -130,7 +132,7 @@ where
 
 impl<E, H, S> BlockExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -154,7 +156,7 @@ pub async fn compute<E, H, S>(
     strategy: &S,
 ) -> (StateStaged<E, H, EightCap, S>, Option<StateUpdates>)
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -183,7 +185,7 @@ pub(super) async fn stage_empty<E, H, S>(
     batch: StateBatch<E, H, EightCap, S>,
 ) -> StateStaged<E, H, EightCap, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -225,7 +227,7 @@ async fn load_accounts<E, H, S>(
     general: &executor::GeneralWorkload,
 ) -> (StateStaged<E, H, EightCap, S>, LoadedAccounts)
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -363,7 +365,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S>(
     transactions: Vec<SignedTransaction<H>>,
 ) -> Option<ProposalExecution<E, H, S>>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     H: Hasher,
     P: PublicKey,
@@ -428,7 +430,7 @@ pub(super) async fn execute_body<E, C, P, H, S>(
     body: PreparedBody<H>,
 ) -> Result<BlockExecution<E, H, S>>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -474,7 +476,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     strategy: S,
 ) -> Result<db::MerkleizedDatabases<E, H, S>>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -504,7 +506,7 @@ pub(super) fn commitments_match<E, C, P, H, S>(
     execution: &BlockExecution<E, H, S>,
 ) -> bool
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,
@@ -540,7 +542,7 @@ async fn finalize_child<E, C, P, H, S>(
     expect_message: &'static str,
 ) -> BlockExecution<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     H: Hasher,

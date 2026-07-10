@@ -152,7 +152,7 @@ pub enum StartupMode<F> {
 
 pub struct Config<E, C, M, B, V, St, I, H, O>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,

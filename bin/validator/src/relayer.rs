@@ -131,10 +131,26 @@ struct Leader {
 #[derive(Debug)]
 struct DecodedBatch {
     transactions: Vec<SignedTransaction<sha256::Sha256>>,
-    /// Hex digest -> every position in `transactions` carrying it (duplicate
-    /// digests map to all copies), for matching status-API digest lists back
-    /// to local transactions.
-    digest_index: HashMap<String, Vec<usize>>,
+}
+
+/// Hex digest -> every position in `transactions` carrying it (duplicate
+/// digests map to all copies), for matching status-API digest lists back to
+/// local transactions.
+///
+/// Only the partial-finalization status arm consumes this, so it is built on
+/// demand (on the strategy's pool) instead of eagerly hex-formatting tens of
+/// thousands of digests on every submission.
+type DigestIndex = HashMap<String, Vec<usize>>;
+
+fn build_digest_index(batch: &DecodedBatch) -> DigestIndex {
+    let mut digest_index = DigestIndex::new();
+    for (index, transaction) in batch.transactions.iter().enumerate() {
+        digest_index
+            .entry(transaction.message_digest().to_string())
+            .or_default()
+            .push(index);
+    }
+    digest_index
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -217,7 +233,9 @@ async fn submit_transactions<St: Strategy>(
     // Decoding seal-hashes every transaction, so it runs on the strategy's
     // pool along with hashing the batch id. The owned permit rides in the
     // job to bound concurrent decode CPU (the pool is shared with the
-    // co-located engine).
+    // co-located engine). The job itself is single-threaded because the wire
+    // format has no per-transaction framing to split on; the digest index is
+    // deferred to first use instead of paying it here on every submission.
     let Ok(permit) = state.decode_permits.clone().acquire_owned().await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
     };
@@ -266,9 +284,20 @@ async fn submit_with_retries<St: Strategy>(
     let mut pending: HashSet<usize> = (0..total).collect();
     let mut included: HashSet<usize> = HashSet::new();
     let mut sent: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut digest_index: Option<DigestIndex> = None;
     let mut height = 0;
     let mut accepted_any = false;
-    let mut attempts = Vec::<(String, Leader)>::new();
+    // Every (batch id, leader) pair POSTed at least once; each is polled for
+    // status every round, which also recovers outcomes whose accept response
+    // was lost in transit.
+    let mut posted = Vec::<(String, Leader)>::new();
+    // Pairs whose POST was accepted are never re-POSTed; a pair that failed
+    // (or whose response was lost) is re-POSTed only while its leader remains
+    // in the current targeting window. Suppression loses nothing: the leader
+    // caches every batch id's status, so a repeat POST of a known batch id is
+    // acknowledged without re-admitting its transactions — even one whose
+    // status has resolved to dropped.
+    let mut accepted: HashSet<(String, String)> = HashSet::new();
     let mut views = state.view_clock.current_view.subscribe();
     let mut view = *views.borrow();
 
@@ -292,21 +321,41 @@ async fn submit_with_retries<St: Strategy>(
         };
         sent.entry(sent_batch_id.clone())
             .or_insert_with(|| pending.iter().copied().collect());
-        for target in next_two_leaders(&state.leaders, view) {
-            attempts.push((sent_batch_id.clone(), target));
-        }
-        let targets = attempts
-            .iter()
-            .filter(|(batch_id, _)| batch_id == &sent_batch_id)
-            .map(|(_, leader)| leader.clone())
+        // POST only to leaders that have not already accepted this batch id:
+        // consecutive next-two-leaders windows overlap by one, and a resend
+        // to an accepting leader only re-burns its ingress decode and verify.
+        let targets = next_two_leaders(&state.leaders, view)
+            .into_iter()
+            .filter(|target| {
+                !accepted.contains(&(sent_batch_id.clone(), target.public_key.clone()))
+            })
             .collect::<Vec<_>>();
+        for target in &targets {
+            if !posted.iter().any(|(batch_id, leader)| {
+                batch_id == &sent_batch_id && leader.public_key == target.public_key
+            }) {
+                posted.push((sent_batch_id.clone(), target.clone()));
+            }
+        }
         let result = forward_to_targets(&state.http, &targets, send_body).await;
         if let Some(status) = result.deterministic {
             return (status, String::new());
         }
-        accepted_any |= result.accepted;
+        accepted_any |= !result.accepted.is_empty();
+        for leader in result.accepted {
+            accepted.insert((sent_batch_id.clone(), leader.public_key));
+        }
 
-        merge_statuses(state, &attempts, &sent, &batch, &mut included, &mut height).await;
+        merge_statuses(
+            state,
+            &posted,
+            &sent,
+            &batch,
+            &mut digest_index,
+            &mut included,
+            &mut height,
+        )
+        .await;
         pending.retain(|index| !included.contains(index));
         if pending.is_empty() {
             return json_response(TxStatus::Finalized { height });
@@ -326,7 +375,7 @@ async fn submit_with_retries<St: Strategy>(
 }
 
 struct ForwardSummary {
-    accepted: bool,
+    accepted: Vec<Leader>,
     deterministic: Option<StatusCode>,
 }
 
@@ -342,13 +391,13 @@ async fn forward_to_targets(
         async move { forward_to_leader(&http, leader, body).await }
     });
 
-    let mut accepted = false;
+    let mut accepted = Vec::new();
     let mut deterministic = None;
     for result in join_all(sends).await {
         match result {
             ForwardResult::Accepted { leader } => {
-                accepted = true;
                 debug!(leader = %leader.public_key, "relayer forward accepted");
+                accepted.push(leader);
             }
             ForwardResult::Deterministic(status) => deterministic = Some(status),
             ForwardResult::Transient { leader } => {
@@ -365,14 +414,24 @@ async fn forward_to_targets(
 
 async fn merge_statuses<St: Strategy>(
     state: &AppState<St>,
-    attempts: &[(String, Leader)],
+    posted: &[(String, Leader)],
     sent: &HashMap<String, Vec<usize>>,
-    batch: &DecodedBatch,
+    batch: &Arc<DecodedBatch>,
+    digest_index: &mut Option<DigestIndex>,
     included: &mut HashSet<usize>,
     height: &mut u64,
 ) {
-    for (batch_id, leader) in attempts {
-        let Some(status) = fetch_status_from_leader(&state.http, leader, batch_id).await else {
+    let fetches = posted.iter().map(|(batch_id, leader)| {
+        let http = state.http.clone();
+        async move {
+            (
+                batch_id,
+                fetch_status_from_leader(&http, leader, batch_id).await,
+            )
+        }
+    });
+    for (batch_id, status) in join_all(fetches).await {
+        let Some(status) = status else {
             continue;
         };
         match status {
@@ -393,8 +452,18 @@ async fn merge_statuses<St: Strategy>(
                 ..
             } => {
                 *height = (*height).max(finalized_height);
+                if digest_index.is_none() {
+                    let batch = Arc::clone(batch);
+                    *digest_index = Some(
+                        state
+                            .strategy
+                            .spawn(move |_: St| build_digest_index(&batch))
+                            .await,
+                    );
+                }
+                let index = digest_index.as_ref().expect("digest index built above");
                 for digest in leader_included {
-                    if let Some(indices) = batch.digest_index.get(&digest) {
+                    if let Some(indices) = index.get(&digest) {
                         included.extend(indices.iter().copied());
                     }
                 }
@@ -601,18 +670,8 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<DecodedBatch, St
     if total_bytes > max_batch_bytes {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
-    let mut digest_index: HashMap<String, Vec<usize>> = HashMap::new();
-    for (index, transaction) in transactions.iter().enumerate() {
-        digest_index
-            .entry(transaction.message_digest().to_string())
-            .or_default()
-            .push(index);
-    }
 
-    Ok(DecodedBatch {
-        transactions,
-        digest_index,
-    })
+    Ok(DecodedBatch { transactions })
 }
 
 fn encode_pending(batch: &DecodedBatch, pending: &HashSet<usize>) -> Bytes {
@@ -735,15 +794,16 @@ mod tests {
     }
 
     #[test]
-    fn decode_batch_maps_duplicate_digests_to_all_positions() {
+    fn digest_index_maps_duplicate_digests_to_all_positions() {
         let unique = signed_transfer(1, 0);
         let duplicate = signed_transfer(2, 0);
         let body = vec![unique.clone(), duplicate.clone(), duplicate.clone()].encode();
 
         let batch = decode_batch(&body, DEFAULT_MAX_BATCH_BYTES).expect("decode");
+        let digest_index = build_digest_index(&batch);
 
-        let unique_positions = &batch.digest_index[&unique.message_digest().to_string()];
-        let duplicate_positions = &batch.digest_index[&duplicate.message_digest().to_string()];
+        let unique_positions = &digest_index[&unique.message_digest().to_string()];
+        let duplicate_positions = &digest_index[&duplicate.message_digest().to_string()];
         assert_eq!(unique_positions, &vec![0]);
         assert_eq!(duplicate_positions, &vec![1, 2]);
 
@@ -907,5 +967,194 @@ mod tests {
             TxStatus::Dropped,
         );
         assert_eq!(submit_count.load(Ordering::Relaxed), 2);
+    }
+
+    /// Pops the next scripted response, repeating the last one once the
+    /// script is down to a single entry; `None` for an empty script.
+    fn take_scripted<T: Clone>(script: &std::sync::Mutex<Vec<T>>) -> Option<T> {
+        let mut script = script.lock().expect("script lock");
+        match script.len() {
+            0 => None,
+            1 => Some(script[0].clone()),
+            _ => Some(script.remove(0)),
+        }
+    }
+
+    /// A mock leader whose ingest endpoint answers with scripted status codes
+    /// (default 202) while recording POST bodies, and whose status endpoint
+    /// serves scripted [`BatchStatus`] responses (`None` -> 404).
+    fn scripted_leader(
+        ingest: Vec<StatusCode>,
+        statuses: Vec<Option<BatchStatus>>,
+    ) -> (Router, Arc<std::sync::Mutex<Vec<Bytes>>>) {
+        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let ingest = Arc::new(std::sync::Mutex::new(ingest));
+        let statuses = Arc::new(std::sync::Mutex::new(statuses));
+        let bodies_for_handler = bodies.clone();
+        let router = Router::new()
+            .route(
+                "/transactions/ingest",
+                post(move |body: Bytes| {
+                    let bodies = bodies_for_handler.clone();
+                    let ingest = ingest.clone();
+                    async move {
+                        bodies.lock().expect("bodies lock").push(body);
+                        let status = take_scripted(&ingest).unwrap_or(StatusCode::ACCEPTED);
+                        (status, String::new())
+                    }
+                }),
+            )
+            .route(
+                "/transactions/{batch_id}",
+                get(move |Path(_): Path<String>| {
+                    let statuses = statuses.clone();
+                    async move {
+                        take_scripted(&statuses).flatten().map_or_else(
+                            || (StatusCode::NOT_FOUND, String::new()),
+                            |status| {
+                                (
+                                    StatusCode::OK,
+                                    serde_json::to_string(&status).expect("status json"),
+                                )
+                            },
+                        )
+                    }
+                }),
+            );
+        (router, bodies)
+    }
+
+    fn retry_state(
+        leaders: Vec<Leader>,
+        max_retry_views: u64,
+    ) -> AppState<commonware_parallel::Sequential> {
+        let (_, view_clock) = Observer::new();
+        AppState {
+            leaders: Arc::new(leaders),
+            max_retry_views,
+            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+            account_reader: Arc::new(OnceLock::new()),
+            view_clock,
+            http: reqwest::Client::new(),
+            strategy: commonware_parallel::Sequential,
+            decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        }
+    }
+
+    fn mock_leader(key: &str, url: String) -> Leader {
+        Leader {
+            public_key: key.to_string(),
+            sort_key: from_hex(key).expect("hex key"),
+            url,
+        }
+    }
+
+    /// Advances the relayer's observed view every few milliseconds so
+    /// `wait_for_view_advance` never stalls a retry round.
+    fn advance_views(sender: watch::Sender<u64>) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            let mut view = 0u64;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                view += 1;
+                sender.send_replace(view);
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn unpinned_retry_posts_once_per_accepting_leader() {
+        let (router_a, bodies_a) = scripted_leader(
+            Vec::new(),
+            vec![
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Finalized { height: 7 }),
+            ],
+        );
+        let (router_b, bodies_b) = scripted_leader(Vec::new(), vec![Some(BatchStatus::Accepted)]);
+        let leader_a = mock_leader("aa", spawn_mock_leader(router_a).await);
+        let leader_b = mock_leader("bb", spawn_mock_leader(router_b).await);
+        let state = retry_state(vec![leader_a, leader_b], 3);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 7 },
+        );
+        // Both leaders accepted in round 0 and are polled (not re-POSTed) in
+        // every later round.
+        assert_eq!(bodies_a.lock().expect("bodies lock").len(), 1);
+        assert_eq!(bodies_b.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unpinned_retry_reposts_transient_leader_within_window() {
+        let (router, bodies) = scripted_leader(
+            vec![StatusCode::SERVICE_UNAVAILABLE, StatusCode::ACCEPTED],
+            vec![None, Some(BatchStatus::Finalized { height: 3 })],
+        );
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 2);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 3 },
+        );
+        // The transient round-0 failure is retried in round 1 because the
+        // single leader stays in the targeting window; the accepted POST is
+        // never repeated.
+        assert_eq!(bodies.lock().expect("bodies lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn unpinned_retry_resends_pending_subset_after_partial_finalization() {
+        let first = signed_transfer(1, 0);
+        let second = signed_transfer(2, 0);
+        let partial = BatchStatus::PartiallyFinalized {
+            height: 5,
+            included: vec![first.message_digest().to_string()],
+            filtered: vec![second.message_digest().to_string()],
+        };
+        let (router, bodies) = scripted_leader(Vec::new(), vec![Some(partial)]);
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 1);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![first, second.clone()].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::PartiallyFinalized {
+                height: 5,
+                included: 1,
+                filtered: 1,
+            },
+        );
+        // The partial finalization builds the on-demand digest index, shrinks
+        // the pending set, and round 1 re-POSTs only the pending subset under
+        // a fresh batch id.
+        let bodies = bodies.lock().expect("bodies lock");
+        assert_eq!(bodies.len(), 2);
+        assert_eq!(bodies[1], vec![second].encode());
     }
 }

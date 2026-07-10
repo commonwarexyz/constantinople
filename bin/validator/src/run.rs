@@ -29,7 +29,7 @@ use commonware_macros::boxed;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    BufferPoolConfig, Quota, Runner as _, Supervisor as _, ThreadPooler as _,
+    BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
@@ -723,9 +723,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        let strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create worker strategy");
+        let strategy = context.strategy(NZUsize!(rayon_threads));
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),
             NonZeroUsize::new(public_key_cache_size)

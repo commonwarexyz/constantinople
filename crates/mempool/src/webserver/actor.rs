@@ -652,6 +652,18 @@ where
                     response.send_lossy(batch_txs);
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
+                    // Only outstanding proposals from this node consume the
+                    // finalized-digest set (at most ~1 in `participants`
+                    // views), so the full-body decode is skipped otherwise.
+                    // The block is still released on the strategy's pool, so
+                    // neither the derive nor the drop blocks this loop and
+                    // the Propose requests it serves.
+                    if proposed.is_empty() {
+                        drop(strategy.spawn(move |_: St| drop(block)));
+                        acknowledgement.acknowledge();
+                        continue;
+                    }
+
                     let height = block.header.height;
                     // Deriving the finalized set decodes any transaction the
                     // application has not already materialized, so it runs on
