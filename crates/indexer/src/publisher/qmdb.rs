@@ -40,14 +40,13 @@ use std::{
     marker::PhantomData,
     num::NonZeroU64,
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
-    time::sleep,
 };
-use tracing::{debug, warn};
+use tracing::debug;
 
 /// Durable queued uploads are self-contained and comparatively cheap to admit.
 const MAX_BUFFERED_QMDB_UPLOADS: usize = 64;
@@ -1527,31 +1526,12 @@ const fn next_writer_location(watermark: Option<Location<QmdbFamily>>) -> u64 {
     }
 }
 
-async fn commit_with_retry(client: &StoreClient, batch: &StoreWriteBatch) -> u64 {
-    let mut attempt = 0u32;
-    loop {
-        match batch.commit(client).await {
-            Ok(seq) => return seq,
-            Err(error) => {
-                attempt = attempt.saturating_add(1);
-                warn!(
-                    ?error,
-                    attempt,
-                    rows = batch.len(),
-                    "indexer finalized index upload failed, retrying"
-                );
-                sleep(retry_backoff(attempt)).await;
-            }
-        }
-    }
-}
-
 async fn commit_required_batch(client: StoreClient, batch: StoreWriteBatch) -> u64 {
     assert!(
         !batch.is_empty(),
         "QMDB component batches must contain at least one row"
     );
-    commit_with_retry(&client, &batch).await
+    super::commit_with_retry(&client, &batch, "finalized index upload").await
 }
 
 async fn commit_required_batch_blocking<Cx>(
@@ -1567,13 +1547,6 @@ where
         .spawn(move |_| async move { commit_required_batch(client, batch).await })
         .await
         .expect("QMDB Store commit task exited")
-}
-
-fn retry_backoff(attempt: u32) -> Duration {
-    const INITIAL: Duration = Duration::from_millis(100);
-    const MAX: Duration = Duration::from_secs(2);
-    let factor = 1u32 << attempt.min(5);
-    INITIAL.saturating_mul(factor).min(MAX)
 }
 
 #[cfg(test)]

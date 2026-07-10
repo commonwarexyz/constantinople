@@ -17,10 +17,10 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use exoware_sdk::{PrefixedStoreClient, StoreClient, StoreWriteBatch};
+use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
-use std::{sync::Arc, time::Duration};
-use tokio::{sync::mpsc, task::JoinHandle, time::sleep};
+use std::sync::Arc;
+use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, warn};
 
 /// Cloneable reporter over Simplex activity.
@@ -216,7 +216,9 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex block upload must stage");
-    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let seq =
+        super::commit_with_retry(client.store_client().client(), &batch, "certificate upload")
+            .await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
@@ -280,7 +282,9 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex upload must stage");
-    let seq = commit_with_retry(client.store_client(), &batch).await;
+    let seq =
+        super::commit_with_retry(client.store_client().client(), &batch, "certificate upload")
+            .await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,
@@ -290,36 +294,6 @@ where
         "indexer uploaded simplex header certificate batch"
     );
     uploaded_finalization
-}
-
-async fn commit_with_retry(client: &PrefixedStoreClient, batch: &StoreWriteBatch) -> u64 {
-    // Rows are prefix-encoded as they are staged (a shared batch may span
-    // namespaces), so the batch commit is namespace-agnostic and the SDK
-    // only exposes it on the underlying client.
-    let client = client.client();
-    let mut attempt = 0u32;
-    loop {
-        match batch.commit(client).await {
-            Ok(seq) => return seq,
-            Err(error) => {
-                attempt = attempt.saturating_add(1);
-                warn!(
-                    ?error,
-                    attempt,
-                    rows = batch.len(),
-                    "simplex certificate upload failed, retrying"
-                );
-                sleep(retry_backoff(attempt)).await;
-            }
-        }
-    }
-}
-
-fn retry_backoff(attempt: u32) -> Duration {
-    const INITIAL: Duration = Duration::from_millis(100);
-    const MAX: Duration = Duration::from_secs(2);
-    let factor = 1u32 << attempt.min(5);
-    INITIAL.saturating_mul(factor).min(MAX)
 }
 
 /// A finalized header tagged with the marshal commitment certified by Simplex.

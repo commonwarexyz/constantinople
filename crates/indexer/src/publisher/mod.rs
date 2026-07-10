@@ -21,5 +21,43 @@ pub mod qmdb;
 pub mod sql;
 
 pub use certificate::CertificateReporter;
+use exoware_sdk::{StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
 pub use sql::SqlRow;
+use std::time::Duration;
+use tokio::time::sleep;
+use tracing::warn;
+
+/// Commits `batch` through the physical Store client, retrying with capped
+/// exponential backoff until it lands. Rows are namespace-encoded when they
+/// are staged, so the commit is a raw write.
+pub(crate) async fn commit_with_retry(
+    client: &StoreClient,
+    batch: &StoreWriteBatch,
+    what: &'static str,
+) -> u64 {
+    let mut attempt = 0u32;
+    loop {
+        match batch.commit(client).await {
+            Ok(seq) => return seq,
+            Err(error) => {
+                attempt = attempt.saturating_add(1);
+                warn!(
+                    ?error,
+                    attempt,
+                    rows = batch.len(),
+                    what,
+                    "store batch commit failed, retrying"
+                );
+                sleep(retry_backoff(attempt)).await;
+            }
+        }
+    }
+}
+
+fn retry_backoff(attempt: u32) -> Duration {
+    const INITIAL: Duration = Duration::from_millis(100);
+    const MAX: Duration = Duration::from_secs(2);
+    let factor = 1u32 << attempt.min(5);
+    INITIAL.saturating_mul(factor).min(MAX)
+}
