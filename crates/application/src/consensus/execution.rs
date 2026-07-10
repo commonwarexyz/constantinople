@@ -355,7 +355,7 @@ where
 /// would strand), so the deadline gates starting another refill, not
 /// finishing one. Transactions dropped in the final round age out of the
 /// mempool like any unfinalized proposal.
-const BUILD_TIMEOUT: Duration = Duration::from_millis(100);
+const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 
 /// Executes a proposal's candidate transactions best effort.
 ///
