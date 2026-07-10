@@ -74,8 +74,8 @@ where
         // consumed from the mempool, so its selection seeds a best-effort
         // re-execution against the actual parent: anything already included
         // upstream (or otherwise inapplicable there) fails its nonce or
-        // balance check and is dropped, and the dropped bytes are refilled
-        // from the mempool.
+        // balance check and is dropped, and the block tops up from the live
+        // mempool toward the proposal budget.
         let speculation = match &self.speculator {
             Some(speculator) => speculator.take().await,
             None => None,
