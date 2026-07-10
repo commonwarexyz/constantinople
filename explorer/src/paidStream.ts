@@ -18,6 +18,7 @@ export interface OperatorAdvertisement {
     readonly settleMargin: bigint;
     readonly pricePerToken: bigint;
     readonly debtLimit: bigint;
+    readonly streamTokens: bigint;
 }
 
 /// Parses the `/public-key` response, rejecting advertisements that miss a
@@ -32,7 +33,17 @@ export function parseAdvertisement(body: unknown): OperatorAdvertisement {
         settleMargin: numberField(record, 'settle_margin'),
         pricePerToken: numberField(record, 'price_per_token'),
         debtLimit: numberField(record, 'debt_limit'),
+        streamTokens: numberField(record, 'stream_tokens'),
     };
+}
+
+/// Sizes a fresh channel's deposit from the advertisement: enough for the
+/// whole stream plus a debt window of headroom, so a paying session ends
+/// with `complete` (any surplus refunds at close). Guards a zero price so a
+/// misconfigured operator cannot produce an unfundable zero deposit.
+export function channelDeposit(advertisement: OperatorAdvertisement): bigint {
+    const price = advertisement.pricePerToken > 0n ? advertisement.pricePerToken : 1n;
+    return (advertisement.streamTokens + advertisement.debtLimit) * price;
 }
 
 /// Picks an expiry for a fresh channel from the operator's advertised
@@ -203,6 +214,17 @@ export function parseSettleOutcome(body: unknown): SettleOutcome {
         throw new Error('settled must be a boolean');
     }
     return { settled, cumulative: numberField(record, 'cumulative') };
+}
+
+/// The `GET /stats` response. The body carries more counters; the explorer
+/// reads only the off-chain one the chain cannot corroborate.
+export interface OperatorStatsSnapshot {
+    readonly vouchers: bigint;
+}
+
+export function parseStats(body: unknown): OperatorStatsSnapshot {
+    const record = asRecord(body, 'operator stats');
+    return { vouchers: numberField(record, 'vouchers') };
 }
 
 function parseMeter(record: Record<string, unknown>): StreamMeter {

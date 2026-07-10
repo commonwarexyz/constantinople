@@ -126,16 +126,6 @@ export function unionUnique(namespace: string, message: Uint8Array): Uint8Array 
     return bytesConcat(encodeUsize(namespaceBytes.length), namespaceBytes, message);
 }
 
-/// Wraps a raw 32-byte ed25519 public key into the chain's 34-byte
-/// transaction public key (scheme byte, key, one padding byte).
-export function ed25519TransactionPublicKey(rawPublicKey: Uint8Array): Uint8Array {
-    assertByteLength(rawPublicKey, ACCOUNT_KEY_BYTES, 'ed25519 public key');
-    const publicKey = new Uint8Array(PUBLIC_KEY_BYTES);
-    publicKey[0] = ED25519_SCHEME;
-    publicKey.set(rawPublicKey, 1);
-    return publicKey;
-}
-
 /// Wraps a raw 64-byte ed25519 signature into the chain's scheme-tagged
 /// transaction signature tail.
 export function ed25519TransactionSignature(rawSignature: Uint8Array): Uint8Array {

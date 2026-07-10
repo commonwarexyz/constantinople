@@ -338,6 +338,7 @@ async fn public_key(State(service): State<Arc<Service>>) -> Json<PublicKeyRespon
         margins.settle_margin,
         STREAM_PRICE_PER_TOKEN,
         STREAM_DEBT_LIMIT,
+        content::tokens().len() as u64,
     ))
 }
 

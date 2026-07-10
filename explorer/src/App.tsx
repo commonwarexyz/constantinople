@@ -24,6 +24,7 @@ import {
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
 import { type BlockKindCounts, type ObservedBlock, subscribeBlocks } from './indexer';
+import { fetchStats } from './operatorClient';
 import {
     fetchAccount,
     statusHasHeight,
@@ -69,7 +70,7 @@ import {
     type OpenStreamChannelRequest,
     type ReclaimStreamChannelRequest,
 } from './PaidStreamPage';
-import { shortHex, sleep, trimTrailingSlash } from './util';
+import { shortHex, sleep } from './util';
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
@@ -146,10 +147,15 @@ function addKindCounts(total: BlockKindCounts, block: ObservedBlock): BlockKindC
     return buildKindCounts((key) => total[key] + block.kinds[key]);
 }
 
-// The `/stats` body carries more counters; the explorer only reads the
-// off-chain one the stream can't provide.
-interface OperatorStatsSnapshot {
-    readonly vouchers: number;
+/// A stable identity over the freshest closure: the wrapped function may be
+/// rebuilt every render, but memoized consumers of the returned one don't
+/// re-render for that.
+function useStableCallback<Args extends unknown[], Result>(
+    latest: (...args: Args) => Result,
+): (...args: Args) => Result {
+    const ref = useRef(latest);
+    ref.current = latest;
+    return useCallback((...args: Args) => ref.current(...args), []);
 }
 
 interface SubmittedTransaction {
@@ -332,23 +338,20 @@ export default function App() {
     // the page they are not proof-verified, and the strip labels them so.
     useEffect(() => {
         if (!operatorUrl) return;
-        const base = trimTrailingSlash(operatorUrl);
         let cancelled = false;
         const poll = async () => {
             try {
-                const response = await fetch(`${base}/stats`);
-                if (!response.ok) return;
-                const stats: OperatorStatsSnapshot = await response.json();
+                const vouchers = Number((await fetchStats(operatorUrl)).vouchers);
                 if (cancelled) return;
                 const baseline = voucherBaselineRef.current;
                 if (baseline === null) {
-                    voucherBaselineRef.current = stats.vouchers;
-                } else if (stats.vouchers < baseline) {
+                    voucherBaselineRef.current = vouchers;
+                } else if (vouchers < baseline) {
                     // The operator restarted (its lifetime count reset);
                     // restart the session count with it.
                     voucherBaselineRef.current = 0;
                 }
-                setSessionVouchers(stats.vouchers - (voucherBaselineRef.current ?? 0));
+                setSessionVouchers(vouchers - (voucherBaselineRef.current ?? 0));
             } catch {
                 // Operator not up yet (or between restarts); keep polling.
             }
@@ -905,13 +908,12 @@ export default function App() {
         }
     };
 
-    /// The transfer half of a `submitSigned` call, shared by the transfer
-    /// form and the paid-stream funding path. Parses the recipient inside the
-    /// returned builder so bad input surfaces through `submitSigned`'s catch.
-    const transferBuilder =
-        (toKeyHex: string, transferValue: bigint) =>
-        async (nonce: bigint, activeWallet: ActiveWallet) => {
-            const toAccountKey = parseAccountKeyHex(toKeyHex);
+    /// Parses the form inputs inside the builder so bad input surfaces
+    /// through `submitSigned`'s catch.
+    const submitTransfer = () =>
+        submitSigned('forming transaction', async (nonce, activeWallet) => {
+            const toAccountKey = parseAccountKeyHex(toKey);
+            const transferValue = parseU64(value, 'value');
             const encoded = await encodeSignedTransaction(
                 {
                     senderPublicKey: activeWallet.publicKey,
@@ -922,12 +924,7 @@ export default function App() {
                 activeWallet.sign,
             );
             return { encoded, kind: 'transfer' as const, to: toHex(toAccountKey), value: transferValue };
-        };
-
-    const submitTransfer = () =>
-        submitSigned('forming transaction', (nonce, activeWallet) =>
-            transferBuilder(toKey, parseU64(value, 'value'))(nonce, activeWallet),
-        );
+        });
 
     /// Signs and submits the paid stream's OpenChannel from the passkey
     /// wallet (payee-run topology: the operator is also the receiver).
@@ -994,18 +991,8 @@ export default function App() {
     // Stable identities over the freshest closures: `submitSigned` (and so
     // both builders above) is rebuilt every render, but the memoized
     // PaidStreamPage must not re-render for that.
-    const openStreamChannelRef = useRef(openStreamChannelNow);
-    openStreamChannelRef.current = openStreamChannelNow;
-    const openStreamChannel = useCallback(
-        (request: OpenStreamChannelRequest) => openStreamChannelRef.current(request),
-        [],
-    );
-    const reclaimStreamChannelRef = useRef(reclaimStreamChannelNow);
-    reclaimStreamChannelRef.current = reclaimStreamChannelNow;
-    const reclaimStreamChannel = useCallback(
-        (request: ReclaimStreamChannelRequest) => reclaimStreamChannelRef.current(request),
-        [],
-    );
+    const openStreamChannel = useStableCallback(openStreamChannelNow);
+    const reclaimStreamChannel = useStableCallback(reclaimStreamChannelNow);
 
     const submitMint = () =>
         submitSigned('forming mint', async (nonce, activeWallet, senderAccountKey) => {

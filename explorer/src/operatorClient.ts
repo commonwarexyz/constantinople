@@ -6,6 +6,7 @@
 import { toHex } from './codec';
 import {
     OperatorAdvertisement,
+    OperatorStatsSnapshot,
     STREAM_CHUNK_EVENT,
     STREAM_END_EVENT,
     STREAM_PAYMENT_REQUIRED_EVENT,
@@ -15,6 +16,7 @@ import {
     StreamMeter,
     parseAdvertisement,
     parseSettleOutcome,
+    parseStats,
     parseStreamChunk,
     parseStreamEnd,
     parseStreamMeter,
@@ -63,6 +65,11 @@ async function requestJson(url: string, init?: RequestInit): Promise<unknown> {
 export async function fetchAdvertisement(operatorUrl: string): Promise<OperatorAdvertisement> {
     const body = await requestJson(`${trimTrailingSlash(operatorUrl)}/public-key`);
     return parseAdvertisement(body);
+}
+
+export async function fetchStats(operatorUrl: string): Promise<OperatorStatsSnapshot> {
+    const body = await requestJson(`${trimTrailingSlash(operatorUrl)}/stats`);
+    return parseStats(body);
 }
 
 /// Registers a finalized channel open, retrying through indexer lag. The

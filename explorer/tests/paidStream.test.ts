@@ -3,8 +3,10 @@ import test from 'node:test';
 
 import {
     CHANNEL_EXPIRY_SLACK,
+    channelDeposit,
     channelExpiry,
     parseAdvertisement,
+    parseStats,
     parseStreamChunk,
     parseStreamEnd,
     parseStreamMeter,
@@ -19,13 +21,28 @@ const advertisementBody = {
     settle_margin: 10,
     price_per_token: 1,
     debt_limit: 32,
+    stream_tokens: 500,
 };
 
 test('advertisement parses and prices the channel expiry', () => {
     const advertisement = parseAdvertisement(advertisementBody);
     assert.equal(advertisement.debtLimit, 32n);
     assert.equal(advertisement.pricePerToken, 1n);
+    assert.equal(advertisement.streamTokens, 500n);
     assert.equal(channelExpiry(advertisement), 130n + CHANNEL_EXPIRY_SLACK);
+});
+
+test('deposit covers the whole stream plus a debt window of headroom', () => {
+    const advertisement = parseAdvertisement(advertisementBody);
+    assert.equal(channelDeposit(advertisement), 532n);
+    // A zero advertised price still yields a fundable deposit.
+    assert.equal(channelDeposit({ ...advertisement, pricePerToken: 0n }), 532n);
+    assert.equal(channelDeposit({ ...advertisement, pricePerToken: 3n }), 1_596n);
+});
+
+test('operator stats parse the voucher counter', () => {
+    assert.equal(parseStats({ vouchers: 7, streamed: 100 }).vouchers, 7n);
+    assert.throws(() => parseStats({ streamed: 100 }), /vouchers/);
 });
 
 test('advertisement missing a knob is rejected, not zero-defaulted', () => {

@@ -66,6 +66,10 @@ pub struct PublicKeyResponse {
     /// before it pauses for a voucher. Advertised (like the margins) so
     /// clients pace their payments from the operator's actual configuration.
     pub debt_limit: u64,
+    /// Total tokens in the streamed content. Advertised so clients size a
+    /// channel deposit that covers the whole stream instead of agreeing on
+    /// the content's length by convention.
+    pub stream_tokens: u64,
 }
 
 impl PublicKeyResponse {
@@ -76,6 +80,7 @@ impl PublicKeyResponse {
         settle_margin: u64,
         price_per_token: u64,
         debt_limit: u64,
+        stream_tokens: u64,
     ) -> Self {
         Self {
             public_key: encode_field(public_key),
@@ -85,6 +90,7 @@ impl PublicKeyResponse {
             settle_margin,
             price_per_token,
             debt_limit,
+            stream_tokens,
         }
     }
 
@@ -390,7 +396,7 @@ mod tests {
     fn public_key_response_rejects_missing_advertised_knobs() {
         let payer_key = ed25519::PrivateKey::from_seed(6);
         let payer = TransactionPublicKey::ed25519(payer_key.public_key());
-        let response = PublicKeyResponse::new(&payer, 42, 20, 10, 1, 32);
+        let response = PublicKeyResponse::new(&payer, 42, 20, 10, 1, 32, 500);
 
         let partial_wire = format!(
             r#"{{"public_key":"{}","account":"{}"}}"#,

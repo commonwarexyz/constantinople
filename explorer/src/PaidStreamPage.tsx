@@ -20,6 +20,7 @@ import {
     settleChannel,
 } from './operatorClient';
 import {
+    channelDeposit,
     channelExpiry,
     voucherTopUp,
     type OperatorAdvertisement,
@@ -29,9 +30,6 @@ import {
 import { createVoucherKey, importVoucherKey, type VoucherKey } from './voucherKey';
 import { readStoredJson, shortHex } from './util';
 
-/// Tokens of content a channel's deposit buys (the essay is shorter, so a
-/// paying session ends with `complete`, not `deposit_exhausted`).
-const DEPOSIT_TOKENS = 600n;
 /// Retry delay for a transiently failed voucher post — well inside the
 /// operator's grace window, so a blip cannot kill a paying stream.
 const VOUCHER_RETRY_MS = 1_000;
@@ -275,15 +273,13 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     /// wallet reused the rolled-back nonce on another transaction before a
     /// retry, this open can never land and registration will keep answering
     /// 503 — recover by clearing the stream channel from localStorage.)
+    // (A duplicate of an already-finalized open reports dropped; the
+    // registration that follows is the check that actually decides.)
     const resubmitOpen = async (record: ChannelRecord) => {
-        const status = await submitTransactions(
+        await submitTransactions(
             mempoolUrl,
             encodeTransactionBatch([fromHex(record.signedOpenTxHex)]),
         );
-        if (!statusHasHeight(status)) {
-            // A duplicate of an already-finalized open reports dropped; the
-            // registration below is the check that actually decides.
-        }
     };
 
     /// Open the channel from the wallet (one passkey ceremony) and register
@@ -315,8 +311,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             setAdvertisement(ad);
 
             if (!record) {
-                const price = ad.pricePerToken > 0n ? ad.pricePerToken : 1n;
-                const deposit = DEPOSIT_TOKENS * price;
+                const deposit = channelDeposit(ad);
                 if (walletBalance === null || BigInt(walletBalance) < deposit) {
                     throw new Error(
                         `wallet balance too low for the ${deposit} deposit; mint to the wallet first`,

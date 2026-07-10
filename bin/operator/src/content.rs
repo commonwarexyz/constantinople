@@ -78,10 +78,9 @@ mod tests {
     fn tokens_reassemble_the_essay() {
         assert_eq!(tokens().concat(), ESSAY);
         assert!(tokens().iter().all(|token| !token.trim().is_empty()));
-        // The demo's pacing assumes a few hundred tokens, and the explorer
-        // sizes its deposit at DEPOSIT_TOKENS = 600 (PaidStreamPage.tsx) so a
-        // paying session ends with `complete`, not `deposit_exhausted` —
-        // growing the essay past that silently breaks the demo's ending.
-        assert!((300..600).contains(&tokens().len()));
+        // The demo's pacing assumes a few hundred tokens; clients size their
+        // deposits from the advertised count (`stream_tokens` on
+        // `/public-key`), so the length only needs to stay demo-sized.
+        assert!((300..1_000).contains(&tokens().len()));
     }
 }
