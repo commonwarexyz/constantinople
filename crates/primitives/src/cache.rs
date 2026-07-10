@@ -14,10 +14,7 @@ use commonware_runtime::{
 use commonware_utils::{cache::Clock, sync::RwLock};
 use core::num::NonZeroUsize;
 use p256::ecdsa::VerifyingKey;
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
+use std::sync::Arc;
 
 /// A public key decompressed into the form used by signature verification.
 ///
@@ -68,40 +65,49 @@ impl PublicKeyCache {
         );
         let _guard = span.enter();
 
-        // One read guard shared across the pool: acquiring the lock per key
-        // ping-pongs its cache line across threads on a hit-heavy batch.
-        let cache = self.inner.read();
-        let missed = AtomicU64::new(0);
-        let resolved: Vec<(DecompressedPublicKey, bool)> = strategy
-            .try_map_collect_vec(keys, |&key| {
-                if let Some(hit) = cache.get(key).cloned() {
-                    return Ok((hit, false));
-                }
-                let decompressed = Self::decompress_uncached(key).ok_or(())?;
-                missed.fetch_add(1, Ordering::Relaxed);
-                Ok::<_, ()>((decompressed, true))
-            })
-            .ok()?;
-        drop(cache);
+        // Look up hits sequentially under one short read guard. The guard
+        // MUST NOT be held across `strategy` work: a pool worker waiting
+        // inside a parallel operation steals other jobs, and a stolen job
+        // that re-enters this cache can block on the lock this thread still
+        // holds (a queued writer from a miss path blocks new readers), which
+        // deadlocks the entire pool. Lookups are cheap hash probes; only the
+        // curve arithmetic below is worth parallelism.
+        let mut resolved: Vec<Option<DecompressedPublicKey>> = {
+            let cache = self.inner.read();
+            keys.iter().map(|&key| cache.get(key).cloned()).collect()
+        };
 
-        // Insert all misses under one write lock; a pure-hit batch never
-        // takes it.
-        let missed = missed.into_inner();
+        // Decompress the misses on the pool with no lock held.
+        let missing: Vec<(usize, &TransactionPublicKey)> = resolved
+            .iter()
+            .enumerate()
+            .filter(|(_, hit)| hit.is_none())
+            .map(|(index, _)| (index, keys[index]))
+            .collect();
+        let missed = missing.len() as u64;
         span.record("misses", missed.traced());
         if missed > 0 {
             self.misses.inc_by(missed);
+            let decompressed: Vec<(usize, DecompressedPublicKey)> = strategy
+                .try_map_collect_vec(missing, |(index, key)| {
+                    Self::decompress_uncached(key)
+                        .map(|decompressed| (index, decompressed))
+                        .ok_or(())
+                })
+                .ok()?;
+
+            // Insert all misses under one write lock.
             let mut cache = self.inner.write();
-            for (key, (decompressed, miss)) in keys.iter().zip(&resolved) {
-                if *miss {
-                    cache.put((*key).clone(), decompressed.clone());
-                }
+            for (index, value) in decompressed {
+                cache.put(keys[index].clone(), value.clone());
+                resolved[index] = Some(value);
             }
         }
 
         Some(
             resolved
                 .into_iter()
-                .map(|(decompressed, _)| decompressed)
+                .map(|hit| hit.expect("every key resolved above"))
                 .collect(),
         )
     }
@@ -149,7 +155,7 @@ mod tests {
     use commonware_codec::Encode as _;
     use commonware_cryptography::{Signer as _, ed25519, secp256r1::standard as secp256r1};
     use commonware_math::algebra::Random as _;
-    use commonware_runtime::{Runner as _, Supervisor as _, deterministic};
+    use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, deterministic};
     use commonware_utils::{NZUsize, test_rng};
 
     fn decompress_one(
@@ -299,6 +305,61 @@ mod tests {
                 encoded.contains("public_key_cache_misses_total 1"),
                 "missing miss count:\n{encoded}"
             );
+        });
+    }
+
+    /// Regression: `decompress` once held the cache's read guard across the
+    /// strategy's parallel map while the miss path queued the write lock. A
+    /// pool worker waiting inside the map steals other jobs; a stolen
+    /// `decompress` then blocks on the lock its own thread still holds
+    /// (parking_lot blocks new readers once a writer queues), deadlocking the
+    /// entire pool. This drives many concurrent miss-heavy batches through a
+    /// tiny work-stealing pool; under the broken locking it wedges within a
+    /// few rounds (the test hangs), while correct locking finishes quickly.
+    ///
+    /// Runs on the tokio runtime: reproducing the steal interleaving needs a
+    /// real work-stealing pool, which the deterministic runtime cannot wait
+    /// on.
+    #[test]
+    fn concurrent_miss_heavy_decompress_terminates() {
+        let runner = commonware_runtime::tokio::Runner::default();
+        runner.start(|context| async move {
+            let strategy = context.strategy(NZUsize!(2));
+            let cache = PublicKeyCache::new(context, NZUsize!(64));
+
+            // Distinct keys per task so every batch is miss-heavy and takes
+            // the write path.
+            let mut rng = test_rng();
+            let keys: Vec<TransactionPublicKey> = (0..1024)
+                .map(|_| {
+                    TransactionPublicKey::ed25519(
+                        ed25519::PrivateKey::random(&mut rng).public_key(),
+                    )
+                })
+                .collect();
+
+            for round in 0..64 {
+                // Run every decompress INSIDE a pool job (as verification
+                // does in production): a worker mid-map steals sibling jobs,
+                // which is the interleaving the old locking deadlocked on.
+                let pending: Vec<_> = (0..16)
+                    .map(|task| {
+                        let cache = cache.clone();
+                        let keys = keys.clone();
+                        strategy.spawn(move |strategy: commonware_parallel::Rayon| {
+                            let start = (round * 16 + task * 64) % 768;
+                            let refs: Vec<&TransactionPublicKey> =
+                                keys[start..start + 256].iter().collect();
+                            cache
+                                .decompress(&refs, &strategy)
+                                .expect("valid keys decompress");
+                        })
+                    })
+                    .collect();
+                for job in pending {
+                    job.await;
+                }
+            }
         });
     }
 }
