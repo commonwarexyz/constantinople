@@ -17,8 +17,9 @@
 //! histories are possible — which is why reuse relies on execution alone:
 //! the selection re-executes best effort against the actual parent's state,
 //! any transaction that no longer applies (typically one that already landed
-//! on that chain) is dropped by its nonce or balance check, and the dropped
-//! bytes are refilled from the mempool. Execution output depends only on the
+//! on that chain) is dropped by its nonce or balance check, and the block
+//! tops up from the live mempool toward the proposal budget. Execution
+//! output depends only on the
 //! parent and the transaction set — not on the consensus context or the
 //! block timestamp — so a pre-built execution is valid for whichever round
 //! ends up proposing on the parent it was built on.
@@ -115,12 +116,10 @@ where
 }
 
 /// Decides when to pre-build and hands finished pre-builds to `propose`.
-pub(super) struct Speculator<E, H, C, P, I, St>
+pub(super) struct Speculator<E, H, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
-    C: Digest,
-    P: PublicKey,
     St: Strategy,
 {
     /// Mempool handle shared with each pre-build task. A replaced task can
@@ -134,15 +133,12 @@ where
     hits: Counter,
     reuses: Counter,
     discards: Counter,
-    _marker: std::marker::PhantomData<(C, P)>,
 }
 
-impl<E, H, C, P, I, St> Speculator<E, H, C, P, I, St>
+impl<E, H, I, St> Speculator<E, H, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
-    C: Digest,
-    P: PublicKey,
     St: Strategy,
 {
     pub(super) fn new(
@@ -167,27 +163,25 @@ where
                 "discards",
                 "Speculative pre-builds replaced before any proposal consumed them",
             ),
-            _marker: std::marker::PhantomData,
         }
     }
-}
 
-impl<E, H, C, P, I, St> Speculator<E, H, C, P, I, St>
-where
-    E: Spawner + BufferPooler + Storage + Clock + Metrics,
-    H: Hasher,
-    C: Digest,
-    P: PublicKey,
-    I: TransactionSource<C, P, H> + Sync,
-    St: Strategy,
-{
     /// Starts a pre-build of the next proposal on top of `parent` (a block
     /// this node just verified) when the local signer leads the next view.
+    /// The next round is assumed to stay in the parent's epoch; near an epoch
+    /// boundary the guess can only waste one pre-build, never corrupt one
+    /// (consumption ignores rounds entirely).
     ///
     /// The heavy work (mempool selection, execution, merkleization) runs on a
     /// spawned task and the strategy's pool; this call only forks batches and
     /// swaps the slot.
-    pub(super) fn maybe_prebuild(
+    ///
+    /// The forked batches read through `merkleized`, which the stateful actor
+    /// keeps alive in its pending map. If a conflicting finalization prunes
+    /// that entry mid-build, the task's merkleize panics; the runtime handle
+    /// catches it, the slot then yields `None`, and the proposal falls back
+    /// to the fresh path — a lost pre-build, never a lost proposal.
+    pub(super) fn maybe_prebuild<C, P>(
         &self,
         runtime: &E,
         strategy: &St,
@@ -195,7 +189,12 @@ where
         parent_digest: H::Digest,
         parent_body_len: u64,
         merkleized: &MerkleizedDatabases<E, H, St>,
-    ) {
+    ) where
+        E: Spawner,
+        C: Digest,
+        P: PublicKey,
+        I: TransactionSource<C, P, H> + Sync,
+    {
         let round = parent_header.context.round;
         let next = Round::new(round.epoch(), View::new(round.view().get() + 1));
         if !(self.is_leader)(next) {
@@ -203,11 +202,16 @@ where
         }
 
         let (result, receiver) = oneshot::channel();
-        if self.slot.lock().replace(receiver).is_some() {
+        let displaced = self.slot.lock().replace(receiver);
+        if let Some(displaced) = displaced {
             // The previous pre-build was never consumed. Its transactions are
-            // dropped with it; the mempool ages them out the same way it ages
-            // out transactions from a proposal that never finalized.
+            // dropped with it (the mempool ages them out the same way it ages
+            // out transactions from a proposal that never finalized), and the
+            // possibly block-sized buffered execution is released on the
+            // pool, off the verify path.
             self.discards.inc();
+            let drop_span = info_span!("application.speculate.drop_replaced");
+            drop(strategy.spawn(move |_: St| drop_span.in_scope(|| drop(displaced))));
         }
         self.prebuilds.inc();
 
@@ -261,6 +265,14 @@ where
                     None,
                 )
                 .await;
+                if execution.body.is_empty() {
+                    // Every seed transaction dropped against the guessed
+                    // parent: an empty pre-build would later propose an empty
+                    // block without ever consulting the mempool, so leave the
+                    // slot empty and let propose take the fresh path.
+                    let _ = result.send(None);
+                    return;
+                }
                 let _ = result.send(Some(PreBuilt {
                     parent: parent_digest,
                     execution,

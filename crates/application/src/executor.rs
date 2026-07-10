@@ -20,10 +20,12 @@
 //! and written once. A sender spends only the balance it held at the start of the
 //! block, never funds credited to it within the same block.
 //!
-//! Execution is all or nothing: if any transfer fails its nonce or balance check
-//! or overflows its recipient, the whole batch is rejected. Because a successful
-//! batch has no failed debits, every loaded account effect produces one final
-//! write.
+//! Verification is all or nothing: if any transfer fails its nonce or balance
+//! check or overflows its recipient, the whole batch is rejected. Because a
+//! successful batch has no failed debits, every loaded account effect produces
+//! one final write. Proposal construction instead uses [`SelectiveExecutor`],
+//! which applies the same per-account rules per transfer and drops what cannot
+//! apply.
 
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;

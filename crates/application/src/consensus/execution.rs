@@ -63,9 +63,11 @@
 //! transaction-history commitment still reflects block order.
 //!
 //! Proposing, verifying, and applying certified blocks all use this same
-//! transition. `execute_proposal` prepares locally selected transactions,
-//! proposing an empty block for an empty selection and dropping the proposal
-//! (so consensus skips the view) if the selected body is malformed or invalid.
+//! transition. `execute_proposal` builds a proposal best effort: malformed or
+//! inapplicable candidates are dropped individually, the block tops up from
+//! the mempool toward the proposal budget, and an empty selection proposes an
+//! empty block so an idle chain keeps making progress — a proposal is always
+//! produced.
 //! `execute_body` prepares a proposed body, recomputes execution, and compares
 //! the resulting commitments to the header. Certified apply shallow-clones the
 //! block's lazy body (per-transaction handles whose decode cache stays shared)
@@ -450,13 +452,12 @@ where
                 selector.register(&values);
                 staged = Some(next);
             } else {
-                let (range, values, next) = staged
+                let (_, values, next) = staged
                     .take()
                     .expect("staged batch exists after the first round")
                     .expand(&keys)
                     .await
                     .expect("account state loading must succeed");
-                assert_eq!(range.len(), values.len());
                 selector.register(&values);
                 staged = Some(next);
             }

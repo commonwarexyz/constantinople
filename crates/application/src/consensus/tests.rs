@@ -347,8 +347,9 @@ fn propose_drops_inapplicable_and_refills() {
             parent: (View::zero(), *parent.seal()),
         };
         // Both selected transfers consume the same nonce: proposing keeps the
-        // first, drops the duplicate, and refills the dropped bytes from the
-        // mempool. The proposed block is the applicable subset.
+        // first, drops the duplicate, and tops the block up from the mempool
+        // toward the proposal budget. The proposed block is the applicable
+        // subset plus the top-up.
         let keep = transfer(&sender, &recipient, 1);
         let duplicate = transfer(&sender, &recipient, 2);
         let refill = transfer(&alt_sender, &recipient, 3);
@@ -545,10 +546,7 @@ async fn build_and_verify_empty_child(
     context: &deterministic::Context,
     app: &mut TestApp,
     parent: &TestBlock,
-    batches: <TestDbs as commonware_glue::stateful::db::DatabaseSet<deterministic::Context>>::Unmerkleized,
-    verify_batches: <TestDbs as commonware_glue::stateful::db::DatabaseSet<
-        deterministic::Context,
-    >>::Unmerkleized,
+    dbs: &TestDbs,
     view: u64,
     leader: &ed25519::PrivateKey,
 ) -> (
@@ -561,7 +559,7 @@ async fn build_and_verify_empty_child(
         .propose_child(
             (context.child("propose_child_block"), ctx.clone()),
             parent.clone(),
-            batches,
+            dbs.new_batches().await,
             &mut empty,
         )
         .await
@@ -571,7 +569,7 @@ async fn build_and_verify_empty_child(
             (context.child("verify_child_block"), ctx),
             proposed.block.clone(),
             ready(Some(parent.clone())),
-            verify_batches,
+            dbs.new_batches().await,
         )
         .await
         .expect("own proposal must verify");
@@ -591,8 +589,7 @@ fn speculation_hit_reuses_prebuilt_execution() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -658,8 +655,7 @@ fn speculation_recovers_on_unexpected_parent() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -724,8 +720,7 @@ fn speculation_reuse_filters_transactions_already_in_parent() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -790,8 +785,7 @@ fn speculation_empty_selection_falls_back_to_fresh_input() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -843,8 +837,7 @@ fn speculation_discards_replaced_prebuild() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -924,8 +917,7 @@ fn speculation_reuse_drops_transactions_included_upstream() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -951,7 +943,7 @@ fn speculation_reuse_drops_transactions_included_upstream() {
 
         // Proposing on C reuses the pre-built selection, but execution
         // against C's state drops tx1 (its nonce is already consumed there)
-        // and the dropped bytes refill from the live mempool. No structural
+        // and the block tops up from the live mempool. No structural
         // assumption about C's relationship to B is needed.
         let fresh_tx = transfer(&harness.alt_sender, &harness.recipient, 5);
         let mut fresh: TestSource = StaticTransactionSource::new(vec![vec![fresh_tx.clone()]]);
@@ -1153,8 +1145,7 @@ fn speculation_reuse_survives_any_view_distance() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -1210,8 +1201,7 @@ fn speculation_hit_survives_any_view_distance() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -1260,8 +1250,7 @@ fn speculation_reuse_tops_up_underfull_seed() {
             &context,
             &mut app,
             &harness.parent,
-            harness.dbs.new_batches().await,
-            harness.dbs.new_batches().await,
+            &harness.dbs,
             1,
             &harness.leader,
         )
@@ -1290,5 +1279,259 @@ fn speculation_reuse_tops_up_underfull_seed() {
         );
         let metrics = context.encode();
         assert!(metrics.contains("speculation_reuses_total 1"), "{metrics}");
+    });
+}
+
+#[test]
+fn speculation_requires_next_round_leadership() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let tx1 = transfer(&harness.sender, &harness.recipient, 1);
+        // The oracle never elects this node, so verifying must not consume
+        // anything from the speculative mempool handle.
+        let mut app = TestApp::new(
+            context.child("spec_follower"),
+            Sequential,
+            harness.leader.public_key(),
+            sha256::Digest::EMPTY,
+            TEST_TX_NS,
+            PublicKeyCache::new(context.child("spec_follower_pkc"), NZUsize!(64)),
+            harness.state_target.clone(),
+            harness.transaction_target.clone(),
+            None,
+            Some(SpeculationConfig {
+                input: StaticTransactionSource::new(vec![vec![tx1]]),
+                is_leader: Arc::new(|_| false),
+            }),
+        );
+
+        context.sleep(Duration::from_millis(10)).await;
+        let (block_b, b_merkleized) = build_and_verify_empty_child(
+            &context,
+            &mut app,
+            &harness.parent,
+            &harness.dbs,
+            1,
+            &harness.leader,
+        )
+        .await;
+        context.sleep(Duration::from_millis(10)).await;
+
+        // No pre-build was armed; propose takes the fresh path.
+        let fresh_tx = transfer(&harness.alt_sender, &harness.recipient, 2);
+        let mut fresh: TestSource = StaticTransactionSource::new(vec![vec![fresh_tx.clone()]]);
+        let ctx2 = consensus_context(2, &harness.leader, 1, &block_b);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_follower"), ctx2),
+                block_b,
+                TestDbs::fork_batches(&b_merkleized),
+                &mut fresh,
+            )
+            .await
+            .expect("fresh proposal must succeed");
+
+        assert_eq!(
+            body_digests(&proposed.block),
+            vec![*fresh_tx.message_digest()]
+        );
+        let metrics = context.encode();
+        assert!(
+            metrics.contains("speculation_prebuilds_total 0"),
+            "{metrics}"
+        );
+    });
+}
+
+#[test]
+fn build_timeout_bounds_refill_rounds() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let seed_keep = transfer(&harness.sender, &harness.recipient, 1);
+        let seed_dup = transfer(&harness.sender, &harness.recipient, 2);
+        let refill_one = transfer(&harness.alt_sender, &harness.recipient, 3);
+        let never_pulled = transfer(&harness.recipient, &harness.sender, 4);
+
+        // Each mempool round trip burns 60ms of virtual time — past the 50ms
+        // build deadline after one refill.
+        let slow = |batches| DelayedSource {
+            context: context.child("slow_clock"),
+            delay: Duration::from_millis(60),
+            inner: StaticTransactionSource::new(batches),
+        };
+        let mut app: Application<
+            deterministic::Context,
+            sha256::Sha256,
+            sha256::Digest,
+            threshold::Scheme<ed25519::PublicKey, MinSig>,
+            ed25519::PublicKey,
+            DelayedSource,
+            (),
+            Sequential,
+        > = Application::new(
+            context.child("deadline_app"),
+            Sequential,
+            harness.leader.public_key(),
+            sha256::Digest::EMPTY,
+            TEST_TX_NS,
+            PublicKeyCache::new(context.child("deadline_pkc"), NZUsize!(64)),
+            harness.state_target.clone(),
+            harness.transaction_target.clone(),
+            None,
+            None,
+        );
+
+        context.sleep(Duration::from_millis(10)).await;
+        // The seed pull happens before the build deadline starts; the first
+        // refill (delayed 60ms) lands past the deadline, so a second refill
+        // is never requested even though headroom and candidates remain.
+        let mut input = slow(vec![
+            vec![seed_keep.clone(), seed_dup],
+            vec![refill_one.clone()],
+            vec![never_pulled],
+        ]);
+        let ctx1 = consensus_context(1, &harness.leader, 0, &harness.parent);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_deadline"), ctx1),
+                harness.parent.clone(),
+                harness.dbs.new_batches().await,
+                &mut input,
+            )
+            .await
+            .expect("proposal must succeed");
+
+        assert_eq!(
+            body_digests(&proposed.block),
+            vec![*seed_keep.message_digest(), *refill_one.message_digest()],
+            "the deadline must stop the loop after the first refill"
+        );
+    });
+}
+
+#[test]
+fn speculation_replaced_task_stops_before_consuming() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let tx1 = transfer(&harness.sender, &harness.recipient, 1);
+        let tx2 = transfer(&harness.alt_sender, &harness.recipient, 2);
+        let tx3 = transfer(&harness.sender, &harness.recipient, 3);
+        // Each speculative selection sleeps 100ms while holding the input
+        // lock. Three verifies land ~10ms apart, so task one is still mid-
+        // selection when tasks two and three queue behind it: task one pops
+        // batch one for a dead result, task two observes its cancellation and
+        // pops NOTHING, task three pops batch two. If task two popped before
+        // checking cancellation, task three would serve batch three instead.
+        let mut app: Application<
+            deterministic::Context,
+            sha256::Sha256,
+            sha256::Digest,
+            threshold::Scheme<ed25519::PublicKey, MinSig>,
+            ed25519::PublicKey,
+            DelayedSource,
+            (),
+            Sequential,
+        > = Application::new(
+            context.child("spec_stop"),
+            Sequential,
+            harness.leader.public_key(),
+            sha256::Digest::EMPTY,
+            TEST_TX_NS,
+            PublicKeyCache::new(context.child("spec_stop_pkc"), NZUsize!(64)),
+            harness.state_target.clone(),
+            harness.transaction_target.clone(),
+            None,
+            Some(SpeculationConfig {
+                input: DelayedSource {
+                    context: context.child("spec_stop_clock"),
+                    delay: Duration::from_millis(100),
+                    inner: StaticTransactionSource::new(vec![
+                        vec![tx1],
+                        vec![tx2.clone()],
+                        vec![tx3],
+                    ]),
+                },
+                is_leader: Arc::new(|_| true),
+            }),
+        );
+        // Blocks are built by a non-speculating app so the chain proposes
+        // never consume the pre-builds under test.
+        let mut builder = make_app(&context, &harness, "spec_stop_builder", None);
+
+        context.sleep(Duration::from_millis(10)).await;
+        let mut parent = harness.parent.clone();
+        let mut chain: Vec<
+            <TestDbs as commonware_glue::stateful::db::DatabaseSet<
+                deterministic::Context,
+            >>::Merkleized,
+        > = Vec::new();
+        for view in 1..=3u64 {
+            let ctx = consensus_context(view, &harness.leader, view - 1, &parent);
+            let mut empty: TestSource = StaticTransactionSource::new(Vec::new());
+            let batches = match chain.last() {
+                None => harness.dbs.new_batches().await,
+                Some(m) => TestDbs::fork_batches(m),
+            };
+            let proposed = builder
+                .propose_child(
+                    (context.child("propose_chain"), ctx.clone()),
+                    parent.clone(),
+                    batches,
+                    &mut empty,
+                )
+                .await
+                .expect("chain proposal must succeed");
+            // Verifying through the speculating app arms a fresh pre-build,
+            // replacing (cancelling) the previous one mid-flight. Keep every
+            // block's merkleized state alive, as the stateful actor's
+            // pending map would, so in-flight pre-builds keep their parents.
+            let verify_batches = match chain.last() {
+                None => harness.dbs.new_batches().await,
+                Some(m) => TestDbs::fork_batches(m),
+            };
+            let m = app
+                .verify_child(
+                    (context.child("verify_chain"), ctx),
+                    proposed.block.clone(),
+                    ready(Some(parent.clone())),
+                    verify_batches,
+                )
+                .await
+                .expect("chain verify must succeed");
+            parent = proposed.block;
+            chain.push(m);
+            context.sleep(Duration::from_millis(10)).await;
+        }
+
+        // Let all three tasks resolve their locks and finish.
+        context.sleep(Duration::from_millis(500)).await;
+
+        let mut fresh = DelayedSource {
+            context: context.child("noop_clock"),
+            delay: Duration::ZERO,
+            inner: StaticTransactionSource::new(Vec::new()),
+        };
+        let ctx4 = consensus_context(4, &harness.leader, 3, &parent);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_final"), ctx4),
+                parent,
+                TestDbs::fork_batches(chain.last().expect("chain built")),
+                &mut fresh,
+            )
+            .await
+            .expect("final proposal must succeed");
+
+        assert_eq!(body_digests(&proposed.block), vec![*tx2.message_digest()]);
+        let metrics = context.encode();
+        assert!(
+            metrics.contains("speculation_prebuilds_total 3"),
+            "{metrics}"
+        );
+        assert!(
+            metrics.contains("speculation_discards_total 2"),
+            "{metrics}"
+        );
+        assert!(metrics.contains("speculation_hits_total 1"), "{metrics}");
     });
 }

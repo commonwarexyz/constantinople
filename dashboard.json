@@ -5091,7 +5091,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Exact-parent hits as a share of pre-builds started. The gap to 1.0 is nullified views (reuse/discard). Persistent low values with healthy view latency suggest the leader oracle and consensus disagree on leadership.",
+      "description": "Exact-parent hits as a share of pre-builds started. The gap to 1.0 is nullified views (reuse/discard) plus pre-builds whose selection came back empty (an idle mempool counts a pre-build but can never hit). Persistent low values under load with healthy view latency suggest the leader oracle and consensus disagree on leadership.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5961,7 +5961,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Reads served without touching a blob across every contiguous journal (the paged cache itself exports no metrics, so per-journal hit/miss counters are the efficacy proxy; segmented journals are invisible here). Sustained dips are the page cache thrashing.",
+      "description": "Reads served without touching a blob across every contiguous journal (the paged cache itself exports no metrics, so per-journal hit/miss counters are the efficacy proxy; segmented journals are invisible here and the hits-less public-key cache is excluded). Sustained dips are the page cache thrashing.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -6048,7 +6048,7 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum(rate({__name__=~\".+_cache_hits_total\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / (sum(rate({__name__=~\".+_cache_hits_total\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) + sum(rate({__name__=~\".+_cache_misses_total\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "expr": "sum(rate({__name__=~\".+_cache_hits_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / (sum(rate({__name__=~\".+_cache_hits_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) + sum(rate({__name__=~\".+_cache_misses_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "legendFormat": "hit rate",
@@ -6151,10 +6151,10 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
-          "expr": "sum by(__name__) (rate({__name__=~\".+_cache_misses_total\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum by(journal) (rate((label_replace({__name__=~\".+_cache_misses_total\", __name__!~\".*public_key.*\", deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, \"journal\", \"$1\", \"__name__\", \"(.+)\"))[$__rate_interval:]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
-          "legendFormat": "{{__name__}}",
+          "legendFormat": "{{journal}}",
           "range": true,
           "refId": "A",
           "useBackend": false

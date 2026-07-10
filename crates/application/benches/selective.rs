@@ -32,8 +32,9 @@ fn transfer(sender: AccountKey, recipient: AccountKey, value: u64, nonce: u64) -
     }
 }
 
-/// `n` transfers with unique senders/recipients, `stale` of them carrying an
-/// already-consumed nonce (only the selective path can execute those bodies).
+/// `n` transfers with unique senders/recipients; when `stale_every > 0`,
+/// every `stale_every`-th transfer carries an already-consumed nonce (only
+/// the selective path can execute those bodies).
 fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTransfer>) {
     let mut state = State::with_capacity(2 * n);
     let mut transfers = Vec::with_capacity(n);
@@ -51,15 +52,13 @@ fn fixture(n: usize, shared: bool, stale_every: usize) -> (State, Vec<PreparedTr
                 nonce: Nonce::default(),
             },
         );
-        let nonce = if stale_every > 0 && (i as usize).is_multiple_of(stale_every) {
-            // Consumed at genesis: the selective pass must drop it.
+        if stale_every > 0 && (i as usize).is_multiple_of(stale_every) {
+            // Nonce 0 consumed at genesis: the selective pass must drop the
+            // transfer below, which also carries nonce 0.
             let account = state.get_mut(&sender).expect("just inserted");
             assert!(account.nonce.consume(0));
-            0
-        } else {
-            0
-        };
-        transfers.push(transfer(sender, recipient, 1 + i % 97, nonce));
+        }
+        transfers.push(transfer(sender, recipient, 1 + i % 97, 0));
     }
     (state, transfers)
 }

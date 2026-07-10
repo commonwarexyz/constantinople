@@ -103,11 +103,11 @@ where
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
     proposed_transactions: Counter,
-    speculator: Option<SpeculatorHandle<E, H, C, P, I, St>>,
+    speculator: Option<SpeculatorHandle<E, H, I, St>>,
     _marker: PhantomData<(E, C, S, I, B)>,
 }
 
-type SpeculatorHandle<E, H, C, P, I, St> = Arc<speculation::Speculator<E, H, C, P, I, St>>;
+type SpeculatorHandle<E, H, I, St> = Arc<speculation::Speculator<E, H, I, St>>;
 
 impl<E, H, C, S, P, I, B, St> Clone for Application<E, H, C, S, P, I, B, St>
 where
