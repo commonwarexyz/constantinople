@@ -280,7 +280,6 @@ where
         // the just-computed state so the propose request finds it finished.
         if let Some(speculator) = &self.speculator {
             speculator.maybe_prebuild(
-                &runtime,
                 &self.strategy,
                 &header,
                 block_digest,

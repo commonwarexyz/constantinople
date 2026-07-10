@@ -511,6 +511,10 @@ where
             let elector =
                 commonware_utils::sync::Mutex::new(L::default().build(scheme.participants()));
             SpeculationConfig {
+                // Rooted directly under the engine context, which lives for
+                // the process: pre-build tasks must not be children of any
+                // per-operation consensus scope.
+                spawner: context.child("speculation"),
                 input: config.input.clone(),
                 is_leader: Arc::new(move |round| {
                     me.is_some_and(|me| elector.lock().elect(round, None) == me)

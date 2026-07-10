@@ -196,6 +196,7 @@ fn make_app(
     speculative_batches: Option<Vec<Vec<SignedTransaction<sha256::Sha256>>>>,
 ) -> TestApp {
     let speculation = speculative_batches.map(|batches| SpeculationConfig {
+        spawner: context.child(label).child("spawner"),
         input: StaticTransactionSource::new(batches),
         is_leader: Arc::new(|_| true),
     });
@@ -1122,6 +1123,7 @@ fn speculation_survives_cancelled_propose() {
             harness.transaction_target.clone(),
             None,
             Some(SpeculationConfig {
+                spawner: context.child("spec_cancel_spawner"),
                 input: delayed(Duration::from_millis(200), vec![vec![tx.clone()]]),
                 is_leader: Arc::new(|_| true),
             }),
@@ -1370,6 +1372,7 @@ fn speculation_requires_next_round_leadership() {
             harness.transaction_target.clone(),
             None,
             Some(SpeculationConfig {
+                spawner: context.child("spec_follower_spawner"),
                 input: StaticTransactionSource::new(vec![vec![tx1]]),
                 is_leader: Arc::new(|_| false),
             }),
@@ -1512,6 +1515,7 @@ fn speculation_replaced_task_stops_before_consuming() {
             harness.transaction_target.clone(),
             None,
             Some(SpeculationConfig {
+                spawner: context.child("spec_stop_spawner"),
                 input: DelayedSource {
                     context: context.child("spec_stop_clock"),
                     delay: Duration::from_millis(100),
@@ -1602,6 +1606,84 @@ fn speculation_replaced_task_stops_before_consuming() {
             metrics.contains("speculation_discards_total 2"),
             "{metrics}"
         );
+        assert!(metrics.contains("speculation_hits_total 1"), "{metrics}");
+    });
+}
+
+#[test]
+fn speculation_survives_verify_scope_teardown() {
+    deterministic::Runner::default().start(|context| async move {
+        let mut harness = verify_harness(&context).await;
+        let tx1 = transfer(&harness.sender, &harness.recipient, 1);
+        let mut app = make_app(
+            &context,
+            &harness,
+            "spec_scope",
+            Some(vec![vec![tx1.clone()]]),
+        );
+
+        context.sleep(Duration::from_millis(10)).await;
+        let mut empty: TestSource = StaticTransactionSource::new(Vec::new());
+        let ctx1 = consensus_context(1, &harness.leader, 0, &harness.parent);
+        let proposed_b = harness
+            .app
+            .propose_child(
+                (context.child("propose_b"), ctx1.clone()),
+                harness.parent.clone(),
+                harness.dbs.new_batches().await,
+                &mut empty,
+            )
+            .await
+            .expect("B must build");
+        let block_b = proposed_b.block.clone();
+
+        // Verify B with a runtime context that belongs to a short-lived
+        // task, mirroring the marshal's deferred verification: when that
+        // task finishes, the runtime aborts every child spawned under its
+        // supervision subtree. A pre-build spawned from the verify call's
+        // runtime would be killed here; the speculator must spawn from its
+        // own long-lived context instead.
+        let (ctx_tx, ctx_rx) = futures::channel::oneshot::channel();
+        let (done_tx, done_rx) = futures::channel::oneshot::channel::<()>();
+        let ephemeral_task = commonware_runtime::Spawner::spawn(
+            context.child("ephemeral"),
+            move |ephemeral: deterministic::Context| async move {
+                let _ = ctx_tx.send(ephemeral.child("verify_scope"));
+                let _ = done_rx.await;
+            },
+        );
+        let verify_runtime = ctx_rx.await.expect("ephemeral context");
+        let b_merkleized = app
+            .verify_child(
+                (verify_runtime, ctx1),
+                block_b.clone(),
+                ready(Some(harness.parent.clone())),
+                harness.dbs.new_batches().await,
+            )
+            .await
+            .expect("B must verify");
+        // Finish the ephemeral task: its supervision subtree is drained and
+        // any children are aborted.
+        drop(done_tx);
+        ephemeral_task.await.expect("ephemeral task");
+
+        // Give the pre-build time to finish on the speculator's own context.
+        context.sleep(Duration::from_millis(300)).await;
+
+        let mut fresh: TestSource = StaticTransactionSource::new(Vec::new());
+        let ctx2 = consensus_context(2, &harness.leader, 1, &block_b);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_hit"), ctx2),
+                block_b,
+                TestDbs::fork_batches(&b_merkleized),
+                &mut fresh,
+            )
+            .await
+            .expect("pre-built proposal must survive the verify scope teardown");
+
+        assert_eq!(body_digests(&proposed.block), vec![*tx1.message_digest()]);
+        let metrics = context.encode();
         assert!(metrics.contains("speculation_hits_total 1"), "{metrics}");
     });
 }

@@ -122,6 +122,12 @@ where
     H: Hasher,
     St: Strategy,
 {
+    /// Long-lived context pre-build tasks spawn from. Tasks must never spawn
+    /// from the verify call's runtime: that context belongs to a short-lived
+    /// task (the marshal's deferred verification), and the runtime aborts a
+    /// finished task's children — which would silently kill every pre-build
+    /// moments after it starts.
+    spawner: E,
     /// Mempool handle shared with each pre-build task. A replaced task can
     /// briefly contend with its successor's seed selection, so tasks hold the
     /// lock only for that selection, never across execution.
@@ -145,10 +151,12 @@ where
 {
     pub(super) fn new(
         context: impl Metrics,
+        spawner: E,
         input: I,
         is_leader: Arc<dyn Fn(Round) -> bool + Send + Sync>,
     ) -> Self {
         Self {
+            spawner,
             input: Arc::new(AsyncMutex::new(input)),
             is_leader,
             slot: Mutex::new(None),
@@ -193,7 +201,6 @@ where
     /// to the fresh path — a lost pre-build, never a lost proposal.
     pub(super) fn maybe_prebuild<C, P>(
         &self,
-        runtime: &E,
         strategy: &St,
         parent_header: &Header<C, H::Digest, P>,
         parent_digest: H::Digest,
@@ -238,7 +245,7 @@ where
             "application.speculate",
             height = (parent_header.height + 1).traced()
         );
-        drop(runtime.child("speculation").spawn(move |clock| {
+        drop(self.spawner.child("build").spawn(move |clock| {
             async move {
                 // Consume from the mempool only while someone can still use
                 // the result: a replaced task stops before selecting. The

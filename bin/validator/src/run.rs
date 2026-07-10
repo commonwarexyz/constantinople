@@ -86,9 +86,17 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
+// Shards are up to 1 MiB of payload plus envelope, so a 1 MiB cap pushed
+// every shard transfer into an unpooled heap allocation (visible as
+// buffer_pool_oversized). 4 MiB keeps them pooled with room for growth.
+const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(4 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(8_192);
-const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+// The engine runs two 512 MiB page caches (2 x 65,536 pages of 8 KiB), all
+// drawing from this one pool; a 1,024-per-class cap pinned the 8 KiB class
+// and forced every page fill into an unpooled allocation (visible as
+// buffer_pool_exhausted). Demand is bounded by the cache capacities, so the
+// cap only needs to sit above them with churn headroom.
+const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(262_144);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
