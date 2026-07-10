@@ -174,6 +174,26 @@ pub enum ServeError {
     Overdraft,
 }
 
+/// A channel's stream meter at the moment of a consume decision.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeterSnapshot {
+    /// Stream tokens delivered against the channel so far.
+    pub served: u64,
+    /// Cumulative amount the channel's latest voucher has paid for.
+    pub paid: u64,
+}
+
+/// Outcome of metering one stream chunk against a channel's credit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConsumeOutcome {
+    /// The chunk was paid for (within the debt limit); the meter advanced.
+    Served(MeterSnapshot),
+    /// Serving would exceed the debt limit; a fresher voucher unblocks it.
+    PaymentRequired(MeterSnapshot),
+    /// Serving would exceed the deposit; no voucher can unblock it.
+    DepositExhausted(MeterSnapshot),
+}
+
 /// A verified channel the operator serves vouchers against: the registration
 /// metadata plus the per-channel meter (the latest-voucher accounting).
 pub(crate) struct RegisteredChannel {
@@ -192,6 +212,10 @@ pub(crate) struct RegisteredChannel {
     deposit: NonZeroU64,
     /// Block height after which the payer may reclaim the escrow.
     expiry: u64,
+    /// Stream tokens delivered against this channel (the metered-content
+    /// side of the accounting; vouchers pay it down). In-memory only, like
+    /// the voucher state.
+    served: u64,
     latest: Option<Voucher>,
     settlement: SettlementState,
 }
@@ -215,9 +239,36 @@ impl RegisteredChannel {
             open_nonce,
             deposit,
             expiry,
+            served: 0,
             latest: None,
             settlement: SettlementState::Open,
         }
+    }
+
+    /// Meters `cost` stream tokens against the channel's credit.
+    ///
+    /// Serving is allowed while the served total stays within `debt_limit`
+    /// of the paid cumulative (the latest voucher) and never exceeds the
+    /// deposit — tokens beyond the deposit could not be settled even with a
+    /// voucher in hand. Refusals do not advance the meter, so a `cost` of
+    /// zero is a free probe of the channel's credit.
+    pub(crate) fn consume(&mut self, cost: u64, debt_limit: u64) -> ConsumeOutcome {
+        let paid = self.latest.as_ref().map_or(0, |latest| latest.cumulative);
+        let next = self.served.saturating_add(cost);
+        if next > self.deposit.get() {
+            return ConsumeOutcome::DepositExhausted(MeterSnapshot {
+                served: self.served,
+                paid,
+            });
+        }
+        if next > paid.saturating_add(debt_limit) {
+            return ConsumeOutcome::PaymentRequired(MeterSnapshot {
+                served: self.served,
+                paid,
+            });
+        }
+        self.served = next;
+        ConsumeOutcome::Served(MeterSnapshot { served: next, paid })
     }
 
     /// Verifies a voucher and serves one request against it.
@@ -269,6 +320,10 @@ struct OperatorState {
     /// Vouchers accepted over the service's lifetime — the off-chain payment
     /// count the chain never sees, surfaced via [`OperatorService::stats`].
     vouchers_served: u64,
+    /// Streamed content delivered over the service's lifetime (all
+    /// channels), denominated in chain units — identical to a token count
+    /// while the advertised price per token is 1.
+    tokens_streamed: u64,
     /// Channels handed to a settle task by [`OperatorService::due_settlements`]
     /// whose settlement has not yet moved past `Open` (a settle task can wait
     /// on the nonce window with the channel still `Open`); tracked so a sweep
@@ -285,6 +340,7 @@ impl OperatorState {
             aligned,
             channels: BTreeMap::new(),
             vouchers_served: 0,
+            tokens_streamed: 0,
             sweep_claimed: BTreeSet::new(),
         }
     }
@@ -344,6 +400,34 @@ fn try_reserve_nonce(nonce: &mut u64, inflight: &mut BTreeSet<u64>, aligned: boo
     Some(reserved)
 }
 
+/// Looks up a channel and applies the gates every serving path shares: the
+/// channel must be registered, its settlement must not have started (work
+/// served after the close is built will never be paid for), and its expiry
+/// must be far enough away that what is served can still settle safely.
+///
+/// A free function over the channels map (rather than a method) so callers
+/// can keep borrowing the rest of [`OperatorState`] alongside the returned
+/// channel.
+fn servable_channel<'a>(
+    margins: Margins,
+    height: u64,
+    channels: &'a mut BTreeMap<AccountKey, RegisteredChannel>,
+    channel: &AccountKey,
+) -> Result<&'a mut RegisteredChannel, OperatorError> {
+    let Some(registered) = channels.get_mut(channel) else {
+        return Err(OperatorError::rejected("channel metadata missing"));
+    };
+    if registered.settlement != SettlementState::Open {
+        return Err(OperatorError::rejected(
+            "channel settlement already started",
+        ));
+    }
+    if margins.expiry_phase(height, registered.expiry) != ExpiryPhase::Serving {
+        return Err(OperatorError::rejected("channel is about to expire"));
+    }
+    Ok(registered)
+}
+
 /// Outcome of settling one channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SettleOutcome {
@@ -365,6 +449,8 @@ pub struct OperatorStats {
     pub abandoned: u64,
     /// Vouchers accepted off-chain.
     pub vouchers: u64,
+    /// Stream tokens delivered (all channels, lifetime).
+    pub streamed: u64,
 }
 
 /// The operator's settlement service: voucher metering plus everything needed
@@ -418,8 +504,10 @@ where
         // settlement finalizes but before it commits can recover a stale base
         // with a clean bitmap and resume on a consumed nonce. Closing that
         // window needs a finalized-state read or a durable local nonce store;
-        // until then the exclusion checks in `submit_tx` keep a reused nonce
-        // from looping forever, but the settlement is misreported.
+        // until then the consumed-nonce checks in the submit path abandon
+        // such a settlement instead of wedging on it — misreported (the
+        // channel stays open on chain, closeable with a fresh nonce), but
+        // never blocking later settlements.
         let (nonce, aligned) = loop {
             match relayer.fetch_nonce(&operator_pk).await {
                 Ok(None) => break (0, true),
@@ -569,26 +657,39 @@ where
         let height = self.height();
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
-        let Some(registered) = state.channels.get_mut(&voucher.channel) else {
-            return Err(OperatorError::rejected("channel metadata missing"));
-        };
-        // Once a close has been built, a newer voucher can no longer be
-        // settled; refuse to serve work the submitted close will not pay for.
-        if registered.settlement != SettlementState::Open {
-            return Err(OperatorError::rejected(
-                "channel settlement already started",
-            ));
-        }
-        // Near expiry a voucher may not settle before the payer can reclaim
-        // the escrow; stop serving and let the sweep close the channel.
-        if self.margins.expiry_phase(height, registered.expiry) != ExpiryPhase::Serving {
-            return Err(OperatorError::rejected("channel is about to expire"));
-        }
+        let registered =
+            servable_channel(self.margins, height, &mut state.channels, &voucher.channel)?;
         let cumulative = registered
             .serve(voucher)
             .map_err(|error| OperatorError::rejected(format!("voucher rejected: {error:?}")))?;
         state.vouchers_served += 1;
         Ok(cumulative)
+    }
+
+    /// Meters `cost` stream tokens against a channel's credit, returning the
+    /// meter after the decision.
+    ///
+    /// Applies the same gates as voucher serving — the channel must be
+    /// registered, its settlement not started, and its expiry far enough
+    /// away — then the credit policy documented on the channel-level
+    /// `RegisteredChannel::consume`. Terminal channel states are errors;
+    /// running out of credit is a [`ConsumeOutcome`], not an error, because
+    /// the caller's next move differs (wait for a voucher vs. give up).
+    pub async fn consume(
+        &self,
+        channel: &AccountKey,
+        cost: u64,
+        debt_limit: u64,
+    ) -> Result<ConsumeOutcome, OperatorError> {
+        let height = self.height();
+        let mut guard = self.state.lock().await;
+        let state = &mut *guard;
+        let registered = servable_channel(self.margins, height, &mut state.channels, channel)?;
+        let outcome = registered.consume(cost, debt_limit);
+        if matches!(outcome, ConsumeOutcome::Served(_)) {
+            state.tokens_streamed = state.tokens_streamed.saturating_add(cost);
+        }
+        Ok(outcome)
     }
 
     /// A snapshot of the service's lifetime counters.
@@ -608,6 +709,7 @@ where
             settled,
             abandoned,
             vouchers: state.vouchers_served,
+            streamed: state.tokens_streamed,
         }
     }
 
@@ -740,7 +842,7 @@ where
             &mut Sha256::default(),
         );
         let close_digest = *close.message_digest();
-        let mut finalized = self.submit_tx(close, expiry, "close").await;
+        let mut finalized = self.submit_tx(close, nonce, expiry, "close").await;
         if !finalized {
             // Giving up does not mean the close is dead: an earlier
             // submission may still be queued at a validator and finalize
@@ -755,7 +857,9 @@ where
                 TRANSACTION_NAMESPACE,
                 &mut Sha256::default(),
             );
-            finalized = self.resolve_abandoned_close(burn, &close_digest).await;
+            finalized = self
+                .resolve_abandoned_close(burn, nonce, &close_digest)
+                .await;
         }
 
         let mut guard = self.state.lock().await;
@@ -798,8 +902,14 @@ where
     /// would loop forever, pinning its nonce in the in-flight window until
     /// every settlement wedged.
     ///
+    /// An exclusion with the nonce consumed but the digest unseen means a
+    /// *different* transaction from the operator account owns the nonce (the
+    /// stale-recovery hazard documented on [`Self::init`]): this transaction
+    /// can never land, at any height, so the submission gives up regardless
+    /// of expiry.
+    ///
     /// Returns whether the transaction finalized.
-    async fn submit_tx(&self, tx: Tx, expiry: u64, what: &'static str) -> bool {
+    async fn submit_tx(&self, tx: Tx, nonce: u64, expiry: u64, what: &'static str) -> bool {
         let digest = *tx.message_digest();
         loop {
             let definitive = match self.relayer.submit(tx.clone()).await {
@@ -824,6 +934,21 @@ where
                     );
                     return true;
                 }
+                // Consumption is checked before the digest re-check:
+                // consumed nonces stay consumed, so a digest still unseen
+                // *afterwards* proves the consumer was someone else (up to
+                // the chain reader lagging the committed nonce state, the
+                // same accepted hazard as recovery itself).
+                if self.nonce_consumed(nonce).await {
+                    if self.observed_finalized(&digest, what).await {
+                        return true;
+                    }
+                    warn!(
+                        what,
+                        nonce, "nonce consumed by a different operator transaction; giving up"
+                    );
+                    return false;
+                }
                 if self.margins.expiry_phase(self.height(), expiry) == ExpiryPhase::Expired {
                     return false;
                 }
@@ -843,8 +968,14 @@ where
     /// would spin forever once the close won the race, pinning the nonce in
     /// the in-flight set and wedging all settlements.
     ///
+    /// A third outcome ends the race too: the nonce is consumed but neither
+    /// digest ever finalizes, meaning a different transaction from the
+    /// operator account owns it (the stale-recovery hazard documented on
+    /// [`Self::init`]). Neither the close nor the burn can land then, so the
+    /// settlement is abandoned.
+    ///
     /// Returns whether the close finalized.
-    async fn resolve_abandoned_close(&self, burn: Tx, close_digest: &Digest) -> bool {
+    async fn resolve_abandoned_close(&self, burn: Tx, nonce: u64, close_digest: &Digest) -> bool {
         let burn_digest = *burn.message_digest();
         loop {
             match self.relayer.submit(burn.clone()).await {
@@ -871,6 +1002,20 @@ where
                 debug!("abandoned close's nonce burned");
                 return false;
             }
+            // Consumption is checked after both digests missed, and the
+            // close is re-checked after it: consumed nonces stay consumed,
+            // so a digest still unseen afterwards proves the consumer was a
+            // different operator transaction.
+            if self.nonce_consumed(nonce).await {
+                if self.observed_finalized(close_digest, "close").await {
+                    return true;
+                }
+                warn!(
+                    nonce,
+                    "nonce consumed by a different operator transaction; abandoning settlement"
+                );
+                return false;
+            }
             self.context.sleep(SUBMIT_ERROR_BACKOFF).await;
         }
     }
@@ -882,6 +1027,19 @@ where
             Ok(observed) => observed,
             Err(error) => {
                 warn!(%error, what, "finalization lookup failed; treating as not yet finalized");
+                false
+            }
+        }
+    }
+
+    /// Whether the operator account's committed nonce state records `nonce`
+    /// as consumed (below the base, or set in the run-ahead bitmap). Lookup
+    /// errors are logged and read as "not consumed" — the caller retries.
+    async fn nonce_consumed(&self, nonce: u64) -> bool {
+        match self.relayer.fetch_nonce(&self.operator_pk).await {
+            Ok(state) => state.is_some_and(|state| state.is_consumed(nonce)),
+            Err(error) => {
+                warn!(%error, "nonce lookup failed; treating the nonce as not consumed");
                 false
             }
         }
@@ -963,6 +1121,84 @@ mod tests {
         assert_eq!(
             registered.serve(Voucher::sign(&attacker, channel, 10)),
             Err(ServeError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn consume_pauses_at_debt_limit_and_vouchers_unlock() {
+        let (payer, channel, mut registered) = metered_channel();
+        let limit = 3;
+
+        // An unpaid channel streams up to the debt limit, then pauses.
+        for served in 1..=limit {
+            assert_eq!(
+                registered.consume(1, limit),
+                ConsumeOutcome::Served(MeterSnapshot { served, paid: 0 })
+            );
+        }
+        assert_eq!(
+            registered.consume(1, limit),
+            ConsumeOutcome::PaymentRequired(MeterSnapshot {
+                served: limit,
+                paid: 0
+            })
+        );
+
+        // Paying moves the window; a refused consume did not advance the
+        // meter.
+        registered
+            .serve(Voucher::sign(&payer, channel, 2))
+            .expect("voucher should be accepted");
+        assert_eq!(
+            registered.consume(1, limit),
+            ConsumeOutcome::Served(MeterSnapshot { served: 4, paid: 2 })
+        );
+    }
+
+    #[test]
+    fn consume_never_exceeds_deposit() {
+        let (payer, channel, mut registered) = metered_channel();
+        // Fully paid up (deposit is 50), so only the deposit can bind.
+        registered
+            .serve(Voucher::sign(&payer, channel, 50))
+            .expect("voucher should be accepted");
+        assert_eq!(
+            registered.consume(50, u64::MAX),
+            ConsumeOutcome::Served(MeterSnapshot {
+                served: 50,
+                paid: 50
+            })
+        );
+        assert_eq!(
+            registered.consume(1, u64::MAX),
+            ConsumeOutcome::DepositExhausted(MeterSnapshot {
+                served: 50,
+                paid: 50
+            })
+        );
+    }
+
+    #[test]
+    fn zero_cost_consume_probes_without_advancing() {
+        let (_payer, _channel, mut registered) = metered_channel();
+        // A zero-cost probe reports the meter without consuming credit.
+        assert_eq!(
+            registered.consume(0, 1),
+            ConsumeOutcome::Served(MeterSnapshot { served: 0, paid: 0 })
+        );
+        assert_eq!(
+            registered.consume(1, 1),
+            ConsumeOutcome::Served(MeterSnapshot { served: 1, paid: 0 })
+        );
+        // A refusal does not advance the meter, and the probe still answers
+        // after it.
+        assert_eq!(
+            registered.consume(1, 1),
+            ConsumeOutcome::PaymentRequired(MeterSnapshot { served: 1, paid: 0 })
+        );
+        assert_eq!(
+            registered.consume(0, 1),
+            ConsumeOutcome::Served(MeterSnapshot { served: 1, paid: 0 })
         );
     }
 

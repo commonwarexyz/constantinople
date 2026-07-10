@@ -1855,6 +1855,7 @@ dependencies = [
  "constantinople-primitives",
  "exoware-qmdb",
  "exoware-sdk",
+ "futures",
  "serde",
  "serde_yaml",
  "tokio",

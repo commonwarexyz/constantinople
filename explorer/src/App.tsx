@@ -1,11 +1,13 @@
 import {
     memo,
+    useCallback,
     useEffect,
     useMemo,
     useRef,
     useState,
     type CSSProperties,
 } from 'react';
+import { AddressValue } from './AddressValue';
 import {
     accountKeyFromPublicKey,
     encodeSignedMintTransaction,
@@ -14,13 +16,13 @@ import {
     parseAccountKeyHex,
     parseU64,
     toHex,
-    trimTrailingSlash,
     type EncodedTransaction,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
 import { type BlockKindCounts, type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
+    statusHasHeight,
     submitTransactions,
     type AccountView,
     type TxStatus,
@@ -58,6 +60,8 @@ import {
     signInWithPasskey,
     type ActiveWallet,
 } from './wallet';
+import { PaidStreamPage } from './PaidStreamPage';
+import { shortHex, sleep, trimTrailingSlash } from './util';
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
@@ -243,6 +247,7 @@ export default function App() {
     const [history, setHistory] = useState<SubmittedTransaction[]>([]);
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
+    const [isStreamOpen, setIsStreamOpen] = useState(false);
     const [accountInput, setAccountInput] = useState(() => accountFromLocation());
     const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
     const [accountProof, setAccountProof] = useState<AccountProofState>({
@@ -722,7 +727,9 @@ export default function App() {
         setWalletMessage('signed out');
     };
 
-    const copyValue = async (value: string) => {
+    // Stable (empty deps): only setters and refs — and referential stability
+    // is what lets the memoized PaidStreamPage skip App's dashboard ticks.
+    const copyValue = useCallback(async (value: string) => {
         try {
             await navigator.clipboard.writeText(value);
             if (copyToastTimeoutRef.current !== null) {
@@ -744,9 +751,9 @@ export default function App() {
                 copyToastTimeoutRef.current = null;
             }, 1_400);
         }
-    };
+    }, []);
 
-    const openAccountPage = (value: string): boolean => {
+    const openAccountPage = useCallback((value: string): boolean => {
         const normalized = normalizeAccountInput(value);
         if (!normalized) return false;
 
@@ -763,7 +770,9 @@ export default function App() {
         setIsWalletOpen(false);
         setIsSearchOpen(false);
         return true;
-    };
+    }, []);
+
+    const openWalletDialog = useCallback(() => setIsWalletOpen(true), []);
 
     const submitAccountLookup = () => {
         if (openAccountPage(accountInput)) return;
@@ -825,11 +834,11 @@ export default function App() {
             to: string;
             value: bigint;
         }>,
-    ) => {
-        if (!wallet) return;
+    ): Promise<TxStatus | null> => {
+        if (!wallet) return null;
         if (!walletAccountKey) {
             setSubmitMessage('loading account address');
-            return;
+            return null;
         }
 
         setPendingSubmissionCount((count) => count + 1);
@@ -876,31 +885,62 @@ export default function App() {
             );
             setSubmitMessage('');
             await refreshAccount();
+            return txStatus;
         } catch (error) {
             if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
                 setLocalNonceState(reservation.previous);
             }
             setSubmitMessage(error instanceof Error ? error.message : String(error));
+            return null;
         } finally {
             setPendingSubmissionCount((count) => Math.max(0, count - 1));
         }
     };
 
-    const submitTransfer = () =>
-        submitSigned('forming transaction', async (nonce, activeWallet) => {
-            const parsedToKey = parseAccountKeyHex(toKey);
-            const parsedValue = parseU64(value, 'value');
+    /// The transfer half of a `submitSigned` call, shared by the transfer
+    /// form and the paid-stream funding path. Parses the recipient inside the
+    /// returned builder so bad input surfaces through `submitSigned`'s catch.
+    const transferBuilder =
+        (toKeyHex: string, transferValue: bigint) =>
+        async (nonce: bigint, activeWallet: ActiveWallet) => {
+            const toAccountKey = parseAccountKeyHex(toKeyHex);
             const encoded = await encodeSignedTransaction(
                 {
                     senderPublicKey: activeWallet.publicKey,
-                    toAccountKey: parsedToKey,
-                    value: parsedValue,
+                    toAccountKey,
+                    value: transferValue,
                     nonce,
                 },
                 activeWallet.sign,
             );
-            return { encoded, kind: 'transfer' as const, to: toHex(parsedToKey), value: parsedValue };
-        });
+            return { encoded, kind: 'transfer' as const, to: toHex(toAccountKey), value: transferValue };
+        };
+
+    const submitTransfer = () =>
+        submitSigned('forming transaction', (nonce, activeWallet) =>
+            transferBuilder(toKey, parseU64(value, 'value'))(nonce, activeWallet),
+        );
+
+    /// Funds the paid-stream session account from the passkey wallet. The
+    /// stream page awaits finality before opening the channel — never batch
+    /// the two: the transfer and the open write the same account across
+    /// lanes and would conflict in one block.
+    const fundStreamSessionNow = async (accountKeyHex: string, amount: bigint): Promise<boolean> => {
+        const status = await submitSigned(
+            'funding stream session',
+            transferBuilder(accountKeyHex, amount),
+        );
+        return status !== null && statusHasHeight(status);
+    };
+    // Stable identity over the freshest closure: `submitSigned` (and so
+    // `fundStreamSessionNow`) is rebuilt every render, but the memoized
+    // PaidStreamPage must not re-render for that.
+    const fundStreamSessionRef = useRef(fundStreamSessionNow);
+    fundStreamSessionRef.current = fundStreamSessionNow;
+    const fundStreamSession = useCallback(
+        (accountKeyHex: string, amount: bigint) => fundStreamSessionRef.current(accountKeyHex, amount),
+        [],
+    );
 
     const submitMint = () =>
         submitSigned('forming mint', async (nonce, activeWallet, senderAccountKey) => {
@@ -933,6 +973,22 @@ export default function App() {
                     </h1>
                     <div className="app__header-actions">
                         <StatusBadge status={status} spinner={spinner} />
+                        {operatorUrl && (
+                            <>
+                                <span className="app__header-separator" aria-hidden="true">
+                                    ⬝
+                                </span>
+                                <button
+                                    className="wallet-trigger"
+                                    onClick={() => {
+                                        clearAccountLookup();
+                                        setIsStreamOpen((open) => !open);
+                                    }}
+                                >
+                                    {isStreamOpen ? 'explorer' : 'paid stream'}
+                                </button>
+                            </>
+                        )}
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
@@ -949,7 +1005,18 @@ export default function App() {
                 </header>
                 <main className="app__main app__main--minimal">
                     <section className="explorer-stage" aria-label="live transaction throughput">
-                        {lookupAccount ? (
+                        {isStreamOpen && !lookupAccount ? (
+                            <PaidStreamPage
+                                operatorUrl={operatorUrl}
+                                mempoolUrl={mempoolUrl}
+                                walletReady={wallet !== null && walletAccountKey !== null}
+                                walletBalance={account?.balance ?? null}
+                                onFundSession={fundStreamSession}
+                                onOpenWallet={openWalletDialog}
+                                onOpenAddress={openAccountPage}
+                                onCopy={copyValue}
+                            />
+                        ) : lookupAccount ? (
                             <AccountPage
                                 account={lookupAccount}
                                 onCopy={copyValue}
@@ -1511,39 +1578,6 @@ function CopyableValue({
     );
 }
 
-function AddressValue({
-    disabled = false,
-    plain = false,
-    value,
-    onOpenAddress,
-}: {
-    disabled?: boolean;
-    plain?: boolean;
-    value: string;
-    onOpenAddress: (value: string) => void;
-}) {
-    const className = [
-        'copyable',
-        'copyable--address',
-        plain ? 'copyable--plain' : '',
-    ]
-        .filter(Boolean)
-        .join(' ');
-
-    return (
-        <button
-            aria-label={`open address ${value}`}
-            className={className}
-            disabled={disabled}
-            onClick={() => onOpenAddress(value)}
-            title="open address"
-            type="button"
-        >
-            <span className="copyable__value">{value}</span>
-        </button>
-    );
-}
-
 function AccountPageAddressValue({
     account,
     value,
@@ -1916,10 +1950,6 @@ function nextProofState(
     return { status: 'waiting', detail: 'waiting for QMDB proof' };
 }
 
-function statusHasHeight(status: TxStatus): status is Extract<TxStatus, { readonly height: number }> {
-    return status.status === 'finalized' || status.status === 'partially_finalized';
-}
-
 function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofState {
     return {
         status: 'verified',
@@ -1976,14 +2006,6 @@ function formatTxStatus(status: TxStatus, digest: string): string {
         return `partial at ${status.height}: filtered ${status.filtered.map(shortHex).join(', ')}`;
     }
     return status.status;
-}
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
-}
-
-function shortHex(value: string): string {
-    return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
 }
 
 function bytesToHex(bytes: Uint8Array): string {

@@ -12,6 +12,7 @@ use commonware_codec::{DecodeExt, Encode};
 use commonware_cryptography::ed25519;
 use commonware_formatting::{from_hex, hex};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 
 /// A wire field that failed to parse back into its chain type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,6 +60,12 @@ pub struct PublicKeyResponse {
     /// Blocks before expiry at which the operator stops serving vouchers and
     /// force-settles.
     pub settle_margin: u64,
+    /// Chain units one streamed token on `GET /stream` costs.
+    pub price_per_token: u64,
+    /// Tokens the stream may run ahead of the channel's paid cumulative
+    /// before it pauses for a voucher. Advertised (like the margins) so
+    /// clients pace their payments from the operator's actual configuration.
+    pub debt_limit: u64,
 }
 
 impl PublicKeyResponse {
@@ -67,6 +74,8 @@ impl PublicKeyResponse {
         height: u64,
         min_runway: u64,
         settle_margin: u64,
+        price_per_token: u64,
+        debt_limit: u64,
     ) -> Self {
         Self {
             public_key: encode_field(public_key),
@@ -74,6 +83,8 @@ impl PublicKeyResponse {
             height,
             min_runway,
             settle_margin,
+            price_per_token,
+            debt_limit,
         }
     }
 
@@ -113,7 +124,7 @@ impl RegisterRequest {
     }
 
     pub fn channel(&self) -> Result<AccountKey, FieldError> {
-        decode_field("channel", &self.channel)
+        parse_channel(&self.channel)
     }
 
     pub fn payer(&self) -> Result<TransactionPublicKey, FieldError> {
@@ -176,6 +187,72 @@ pub struct VoucherResponse {
     pub cumulative: u64,
 }
 
+/// Parses the hex-encoded `channel` query parameter of `GET /stream`.
+pub fn parse_channel(value: &str) -> Result<AccountKey, FieldError> {
+    decode_field("channel", value)
+}
+
+/// SSE event name carrying a [`StreamChunk`].
+pub const STREAM_CHUNK_EVENT: &str = "chunk";
+/// SSE event name carrying a [`StreamMeter`] when the stream pauses.
+pub const STREAM_PAYMENT_REQUIRED_EVENT: &str = "payment-required";
+/// SSE event name carrying the terminal [`StreamEnd`].
+pub const STREAM_END_EVENT: &str = "end";
+
+/// One `chunk` event on `GET /stream`: the next priced slice of content plus
+/// the channel's meter after paying for it.
+///
+/// The stream endpoint is the demo's metered service: content is delivered
+/// token by token over SSE while the channel's debt (`served - paid`) stays
+/// under the advertised [`PublicKeyResponse::debt_limit`]. A request without
+/// a registered channel answers `402 Payment Required`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamChunk {
+    /// The next slice of content. `Cow` lets a server with static content
+    /// serialize each chunk without a per-token copy.
+    pub text: Cow<'static, str>,
+    /// Tokens the channel has consumed after this chunk.
+    pub served: u64,
+    /// Cumulative amount the channel's latest voucher has paid for.
+    pub paid: u64,
+}
+
+/// The `payment-required` event on `GET /stream`: the meter is at the debt
+/// limit; a fresher voucher within the grace window resumes the stream.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamMeter {
+    /// Tokens the channel has consumed.
+    pub served: u64,
+    /// Cumulative amount the channel's latest voucher has paid for.
+    pub paid: u64,
+}
+
+/// Why a `GET /stream` session ended (the terminal `end` event).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StreamEndReason {
+    /// The content ran out; everything served was paid for or within limit.
+    Complete,
+    /// The debt limit was hit and no voucher arrived within the grace window.
+    PaymentTimeout,
+    /// Serving another token would exceed the channel's escrowed deposit.
+    DepositExhausted,
+    /// The channel stopped being servable (settlement started or expiry is
+    /// too close).
+    ChannelClosed,
+}
+
+/// The terminal `end` event on `GET /stream`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamEnd {
+    /// Why the stream ended.
+    pub reason: StreamEndReason,
+    /// Tokens the channel consumed over its lifetime.
+    pub served: u64,
+    /// Cumulative amount the channel's latest voucher has paid for.
+    pub paid: u64,
+}
+
 /// Request to `POST /settle`: close the channel on-chain now.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SettleRequest {
@@ -191,7 +268,7 @@ impl SettleRequest {
     }
 
     pub fn channel(&self) -> Result<AccountKey, FieldError> {
-        decode_field("channel", &self.channel)
+        parse_channel(&self.channel)
     }
 }
 
@@ -218,6 +295,9 @@ pub struct StatsResponse {
     pub abandoned: u64,
     /// Vouchers accepted off-chain.
     pub vouchers: u64,
+    /// Streamed content served through `GET /stream` (lifetime), in chain
+    /// units (a token count while the price per token is 1).
+    pub streamed: u64,
     /// Latest finalized height the operator has observed.
     pub height: u64,
 }
@@ -314,7 +394,7 @@ mod tests {
     fn public_key_response_rejects_missing_advertised_knobs() {
         let payer_key = ed25519::PrivateKey::from_seed(6);
         let payer = TransactionPublicKey::ed25519(payer_key.public_key());
-        let response = PublicKeyResponse::new(&payer, 42, 20, 10);
+        let response = PublicKeyResponse::new(&payer, 42, 20, 10, 1, 32);
 
         let partial_wire = format!(
             r#"{{"public_key":"{}","account":"{}"}}"#,

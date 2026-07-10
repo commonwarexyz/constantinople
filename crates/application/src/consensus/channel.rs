@@ -100,16 +100,15 @@ pub struct PreparedChannelOp {
 }
 
 /// Operation-specific payload for a [`PreparedChannelOp`].
+///
+/// Each variant keeps only what execution reads. The transaction fields
+/// that merely feed the channel-address derivation (receiver, operator, and
+/// the open nonce) are consumed at preparation time and travel on as the
+/// derived `channel` — the address commits to all of them.
 #[derive(Debug, Clone)]
 pub enum PreparedChannelOpKind {
-    /// Open a channel from the sender (payer) to `receiver`, settled by
-    /// `operator`. The channel address is derived from the sender, receiver,
-    /// operator, and this operation's nonce.
+    /// Open a channel from the sender (payer).
     Open {
-        /// Receiver (payee) account key.
-        receiver: AccountKey,
-        /// Operator account key (the only key that can close the channel).
-        operator: AccountKey,
         /// Amount escrowed.
         deposit: u64,
         /// Block height after which the payer may reclaim the escrow.
@@ -122,12 +121,10 @@ pub enum PreparedChannelOpKind {
     Close {
         /// Payer public key (used to verify the voucher).
         payer: TransactionPublicKey,
-        /// Payer account key (used to derive the channel address).
+        /// Payer account key (the refund destination).
         payer_key: AccountKey,
         /// Receiver (payee) account key the cumulative is paid to.
         receiver: AccountKey,
-        /// Nonce of the `OpenChannel` that created the channel.
-        open_nonce: u64,
         /// Cumulative amount claimed.
         cumulative: u64,
         /// Payer's voucher signature.
@@ -137,12 +134,6 @@ pub enum PreparedChannelOpKind {
     },
     /// Reclaim an expired channel's escrow for the sender (payer).
     Timeout {
-        /// Receiver account key (used to derive the channel address).
-        receiver: AccountKey,
-        /// Operator account key (used to derive the channel address).
-        operator: AccountKey,
-        /// Nonce of the `OpenChannel` that created the channel.
-        open_nonce: u64,
         /// Derived channel address, computed once at preparation.
         channel: AccountKey,
     },
@@ -180,8 +171,6 @@ where
             // withdrawal. Refuse to open such a channel.
             sender_key.as_ed25519()?;
             PreparedChannelOpKind::Open {
-                receiver: *receiver,
-                operator: *operator,
                 deposit: deposit.get(),
                 expiry: *expiry,
                 channel: channel_address(&sender, receiver, operator, tx.nonce),
@@ -199,7 +188,6 @@ where
                 payer: payer.clone(),
                 payer_key,
                 receiver: *receiver,
-                open_nonce: *open_nonce,
                 cumulative: *cumulative,
                 voucher: voucher.clone(),
                 channel: channel_address(&payer_key, receiver, &sender, *open_nonce),
@@ -210,9 +198,6 @@ where
             operator,
             open_nonce,
         } => PreparedChannelOpKind::Timeout {
-            receiver: *receiver,
-            operator: *operator,
-            open_nonce: *open_nonce,
             channel: channel_address(&sender, receiver, operator, *open_nonce),
         },
         Operation::Mint { amount } => PreparedChannelOpKind::Mint {
@@ -276,7 +261,7 @@ impl PreparedChannelOp {
                 keys.push(*receiver);
                 keys.push(*channel);
             }
-            PreparedChannelOpKind::Timeout { channel, .. } => {
+            PreparedChannelOpKind::Timeout { channel } => {
                 keys.push(*channel);
             }
             // A mint touches only the sender, already pushed above.
@@ -416,7 +401,7 @@ fn apply_channel_op(
             // Delete the settled channel so it leaves no state.
             pending.insert(*channel, None);
         }
-        PreparedChannelOpKind::Timeout { channel, .. } => {
+        PreparedChannelOpKind::Timeout { channel } => {
             // The channel must exist and its expiry (stored in the channel
             // account's nonce base) must have passed. A receiver close that
             // landed first deleted the channel, so first-to-land wins.

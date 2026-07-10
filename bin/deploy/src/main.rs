@@ -320,6 +320,14 @@ pub(crate) struct OperatorConfig {
     /// Deterministic receiver key seed.
     #[serde(default = "default_operator_seed")]
     pub operator_seed: u64,
+    /// Minimum blocks between registration and a channel's expiry (mirrors
+    /// the operator binary's default).
+    #[serde(default = "default_operator_min_runway")]
+    pub min_runway: u64,
+    /// Blocks before expiry at which vouchers stop and settlement starts
+    /// (mirrors the operator binary's default).
+    #[serde(default = "default_operator_settle_margin")]
+    pub settle_margin: u64,
 }
 
 /// Relayer configuration written into the relayer secondary's YAML.
@@ -549,6 +557,14 @@ const fn default_operator_listen_addr() -> std::net::IpAddr {
 
 const fn default_operator_seed() -> u64 {
     2_000_000_000
+}
+
+const fn default_operator_min_runway() -> u64 {
+    20
+}
+
+const fn default_operator_settle_margin() -> u64 {
+    10
 }
 
 fn main() {

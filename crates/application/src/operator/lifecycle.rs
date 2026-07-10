@@ -7,8 +7,8 @@
 //! end-to-end.
 
 use super::service::{
-    ChainReader, Digest, Margins, OperatorError, OperatorService, Relayer, SettleOutcome,
-    SubmitOutcome, Tx, VerifiedOpenChannel,
+    ChainReader, ConsumeOutcome, Digest, Margins, MeterSnapshot, OperatorError, OperatorService,
+    Relayer, SettleOutcome, SubmitOutcome, Tx, VerifiedOpenChannel,
 };
 use crate::consensus::tests::{
     TEST_TX_NS, TestApp, TestBlock, TestDbs, bootstrap, propose_and_finalize, read_account,
@@ -33,6 +33,9 @@ use std::{
 const STEP: u64 = 5;
 const DEPOSIT: u64 = 25;
 const FUNDED: u64 = 1_000;
+/// Seed of the operator key [`setup`] builds the service with; tests that
+/// need to sign competing operator-account transactions derive it too.
+const OPERATOR_SEED: u64 = 9;
 const MARGINS: Margins = Margins {
     min_runway: 4,
     settle_margin: 2,
@@ -280,7 +283,7 @@ async fn setup_with_relayer<R: Relayer>(
     let mint = payer.mint(FUNDED);
     assert_eq!(chain.0.lock().await.commit(vec![mint]).await, 1);
 
-    let receiver = ed25519::PrivateKey::from_seed(9);
+    let receiver = ed25519::PrivateKey::from_seed(OPERATOR_SEED);
     let service = OperatorService::init(
         context.child("operator"),
         wrap(chain.clone()),
@@ -511,6 +514,89 @@ fn operator_settles_and_abandons_against_live_chain() {
     });
 }
 
+/// The stream meter against a live chain: content pauses at the debt limit,
+/// vouchers resume it, the deposit caps it absolutely, and the settlement
+/// pays out what the meter charged.
+#[test]
+fn stream_meter_paces_content_against_vouchers() {
+    deterministic::Runner::default().start(|context| async move {
+        let (chain, mut payer, service) = setup(&context).await;
+        let receiver_account = *service.operator_account();
+        const LIMIT: u64 = 4;
+
+        // Metering an unregistered channel is refused outright.
+        let bogus = channel_address(&payer.account, &receiver_account, &receiver_account, 99);
+        assert!(service.consume(&bogus, 1, LIMIT).await.is_err());
+
+        let expiry = chain.0.lock().await.height() + 100;
+        let (channel, open_digest, open_nonce) = payer
+            .open_channel(&chain, receiver_account, DEPOSIT, expiry)
+            .await;
+        assert_eq!(
+            service
+                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .await,
+            Ok(true)
+        );
+
+        // An unpaid channel streams a debt limit's worth, then pauses; a
+        // voucher resumes it up to the deposit. (The per-token policy edges
+        // — refusals not advancing the meter, the deposit cap, zero-cost
+        // probes — are pinned by the service unit tests; this scenario
+        // exercises the spine against real registration and settlement.)
+        assert_eq!(
+            service.consume(&channel, LIMIT, LIMIT).await,
+            Ok(ConsumeOutcome::Served(MeterSnapshot {
+                served: LIMIT,
+                paid: 0
+            }))
+        );
+        assert_eq!(
+            service.consume(&channel, 1, LIMIT).await,
+            Ok(ConsumeOutcome::PaymentRequired(MeterSnapshot {
+                served: LIMIT,
+                paid: 0
+            }))
+        );
+        assert_eq!(
+            service.serve_voucher(payer.voucher(channel, DEPOSIT)).await,
+            Ok(DEPOSIT)
+        );
+        assert_eq!(
+            service.consume(&channel, DEPOSIT - LIMIT, u64::MAX).await,
+            Ok(ConsumeOutcome::Served(MeterSnapshot {
+                served: DEPOSIT,
+                paid: DEPOSIT
+            }))
+        );
+
+        // The settlement pays the receiver everything the meter charged, and
+        // a settled channel no longer streams.
+        assert_eq!(
+            service.settle_channel(channel).await,
+            Ok(SettleOutcome {
+                settled: true,
+                cumulative: DEPOSIT,
+            })
+        );
+        {
+            let harness = chain.0.lock().await;
+            assert_eq!(
+                read_account(&harness.dbs, &receiver_account).await.balance,
+                DEPOSIT,
+                "receiver was paid the streamed total"
+            );
+        }
+        assert!(
+            service.consume(&channel, 1, LIMIT).await.is_err(),
+            "settled channel must not stream"
+        );
+
+        let stats = service.stats().await;
+        assert_eq!(stats.streamed, DEPOSIT, "every served token is counted");
+    });
+}
+
 /// The expiry sweep: a voucher-bearing channel becomes due exactly when its
 /// expiry enters the settle margin, is handed out once, and disappears after
 /// settlement.
@@ -635,6 +721,86 @@ fn delegated_operator_pays_the_named_receiver() {
             read_raw(&harness.dbs, &channel).await,
             None,
             "settled channel is deleted"
+        );
+    });
+}
+
+/// A settlement whose reserved nonce was consumed by a different transaction
+/// from the operator account (how the stale-nonce recovery documented on
+/// `init` looks once it bites): neither the close nor its burn can ever
+/// land, so the settlement must resolve as abandoned instead of looping with
+/// the nonce pinned in flight — and the next settlement must still work.
+#[test]
+fn settlement_abandons_a_nonce_consumed_by_another_transaction() {
+    deterministic::Runner::default().start(|context| async move {
+        let (chain, mut payer, service) = setup(&context).await;
+        let receiver_account = *service.operator_account();
+
+        let (channel, open_digest, open_nonce) = payer
+            .open_channel(&chain, receiver_account, DEPOSIT, CHANNEL_NEVER_EXPIRES)
+            .await;
+        assert_eq!(
+            service
+                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            service.serve_voucher(payer.voucher(channel, STEP)).await,
+            Ok(STEP)
+        );
+
+        // A competing operator-signed transaction consumes nonce 0 out from
+        // under the service, exactly as a stale recovered base would. Amount
+        // 2 keeps its digest distinct from the service's own nonce burn (a
+        // mint of 1), so the abandon must come from the consumed-nonce
+        // check, not from mistaking the rogue transaction for the burn.
+        let operator_key = ed25519::PrivateKey::from_seed(OPERATOR_SEED);
+        let rogue = Transaction::mint(service.operator_public_key().clone(), NZU64!(2), 0)
+            .seal_and_sign(&operator_key, TEST_TX_NS, &mut sha256::Sha256::default());
+        assert_eq!(chain.0.lock().await.commit(vec![rogue]).await, 1);
+
+        let outcome = service
+            .settle_channel(channel)
+            .await
+            .expect("settle resolves");
+        assert_eq!(
+            outcome,
+            SettleOutcome {
+                settled: false,
+                cumulative: STEP,
+            },
+            "the settlement is abandoned, not wedged"
+        );
+        {
+            let harness = chain.0.lock().await;
+            assert!(
+                read_raw(&harness.dbs, &channel).await.is_some(),
+                "the escrow is untouched — the close never landed"
+            );
+        }
+
+        // The abandoned nonce left the in-flight window: a second channel
+        // settles normally on the next nonce.
+        let (channel, open_digest, open_nonce) = payer
+            .open_channel(&chain, receiver_account, DEPOSIT, CHANNEL_NEVER_EXPIRES)
+            .await;
+        assert_eq!(
+            service
+                .register_channel(channel, payer.pk.clone(), open_nonce, &open_digest)
+                .await,
+            Ok(true)
+        );
+        assert_eq!(
+            service.serve_voucher(payer.voucher(channel, STEP)).await,
+            Ok(STEP)
+        );
+        assert_eq!(
+            service.settle_channel(channel).await,
+            Ok(SettleOutcome {
+                settled: true,
+                cumulative: STEP,
+            })
         );
     });
 }

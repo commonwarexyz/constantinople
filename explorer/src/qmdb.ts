@@ -1,4 +1,5 @@
-import { fromHex, signedTransactionBodyLength, toArrayBuffer, trimTrailingSlash } from './codec';
+import { fromHex, signedTransactionBodyLength, toArrayBuffer } from './codec';
+import { shortHex, trimTrailingSlash } from './util';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import {
     ACCOUNT_META_ACCOUNT,
@@ -732,9 +733,6 @@ async function fetchAccountProofRow(
     return decoded;
 }
 
-function shortHex(value: string): string {
-    return value.length <= 18 ? value : `${value.slice(0, 10)}...${value.slice(-8)}`;
-}
 
 async function sqlQuery(
     sqlUrl: string,

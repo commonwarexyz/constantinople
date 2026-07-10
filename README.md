@@ -60,8 +60,11 @@ cargo run --bin constantinople-deploy -- generate \
 
 The command writes a `local/mprocs.yaml` with one named process per service
 and prints the `mprocs --config` invocation that starts the network. `--spammer-channel-fraction` makes a fraction of spammer traffic
-exercise **payment channels** — it also starts the channel operator process
-that serves off-chain vouchers and settles channels on-chain. See
+exercise **payment channels** through the channel operator process, which
+serves off-chain vouchers and settles channels on-chain. The operator starts
+whenever the indexer and relayer run; besides settling spammer channels it
+serves an x402-style **paid stream** demo the explorer drives from the
+browser (see [`explorer/README.md`](./explorer/README.md)). See
 [`bin/deploy/README.md`](./bin/deploy/README.md) for port, service, and
 channel-flag details.
 

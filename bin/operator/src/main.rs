@@ -1,12 +1,25 @@
-//! Payment-channel operator process for load testing.
+//! Payment-channel operator process for load testing and the paid-stream
+//! demo.
 //!
-//! The operator owns the settling key for spammer-created channels, accepts
+//! The operator owns the settling key for payer-created channels, accepts
 //! off-chain vouchers over HTTP, enforces monotonic/deposit accounting, and
 //! submits the final close transaction through the relayer. Settlements pay
 //! each channel's named receiver; the operator itself earns nothing (fees are
 //! deliberately out of scope). All of that logic
 //! lives in [`constantinople_application::operator::service::OperatorService`];
 //! this binary is the HTTP surface plus the real relayer/indexer adapters.
+//!
+//! `GET /stream` is the demo's metered service (the x402 shape): it sells a
+//! fixed essay token by token over SSE, streaming only while the channel's
+//! debt stays under [`STREAM_DEBT_LIMIT`], pausing at the limit, and hanging
+//! up if no voucher arrives within [`STREAM_GRACE`]. Requests without a
+//! servable channel answer `402 Payment Required`; pricing is advertised on
+//! `/public-key` next to the margins. Unpaid exposure is bounded at
+//! [`STREAM_DEBT_LIMIT`] per channel, but nothing caps *connections*: one
+//! registered channel may hold any number of concurrent streams (each is a
+//! task plus a socket for at most the grace window once credit runs out).
+//! Fine for demo infrastructure; a production deployment would cap
+//! concurrent streams per channel and per peer.
 //!
 //! Known restart limitation: channel registrations (and their voucher
 //! accounting) live only in memory. Registration verifies that the open
@@ -17,11 +30,16 @@
 //! store (or an account-key state lookup to check the channel still exists)
 //! would be needed to close this.
 
+mod content;
+
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
-    response::{IntoResponse, Response},
+    response::{
+        IntoResponse, Response,
+        sse::{Event, KeepAlive, Sse},
+    },
     routing::{get, post},
 };
 use clap::Parser;
@@ -36,8 +54,8 @@ use commonware_storage::{
     qmdb::{any::value::FixedEncoding, keyless},
 };
 use constantinople_application::operator::service::{
-    ChainReader, Digest, Margins, OperatorError, OperatorService, Relayer, SettleOutcome,
-    SubmitOutcome, Tx, VerifiedOpenChannel,
+    ChainReader, ConsumeOutcome, Digest, Margins, MeterSnapshot, OperatorError, OperatorService,
+    Relayer, SettleOutcome, SubmitOutcome, Tx, VerifiedOpenChannel,
 };
 use constantinople_engine::ThresholdScheme;
 use constantinople_indexer::IndexerClient;
@@ -45,8 +63,10 @@ use constantinople_mempool::webserver::{TxStatus, client::Client};
 use constantinople_primitives::{
     AccountKey, Nonce, Operation, SignedTransaction, TransactionPublicKey,
     operator_api::{
-        ErrorResponse, PublicKeyResponse, RegisterRequest, RegisterResponse, SettleRequest,
-        SettleResponse, StatsResponse, VoucherRequest, VoucherResponse,
+        ErrorResponse, PublicKeyResponse, RegisterRequest, RegisterResponse, STREAM_CHUNK_EVENT,
+        STREAM_END_EVENT, STREAM_PAYMENT_REQUIRED_EVENT, SettleRequest, SettleResponse,
+        StatsResponse, StreamChunk, StreamEnd, StreamEndReason, StreamMeter, VoucherRequest,
+        VoucherResponse, parse_channel,
     },
 };
 use exoware_qmdb::{OperationLogClient, proto::qmdb::v1::GetOperationRangeRequest};
@@ -71,6 +91,21 @@ type Service = OperatorService<commonware_runtime::tokio::Context, RelayerAdapte
 
 const HEIGHT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SETTLEMENT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Chain units one streamed token costs on `GET /stream`. Advertised on
+/// `/public-key` so clients price their vouchers from configuration, not
+/// convention.
+const STREAM_PRICE_PER_TOKEN: u64 = 1;
+/// Chain units of unpaid content a stream may run ahead of the channel's
+/// latest voucher before it pauses. Bounds the operator's exposure to a
+/// payer that stops paying. Advertised alongside the price.
+const STREAM_DEBT_LIMIT: u64 = 32;
+/// How long a paused stream waits for a fresher voucher before ending.
+const STREAM_GRACE: Duration = Duration::from_secs(5);
+/// How often a paused stream re-checks its channel's credit.
+const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(200);
+/// Delay between streamed tokens (the typewriter pace).
+const STREAM_PACE: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-operator")]
@@ -186,6 +221,7 @@ fn main() {
             .route("/channels", post(register_channel))
             .route("/vouchers", post(serve_voucher))
             .route("/settle", post(settle_channel))
+            .route("/stream", get(stream_content))
             // The explorer polls /stats from the browser (a different
             // origin), so answer preflights like the indexer facades do.
             .layer(tower_http::cors::CorsLayer::very_permissive())
@@ -300,6 +336,8 @@ async fn public_key(State(service): State<Arc<Service>>) -> Json<PublicKeyRespon
         service.height(),
         margins.min_runway,
         margins.settle_margin,
+        STREAM_PRICE_PER_TOKEN,
+        STREAM_DEBT_LIMIT,
     ))
 }
 
@@ -310,6 +348,7 @@ async fn stats(State(service): State<Arc<Service>>) -> Json<StatsResponse> {
         settled: stats.settled,
         abandoned: stats.abandoned,
         vouchers: stats.vouchers,
+        streamed: stats.streamed,
         height: service.height(),
     })
 }
@@ -353,6 +392,177 @@ async fn settle_channel(
         settled: outcome.settled,
         cumulative: outcome.cumulative,
     }))
+}
+
+#[derive(Debug, Deserialize)]
+struct StreamQuery {
+    channel: Option<String>,
+}
+
+/// The x402 handshake: `GET /stream` without a servable, registered channel
+/// answers `402 Payment Required`. Pricing is advertised on `/public-key`.
+fn payment_required(message: impl ToString) -> Response {
+    ApiError {
+        status: StatusCode::PAYMENT_REQUIRED,
+        message: message.to_string(),
+    }
+    .into_response()
+}
+
+/// `GET /stream?channel=<hex>`: the metered demo service. Streams the essay
+/// token by token over SSE while the channel's debt stays under
+/// [`STREAM_DEBT_LIMIT`], pausing (then hanging up) when payment falls
+/// behind. Content position derives from the channel's served total, so a
+/// reconnect resumes where the meter left off.
+async fn stream_content(
+    State(service): State<Arc<Service>>,
+    Query(query): Query<StreamQuery>,
+) -> Response {
+    let Some(channel) = query.channel else {
+        return payment_required("open and register a channel, then pass ?channel=<hex>");
+    };
+    let channel = match parse_channel(&channel) {
+        Ok(channel) => channel,
+        Err(error) => return payment_required(error),
+    };
+    // Zero-cost probe: surfaces an unregistered or closed channel as the
+    // 402 handshake instead of an empty stream.
+    let meter = match service.consume(&channel, 0, STREAM_DEBT_LIMIT).await {
+        Ok(
+            ConsumeOutcome::Served(meter)
+            | ConsumeOutcome::PaymentRequired(meter)
+            | ConsumeOutcome::DepositExhausted(meter),
+        ) => meter,
+        Err(error) => return payment_required(error),
+    };
+
+    let session = StreamSession {
+        service,
+        channel,
+        meter,
+        grace_deadline: None,
+        done: false,
+    };
+    let stream = futures::stream::unfold(session, |mut session| async move {
+        if session.done {
+            return None;
+        }
+        let event = session.next_event().await;
+        Some((Ok::<_, std::convert::Infallible>(event), session))
+    });
+    Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response()
+}
+
+/// One client's stream position: the channel it pays with, the last meter
+/// the service reported, and the pause bookkeeping.
+struct StreamSession {
+    service: Arc<Service>,
+    channel: AccountKey,
+    meter: MeterSnapshot,
+    /// When a paused stream gives up, set at the start of each pause and
+    /// cleared by the voucher that resumes it.
+    grace_deadline: Option<tokio::time::Instant>,
+    done: bool,
+}
+
+impl StreamSession {
+    /// Produces the next SSE event, sleeping through pacing and payment
+    /// pauses. Terminal events flag the session done so the stream closes
+    /// after emitting them.
+    async fn next_event(&mut self) -> Event {
+        loop {
+            // Content bound first, so the meter never charges for a token
+            // past the essay's end.
+            let next_token = (self.meter.served / STREAM_PRICE_PER_TOKEN) as usize;
+            if content::tokens().get(next_token).is_none() {
+                return self.end(StreamEndReason::Complete);
+            }
+            // Pace before charging: a client that disconnects mid-pace has
+            // paid for nothing undelivered (charging first would strand the
+            // in-flight token — a resume skips past it). A paused stream has
+            // its own poll cadence and skips the pace.
+            if self.grace_deadline.is_none() {
+                tokio::time::sleep(STREAM_PACE).await;
+            }
+            match self
+                .service
+                .consume(&self.channel, STREAM_PRICE_PER_TOKEN, STREAM_DEBT_LIMIT)
+                .await
+            {
+                Ok(ConsumeOutcome::Served(meter)) => {
+                    self.meter = meter;
+                    self.grace_deadline = None;
+                    // The token the charge actually bought, derived from the
+                    // returned meter: a concurrent session on this channel
+                    // may have advanced the shared meter past the bound
+                    // check above, and past the essay's end the charged
+                    // token does not exist (bounded at one token of slack) —
+                    // end rather than mislabel content.
+                    let index = (meter.served / STREAM_PRICE_PER_TOKEN - 1) as usize;
+                    let Some(text) = content::tokens().get(index) else {
+                        return self.end(StreamEndReason::Complete);
+                    };
+                    return event(
+                        STREAM_CHUNK_EVENT,
+                        &StreamChunk {
+                            text: (*text).into(),
+                            served: meter.served,
+                            paid: meter.paid,
+                        },
+                    );
+                }
+                Ok(ConsumeOutcome::PaymentRequired(meter)) => {
+                    self.meter = meter;
+                    // First refusal of this pause: tell the client and start
+                    // the grace clock. After that, poll quietly — a fresher
+                    // voucher resumes the loop, the deadline ends it.
+                    match self.grace_deadline {
+                        None => {
+                            self.grace_deadline = Some(tokio::time::Instant::now() + STREAM_GRACE);
+                            return event(
+                                STREAM_PAYMENT_REQUIRED_EVENT,
+                                &StreamMeter {
+                                    served: meter.served,
+                                    paid: meter.paid,
+                                },
+                            );
+                        }
+                        Some(deadline) if tokio::time::Instant::now() >= deadline => {
+                            return self.end(StreamEndReason::PaymentTimeout);
+                        }
+                        Some(_) => tokio::time::sleep(STREAM_POLL_INTERVAL).await,
+                    }
+                }
+                Ok(ConsumeOutcome::DepositExhausted(meter)) => {
+                    self.meter = meter;
+                    return self.end(StreamEndReason::DepositExhausted);
+                }
+                Err(_) => return self.end(StreamEndReason::ChannelClosed),
+            }
+        }
+    }
+
+    fn end(&mut self, reason: StreamEndReason) -> Event {
+        self.done = true;
+        event(
+            STREAM_END_EVENT,
+            &StreamEnd {
+                reason,
+                served: self.meter.served,
+                paid: self.meter.paid,
+            },
+        )
+    }
+}
+
+/// Builds a named SSE event from one of the wire payload types.
+fn event<T: serde::Serialize>(name: &str, data: &T) -> Event {
+    Event::default()
+        .event(name)
+        .json_data(data)
+        .expect("stream wire types serialize")
 }
 
 /// Submits operator transactions through the relayer.

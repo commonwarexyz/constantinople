@@ -159,6 +159,16 @@ impl Nonce {
         *self = next;
         true
     }
+
+    /// Whether `nonce` has already been consumed by this account: below
+    /// [`Self::base`], or recorded in the run-ahead bitmap.
+    pub const fn is_consumed(&self, nonce: u64) -> bool {
+        if nonce < self.base {
+            return true;
+        }
+        let delta = nonce - self.base;
+        delta != 0 && delta <= NONCE_BITMAP_CAPACITY && self.bitmap & (1 << (delta - 1)) != 0
+    }
 }
 
 impl FixedSize for Nonce {
@@ -271,6 +281,23 @@ mod tests {
     use commonware_cryptography::{
         Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,
     };
+
+    #[test]
+    fn is_consumed_covers_base_and_bitmap() {
+        // Bit 0 records base + 1, bit 63 records base + 64.
+        let nonce = Nonce::new(10, 0b101);
+        assert!(nonce.is_consumed(9), "below base is stale");
+        assert!(!nonce.is_consumed(10), "base itself is the next free nonce");
+        assert!(nonce.is_consumed(11), "bit 0 set");
+        assert!(!nonce.is_consumed(12), "bit 1 clear");
+        assert!(nonce.is_consumed(13), "bit 2 set");
+        assert!(
+            !nonce.is_consumed(10 + NONCE_BITMAP_CAPACITY + 1),
+            "beyond the run-ahead window is unrecorded"
+        );
+        let full = Nonce::new(10, u64::MAX);
+        assert!(full.is_consumed(10 + NONCE_BITMAP_CAPACITY), "bit 63 set");
+    }
 
     #[test]
     fn account_key_roundtrip_does_not_validate_public_key() {

@@ -19,7 +19,12 @@ use commonware_cryptography::{Signer as _, ed25519, sha256};
 use commonware_formatting::hex;
 use constantinople_primitives::{
     AccountKey, Operation, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
-    TransactionPublicKey, Voucher, channel_address,
+    TransactionPublicKey, VOUCHER_NAMESPACE, Voucher, channel_address,
+    operator_api::{
+        RegisterRequest, STREAM_CHUNK_EVENT, STREAM_END_EVENT, STREAM_PAYMENT_REQUIRED_EVENT,
+        SettleRequest, StreamChunk, StreamEnd, StreamEndReason, VoucherRequest,
+    },
+    voucher_message,
 };
 use core::num::NonZeroU64;
 use serde::Serialize;
@@ -34,9 +39,66 @@ struct Fixture {
     /// relayer (varint count followed by the encoded transactions).
     batch_hex: String,
     transactions: Vec<TransactionFixture>,
+    /// Everything the explorer's paid-stream client must reproduce
+    /// byte-exactly: the channel address derivation and the voucher signing
+    /// path (ed25519 is deterministic, so the TS test re-signs with the
+    /// fixture key and compares signatures).
+    channel: ChannelFixture,
+    /// The `GET /stream` SSE contract: event names and serialized payload
+    /// samples, so a Rust-side rename cannot silently strand the TS client.
+    stream: StreamFixture,
+    /// The operator request bodies the explorer builds (`POST /channels`,
+    /// `/vouchers`, `/settle`), serialized from the channel fixture above:
+    /// the request half of the contract, pinned like `stream` pins the
+    /// response half.
+    requests: RequestFixture,
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RequestFixture {
+    register_sample: String,
+    voucher_sample: String,
+    settle_sample: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamFixture {
+    chunk_event: String,
+    payment_required_event: String,
+    end_event: String,
+    /// Every [`StreamEndReason`] as it crosses the wire.
+    end_reasons: Vec<String>,
+    /// A serialized [`StreamChunk`] / [`StreamEnd`], pinning field names.
+    chunk_sample: String,
+    end_sample: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChannelFixture {
+    /// The payer's raw 32-byte ed25519 private key. Lets the TS suite
+    /// re-sign the open transaction and the voucher from scratch and assert
+    /// byte-identity with the fixtures.
+    payer_private_key_hex: String,
+    payer_account_hex: String,
+    receiver_account_hex: String,
+    operator_account_hex: String,
+    open_nonce: String,
+    /// `channel_address(payer, receiver, operator, open_nonce)`.
+    address_hex: String,
+    /// The namespaces the two ed25519 signing paths must prefix (via the
+    /// commonware `union_unique` framing) to what they sign.
+    transaction_namespace: String,
+    voucher_namespace: String,
+    voucher_cumulative: String,
+    /// `voucher_message(address, cumulative)`: the pre-namespace preimage.
+    voucher_message_hex: String,
+    voucher_signature_hex: String,
+}
+
+#[derive(Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 struct TransactionFixture {
     kind: &'static str,
@@ -55,6 +117,14 @@ struct TransactionFixture {
     to_account_key_hex: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receiver_account_key_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    operator_account_key_hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deposit: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expiry: Option<String>,
 }
 
 fn sign(signer: &ed25519::PrivateKey, tx: Transaction<sha256::Digest>) -> Tx {
@@ -75,8 +145,7 @@ fn fixture_entry(kind: &'static str, tx: &Tx) -> TransactionFixture {
         digest_hex: hex(tx.message_digest().as_ref()),
         sender_public_key_hex: hex(&tx.value().sender.get().expect("sender decodes").encode()),
         nonce: tx.value().nonce.to_string(),
-        to_account_key_hex: None,
-        value: None,
+        ..Default::default()
     }
 }
 
@@ -117,6 +186,34 @@ fn build_fixture() -> Fixture {
         open_nonce,
     );
     let voucher = Voucher::sign(&payer, channel, 35);
+    let channel_fixture = ChannelFixture {
+        payer_private_key_hex: hex(&payer.encode()),
+        payer_account_hex: hex(payer_account.as_ref()),
+        receiver_account_hex: hex(receiver_account.as_ref()),
+        operator_account_hex: hex(receiver_account.as_ref()),
+        open_nonce: open_nonce.to_string(),
+        address_hex: hex(channel.as_ref()),
+        transaction_namespace: String::from_utf8(TRANSACTION_NAMESPACE.to_vec())
+            .expect("namespace is ASCII"),
+        voucher_namespace: String::from_utf8(VOUCHER_NAMESPACE.to_vec())
+            .expect("namespace is ASCII"),
+        voucher_cumulative: voucher.cumulative.to_string(),
+        voucher_message_hex: hex(&voucher_message(&channel, voucher.cumulative)),
+        voucher_signature_hex: hex(&voucher.signature.encode()),
+    };
+    let request_fixture = RequestFixture {
+        register_sample: serde_json::to_string(&RegisterRequest::new(
+            &channel,
+            &payer_pk,
+            open_nonce,
+            open.message_digest(),
+        ))
+        .expect("register request serializes"),
+        voucher_sample: serde_json::to_string(&VoucherRequest::new(&voucher))
+            .expect("voucher request serializes"),
+        settle_sample: serde_json::to_string(&SettleRequest::new(&channel))
+            .expect("settle request serializes"),
+    };
     let close = sign(
         &receiver,
         Transaction::close_channel(
@@ -150,15 +247,54 @@ fn build_fixture() -> Fixture {
     let mut transfer_entry = fixture_entry("transfer", &transfer);
     transfer_entry.to_account_key_hex = Some(hex(receiver_account.as_ref()));
     transfer_entry.value = Some(transfer_value.to_string());
+    let mut open_entry = fixture_entry("open_channel", &open);
+    open_entry.receiver_account_key_hex = Some(hex(receiver_account.as_ref()));
+    open_entry.operator_account_key_hex = Some(hex(receiver_account.as_ref()));
+    open_entry.deposit = Some(50.to_string());
+    open_entry.expiry = Some(424_242.to_string());
     let mut mint_entry = fixture_entry("mint", &mint);
     mint_entry.value = Some(Operation::MAX_MINT_AMOUNT.to_string());
     let transactions = vec![
         transfer_entry,
-        fixture_entry("open_channel", &open),
+        open_entry,
         fixture_entry("close_channel", &close),
         fixture_entry("timeout_channel", &timeout),
         mint_entry,
     ];
+
+    let end_reasons = [
+        StreamEndReason::Complete,
+        StreamEndReason::PaymentTimeout,
+        StreamEndReason::DepositExhausted,
+        StreamEndReason::ChannelClosed,
+    ]
+    .iter()
+    .map(|reason| {
+        serde_json::to_value(reason)
+            .expect("reason serializes")
+            .as_str()
+            .expect("reason is a string")
+            .to_string()
+    })
+    .collect();
+    let stream_fixture = StreamFixture {
+        chunk_event: STREAM_CHUNK_EVENT.to_string(),
+        payment_required_event: STREAM_PAYMENT_REQUIRED_EVENT.to_string(),
+        end_event: STREAM_END_EVENT.to_string(),
+        end_reasons,
+        chunk_sample: serde_json::to_string(&StreamChunk {
+            text: "hello ".into(),
+            served: 1,
+            paid: 0,
+        })
+        .expect("chunk serializes"),
+        end_sample: serde_json::to_string(&StreamEnd {
+            reason: StreamEndReason::PaymentTimeout,
+            served: 32,
+            paid: 7,
+        })
+        .expect("end serializes"),
+    };
 
     let batch = vec![transfer, open, close, timeout, mint];
 
@@ -169,6 +305,9 @@ fn build_fixture() -> Fixture {
         max_mint_amount: Operation::MAX_MINT_AMOUNT.to_string(),
         batch_hex: hex(&batch.encode()),
         transactions,
+        channel: channel_fixture,
+        stream: stream_fixture,
+        requests: request_fixture,
     }
 }
 

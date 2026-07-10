@@ -55,10 +55,18 @@ export async function encodeSignedTransaction(
         throw new Error('value must be greater than zero');
     }
 
-    const body = await encodeTransactionBody(draft);
+    return signEncodedBody(await encodeTransactionBody(draft), sign);
+}
+
+/// The signing tail every transaction encoder shares: digest the body,
+/// hand the digest to the signer, and append the returned scheme-tagged
+/// signature.
+async function signEncodedBody(
+    body: Uint8Array,
+    sign: (message: Uint8Array) => Promise<Uint8Array>,
+): Promise<EncodedTransaction> {
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body)));
     const signature = await sign(digest);
-
     return {
         digestHex: toHex(digest),
         bytes: bytesConcat(body, signature),
@@ -92,25 +100,147 @@ export async function encodeSignedMintTransaction(
         Uint8Array.of(MINT_TAG),
         encodeU64(draft.amount),
     );
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body)));
-    const signature = await sign(digest);
-
-    return {
-        digestHex: toHex(digest),
-        bytes: bytesConcat(body, signature),
-    };
+    return signEncodedBody(body, sign);
 }
 
 export function encodeTransactionBatch(transactions: Uint8Array[]): Uint8Array {
     return bytesConcat(encodeUsize(transactions.length), ...transactions);
 }
 
-export function toHex(bytes: Uint8Array): string {
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
+/// Namespace every transaction signature commits to (matches
+/// `TRANSACTION_NAMESPACE` in the Rust codec). The passkey path signs the raw
+/// digest as its WebAuthn challenge; the ed25519 path must sign
+/// `unionUnique(TRANSACTION_NAMESPACE, digest)`.
+export const TRANSACTION_NAMESPACE = 'constantinople-tx';
+/// Namespace every voucher signature commits to (matches `VOUCHER_NAMESPACE`).
+export const VOUCHER_NAMESPACE = 'constantinople-voucher';
+/// Domain separator of the channel address derivation (matches
+/// `CHANNEL_ADDRESS_DOMAIN`).
+const CHANNEL_ADDRESS_DOMAIN = 'constantinople-channel';
+
+/// The commonware namespace framing: `varint(len(namespace)) || namespace ||
+/// message`. Ed25519 signers sign this; the chain verifies against it.
+export function unionUnique(namespace: string, message: Uint8Array): Uint8Array {
+    const namespaceBytes = new TextEncoder().encode(namespace);
+    return bytesConcat(encodeUsize(namespaceBytes.length), namespaceBytes, message);
 }
 
-export function trimTrailingSlash(value: string): string {
-    return value.replace(/\/+$/, '');
+/// Wraps a raw 32-byte ed25519 public key into the chain's 34-byte
+/// transaction public key (scheme byte, key, one padding byte).
+export function ed25519TransactionPublicKey(rawPublicKey: Uint8Array): Uint8Array {
+    assertByteLength(rawPublicKey, ACCOUNT_KEY_BYTES, 'ed25519 public key');
+    const publicKey = new Uint8Array(PUBLIC_KEY_BYTES);
+    publicKey[0] = ED25519_SCHEME;
+    publicKey.set(rawPublicKey, 1);
+    return publicKey;
+}
+
+/// Wraps a raw 64-byte ed25519 signature into the chain's scheme-tagged
+/// transaction signature tail.
+export function ed25519TransactionSignature(rawSignature: Uint8Array): Uint8Array {
+    assertByteLength(rawSignature, VOUCHER_SIGNATURE_BYTES, 'ed25519 signature');
+    return bytesConcat(Uint8Array.of(ED25519_SCHEME), rawSignature);
+}
+
+/// Derives a channel's account address (matches `channel_address` in the
+/// Rust codec): SHA-256 over the domain, payer, receiver, and operator
+/// account keys, and the open nonce.
+export async function channelAddress(
+    payerAccountKey: Uint8Array,
+    receiverAccountKey: Uint8Array,
+    operatorAccountKey: Uint8Array,
+    openNonce: bigint,
+): Promise<Uint8Array> {
+    assertByteLength(payerAccountKey, ACCOUNT_KEY_BYTES, 'payer account key');
+    assertByteLength(receiverAccountKey, ACCOUNT_KEY_BYTES, 'receiver account key');
+    assertByteLength(operatorAccountKey, ACCOUNT_KEY_BYTES, 'operator account key');
+    const preimage = bytesConcat(
+        new TextEncoder().encode(CHANNEL_ADDRESS_DOMAIN),
+        payerAccountKey,
+        receiverAccountKey,
+        operatorAccountKey,
+        encodeU64(openNonce),
+    );
+    return new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(preimage)));
+}
+
+/// The exact bytes a voucher's ed25519 signature must be made over,
+/// including the namespace framing (matches `voucher_message` +
+/// `VOUCHER_NAMESPACE` in the Rust codec).
+export function voucherSigningPayload(channel: Uint8Array, cumulative: bigint): Uint8Array {
+    assertByteLength(channel, ACCOUNT_KEY_BYTES, 'channel account key');
+    return unionUnique(VOUCHER_NAMESPACE, bytesConcat(channel, encodeU64(cumulative)));
+}
+
+export interface OpenChannelDraft {
+    readonly senderPublicKey: Uint8Array;
+    readonly receiverAccountKey: Uint8Array;
+    readonly operatorAccountKey: Uint8Array;
+    readonly deposit: bigint;
+    readonly expiry: bigint;
+    readonly nonce: bigint;
+}
+
+/// Encodes and signs an OpenChannel transaction. Wire layout matches the
+/// Rust codec: sender, nonce, tag, receiver, operator, deposit, expiry. The
+/// `sign` callback receives the body digest (like the transfer encoder); an
+/// ed25519 signer must namespace it itself via
+/// `unionUnique(TRANSACTION_NAMESPACE, digest)`.
+export async function encodeSignedOpenChannelTransaction(
+    draft: OpenChannelDraft,
+    sign: (message: Uint8Array) => Promise<Uint8Array>,
+): Promise<EncodedTransaction> {
+    if (draft.deposit === 0n) {
+        throw new Error('deposit must be greater than zero');
+    }
+    assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
+    assertByteLength(draft.receiverAccountKey, ACCOUNT_KEY_BYTES, 'receiver account key');
+    assertByteLength(draft.operatorAccountKey, ACCOUNT_KEY_BYTES, 'operator account key');
+
+    const body = bytesConcat(
+        draft.senderPublicKey,
+        encodeU64(draft.nonce),
+        Uint8Array.of(OPEN_CHANNEL_TAG),
+        draft.receiverAccountKey,
+        draft.operatorAccountKey,
+        encodeU64(draft.deposit),
+        encodeU64(draft.expiry),
+    );
+    return signEncodedBody(body, sign);
+}
+
+export interface TimeoutChannelDraft {
+    readonly senderPublicKey: Uint8Array;
+    readonly receiverAccountKey: Uint8Array;
+    readonly operatorAccountKey: Uint8Array;
+    readonly openNonce: bigint;
+    readonly nonce: bigint;
+}
+
+/// Encodes and signs a TimeoutChannel transaction — the payer (sender)
+/// reclaiming an expired channel's escrow. Wire layout matches the Rust
+/// codec: sender, nonce, tag, receiver, operator, open nonce.
+export async function encodeSignedTimeoutChannelTransaction(
+    draft: TimeoutChannelDraft,
+    sign: (message: Uint8Array) => Promise<Uint8Array>,
+): Promise<EncodedTransaction> {
+    assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
+    assertByteLength(draft.receiverAccountKey, ACCOUNT_KEY_BYTES, 'receiver account key');
+    assertByteLength(draft.operatorAccountKey, ACCOUNT_KEY_BYTES, 'operator account key');
+
+    const body = bytesConcat(
+        draft.senderPublicKey,
+        encodeU64(draft.nonce),
+        Uint8Array.of(TIMEOUT_CHANNEL_TAG),
+        draft.receiverAccountKey,
+        draft.operatorAccountKey,
+        encodeU64(draft.openNonce),
+    );
+    return signEncodedBody(body, sign);
+}
+
+export function toHex(bytes: Uint8Array): string {
+    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
 }
 
 export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {

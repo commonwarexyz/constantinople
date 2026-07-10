@@ -294,11 +294,18 @@ fn local_run_commands(
     simplex_verification_material: &str,
 ) -> Vec<(String, String)> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
-    // The channel operator (and everything that points at it: the spammer's
-    // settlement flag, the explorer's voucher stats) exists exactly when the
-    // spammer runs channel traffic.
-    let operator_url = (args.spammer && args.spammer_channel_fraction > 0.0)
-        .then(|| format!("http://127.0.0.1:{}", crate::DEFAULT_OPERATOR_PORT));
+    let relayer_port = relayer_http_port(args, local);
+    // The channel operator runs whenever its dependencies (relayer, indexer)
+    // do: the spammer's channel lifecycles and the explorer's paid-stream
+    // demo both point at it, and the explorer alone is reason enough. URL and
+    // relayer port travel together so the process can never be advertised
+    // without being started (or vice versa).
+    let operator = relayer_port.filter(|_| indexer_enabled(args)).map(|port| {
+        (
+            format!("http://127.0.0.1:{}", crate::DEFAULT_OPERATOR_PORT),
+            port,
+        )
+    });
     let mut commands: Vec<(String, String)> = (0..args.validators)
         .map(|index| {
             let path = output_dir.join(format!("validator-{index}.yaml"));
@@ -365,14 +372,14 @@ fn local_run_commands(
         // submitted-transaction proofs.
         // The defaults in `explorer/src/App.tsx` match these ports, but pass
         // both URLs explicitly so non-default deployer ports still work.
-        let relayer_env = relayer_http_port(args, local)
+        let relayer_env = relayer_port
             .map(|port| format!(" VITE_MEMPOOL_URL=http://127.0.0.1:{port}"))
             .unwrap_or_default();
         // Point the explorer at the operator's /stats so it can show the
         // off-chain voucher count next to the on-chain settlement count.
-        let operator_env = operator_url
+        let operator_env = operator
             .as_ref()
-            .map(|url| format!(" VITE_OPERATOR_URL={url}"))
+            .map(|(url, _)| format!(" VITE_OPERATOR_URL={url}"))
             .unwrap_or_default();
         commands.push((
             "explorer".to_string(),
@@ -388,29 +395,32 @@ fn local_run_commands(
         ));
     }
 
+    if let Some((_, relayer_port)) = &operator {
+        commands.push((
+            "operator".to_string(),
+            format!(
+                "cargo run --release --bin constantinople-operator -- \
+                 --relayer-url http://127.0.0.1:{relayer_port} \
+                 --indexer-url http://127.0.0.1:{} \
+                 --qmdb-url http://127.0.0.1:{} \
+                 --port {} \
+                 --listen-addr 127.0.0.1",
+                local.chain_indexer_port,
+                local.qmdb_indexer_port,
+                crate::DEFAULT_OPERATOR_PORT,
+            ),
+        ));
+    }
+
     if args.spammer {
         let targets = relayer_targets.join(",");
-        let relayer_port =
-            relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
-        if operator_url.is_some() {
-            commands.push((
-                "operator".to_string(),
-                format!(
-                    "cargo run --release --bin constantinople-operator -- \
-                     --relayer-url http://127.0.0.1:{relayer_port} \
-                     --indexer-url http://127.0.0.1:{} \
-                     --qmdb-url http://127.0.0.1:{} \
-                     --port {} \
-                     --listen-addr 127.0.0.1",
-                    local.chain_indexer_port,
-                    local.qmdb_indexer_port,
-                    crate::DEFAULT_OPERATOR_PORT,
-                ),
-            ));
-        }
-        let operator_flag = operator_url
+        let relayer_port = relayer_port.expect("--spammer requires a relayer secondary");
+        // The spammer settles channels through the operator only when it
+        // actually runs channel lifecycles.
+        let operator_flag = operator
             .as_ref()
-            .map(|url| format!(" --channel-operator-url {url}"))
+            .filter(|_| args.spammer_channel_fraction > 0.0)
+            .map(|(url, _)| format!(" --channel-operator-url {url}"))
             .unwrap_or_default();
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
@@ -688,6 +698,53 @@ mod tests {
         );
     }
 
+    /// The paid-stream demo needs the operator without any spammer: the
+    /// indexer/relayer stack alone brings it up, and a spammer without
+    /// channel traffic does not point at it.
+    #[test]
+    fn local_explorer_stack_starts_operator_without_spammer() {
+        let mut args = test_args(false);
+        args.indexer = true;
+        args.relayer = true;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(
+            commands.iter().any(|(name, _)| name == "operator"),
+            "operator must run for the explorer's paid-stream demo"
+        );
+        let (_, explorer) = commands
+            .iter()
+            .find(|(_, command)| command.contains("npm --prefix explorer"))
+            .expect("explorer command should be present");
+        assert!(explorer.contains("VITE_OPERATOR_URL=http://127.0.0.1:8093"));
+
+        let mut args = test_args(true);
+        args.indexer = true;
+        args.relayer = true;
+        args.spammer_channel_fraction = 0.0;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+        let (_, spammer) = commands
+            .iter()
+            .find(|(_, command)| command.contains("constantinople-spammer"))
+            .expect("spammer command should be present");
+        assert!(
+            !spammer.contains("--channel-operator-url"),
+            "a spammer without channel traffic must not settle through the operator"
+        );
+    }
+
     #[test]
     fn local_run_commands_include_indexer_and_relayer_stack() {
         let mut args = test_args(false);
@@ -701,7 +758,8 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        assert_eq!(commands.len(), 8);
+        // 2 validators + 2 secondaries + store/sql/qmdb + explorer + operator.
+        assert_eq!(commands.len(), 9);
         assert!(commands[2].1.contains("secondary-0.yaml"));
         assert!(commands[3].1.contains("secondary-1.yaml"));
     }
@@ -751,8 +809,9 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        // 2 validators + 1 indexer secondary + 1 relayer secondary + store/sql/qmdb + explorer.
-        assert_eq!(commands.len(), 8);
+        // 2 validators + 1 indexer secondary + 1 relayer secondary +
+        // store/sql/qmdb + explorer + operator.
+        assert_eq!(commands.len(), 9);
         let (_, indexer_cmd) = commands
             .iter()
             .find(|(_, c)| c.contains("--bin chain-indexer"))

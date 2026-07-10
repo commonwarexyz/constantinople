@@ -1,4 +1,5 @@
-import { toArrayBuffer, trimTrailingSlash } from './codec';
+import { toArrayBuffer } from './codec';
+import { trimTrailingSlash } from './util';
 
 export interface AccountView {
     readonly balance: number;
@@ -19,6 +20,14 @@ export type TxStatus =
           readonly filtered: string[];
       }
     | { readonly status: 'dropped' };
+
+/// Whether the batch finalized (fully or partially) — the statuses that
+/// carry a height.
+export function statusHasHeight(
+    status: TxStatus,
+): status is Extract<TxStatus, { readonly height: number }> {
+    return status.status === 'finalized' || status.status === 'partially_finalized';
+}
 
 export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);

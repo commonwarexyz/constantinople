@@ -305,6 +305,8 @@ fn remote_operator_config(
         indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
         qmdb_url: format!("http://{QMDB_INDEXER_HOST}:{}", remote.qmdb_indexer_port),
         operator_seed: crate::default_operator_seed(),
+        min_runway: crate::default_operator_min_runway(),
+        settle_margin: crate::default_operator_settle_margin(),
     })
 }
 

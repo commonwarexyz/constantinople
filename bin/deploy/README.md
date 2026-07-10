@@ -166,7 +166,7 @@ full upload path for raw KV, SQL metadata, simplex, and QMDB writes. When both
 `--indexer` and `--relayer` are set, the indexer is `secondary-0` and the
 relayer is `secondary-1`.
 
-The printed `mprocs` command list grows by four entries:
+The printed `mprocs` command list grows by five entries:
 
 - `cargo run --release -p constantinople-indexer --bin chain-indexer -- --port 8090 --data-dir ./local/chain-indexer`
   — the simulator-backed shared store. `--chain-indexer-port` overrides the port.
@@ -182,6 +182,11 @@ The printed `mprocs` command list grows by four entries:
   certificates in the shared store.
   Add `VITE_VERIFY_CERTIFICATES=false` to disable block-list certificate
   verification during streaming-performance experiments.
+- `cargo run --release --bin constantinople-operator -- --relayer-url … --indexer-url … --qmdb-url … --port 8093`
+  — the channel operator (port 8093), started whenever the indexer and
+  relayer both run. It settles the spammer's channel lifecycles and serves
+  the explorer's paid-stream demo (`GET /stream`); the explorer learns its
+  address via `VITE_OPERATOR_URL`.
 
 Validators do not upload QMDB data to `qmdb-indexer` directly. The indexer
 secondary writes QMDB rows into the shared `chain-indexer` store using reserved
