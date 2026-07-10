@@ -141,9 +141,9 @@ struct PoolEntry<H: Hasher> {
 }
 
 /// A batch proposed at a given height.
-struct ProposedBatch<H: Hasher> {
+struct ProposedBatch<D> {
     height: u64,
-    digests: Vec<H::Digest>,
+    digests: Vec<D>,
 }
 
 #[derive(Clone, Copy)]
@@ -369,6 +369,107 @@ where
     affected
 }
 
+/// Pops pool entries for a proposal at `height`, recording each served batch.
+///
+/// A caller-supplied `limit` is a strict refill budget capped by
+/// `max_propose_bytes`: it is never overshot, so a refill replacing dropped
+/// transactions cannot inflate the block. The default budget
+/// (`limit == None`) may overshoot by one entry so an oversized head entry
+/// cannot wedge the pool.
+fn pop_proposal<H>(
+    pool: &mut VecDeque<PoolEntry<H>>,
+    pool_bytes: &mut usize,
+    proposed: &mut VecDeque<ProposedBatch<H::Digest>>,
+    height: u64,
+    limit: Option<usize>,
+    max_propose_bytes: usize,
+) -> Vec<VerifiedTransaction<H>>
+where
+    H: Hasher,
+{
+    let (budget, strict) = limit.map_or((max_propose_bytes, false), |limit| {
+        (limit.min(max_propose_bytes), true)
+    });
+    let mut batch_txs = Vec::new();
+    let mut batch_bytes = 0;
+
+    while let Some(entry) = pool.front() {
+        if batch_bytes + entry.total_bytes > budget && (strict || !batch_txs.is_empty()) {
+            break;
+        }
+        let entry = pool.pop_front().expect("front was Some");
+        *pool_bytes -= entry.total_bytes;
+        batch_bytes += entry.total_bytes;
+        let mut digests = Vec::with_capacity(entry.transactions.len());
+        for tx in &entry.transactions {
+            digests.push(*tx.message_digest());
+        }
+        proposed.push_back(ProposedBatch { height, digests });
+        batch_txs.extend(entry.transactions);
+    }
+    batch_txs
+}
+
+/// Applies one finalized block's digest set to the outstanding proposed
+/// batches, recording per-digest outcomes and pruning `known_digests`.
+///
+/// A partial match does not prove the unmatched digests are dead: a
+/// speculative reuse can split one selection across two finalized blocks (the
+/// filtered digests land in the parent, the remainder in the next block this
+/// node proposes). Matched digests finalize immediately; the remainder stays
+/// outstanding until its own block is reported or the grace window expires.
+///
+/// Returns the batch ids whose digests gained outcomes, for terminal-status
+/// resolution by the caller.
+fn resolve_proposed_batches<D>(
+    proposed: &mut VecDeque<ProposedBatch<D>>,
+    finalized: &AHashSet<D>,
+    height: u64,
+    drop_grace_blocks: u64,
+    known_digests: &mut AHashSet<D>,
+    digest_outcomes: &mut AHashMap<D, DigestOutcome>,
+    digest_watchers: &AHashMap<D, Vec<Arc<str>>>,
+) -> AHashSet<Arc<str>>
+where
+    D: Copy + Eq + Hash,
+{
+    let mut affected: AHashSet<Arc<str>> = AHashSet::new();
+    let mut remaining = VecDeque::new();
+    for batch in proposed.drain(..) {
+        let expired = height >= batch.height + drop_grace_blocks;
+        let any_finalized = batch
+            .digests
+            .iter()
+            .any(|digest| finalized.contains(digest));
+        if !any_finalized && !expired {
+            remaining.push_back(batch);
+            continue;
+        }
+
+        affected.extend(watched_batches_for(&batch.digests, digest_watchers));
+        let mut outstanding = Vec::new();
+        for digest in &batch.digests {
+            if finalized.contains(digest) {
+                digest_outcomes.insert(*digest, DigestOutcome::Finalized { height });
+                known_digests.remove(digest);
+            } else if expired {
+                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
+                known_digests.remove(digest);
+            } else {
+                outstanding.push(*digest);
+            }
+        }
+        if !outstanding.is_empty() {
+            remaining.push_back(ProposedBatch {
+                height: batch.height,
+                digests: outstanding,
+            });
+        }
+    }
+    *proposed = remaining;
+    affected
+}
+
 fn resolve_batch_if_terminal<D>(
     batch_id: &Arc<str>,
     statuses: &mut AHashMap<Arc<str>, StoredBatchStatus<D>>,
@@ -546,7 +647,7 @@ where
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut proposed: VecDeque<ProposedBatch<H>> = VecDeque::new();
+        let mut proposed: VecDeque<ProposedBatch<H::Digest>> = VecDeque::new();
         let mut statuses: AHashMap<Arc<str>, StoredBatchStatus<H::Digest>> = AHashMap::new();
         let mut status_order = VecDeque::new();
         let mut batch_digests: AHashMap<Arc<str>, Vec<H::Digest>> = AHashMap::new();
@@ -629,26 +730,19 @@ where
                 Message::QueryStatus { batch_id, response } => {
                     let _ = response.send(statuses.get(batch_id.as_str()).cloned());
                 }
-                Message::Propose { height, response } => {
-                    let mut batch_txs = Vec::new();
-                    let mut batch_bytes = 0;
-
-                    while let Some(entry) = pool.front() {
-                        if batch_bytes + entry.total_bytes > max_propose_bytes
-                            && !batch_txs.is_empty()
-                        {
-                            break;
-                        }
-                        let entry = pool.pop_front().expect("front was Some");
-                        pool_bytes -= entry.total_bytes;
-                        batch_bytes += entry.total_bytes;
-                        let mut digests = Vec::with_capacity(entry.transactions.len());
-                        for tx in &entry.transactions {
-                            digests.push(*tx.message_digest());
-                        }
-                        proposed.push_back(ProposedBatch { height, digests });
-                        batch_txs.extend(entry.transactions);
-                    }
+                Message::Propose {
+                    height,
+                    limit,
+                    response,
+                } => {
+                    let batch_txs = pop_proposal(
+                        &mut pool,
+                        &mut pool_bytes,
+                        &mut proposed,
+                        height,
+                        limit,
+                        max_propose_bytes,
+                    );
                     response.send_lossy(batch_txs);
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
@@ -679,55 +773,26 @@ where
                         })
                         .await;
 
-                    let mut remaining = VecDeque::new();
-                    for batch in proposed.drain(..) {
-                        let affected = watched_batches_for(&batch.digests, &digest_watchers);
-                        if batch
-                            .digests
-                            .iter()
-                            .any(|digest| finalized.contains(digest))
-                        {
-                            for digest in &batch.digests {
-                                if finalized.contains(digest) {
-                                    digest_outcomes
-                                        .insert(*digest, DigestOutcome::Finalized { height });
-                                } else {
-                                    digest_outcomes.insert(*digest, DigestOutcome::Dropped);
-                                }
-                                known_digests.remove(digest);
-                            }
-                            for batch_id in affected {
-                                resolve_batch_if_terminal(
-                                    &batch_id,
-                                    &mut statuses,
-                                    &mut status_order,
-                                    &mut batch_digests,
-                                    &mut digest_watchers,
-                                    &mut digest_outcomes,
-                                    &mut pending_waiters,
-                                );
-                            }
-                        } else if height >= batch.height + drop_grace_blocks {
-                            for digest in &batch.digests {
-                                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
-                                known_digests.remove(digest);
-                            }
-                            for batch_id in affected {
-                                resolve_batch_if_terminal(
-                                    &batch_id,
-                                    &mut statuses,
-                                    &mut status_order,
-                                    &mut batch_digests,
-                                    &mut digest_watchers,
-                                    &mut digest_outcomes,
-                                    &mut pending_waiters,
-                                );
-                            }
-                        } else {
-                            remaining.push_back(batch);
-                        }
+                    let affected = resolve_proposed_batches(
+                        &mut proposed,
+                        &finalized,
+                        height,
+                        drop_grace_blocks,
+                        &mut known_digests,
+                        &mut digest_outcomes,
+                        &digest_watchers,
+                    );
+                    for batch_id in affected {
+                        resolve_batch_if_terminal(
+                            &batch_id,
+                            &mut statuses,
+                            &mut status_order,
+                            &mut batch_digests,
+                            &mut digest_watchers,
+                            &mut digest_outcomes,
+                            &mut pending_waiters,
+                        );
                     }
-                    proposed = remaining;
 
                     acknowledgement.acknowledge();
                 }
@@ -741,7 +806,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DigestOutcome, StoredBatchStatus, TxStatus, batch_status_from_outcomes, new_transactions,
+        DigestOutcome, PoolEntry, ProposedBatch, StoredBatchStatus, TxStatus,
+        batch_status_from_outcomes, new_transactions, pop_proposal, resolve_proposed_batches,
         status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
@@ -750,6 +816,7 @@ mod tests {
     use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
+    use std::collections::VecDeque;
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {
@@ -847,5 +914,254 @@ mod tests {
                 filtered: vec![second],
             }),
         );
+    }
+
+    /// A speculative reuse can split one selection across two finalized
+    /// blocks: the filtered digest lands in the parent, the remainder in the
+    /// next block this node proposes. Both must resolve as finalized.
+    #[test]
+    fn split_selection_finalizes_across_two_blocks() {
+        let mut rng = StdRng::from_seed([17; 32]);
+        let filtered = sha256::Digest::random(&mut rng);
+        let reused = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![filtered, reused],
+        }]);
+        let mut known: AHashSet<_> = [filtered, reused].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        let watchers = AHashMap::new();
+
+        // The parent block (containing the filtered digest) finalizes first.
+        let parent_body: AHashSet<_> = [filtered].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &parent_body,
+            2,
+            10,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert_eq!(proposed.len(), 1, "remainder must stay outstanding");
+        assert_eq!(proposed[0].digests, vec![reused]);
+        assert_eq!(
+            batch_status_from_outcomes(&[filtered, reused], &outcomes),
+            None,
+            "batch must not resolve until the remainder settles"
+        );
+
+        // The reuse block (containing the remainder) finalizes next.
+        let reuse_body: AHashSet<_> = [reused].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &reuse_body,
+            3,
+            10,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert!(proposed.is_empty());
+        assert!(known.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[filtered, reused], &outcomes),
+            Some(StoredBatchStatus::Finalized { height: 3 }),
+            "both digests finalized, split across blocks"
+        );
+    }
+
+    /// A remainder that never finalizes still ages out at the grace bound.
+    #[test]
+    fn split_selection_remainder_drops_after_grace() {
+        let mut rng = StdRng::from_seed([19; 32]);
+        let included = sha256::Digest::random(&mut rng);
+        let dead = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![included, dead],
+        }]);
+        let mut known: AHashSet<_> = [included, dead].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        let watchers = AHashMap::new();
+
+        let first_body: AHashSet<_> = [included].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &first_body,
+            2,
+            3,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert_eq!(proposed.len(), 1);
+
+        // Nothing includes the remainder; grace (height 2 + 3) expires it.
+        let empty_body = AHashSet::new();
+        resolve_proposed_batches(
+            &mut proposed,
+            &empty_body,
+            5,
+            3,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert!(proposed.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[included, dead], &outcomes),
+            Some(StoredBatchStatus::PartiallyFinalized {
+                height: 2,
+                included: vec![included],
+                filtered: vec![dead],
+            }),
+        );
+    }
+
+    /// The pre-split behavior is unchanged when a whole selection lands in
+    /// one block or dies untouched.
+    #[test]
+    fn whole_batch_resolution_is_unchanged() {
+        let mut rng = StdRng::from_seed([23; 32]);
+        let a = sha256::Digest::random(&mut rng);
+        let b = sha256::Digest::random(&mut rng);
+
+        // Full inclusion resolves immediately.
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![a, b],
+        }]);
+        let mut known: AHashSet<_> = [a, b].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        let body: AHashSet<_> = [a, b].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &body,
+            2,
+            10,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+        );
+        assert!(proposed.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[a, b], &outcomes),
+            Some(StoredBatchStatus::Finalized { height: 2 }),
+        );
+
+        // No inclusion within grace keeps the batch pending, then drops it.
+        let c = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![c],
+        }]);
+        let mut known: AHashSet<_> = [c].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        resolve_proposed_batches(
+            &mut proposed,
+            &AHashSet::new(),
+            3,
+            3,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+        );
+        assert_eq!(proposed.len(), 1, "still within grace");
+        resolve_proposed_batches(
+            &mut proposed,
+            &AHashSet::new(),
+            5,
+            3,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+        );
+        assert!(proposed.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[c], &outcomes),
+            Some(StoredBatchStatus::Dropped),
+        );
+    }
+
+    fn pool_entry(seed: u64, txs: usize, total_bytes: usize) -> PoolEntry<sha256::Sha256> {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 100).public_key();
+        let transactions = (0..txs as u64)
+            .map(|nonce| {
+                Transaction::new(
+                    TransactionPublicKey::ed25519(signer.public_key()),
+                    TransactionPublicKey::ed25519(recipient.clone()),
+                    NonZeroU64::new(1).expect("non-zero"),
+                    nonce,
+                )
+                .seal_and_sign(
+                    &signer,
+                    TRANSACTION_NAMESPACE,
+                    &mut sha256::Sha256::default(),
+                )
+            })
+            .collect();
+        PoolEntry {
+            transactions,
+            total_bytes,
+        }
+    }
+
+    /// A strict refill budget is never overshot, even by the head entry; the
+    /// default budget may overshoot by exactly one entry.
+    #[test]
+    fn pop_proposal_respects_strict_budget() {
+        let mut pool = VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]);
+        let mut pool_bytes = 900;
+        let mut proposed = VecDeque::new();
+
+        // Strict budget below the head entry: nothing is served.
+        let txs = pop_proposal(
+            &mut pool,
+            &mut pool_bytes,
+            &mut proposed,
+            5,
+            Some(500),
+            1_000,
+        );
+        assert!(txs.is_empty());
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool_bytes, 900);
+        assert!(proposed.is_empty());
+
+        // Strict budget covering only the head entry stops before the next.
+        let txs = pop_proposal(
+            &mut pool,
+            &mut pool_bytes,
+            &mut proposed,
+            5,
+            Some(700),
+            1_000,
+        );
+        assert_eq!(txs.len(), 2);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool_bytes, 300);
+        assert_eq!(proposed.len(), 1);
+
+        // The strict budget is additionally capped by the default maximum.
+        let mut pool = VecDeque::from([pool_entry(3, 1, 400)]);
+        let mut pool_bytes = 400;
+        let txs = pop_proposal(
+            &mut pool,
+            &mut pool_bytes,
+            &mut proposed,
+            5,
+            Some(10_000),
+            300,
+        );
+        assert!(txs.is_empty(), "strict budget capped below the entry");
+
+        // The default budget overshoots by one entry so an oversized head
+        // cannot wedge the pool.
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, None, 300);
+        assert_eq!(txs.len(), 1);
+        assert!(pool.is_empty());
+        assert_eq!(pool_bytes, 0);
     }
 }

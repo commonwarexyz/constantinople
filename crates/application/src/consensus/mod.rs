@@ -43,6 +43,7 @@ mod genesis;
 mod glue;
 mod history;
 mod lifecycle;
+mod speculation;
 #[cfg(test)]
 mod tests;
 mod time;
@@ -65,6 +66,24 @@ pub type FinalizedHookFn<E, C, H, P, St> = Arc<
         + Sync,
 >;
 type Result<T> = core::result::Result<T, &'static str>;
+
+/// Returns whether the local signer leads a given round. Supplied by the
+/// engine, which derives it from the same elector and participant set it
+/// hands to consensus.
+pub type LeaderOracle = Arc<dyn Fn(commonware_consensus::types::Round) -> bool + Send + Sync>;
+
+/// Configuration for speculative pre-building of next-round proposals.
+pub struct SpeculationConfig<I> {
+    /// Mempool handle used for speculative transaction selection.
+    pub input: I,
+    /// Returns whether the local signer leads a given round.
+    pub is_leader: LeaderOracle,
+    /// Maximum view distance at which a pre-build may still seed a proposal.
+    /// Must stay well inside the mempool's drop-grace window (in blocks) so
+    /// reused transactions land before their batch statuses resolve; one
+    /// validator rotation is a sound default against a two-rotation grace.
+    pub max_reuse_views: u64,
+}
 
 const INVALID_SIGNATURE: &str = "invalid signature";
 
@@ -89,8 +108,11 @@ where
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
     proposed_transactions: Counter,
+    speculator: Option<SpeculatorHandle<E, H, C, P, I, St>>,
     _marker: PhantomData<(E, C, S, I, B)>,
 }
+
+type SpeculatorHandle<E, H, C, P, I, St> = Arc<speculation::Speculator<E, H, C, P, I, St>>;
 
 impl<E, H, C, S, P, I, B, St> Clone for Application<E, H, C, S, P, I, B, St>
 where
@@ -112,6 +134,7 @@ where
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
+            speculator: self.speculator.clone(),
             _marker: PhantomData,
         }
     }
@@ -140,11 +163,20 @@ where
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
+        speculation: Option<SpeculationConfig<I>>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
             "The number of transactions proposed into blocks",
         );
+        let speculator = speculation.map(|config| {
+            Arc::new(speculation::Speculator::new(
+                context.child("speculation"),
+                config.input,
+                config.is_leader,
+                config.max_reuse_views,
+            ))
+        });
 
         Self {
             strategy,
@@ -156,6 +188,7 @@ where
             genesis_transactions_target,
             finalized_hook,
             proposed_transactions,
+            speculator,
             _marker: PhantomData,
         }
     }

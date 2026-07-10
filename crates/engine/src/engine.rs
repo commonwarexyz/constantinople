@@ -23,9 +23,12 @@ use commonware_consensus::{
         store::{Blocks, Certificates},
     },
     simplex::{
-        self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
+        self,
+        config::Floor as SimplexFloor,
+        elector::{Config as Elector, Elector as _},
+        types::Finalization,
     },
-    types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, Participant, ViewDelta, coding::Commitment},
 };
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
@@ -33,7 +36,7 @@ use commonware_cryptography::{
         dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
     },
-    certificate::{ConstantProvider, Verifier},
+    certificate::{ConstantProvider, Scheme as _, Verifier},
 };
 use commonware_glue::stateful::{
     Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
@@ -58,7 +61,7 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
-    Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, FinalizedHookFn, SpeculationConfig, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache};
@@ -66,6 +69,7 @@ use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -246,7 +250,7 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    I: TransactionSource<Commitment, C::PublicKey, H> + Clone + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
@@ -488,6 +492,35 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
+        // Speculative pre-building is always on. The leader oracle mirrors
+        // consensus exactly: the same elector type built with the same
+        // participant set the scheme hands simplex. `elect` is called without
+        // a certificate, which is only sound for electors that ignore it —
+        // this engine's leadership must stay certificate-independent (e.g.
+        // round-robin), since next-round leadership is derived before the
+        // current round's certificate exists. Non-participants (no position
+        // in the scheme) never lead, so the oracle is inert for them and no
+        // pre-build ever starts.
+        let speculation = {
+            let me = scheme
+                .participants()
+                .position(&config.signer.public_key())
+                .map(Participant::from_usize);
+            // The Elector trait does not require Sync; the mutex makes the
+            // oracle shareable and is uncontended (one call per verify).
+            let elector =
+                commonware_utils::sync::Mutex::new(L::default().build(scheme.participants()));
+            SpeculationConfig {
+                input: config.input.clone(),
+                is_leader: Arc::new(move |round| {
+                    me.is_some_and(|me| elector.lock().elect(round, None) == me)
+                }),
+                // One rotation: comfortably inside the mempool's drop-grace
+                // window (two rotations of blocks), so reused pre-built
+                // transactions always land before their statuses resolve.
+                max_reuse_views: scheme.participants().len() as u64,
+            }
+        };
         let application = Application::new(
             context.child("application"),
             config.strategy.clone(),
@@ -498,6 +531,7 @@ where
             genesis_state_target,
             genesis_transactions_target,
             config.finalized_hook,
+            Some(speculation),
         );
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),

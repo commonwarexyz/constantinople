@@ -1550,6 +1550,7 @@ version = "0.1.0"
 dependencies = [
  "ahash",
  "bytes",
+ "commonware-actor",
  "commonware-codec",
  "commonware-consensus",
  "commonware-cryptography",

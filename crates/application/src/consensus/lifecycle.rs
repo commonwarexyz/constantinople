@@ -4,9 +4,13 @@ use super::{
     Application,
     body::{verify_signatures, wait_for_timestamp},
     execution::{
-        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
+        ProposalExecution, apply_prepared_body, commitments_match, execute_body, execute_proposal,
+        prepare_lazy,
     },
-    reject_verify, time,
+    history::parent_transactions_inactivity_floor,
+    reject_verify,
+    speculation::PreBuilt,
+    time,
 };
 use commonware_consensus::simplex::types::Context;
 use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
@@ -61,33 +65,82 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let body = input
-            .propose(&parent.header, &context)
-            .instrument(info_span!("application.propose.input"))
-            .await;
-
         let parent_digest = parent.digest();
         let parent_height = parent.header.height;
-        let (state_batch, transaction_batch) = batches;
-        let execution = execute_proposal(
-            self.strategy.clone(),
-            state_batch,
-            transaction_batch,
-            &parent,
-            body,
-        )
-        .await;
 
-        // The parent (a full block of decoded transactions) is released on
-        // the strategy's pool so the drop stays off the propose path.
+        // A pre-built execution for this exact parent is the finished
+        // proposal: only the header (real context, fresh timestamp) remains.
+        // A pre-build for any other parent still owns transactions that were
+        // consumed from the mempool, so its selection seeds a best-effort
+        // re-execution against the actual parent: anything already included
+        // upstream (or otherwise inapplicable there) fails its nonce or
+        // balance check and is dropped, and the dropped bytes are refilled
+        // from the mempool.
+        let speculation = match &self.speculator {
+            Some(speculator) => {
+                speculator
+                    .take(context.round, &parent_digest, &self.strategy)
+                    .await
+            }
+            None => None,
+        };
+        let (execution, batches) = match speculation {
+            Some(prebuilt) if prebuilt.parent == parent_digest => {
+                self.speculator
+                    .as_ref()
+                    .expect("speculation implies speculator")
+                    .record_hit();
+                (prebuilt.execution, Some(batches))
+            }
+            speculation => {
+                let seed = match speculation {
+                    Some(prebuilt) => {
+                        self.speculator
+                            .as_ref()
+                            .expect("speculation implies speculator")
+                            .record_reuse();
+                        // Release the mismatched execution off the propose
+                        // path; only its transaction selection is reused.
+                        let PreBuilt { execution, .. } = prebuilt;
+                        let ProposalExecution { block, body } = execution;
+                        let drop_span = info_span!("application.propose.drop_speculation");
+                        drop(
+                            self.strategy
+                                .spawn(move |_: St| drop_span.in_scope(|| drop(block))),
+                        );
+                        body
+                    }
+                    None => {
+                        input
+                            .propose(&parent.header, context.round, None)
+                            .instrument(info_span!("application.propose.input"))
+                            .await
+                    }
+                };
+                let (state_batch, transaction_batch) = batches;
+                let execution = execute_proposal(
+                    self.strategy.clone(),
+                    state_batch,
+                    transaction_batch,
+                    parent_transactions_inactivity_floor(&parent),
+                    &parent.header,
+                    context.round,
+                    seed,
+                    Some(input),
+                )
+                .await;
+                (execution, None)
+            }
+        };
+
+        // The parent (a full block of decoded transactions) and, on the
+        // pre-built path, the unused batches are released on the strategy's
+        // pool so the drops stay off the propose path.
         let drop_span = info_span!("application.propose.drop_parent");
         drop(
             self.strategy
-                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
+                .spawn(move |_: St| drop_span.in_scope(|| drop((parent, batches)))),
         );
-
-        // A rejected candidate drops the proposal; consensus skips the view.
-        let execution = execution?;
 
         self.proposed_transactions
             .inc_by(execution.block.transaction_count as u64);
@@ -143,6 +196,7 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        let block_digest = block.digest();
         let Block { header, body } = block.into_inner();
 
         // Signature verification needs only the block body, so it starts
@@ -182,10 +236,13 @@ where
             self.strategy.clone(),
             state_batch,
             transaction_batch,
-            &parent,
+            parent_transactions_inactivity_floor(&parent),
             body,
         );
-        let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
+        let wait = wait_for_timestamp(
+            runtime.child("wait"),
+            time::block_deadline(header.timestamp),
+        );
 
         let result = futures::try_join!(signatures, execution, wait);
 
@@ -218,7 +275,24 @@ where
             "application.verify.complete"
         );
 
-        Some(execution.into_merkleized())
+        let transaction_count = execution.transaction_count;
+        let merkleized = execution.into_merkleized();
+
+        // The verified block is the likely parent of the next proposal. If
+        // this node leads the next round, pre-build that proposal on top of
+        // the just-computed state so the propose request finds it finished.
+        if let Some(speculator) = &self.speculator {
+            speculator.maybe_prebuild(
+                &runtime,
+                &self.strategy,
+                &header,
+                block_digest,
+                u64::try_from(transaction_count).expect("transaction count exceeded u64"),
+                &merkleized,
+            );
+        }
+
+        Some(merkleized)
     }
 
     /// Applies a certified block to speculative batches.

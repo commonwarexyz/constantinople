@@ -1,7 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
-use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
+use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
 use std::future::Future;
@@ -15,10 +15,20 @@ where
     P: PublicKey,
 {
     /// Returns the transactions to include in the next proposal.
+    ///
+    /// `round` is the consensus round the proposal targets. Speculative
+    /// pre-builds call this before the round is entered, so implementations
+    /// must not assume the round is live.
+    ///
+    /// `limit` caps the returned batch in encoded bytes. `None` uses the
+    /// implementation's default proposal budget; `Some` is a strict cap used
+    /// by refills that replace dropped transactions, so implementations must
+    /// not overshoot it.
     fn propose(
         &mut self,
         parent: &Header<C, H::Digest, P>,
-        context: &Context<C, P>,
+        round: Round,
+        limit: Option<usize>,
     ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send;
 }
 

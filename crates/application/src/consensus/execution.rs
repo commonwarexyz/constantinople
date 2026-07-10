@@ -89,10 +89,11 @@ use super::{
     db::{
         self, StateBatch, StateStaged, StateUpdates, TransactionBatch, apply_transaction_digests,
     },
-    history::parent_transactions_inactivity_floor,
     reject_verify,
 };
 use crate::executor::{self, PreparedTransfer};
+use commonware_codec::EncodeSize as _;
+use commonware_consensus::types::Round;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
@@ -101,11 +102,10 @@ use commonware_runtime::{
 };
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
-use constantinople_primitives::{
-    Account, Header, LazySignedTransaction, SealedBlock, SignedTransaction,
-};
+use constantinople_mempool::TransactionSource;
+use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
 use std::sync::Arc;
-use tracing::info_span;
+use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
 where
@@ -349,90 +349,194 @@ where
         .map(|prepared| prepared.into_iter().unzip())
 }
 
-/// Executes a proposal's candidate transactions all or nothing.
+/// Mempool refill rounds a proposal may attempt after dropping inapplicable
+/// candidates. Bounds propose latency; transactions dropped in the final
+/// round age out of the mempool like any unfinalized proposal.
+const MAX_REFILL_ROUNDS: usize = 3;
+
+/// Executes a proposal's candidate transactions best effort.
 ///
-/// If every candidate executes cleanly the block includes them all. An empty
-/// selection proposes an empty block so an idle chain keeps making progress.
-/// If any candidate is malformed, fails its nonce or balance check, or
-/// overflows a recipient, the proposal is dropped (`None`) and consensus
-/// skips the view.
+/// Verification is all or nothing, but a proposer chooses the block body:
+/// each candidate (the supplied selection first, then mempool refills)
+/// executes against block-start account state in block order, and any
+/// transaction that does not apply — malformed encoding, stale nonce
+/// (typically a transaction that already landed in an ancestor block),
+/// unaffordable value, or credit overflow — is dropped instead of dooming the
+/// proposal. Dropped bytes are refilled from the mempool, with `stage` +
+/// `expand` loading each round's new accounts incrementally, until the
+/// selection applies cleanly, the mempool runs dry, the round bound hits, or
+/// no refill source was supplied (`input: None`, the speculative pre-build
+/// path). The surviving body re-executes cleanly under all-or-nothing
+/// verification with identical account writes.
+///
+/// The transaction-history append is ordered after selection settles (the
+/// final body is unknown until then), unlike verification where it overlaps
+/// state execution — but it still runs on the strategy's pool, as does the
+/// hashing inside both merkleizes downstream. An empty selection proposes an
+/// empty block so an idle chain keeps making progress.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
-pub(super) async fn execute_proposal<E, C, P, H, S>(
+pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
-    parent: &SealedBlock<C, P, H>,
-    transactions: Vec<SignedTransaction<H>>,
-) -> Option<ProposalExecution<E, H, S>>
+    parent_floor: mmr::Location,
+    parent_header: &Header<C, H::Digest, P>,
+    round: Round,
+    candidates: Vec<SignedTransaction<H>>,
+    mut input: Option<&mut I>,
+) -> ProposalExecution<E, H, S>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
-    H: Hasher,
     P: PublicKey,
+    H: Hasher,
     S: Strategy,
+    I: TransactionSource<C, P, H> + Sync,
 {
-    let prepare_span = info_span!(
-        "application.execute.prepare",
-        txs = transactions.len().traced()
-    );
-    let prepared = strategy
-        .spawn(move |s| {
-            prepare_span.in_scope(|| {
-                prepare_signed(&s, &transactions)
-                    .map(|(transfers, digests)| (transfers, digests, transactions))
-            })
-        })
-        .await?;
+    let mut unstaged = Some(state_batch);
+    let mut staged: Option<StateStaged<E, H, EightCap, S>> = None;
+    let mut selector = executor::SelectiveExecutor::new();
+    let mut body: Vec<SignedTransaction<H>> = Vec::new();
+    let mut digests: Vec<H::Digest> = Vec::new();
+    let mut candidates = candidates;
 
-    let (staged, transaction_batch, outcome) = match prepared {
-        (transfers, digests, transactions) if !transfers.is_empty() => {
-            let transfers = Arc::new(transfers);
-            // The transaction-history append has no dependency on state
-            // execution, so it runs on the pool concurrently with compute; a
-            // rejected candidate drops the whole proposal, so the appended
-            // batch is discarded, never reused.
-            let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-            let apply = strategy.spawn(move |_: S| {
-                apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
-            });
-            let (staged, updates) = compute(state_batch, transfers, &strategy).await;
-            let transaction_batch = apply.await;
-            let updates = updates?;
-            (staged, transaction_batch, Some((transactions, updates)))
+    for refills in 0.. {
+        if candidates.is_empty() {
+            break;
         }
-        // Appending zero digests is an identity, so the empty selection
-        // skips the pool round-trip entirely.
-        _ => (stage_empty(state_batch).await, transaction_batch, None),
+
+        // Prepare the candidates on the pool, dropping malformed ones.
+        let prepare_span = info_span!(
+            "application.execute.prepare",
+            txs = candidates.len().traced()
+        );
+        let prepared: Vec<(PreparedTransfer, H::Digest, SignedTransaction<H>)> = strategy
+            .spawn(move |s: S| {
+                prepare_span.in_scope(|| {
+                    s.map_collect_vec(candidates, |tx| {
+                        executor::prepare_transfer(&tx)
+                            .map(|transfer| (transfer, *tx.message_digest(), tx))
+                    })
+                    .into_iter()
+                    .flatten()
+                    .collect()
+                })
+            })
+            .await;
+        let transfers: Vec<PreparedTransfer> =
+            prepared.iter().map(|(transfer, _, _)| *transfer).collect();
+
+        // Load block-start values for accounts this round touches for the
+        // first time; later rounds expand the same staged read space, whose
+        // indices continue exactly where the selector's dense table does.
+        let missing = selector.begin_round(&transfers);
+        if !missing.is_empty() {
+            let keys: Vec<&_> = missing.iter().collect();
+            if let Some(batch) = unstaged.take() {
+                let (values, next) = batch
+                    .stage(&keys)
+                    .await
+                    .expect("account state loading must succeed");
+                selector.register(&values);
+                staged = Some(next);
+            } else {
+                let (range, values, next) = staged
+                    .take()
+                    .expect("staged batch exists after the first round")
+                    .expand(&keys)
+                    .await
+                    .expect("account state loading must succeed");
+                assert_eq!(range.len(), values.len());
+                selector.register(&values);
+                staged = Some(next);
+            }
+        }
+
+        // Apply in block order, keeping the survivors.
+        let select_span = info_span!(
+            "application.execute.select",
+            txs = transfers.len().traced(),
+            dropped = tracing::field::Empty,
+        );
+        let (returned, applied) = strategy
+            .spawn({
+                let span = select_span.clone();
+                move |_: S| {
+                    span.in_scope(|| {
+                        let applied = selector.apply(&transfers);
+                        (selector, applied)
+                    })
+                }
+            })
+            .await;
+        selector = returned;
+
+        let mut dropped_bytes = 0;
+        for ((_, digest, transaction), applied) in prepared.into_iter().zip(applied) {
+            if applied {
+                digests.push(digest);
+                body.push(transaction);
+            } else {
+                dropped_bytes += transaction.encode_size();
+            }
+        }
+        select_span.record("dropped", dropped_bytes.traced());
+        if dropped_bytes == 0 || refills >= MAX_REFILL_ROUNDS {
+            break;
+        }
+        let Some(input) = input.as_mut() else {
+            break;
+        };
+
+        // Replace the dropped bytes from the live mempool.
+        candidates = input
+            .propose(parent_header, round, Some(dropped_bytes))
+            .instrument(info_span!("application.execute.refill"))
+            .await;
+    }
+
+    let staged = match staged {
+        Some(staged) => staged,
+        None => stage_empty(unstaged.take().expect("nothing was staged")).await,
     };
+    let updates = selector.into_updates();
 
-    let (body, state_updates) = outcome.unwrap_or_default();
+    // The final body is only known after selection, so the history append is
+    // ordered after it rather than overlapping it (as verification does). It
+    // still executes on the strategy's pool, and the merkleizes inside
+    // `finalize_child` fan their hashing out there too.
+    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
+    let transaction_batch = strategy
+        .spawn(move |_: S| {
+            apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
+        })
+        .await;
 
-    Some(ProposalExecution {
+    ProposalExecution {
         block: finalize_child(
             staged,
-            state_updates,
+            updates,
             transaction_batch,
-            parent,
+            parent_floor,
             body.len(),
             "database merkleization must succeed",
         )
         .await,
         body,
-    })
+    }
 }
 
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
-pub(super) async fn execute_body<E, C, P, H, S>(
+pub(super) async fn execute_body<E, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
-    parent: &SealedBlock<C, P, H>,
+    parent_floor: mmr::Location,
     body: PreparedBody<H>,
 ) -> Result<BlockExecution<E, H, S>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
-    C: Digest,
-    P: PublicKey,
     H: Hasher,
     S: Strategy,
 {
@@ -459,7 +563,7 @@ where
         staged,
         state_updates,
         transaction_batch,
-        parent,
+        parent_floor,
         transaction_count,
         "database merkleization during verification must succeed",
     )
@@ -533,23 +637,20 @@ where
 }
 
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
-async fn finalize_child<E, C, P, H, S>(
+async fn finalize_child<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
     transaction_batch: TransactionBatch<E, H, S>,
-    parent: &SealedBlock<C, P, H>,
+    parent_floor: mmr::Location,
     transaction_count: usize,
     expect_message: &'static str,
 ) -> BlockExecution<E, H, S>
 where
     E: BufferPooler + Storage + Clock + Metrics,
-    C: Digest,
-    P: PublicKey,
     H: Hasher,
     S: Strategy,
 {
-    let transaction_batch =
-        transaction_batch.with_inactivity_floor(parent_transactions_inactivity_floor(parent));
+    let transaction_batch = transaction_batch.with_inactivity_floor(parent_floor);
     let (state, transactions) =
         db::finalize_execution(state_staged, state_updates, transaction_batch)
             .await
