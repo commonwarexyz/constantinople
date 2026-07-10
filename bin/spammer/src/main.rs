@@ -105,16 +105,26 @@ fn main() {
     runner.start(|context| async move {
         // In deployer mode (--hosts), use JSON logs so Loki/Promtail can scrape them.
         let json_logs = cli.hosts.is_some();
+        // In deployer mode the spammer runs on a dedicated instance whose
+        // metrics are scraped at the deployer's fixed port, so that is the
+        // fallback; ad-hoc runs serve metrics only when a port is given,
+        // since the deployer's port doubles as the first co-located
+        // validator's metrics port.
+        let metrics_address = cli
+            .metrics_port
+            .or_else(|| {
+                cli.hosts
+                    .is_some()
+                    .then_some(commonware_deployer::aws::METRICS_PORT)
+            })
+            .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
         telemetry::init(
             context.child("telemetry"),
             telemetry::Logs {
                 level: tracing::Level::INFO,
                 json: json_logs,
             },
-            Some(SocketAddr::new(
-                IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-                cli.metrics_port,
-            )),
+            metrics_address,
             None,
         );
 
