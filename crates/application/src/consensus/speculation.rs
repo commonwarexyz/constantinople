@@ -8,6 +8,18 @@
 //! then requests a proposal with the expected parent, the pre-built execution
 //! is reused and only the header (real context, fresh timestamp) remains.
 //!
+//! The pre-build itself is split in two so its parent-independent half never
+//! waits on the parent. Mempool selection depends only on mempool contents
+//! and the parent's header (the mempool serves pre-verified transactions by
+//! height; nonce and balance filtering happens later, against the parent's
+//! staged post-execution state), and candidate preparation depends only on
+//! the transactions themselves — so both start when verification of the
+//! likely parent *begins* ([`Speculator::maybe_preselect`]), overlapping the
+//! parent's own execution. The state-dependent half — staging block-start
+//! account values, applying the nonce/balance selection, and merkleizing —
+//! starts once verification produces the parent's merkleized state
+//! ([`Speculator::maybe_prebuild`]).
+//!
 //! Selection consumes transactions from the mempool (the mempool never
 //! re-queues served transactions), so a pre-build whose parent guess turns
 //! out wrong must not be discarded: its transaction selection seeds the
@@ -26,7 +38,9 @@
 
 use super::{
     db::{Databases, MerkleizedDatabases},
-    execution::{ProposalExecution, execute_proposal},
+    execution::{
+        Candidates, PreparedCandidate, ProposalExecution, execute_proposal, prepare_candidates,
+    },
     history::transactions_inactivity_floor,
 };
 use commonware_consensus::types::{Round, View};
@@ -44,7 +58,10 @@ use commonware_storage::translator::EightCap;
 use commonware_utils::sync::{AsyncMutex, Mutex};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::Header;
-use futures::channel::oneshot;
+use futures::{
+    channel::oneshot,
+    future::{self, Either},
+};
 use std::sync::Arc;
 use tracing::{Instrument as _, info_span};
 
@@ -66,6 +83,18 @@ where
 /// pre-build task; a completed value waits buffered in the channel until
 /// consumed, restored, or replaced.
 type Slot<E, H, St> = Option<oneshot::Receiver<Option<PreBuilt<E, H, St>>>>;
+
+/// Handle to an in-flight pre-selection: the parent-independent half of a
+/// pre-build (mempool pop plus candidate preparation), started when
+/// verification of the speculated parent begins. The channel carries `None`
+/// when the mempool had nothing to select. Dropping the handle cancels a
+/// pre-selection that has not yet consumed from the mempool.
+pub(super) struct Preselection<H>
+where
+    H: Hasher,
+{
+    receiver: oneshot::Receiver<Option<Vec<PreparedCandidate<H>>>>,
+}
 
 /// Awaits an in-flight pre-build, restoring it to the slot if the caller is
 /// cancelled first. The glue actor drops the propose future whenever the
@@ -184,6 +213,80 @@ where
         }
     }
 
+    /// Starts the parent-independent half of a pre-build — the mempool pop
+    /// and candidate preparation — when verification of `parent_header`'s
+    /// block *begins*, so it overlaps that block's execution instead of
+    /// following it. Mempool selection needs only the parent's header (the
+    /// mempool serves pre-verified transactions by height, never by parent
+    /// state), and preparation needs only the transactions, so neither waits
+    /// for the parent's post-execution state; the state-dependent half —
+    /// staging, nonce/balance selection, execution, merkleization — still
+    /// starts in [`Self::maybe_prebuild`] at verify-end.
+    ///
+    /// Returns `None` unless the local signer leads the next round. Pass the
+    /// returned handle to `maybe_prebuild`; dropping it instead (the verify
+    /// was rejected or abandoned) cancels a pre-selection that has not yet
+    /// consumed from the mempool, while one that already popped strands its
+    /// transactions exactly like a replaced pre-build (the mempool ages them
+    /// out).
+    pub(super) fn maybe_preselect<C, P>(
+        &self,
+        strategy: &St,
+        parent_header: &Header<C, H::Digest, P>,
+    ) -> Option<Preselection<H>>
+    where
+        E: Spawner,
+        C: Digest,
+        P: PublicKey,
+        I: TransactionSource<C, P, H> + Sync,
+    {
+        let round = parent_header.context.round;
+        let next = Round::new(round.epoch(), View::new(round.view().get() + 1));
+        if !(self.is_leader)(next) {
+            return None;
+        }
+
+        let (sender, receiver) = oneshot::channel();
+        let parent_header = parent_header.clone();
+        let input = Arc::clone(&self.input);
+        let strategy = strategy.clone();
+        let span = info_span!(
+            "application.speculate.preselect",
+            height = (parent_header.height + 1).traced()
+        );
+        drop(self.spawner.child("preselect").spawn(move |_| {
+            async move {
+                // Consume from the mempool only while someone can still use
+                // the result: a pre-selection whose verify was rejected (or
+                // whose pre-build was replaced) stops before selecting. The
+                // lock covers just the pop, never the preparation.
+                let seed = {
+                    let mut input = input.lock().await;
+                    if sender.is_canceled() {
+                        return;
+                    }
+                    input
+                        .propose(&parent_header, next, 0)
+                        .instrument(info_span!("application.speculate.input"))
+                        .await
+                };
+                if seed.is_empty() {
+                    let _ = sender.send(None);
+                    return;
+                }
+                let prepare_span =
+                    info_span!("application.speculate.prepare", txs = seed.len().traced());
+                let prepared = strategy
+                    .spawn(move |s: St| prepare_span.in_scope(|| prepare_candidates(&s, seed)))
+                    .await;
+                let _ = sender.send(Some(prepared));
+            }
+            .instrument(span)
+        }));
+
+        Some(Preselection { receiver })
+    }
+
     /// Starts a pre-build of the next proposal on top of `parent` (a block
     /// this node just verified) when the local signer leads the next view.
     /// The next round is assumed to stay in the parent's epoch; near an epoch
@@ -192,7 +295,11 @@ where
     ///
     /// The heavy work (mempool selection, execution, merkleization) runs on a
     /// spawned task and the strategy's pool; this call only forks batches and
-    /// swaps the slot.
+    /// swaps the slot. When `preselection` is supplied (started by
+    /// [`Self::maybe_preselect`] at verify-begin), the mempool pop and
+    /// candidate preparation already ran concurrently with the parent's
+    /// execution and the task consumes their result instead of repeating
+    /// them.
     ///
     /// The forked batches read through `merkleized`, which the stateful actor
     /// keeps alive in its pending map. If a conflicting finalization prunes
@@ -206,6 +313,7 @@ where
         parent_digest: H::Digest,
         parent_body_len: u64,
         merkleized: &MerkleizedDatabases<E, H, St>,
+        preselection: Option<Preselection<H>>,
     ) where
         E: Spawner,
         C: Digest,
@@ -247,28 +355,61 @@ where
         );
         drop(self.spawner.child("build").spawn(move |clock| {
             async move {
-                // Consume from the mempool only while someone can still use
-                // the result: a replaced task stops before selecting. The
-                // lock covers just the selection so a successor's seed pop
-                // (and nothing heavier) can ever wait on this task.
-                let seed = {
-                    let mut input = input.lock().await;
-                    if result.is_canceled() {
+                let mut result = result;
+                // A pre-selection started at verify-begin already popped and
+                // prepared the seed; await it, but stop if this pre-build is
+                // replaced first — dropping the pre-selection receiver lets
+                // a pre-selection still queued on the mempool lock skip its
+                // pop (mirroring the fresh path's cancellation check below).
+                let preselected = match preselection {
+                    Some(Preselection { receiver }) => {
+                        match future::select(receiver, result.cancellation()).await {
+                            Either::Left((preselected, _)) => Some(preselected),
+                            Either::Right(((), _receiver)) => return,
+                        }
+                    }
+                    None => None,
+                };
+                let candidates = match preselected {
+                    // The seed was popped and prepared while the parent was
+                    // still executing.
+                    Some(Ok(Some(prepared))) => Candidates::Prepared(prepared),
+                    // The mempool had nothing to select at verify-begin;
+                    // leave the slot empty so propose takes the fresh path
+                    // (and picks up any transactions that arrive in the
+                    // meantime).
+                    Some(Ok(None)) => {
+                        empty_seeds.inc();
+                        let _ = result.send(None);
                         return;
                     }
-                    input
-                        .propose(&parent_header, next, 0)
-                        .instrument(info_span!("application.speculate.input"))
-                        .await
+                    // No pre-selection ran, or its task died before sending:
+                    // consume from the mempool now — but only while someone
+                    // can still use the result: a replaced task stops before
+                    // selecting. The lock covers just the selection so a
+                    // successor's seed pop (and nothing heavier) can ever
+                    // wait on this task.
+                    Some(Err(oneshot::Canceled)) | None => {
+                        let seed = {
+                            let mut input = input.lock().await;
+                            if result.is_canceled() {
+                                return;
+                            }
+                            input
+                                .propose(&parent_header, next, 0)
+                                .instrument(info_span!("application.speculate.input"))
+                                .await
+                        };
+                        if seed.is_empty() {
+                            // Nothing was consumed from the mempool; leave
+                            // the slot empty so propose takes the fresh path.
+                            empty_seeds.inc();
+                            let _ = result.send(None);
+                            return;
+                        }
+                        Candidates::Raw(seed)
+                    }
                 };
-                if seed.is_empty() {
-                    // Nothing was consumed from the mempool; leave the slot
-                    // empty so propose takes the fresh path (and picks up any
-                    // transactions that arrive in the meantime).
-                    empty_seeds.inc();
-                    let _ = result.send(None);
-                    return;
-                }
                 // No refill source: dropped candidates are rare on the newest
                 // block, and a miss re-executes with live refills at propose
                 // time anyway. This also caps what a replaced task can strand
@@ -281,7 +422,7 @@ where
                     parent_floor,
                     &parent_header,
                     next,
-                    seed,
+                    candidates,
                     None,
                 )
                 .await;

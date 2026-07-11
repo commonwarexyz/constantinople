@@ -195,6 +195,15 @@ pub(crate) struct RemoteArgs {
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
+    /// Provisioned IOPS for validator gp3 volumes (EBS default when unset).
+    #[arg(long = "storage-iops")]
+    storage_iops: Option<i32>,
+    /// Provisioned throughput (MiB/s) for validator gp3 volumes (EBS default
+    /// when unset). Validators write ~4x the raw block per view; the gp3
+    /// default of 125 MiB/s throttles the cluster before either the NIC or
+    /// consensus does.
+    #[arg(long = "storage-throughput")]
+    storage_throughput: Option<i32>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,

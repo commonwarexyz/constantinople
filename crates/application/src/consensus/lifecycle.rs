@@ -4,8 +4,8 @@ use super::{
     Application,
     body::{verify_signatures, wait_for_timestamp},
     execution::{
-        ProposalExecution, apply_prepared_body, commitments_match, execute_body, execute_proposal,
-        prepare_lazy,
+        Candidates, ProposalExecution, apply_prepared_body, commitments_match, execute_body,
+        execute_proposal, prepare_lazy,
     },
     history::parent_transactions_inactivity_floor,
     reject_verify,
@@ -122,7 +122,7 @@ where
                     parent_transactions_inactivity_floor(&parent),
                     &parent.header,
                     context.round,
-                    seed,
+                    Candidates::Raw(seed),
                     Some(input),
                 )
                 .await;
@@ -195,6 +195,19 @@ where
     {
         let block_digest = block.digest();
         let Block { header, body } = block.into_inner();
+
+        // If this node leads the next round, its proposal will most likely
+        // extend this block. The parent-independent half of that pre-build —
+        // popping the mempool and preparing the candidates — needs only this
+        // block's header, so it starts now and runs concurrently with the
+        // verification below; the state-dependent half starts in
+        // `maybe_prebuild` once the verified state exists. Any rejection
+        // below drops the handle, which cancels a pre-selection that has not
+        // yet consumed from the mempool.
+        let preselection = self
+            .speculator
+            .as_ref()
+            .and_then(|speculator| speculator.maybe_preselect(&self.strategy, &header));
 
         // Signature verification needs only the block body, so it starts
         // immediately and overlaps the parent fetch below. The child context
@@ -285,6 +298,7 @@ where
                 block_digest,
                 u64::try_from(transaction_count).expect("transaction count exceeded u64"),
                 &merkleized,
+                preselection,
             );
         }
 
