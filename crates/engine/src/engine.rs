@@ -28,7 +28,7 @@ use commonware_consensus::{
         elector::{Config as Elector, Elector as _},
         types::Finalization,
     },
-    types::{Epoch, FixedEpocher, Participant, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, Participant, Round, View, ViewDelta, coding::Commitment},
 };
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
@@ -59,7 +59,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
+use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, ordered::Quorum, union};
 use constantinople_application::consensus::{
     Application, FinalizedHookFn, SpeculationConfig, StateSyncTarget, TransactionHistoryTarget,
 };
@@ -92,6 +92,7 @@ pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
+const MAX_PENDING_FORWARDS: NonZero<usize> = NZUsize!(8);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
@@ -476,6 +477,27 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
+        // Proactive full-block forwarding: the proposer sends its full block
+        // to the predicted next-round leader alongside shard dissemination.
+        // The route is derived by calling the elector without a certificate,
+        // which is only sound because Constantinople's elector is
+        // certificate-independent (see the speculative pre-building oracle
+        // below, which relies on the same property).
+        let forward_router = {
+            let participants = scheme.participants().clone();
+            let elector = Arc::new(commonware_utils::sync::Mutex::new(
+                L::default().build(&participants),
+            ));
+            ShardsForwardRouter(Arc::new(move |round: Round| {
+                // The round comes off the wire unauthenticated; decline the
+                // route instead of overflowing on a hostile view.
+                let next = Round::new(round.epoch(), View::new(round.view().get().checked_add(1)?));
+                let elector = elector.lock();
+                let leader = participants.key(elector.elect(round, None))?.clone();
+                let recipient = participants.key(elector.elect(next, None))?.clone();
+                Some(shards::ForwardRoute { leader, recipient })
+            }))
+        };
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
             shards::Config {
@@ -490,6 +512,8 @@ where
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
+                forward_router,
+                max_pending_forwards: MAX_PENDING_FORWARDS,
             },
         );
         // Speculative pre-building is always on. The leader oracle mirrors
