@@ -4,13 +4,10 @@ use super::{
     Application,
     body::{verify_signatures, wait_for_timestamp},
     execution::{
-        Candidates, ProposalExecution, apply_prepared_body, commitments_match, execute_body,
-        execute_proposal, prepare_lazy,
+        apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
     },
     history::parent_transactions_inactivity_floor,
-    reject_verify,
-    speculation::PreBuilt,
-    time,
+    reject_verify, time,
 };
 use commonware_consensus::simplex::types::Context;
 use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
@@ -68,75 +65,34 @@ where
         let parent_digest = parent.digest();
         let parent_height = parent.header.height;
 
-        // A pre-built execution for this exact parent is the finished
-        // proposal: only the header (real context, fresh timestamp) remains.
-        // A pre-build for any other parent still owns transactions that were
-        // consumed from the mempool, so its selection seeds a best-effort
-        // re-execution against the actual parent: anything already included
-        // upstream (or otherwise inapplicable there) fails its nonce or
-        // balance check and is dropped, and the block tops up from the live
-        // mempool toward the proposal budget.
-        let speculation = match &self.speculator {
-            Some(speculator) => speculator.take().await,
-            None => None,
-        };
-        let (execution, batches) = match speculation {
-            Some(prebuilt) if prebuilt.parent == parent_digest => {
-                self.speculator
-                    .as_ref()
-                    .expect("speculation implies speculator")
-                    .record_hit();
-                (prebuilt.execution, Some(batches))
-            }
-            speculation => {
-                let seed = match speculation {
-                    Some(prebuilt) => {
-                        self.speculator
-                            .as_ref()
-                            .expect("speculation implies speculator")
-                            .record_reuse();
-                        // Release the mismatched execution off the propose
-                        // path; only its transaction selection is reused.
-                        let PreBuilt { execution, .. } = prebuilt;
-                        let ProposalExecution { block, body } = execution;
-                        let drop_span = info_span!("application.propose.drop_speculation");
-                        drop(
-                            self.strategy
-                                .spawn(move |_: St| drop_span.in_scope(|| drop(block))),
-                        );
-                        body
-                    }
-                    None => {
-                        input
-                            .propose(&parent.header, context.round, 0)
-                            .instrument(info_span!("application.propose.input"))
-                            .await
-                    }
-                };
-                let (state_batch, transaction_batch) = batches;
-                let execution = execute_proposal(
-                    self.strategy.clone(),
-                    &runtime,
-                    state_batch,
-                    transaction_batch,
-                    parent_transactions_inactivity_floor(&parent),
-                    &parent.header,
-                    context.round,
-                    Candidates::Raw(seed),
-                    Some(input),
-                )
-                .await;
-                (execution, None)
-            }
-        };
+        // Select from the mempool, then execute the selection best effort
+        // against the parent's state: anything inapplicable there fails its
+        // nonce or balance check and is dropped, and the block tops up from
+        // the live mempool toward the proposal budget.
+        let seed = input
+            .propose(&parent.header, context.round, 0)
+            .instrument(info_span!("application.propose.input"))
+            .await;
+        let (state_batch, transaction_batch) = batches;
+        let execution = execute_proposal(
+            self.strategy.clone(),
+            &runtime,
+            state_batch,
+            transaction_batch,
+            parent_transactions_inactivity_floor(&parent),
+            &parent.header,
+            context.round,
+            seed,
+            input,
+        )
+        .await;
 
-        // The parent (a full block of decoded transactions) and, on the
-        // pre-built path, the unused batches are released on the strategy's
-        // pool so the drops stay off the propose path.
+        // The parent (a full block of decoded transactions) is released on
+        // the strategy's pool so the drop stays off the propose path.
         let drop_span = info_span!("application.propose.drop_parent");
         drop(
             self.strategy
-                .spawn(move |_: St| drop_span.in_scope(|| drop((parent, batches)))),
+                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
         );
 
         self.proposed_transactions
@@ -193,21 +149,7 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let block_digest = block.digest();
         let Block { header, body } = block.into_inner();
-
-        // If this node leads the next round, its proposal will most likely
-        // extend this block. The parent-independent half of that pre-build —
-        // popping the mempool and preparing the candidates — needs only this
-        // block's header, so it starts now and runs concurrently with the
-        // verification below; the state-dependent half starts in
-        // `maybe_prebuild` once the verified state exists. Any rejection
-        // below drops the handle, which cancels a pre-selection that has not
-        // yet consumed from the mempool.
-        let preselection = self
-            .speculator
-            .as_ref()
-            .and_then(|speculator| speculator.maybe_preselect(&self.strategy, &header));
 
         // Signature verification needs only the block body, so it starts
         // immediately and overlaps the parent fetch below. The child context
@@ -285,24 +227,7 @@ where
             "application.verify.complete"
         );
 
-        let transaction_count = execution.transaction_count;
-        let merkleized = execution.into_merkleized();
-
-        // The verified block is the likely parent of the next proposal. If
-        // this node leads the next round, pre-build that proposal on top of
-        // the just-computed state so the propose request finds it finished.
-        if let Some(speculator) = &self.speculator {
-            speculator.maybe_prebuild(
-                &self.strategy,
-                &header,
-                block_digest,
-                u64::try_from(transaction_count).expect("transaction count exceeded u64"),
-                &merkleized,
-                preselection,
-            );
-        }
-
-        Some(merkleized)
+        Some(execution.into_merkleized())
     }
 
     /// Applies a certified block to speculative batches.

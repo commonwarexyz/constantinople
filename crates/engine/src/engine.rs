@@ -28,7 +28,7 @@ use commonware_consensus::{
         elector::{Config as Elector, Elector as _},
         types::Finalization,
     },
-    types::{Epoch, FixedEpocher, Participant, Round, View, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, Round, View, ViewDelta, coding::Commitment},
 };
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
@@ -61,7 +61,7 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, ordered::Quorum, union};
 use constantinople_application::consensus::{
-    Application, FinalizedHookFn, SpeculationConfig, StateSyncTarget, TransactionHistoryTarget,
+    Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache};
@@ -480,8 +480,9 @@ where
         // to the predicted next-round leader alongside shard dissemination.
         // The route is derived by calling the elector without a certificate,
         // which is only sound because Constantinople's elector is
-        // certificate-independent (see the speculative pre-building oracle
-        // below, which relies on the same property).
+        // certificate-independent (e.g. round-robin): next-round leadership
+        // is derived before the current round's certificate exists, so this
+        // engine's leadership must stay certificate-independent.
         let forward_router = {
             let participants = scheme.participants().clone();
             let elector = Arc::new(commonware_utils::sync::Mutex::new(
@@ -514,35 +515,6 @@ where
                 forward_router,
             },
         );
-        // Speculative pre-building is always on. The leader oracle mirrors
-        // consensus exactly: the same elector type built with the same
-        // participant set the scheme hands simplex. `elect` is called without
-        // a certificate, which is only sound for electors that ignore it —
-        // this engine's leadership must stay certificate-independent (e.g.
-        // round-robin), since next-round leadership is derived before the
-        // current round's certificate exists. Non-participants (no position
-        // in the scheme) never lead, so the oracle is inert for them and no
-        // pre-build ever starts.
-        let speculation = {
-            let me = scheme
-                .participants()
-                .position(&config.signer.public_key())
-                .map(Participant::from_usize);
-            // The Elector trait does not require Sync; the mutex makes the
-            // oracle shareable and is uncontended (one call per verify).
-            let elector =
-                commonware_utils::sync::Mutex::new(L::default().build(scheme.participants()));
-            SpeculationConfig {
-                // Rooted directly under the engine context, which lives for
-                // the process: pre-build tasks must not be children of any
-                // per-operation consensus scope.
-                spawner: context.child("speculation"),
-                input: config.input.clone(),
-                is_leader: Arc::new(move |round| {
-                    me.is_some_and(|me| elector.lock().elect(round, None) == me)
-                }),
-            }
-        };
         let application = Application::new(
             context.child("application"),
             config.strategy.clone(),
@@ -553,7 +525,6 @@ where
             genesis_state_target,
             genesis_transactions_target,
             config.finalized_hook,
-            Some(speculation),
         );
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),

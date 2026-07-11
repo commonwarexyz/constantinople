@@ -351,60 +351,6 @@ where
         .map(|prepared| prepared.into_iter().unzip())
 }
 
-/// A proposal candidate that finished preparation: the derived transfer, the
-/// transaction's sealed message digest, and the original transaction.
-pub(super) type PreparedCandidate<H> = (
-    PreparedTransfer,
-    <H as Hasher>::Digest,
-    SignedTransaction<H>,
-);
-
-/// Candidate transactions supplied to [`execute_proposal`]: either raw
-/// (still needing pool-side preparation) or already prepared. A speculative
-/// pre-selection prepares its seed while the parent block is still
-/// executing, so the pre-build that follows skips that stage.
-pub(super) enum Candidates<H>
-where
-    H: Hasher,
-{
-    /// Transactions that still need preparation on the strategy's pool.
-    Raw(Vec<SignedTransaction<H>>),
-    /// Transactions whose preparation already ran off the critical path.
-    Prepared(Vec<PreparedCandidate<H>>),
-}
-
-impl<H> Candidates<H>
-where
-    H: Hasher,
-{
-    const fn is_empty(&self) -> bool {
-        match self {
-            Self::Raw(candidates) => candidates.is_empty(),
-            Self::Prepared(prepared) => prepared.is_empty(),
-        }
-    }
-}
-
-/// Prepares proposal candidates, dropping malformed ones. Unlike
-/// verification's all-or-nothing [`prepare_lazy`], a proposer chooses its
-/// body: a candidate that fails preparation is simply excluded.
-pub(super) fn prepare_candidates<H, S>(
-    strategy: &S,
-    candidates: Vec<SignedTransaction<H>>,
-) -> Vec<PreparedCandidate<H>>
-where
-    H: Hasher,
-    S: Strategy,
-{
-    strategy
-        .map_collect_vec(candidates, |tx| {
-            executor::prepare_transfer(&tx).map(|transfer| (transfer, *tx.message_digest(), tx))
-        })
-        .into_iter()
-        .flatten()
-        .collect()
-}
-
 /// Wall-clock budget for building one proposal. Refill rounds keep running
 /// while block headroom remains and this deadline has not passed; a round in
 /// flight always completes (popped transactions must be executed or they
@@ -416,21 +362,18 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// Executes a proposal's candidate transactions best effort.
 ///
 /// Verification is all or nothing, but a proposer chooses the block body:
-/// each candidate (the supplied selection first — raw or already prepared —
-/// then mempool refills) executes against block-start account state in block
-/// order, and any
+/// each candidate (the supplied selection first, then mempool refills)
+/// executes against block-start account state in block order, and any
 /// transaction that does not apply — malformed encoding, stale nonce
 /// (typically a transaction that already landed in an ancestor block),
 /// unaffordable value, or credit overflow — is dropped instead of dooming the
 /// proposal. Each refill asks the mempool for the block's remaining headroom
 /// (it knows the proposal budget; we report the bytes already included), so
-/// the block fills toward the budget even when the seed was small — e.g. a
-/// reused pre-build that shrank. `stage` + `expand` load each round's new
-/// accounts incrementally. The loop ends when the mempool has nothing left
-/// that fits, the build deadline passes, or no refill source was supplied
-/// (`input: None`, the speculative pre-build path). The surviving body
-/// re-executes cleanly under all-or-nothing verification with identical
-/// account writes.
+/// the block fills toward the budget even when the seed was small. `stage` +
+/// `expand` load each round's new accounts incrementally. The loop ends when
+/// the mempool has nothing left that fits or the build deadline passes. The
+/// surviving body re-executes cleanly under all-or-nothing verification with
+/// identical account writes.
 ///
 /// The transaction-history append is ordered after selection settles (the
 /// final body is unknown until then), unlike verification where it overlaps
@@ -447,8 +390,8 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I>(
     parent_floor: mmr::Location,
     parent_header: &Header<C, H::Digest, P>,
     round: Round,
-    candidates: Candidates<H>,
-    mut input: Option<&mut I>,
+    candidates: Vec<SignedTransaction<H>>,
+    input: &mut I,
 ) -> ProposalExecution<E, H, S>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -472,19 +415,26 @@ where
             break;
         }
 
-        // Prepare the candidates on the pool, dropping malformed ones. A
-        // pre-selected seed arrives already prepared (that work ran while
-        // the parent block was still executing) and skips the round trip.
-        let prepared: Vec<PreparedCandidate<H>> = match candidates {
-            Candidates::Prepared(prepared) => prepared,
-            Candidates::Raw(raw) => {
-                let prepare_span =
-                    info_span!("application.execute.prepare", txs = raw.len().traced());
-                strategy
-                    .spawn(move |s: S| prepare_span.in_scope(|| prepare_candidates(&s, raw)))
-                    .await
-            }
-        };
+        // Prepare the candidates on the pool, dropping malformed ones. Unlike
+        // verification's all-or-nothing preparation, a proposer chooses its
+        // body: a candidate that fails preparation is simply excluded.
+        let prepare_span = info_span!(
+            "application.execute.prepare",
+            txs = candidates.len().traced()
+        );
+        let prepared: Vec<(PreparedTransfer, H::Digest, SignedTransaction<H>)> = strategy
+            .spawn(move |s: S| {
+                prepare_span.in_scope(|| {
+                    s.map_collect_vec(candidates, |tx| {
+                        executor::prepare_transfer(&tx)
+                            .map(|transfer| (transfer, *tx.message_digest(), tx))
+                    })
+                    .into_iter()
+                    .flatten()
+                    .collect()
+                })
+            })
+            .await;
         let transfers: Vec<PreparedTransfer> =
             prepared.iter().map(|(transfer, _, _)| *transfer).collect();
 
@@ -546,19 +496,14 @@ where
         if clock.current() >= deadline {
             break;
         }
-        let Some(input) = input.as_mut() else {
-            break;
-        };
 
         // Top the block up toward the mempool's proposal budget; an empty
         // response means nothing fits in the remaining headroom (or the pool
         // is dry) and ends the loop.
-        candidates = Candidates::Raw(
-            input
-                .propose(parent_header, round, included_bytes)
-                .instrument(info_span!("application.execute.refill"))
-                .await,
-        );
+        candidates = input
+            .propose(parent_header, round, included_bytes)
+            .instrument(info_span!("application.execute.refill"))
+            .await;
     }
 
     let staged = match staged {

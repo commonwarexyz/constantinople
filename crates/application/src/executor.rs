@@ -408,8 +408,8 @@ fn execute_discrete(
 /// state and simply drops any transfer that cannot apply (stale nonce,
 /// insufficient start balance, credit overflow) — typically a transaction
 /// that already landed in another block on this chain. Candidates can be fed
-/// in multiple rounds (e.g. a speculative selection first, then mempool
-/// refills), with account state loaded incrementally per round.
+/// in multiple rounds (the initial selection, then mempool refills), with
+/// account state loaded incrementally per round.
 ///
 /// The per-account bookkeeping mirrors `apply_general_accounts` exactly:
 /// debits and self-transfer floors are checked against the block-start
