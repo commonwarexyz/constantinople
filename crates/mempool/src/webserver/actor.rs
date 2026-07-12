@@ -127,8 +127,9 @@ pub struct Config<St: Strategy> {
     /// Number of finalized blocks to wait before marking a proposed
     /// batch as [`TxStatus::Dropped`].
     pub drop_grace_blocks: u64,
-    /// Parallel execution strategy for transaction verification: decoding, seal
-    /// hashing, and batch signature verification.
+    /// Parallel execution strategy for ingress batch verification (decoding,
+    /// seal hashing, batch signature verification), the actor's pool
+    /// maintenance, and cheap HTTP formatting.
     pub strategy: St,
     /// Shared cache of decompressed transaction public keys.
     pub public_key_cache: PublicKeyCache,

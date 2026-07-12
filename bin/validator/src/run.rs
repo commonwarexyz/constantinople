@@ -777,6 +777,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
+        // One shared rayon pool for all CPU-parallel work. Gate-path ed25519
+        // batch verification scales near-linearly with threads (measured 7.2x
+        // at 13 threads in constantinople-primitives'
+        // `sig_verify_thread_scaling`; production traces show ~470 core-ms
+        // finishing in ~36ms wall on 13 threads), so carving it onto a
+        // smaller sub-pool would only lengthen the deferred-verify gate that
+        // bounds view latency. Its contention with qmdb merkleize (merkleize
+        // wall 8.9ms uncontended -> 31.3ms mid-burst) is instead resolved by
+        // ordering: application verify gates the merkleize on signature
+        // completion (see `execute_body` in constantinople-application).
         let strategy = context.strategy(NZUsize!(rayon_threads));
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),

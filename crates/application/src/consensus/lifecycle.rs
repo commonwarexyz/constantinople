@@ -183,7 +183,12 @@ where
 
         // Execution stays on this async task; CPU-heavy stages are dispatched
         // to the strategy's pool, so a failure surfaces as a graceful
-        // rejection below.
+        // rejection below. Signatures verify concurrently with execution on
+        // the shared pool: a contention benchmark (storage `contention`
+        // bench) measured the concurrent join ~2ms FASTER than sequencing
+        // the merkleize after the signature burst — work-stealing packs the
+        // two workloads at ideal throughput, and the merkleize's stretched
+        // wall during the burst is overlap accounting, not lost work.
         let execution = execute_body(
             self.strategy.clone(),
             state_batch,
