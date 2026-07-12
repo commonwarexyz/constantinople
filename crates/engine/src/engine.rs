@@ -23,12 +23,9 @@ use commonware_consensus::{
         store::{Blocks, Certificates},
     },
     simplex::{
-        self,
-        config::Floor as SimplexFloor,
-        elector::{Config as Elector, Elector as _},
-        types::Finalization,
+        self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
     },
-    types::{Epoch, FixedEpocher, Round, View, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
 };
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
@@ -36,7 +33,7 @@ use commonware_cryptography::{
         dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
     },
-    certificate::{ConstantProvider, Scheme as _, Verifier},
+    certificate::{ConstantProvider, Verifier},
 };
 use commonware_glue::stateful::{
     Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
@@ -59,7 +56,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, ordered::Quorum, union};
+use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
     Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
@@ -69,7 +66,6 @@ use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
-    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -476,28 +472,12 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
-        // Proactive full-block forwarding: the proposer sends its full block
-        // to the predicted next-round leader alongside shard dissemination.
-        // The route is derived by calling the elector without a certificate,
-        // which is only sound because Constantinople's elector is
-        // certificate-independent (e.g. round-robin): next-round leadership
-        // is derived before the current round's certificate exists, so this
-        // engine's leadership must stay certificate-independent.
-        let forward_router = {
-            let participants = scheme.participants().clone();
-            let elector = Arc::new(commonware_utils::sync::Mutex::new(
-                L::default().build(&participants),
-            ));
-            ShardsForwardRouter(Arc::new(move |round: Round| {
-                // The round comes off the wire unauthenticated; decline the
-                // route instead of overflowing on a hostile view.
-                let next = Round::new(round.epoch(), View::new(round.view().get().checked_add(1)?));
-                let elector = elector.lock();
-                let leader = participants.key(elector.elect(round, None))?.clone();
-                let recipient = participants.key(elector.elect(next, None))?.clone();
-                Some(shards::ForwardRoute { leader, recipient })
-            }))
-        };
+        // Shard-bundle forwarding is disabled: production traces showed the
+        // bundle cannot beat the 50-way parallel rebroadcast wave it shares
+        // the leader's NIC with (reconstruction p50 was unchanged), so the
+        // extra ~block of prime-time leader egress buys nothing. The
+        // upstream machinery remains available behind a router if a design
+        // that does not compete with the fan-out emerges.
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
             shards::Config {
@@ -512,7 +492,7 @@ where
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
-                forward_router,
+                forward_router: shards::NoForwarding,
             },
         );
         let application = Application::new(

@@ -166,7 +166,15 @@ fn buffer_pool_configs(
         .with_class_max(
             NETWORK_BUFFER_POOL_1KIB_CLASS_SIZE,
             NETWORK_BUFFER_POOL_1KIB_CLASS_MAX,
-        );
+        )
+        // Shard buffers are allocated on network-reader/encode threads but
+        // freed on engine/worker threads, so TLS caches on the freeing
+        // threads strand the entire class and every alloc misses (measured:
+        // raising the cap 4x left ~540 fallback allocs/s/node and tripled
+        // erasure-encode time). Disable TLS caching for this class: the
+        // shared freelist is lock-free and ~1k ops/s/node is negligible,
+        // and the full class cap becomes dependable shared capacity.
+        .with_class_thread_cache(NETWORK_BUFFER_POOL_512KIB_CLASS_SIZE, 0);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.

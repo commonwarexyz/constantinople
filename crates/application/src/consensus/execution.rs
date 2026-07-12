@@ -106,7 +106,12 @@ use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, transla
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
-use std::{sync::Arc, time::Duration};
+use std::{
+    future::{Future, ready},
+    pin::Pin,
+    sync::Arc,
+    time::Duration,
+};
 use tracing::{Instrument as _, info_span};
 
 pub(super) struct ProposalExecution<E, H, S>
@@ -351,6 +356,9 @@ where
         .map(|prepared| prepared.into_iter().unzip())
 }
 
+/// An in-flight transaction-history append chained across refill rounds.
+type PendingAppend<E, H, S> = Pin<Box<dyn Future<Output = TransactionBatch<E, H, S>> + Send>>;
+
 /// Wall-clock budget for building one proposal. Refill rounds keep running
 /// while block headroom remains and this deadline has not passed; a round in
 /// flight always completes (popped transactions must be executed or they
@@ -375,11 +383,12 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// surviving body re-executes cleanly under all-or-nothing verification with
 /// identical account writes.
 ///
-/// The transaction-history append is ordered after selection settles (the
-/// final body is unknown until then), unlike verification where it overlaps
-/// state execution — but it still runs on the strategy's pool, as does the
-/// hashing inside both merkleizes downstream. An empty selection proposes an
-/// empty block so an idle chain keeps making progress.
+/// The transaction-history append is pipelined per round: a round's accepted
+/// digests append on the strategy's pool while the next round refills,
+/// prepares, stages, and selects, and the final round's append drains
+/// concurrently with the state merkleize inside `finalize_child` (chunked
+/// appends fold to exactly the accepted digests in block order). An empty
+/// selection proposes an empty block so an idle chain keeps making progress.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S, I>(
@@ -405,9 +414,13 @@ where
     let mut staged: Option<StateStaged<E, H, EightCap, S>> = None;
     let mut selector = executor::SelectiveExecutor::new();
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
-    let mut digests: Vec<H::Digest> = Vec::new();
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
+    // The history append for a round's accepted digests runs on the pool
+    // while later rounds refill, prepare, stage, and select; rounds chain on
+    // the batch, so the previous append is joined before the next is spawned.
+    let mut transaction_batch = Some(transaction_batch);
+    let mut pending_append: Option<PendingAppend<E, H, S>> = None;
     let deadline = clock.current() + BUILD_TIMEOUT;
 
     loop {
@@ -417,82 +430,134 @@ where
 
         // Prepare the candidates on the pool, dropping malformed ones. Unlike
         // verification's all-or-nothing preparation, a proposer chooses its
-        // body: a candidate that fails preparation is simply excluded.
+        // body: a candidate that fails preparation is simply excluded. The
+        // prepared results stay index-aligned with the untouched candidate
+        // vector — no transaction is moved through the parallel map — and the
+        // same job compacts the well-formed transfers and records the
+        // accounts this round touches for the first time.
         let prepare_span = info_span!(
             "application.execute.prepare",
             txs = candidates.len().traced()
         );
-        let prepared: Vec<(PreparedTransfer, H::Digest, SignedTransaction<H>)> = strategy
-            .spawn(move |s: S| {
-                prepare_span.in_scope(|| {
-                    s.map_collect_vec(candidates, |tx| {
-                        executor::prepare_transfer(&tx)
-                            .map(|transfer| (transfer, *tx.message_digest(), tx))
-                    })
-                    .into_iter()
-                    .flatten()
-                    .collect()
-                })
+        let accounts_span =
+            info_span!("application.execute.accounts", keys = tracing::field::Empty);
+        let (candidates_back, prepared, transfers, selector_back, missing) = strategy
+            .spawn({
+                let accounts_span = accounts_span.clone();
+                let mut selector = selector;
+                move |s: S| {
+                    let (prepared, transfers) = prepare_span.in_scope(|| {
+                        let prepared: Vec<Option<(PreparedTransfer, H::Digest)>> = s
+                            .map_collect_vec(&candidates, |tx| {
+                                executor::prepare_transfer(tx)
+                                    .map(|transfer| (transfer, *tx.message_digest()))
+                            });
+                        let transfers: Vec<PreparedTransfer> = prepared
+                            .iter()
+                            .flatten()
+                            .map(|(transfer, _)| *transfer)
+                            .collect();
+                        (prepared, transfers)
+                    });
+                    let missing = accounts_span.in_scope(|| selector.begin_round(&transfers));
+                    (candidates, prepared, transfers, selector, missing)
+                }
             })
             .await;
-        let transfers: Vec<PreparedTransfer> =
-            prepared.iter().map(|(transfer, _, _)| *transfer).collect();
+        candidates = candidates_back;
+        selector = selector_back;
+        accounts_span.record("keys", missing.len().traced());
 
         // Load block-start values for accounts this round touches for the
         // first time; later rounds expand the same staged read space, whose
         // indices continue exactly where the selector's dense table does.
-        let missing = selector.begin_round(&transfers);
         if !missing.is_empty() {
-            let keys: Vec<&_> = missing.iter().collect();
-            if let Some(batch) = unstaged.take() {
-                let (values, next) = batch
-                    .stage(&keys)
-                    .await
-                    .expect("account state loading must succeed");
-                selector.register(&values);
-                staged = Some(next);
-            } else {
-                let (_, values, next) = staged
-                    .take()
-                    .expect("staged batch exists after the first round")
-                    .expand(&keys)
-                    .await
-                    .expect("account state loading must succeed");
-                selector.register(&values);
-                staged = Some(next);
+            let stage_span = info_span!("application.execute.stage", keys = missing.len().traced());
+            async {
+                let keys: Vec<&_> = missing.iter().collect();
+                if let Some(batch) = unstaged.take() {
+                    let (values, next) = batch
+                        .stage(&keys)
+                        .await
+                        .expect("account state loading must succeed");
+                    selector.register(&values);
+                    staged = Some(next);
+                } else {
+                    let (_, values, next) = staged
+                        .take()
+                        .expect("staged batch exists after the first round")
+                        .expand(&keys)
+                        .await
+                        .expect("account state loading must succeed");
+                    selector.register(&values);
+                    staged = Some(next);
+                }
             }
+            .instrument(stage_span)
+            .await;
         }
 
-        // Apply in block order, keeping the survivors.
+        // Apply in block order and fold the survivors into the body, all in
+        // one pool job so the split is attributed and the candidates move
+        // straight into the body.
         let select_span = info_span!(
             "application.execute.select",
             txs = transfers.len().traced(),
             dropped = tracing::field::Empty,
         );
-        let (returned, applied) = strategy
+        let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
             .spawn({
                 let span = select_span.clone();
+                let mut selector = selector;
+                let mut body = body;
                 move |_: S| {
                     span.in_scope(|| {
                         let applied = selector.apply(&transfers);
-                        (selector, applied)
+                        let mut flags = applied.into_iter();
+                        let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
+                        let mut included = 0usize;
+                        let mut dropped = 0usize;
+                        for (transaction, prepared) in candidates.into_iter().zip(prepared) {
+                            let Some((_, digest)) = prepared else {
+                                continue;
+                            };
+                            if flags.next().expect("one flag per prepared transfer") {
+                                included += transaction.encode_size();
+                                chunk.push(digest);
+                                body.push(transaction);
+                            } else {
+                                dropped += transaction.encode_size();
+                            }
+                        }
+                        (selector, body, chunk, included, dropped)
                     })
                 }
             })
             .await;
-        selector = returned;
-
-        let mut dropped_bytes = 0;
-        for ((_, digest, transaction), applied) in prepared.into_iter().zip(applied) {
-            if applied {
-                included_bytes += transaction.encode_size();
-                digests.push(digest);
-                body.push(transaction);
-            } else {
-                dropped_bytes += transaction.encode_size();
-            }
-        }
+        selector = selector_back;
+        body = body_back;
+        included_bytes += included_delta;
         select_span.record("dropped", dropped_bytes.traced());
+
+        // Chain this round's history append on the pool; it overlaps the
+        // refill round-trip and the next round's prepare, stage, and select.
+        if !chunk.is_empty() {
+            let batch = match pending_append.take() {
+                Some(append) => {
+                    append
+                        .instrument(info_span!("application.execute.apply_wait"))
+                        .await
+                }
+                None => transaction_batch
+                    .take()
+                    .expect("transaction batch is owned until the first append"),
+            };
+            let apply_span = info_span!("application.execute.apply", txs = chunk.len().traced());
+            pending_append = Some(Box::pin(strategy.spawn(move |_: S| {
+                apply_span.in_scope(|| apply_transaction_digests(batch, &chunk))
+            })));
+        }
+
         if clock.current() >= deadline {
             break;
         }
@@ -510,18 +575,28 @@ where
         Some(staged) => staged,
         None => stage_empty(unstaged.take().expect("nothing was staged")).await,
     };
-    let updates = selector.into_updates();
 
-    // The final body is only known after selection, so the history append is
-    // ordered after it rather than overlapping it (as verification does). It
-    // still executes on the strategy's pool, and the merkleizes inside
-    // `finalize_child` fan their hashing out there too.
-    let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let transaction_batch = strategy
-        .spawn(move |_: S| {
-            apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
-        })
-        .await;
+    // The final account values are computed on this task while the last
+    // round's history append drains on the pool.
+    let updates_span = info_span!(
+        "application.execute.updates",
+        accounts = tracing::field::Empty
+    );
+    let updates = updates_span.in_scope(|| selector.into_updates());
+    updates_span.record("accounts", updates.len().traced());
+
+    // The last append drains concurrently with the state merkleize inside
+    // `finalize_child`; appending zero digests is an identity, so an empty
+    // selection skips the pool round-trip entirely.
+    let drained = transaction_batch.take();
+    let append = pending_append.take();
+    let transaction_batch = async move {
+        match append {
+            Some(append) => append.await,
+            None => drained.expect("transaction batch is owned until the first append"),
+        }
+    }
+    .instrument(info_span!("application.execute.apply_wait"));
 
     ProposalExecution {
         block: finalize_child(
@@ -572,7 +647,7 @@ where
     Ok(finalize_child(
         staged,
         state_updates,
-        transaction_batch,
+        ready(transaction_batch),
         parent_floor,
         transaction_count,
         "database merkleization during verification must succeed",
@@ -610,7 +685,7 @@ where
     let transaction_batch = apply.await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    db::finalize_execution(staged, state_updates, transaction_batch)
+    db::finalize_execution(staged, state_updates, ready(transaction_batch))
         .await
         .map_err(|_| STATIC_INVALID_TRANSACTION)
 }
@@ -646,11 +721,15 @@ where
     true
 }
 
+/// Merkleizes the staged state and transaction batches into a child block
+/// execution. `transaction_batch` is a future so a still-draining history
+/// append can overlap the state merkleize; callers holding a finished batch
+/// pass it via [`ready`].
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
 async fn finalize_child<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
-    transaction_batch: TransactionBatch<E, H, S>,
+    transaction_batch: impl Future<Output = TransactionBatch<E, H, S>>,
     parent_floor: mmr::Location,
     transaction_count: usize,
     expect_message: &'static str,
@@ -660,7 +739,8 @@ where
     H: Hasher,
     S: Strategy,
 {
-    let transaction_batch = transaction_batch.with_inactivity_floor(parent_floor);
+    let transaction_batch =
+        async move { transaction_batch.await.with_inactivity_floor(parent_floor) };
     let (state, transactions) =
         db::finalize_execution(state_staged, state_updates, transaction_batch)
             .await

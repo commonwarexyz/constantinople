@@ -17,7 +17,7 @@ use commonware_consensus::{
         core::Mailbox as MarshalMailbox,
     },
     simplex::{self, types::Finalization},
-    types::{Epoch, FixedEpocher, Round, coding::Commitment},
+    types::{Epoch, FixedEpocher, coding::Commitment},
 };
 use commonware_cryptography::{
     Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
@@ -164,21 +164,6 @@ pub(crate) type MarshaledApp<E, H, P, V, I, B, St> = Marshaled<
     FixedEpocher,
 >;
 
-/// Type-erased [`shards::ForwardRouter`] for proactive full-block forwarding.
-///
-/// A nameable type is required by [`ShardsEngine`]; the engine builds the
-/// route closure from its configured elector.
-#[derive(Clone)]
-pub(crate) struct ShardsForwardRouter<P: PublicKey>(
-    pub(crate) Arc<dyn Fn(Round) -> Option<shards::ForwardRoute<P>> + Send + Sync>,
-);
-
-impl<P: PublicKey> shards::ForwardRouter<P> for ShardsForwardRouter<P> {
-    fn route(&self, round: Round) -> Option<shards::ForwardRoute<P>> {
-        (self.0)(round)
-    }
-}
-
 pub(crate) type ShardsEngine<E, B, M, H, P, V, T> = shards::Engine<
     E,
     SchemeProvider<P, V>,
@@ -189,7 +174,7 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> = shards::Engine<
     EngineBlock<H, P>,
     P,
     T,
-    ShardsForwardRouter<P>,
+    shards::NoForwarding,
 >;
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
