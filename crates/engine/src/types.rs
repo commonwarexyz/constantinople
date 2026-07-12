@@ -174,7 +174,6 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> = shards::Engine<
     EngineBlock<H, P>,
     P,
     T,
-    shards::NoForwarding,
 >;
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;

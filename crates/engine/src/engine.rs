@@ -500,7 +500,6 @@ where
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
-                forward_router: shards::NoForwarding,
             },
         );
         let application = Application::new(
