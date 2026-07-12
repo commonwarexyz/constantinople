@@ -112,6 +112,7 @@ fn build_validators(
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
             max_pool_bytes: args.max_pool_bytes,
+            page_cache_bytes: args.page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
@@ -186,6 +187,7 @@ fn build_secondaries(
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
             max_pool_bytes: args.max_pool_bytes,
+            page_cache_bytes: args.page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
@@ -394,8 +396,8 @@ mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
-        default_max_propose_bytes, default_public_key_cache_size, generate_local_cluster_material,
-        total_secondaries,
+        default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
+        generate_local_cluster_material, total_secondaries,
     };
     use std::path::{Path, PathBuf};
 
@@ -413,6 +415,7 @@ mod tests {
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
+            page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,

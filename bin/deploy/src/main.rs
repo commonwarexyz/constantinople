@@ -124,6 +124,11 @@ pub(crate) struct GenerateArgs {
     /// Maximum mempool size in bytes.
     #[arg(long = "max-pool-bytes", default_value_t = default_max_pool_bytes())]
     max_pool_bytes: usize,
+    /// Capacity in bytes of each validator's two storage page caches. Must
+    /// hold the state journal's working set: 512 MiB thrashed once the live
+    /// account set passed ~2M and build/verify doubled on cache misses.
+    #[arg(long = "page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    page_cache_bytes: usize,
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
@@ -389,6 +394,8 @@ pub(crate) struct ValidatorConfig {
     max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
     max_pool_bytes: usize,
+    /// Capacity in bytes of each of the engine's two storage page caches.
+    page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,
@@ -717,6 +724,10 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) const fn default_page_cache_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
 }
 
 pub(crate) const fn default_public_key_cache_size() -> usize {
