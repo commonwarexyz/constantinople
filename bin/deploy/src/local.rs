@@ -3,9 +3,9 @@ use crate::{
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
+    total_secondaries, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -110,8 +110,8 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
@@ -184,8 +184,8 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
@@ -393,8 +393,9 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries,
+        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
+        default_max_propose_bytes, default_public_key_cache_size, generate_local_cluster_material,
+        total_secondaries,
     };
     use std::path::{Path, PathBuf};
 
@@ -410,6 +411,8 @@ mod tests {
             worker_threads: 2,
             rayon_threads: 2,
             public_key_cache_size: default_public_key_cache_size(),
+            max_propose_bytes: default_max_propose_bytes(),
+            max_pool_bytes: default_max_pool_bytes(),
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,

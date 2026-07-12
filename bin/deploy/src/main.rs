@@ -117,6 +117,13 @@ pub(crate) struct GenerateArgs {
     /// Capacity of each node's decompressed public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
+    /// Maximum bytes proposed per block (also the maximum accepted
+    /// submission batch size).
+    #[arg(long = "max-propose-bytes", default_value_t = default_max_propose_bytes())]
+    max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
+    #[arg(long = "max-pool-bytes", default_value_t = default_max_pool_bytes())]
+    max_pool_bytes: usize,
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
@@ -152,6 +159,10 @@ pub(crate) struct GenerateArgs {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "constructed once per invocation; boxing fights the clap derive"
+)]
 enum GenerateTarget {
     Local(LocalArgs),
     Remote(RemoteArgs),
