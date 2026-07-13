@@ -2,7 +2,7 @@
 
 use super::{
     block::{IndexedBlockRows, encode_indexed_block_rows_at},
-    sql::{AccountMetaRow, encode_account_meta_row},
+    sql::{AccountMetaRow, account_key_array, encode_account_meta_row},
 };
 use crate::sql_schema::build_meta_schema;
 use commonware_codec::{
@@ -1415,12 +1415,6 @@ fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::Sql
         rows.push(encode_account_meta_row(row));
     }
     rows
-}
-
-fn account_key_array(key: &AccountKey) -> [u8; AccountKey::SIZE] {
-    key.as_ref()
-        .try_into()
-        .expect("account key has fixed width")
 }
 
 fn account_value_balance(account: &AccountValue) -> u64 {

@@ -15,7 +15,7 @@
 // non-extractable CryptoKey in IndexedDB instead (structured-clone
 // persistence without exposing key material).
 
-import { fromHex, toArrayBuffer, toHex, voucherSigningPayload } from './codec';
+import { fromHex, toArrayBuffer, voucherSigningPayload } from './codec';
 
 export interface VoucherKey {
     /// The raw 32-byte ed25519 public key the channel commits to.
@@ -37,7 +37,7 @@ export async function createVoucherKey(): Promise<VoucherKey> {
     ])) as CryptoKeyPair;
     const privateJwk = await crypto.subtle.exportKey('jwk', pair.privateKey);
     const publicKey = new Uint8Array(await crypto.subtle.exportKey('raw', pair.publicKey));
-    return activate(privateJwk, toHex(publicKey));
+    return activate(privateJwk, publicKey, pair.privateKey);
 }
 
 /// Reactivates a persisted voucher key from a channel record.
@@ -45,15 +45,19 @@ export async function importVoucherKey(
     privateJwk: JsonWebKey,
     publicKeyHex: string,
 ): Promise<VoucherKey> {
-    return activate(privateJwk, publicKeyHex);
-}
-
-async function activate(privateJwk: JsonWebKey, publicKeyHex: string): Promise<VoucherKey> {
     const privateKey = await crypto.subtle.importKey('jwk', privateJwk, 'Ed25519', false, [
         'sign',
     ]);
+    return activate(privateJwk, fromHex(publicKeyHex), privateKey);
+}
+
+function activate(
+    privateJwk: JsonWebKey,
+    publicKey: Uint8Array,
+    privateKey: CryptoKey,
+): VoucherKey {
     return {
-        publicKey: fromHex(publicKeyHex),
+        publicKey,
         privateJwk,
         signVoucher: async (channel, cumulative) =>
             new Uint8Array(

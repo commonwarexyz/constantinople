@@ -4,7 +4,15 @@ use crate::sql_schema::{
     self, ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE,
 };
 use bytes::Bytes;
+use commonware_codec::FixedSize as _;
+use constantinople_primitives::AccountKey;
 use exoware_sql::CellValue;
+
+pub(crate) fn account_key_array(key: &AccountKey) -> [u8; AccountKey::SIZE] {
+    key.as_ref()
+        .try_into()
+        .expect("account key has fixed width")
+}
 
 /// One row destined for a SQL metadata table.
 ///

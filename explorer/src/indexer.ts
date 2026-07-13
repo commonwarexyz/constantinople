@@ -26,6 +26,7 @@ import {
     BLOCK_META_TRANSFERS,
     BLOCK_META_TX_COUNT,
 } from './sqlContract';
+import { sleep } from './util';
 
 const NETWORK_RECONNECT_DELAY_MS = 5_000;
 
@@ -233,22 +234,4 @@ function isNetworkError(error: unknown): boolean {
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
-}
-
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
-        if (signal?.aborted) {
-            reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
-            return;
-        }
-        const timeout = window.setTimeout(resolve, ms);
-        signal?.addEventListener(
-            'abort',
-            () => {
-                window.clearTimeout(timeout);
-                reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
-            },
-            { once: true },
-        );
-    });
 }

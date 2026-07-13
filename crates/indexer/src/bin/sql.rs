@@ -30,15 +30,10 @@ struct Cli {
     port: u16,
 }
 
-fn build_server(store_url: &str) -> Result<Arc<SqlServer>, facade::Error> {
+fn build_app(store_url: &str) -> Result<Router, facade::Error> {
     let client = StoreClient::new(store_url);
     let schema = build_meta_schema(client).map_err(|e| format!("configure schema: {e}"))?;
-    let server = SqlServer::new(schema)?;
-    Ok(Arc::new(server))
-}
-
-fn build_app(store_url: &str) -> Result<Router, facade::Error> {
-    let server = build_server(store_url)?;
+    let server = Arc::new(SqlServer::new(schema)?);
     // The explorer hits this server from a browser; allow any origin so
     // local dev (Vite on a different port) can connect without a proxy.
     Ok(Router::new()

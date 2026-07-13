@@ -4,7 +4,7 @@ use crate::publisher::{
     SqlRow,
     sql::{
         BlockMetaRow, KindCounts, TxActivityRole, TxActivityRow, TxKind, TxMetaRow,
-        encode_block_meta_row, encode_tx_activity_row, encode_tx_meta_row,
+        account_key_array, encode_block_meta_row, encode_tx_activity_row, encode_tx_meta_row,
     },
 };
 use bytes::Bytes;
@@ -106,17 +106,13 @@ where
             body: tx.bytes,
         }));
         for activity in &tx.activities {
-            let mut account = [0u8; AccountKey::SIZE];
-            account.copy_from_slice(activity.account.as_ref());
-            let mut counterparty = [0u8; AccountKey::SIZE];
-            counterparty.copy_from_slice(activity.counterparty.as_ref());
             sql.push(encode_tx_activity_row(TxActivityRow {
-                account,
+                account: account_key_array(&activity.account),
                 role: activity.role,
                 height,
                 index: idx_u32,
                 digest,
-                counterparty,
+                counterparty: account_key_array(&activity.counterparty),
                 value: activity.value,
                 nonce: tx.nonce,
                 kind: tx.kind,

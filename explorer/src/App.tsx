@@ -1198,7 +1198,7 @@ function AccountPage({
             </div>
             <div className="account-proof-grid">
                 <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
-                <ProofDatum label="block" value={target ? shortHex(bytesToHex(target.blockDigest)) : '-'} />
+                <ProofDatum label="block" value={target ? shortHex(toHex(target.blockDigest)) : '-'} />
                 <ProofDatum
                     label="state"
                     value={
@@ -2056,10 +2056,6 @@ function formatTxStatus(status: TxStatus, digest: string): string {
     return status.status;
 }
 
-function bytesToHex(bytes: Uint8Array): string {
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
 function normalizeAccountInput(value: string): string | null {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
     if (isAccountKeyHex(normalized)) {
@@ -2522,7 +2518,7 @@ const BlockLogRow = memo(function BlockLogRow({
     block: ObservedBlock;
     formatter: Intl.DateTimeFormat;
 }) {
-    const hash = useMemo(() => bytesToHex(block.digest), [block.digest]);
+    const hash = useMemo(() => toHex(block.digest), [block.digest]);
     return (
         <div className="block-row">
             <span className="block-row__height">{block.height.toString()}</span>

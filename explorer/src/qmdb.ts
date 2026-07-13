@@ -1,4 +1,4 @@
-import { fromHex, signedTransactionBodyLength, toArrayBuffer } from './codec';
+import { fromHex, signedTransactionBodyLength, toArrayBuffer, toHex } from './codec';
 import { shortHex, trimTrailingSlash } from './util';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import {
@@ -877,11 +877,6 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
     }
     return true;
 }
-
-function toHex(bytes: Uint8Array): string {
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
 
 interface AccountProofRow {
     readonly balance: bigint;
