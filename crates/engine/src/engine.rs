@@ -417,6 +417,8 @@ where
             .expect("transaction history db must initialize for genesis target");
             let database_transactions_target =
                 <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&transaction_db).await;
+            // Stateful owns the long-lived database initialization after selecting its startup
+            // path. These temporary handles exist only to derive the first-boot genesis targets.
             drop(state_db);
             drop(transaction_db);
 
