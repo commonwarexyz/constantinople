@@ -3,6 +3,7 @@
 
 pub mod client;
 pub mod codec;
+pub mod facade;
 pub mod publisher;
 mod simplex_block;
 pub mod sql_schema;

@@ -368,6 +368,92 @@ async fn fund(
     block
 }
 
+/// The common two-party topology used by channel consensus tests.
+///
+/// Transaction ordering and assertions stay in each test; this fixture only
+/// centralizes account derivation and the protocol's signed wire objects.
+struct ChannelFixture {
+    payer: ed25519::PrivateKey,
+    receiver: ed25519::PrivateKey,
+    payer_pk: TransactionPublicKey,
+    receiver_pk: TransactionPublicKey,
+    payer_key: AccountKey,
+    receiver_key: AccountKey,
+    open_nonce: u64,
+    channel: AccountKey,
+}
+
+impl ChannelFixture {
+    fn new(payer_seed: u64, receiver_seed: u64, open_nonce: u64) -> Self {
+        let payer = ed25519::PrivateKey::from_seed(payer_seed);
+        let receiver = ed25519::PrivateKey::from_seed(receiver_seed);
+        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
+        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
+        let payer_key = AccountKey::from_public_key(&payer_pk);
+        let receiver_key = AccountKey::from_public_key(&receiver_pk);
+        let channel = channel_address(
+            &payer_key,
+            &receiver_key,
+            &receiver_key,
+            &payer.public_key(),
+            open_nonce,
+        );
+        Self {
+            payer,
+            receiver,
+            payer_pk,
+            receiver_pk,
+            payer_key,
+            receiver_key,
+            open_nonce,
+            channel,
+        }
+    }
+
+    fn open(&self, deposit: u64, expiry: u64) -> TestTx {
+        Transaction::open_channel(
+            self.payer_pk.clone(),
+            self.receiver_key,
+            self.receiver_key,
+            self.payer.public_key(),
+            NonZeroU64::new(deposit).expect("deposit is non-zero"),
+            expiry,
+            self.open_nonce,
+        )
+        .seal_and_sign(&self.payer, TEST_TX_NS, &mut sha256::Sha256::default())
+    }
+
+    fn voucher(&self, cumulative: u64) -> Voucher {
+        Voucher::sign(&self.payer, self.channel, cumulative)
+    }
+
+    fn close(&self, voucher: &Voucher, nonce: u64) -> TestTx {
+        Transaction::close_channel(
+            self.receiver_pk.clone(),
+            self.payer_key,
+            self.receiver_key,
+            self.payer.public_key(),
+            self.open_nonce,
+            voucher.cumulative,
+            voucher.signature.clone(),
+            nonce,
+        )
+        .seal_and_sign(&self.receiver, TEST_TX_NS, &mut sha256::Sha256::default())
+    }
+
+    fn timeout(&self, nonce: u64) -> TestTx {
+        Transaction::timeout_channel(
+            self.payer_pk.clone(),
+            self.receiver_key,
+            self.receiver_key,
+            self.payer.public_key(),
+            self.open_nonce,
+            nonce,
+        )
+        .seal_and_sign(&self.payer, TEST_TX_NS, &mut sha256::Sha256::default())
+    }
+}
+
 /// The full channel demo: open a channel, stream vouchers entirely off-chain,
 /// then settle the latest voucher with a single on-chain transaction.
 ///
@@ -379,38 +465,24 @@ fn channel_streams_offchain_and_settles_onchain() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
+        let channel = ChannelFixture::new(2, 3, 1);
         // The payer mints its working funds first (accounts start empty), so
         // the open consumes its next nonce — from which the channel address is
         // derived.
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
+        )
+        .await;
 
         let mut chain_txs = 0;
 
         // --- On-chain: open + escrow the deposit. ---
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            CHANNEL_NEVER_EXPIRES,
-            open_nonce,
-        )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let open = channel.open(DEPOSIT, CHANNEL_NEVER_EXPIRES);
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
         assert_eq!(included, 1, "opening a channel is one on-chain transaction");
@@ -418,28 +490,28 @@ fn channel_streams_offchain_and_settles_onchain() {
 
         // Deposit locked: payer debited, channel funded with exactly the deposit.
         assert_eq!(
-            read_account(&dbs, &payer_key).await.balance,
+            read_account(&dbs, &channel.payer_key).await.balance,
             FUNDED - DEPOSIT
         );
-        assert_eq!(read_account(&dbs, &channel).await.balance, DEPOSIT);
+        assert_eq!(read_account(&dbs, &channel.channel).await.balance, DEPOSIT);
 
         // --- Off-chain: stream PAYMENTS vouchers, verified locally. No chain txs. ---
         let mut meter = RegisteredChannel::new(
             &VerifiedOpenChannel {
-                payer: payer_key,
-                receiver: receiver_key,
-                voucher_key: payer.public_key(),
-                operator: receiver_key,
-                open_nonce,
+                payer: channel.payer_key,
+                receiver: channel.receiver_key,
+                voucher_key: channel.payer.public_key(),
+                operator: channel.receiver_key,
+                open_nonce: channel.open_nonce,
                 deposit: NZU64!(DEPOSIT),
                 expiry: CHANNEL_NEVER_EXPIRES,
                 tip_height: 0,
             },
-            Voucher::sign(&payer, channel, 0),
+            channel.voucher(0),
         );
         let mut latest = None;
         for i in 1..=PAYMENTS {
-            let voucher = Voucher::sign(&payer, channel, i * STEP);
+            let voucher = channel.voucher(i * STEP);
             assert_eq!(
                 meter.serve(voucher.clone()),
                 Ok(i * STEP),
@@ -451,17 +523,7 @@ fn channel_streams_offchain_and_settles_onchain() {
         assert_eq!(latest.cumulative, PAYMENTS * STEP);
 
         // --- On-chain: settle the latest voucher with a single transaction. ---
-        let close = Transaction::close_channel(
-            receiver_pk.clone(),
-            payer_key,
-            AccountKey::from_public_key(&receiver_pk),
-            payer.public_key(),
-            open_nonce,
-            latest.cumulative,
-            latest.signature.clone(),
-            0,
-        )
-        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let close = channel.close(&latest, 0);
         let (_block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
         assert_eq!(
@@ -473,14 +535,17 @@ fn channel_streams_offchain_and_settles_onchain() {
         // Receiver received exactly the claimed amount; payer reclaimed the rest;
         // the channel is deleted, leaving no state.
         let claimed = PAYMENTS * STEP;
-        assert_eq!(read_account(&dbs, &receiver_key).await.balance, claimed);
         assert_eq!(
-            read_account(&dbs, &payer_key).await.balance,
+            read_account(&dbs, &channel.receiver_key).await.balance,
+            claimed
+        );
+        assert_eq!(
+            read_account(&dbs, &channel.payer_key).await.balance,
             FUNDED - claimed,
             "payer reclaimed deposit minus the settled amount"
         );
         assert_eq!(
-            read_raw(&dbs, &channel).await,
+            read_raw(&dbs, &channel.channel).await,
             None,
             "settled channel is deleted, leaving no state"
         );
@@ -554,55 +619,31 @@ fn chain_rejects_overclaim_voucher() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
-
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            CHANNEL_NEVER_EXPIRES,
-            open_nonce,
+        let channel = ChannelFixture::new(2, 3, 1);
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
         )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        .await;
+
+        let open = channel.open(DEPOSIT, CHANNEL_NEVER_EXPIRES);
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
         assert_eq!(included, 1);
 
         // A validly-signed voucher claiming more than the deposit.
-        let overclaim = Voucher::sign(&payer, channel, DEPOSIT + 10);
-        let close = Transaction::close_channel(
-            receiver_pk.clone(),
-            payer_key,
-            AccountKey::from_public_key(&receiver_pk),
-            payer.public_key(),
-            open_nonce,
-            overclaim.cumulative,
-            overclaim.signature.clone(),
-            0,
-        )
-        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let overclaim = channel.voucher(DEPOSIT + 10);
+        let close = channel.close(&overclaim, 0);
         let (_block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
         assert_eq!(included, 0, "over-claim settlement must be rejected");
 
         // Escrow untouched.
-        assert_eq!(read_account(&dbs, &channel).await.balance, DEPOSIT);
+        assert_eq!(read_account(&dbs, &channel.channel).await.balance, DEPOSIT);
     });
 }
 
@@ -613,54 +654,30 @@ fn chain_rejects_forged_voucher() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
+        let channel = ChannelFixture::new(2, 3, 1);
         let attacker = ed25519::PrivateKey::from_seed(99);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
-
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            CHANNEL_NEVER_EXPIRES,
-            open_nonce,
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
         )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        .await;
+
+        let open = channel.open(DEPOSIT, CHANNEL_NEVER_EXPIRES);
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
         assert_eq!(included, 1);
 
         // Attacker signs a voucher for a channel they do not control.
-        let forged = Voucher::sign(&attacker, channel, STEP);
-        let close = Transaction::close_channel(
-            receiver_pk.clone(),
-            payer_key,
-            AccountKey::from_public_key(&receiver_pk),
-            payer.public_key(),
-            open_nonce,
-            forged.cumulative,
-            forged.signature.clone(),
-            0,
-        )
-        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let forged = Voucher::sign(&attacker, channel.channel, STEP);
+        let close = channel.close(&forged, 0);
         let (_block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
         assert_eq!(included, 0, "forged-voucher settlement must be rejected");
-        assert_eq!(read_account(&dbs, &channel).await.balance, DEPOSIT);
+        assert_eq!(read_account(&dbs, &channel.channel).await.balance, DEPOSIT);
     });
 }
 
@@ -748,68 +765,42 @@ fn settled_voucher_cannot_be_replayed() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
-
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            CHANNEL_NEVER_EXPIRES,
-            open_nonce,
+        let channel = ChannelFixture::new(2, 3, 1);
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
         )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        .await;
+
+        let open = channel.open(DEPOSIT, CHANNEL_NEVER_EXPIRES);
         let (block, _) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
 
-        let voucher = Voucher::sign(&payer, channel, STEP);
+        let voucher = channel.voucher(STEP);
         // `nonce` is the receiver's transaction nonce; both closes carry the
         // same voucher.
-        let close = |nonce: u64| {
-            Transaction::close_channel(
-                receiver_pk.clone(),
-                payer_key,
-                AccountKey::from_public_key(&receiver_pk),
-                payer.public_key(),
-                open_nonce,
-                voucher.cumulative,
-                voucher.signature.clone(),
-                nonce,
-            )
-            .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default())
-        };
+        let close = |nonce| channel.close(&voucher, nonce);
 
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close(0)]).await;
         assert_eq!(included, 1, "first settlement succeeds");
         assert_eq!(
-            read_raw(&dbs, &channel).await,
+            read_raw(&dbs, &channel.channel).await,
             None,
             "channel deleted after settlement"
         );
-        let receiver_balance = read_account(&dbs, &receiver_key).await.balance;
+        let receiver_balance = read_account(&dbs, &channel.receiver_key).await.balance;
 
         // Replaying the same voucher is rejected — the channel is gone.
         let (_block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close(1)]).await;
         assert_eq!(included, 0, "replayed voucher must be rejected");
         assert_eq!(
-            read_account(&dbs, &receiver_key).await.balance,
+            read_account(&dbs, &channel.receiver_key).await.balance,
             receiver_balance,
             "receiver is not paid twice"
         );
@@ -829,67 +820,45 @@ fn refunding_a_settled_channel_address_enables_replay() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
-
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            CHANNEL_NEVER_EXPIRES,
-            open_nonce,
+        let channel = ChannelFixture::new(2, 3, 1);
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
         )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        .await;
+
+        let open = channel.open(DEPOSIT, CHANNEL_NEVER_EXPIRES);
         let (block, _) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
 
-        let voucher = Voucher::sign(&payer, channel, STEP);
-        let close = |nonce: u64| {
-            Transaction::close_channel(
-                receiver_pk.clone(),
-                payer_key,
-                AccountKey::from_public_key(&receiver_pk),
-                payer.public_key(),
-                open_nonce,
-                voucher.cumulative,
-                voucher.signature.clone(),
-                nonce,
-            )
-            .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default())
-        };
+        let voucher = channel.voucher(STEP);
+        let close = |nonce| channel.close(&voucher, nonce);
 
         // First settlement deletes the channel.
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close(0)]).await;
         assert_eq!(included, 1);
-        assert_eq!(read_raw(&dbs, &channel).await, None, "channel deleted");
-        let receiver_after_first = read_account(&dbs, &receiver_key).await.balance;
+        assert_eq!(
+            read_raw(&dbs, &channel.channel).await,
+            None,
+            "channel deleted"
+        );
+        let receiver_after_first = read_account(&dbs, &channel.receiver_key).await.balance;
 
         // An ordinary transfer re-funds the (publicly derivable) dead address.
         let refund = Transaction::with_op(
-            payer_pk.clone(),
+            channel.payer_pk.clone(),
             2,
             Operation::Transfer {
-                to: channel,
+                to: channel.channel,
                 value: NonZeroU64::new(STEP).expect("step is non-zero"),
             },
         )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        .seal_and_sign(&channel.payer, TEST_TX_NS, &mut sha256::Sha256::default());
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![refund]).await;
         assert_eq!(included, 1, "transfer to the dead channel address lands");
@@ -897,7 +866,7 @@ fn refunding_a_settled_channel_address_enables_replay() {
         // default, so the exact balance is incidental — what matters is that an
         // old voucher can now find escrow here.
         assert!(
-            read_raw(&dbs, &channel).await.is_some(),
+            read_raw(&dbs, &channel.channel).await.is_some(),
             "channel re-funded"
         );
 
@@ -906,7 +875,7 @@ fn refunding_a_settled_channel_address_enables_replay() {
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close(1)]).await;
         assert_eq!(included, 1, "replay against the re-funded address succeeds");
         assert_eq!(
-            read_account(&dbs, &receiver_key).await.balance,
+            read_account(&dbs, &channel.receiver_key).await.balance,
             receiver_after_first + STEP,
             "receiver is paid a second time"
         );
@@ -922,32 +891,18 @@ fn verifier_accepts_a_proposed_channel_block() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
-
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            CHANNEL_NEVER_EXPIRES,
-            open_nonce,
+        let channel = ChannelFixture::new(2, 3, 1);
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
         )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        .await;
+
+        let open = channel.open(DEPOSIT, CHANNEL_NEVER_EXPIRES);
         let (parent, _) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
 
@@ -955,18 +910,8 @@ fn verifier_accepts_a_proposed_channel_block() {
         // timestamp than its parent (a child-timestamp validity requirement).
         context.sleep(Duration::from_secs(1)).await;
 
-        let voucher = Voucher::sign(&payer, channel, STEP);
-        let close = Transaction::close_channel(
-            receiver_pk.clone(),
-            payer_key,
-            AccountKey::from_public_key(&receiver_pk),
-            payer.public_key(),
-            open_nonce,
-            voucher.cumulative,
-            voucher.signature.clone(),
-            0,
-        )
-        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let voucher = channel.voucher(STEP);
+        let close = channel.close(&voucher, 0);
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(parent.header.height + 1)),
@@ -1237,57 +1182,37 @@ fn timeout_respects_expiry_then_reclaims() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
+        let channel = ChannelFixture::new(2, 3, 1);
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
+        )
+        .await;
         // The funding mint lands at height 1 and the open at height 2, so the
         // channel is expired (reclaimable) from height 4 on.
         let expiry = 3;
 
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            expiry,
-            open_nonce,
-        )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let open = channel.open(DEPOSIT, expiry);
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
         assert_eq!(included, 1);
         // The channel account's (otherwise unusable) nonce slot records the
         // expiry.
-        let stored = read_raw(&dbs, &channel).await.expect("channel exists");
+        let stored = read_raw(&dbs, &channel.channel)
+            .await
+            .expect("channel exists");
         assert_eq!(stored.nonce.base, expiry);
         assert_eq!(stored.balance, DEPOSIT);
 
         // The payer signs a voucher off-chain; the receiver will miss the
         // deadline and forfeit it.
-        let voucher = Voucher::sign(&payer, channel, STEP);
+        let voucher = channel.voucher(STEP);
 
-        let timeout = Transaction::timeout_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            open_nonce,
-            2,
-        )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let timeout = channel.timeout(2);
 
         // Height 3 is not past the expiry; the timeout is rejected and the
         // channel is untouched.
@@ -1301,7 +1226,7 @@ fn timeout_respects_expiry_then_reclaims() {
         )
         .await;
         assert_eq!(included, 0, "timeout before expiry must be rejected");
-        assert_eq!(read_account(&dbs, &channel).await.balance, DEPOSIT);
+        assert_eq!(read_account(&dbs, &channel.channel).await.balance, DEPOSIT);
 
         // Height 4 exceeds the expiry; the same transaction now reclaims the
         // full escrow and deletes the channel.
@@ -1309,28 +1234,22 @@ fn timeout_respects_expiry_then_reclaims() {
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![timeout]).await;
         assert_eq!(included, 1, "timeout after expiry reclaims the channel");
         assert_eq!(
-            read_account(&dbs, &payer_key).await.balance,
+            read_account(&dbs, &channel.payer_key).await.balance,
             FUNDED,
             "payer reclaimed the entire escrow"
         );
-        assert_eq!(read_raw(&dbs, &channel).await, None, "channel deleted");
+        assert_eq!(
+            read_raw(&dbs, &channel.channel).await,
+            None,
+            "channel deleted"
+        );
 
         // The receiver's (still validly signed) voucher is now worthless.
-        let close = Transaction::close_channel(
-            receiver_pk.clone(),
-            payer_key,
-            AccountKey::from_public_key(&receiver_pk),
-            payer.public_key(),
-            open_nonce,
-            voucher.cumulative,
-            voucher.signature.clone(),
-            0,
-        )
-        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let close = channel.close(&voucher, 0);
         let (_block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
         assert_eq!(included, 0, "close after reclaim must be rejected");
-        assert_eq!(read_account(&dbs, &receiver_key).await.balance, 0);
+        assert_eq!(read_account(&dbs, &channel.receiver_key).await.balance, 0);
     });
 }
 
@@ -1342,72 +1261,43 @@ fn close_beats_timeout_after_expiry() {
     deterministic::Runner::default().start(|context| async move {
         let (dbs, mut app, genesis, leader) = bootstrap(&context).await;
 
-        let payer = ed25519::PrivateKey::from_seed(2);
-        let receiver = ed25519::PrivateKey::from_seed(3);
-        let payer_pk = TransactionPublicKey::ed25519(payer.public_key());
-        let receiver_pk = TransactionPublicKey::ed25519(receiver.public_key());
-        let payer_key = AccountKey::from_public_key(&payer_pk);
-        let receiver_key = AccountKey::from_public_key(&receiver_pk);
-        let genesis = fund(&mut app, &context, &dbs, &leader, &genesis, &[&payer]).await;
-        let open_nonce: u64 = 1;
-        let channel = channel_address(
-            &payer_key,
-            &receiver_key,
-            &receiver_key,
-            &payer.public_key(),
-            open_nonce,
-        );
+        let channel = ChannelFixture::new(2, 3, 1);
+        let genesis = fund(
+            &mut app,
+            &context,
+            &dbs,
+            &leader,
+            &genesis,
+            &[&channel.payer],
+        )
+        .await;
 
         // Expired as soon as the next block: the open lands at height 2 and
         // the expiry is 2.
-        let open = Transaction::open_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            NonZeroU64::new(DEPOSIT).expect("deposit is non-zero"),
-            2,
-            open_nonce,
-        )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let open = channel.open(DEPOSIT, 2);
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &genesis, vec![open]).await;
         assert_eq!(included, 1);
 
         // The close still settles at height 3 (> expiry) because the channel
         // exists until someone deletes it.
-        let voucher = Voucher::sign(&payer, channel, STEP);
-        let close = Transaction::close_channel(
-            receiver_pk.clone(),
-            payer_key,
-            AccountKey::from_public_key(&receiver_pk),
-            payer.public_key(),
-            open_nonce,
-            voucher.cumulative,
-            voucher.signature.clone(),
-            0,
-        )
-        .seal_and_sign(&receiver, TEST_TX_NS, &mut sha256::Sha256::default());
+        let voucher = channel.voucher(STEP);
+        let close = channel.close(&voucher, 0);
         let (block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![close]).await;
         assert_eq!(included, 1, "close settles even after expiry");
-        assert_eq!(read_account(&dbs, &receiver_key).await.balance, STEP);
+        assert_eq!(
+            read_account(&dbs, &channel.receiver_key).await.balance,
+            STEP
+        );
 
         // The payer's timeout finds no channel.
-        let timeout = Transaction::timeout_channel(
-            payer_pk.clone(),
-            receiver_key,
-            receiver_key,
-            payer.public_key(),
-            open_nonce,
-            2,
-        )
-        .seal_and_sign(&payer, TEST_TX_NS, &mut sha256::Sha256::default());
+        let timeout = channel.timeout(2);
         let (_block, included) =
             propose_and_finalize(&mut app, &context, &dbs, &leader, &block, vec![timeout]).await;
         assert_eq!(included, 0, "timeout after close finds no channel");
         assert_eq!(
-            read_account(&dbs, &payer_key).await.balance,
+            read_account(&dbs, &channel.payer_key).await.balance,
             FUNDED - STEP,
             "payer keeps only the close refund"
         );

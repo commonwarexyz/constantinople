@@ -16,6 +16,10 @@ use commonware_cryptography::{
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, TryCollect};
+use constantinople_primitives::operator_config::{
+    DEFAULT_HTTP_PORT as DEFAULT_OPERATOR_PORT, DEFAULT_MIN_RUNWAY, DEFAULT_OPERATOR_SEED,
+    DEFAULT_SETTLE_MARGIN, OperatorConfig as SharedOperatorConfig,
+};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -59,7 +63,6 @@ const SIMPLEX_VERIFICATION_MATERIAL_FILE: &str = "simplex-verification-material.
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
-const DEFAULT_OPERATOR_PORT: u16 = 8093;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
@@ -303,32 +306,7 @@ pub(crate) struct SpammerConfig {
     pub channel_vouchers: u64,
 }
 
-/// Operator configuration, written as YAML by deploy and read by the operator binary.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct OperatorConfig {
-    /// Local HTTP port the operator serves on.
-    pub http_port: u16,
-    /// HTTP bind address for the operator server.
-    #[serde(default = "default_operator_listen_addr")]
-    pub listen_addr: std::net::IpAddr,
-    /// Relayer URL used for close transaction submission.
-    pub relayer_url: String,
-    /// Shared chain-indexer Store URL used for finalized transaction lookup.
-    pub indexer_url: String,
-    /// Shared QMDB facade URL used for transaction inclusion proofs.
-    pub qmdb_url: String,
-    /// Deterministic receiver key seed.
-    #[serde(default = "default_operator_seed")]
-    pub operator_seed: u64,
-    /// Minimum blocks between registration and a channel's expiry (mirrors
-    /// the operator binary's default).
-    #[serde(default = "default_operator_min_runway")]
-    pub min_runway: u64,
-    /// Blocks before expiry at which vouchers stop and settlement starts
-    /// (mirrors the operator binary's default).
-    #[serde(default = "default_operator_settle_margin")]
-    pub settle_margin: u64,
-}
+pub(crate) type OperatorConfig = SharedOperatorConfig;
 
 /// Relayer configuration written into the relayer secondary's YAML.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -551,20 +529,16 @@ const fn default_spammer_channel_vouchers() -> u64 {
     DEFAULT_SPAMMER_CHANNEL_VOUCHERS
 }
 
-const fn default_operator_listen_addr() -> std::net::IpAddr {
-    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-}
-
 const fn default_operator_seed() -> u64 {
-    2_000_000_000
+    DEFAULT_OPERATOR_SEED
 }
 
 const fn default_operator_min_runway() -> u64 {
-    20
+    DEFAULT_MIN_RUNWAY
 }
 
 const fn default_operator_settle_margin() -> u64 {
-    10
+    DEFAULT_SETTLE_MARGIN
 }
 
 fn main() {

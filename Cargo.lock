@@ -1718,6 +1718,7 @@ dependencies = [
  "commonware-formatting",
  "commonware-math",
  "commonware-utils",
+ "constantinople-primitives",
  "mimalloc",
  "rand_core 0.6.4",
  "serde",

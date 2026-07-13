@@ -68,13 +68,17 @@ use constantinople_primitives::{
         StatsResponse, StreamChunk, StreamEnd, StreamEndReason, StreamMeter, VoucherRequest,
         VoucherResponse, parse_channel,
     },
+    operator_config::{
+        DEFAULT_HTTP_PORT, DEFAULT_LISTEN_ADDR, DEFAULT_MIN_RUNWAY, DEFAULT_OPERATOR_SEED,
+        DEFAULT_SETTLE_MARGIN, OperatorConfig,
+    },
 };
 use exoware_qmdb::{OperationLogClient, proto::qmdb::v1::GetOperationRangeRequest};
 use exoware_sdk::{StoreClient, proto::PreferZstdHttpClient};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -119,11 +123,11 @@ struct Cli {
     hosts: Option<PathBuf>,
 
     /// HTTP port to listen on.
-    #[arg(long, default_value_t = 8093)]
+    #[arg(long, default_value_t = DEFAULT_HTTP_PORT)]
     port: u16,
 
     /// HTTP bind address.
-    #[arg(long, default_value = "127.0.0.1")]
+    #[arg(long, default_value_t = DEFAULT_LISTEN_ADDR)]
     listen_addr: IpAddr,
 
     /// Relayer base URL for close transaction submission.
@@ -139,55 +143,23 @@ struct Cli {
     qmdb_url: Option<String>,
 
     /// Deterministic operator key seed (the key that settles channels).
-    #[arg(long, default_value_t = default_operator_seed())]
+    #[arg(long, default_value_t = DEFAULT_OPERATOR_SEED)]
     operator_seed: u64,
 
     /// Minimum blocks between registration and a channel's expiry.
-    #[arg(long, default_value_t = default_min_runway())]
+    #[arg(long, default_value_t = DEFAULT_MIN_RUNWAY)]
     min_runway: u64,
 
     /// Blocks before expiry at which vouchers stop and settlement starts.
-    #[arg(long, default_value_t = default_settle_margin())]
+    #[arg(long, default_value_t = DEFAULT_SETTLE_MARGIN)]
     settle_margin: u64,
-}
-
-#[derive(Debug, Deserialize)]
-struct OperatorConfig {
-    http_port: u16,
-    #[serde(default = "default_listen_addr")]
-    listen_addr: IpAddr,
-    relayer_url: String,
-    indexer_url: String,
-    qmdb_url: String,
-    #[serde(default = "default_operator_seed")]
-    operator_seed: u64,
-    #[serde(default = "default_min_runway")]
-    min_runway: u64,
-    #[serde(default = "default_settle_margin")]
-    settle_margin: u64,
-}
-
-const fn default_listen_addr() -> IpAddr {
-    IpAddr::V4(Ipv4Addr::LOCALHOST)
-}
-
-const fn default_operator_seed() -> u64 {
-    2_000_000_000
-}
-
-const fn default_min_runway() -> u64 {
-    20
-}
-
-const fn default_settle_margin() -> u64 {
-    10
 }
 
 fn main() {
     let cli = Cli::parse();
     tracing_subscriber::fmt().init();
 
-    let config = OperatorConfig::from_cli(cli);
+    let config = operator_config(cli);
 
     let runtime_cfg = commonware_runtime::tokio::Config::default();
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
@@ -237,31 +209,29 @@ fn main() {
     });
 }
 
-impl OperatorConfig {
-    /// Resolves the runtime configuration: the YAML file (with hosts-file URL
-    /// resolution) when `--config` is given, bare CLI flags otherwise.
-    fn from_cli(cli: Cli) -> Self {
-        if let Some(config_path) = cli.config {
-            let raw = std::fs::read_to_string(config_path).expect("failed to read operator config");
-            let mut config: Self =
-                serde_yaml::from_str(&raw).expect("failed to parse operator config");
-            let hosts = cli.hosts.as_deref().map(load_hosts);
-            config.relayer_url = resolve_named_http_url(&config.relayer_url, hosts.as_ref());
-            config.indexer_url = resolve_named_http_url(&config.indexer_url, hosts.as_ref());
-            config.qmdb_url = resolve_named_http_url(&config.qmdb_url, hosts.as_ref());
-            return config;
-        }
+/// Resolves the runtime configuration: the YAML file (with hosts-file URL
+/// resolution) when `--config` is given, bare CLI flags otherwise.
+fn operator_config(cli: Cli) -> OperatorConfig {
+    if let Some(config_path) = cli.config {
+        let raw = std::fs::read_to_string(config_path).expect("failed to read operator config");
+        let mut config: OperatorConfig =
+            serde_yaml::from_str(&raw).expect("failed to parse operator config");
+        let hosts = cli.hosts.as_deref().map(load_hosts);
+        config.relayer_url = resolve_named_http_url(&config.relayer_url, hosts.as_ref());
+        config.indexer_url = resolve_named_http_url(&config.indexer_url, hosts.as_ref());
+        config.qmdb_url = resolve_named_http_url(&config.qmdb_url, hosts.as_ref());
+        return config;
+    }
 
-        Self {
-            http_port: cli.port,
-            listen_addr: cli.listen_addr,
-            relayer_url: cli.relayer_url.expect("provide --relayer-url or --config"),
-            indexer_url: cli.indexer_url.expect("provide --indexer-url or --config"),
-            qmdb_url: cli.qmdb_url.expect("provide --qmdb-url or --config"),
-            operator_seed: cli.operator_seed,
-            min_runway: cli.min_runway,
-            settle_margin: cli.settle_margin,
-        }
+    OperatorConfig {
+        http_port: cli.port,
+        listen_addr: cli.listen_addr,
+        relayer_url: cli.relayer_url.expect("provide --relayer-url or --config"),
+        indexer_url: cli.indexer_url.expect("provide --indexer-url or --config"),
+        qmdb_url: cli.qmdb_url.expect("provide --qmdb-url or --config"),
+        operator_seed: cli.operator_seed,
+        min_runway: cli.min_runway,
+        settle_margin: cli.settle_margin,
     }
 }
 
@@ -805,21 +775,5 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn config_defaults_to_loopback_listen_addr() {
-        let config: OperatorConfig =
-            serde_yaml::from_str(
-                "http_port: 8093\nrelayer_url: http://127.0.0.1:8082\nindexer_url: http://127.0.0.1:8090\nqmdb_url: http://127.0.0.1:8092\n",
-            )
-                .expect("operator config should parse");
-
-        assert_eq!(config.listen_addr, IpAddr::V4(Ipv4Addr::LOCALHOST));
     }
 }

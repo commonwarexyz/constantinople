@@ -29,6 +29,7 @@ pub use transaction::{
 };
 
 pub mod operator_api;
+pub mod operator_config;
 
 mod channel;
 pub use channel::{VOUCHER_NAMESPACE, Voucher, channel_address, verify_voucher, voucher_message};

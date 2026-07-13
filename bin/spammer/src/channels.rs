@@ -436,14 +436,13 @@ impl ChannelRunner {
         // The open is finalized but the operator's indexer may not have
         // ingested it yet. Retry through transient lag (503/transport); a 400
         // rejection will keep failing, so go straight to the timeout reclaim.
+        let zero_voucher = Voucher::sign(&self.accounts[payer_i].private_key, channel, 0).signature;
         let mut registered = false;
         for attempt in 1..=REGISTRATION_ATTEMPTS {
-            let zero_voucher =
-                Voucher::sign(&self.accounts[payer_i].private_key, channel, 0).signature;
             match self
                 .operator
                 .client
-                .register_channel(&open_tx_digest, zero_voucher)
+                .register_channel(&open_tx_digest, &zero_voucher)
                 .await
             {
                 Ok(()) => {
@@ -718,11 +717,11 @@ impl OperatorClient {
     async fn register_channel(
         &self,
         open_tx_digest: &sha256::Digest,
-        zero_voucher: ed25519::Signature,
+        zero_voucher: &ed25519::Signature,
     ) -> Result<(), OperatorError> {
         self.post_json(
             "/channels",
-            &RegisterRequest::new(open_tx_digest, &zero_voucher),
+            &RegisterRequest::new(open_tx_digest, zero_voucher),
         )
         .await
         .map(|_| ())
