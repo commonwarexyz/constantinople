@@ -373,6 +373,9 @@ where
                 stateful_partition_prefix.clone(),
             )
             .await;
+        // The durable plan distinguishes normal recovery from peer state sync. Normal recovery
+        // stays floorless so marshal restores its acknowledged progress; only a requested or
+        // interrupted state sync discovers a new floor.
         let state_sync_requested = matches!(&config.startup, StartupMode::StateSync);
         if startup_plan.should_state_sync(state_sync_requested) {
             let finalization = config
@@ -385,6 +388,8 @@ where
             startup_plan = startup_plan.with_floor(finalization);
         }
 
+        // A floorless plan requires marshal's canonical height-zero anchor. Reuse the archived
+        // block on restart so current database targets cannot change the genesis commitment.
         let stored_genesis = finalized_blocks
             .get(ArchiveIdentifier::Index(0))
             .await
@@ -433,6 +438,8 @@ where
 
         #[cfg(all(test, feature = "test-utils"))]
         let startup_sync_floor = startup_plan.floor().cloned();
+        // Simplex adopts the peer floor only for state sync. Otherwise it independently replays
+        // its journal from canonical genesis while marshal restores application progress.
         let genesis_commitment = canonical_genesis.commitment();
         let simplex_floor = startup_plan.floor().map_or_else(
             || SimplexFloor::Genesis(genesis_commitment),
