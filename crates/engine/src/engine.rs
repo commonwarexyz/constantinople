@@ -76,8 +76,6 @@ pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
-#[cfg(not(all(test, feature = "test-utils")))]
-const PRUNABLE_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(4_096);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
@@ -178,7 +176,6 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    #[cfg(all(test, feature = "test-utils"))]
     pub prunable_items_per_section: NonZero<u64>,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
@@ -347,10 +344,7 @@ where
             coding_config,
         ));
 
-        #[cfg(all(test, feature = "test-utils"))]
         let prunable_items_per_section = config.prunable_items_per_section;
-        #[cfg(not(all(test, feature = "test-utils")))]
-        let prunable_items_per_section = PRUNABLE_ITEMS_PER_SECTION;
         let (finalizations_by_height, finalized_blocks) = futures::join!(
             init_finalizations_archive::<E, H, C::PublicKey, V>(
                 &context,

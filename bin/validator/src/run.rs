@@ -82,6 +82,7 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
     retained_marshal_blocks: 1024,
     retained_qmdb_blocks: 32,
 };
+const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
@@ -905,6 +906,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
+                prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
