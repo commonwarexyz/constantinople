@@ -45,6 +45,7 @@ import {
     type VerifiedFixedKeylessAppendProof,
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
+import type { NonceState } from './nonce';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
@@ -88,6 +89,12 @@ interface FinalizedTransactionTarget {
 export interface LatestProofTarget extends FinalizedTransactionTarget {}
 
 export type AccountActivityMode = 'all' | 'sent' | 'received';
+
+/// Whether the account index has observed an account and, if so, whether its
+/// latest state operation deleted it. Channel accounts are deleted when they
+/// settle or time out, so this is the stream page's authoritative recovery
+/// signal after restoring browser-local channel state.
+export type IndexedAccountState = 'missing' | 'live' | 'deleted';
 
 // The kind of operation an activity row describes.
 export type TransactionKind =
@@ -207,6 +214,79 @@ export async function fetchAccountTransactionsPage({
     return {
         rows: visible.map(decodeAccountActivityRow),
         nextCursor: rows.length > ACCOUNT_PAGE_SIZE && last ? encodeActivityCursor(last) : null,
+    };
+}
+
+/// Reads the latest indexed lifecycle state for any account key.
+///
+/// A missing row is deliberately distinct from a deleted row: it may mean a
+/// freshly submitted channel open has not reached the indexer yet and must
+/// never cause the browser to discard its recovery record.
+export async function fetchIndexedAccountState({
+    sqlUrl,
+    account,
+    signal,
+}: {
+    sqlUrl: string;
+    account: string;
+    signal?: AbortSignal;
+}): Promise<IndexedAccountState> {
+    const accountBytes = parseAccountBytes(account);
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${ACCOUNT_META_DELETED}
+            FROM ${ACCOUNT_META_TABLE}
+            WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(accountBytes)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) return 'missing';
+
+    const deleted = expectBigint(row.values[ACCOUNT_META_DELETED], ACCOUNT_META_DELETED);
+    if (deleted === 0n) return 'live';
+    if (deleted === 1n) return 'deleted';
+    throw new Error(`invalid account deletion marker ${deleted.toString()}`);
+}
+
+/// Reads the committed replay-protection state for an account. A missing or
+/// deleted account has no usable nonce state.
+export async function fetchIndexedNonceState({
+    sqlUrl,
+    account,
+    signal,
+}: {
+    sqlUrl: string;
+    account: string;
+    signal?: AbortSignal;
+}): Promise<NonceState | null> {
+    const accountBytes = parseAccountBytes(account);
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT
+                ${ACCOUNT_META_NONCE_BASE},
+                ${ACCOUNT_META_NONCE_BITMAP},
+                ${ACCOUNT_META_DELETED}
+            FROM ${ACCOUNT_META_TABLE}
+            WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(accountBytes)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+
+    const deleted = expectBigint(row.values[ACCOUNT_META_DELETED], ACCOUNT_META_DELETED);
+    if (deleted === 1n) return null;
+    if (deleted !== 0n) {
+        throw new Error(`invalid account deletion marker ${deleted.toString()}`);
+    }
+    return {
+        base: expectBigint(row.values[ACCOUNT_META_NONCE_BASE], ACCOUNT_META_NONCE_BASE),
+        bitmap: expectBigint(row.values[ACCOUNT_META_NONCE_BITMAP], ACCOUNT_META_NONCE_BITMAP),
     };
 }
 

@@ -133,21 +133,6 @@ body {
     color: var(--theme-accent);
 }
 
-.app__title-link {
-    color: inherit;
-    background: transparent;
-    border: 0;
-    font: inherit;
-    letter-spacing: inherit;
-    padding: 0;
-    cursor: pointer;
-}
-
-.app__title-link:hover,
-.app__title-link:focus-visible {
-    color: var(--theme-accent);
-}
-
 .app__header-actions {
     min-width: 0;
     display: flex;
@@ -254,15 +239,53 @@ body {
 .modal__close,
 .account-lookup button,
 .account-page button,
-.wallet button:not(.copyable--plain),
-.transfer button,
-.transfer__submit {
+.action-button {
     color: var(--theme-background);
     background: var(--theme-accent);
     border: 1px solid var(--theme-accent);
     font: inherit;
     padding: 0.35ch 1ch;
     cursor: pointer;
+}
+
+.action-button--secondary,
+.action-button--toggle {
+    color: var(--theme-text);
+    background: transparent;
+    border-color: var(--theme-border);
+}
+
+.action-button--emphasis {
+    color: var(--theme-accent);
+    background: transparent;
+    border-color: var(--theme-accent);
+}
+
+.action-button--danger {
+    color: var(--theme-danger);
+    background: transparent;
+    border-color: color-mix(in srgb, var(--theme-danger) 60%, var(--theme-border));
+}
+
+.action-button:hover:not(:disabled),
+.action-button:focus-visible {
+    border-color: var(--theme-accent);
+}
+
+.action-button--secondary:hover:not(:disabled),
+.action-button--secondary:focus-visible,
+.action-button--toggle:hover:not(:disabled),
+.action-button--toggle:focus-visible,
+.action-button--emphasis:hover:not(:disabled),
+.action-button--emphasis:focus-visible {
+    color: var(--theme-accent);
+}
+
+.action-button--danger:hover:not(:disabled),
+.action-button--danger:focus-visible {
+    color: var(--theme-background);
+    background: var(--theme-danger);
+    border-color: var(--theme-danger);
 }
 
 .account-lookup {
@@ -321,6 +344,19 @@ body {
 
 .wallet-trigger {
     text-align: center;
+}
+
+.app__nav-link {
+    color: var(--theme-text-dim);
+    background: transparent;
+    border-color: transparent;
+}
+
+.app__nav-link:hover,
+.app__nav-link:focus-visible,
+.app__nav-link--active {
+    color: var(--theme-accent);
+    border-bottom-color: var(--theme-accent);
 }
 
 .spinner {
@@ -523,18 +559,80 @@ body {
     color: var(--theme-text-dim);
 }
 
+.wallet__account-status {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 1ch;
+}
+
+.wallet__retry {
+    padding: 0;
+    color: var(--theme-accent);
+    background: transparent;
+    border: 0;
+    font: inherit;
+    cursor: pointer;
+}
+
+.wallet__retry:hover,
+.wallet__retry:focus-visible {
+    text-decoration: underline;
+}
+
+.wallet__label--connected::before {
+    display: inline-block;
+    width: 0.7ch;
+    height: 0.7ch;
+    margin-right: 0.7ch;
+    border-radius: 50%;
+    background: var(--theme-success);
+    content: '';
+}
+
 .wallet__actions {
     display: flex;
     flex-wrap: wrap;
     gap: 1ch;
 }
 
-.wallet button:disabled,
-.transfer button:disabled,
-.transfer__submit:disabled,
+.action-button:disabled,
 .copyable:disabled {
     cursor: default;
     opacity: 0.45;
+}
+
+.wallet--onboarding {
+    min-height: min(26rem, 65vh);
+    display: grid;
+    place-items: center;
+}
+
+.wallet__onboarding {
+    width: min(56ch, 100%);
+    padding: clamp(1rem, 4vw, 3rem);
+    border: 1px solid var(--theme-border);
+    background: var(--theme-row-alt);
+}
+
+.wallet__onboarding h3 {
+    margin: 0.35rem 0;
+    color: var(--theme-text);
+    font-size: 1.25rem;
+    font-weight: 400;
+}
+
+.wallet__onboarding p {
+    margin: 0;
+    color: var(--theme-text-dim);
+}
+
+.wallet__onboarding .wallet__status {
+    margin: 1rem 0;
+}
+
+.wallet__onboarding .wallet__actions {
+    width: 100%;
 }
 
 .wallet__grid {
@@ -560,6 +658,30 @@ body {
     min-width: 0;
     overflow-wrap: anywhere;
     font-weight: 400;
+}
+
+.wallet__balance {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 1ch;
+}
+
+.wallet__mint {
+    flex: 0 0 auto;
+    padding: 0.15ch 0.6ch;
+    color: var(--theme-accent);
+    border-color: var(--theme-accent);
+    font-size: 0.75em;
+}
+
+.wallet__activity {
+    margin-top: 0.75rem;
+    padding: 0.6rem 1ch;
+    color: var(--theme-accent);
+    border-left: 2px solid var(--theme-accent);
+    background: var(--theme-row-alt);
+    overflow-wrap: anywhere;
 }
 
 .copyable {
@@ -623,20 +745,20 @@ body {
 
 .transfer {
     display: grid;
-    /* to · amount · submit · mint — both actions share the input row. */
-    grid-template-columns: minmax(18ch, 1fr) 12ch calc(10ch + 2px) calc(10ch + 2px);
+    grid-template-columns: minmax(18ch, 1fr) 12ch max-content;
     gap: 1ch;
     align-items: end;
 }
 
 .transfer__submit {
-    width: calc(10ch + 2px);
+    width: auto;
+    min-width: calc(10ch + 2px);
     height: calc(1lh + 0.7ch + 2px);
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 0;
-    line-height: 1;
+    line-height: var(--line-height);
 }
 
 .transfer label {
@@ -662,9 +784,9 @@ body {
 }
 
 .tx-record {
-    display: flex;
-    flex-direction: column;
-    gap: 0.3ch;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) max-content;
+    gap: 0.3ch 2ch;
     padding: 0.8ch 0;
     border-bottom: 1px solid var(--theme-border);
 }
@@ -674,6 +796,8 @@ body {
 }
 
 .tx-record__primary {
+    grid-column: 1;
+    grid-row: 1;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -699,13 +823,25 @@ body {
 }
 
 .tx-record__time {
-    margin-left: auto;
+    grid-column: 2;
+    grid-row: 1 / span 2;
     color: var(--theme-text-dim);
     white-space: nowrap;
     flex-shrink: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-end;
+    align-self: start;
+    text-align: right;
+}
+
+.tx-record__outcome-mark {
+    color: var(--theme-danger);
 }
 
 .tx-record__secondary {
+    grid-column: 1;
+    grid-row: 2;
     display: flex;
     align-items: center;
     gap: 0.75ch;
@@ -1082,27 +1218,43 @@ body {
 
 @media (max-width: 760px) {
     .app__header {
-        padding: 1rem;
-        gap: 0.75rem 1rem;
+        padding: 0.65rem 1rem;
+        gap: 0.45rem 1rem;
     }
 
     .app__title {
         flex: 1 1 100%;
         text-align: center;
+        font-size: 0.9rem;
     }
 
     .app__header-actions {
         flex: 1 1 100%;
-        justify-content: space-between;
+        justify-content: center;
+        gap: 0.5ch;
     }
 
     .app__status {
-        flex: 1 1 auto;
+        order: 2;
+        flex: 1 1 100%;
+        justify-content: center;
+        font-size: 0.75em;
+        line-height: 1.2;
+        overflow: visible;
+        text-align: center;
+        text-overflow: clip;
+        white-space: normal;
+    }
+
+    .app__header-separator {
+        display: none;
     }
 
     .wallet-trigger {
         flex: 0 0 auto;
         max-width: 22ch;
+        padding: 0.25ch 0.65ch;
+        font-size: 0.85em;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -1240,17 +1392,25 @@ body {
         padding: 1rem;
     }
 
-    .wallet-trigger__key {
-        display: none;
-    }
-
     .tx-record__primary {
         flex-wrap: wrap;
         row-gap: 0.3ch;
     }
 
     .tx-record__time {
-        margin-left: 0;
+        grid-column: 1;
+        grid-row: 3;
+        align-items: flex-start;
+        text-align: left;
+    }
+
+    .tx-record__secondary {
+        grid-column: 1;
+        grid-row: 2;
+    }
+
+    .tx-record {
+        grid-template-columns: minmax(0, 1fr);
     }
 
     .wallet__header {
@@ -1277,9 +1437,7 @@ body {
     }
 
     .transfer {
-        /* Inputs stack full-width; submit and mint stay paired on one
-           row (the wallet__actions pattern). */
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: 1fr;
     }
 
     .transfer label {
@@ -1308,10 +1466,6 @@ body {
         grid-template-columns: 1fr;
     }
 
-    .app__header-separator {
-        display: none;
-    }
-
     .histogram {
         font-size: 6px;
     }
@@ -1332,31 +1486,72 @@ body {
 .paid-stream {
     display: flex;
     flex-direction: column;
+    flex: 1 1 auto;
     gap: 1rem;
+    min-height: 0;
+    overflow-y: auto;
+    padding: 1rem 0;
     width: 100%;
 }
 
-.paid-stream__intro p {
-    color: var(--theme-text-dim);
+.paid-stream__heading {
+    padding-bottom: 0.55rem;
+    border-bottom: 1px solid var(--theme-border);
+}
+
+.paid-stream__heading h2 {
     margin: 0;
+    font-size: clamp(1.15rem, 2vw, 1.5rem);
+    font-weight: 400;
+}
+
+.paid-stream__summary-heading {
+    display: flex;
+    align-items: end;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.paid-stream__operator-retry {
+    display: inline-flex;
+    align-items: center;
+    gap: 1ch;
+}
+
+.paid-stream__operator-retry > span {
+    color: var(--theme-danger);
+}
+
+.paid-stream__fact-groups {
+    display: grid;
+    gap: 0.75rem;
 }
 
 .paid-stream__facts {
-    border: 1px solid var(--theme-border);
     display: grid;
-    gap: 0.5rem 2ch;
-    grid-template-columns: repeat(auto-fit, minmax(28ch, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(10rem, 1fr));
+    gap: 1px;
     margin: 0;
-    padding: 0.75rem 1ch;
+    padding: 1px;
+    background: var(--theme-border);
+}
+
+.paid-stream__facts > div {
+    min-width: 0;
+    padding: 0.65rem 1ch;
+    background: var(--theme-background);
 }
 
 .paid-stream__facts dt {
     color: var(--theme-text-dim);
-    text-transform: lowercase;
+    font-size: 0.75em;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
 }
 
 .paid-stream__facts dd {
-    margin: 0;
+    margin: 0.2rem 0 0;
+    overflow-wrap: anywhere;
 }
 
 .paid-stream__fact-note {
@@ -1366,31 +1561,53 @@ body {
 .paid-stream__controls {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem 1ch;
+}
+
+.paid-stream__primary-controls,
+.paid-stream__secondary-controls {
+    display: flex;
+    flex-wrap: wrap;
     gap: 1ch;
 }
 
-.paid-stream__controls .transfer__submit {
-    width: auto;
-}
-
 .paid-stream__note {
-    color: var(--theme-accent);
     margin: 0;
+    padding: 0.55rem 1ch;
+    color: var(--theme-accent);
+    border-left: 2px solid var(--theme-accent);
+    background: var(--theme-row-alt);
+    overflow-wrap: anywhere;
 }
 
-.paid-stream__meter {
-    align-items: center;
+.paid-stream__status {
+    padding: 0.65rem 1ch;
+    border: 1px solid var(--theme-border);
+}
+
+.paid-stream__meter-label {
     display: flex;
-    flex-wrap: wrap;
-    gap: 2ch;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 1ch;
+    margin-bottom: 0.45rem;
+}
+
+.paid-stream__meter-label span {
+    color: var(--theme-text-dim);
+}
+
+.paid-stream__meter-label strong {
+    font-weight: 400;
+    text-align: right;
 }
 
 .paid-stream__meter-bar {
     background: var(--theme-row-alt);
     border: 1px solid var(--theme-border);
-    flex: 1 1 20ch;
-    height: 1rem;
-    min-width: 12ch;
+    height: 0.65rem;
 }
 
 .paid-stream__meter-fill {
@@ -1399,22 +1616,31 @@ body {
     transition: width 120ms linear;
 }
 
-.paid-stream__meter-fill--full {
-    background: var(--theme-danger);
+.paid-stream__status-meta {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.35rem 2ch;
+    margin-top: 0.6rem;
+    color: var(--theme-text-dim);
 }
 
-.paid-stream__panes {
-    display: grid;
-    gap: 1rem;
-    grid-template-columns: minmax(0, 2fr) minmax(24ch, 1fr);
+.paid-stream__status-meta strong {
+    color: var(--theme-text);
+    font-weight: 400;
+}
+
+.paid-stream__unpaid--warning,
+.paid-stream__unpaid--warning strong {
+    color: var(--theme-danger);
 }
 
 .paid-stream__text {
     border: 1px solid var(--theme-border);
     font-family: var(--font-family-mono);
     margin: 0;
-    max-height: 24rem;
-    min-height: 12rem;
+    max-height: 30rem;
+    min-height: 16rem;
     overflow-y: auto;
     padding: 0.75rem 1ch;
     white-space: pre-wrap;
@@ -1432,37 +1658,50 @@ body {
     }
 }
 
-.paid-stream__payments {
-    border: 1px solid var(--theme-border);
-    max-height: 24rem;
-    overflow-y: auto;
-    padding: 0.75rem 1ch;
-}
-
-.paid-stream__payments h3 {
-    color: var(--theme-text-dim);
-    font-size: inherit;
-    font-weight: normal;
-    margin: 0 0 0.5rem;
-}
-
-.paid-stream__payments ul {
-    list-style: none;
-    margin: 0;
-    padding: 0;
-}
-
-.paid-stream__payments li {
-    border-bottom: 1px solid var(--theme-border);
-    padding: 0.15rem 0;
-}
-
-.paid-stream__payments li:last-child {
-    border-bottom: 0;
-}
-
 @media (max-width: 720px) {
-    .paid-stream__panes {
+    .paid-stream {
+        gap: 0.85rem;
+        padding: 1rem;
+    }
+
+    .paid-stream__facts {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .paid-stream__status {
+        font-size: 0.9em;
+    }
+
+    .paid-stream__meter-label {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.15rem;
+    }
+
+    .paid-stream__controls,
+    .paid-stream__primary-controls,
+    .paid-stream__secondary-controls {
+        align-items: stretch;
+        flex-direction: column;
+    }
+
+    .paid-stream__controls .action-button {
+        width: 100%;
+    }
+
+    .paid-stream__text {
+        min-height: 10rem;
+    }
+}
+
+@media (max-width: 420px) {
+    .paid-stream__facts {
         grid-template-columns: 1fr;
+    }
+
+    .paid-stream__summary-heading {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 0.35rem;
     }
 }

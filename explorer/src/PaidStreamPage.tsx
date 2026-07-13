@@ -9,8 +9,15 @@
 import { memo, useEffect, useMemo, useRef, useState } from 'react';
 
 import { AddressValue } from './AddressValue';
-import { encodeTransactionBatch, fromHex, parseAccountKeyHex, toHex } from './codec';
+import {
+    channelAddress,
+    encodeTransactionBatch,
+    fromHex,
+    parseAccountKeyHex,
+    toHex,
+} from './codec';
 import { statusHasHeight, submitTransactions, type TxStatus } from './mempool';
+import { consumeNonce } from './nonce';
 import {
     OperatorRequestError,
     fetchAdvertisement,
@@ -29,14 +36,13 @@ import {
     type StreamEnd,
     type StreamMeter,
 } from './paidStream';
+import { fetchIndexedAccountState, fetchIndexedNonceState } from './qmdb';
 import { createVoucherKey, importVoucherKey, type VoucherKey } from './voucherKey';
 import { readStoredJson, shortHex } from './util';
 
 /// Retry delay for a transiently failed voucher post — well inside the
 /// operator's grace window, so a blip cannot kill a paying stream.
 const VOUCHER_RETRY_MS = 1_000;
-/// Most recent voucher payments kept in the on-page log.
-const PAYMENTS_LOG_LIMIT = 8;
 /// The page tracks one outstanding channel: the record lands here after the
 /// wallet signs the open (before submission) and stays until a close or a
 /// timeout reclaim resolves the escrow — the only two ways the funds move,
@@ -45,6 +51,10 @@ const CHANNEL_STORAGE_KEY = 'constantinople.stream-channel.v2';
 
 interface ChannelRecord {
     readonly channelHex: string;
+    /// Optional only for records written before payer identity was persisted.
+    /// Old records can recover it from the currently signed-in wallet after
+    /// verifying that it derives the stored channel address.
+    readonly payerHex?: string;
     readonly openNonce: string;
     readonly deposit: string;
     readonly openTxDigestHex: string;
@@ -72,6 +82,7 @@ interface ChannelRecord {
 /// before submitting it.
 export interface PendingOpen {
     readonly channelHex: string;
+    readonly payerHex: string;
     readonly openNonce: string;
     readonly openTxDigestHex: string;
     readonly signedOpenTxHex: string;
@@ -102,7 +113,10 @@ type Phase = 'idle' | 'opening' | 'ready' | 'streaming' | 'ended' | 'settling' |
 export interface PaidStreamPageProps {
     readonly operatorUrl: string;
     readonly mempoolUrl: string;
+    readonly sqlUrl: string;
+    readonly chainHeight: bigint | null;
     readonly walletReady: boolean;
+    readonly walletAccountHex: string | null;
     readonly walletBalance: number | null;
     /// Signs and submits the OpenChannel with the passkey (one user ceremony
     /// per channel — the delegation the voucher key operates under).
@@ -111,32 +125,37 @@ export interface PaidStreamPageProps {
     readonly onReclaimChannel: (request: ReclaimStreamChannelRequest) => Promise<TxStatus | null>;
     readonly onOpenWallet: () => void;
     readonly onOpenAddress: (accountHex: string) => void;
-    readonly onCopy: (value: string) => void;
+    readonly onNotify: (message: string) => void;
 }
 
-/// Memoized: App re-renders on every live-dashboard tick, and none of that
-/// concerns this page — its props are primitives and stable callbacks.
+/// Memoized so unrelated App state does not disturb an active stream. The
+/// latest chain height intentionally re-renders the page to update expiry
+/// runway and reveal post-expiry recovery.
 export const PaidStreamPage = memo(function PaidStreamPage({
     operatorUrl,
     mempoolUrl,
+    sqlUrl,
+    chainHeight,
     walletReady,
+    walletAccountHex,
     walletBalance,
     onOpenChannel,
     onReclaimChannel,
     onOpenWallet,
     onOpenAddress,
-    onCopy,
+    onNotify,
 }: PaidStreamPageProps) {
     const [phase, setPhase] = useState<Phase>('idle');
     const [note, setNote] = useState('');
+    // Payment feedback is transient: a later stream chunk proves the
+    // operator accepted payment and resumed delivery, so it clears itself.
+    const [paymentNotice, setPaymentNotice] = useState('');
     const [advertisement, setAdvertisement] = useState<OperatorAdvertisement | null>(null);
     const [channel, setChannel] = useState<ChannelRecord | null>(() => readChannelRecord());
     const [text, setText] = useState('');
     const [meter, setMeter] = useState<StreamMeter>({ served: 0n, paid: 0n });
     const [paying, setPaying] = useState(true);
-    // Signed cumulatives, newest first (strictly monotonic per channel, so
-    // the values key the log rows).
-    const [payments, setPayments] = useState<bigint[]>([]);
+    const [voucherCount, setVoucherCount] = useState(0);
     const [endReason, setEndReason] = useState<StreamEnd['reason'] | null>(null);
 
     const payingRef = useRef(true);
@@ -179,8 +198,10 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             (ad) => {
                 if (!cancelled) setAdvertisement(ad);
             },
-            (error) => {
-                if (!cancelled) setNote(`operator unreachable: ${String(error)}`);
+            () => {
+                if (!cancelled) {
+                    setAdvertisement(null);
+                }
             },
         );
         void (async () => {
@@ -193,13 +214,26 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 );
                 if (!cancelled) voucherKeyRef.current = key;
             } catch (error) {
-                if (!cancelled) setNote(`stored voucher key failed to import: ${String(error)}`);
+                if (!cancelled) {
+                    setNote(`stored voucher key failed to import: ${errorMessage(error)}`);
+                }
             }
         })();
         return () => {
             cancelled = true;
         };
     }, [operatorUrl]);
+
+    const retryOperator = async () => {
+        setNote('checking operator…');
+        try {
+            setAdvertisement(await fetchAdvertisement(operatorUrl));
+            setNote('');
+        } catch {
+            setAdvertisement(null);
+            setNote('');
+        }
+    };
 
     /// Closes a live stream, if any. Nulling the ref matters: the voucher
     /// retry timer reads `closeStreamRef.current !== null` as "stream is
@@ -209,8 +243,88 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         closeStreamRef.current = null;
     };
 
+    /// Clears a browser-local recovery record only when the index proves that
+    /// it cannot represent live escrow: either the channel was deleted, or it
+    /// never existed and its signed open nonce has since been consumed.
+    const resolveStoredChannel = async (
+        record: ChannelRecord,
+        cancelled?: () => boolean,
+    ): Promise<boolean> => {
+        try {
+            const state = await fetchIndexedAccountState({
+                sqlUrl,
+                account: record.channelHex,
+            });
+            if (cancelled?.()) return false;
+            if (state === 'deleted') {
+                clearStoredChannel(
+                    record,
+                    'channel resolved on-chain; no deposit remains locked.',
+                    'settled',
+                );
+                return true;
+            }
+            if (state !== 'missing') return false;
+
+            const payerHex = record.payerHex ?? walletAccountHex;
+            if (!payerHex || !(await channelMatchesPayer(record, payerHex)) || cancelled?.()) {
+                return false;
+            }
+            const payerNonce = await fetchIndexedNonceState({
+                sqlUrl,
+                account: payerHex,
+            });
+            if (
+                payerNonce === null ||
+                consumeNonce(payerNonce, BigInt(record.openNonce)) !== null ||
+                cancelled?.()
+            ) {
+                return false;
+            }
+
+            clearStoredChannel(
+                record,
+                'channel open never finalized; no deposit was locked.',
+                'idle',
+            );
+            return true;
+        } catch {
+            // Reconciliation is recovery assistance, not a prerequisite for
+            // normal operation. A transient indexer failure leaves the only
+            // recovery record intact and lets the existing action continue.
+            return false;
+        }
+    };
+
+    const clearStoredChannel = (record: ChannelRecord, message: string, nextPhase: Phase) => {
+        const stored = readChannelRecord();
+        if (stored?.channelHex === record.channelHex) {
+            localStorage.removeItem(CHANNEL_STORAGE_KEY);
+        }
+        setChannel((current) =>
+            current?.channelHex === record.channelHex ? null : current,
+        );
+        setEndReason(null);
+        setNote(message);
+        setPhase(nextPhase);
+    };
+
     // Close a live stream when the view unmounts.
     useEffect(() => () => closeStream(), []);
+
+    // A settlement sweep or a lost HTTP response can resolve the channel
+    // while its browser-local record survives. Reconcile that record as soon
+    // as the page restores it so stale retry/reclaim controls never appear.
+    useEffect(() => {
+        const restored = readChannelRecord();
+        if (!restored) return;
+
+        let cancelled = false;
+        void resolveStoredChannel(restored, () => cancelled);
+        return () => {
+            cancelled = true;
+        };
+    }, [sqlUrl, walletAccountHex]);
 
     // Follow the typewriter.
     useEffect(() => {
@@ -245,7 +359,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             await postVoucher(operatorUrl, { channel: channelKey, cumulative: target, signature });
             if (generation !== sessionGenerationRef.current) return;
             lastSignedRef.current = target;
-            setPayments((current) => [target, ...current].slice(0, PAYMENTS_LOG_LIMIT));
+            setVoucherCount((current) => current + 1);
         })();
         let tracked!: Promise<void>;
         tracked = pending
@@ -285,14 +399,14 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             if (generation !== sessionGenerationRef.current) return;
             if (error instanceof OperatorRequestError && !error.transient) {
                 deadTargetRef.current = target;
-                setNote(`voucher rejected: ${error.message}`);
+                setPaymentNotice(`voucher rejected: ${error.message}`);
                 return;
             }
             // The operator announces a pause only once per pause, so a
             // transiently failed post must retry on its own — no further
             // SSE event may arrive to re-trigger payment before the
             // grace window expires.
-            setNote(`voucher failed: ${String(error)} — retrying`);
+            setPaymentNotice(`voucher failed: ${errorMessage(error)} — retrying`);
             window.setTimeout(() => {
                 if (closeStreamRef.current !== null) maybePay();
             }, VOUCHER_RETRY_MS);
@@ -303,9 +417,9 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     /// meter can no longer advance, wait for an older post and then cover any
     /// delivered remainder exactly. This preserves the no-prepayment policy
     /// without making the operator forfeit the last partial voucher window.
-    const flushDeliveredVoucher = async () => {
+    const flushDeliveredVoucher = async (): Promise<bigint | null> => {
         await voucherPostRef.current;
-        if (!payingRef.current || !channel || !channelKey) return;
+        if (!payingRef.current || !channel || !channelKey) return null;
 
         const target = voucherFinalTopUp({
             served: meterRef.current.served,
@@ -313,7 +427,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             lastSigned: lastSignedRef.current,
             deposit: BigInt(channel.deposit),
         });
-        if (target === null) return;
+        if (target === null) return null;
         if (deadTargetRef.current === target) {
             throw new Error(`the operator previously rejected the final voucher ${target}`);
         }
@@ -321,6 +435,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         const voucherKey = voucherKeyRef.current;
         if (!voucherKey) throw new Error('voucher key unavailable');
         await postSignedVoucher(voucherKey, channelKey, target);
+        return target;
     };
 
     /// Open the channel from the wallet (one passkey ceremony) and register
@@ -346,6 +461,8 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             voucherKeyRef.current = null;
         }
         try {
+            if (record && (await resolveStoredChannel(record))) return;
+
             // Fresh advertisement: the expiry derives from the operator's
             // current height.
             const ad = await fetchAdvertisement(operatorUrl);
@@ -366,7 +483,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 const expiry = channelExpiry(ad);
                 const voucherPublicKeyHex = toHex(voucherKey.publicKey);
                 setNote('approve the channel open in the wallet…');
-                await onOpenChannel({
+                const openStatus = await onOpenChannel({
                     operatorHex: ad.accountHex,
                     voucherPublicKeyHex,
                     deposit,
@@ -386,8 +503,27 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                         setChannel(record);
                     },
                 });
-                if (!record) {
+                const signedRecord = readChannelRecord();
+                if (!signedRecord) {
                     throw new Error('channel open was not signed');
+                }
+                record = signedRecord;
+                if (
+                    openStatus?.status === 'partially_finalized' &&
+                    openStatus.filtered.includes(signedRecord.openTxDigestHex)
+                ) {
+                    throw new Error('channel open was rejected on-chain');
+                }
+                // A dropped proposal or lost submission response does not
+                // require another passkey ceremony. Resubmit the exact
+                // persisted bytes; the signed nonce makes this idempotent if
+                // the first request actually finalized.
+                if (openStatus === null || openStatus.status === 'dropped') {
+                    setNote('confirming the channel open on-chain…');
+                    await submitTransactions(
+                        mempoolUrl,
+                        encodeTransactionBatch([fromHex(signedRecord.signedOpenTxHex)]),
+                    );
                 }
             } else {
                 // A restored or retried record: make sure its voucher key is
@@ -431,10 +567,16 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             record = { ...record, capability };
             persistChannel(record);
             setChannel(record);
-            setNote('channel registered — start the stream');
+            setNote('');
+            onNotify('channel ready');
             setPhase('ready');
         } catch (error) {
-            setNote(error instanceof Error ? error.message : String(error));
+            const message = error instanceof Error ? error.message : String(error);
+            setNote(
+                message === 'open transaction is not finalized'
+                    ? 'still finalizing. try again shortly.'
+                    : message,
+            );
             // Every failure returns to 'idle': the start button is the
             // retry path — it reuses a persisted record and re-runs the
             // idempotent resubmit and registration steps.
@@ -451,16 +593,18 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         closeStream();
         setEndReason(null);
         setNote('');
+        setPaymentNotice('');
         setPhase('streaming');
         closeStreamRef.current = openStream(operatorUrl, channelKey, channel.capability, {
             onChunk: (chunk) => {
                 setText((current) => current + chunk.text);
                 updateMeter(chunk);
+                setPaymentNotice('');
                 maybePay();
             },
             onPaymentRequired: (paused) => {
                 updateMeter(paused);
-                setNote('debt limit reached — stream paused until a voucher lands');
+                setPaymentNotice('stream paused — payment required');
                 maybePay();
             },
             onEnd: (end) => {
@@ -468,11 +612,13 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 updateMeter(end);
                 setEndReason(end.reason);
                 setNote('');
+                setPaymentNotice('');
                 setPhase('ended');
             },
             onError: (message) => {
                 closeStreamRef.current = null;
                 setNote(message);
+                setPaymentNotice('');
                 setPhase('ready');
             },
         });
@@ -480,12 +626,14 @@ export const PaidStreamPage = memo(function PaidStreamPage({
 
     const stopStream = () => {
         closeStream();
+        setPaymentNotice('');
         setPhase('ready');
     };
 
     const settle = async () => {
         if (!channelKey || !channel?.capability) return;
         closeStream();
+        setPaymentNotice('');
         // A failure returns to the phase the action started from ('ended'
         // when it started mid-stream: the stream was just closed). Landing
         // anywhere else strands the user — notably in 'ended' from 'idle',
@@ -495,8 +643,9 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         setPhase('settling');
         try {
             setNote('paying for delivered content…');
+            let finalVoucher: bigint | null = null;
             try {
-                await flushDeliveredVoucher();
+                finalVoucher = await flushDeliveredVoucher();
             } catch (error) {
                 const settlementStarted =
                     error instanceof OperatorRequestError &&
@@ -506,25 +655,28 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             }
             setNote('closing the channel on-chain…');
             const outcome = await settleChannel(operatorUrl, channelKey, channel.capability);
-            setNote(
-                outcome.settled
-                    ? `settled: one close paid ${outcome.cumulative} for ${payments.length ? 'all the vouchers you watched' : 'the session'} — the remainder refunded to the wallet`
-                    : 'close abandoned — the channel expired first',
-            );
             if (outcome.settled) {
+                setNote('');
+                onNotify(
+                    finalVoucher === null
+                        ? `settled ${outcome.cumulative} on-chain; remaining deposit refunded.`
+                        : `settled ${outcome.cumulative} on-chain; final voucher ${finalVoucher}; remaining deposit refunded.`,
+                );
                 // A finalized close resolved the escrow, so there is
                 // nothing left to reclaim.
                 localStorage.removeItem(CHANNEL_STORAGE_KEY);
                 setChannel(null);
+                setEndReason(null);
                 setPhase('settled');
             } else {
+                setNote('channel expired before settlement. reclaim the deposit.');
                 // An abandoned close leaves the escrow live. Keep its only
                 // persisted recovery record and return to controls that
                 // expose the post-expiry timeout reclaim.
                 setPhase(origin);
             }
         } catch (error) {
-            setNote(`settlement failed: ${String(error)}`);
+            setNote(`settlement failed: ${errorMessage(error)}`);
             setPhase(origin);
         }
     };
@@ -558,16 +710,19 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 openNonce: channel.openNonce,
             });
             if (status === null || !statusHasHeight(status)) {
+                if (await resolveStoredChannel(channel)) return;
                 throw new Error(
                     `timeout reclaim was ${status?.status ?? 'not signed'} — the channel may already be closed`,
                 );
             }
             localStorage.removeItem(CHANNEL_STORAGE_KEY);
             setChannel(null);
-            setNote('deposit reclaimed — the escrow returned to the wallet');
+            setEndReason(null);
+            setNote('');
+            onNotify('deposit returned to wallet');
             setPhase('settled');
         } catch (error) {
-            setNote(error instanceof Error ? error.message : String(error));
+            setNote(errorMessage(error));
             setPhase(origin);
         }
     };
@@ -583,7 +738,8 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         voucherPostRef.current = null;
         setText('');
         updateMeter({ served: 0n, paid: 0n });
-        setPayments([]);
+        setVoucherCount(0);
+        setPaymentNotice('');
         setEndReason(null);
         lastSignedRef.current = 0n;
         deadTargetRef.current = null;
@@ -595,183 +751,275 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     if (!operatorUrl) {
         return (
             <div className="paid-stream">
-                <p className="paid-stream__note">
-                    no operator configured — set VITE_OPERATOR_URL (the local deploy does this
-                    automatically when the indexer and relayer run).
-                </p>
+                <p className="paid-stream__note">operator not configured. set VITE_OPERATOR_URL.</p>
             </div>
         );
     }
 
     const debtLimit = advertisement?.debtLimit ?? 0n;
     const debt = meter.served > meter.paid ? meter.served - meter.paid : 0n;
-    const debtRatio = debtLimit > 0n ? Number(debt) / Number(debtLimit) : 0;
+    const paymentWarning = debtLimit > 0n && debt * 4n >= debtLimit * 3n;
+    const streamCost = advertisement
+        ? advertisement.streamTokens * advertisement.pricePerToken
+        : 0n;
+    const contentRatio = streamCost > 0n ? Number(meter.served) / Number(streamCost) : 0;
+    const deliveredTokens = advertisement?.pricePerToken
+        ? meter.served / advertisement.pricePerToken
+        : 0n;
     const streaming = phase === 'streaming';
+    const channelExpiryBlock = channel ? BigInt(channel.expiry) : null;
+    const advertisedHeight = advertisement?.height ?? null;
+    const currentHeight =
+        chainHeight === null
+            ? advertisedHeight
+            : advertisedHeight === null || chainHeight > advertisedHeight
+              ? chainHeight
+              : advertisedHeight;
+    const reclaimable =
+        channelExpiryBlock !== null &&
+        currentHeight !== null &&
+        currentHeight > channelExpiryBlock;
+    const expiryDetail =
+        channelExpiryBlock === null || currentHeight === null
+            ? null
+            : currentHeight > channelExpiryBlock
+              ? 'expired'
+              : currentHeight === channelExpiryBlock
+                ? 'expires this block'
+                : `${(channelExpiryBlock - currentHeight).toString()} blocks left`;
+    const terminalStream =
+        phase === 'ended' && endReason !== null && endReason !== 'payment_timeout';
+    const endMessage = streamEndMessage(endReason, paying);
+    const showStreamOutput = channel?.capability !== undefined || phase === 'settled';
+    const operatorAccountHex = advertisement?.accountHex ?? channel?.operatorHex ?? null;
 
     return (
         <div className="paid-stream">
-            <div className="paid-stream__intro">
-                <p>
-                    an x402-style metered service: the operator sells an essay token by token, paid
-                    through a payment channel. the wallet signs one open delegating payment to a
-                    disposable voucher key — the chain sees two transactions (open and close) no
-                    matter how many vouchers stream in between.
-                </p>
+            <div className="paid-stream__heading">
+                <h2>stream</h2>
             </div>
 
-            <dl className="paid-stream__facts">
-                <div>
-                    <dt>channel</dt>
-                    <dd>
-                        {channel ? (
-                            <SessionAddress hex={channel.channelHex} onOpenAddress={onOpenAddress} />
-                        ) : (
-                            'none yet'
-                        )}
-                        {channel && (
-                            <span className="paid-stream__fact-note"> deposit {channel.deposit}</span>
-                        )}
-                    </dd>
+            {phase !== 'settled' && !advertisement && (
+                <div className="paid-stream__summary-heading">
+                    <span className="paid-stream__operator-retry">
+                        <span>operator unavailable</span>
+                        <button
+                            className="action-button action-button--secondary"
+                            onClick={() => void retryOperator()}
+                            type="button"
+                        >
+                            retry
+                        </button>
+                    </span>
                 </div>
-                <div>
-                    <dt>voucher key</dt>
-                    <dd>
-                        {channel ? (
-                            <span title={channel.voucherPublicKeyHex}>
-                                {shortHex(channel.voucherPublicKeyHex)}
-                            </span>
-                        ) : (
-                            'created at open'
+            )}
+            {phase !== 'settled' && (advertisement || channel) && (
+                <div className="paid-stream__fact-groups">
+                    <dl className="paid-stream__facts">
+                        {operatorAccountHex && (
+                            <div>
+                                <dt>operator</dt>
+                                <dd>
+                                    <SessionAddress
+                                        hex={operatorAccountHex}
+                                        onOpenAddress={onOpenAddress}
+                                    />
+                                </dd>
+                            </div>
                         )}
-                        {channel && (
-                            <span className="paid-stream__fact-note"> signs vouchers only</span>
+                        <div>
+                            <dt>deposit</dt>
+                            <dd>
+                                {channel
+                                    ? channel.deposit
+                                    : advertisement
+                                      ? `${channelDeposit(advertisement).toString()} required`
+                                      : '—'}
+                            </dd>
+                        </div>
+                        {advertisement && (
+                            <div>
+                                <dt>price</dt>
+                                <dd>{advertisement.pricePerToken.toString()} / token</dd>
+                            </div>
                         )}
-                    </dd>
+                    </dl>
+                    {channel && (
+                        <dl className="paid-stream__facts">
+                            <div>
+                                <dt>channel</dt>
+                                <dd>
+                                    <SessionAddress
+                                        hex={channel.channelHex}
+                                        onOpenAddress={onOpenAddress}
+                                    />
+                                </dd>
+                            </div>
+                            <div>
+                                <dt>{channel.capability ? 'expiry' : 'pending expiry'}</dt>
+                                <dd>
+                                    block {channel.expiry}
+                                    {expiryDetail && ` · ${expiryDetail}`}
+                                </dd>
+                            </div>
+                        </dl>
+                    )}
                 </div>
-                <div>
-                    <dt>operator</dt>
-                    <dd>
-                        {advertisement ? (
-                            <>
-                                <SessionAddress
-                                    hex={advertisement.accountHex}
-                                    onOpenAddress={onOpenAddress}
-                                />{' '}
-                                <span className="paid-stream__fact-note">
-                                    {advertisement.pricePerToken.toString()}/token, credit window{' '}
-                                    {advertisement.debtLimit.toString()}
-                                </span>
-                            </>
-                        ) : (
-                            'unreachable'
-                        )}
-                    </dd>
-                </div>
-            </dl>
-
-            <div className="paid-stream__controls">
-                {phase === 'idle' && (
-                    <button
-                        className="transfer__submit"
-                        disabled={!advertisement}
-                        onClick={() => void startSession()}
-                        type="button"
-                    >
-                        start session
-                    </button>
-                )}
-                {phase === 'opening' && (
-                    <button className="transfer__submit" disabled type="button">
-                        opening…
-                    </button>
-                )}
-                {(phase === 'ready' || phase === 'ended') && channel && (
-                    <button className="transfer__submit" onClick={startStream} type="button">
-                        {text ? 'resume stream' : 'start stream'}
-                    </button>
-                )}
-                {streaming && (
-                    <button className="transfer__submit" onClick={stopStream} type="button">
-                        stop stream
-                    </button>
-                )}
-                {(streaming || phase === 'ready') && (
-                    <button
-                        className="transfer__submit"
-                        onClick={() => setPayingMode(!paying)}
-                        type="button"
-                    >
-                        {paying ? 'stop paying' : 'resume paying'}
-                    </button>
-                )}
-                {channel && phase !== 'opening' && phase !== 'settling' && phase !== 'settled' && (
-                    <button className="transfer__submit" onClick={() => void settle()} type="button">
-                        settle on-chain
-                    </button>
-                )}
-                {channel && (phase === 'idle' || phase === 'ready' || phase === 'ended') && (
-                    <button
-                        className="transfer__submit"
-                        onClick={() => void reclaimDeposit()}
-                        title="reclaim the escrow after the channel expiry (the exit when settle is refused)"
-                        type="button"
-                    >
-                        reclaim deposit
-                    </button>
-                )}
-                {phase === 'settled' && (
-                    <button className="transfer__submit" onClick={resetSession} type="button">
-                        new session
-                    </button>
-                )}
-            </div>
-
-            {note && <p className="paid-stream__note">{note}</p>}
-            {endReason && (
-                <p className="paid-stream__note">stream ended: {endReason.replace('_', ' ')}</p>
             )}
 
-            <div className="paid-stream__meter" aria-label="stream payment meter">
-                <span>served {meter.served.toString()}</span>
-                <span>paid {meter.paid.toString()}</span>
-                <span>
-                    debt {debt.toString()}/{debtLimit.toString()}
-                </span>
-                <div className="paid-stream__meter-bar">
-                    <div
-                        className={`paid-stream__meter-fill${debtRatio >= 1 ? ' paid-stream__meter-fill--full' : ''}`}
-                        style={{ width: `${Math.min(100, Math.round(debtRatio * 100))}%` }}
-                    />
+            <div className="paid-stream__controls">
+                <div className="paid-stream__primary-controls">
+                    {phase === 'idle' && (
+                        <button
+                            className="action-button action-button--primary"
+                            disabled={!advertisement}
+                            onClick={() => void startSession()}
+                            type="button"
+                        >
+                            {channel ? 'retry opening' : 'open channel'}
+                        </button>
+                    )}
+                    {phase === 'opening' && (
+                        <button className="action-button action-button--primary" disabled type="button">
+                            opening…
+                        </button>
+                    )}
+                    {(phase === 'ready' || (phase === 'ended' && !terminalStream)) && channel && (
+                        <button
+                            className={`action-button ${
+                                text
+                                    ? 'action-button--emphasis'
+                                    : 'action-button--primary'
+                            }`}
+                            onClick={startStream}
+                            type="button"
+                        >
+                            {text ? 'resume stream' : 'start stream'}
+                        </button>
+                    )}
+                    {streaming && (
+                        <button
+                            className="action-button action-button--toggle"
+                            onClick={stopStream}
+                            type="button"
+                        >
+                            pause stream
+                        </button>
+                    )}
+                    {phase === 'settled' && (
+                        <button
+                            className="action-button action-button--primary"
+                            onClick={resetSession}
+                            type="button"
+                        >
+                            new session
+                        </button>
+                    )}
+                </div>
+                <div className="paid-stream__secondary-controls">
+                    {terminalStream && channel?.capability && (
+                        <button
+                            className="action-button action-button--emphasis"
+                            onClick={() => void settle()}
+                            type="button"
+                        >
+                            {endReason === 'channel_closed'
+                                ? 'confirm settlement'
+                                : 'settle on-chain'}
+                        </button>
+                    )}
+                    {(streaming ||
+                        phase === 'ready' ||
+                        (phase === 'ended' && endReason === 'payment_timeout')) && (
+                        <button
+                            className={`action-button ${
+                                paying ? 'action-button--toggle' : 'action-button--emphasis'
+                            }`}
+                            onClick={() => setPayingMode(!paying)}
+                            type="button"
+                        >
+                            {paying ? 'pause auto-pay' : 'resume auto-pay'}
+                        </button>
+                    )}
+                    {channel?.capability &&
+                        !terminalStream &&
+                        phase !== 'opening' &&
+                        phase !== 'settling' &&
+                        phase !== 'settled' && (
+                            <button
+                                className="action-button action-button--secondary"
+                                onClick={() => void settle()}
+                                type="button"
+                            >
+                                end & settle
+                            </button>
+                        )}
+                    {channel &&
+                        reclaimable &&
+                        (phase === 'idle' || phase === 'ready' || phase === 'ended') && (
+                        <button
+                            className="action-button action-button--danger"
+                            onClick={() => void reclaimDeposit()}
+                            type="button"
+                        >
+                            reclaim deposit
+                        </button>
+                    )}
                 </div>
             </div>
 
-            <div className="paid-stream__panes">
+            {note && (
+                <p className="paid-stream__note" role="status">
+                    {note}
+                </p>
+            )}
+            {paymentNotice && (
+                <p className="paid-stream__note" role="status">
+                    {paymentNotice}
+                </p>
+            )}
+            {endMessage && (
+                <p className="paid-stream__note">{endMessage}</p>
+            )}
+
+            {showStreamOutput && (
+                <section className="paid-stream__status" aria-label="stream status">
+                    <div className="paid-stream__meter-label">
+                        <span>stream progress</span>
+                        <strong>
+                            {deliveredTokens.toString()} /{' '}
+                            {advertisement?.streamTokens.toString() ?? '—'} tokens
+                        </strong>
+                    </div>
+                    <div className="paid-stream__meter-bar">
+                        <div
+                            className="paid-stream__meter-fill"
+                            style={{ width: `${Math.min(100, Math.round(contentRatio * 100))}%` }}
+                        />
+                    </div>
+                    <div className="paid-stream__status-meta">
+                        <span>
+                            paid <strong>{meter.paid.toString()}</strong>
+                        </span>
+                        <span className={paymentWarning ? 'paid-stream__unpaid--warning' : ''}>
+                            unpaid <strong>{debt.toString()}</strong>
+                            {paymentWarning && ` / ${debtLimit.toString()}`}
+                        </span>
+                        {voucherCount > 0 && (
+                            <span>
+                                {voucherCount} voucher{voucherCount === 1 ? '' : 's'} sent
+                            </span>
+                        )}
+                    </div>
+                </section>
+            )}
+
+            {showStreamOutput && (
                 <pre className="paid-stream__text" ref={textRef}>
                     {text}
                     {streaming && <span className="paid-stream__cursor">▋</span>}
                 </pre>
-                <div className="paid-stream__payments">
-                    <h3>vouchers (off-chain)</h3>
-                    {payments.length === 0 ? (
-                        <p className="paid-stream__fact-note">none yet</p>
-                    ) : (
-                        <ul>
-                            {payments.map((cumulative) => (
-                                <li key={cumulative.toString()}>
-                                    <button
-                                        className="copyable copyable--plain"
-                                        onClick={() => onCopy(cumulative.toString())}
-                                        title="copy"
-                                        type="button"
-                                    >
-                                        cumulative {cumulative.toString()}
-                                    </button>
-                                </li>
-                            ))}
-                        </ul>
-                    )}
-                </div>
-            </div>
+            )}
         </div>
     );
 });
@@ -788,11 +1036,24 @@ function SessionAddress({
     return <AddressValue plain value={hex} display={shortHex(hex)} onOpenAddress={onOpenAddress} />;
 }
 
+async function channelMatchesPayer(record: ChannelRecord, payerHex: string): Promise<boolean> {
+    const operator = parseAccountKeyHex(record.operatorHex);
+    const derived = await channelAddress(
+        parseAccountKeyHex(payerHex),
+        operator,
+        operator,
+        fromHex(record.voucherPublicKeyHex),
+        BigInt(record.openNonce),
+    );
+    return toHex(derived) === record.channelHex.toLowerCase();
+}
+
 function isChannelRecord(value: unknown): value is ChannelRecord {
     if (typeof value !== 'object' || value === null) return false;
     const record = value as Partial<ChannelRecord>;
     return (
         typeof record.channelHex === 'string' &&
+        (record.payerHex === undefined || typeof record.payerHex === 'string') &&
         typeof record.openNonce === 'string' &&
         typeof record.deposit === 'string' &&
         typeof record.openTxDigestHex === 'string' &&
@@ -812,4 +1073,25 @@ function readChannelRecord(): ChannelRecord | null {
 
 function persistChannel(record: ChannelRecord): void {
     localStorage.setItem(CHANNEL_STORAGE_KEY, JSON.stringify(record));
+}
+
+function streamEndMessage(reason: StreamEnd['reason'] | null, paying: boolean): string {
+    switch (reason) {
+        case 'complete':
+            return 'stream complete.';
+        case 'payment_timeout':
+            return paying
+                ? 'payment timed out. retry the stream.'
+                : 'payment timed out. resume auto-pay, then resume the stream.';
+        case 'deposit_exhausted':
+            return 'deposit used. settle the channel.';
+        case 'channel_closed':
+            return 'channel closed.';
+        default:
+            return '';
+    }
+}
+
+function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
 }

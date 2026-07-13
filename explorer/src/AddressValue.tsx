@@ -27,11 +27,11 @@ export function AddressValue({
 
     return (
         <button
-            aria-label={`open address ${value}`}
+            aria-label={`view account ${value}`}
             className={className}
             disabled={disabled}
             onClick={() => onOpenAddress(value)}
-            title="open address"
+            title="view account"
             type="button"
         >
             <span className="copyable__value">{display ?? value}</span>

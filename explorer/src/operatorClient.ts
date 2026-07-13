@@ -28,10 +28,10 @@ import {
 } from './paidStream';
 import { sleep, trimTrailingSlash } from './util';
 
-/// Registration retry discipline (mirrors the spammer's): the open is
-/// finalized before the operator's indexer necessarily ingested it, so 503s
-/// are expected for a moment.
-const REGISTRATION_ATTEMPTS = 10;
+/// Registration retry discipline: an interactive local deployment may need
+/// several blocks for the finalized open to reach the operator's indexer.
+/// Give it thirty seconds before handing the retry back to the user.
+const REGISTRATION_ATTEMPTS = 60;
 const REGISTRATION_BACKOFF_MS = 500;
 /// Consecutive EventSource reconnect failures before a stream is abandoned.
 const MAX_STREAM_RECONNECTS = 3;

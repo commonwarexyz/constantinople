@@ -85,6 +85,7 @@ const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧',
 const LIVE_STATUS_TEXT = '>>> live';
 const LIVE_STATUS_SYMBOLS = [...LIVE_STATUS_TEXT];
 const BLOCK_FLUSH_INTERVAL_MS = 250;
+const TEST_MINT_AMOUNT = 1_000n;
 
 type Status =
     | { kind: 'connecting' }
@@ -168,7 +169,7 @@ interface SubmittedTransaction {
     readonly value: string;
     readonly nonce: string;
     readonly submittedAt: number;
-    readonly finalizedInMs: number | null;
+    readonly resolvedInMs: number | null;
     readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
     readonly finalizedHeight: number | null;
@@ -253,6 +254,7 @@ export default function App() {
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
+    const [accountLoadFailed, setAccountLoadFailed] = useState(false);
     const [toKey, setToKey] = useState('');
     const [value, setValue] = useState('1');
     const [nonce, setNonce] = useState('0');
@@ -274,11 +276,12 @@ export default function App() {
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
-    const [copyToast, setCopyToast] = useState('');
+    const [toast, setToast] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
-    const copyToastTimeoutRef = useRef<number | null>(null);
+    const toastTimeoutRef = useRef<number | null>(null);
+    const walletWasOpenRef = useRef(false);
     const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
@@ -656,8 +659,8 @@ export default function App() {
             if (blockFlushTimeoutRef.current !== null) {
                 window.clearTimeout(blockFlushTimeoutRef.current);
             }
-            if (copyToastTimeoutRef.current !== null) {
-                window.clearTimeout(copyToastTimeoutRef.current);
+            if (toastTimeoutRef.current !== null) {
+                window.clearTimeout(toastTimeoutRef.current);
             }
         };
     }, []);
@@ -667,16 +670,19 @@ export default function App() {
             setAccount(null);
             setLocalNonceState(emptyNonceState());
             setAccountMessage('account metadata unavailable');
+            setAccountLoadFailed(false);
             return;
         }
 
         let cancelled = false;
         setAccountMessage('loading account metadata');
+        setAccountLoadFailed(false);
 
         fetchAccount(mempoolUrl, wallet.publicKeyHex)
             .then((nextAccount) => {
                 if (cancelled) return;
                 setAccount(nextAccount);
+                setAccountLoadFailed(false);
                 mergeLocalNonceState(accountNonceState(nextAccount));
                 setAccountMessage(
                     nextAccount
@@ -687,6 +693,7 @@ export default function App() {
             .catch((error) => {
                 if (cancelled) return;
                 setAccount(null);
+                setAccountLoadFailed(true);
                 setAccountMessage(error instanceof Error ? error.message : String(error));
             });
 
@@ -698,17 +705,28 @@ export default function App() {
     const refreshAccount = async () => {
         if (!wallet) return;
         setAccountMessage('loading account metadata');
+        setAccountLoadFailed(false);
         try {
             const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
             setAccount(nextAccount);
+            setAccountLoadFailed(false);
             mergeLocalNonceState(accountNonceState(nextAccount));
             setAccountMessage(
                 nextAccount ? 'committed account loaded' : 'no committed account yet; mint to fund it',
             );
         } catch (error) {
+            setAccountLoadFailed(true);
             setAccountMessage(error instanceof Error ? error.message : String(error));
         }
     };
+
+    useEffect(() => {
+        const justOpened = isWalletOpen && !walletWasOpenRef.current;
+        walletWasOpenRef.current = isWalletOpen;
+        if (justOpened && wallet) {
+            void refreshAccount();
+        }
+    }, [isWalletOpen, wallet]);
 
     const handleCreateWallet = async () => {
         setWalletMessage('opening passkey prompt');
@@ -738,31 +756,27 @@ export default function App() {
         setWalletMessage('signed out');
     };
 
-    // Stable (empty deps): only setters and refs — and referential stability
-    // is what lets the memoized PaidStreamPage skip App's dashboard ticks.
+    const showToast = useCallback((message: string, duration = 2_800) => {
+        if (toastTimeoutRef.current !== null) {
+            window.clearTimeout(toastTimeoutRef.current);
+        }
+        setToast(message);
+        toastTimeoutRef.current = window.setTimeout(() => {
+            setToast('');
+            toastTimeoutRef.current = null;
+        }, duration);
+    }, []);
+
+    // Stable: referential stability is what lets the memoized PaidStreamPage
+    // skip App's dashboard ticks.
     const copyValue = useCallback(async (value: string) => {
         try {
             await navigator.clipboard.writeText(value);
-            if (copyToastTimeoutRef.current !== null) {
-                window.clearTimeout(copyToastTimeoutRef.current);
-            }
-
-            setCopyToast(`copied "${value}" to clipboard`);
-            copyToastTimeoutRef.current = window.setTimeout(() => {
-                setCopyToast('');
-                copyToastTimeoutRef.current = null;
-            }, 1_400);
+            showToast('copied', 1_400);
         } catch (error) {
-            if (copyToastTimeoutRef.current !== null) {
-                window.clearTimeout(copyToastTimeoutRef.current);
-            }
-            setCopyToast(error instanceof Error ? error.message : String(error));
-            copyToastTimeoutRef.current = window.setTimeout(() => {
-                setCopyToast('');
-                copyToastTimeoutRef.current = null;
-            }, 1_400);
+            showToast(error instanceof Error ? error.message : String(error), 1_400);
         }
-    }, []);
+    }, [showToast]);
 
     const openAccountPage = useCallback((value: string): boolean => {
         const normalized = normalizeAccountInput(value);
@@ -787,7 +801,7 @@ export default function App() {
 
     const submitAccountLookup = () => {
         if (openAccountPage(accountInput)) return;
-        setSearchMessage('expected a 32-byte address');
+        setSearchMessage('enter a 32-byte account address');
     };
 
     const clearAccountLookup = () => {
@@ -816,13 +830,6 @@ export default function App() {
         setAccountActivityMode(mode);
         setAccountCursorStack([null]);
         setAccountNextCursor(null);
-    };
-
-    const clearSubmittedTransactionHistory = () => {
-        setHistory([]);
-        if (historyKey !== null) {
-            clearHistory(historyKey);
-        }
     };
 
     /**
@@ -874,7 +881,7 @@ export default function App() {
                 value: sentValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
-                finalizedInMs: null,
+                resolvedInMs: null,
                 status: 'pending',
                 detail: 'submitted to mempool',
                 finalizedHeight: null,
@@ -957,6 +964,7 @@ export default function App() {
             const channelHex = toHex(channel);
             request.persist({
                 channelHex,
+                payerHex: senderAccountKey,
                 openNonce: nonce.toString(),
                 openTxDigestHex: encoded.digestHex,
                 signedOpenTxHex: toHex(encoded.bytes),
@@ -996,17 +1004,21 @@ export default function App() {
 
     const submitMint = () =>
         submitSigned('forming mint', async (nonce, activeWallet, senderAccountKey) => {
-            const parsedAmount = parseU64(value, 'amount');
             const encoded = await encodeSignedMintTransaction(
                 {
                     senderPublicKey: activeWallet.publicKey,
-                    amount: parsedAmount,
+                    amount: TEST_MINT_AMOUNT,
                     nonce,
                 },
                 activeWallet.sign,
             );
             // A mint credits the wallet itself; record it as self-addressed.
-            return { encoded, kind: 'mint' as const, to: senderAccountKey, value: parsedAmount };
+            return {
+                encoded,
+                kind: 'mint' as const,
+                to: senderAccountKey,
+                value: TEST_MINT_AMOUNT,
+            };
         });
 
     return (
@@ -1014,30 +1026,47 @@ export default function App() {
             <div className="app__container">
                 <header className="app__header">
                     <h1 className="app__title">
-                        <span className="accent">constantinople</span> /{' '}
+                        <span className="accent">constantinople</span>
+                    </h1>
+                    <div className="app__header-actions">
+                        <StatusBadge status={status} spinner={spinner} />
+                        <span className="app__header-separator" aria-hidden="true">
+                            ⬝
+                        </span>
                         <button
-                            className="app__title-link"
-                            onClick={clearAccountLookup}
+                            aria-current={!isStreamOpen || lookupAccount ? 'page' : undefined}
+                            className={
+                                !isStreamOpen || lookupAccount
+                                    ? 'wallet-trigger app__nav-link app__nav-link--active'
+                                    : 'wallet-trigger app__nav-link'
+                            }
+                            onClick={() => {
+                                clearAccountLookup();
+                                setIsStreamOpen(false);
+                            }}
                             type="button"
                         >
                             explorer
                         </button>
-                    </h1>
-                    <div className="app__header-actions">
-                        <StatusBadge status={status} spinner={spinner} />
                         {operatorUrl && (
                             <>
                                 <span className="app__header-separator" aria-hidden="true">
                                     ⬝
                                 </span>
                                 <button
-                                    className="wallet-trigger"
+                                    aria-current={isStreamOpen && !lookupAccount ? 'page' : undefined}
+                                    className={
+                                        isStreamOpen && !lookupAccount
+                                            ? 'wallet-trigger app__nav-link app__nav-link--active'
+                                            : 'wallet-trigger app__nav-link'
+                                    }
                                     onClick={() => {
                                         clearAccountLookup();
-                                        setIsStreamOpen((open) => !open);
+                                        setIsStreamOpen(true);
                                     }}
+                                    type="button"
                                 >
-                                    {isStreamOpen ? 'explorer' : 'paid stream'}
+                                    stream
                                 </button>
                             </>
                         )}
@@ -1051,7 +1080,7 @@ export default function App() {
                             ⬝
                         </span>
                         <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
-                            wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
+                            {walletAccountKey ? 'wallet' : 'sign in'}
                         </button>
                     </div>
                 </header>
@@ -1061,13 +1090,16 @@ export default function App() {
                             <PaidStreamPage
                                 operatorUrl={operatorUrl}
                                 mempoolUrl={mempoolUrl}
+                                sqlUrl={indexerUrl}
+                                chainHeight={blocks[0]?.height ?? null}
                                 walletReady={wallet !== null && walletAccountKey !== null}
+                                walletAccountHex={walletAccountKey}
                                 walletBalance={account?.balance ?? null}
                                 onOpenChannel={openStreamChannel}
                                 onReclaimChannel={reclaimStreamChannel}
                                 onOpenWallet={openWalletDialog}
                                 onOpenAddress={openAccountPage}
-                                onCopy={copyValue}
+                                onNotify={showToast}
                             />
                         ) : lookupAccount ? (
                             <AccountPage
@@ -1115,13 +1147,12 @@ export default function App() {
                             nonce={nonce}
                             submitMessage={submitMessage}
                             isSubmitting={isSubmitting}
-                            canClearSubmittedTransactions={history.length > 0}
+                            accountLoadFailed={accountLoadFailed}
                             spinner={spinner}
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
                             onRefreshAccount={refreshAccount}
-                            onClearSubmittedTransactions={clearSubmittedTransactionHistory}
                             onCopy={copyValue}
                             onToKeyChange={setToKey}
                             onValueChange={setValue}
@@ -1150,7 +1181,7 @@ export default function App() {
                         />
                     </SearchModal>
                 )}
-                {copyToast && <TerminalToast message={copyToast} />}
+                {toast && <TerminalToast message={toast} />}
             </div>
         </div>
     );
@@ -1197,29 +1228,41 @@ function AccountPage({
                 <CopyableValue value={account} onCopy={onCopy} />
             </div>
             <div className="account-proof-grid">
-                <ProofDatum label="cert" value={target ? `h${target.height.toString()} / v${target.view.toString()}` : proof.detail} />
-                <ProofDatum label="block" value={target ? shortHex(toHex(target.blockDigest)) : '-'} />
                 <ProofDatum
-                    label="state"
+                    label="finalized"
                     value={
-                        proof.status === 'verified'
-                            ? `${proof.balance.toString()} / nonce ${proof.nonce.toString()}`
+                        target
+                            ? `block ${target.height.toString()} · view ${target.view.toString()}`
                             : proof.detail
                     }
                 />
                 <ProofDatum
-                    label="state proof"
+                    label="block hash"
+                    value={target ? shortHex(toHex(target.blockDigest)) : '—'}
+                />
+                <ProofDatum
+                    label="balance / nonce"
                     value={
                         proof.status === 'verified'
-                            ? `loc ${proof.location.toString()} / ${proof.proofSizeBytes}b`
+                            ? `${proof.balance.toString()} / ${proof.nonce.toString()}`
                             : proof.status === 'missing'
-                                ? proof.detail
-                                : proof.status
+                              ? proof.detail
+                              : '—'
+                    }
+                />
+                <ProofDatum
+                    label="proof"
+                    value={
+                        proof.status === 'verified'
+                            ? `location ${proof.location.toString()} · ${proof.proofSizeBytes} B`
+                            : proof.status === 'missing'
+                                ? 'not available'
+                                : '—'
                     }
                 />
             </div>
             <div className="account-page__subhead">
-                <span>{activityMode} tx page {pageNumber}</span>
+                <span>transactions · page {pageNumber}</span>
                 <div className="account-page__modes" role="tablist" aria-label="account transaction filter">
                     {(['all', 'sent', 'received'] as const).map((mode) => (
                         <button
@@ -1244,7 +1287,7 @@ function AccountPage({
                     <div className="account-tx-row account-tx-row--empty">{activityError}</div>
                 )}
                 {!activityError && transactions.length === 0 && (
-                    <div className="account-tx-row account-tx-row--empty">no transactions indexed</div>
+                    <div className="account-tx-row account-tx-row--empty">no transactions</div>
                 )}
                 {transactions.map(({ row, proof: txProof }) => {
                     // Direction drives the row color; a channel open is a
@@ -1263,7 +1306,9 @@ function AccountPage({
                             <span className={`account-tx-row__kind account-tx-row__kind--${row.kind}`}>
                                 {row.kind.replace('-', ' ')}
                             </span>
-                            <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
+                            <span className="account-tx-row__height">
+                                block {row.height.toString()} · index {row.blockIndex}
+                            </span>
                             <CopyableValue value={row.digest} onCopy={onCopy} />
                             <span>from</span>
                             <AccountPageAddressValue
@@ -1283,7 +1328,11 @@ function AccountPage({
                         <div className="account-tx-row__meta">
                             <span className="account-tx-row__value">{txValueText(row.kind, row.value)}</span>
                             <span>nonce {row.nonce.toString()}</span>
-                            <span>{txProof.status === 'verified' ? `loc ${txProof.location}` : 'loc -'}</span>
+                            <span>
+                                {txProof.status === 'verified'
+                                    ? `location ${txProof.location}`
+                                    : 'location -'}
+                            </span>
                             <span>proof</span>
                             <ProofMark proof={txProof} />
                         </div>
@@ -1310,7 +1359,7 @@ function txValueText(kind: TransactionKind, value: bigint): string {
         case 'mint':
             return `mint ${value.toString()}`;
         default:
-            return `value ${value.toString()}`;
+            return `transfer ${value.toString()}`;
     }
 }
 
@@ -1400,7 +1449,7 @@ function AccountSearchPanel({
                         spellCheck={false}
                     />
                 </label>
-                <button type="submit">open</button>
+                <button type="submit">view account</button>
             </form>
             {message && <div className="account-search__message">{message}</div>}
         </section>
@@ -1455,13 +1504,12 @@ function WalletPanel({
     nonce,
     submitMessage,
     isSubmitting,
-    canClearSubmittedTransactions,
+    accountLoadFailed,
     spinner,
     onCreateWallet,
     onSignIn,
     onSignOut,
     onRefreshAccount,
-    onClearSubmittedTransactions,
     onCopy,
     onToKeyChange,
     onValueChange,
@@ -1478,13 +1526,12 @@ function WalletPanel({
     nonce: string;
     submitMessage: string;
     isSubmitting: boolean;
-    canClearSubmittedTransactions: boolean;
+    accountLoadFailed: boolean;
     spinner: string;
     onCreateWallet: () => void;
     onSignIn: () => void;
     onSignOut: () => void;
     onRefreshAccount: () => void;
-    onClearSubmittedTransactions: () => void;
     onCopy: (value: string) => void;
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
@@ -1494,33 +1541,83 @@ function WalletPanel({
     const balance = account?.balance ?? 0;
     const isWalletLoading = walletMessage === 'opening passkey prompt';
     const isAccountLoading = accountMessage === 'loading account metadata';
-    const walletAccountDisplay = walletAccountKey?.toLowerCase() ?? 'not authenticated';
+    const showWalletMessage =
+        walletMessage !== 'sign in or create a wallet' && walletMessage !== 'signed out';
+    const walletKeyFailed = walletAccountKey === null && walletMessage !== 'signed in';
+
+    if (!wallet) {
+        return (
+            <section className="wallet wallet--onboarding">
+                <div className="wallet__onboarding">
+                    <h3>sign in to transact</h3>
+                    <p>sign in with a passkey, or create one. you’ll approve each transaction.</p>
+                    {showWalletMessage && (
+                        <div className="wallet__status" role="status">
+                            <SpinnerText active={isWalletLoading} spinner={spinner}>
+                                {walletMessage}
+                            </SpinnerText>
+                        </div>
+                    )}
+                    <div className="wallet__actions">
+                        <button
+                            className="action-button action-button--primary"
+                            onClick={onSignIn}
+                        >
+                            sign in
+                        </button>
+                        <button
+                            className="action-button action-button--secondary"
+                            onClick={onCreateWallet}
+                        >
+                            create passkey
+                        </button>
+                    </div>
+                </div>
+            </section>
+        );
+    }
 
     return (
         <section className="wallet">
             <div className="wallet__header">
                 <div>
-                    <div className="wallet__label">status</div>
-                    <div className="wallet__status">
-                        <SpinnerText active={isWalletLoading} spinner={spinner}>
-                            {walletMessage}
-                        </SpinnerText>
+                    <div
+                        className={
+                            walletAccountKey
+                                ? 'wallet__label wallet__label--connected'
+                                : 'wallet__label'
+                        }
+                    >
+                        {walletAccountKey
+                            ? 'connected wallet'
+                            : walletKeyFailed
+                              ? 'wallet unavailable'
+                              : 'connecting wallet'}
                     </div>
+                    {walletKeyFailed && (
+                        <div className="wallet__status" role="alert">
+                            {walletMessage}
+                        </div>
+                    )}
+                    {!walletKeyFailed && (isAccountLoading || accountLoadFailed) && (
+                        <div className="wallet__account-status">
+                            <div className="wallet__status" role="status">
+                                <SpinnerText active={isAccountLoading} spinner={spinner}>
+                                    {isAccountLoading ? 'updating…' : accountMessage}
+                                </SpinnerText>
+                            </div>
+                            {accountLoadFailed && (
+                                <button className="wallet__retry" onClick={onRefreshAccount} type="button">
+                                    retry
+                                </button>
+                            )}
+                        </div>
+                    )}
                 </div>
                 <div className="wallet__actions">
-                    {!wallet && <button onClick={onSignIn}>sign in</button>}
-                    {!wallet && <button onClick={onCreateWallet}>new passkey</button>}
-                    {wallet && (
-                        <button onClick={onRefreshAccount}>
-                            <SpinnerText active={isAccountLoading} spinner={spinner}>
-                                refresh
-                            </SpinnerText>
-                        </button>
-                    )}
-                    {wallet && canClearSubmittedTransactions && (
-                        <button onClick={onClearSubmittedTransactions}>reset</button>
-                    )}
-                    {wallet && <button onClick={onSignOut}>sign out</button>}
+                    <button className="action-button action-button--danger" onClick={onSignOut}>
+                        sign out
+                    </button>
                 </div>
             </div>
             <div className="wallet__grid">
@@ -1529,13 +1626,24 @@ function WalletPanel({
                     <CopyableValue
                         disabled={!walletAccountKey}
                         plain
-                        value={walletAccountDisplay}
+                        value={walletAccountKey?.toLowerCase() ?? 'loading…'}
                         onCopy={onCopy}
                     />
                 </div>
                 <div className="wallet__cell">
                     <span>balance</span>
-                    <strong>{balance.toLocaleString()}</strong>
+                    <div className="wallet__balance">
+                        <strong>{balance.toLocaleString()}</strong>
+                        <button
+                            className="action-button action-button--secondary wallet__mint"
+                            disabled={!walletAccountKey || isSubmitting}
+                            onClick={onMint}
+                            title="mint 1,000 test funds to this wallet"
+                            type="button"
+                        >
+                            + mint 1,000
+                        </button>
+                    </div>
                 </div>
                 <div className="wallet__cell">
                     <span>nonce</span>
@@ -1552,38 +1660,33 @@ function WalletPanel({
                 <label>
                     <span>to</span>
                     <input
+                        disabled={!walletAccountKey || isSubmitting}
                         value={toKey}
                         onChange={(event) => onToKeyChange(event.target.value)}
-                        placeholder="Recipient address"
+                        placeholder="recipient address"
                         spellCheck={false}
-                        disabled={!wallet}
                     />
                 </label>
                 <label>
                     <span>amount</span>
                     <input
+                        disabled={!walletAccountKey || isSubmitting}
                         value={value}
                         onChange={(event) => onValueChange(event.target.value)}
                         inputMode="numeric"
-                        disabled={!wallet}
                     />
                 </label>
-                <button className="transfer__submit" disabled={!wallet} type="submit">
-                    submit
-                </button>
                 <button
-                    className="transfer__submit"
-                    disabled={!wallet}
-                    onClick={onMint}
-                    title="mint the amount to this wallet (accounts start empty)"
-                    type="button"
+                    className="action-button action-button--primary transfer__submit"
+                    disabled={!walletAccountKey || isSubmitting}
+                    type="submit"
                 >
-                    mint
+                    send
                 </button>
             </form>
-            {isSubmitting && submitMessage && (
-                <div className="wallet__status">
-                    <SpinnerText active spinner={spinner}>
+            {submitMessage && (
+                <div className="wallet__activity" role="status">
+                    <SpinnerText active={isSubmitting} spinner={spinner}>
                         {submitMessage}
                     </SpinnerText>
                 </div>
@@ -1735,17 +1838,25 @@ function TransactionRecord({
     verifyCertificates: boolean;
 }) {
     const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
+    const rejected = tx.status === 'partially_finalized' && tx.detail.startsWith('rejected');
+    const included = submittedTransactionWasIncluded(tx.status, tx.detail);
+    const outcome =
+        tx.finalizedHeight !== null
+            ? `${rejected ? 'rejected · ' : ''}block ${tx.finalizedHeight}`
+            : null;
+    const showDetail = tx.status === 'pending' || tx.status === 'error';
+    const showVerification = tx.status === 'pending' || included;
+    const dropped = tx.status === 'dropped';
+    const showResolution = dropped && tx.resolvedInMs !== null;
+    const showSecondary = showDetail || showVerification || dropped;
+
     return (
         <div className="tx-record">
             <div className="tx-record__primary">
                 <span className="tx-record__label">tx</span>
                 <CopyableValue value={tx.digest} onCopy={onCopy} />
                 <span className="tx-record__label">from</span>
-                <AddressValue
-                    value={tx.sender}
-                    onOpenAddress={onOpenAddress}
-                />
-                <span className="tx-record__arrow" aria-hidden="true">→</span>
+                <AddressValue value={tx.sender} onOpenAddress={onOpenAddress} />
                 <span className="tx-record__label">to</span>
                 <AddressValue
                     value={tx.to}
@@ -1753,32 +1864,55 @@ function TransactionRecord({
                 />
                 <span className="tx-record__nonce">{txValueText(tx.kind, BigInt(tx.value))}</span>
                 <span className="tx-record__nonce">nonce {tx.nonce}</span>
-                <span className="tx-record__time">{formatter.format(tx.submittedAt)}</span>
             </div>
-            <div className="tx-record__secondary">
-                <span className="tx-record__detail">{tx.detail}</span>
-                {verifyCertificates && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">cert</span>
-                        <CertificateCell
-                            certificate={tx.certificate}
-                            finalizedHeight={tx.finalizedHeight}
-                            verifyCertificates={verifyCertificates}
-                        />
-                    </>
-                )}
-                <span className="tx-sep" aria-hidden="true">·</span>
-                <span className="tx-label">proof</span>
-                <ProofCell ownsTx={ownsTx} proof={tx.proof} />
-                {tx.finalizedInMs !== null && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">e2e latency</span>
-                        <span>{tx.finalizedInMs}ms</span>
-                    </>
-                )}
+            <div className="tx-record__time">
+                <time dateTime={new Date(tx.submittedAt).toISOString()}>
+                    {formatter.format(tx.submittedAt)}
+                </time>
+                {outcome && <span>{outcome}</span>}
             </div>
+            {showSecondary && (
+                <div className="tx-record__secondary">
+                    {dropped && (
+                        <span>
+                            dropped <span className="tx-record__outcome-mark" aria-hidden="true">×</span>
+                        </span>
+                    )}
+                    {showDetail && <span className="tx-record__detail">{tx.detail}</span>}
+                    {showVerification && verifyCertificates && (
+                        <>
+                            {showDetail && <span className="tx-sep" aria-hidden="true">·</span>}
+                            <span className="tx-label">finalized</span>
+                            <CertificateCell
+                                certificate={tx.certificate}
+                                finalizedHeight={tx.finalizedHeight}
+                                verifyCertificates={verifyCertificates}
+                            />
+                        </>
+                    )}
+                    {showVerification && (showDetail || verifyCertificates) && (
+                        <span className="tx-sep" aria-hidden="true">·</span>
+                    )}
+                    {showVerification && (
+                        <>
+                            <span className="tx-label">proof</span>
+                            <ProofCell ownsTx={ownsTx} proof={tx.proof} />
+                        </>
+                    )}
+                    {included && tx.resolvedInMs !== null && (
+                        <>
+                            <span className="tx-sep" aria-hidden="true">·</span>
+                            <span>took {tx.resolvedInMs}ms</span>
+                        </>
+                    )}
+                    {showResolution && (
+                        <>
+                            <span className="tx-sep" aria-hidden="true">·</span>
+                            <span>took {tx.resolvedInMs}ms</span>
+                        </>
+                    )}
+                </div>
+            )}
         </div>
     );
 }
@@ -1908,17 +2042,27 @@ function updateTransactionStatus(
 ): SubmittedTransaction[] {
     return current.map((tx) => {
         if (tx.digest !== digest) return tx;
-        const finalizedHeight = statusHasHeight(status) ? status.height : tx.finalizedHeight;
+        const finalizedHeight = statusHasHeight(status) ? status.height : null;
         return {
             ...tx,
             status: status.status,
             detail,
-            finalizedInMs: Date.now() - tx.submittedAt,
+            resolvedInMs: Date.now() - tx.submittedAt,
             finalizedHeight,
             certificate: nextBlockCertificateState(status),
             proof: nextProofState(status, digest),
         };
     });
+}
+
+function submittedTransactionWasIncluded(
+    status: SubmittedTransaction['status'],
+    detail: string,
+): boolean {
+    return (
+        status === 'finalized' ||
+        (status === 'partially_finalized' && !detail.startsWith('rejected'))
+    );
 }
 
 function updateTransactionProof(
@@ -2107,10 +2251,6 @@ function writeHistory(key: string, history: SubmittedTransaction[]) {
     window.localStorage.setItem(key, JSON.stringify(history));
 }
 
-function clearHistory(key: string) {
-    window.localStorage.removeItem(key);
-}
-
 function useBrailleSpinner(active: boolean): string {
     const [index, setIndex] = useState(0);
 
@@ -2146,10 +2286,20 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         return null;
     }
 
-    const finalizedInMs =
-        typeof transaction.finalizedInMs === 'number' ? transaction.finalizedInMs : null;
+    const status = normalizeSubmittedTransactionStatus(transaction.status);
+    if (status === null) return null;
+    const hasOutcome =
+        status === 'finalized' || status === 'partially_finalized' || status === 'dropped';
+    const storedResolution =
+        typeof transaction.resolvedInMs === 'number'
+            ? transaction.resolvedInMs
+            : transaction.finalizedInMs;
+    const resolvedInMs =
+        hasOutcome && typeof storedResolution === 'number' ? storedResolution : null;
     const finalizedHeight =
-        typeof transaction.finalizedHeight === 'number' ? transaction.finalizedHeight : null;
+        status !== 'dropped' && typeof transaction.finalizedHeight === 'number'
+            ? transaction.finalizedHeight
+            : null;
 
     return {
         digest: transaction.digest,
@@ -2159,13 +2309,28 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         value: transaction.value,
         nonce: transaction.nonce,
         submittedAt: transaction.submittedAt,
-        finalizedInMs,
-        status: transaction.status as SubmittedTransaction['status'],
+        resolvedInMs,
+        status,
         detail: transaction.detail,
         finalizedHeight,
         certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
         proof: normalizeTransactionProof(transaction.proof),
     };
+}
+
+function normalizeSubmittedTransactionStatus(
+    value: unknown,
+): SubmittedTransaction['status'] | null {
+    switch (value) {
+        case 'pending':
+        case 'finalized':
+        case 'partially_finalized':
+        case 'dropped':
+        case 'error':
+            return value;
+        default:
+            return null;
+    }
 }
 
 // History stored before the kind field existed only held transfers.
@@ -2351,7 +2516,7 @@ const ExplorerStats = memo(function ExplorerStats({
 // Hover text for the operator-reported stats — the one pair of numbers on
 // the page that is not proof-verified.
 const OPERATOR_REPORTED_NOTE =
-    'Served since this page loaded, as reported by the channel operator — off-chain payments never touch the chain, which is the point.';
+    'off-chain vouchers reported by the operator since this page loaded.';
 
 function ExplorerStat({ label, value, title }: { label: string; value: string; title?: string }) {
     return (
