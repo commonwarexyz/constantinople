@@ -35,6 +35,8 @@ import { readStoredJson, shortHex } from './util';
 /// Retry delay for a transiently failed voucher post — well inside the
 /// operator's grace window, so a blip cannot kill a paying stream.
 const VOUCHER_RETRY_MS = 1_000;
+/// Most recent voucher payments kept in the on-page log.
+const PAYMENTS_LOG_LIMIT = 8;
 /// The page tracks one outstanding channel: the record lands here after the
 /// wallet signs the open (before submission) and stays until a close or a
 /// timeout reclaim resolves the escrow — the only two ways the funds move,
@@ -225,6 +227,43 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         if (next) maybePay();
     };
 
+    /// Signs and posts one voucher for `target`, recording it in the payment
+    /// log on success. Owns the outstanding-post bookkeeping: the promise
+    /// stored in `voucherPostRef` never rejects (overlap checks and
+    /// settlement's wait await it bare) and is cleared on completion unless
+    /// the session was reset (generation guard) or a newer post replaced it
+    /// (identity guard). The returned promise DOES reject, so each caller
+    /// applies its own error policy.
+    const postSignedVoucher = (
+        voucherKey: VoucherKey,
+        channelKey: Uint8Array,
+        target: bigint,
+    ): Promise<void> => {
+        const generation = sessionGenerationRef.current;
+        const pending = (async () => {
+            const signature = await voucherKey.signVoucher(channelKey, target);
+            await postVoucher(operatorUrl, { channel: channelKey, cumulative: target, signature });
+            if (generation !== sessionGenerationRef.current) return;
+            lastSignedRef.current = target;
+            setPayments((current) => [target, ...current].slice(0, PAYMENTS_LOG_LIMIT));
+        })();
+        let tracked!: Promise<void>;
+        tracked = pending
+            .catch(() => undefined)
+            .finally(() => {
+                // A post stalled across a reset must not clear the NEW
+                // session's post out from under it.
+                if (
+                    generation === sessionGenerationRef.current &&
+                    voucherPostRef.current === tracked
+                ) {
+                    voucherPostRef.current = null;
+                }
+            });
+        voucherPostRef.current = tracked;
+        return pending;
+    };
+
     /// Signs and posts a voucher whenever the meter (read from `meterRef`,
     /// which every stream event updates first) says one is due. Called from
     /// every stream event; a ref guards against overlapping posts.
@@ -242,41 +281,22 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         });
         if (target === null) return;
         const generation = sessionGenerationRef.current;
-        let pending!: Promise<void>;
-        pending = (async () => {
-            try {
-                const signature = await voucherKey.signVoucher(channelKey, target);
-                await postVoucher(operatorUrl, { channel: channelKey, cumulative: target, signature });
-                if (generation !== sessionGenerationRef.current) return;
-                lastSignedRef.current = target;
-                setPayments((current) => [target, ...current].slice(0, 8));
-            } catch (error) {
-                if (generation !== sessionGenerationRef.current) return;
-                if (error instanceof OperatorRequestError && !error.transient) {
-                    deadTargetRef.current = target;
-                    setNote(`voucher rejected: ${error.message}`);
-                    return;
-                }
-                // The operator announces a pause only once per pause, so a
-                // transiently failed post must retry on its own — no further
-                // SSE event may arrive to re-trigger payment before the
-                // grace window expires.
-                setNote(`voucher failed: ${String(error)} — retrying`);
-                window.setTimeout(() => {
-                    if (closeStreamRef.current !== null) maybePay();
-                }, VOUCHER_RETRY_MS);
-            } finally {
-                // A post stalled across a reset must not clear the NEW
-                // session's post out from under it.
-                if (
-                    generation === sessionGenerationRef.current &&
-                    voucherPostRef.current === pending
-                ) {
-                    voucherPostRef.current = null;
-                }
+        postSignedVoucher(voucherKey, channelKey, target).catch((error) => {
+            if (generation !== sessionGenerationRef.current) return;
+            if (error instanceof OperatorRequestError && !error.transient) {
+                deadTargetRef.current = target;
+                setNote(`voucher rejected: ${error.message}`);
+                return;
             }
-        })();
-        voucherPostRef.current = pending;
+            // The operator announces a pause only once per pause, so a
+            // transiently failed post must retry on its own — no further
+            // SSE event may arrive to re-trigger payment before the
+            // grace window expires.
+            setNote(`voucher failed: ${String(error)} — retrying`);
+            window.setTimeout(() => {
+                if (closeStreamRef.current !== null) maybePay();
+            }, VOUCHER_RETRY_MS);
+        });
     };
 
     /// Stops batching at settlement time: after the stream is closed and its
@@ -287,9 +307,8 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         await voucherPostRef.current;
         if (!payingRef.current || !channel || !channelKey) return;
 
-        const served = meterRef.current.served;
         const target = voucherFinalTopUp({
-            served,
+            served: meterRef.current.served,
             paid: meterRef.current.paid,
             lastSigned: lastSignedRef.current,
             deposit: BigInt(channel.deposit),
@@ -301,29 +320,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
 
         const voucherKey = voucherKeyRef.current;
         if (!voucherKey) throw new Error('voucher key unavailable');
-        const generation = sessionGenerationRef.current;
-        const pending = (async () => {
-            const signature = await voucherKey.signVoucher(channelKey, target);
-            await postVoucher(operatorUrl, {
-                channel: channelKey,
-                cumulative: target,
-                signature,
-            });
-            if (generation !== sessionGenerationRef.current) return;
-            lastSignedRef.current = target;
-            setPayments((current) => [target, ...current].slice(0, 8));
-        })();
-        voucherPostRef.current = pending;
-        try {
-            await pending;
-        } finally {
-            if (
-                generation === sessionGenerationRef.current &&
-                voucherPostRef.current === pending
-            ) {
-                voucherPostRef.current = null;
-            }
-        }
+        await postSignedVoucher(voucherKey, channelKey, target);
     };
 
     /// Open the channel from the wallet (one passkey ceremony) and register

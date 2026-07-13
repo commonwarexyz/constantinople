@@ -287,7 +287,7 @@ fn remote_spammer_config(
         accounts_jitter: args.spammer_accounts_jitter,
         channel_fraction: args.spammer_channel_fraction,
         channel_operator_url: (args.spammer_channel_fraction > 0.0)
-            .then(|| format!("http://operator:{}", remote.http_port)),
+            .then(|| format!("http://{OPERATOR_HOST}:{}", remote.http_port)),
         channel_vouchers: args.spammer_channel_vouchers,
     }
 }
@@ -535,7 +535,7 @@ mod tests {
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, OPERATOR_BINARY_FILE,
-        OPERATOR_CONFIG_FILE, QMDB_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS,
+        OPERATOR_CONFIG_FILE, OPERATOR_HOST, QMDB_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS,
         StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes,
         default_max_propose_bytes, default_public_key_cache_size, generate_local_cluster_material,
         total_secondaries, validate_generate_args,
@@ -755,7 +755,7 @@ mod tests {
 
         assert_eq!(
             config.channel_operator_url,
-            Some("http://operator:8080".to_string())
+            Some(format!("http://{OPERATOR_HOST}:8080"))
         );
         let operator = remote_operator_config(&args, &remote, &material)
             .expect("channel spam should generate operator config");

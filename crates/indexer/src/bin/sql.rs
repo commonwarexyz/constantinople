@@ -7,7 +7,7 @@
 //! `--hosts ... --config ...` convention for remote bundles.
 
 use axum::{Router, routing::get};
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 use constantinople_indexer::{facade, sql_schema::build_meta_schema};
 use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
@@ -22,11 +22,6 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
     version,
     about = "SQL service over Constantinople metadata tables"
 )]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(true)
-        .args(["store_url", "hosts"])
-))]
 struct Cli {
     #[command(flatten)]
     facade: facade::Args,
@@ -54,14 +49,8 @@ fn build_app(store_url: &str) -> Result<Router, facade::Error> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    facade::init_tracing();
     let cli = Cli::parse();
-    let settings = facade::load_settings(cli.facade, cli.port);
-    let result = match build_app(&settings.store_url) {
-        Ok(app) => facade::serve(app, &settings, "metadata-indexer").await,
-        Err(err) => Err(err),
-    };
-    facade::exit(result, "metadata-indexer")
+    facade::run(cli.facade, cli.port, "metadata-indexer", build_app).await
 }
 
 #[cfg(test)]

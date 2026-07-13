@@ -679,16 +679,9 @@ where
         Ok(cumulative)
     }
 
-    /// Meters `cost` stream tokens against a channel's credit, returning the
-    /// meter after the decision.
-    ///
-    /// Applies the same gates as voucher serving — the channel must be
-    /// registered, its settlement not started, and its expiry far enough
-    /// away — then the credit policy documented on the channel-level
-    /// `RegisteredChannel::consume_bounded`. Terminal channel states are errors;
-    /// running out of credit is a [`ConsumeOutcome`], not an error, because
-    /// the caller's next move differs (wait for a voucher vs. give up).
-    pub async fn consume(
+    /// Test convenience for metering without a content bound.
+    #[cfg(test)]
+    pub(crate) async fn consume(
         &self,
         channel: &AccountKey,
         cost: u64,
@@ -698,8 +691,16 @@ where
             .await
     }
 
-    /// Meters `cost` stream tokens while atomically enforcing a maximum
-    /// served total supplied by the content provider.
+    /// Meters `cost` stream tokens against a channel's credit while atomically
+    /// enforcing a maximum served total supplied by the content provider,
+    /// returning the meter after the decision.
+    ///
+    /// Applies the same gates as voucher serving — the channel must be
+    /// registered, its settlement not started, and its expiry far enough
+    /// away — then the credit policy documented on the channel-level
+    /// `RegisteredChannel::consume_bounded`. Terminal channel states are errors;
+    /// running out of credit is a [`ConsumeOutcome`], not an error, because
+    /// the caller's next move differs (wait for a voucher vs. give up).
     ///
     /// The content bound is checked under the same state lock that advances
     /// the meter, so concurrent streams cannot reserve the same final chunk.

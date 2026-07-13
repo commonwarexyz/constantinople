@@ -5,7 +5,7 @@
 //! transaction-hash history under `/transactions`.
 
 use axum::{Router, routing::get};
-use clap::{ArgGroup, Parser};
+use clap::Parser;
 use commonware_codec::FixedSize;
 use commonware_cryptography::sha256::Sha256;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
@@ -41,11 +41,6 @@ type TransactionClient = KeylessClient<
     version,
     about = "QMDB service over Constantinople state and transaction indexes"
 )]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(true)
-        .args(["store_url", "hosts"])
-))]
 struct Cli {
     #[command(flatten)]
     facade: facade::Args,
@@ -77,14 +72,8 @@ fn build_app(store_url: &str) -> Result<Router, facade::Error> {
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    facade::init_tracing();
     let cli = Cli::parse();
-    let settings = facade::load_settings(cli.facade, cli.port);
-    let result = match build_app(&settings.store_url) {
-        Ok(app) => facade::serve(app, &settings, "qmdb-indexer").await,
-        Err(err) => Err(err),
-    };
-    facade::exit(result, "qmdb-indexer")
+    facade::run(cli.facade, cli.port, "qmdb-indexer", build_app).await
 }
 
 #[cfg(test)]

@@ -323,7 +323,6 @@ fn apply_channel_op(
             deposit,
             expiry,
             channel,
-            ..
         } => {
             let mut payer = account_or_default(pending, loaded, &op.sender);
             if payer.balance < *deposit || !payer.nonce.consume(op.nonce) {
@@ -354,7 +353,6 @@ fn apply_channel_op(
             cumulative,
             voucher,
             channel,
-            ..
         } => {
             // The channel must exist (it was opened by a prior transaction).
             let balance = channel_escrow(pending, loaded, channel)?;

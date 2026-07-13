@@ -1847,6 +1847,7 @@ dependencies = [
  "commonware-codec",
  "commonware-cryptography",
  "commonware-deployer",
+ "commonware-formatting",
  "commonware-runtime",
  "commonware-storage",
  "constantinople-application",

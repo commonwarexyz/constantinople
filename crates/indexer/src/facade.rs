@@ -18,7 +18,11 @@ pub type Error = Box<dyn std::error::Error + Send + Sync>;
 #[derive(clap::Args, Debug)]
 pub struct Args {
     /// URL of the exoware Store the index writers publish to.
-    #[arg(long, conflicts_with_all = ["hosts", "config"])]
+    #[arg(
+        long,
+        conflicts_with_all = ["hosts", "config"],
+        required_unless_present = "hosts"
+    )]
     pub store_url: Option<String>,
     /// Bind address (default `0.0.0.0`).
     #[arg(long, default_value = "0.0.0.0")]
@@ -32,13 +36,13 @@ pub struct Args {
 }
 
 /// Resolved settings used to serve an indexer facade.
-pub struct Settings {
+struct Settings {
     /// Resolved exoware Store URL.
-    pub store_url: String,
+    store_url: String,
     /// Interface on which the facade listens.
-    pub host: IpAddr,
+    host: IpAddr,
     /// Port on which the facade listens.
-    pub port: u16,
+    port: u16,
 }
 
 #[derive(Debug, Deserialize)]
@@ -47,8 +51,24 @@ struct DeployerConfig {
     chain_indexer_url: String,
 }
 
+/// Run a facade binary: resolve settings, build the app, serve, and exit.
+pub async fn run(
+    args: Args,
+    local_port: u16,
+    service: &str,
+    build_app: impl FnOnce(&str) -> Result<Router, Error>,
+) -> std::process::ExitCode {
+    init_tracing();
+    let settings = load_settings(args, local_port);
+    let result = match build_app(&settings.store_url) {
+        Ok(app) => serve(app, &settings, service).await,
+        Err(err) => Err(err),
+    };
+    exit(result, service)
+}
+
 /// Resolve local or deployer command-line arguments into server settings.
-pub fn load_settings(args: Args, local_port: u16) -> Settings {
+fn load_settings(args: Args, local_port: u16) -> Settings {
     if let Some(config_path) = args.config {
         let raw = fs::read_to_string(config_path).expect("failed to read indexer facade config");
         let config: DeployerConfig =
@@ -82,7 +102,7 @@ pub fn load_settings(args: Args, local_port: u16) -> Settings {
 }
 
 /// Serve a facade router using the resolved settings.
-pub async fn serve(app: Router, settings: &Settings, service: &str) -> Result<(), Error> {
+async fn serve(app: Router, settings: &Settings, service: &str) -> Result<(), Error> {
     let addr = SocketAddr::from((settings.host, settings.port));
     info!(%addr, store_url = settings.store_url, service, "indexer facade listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
@@ -91,7 +111,7 @@ pub async fn serve(app: Router, settings: &Settings, service: &str) -> Result<()
 }
 
 /// Initialize the standard facade tracing subscriber.
-pub fn init_tracing() {
+fn init_tracing() {
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
@@ -100,7 +120,7 @@ pub fn init_tracing() {
 }
 
 /// Convert a facade result into the process exit status used by the binaries.
-pub fn exit(result: Result<(), Error>, service: &str) -> std::process::ExitCode {
+fn exit(result: Result<(), Error>, service: &str) -> std::process::ExitCode {
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(err) => {
@@ -118,16 +138,11 @@ pub async fn health() -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::{Args, load_settings};
-    use clap::{ArgGroup, Parser};
+    use clap::Parser;
     use std::fs;
     use tempfile::TempDir;
 
     #[derive(Debug, Parser)]
-    #[command(group(
-        ArgGroup::new("mode")
-            .required(true)
-            .args(["store_url", "hosts"])
-    ))]
     struct TestCli {
         #[command(flatten)]
         facade: Args,

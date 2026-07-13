@@ -160,7 +160,7 @@ pub struct VoucherRequest {
     pub channel: String,
     /// Cumulative amount the voucher signs over.
     pub cumulative: u64,
-    /// Hex-encoded payer signature over `(channel, cumulative)`.
+    /// Hex-encoded voucher-key signature over `(channel, cumulative)`.
     pub signature: String,
 }
 

@@ -92,7 +92,7 @@ signing thread count in generated local commands and remote `spammer.yaml`.
 Add `--spammer-channel-fraction F` (default `0`, channels off) to make a
 fraction of spammer iterations exercise **payment channels** instead of
 transfers: open a channel on-chain, stream `--spammer-channel-vouchers V`
-(default `8`) vouchers off-chain (signed by the channel's voucher key — the
+(default `320`) vouchers off-chain (signed by the channel's voucher key — the
 spammer self-delegates its ring keys — and verified with the chain's own
 predicate, no transaction per payment), then settle with a single on-chain
 close. The spammer log's `channel_txs` (on-chain opens+closes) and `vouchers`

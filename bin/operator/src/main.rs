@@ -291,17 +291,7 @@ fn resolve_named_http_url(url: &str, hosts: Option<&BTreeMap<String, IpAddr>>) -
 fn generate_capability() -> String {
     let mut secret = [0u8; 32];
     OsRng.fill_bytes(&mut secret);
-    hex_lower(&secret)
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut encoded = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        encoded.push(HEX[(byte >> 4) as usize] as char);
-        encoded.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    encoded
+    commonware_formatting::hex(&secret)
 }
 
 /// Compares fixed-size bearer secrets without leaking the matching prefix.
