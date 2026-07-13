@@ -52,7 +52,7 @@ use properties::{
     BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
     RestartPreservesProcessedHeight, RestartRecoveryComplete, StateSyncReadyAtHeight,
 };
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 use tracing::{info, warn};
 
 const NUM_VALIDATORS: u32 = 4;
@@ -88,7 +88,10 @@ struct TestEngineDefinition {
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
+    genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
     restart_barrier: Option<RestartBarrier>,
+    prunable_items_per_section: NonZeroU64,
+    retained_marshal_blocks: usize,
 }
 
 impl TestEngineDefinition {
@@ -102,7 +105,10 @@ impl TestEngineDefinition {
             enable_state_sync: false,
             use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
+            genesis_commitments: Arc::new(Mutex::new(BTreeMap::new())),
             restart_barrier: None,
+            prunable_items_per_section: NZU64!(4_096),
+            retained_marshal_blocks: 16,
         }
     }
 
@@ -139,6 +145,13 @@ impl TestEngineDefinition {
 
     fn with_restart_barrier(mut self, barrier: RestartBarrier) -> Self {
         self.restart_barrier = Some(barrier);
+        self.prunable_items_per_section = NZU64!(1);
+        self
+    }
+
+    const fn with_aggressive_pruning(mut self) -> Self {
+        self.prunable_items_per_section = NZU64!(1);
+        self.retained_marshal_blocks = 0;
         self
     }
 }
@@ -185,6 +198,9 @@ impl EngineDefinition for TestEngineDefinition {
         let partition_prefix = format!("validator-{index}");
         let output = self.output.clone();
         let sync_heights = self.sync_heights.clone();
+        let genesis_commitments = self.genesis_commitments.clone();
+        let prunable_items_per_section = self.prunable_items_per_section;
+        let retained_marshal_blocks = self.retained_marshal_blocks;
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
         let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
@@ -316,23 +332,27 @@ impl EngineDefinition for TestEngineDefinition {
                     prune_config: Some(PruneConfig {
                         max_pending_acks: MAX_PENDING_ACKS,
                         maintenance_interval: NZUsize!(16),
-                        retained_marshal_blocks: 16,
+                        retained_marshal_blocks,
                         retained_qmdb_blocks: 0,
                     }),
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
-                    prunable_items_per_section: if restart_barrier.is_some() {
-                        NZU64!(1)
-                    } else {
-                        NZU64!(4_096)
-                    },
+                    prunable_items_per_section,
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
                 },
             )
             .await;
+
+            let genesis_commitment = engine.genesis_commitment();
+            if let Some(expected) = genesis_commitments
+                .lock()
+                .insert(public_key.clone(), genesis_commitment)
+            {
+                assert_eq!(genesis_commitment, expected, "genesis changed on restart");
+            }
 
             let selected_sync_floor = engine.startup_sync_floor();
             let marshal = engine.marshal_mailbox();
@@ -742,8 +762,8 @@ fn deterministic_across_seeds() {
 
 #[test_group("slow")]
 #[test_traced("DEBUG")]
-fn crash_and_restart_one_validator() {
-    run_crash_restart(TestEngineDefinition::new(NUM_VALIDATORS));
+fn restart_preserves_genesis_after_pruning() {
+    run_crash_restart(TestEngineDefinition::new(NUM_VALIDATORS).with_aggressive_pruning());
 }
 
 #[test_group("slow")]
