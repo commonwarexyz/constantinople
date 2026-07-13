@@ -55,7 +55,7 @@ export async function encodeSignedTransaction(
         throw new Error('value must be greater than zero');
     }
 
-    return signEncodedBody(await encodeTransactionBody(draft), sign);
+    return signEncodedBody(encodeTransactionBody(draft), sign);
 }
 
 /// The signing tail every transaction encoder shares: digest the body,
@@ -296,7 +296,7 @@ export function signedTransactionBodyLength(bytes: Uint8Array): number {
     }
 }
 
-async function encodeTransactionBody(draft: TransactionDraft): Promise<Uint8Array> {
+function encodeTransactionBody(draft: TransactionDraft): Uint8Array {
     assertByteLength(draft.senderPublicKey, PUBLIC_KEY_BYTES, 'sender public key');
     assertByteLength(draft.toAccountKey, ACCOUNT_KEY_BYTES, 'recipient account key');
 

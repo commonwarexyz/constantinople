@@ -1261,7 +1261,7 @@ function AccountPage({
                     <div className={`account-tx-row account-tx-row--${tone}`} key={`${row.height.toString()}-${row.blockIndex}`}>
                         <div className="account-tx-row__main">
                             <span className={`account-tx-row__kind account-tx-row__kind--${row.kind}`}>
-                                {txKindLabel(row.kind)}
+                                {row.kind.replace('-', ' ')}
                             </span>
                             <span className="account-tx-row__height">h{row.height.toString()}:{row.blockIndex}</span>
                             <CopyableValue value={row.digest} onCopy={onCopy} />
@@ -1293,11 +1293,6 @@ function AccountPage({
             </div>
         </section>
     );
-}
-
-// Kind ids read as labels once the hyphen becomes a space.
-function txKindLabel(kind: TransactionKind): string {
-    return kind.replace('-', ' ');
 }
 
 // The value column means different things per kind: a transfer's amount, the

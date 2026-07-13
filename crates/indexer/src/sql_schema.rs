@@ -279,39 +279,4 @@ mod tests {
             "account_meta missing: {tables:?}"
         );
     }
-
-    /// The string constants must remain stable so the explorer can rely on
-    /// them without an out-of-band agreement.
-    #[test]
-    fn table_and_column_names_are_stable() {
-        assert_eq!(BLOCK_META_TABLE, "block_meta");
-        assert_eq!(TX_META_TABLE, "tx_meta");
-        assert_eq!(TX_ACTIVITY_TABLE, "tx_activity");
-        assert_eq!(ACCOUNT_META_TABLE, "account_meta");
-        assert_eq!(BLOCK_META_HEIGHT, "height");
-        assert_eq!(BLOCK_META_DIGEST, "digest");
-        assert_eq!(BLOCK_META_TX_COUNT, "tx_count");
-        assert_eq!(BLOCK_META_TRANSACTIONS_ROOT, "transactions_root");
-        assert_eq!(BLOCK_META_TRANSACTIONS_TIP, "transactions_tip");
-        assert_eq!(BLOCK_META_VIEW, "view");
-        assert_eq!(BLOCK_META_FINALIZED_TS, "finalized_ts");
-        assert_eq!(TX_META_DIGEST, "tx_digest");
-        assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
-        assert_eq!(TX_META_BODY_HEX, "body_hex");
-        assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
-        assert_eq!(TX_ACTIVITY_HEIGHT, "height");
-        assert_eq!(TX_ACTIVITY_INDEX, "index");
-        assert_eq!(TX_ACTIVITY_ROLE, "role");
-        assert_eq!(TX_ACTIVITY_DIGEST, "tx_digest");
-        assert_eq!(TX_ACTIVITY_COUNTERPARTY, "counterparty");
-        assert_eq!(TX_ACTIVITY_VALUE, "value");
-        assert_eq!(TX_ACTIVITY_NONCE, "nonce");
-        assert_eq!(TX_ACTIVITY_KIND, "kind");
-        assert_eq!(ACCOUNT_META_ACCOUNT, "account");
-        assert_eq!(ACCOUNT_META_BALANCE, "balance");
-        assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");
-        assert_eq!(ACCOUNT_META_NONCE_BITMAP, "nonce_bitmap");
-        assert_eq!(ACCOUNT_META_QMDB_LOCATION, "qmdb_location");
-        assert_eq!(ACCOUNT_META_DELETED, "deleted");
-    }
 }

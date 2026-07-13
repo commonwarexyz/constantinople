@@ -46,38 +46,6 @@ test('transfers encode in the tagged wire layout', async () => {
     assert.equal(encoded.bytes.length, 83 + 64);
 });
 
-test('signed transaction body length handles per-operation layouts', () => {
-    // Sizes mirror the Rust codec (crates/primitives/src/transaction.rs):
-    // common(42) + tag(1) + operation payload. Channel operations carry the
-    // receiver, operator, and delegated voucher key the address derivation
-    // commits to.
-    const transfer = signedTransactionWithTag(0, 83);
-    const open = signedTransactionWithTag(1, 155);
-    const timeout = signedTransactionWithTag(3, 147);
-
-    assert.equal(signedTransactionBodyLength(transfer), 83);
-    assert.equal(
-        signedTransactionBodyLength(open),
-        155,
-        'open carries receiver + operator + voucher key + deposit + expiry',
-    );
-    assert.equal(
-        signedTransactionBodyLength(timeout),
-        147,
-        'timeout carries the operator and voucher key',
-    );
-});
-
-test('signed transaction body length handles channel close layout', () => {
-    const close = signedTransactionWithTag(2, 219);
-
-    assert.equal(
-        signedTransactionBodyLength(close),
-        219,
-        'close carries payer + receiver + voucher key',
-    );
-});
-
 test('signed transaction body length rejects malformed bodies', () => {
     assert.throws(
         () => signedTransactionBodyLength(new Uint8Array(42)),

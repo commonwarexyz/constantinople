@@ -197,28 +197,6 @@ pub fn parse_channel(value: &str) -> Result<AccountKey, FieldError> {
     decode_field("channel", value)
 }
 
-/// Query parameters for an authorized `GET /stream` request.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StreamRequest {
-    /// Hex-encoded channel account key.
-    pub channel: String,
-    /// Opaque capability returned by the channel's registration.
-    pub capability: String,
-}
-
-impl StreamRequest {
-    pub fn new(channel: &AccountKey, capability: impl Into<String>) -> Self {
-        Self {
-            channel: encode_field(channel),
-            capability: capability.into(),
-        }
-    }
-
-    pub fn channel(&self) -> Result<AccountKey, FieldError> {
-        parse_channel(&self.channel)
-    }
-}
-
 /// SSE event name carrying a [`StreamChunk`].
 pub const STREAM_CHUNK_EVENT: &str = "chunk";
 /// SSE event name carrying a [`StreamMeter`] when the stream pauses.
@@ -448,13 +426,9 @@ mod tests {
     }
 
     #[test]
-    fn authorized_channel_requests_roundtrip() {
+    fn authorized_settle_request_roundtrips() {
         let channel = AccountKey::from([8u8; AccountKey::SIZE]);
         let capability = "opaque-capability";
-
-        let stream = StreamRequest::new(&channel, capability);
-        assert_eq!(stream.channel().expect("channel parses"), channel);
-        assert_eq!(stream.capability, capability);
 
         let settle = SettleRequest::new(&channel, capability);
         assert_eq!(settle.channel().expect("channel parses"), channel);

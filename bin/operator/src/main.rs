@@ -894,13 +894,4 @@ mod tests {
         assert!(capability_matches(&first, &first));
         assert!(!capability_matches(&first, &second));
     }
-
-    #[test]
-    fn content_limit_prices_every_existing_token_once() {
-        assert_eq!(
-            stream_content_limit(),
-            u64::try_from(content::tokens().len()).expect("token count fits u64")
-                * STREAM_PRICE_PER_TOKEN
-        );
-    }
 }

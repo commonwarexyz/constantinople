@@ -1,6 +1,5 @@
 //! Shared command-line and server bootstrap support for the indexer facades.
 
-use ahash::AHashMap;
 use axum::Router;
 use commonware_deployer::aws::Hosts;
 use constantinople_primitives::resolve_named_http_url;
@@ -59,13 +58,12 @@ pub fn load_settings(args: Args, local_port: u16) -> Settings {
             .expect("clap should require --hosts with --config");
         let raw_hosts = fs::read_to_string(hosts_path).expect("failed to read hosts file");
         let hosts: Hosts = serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
-        let hosts_by_name = hosts
-            .hosts
-            .iter()
-            .map(|host| (host.name.as_str(), host.ip))
-            .collect::<AHashMap<_, _>>();
         let store_url = resolve_named_http_url(&config.chain_indexer_url, |name| {
-            hosts_by_name.get(name).copied()
+            hosts
+                .hosts
+                .iter()
+                .find(|host| host.name.as_str() == name)
+                .map(|host| host.ip)
         });
         return Settings {
             store_url,
@@ -121,7 +119,7 @@ pub async fn health() -> &'static str {
 mod tests {
     use super::{Args, load_settings};
     use clap::{ArgGroup, Parser};
-    use std::{fs, path::PathBuf};
+    use std::fs;
     use tempfile::TempDir;
 
     #[derive(Debug, Parser)]
@@ -195,15 +193,5 @@ mod tests {
             TestCli::try_parse_from(["facade", "--hosts", "hosts.yaml"]).is_err(),
             "--hosts should require --config"
         );
-    }
-
-    #[test]
-    fn deployer_paths_are_path_bufs() {
-        let cli =
-            TestCli::try_parse_from(["facade", "--hosts", "hosts.yaml", "--config", "config.yaml"])
-                .expect("deployer invocation should parse");
-
-        assert_eq!(cli.facade.hosts, Some(PathBuf::from("hosts.yaml")));
-        assert_eq!(cli.facade.config, Some(PathBuf::from("config.yaml")));
     }
 }

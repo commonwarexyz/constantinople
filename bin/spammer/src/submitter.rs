@@ -70,7 +70,6 @@ pub struct RelayerSubmitter {
     http: reqwest::Client,
     stats: Arc<Stats>,
     target_leader: Option<String>,
-    leader_fanout: usize,
 }
 
 /// What the relayer reported for a submitted batch.
@@ -108,25 +107,19 @@ enum RelayerBatchStatus {
 }
 
 impl RelayerSubmitter {
-    pub fn new(
-        url: String,
-        stats: Arc<Stats>,
-        _target_offset: usize,
-        target_leader: Option<String>,
-    ) -> Self {
+    pub fn new(url: String, stats: Arc<Stats>, target_leader: Option<String>) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             stats,
             target_leader,
-            leader_fanout: 1,
         }
     }
 
     /// Submits a signed batch once. Failed or dropped batches are abandoned so
     /// the next outer loop iteration uses a fresh nonce set.
     pub async fn submit(&self, batch: Vec<Tx>) {
-        let _ = self.submit_reporting_with_height(batch).await;
+        let _ = self.submit_accounted(&batch).await;
     }
 
     /// Like [`Self::submit`], but returns what the relayer reported. Channel
@@ -277,10 +270,7 @@ impl RelayerSubmitter {
             .http
             .post(format!("{}/transactions", self.url))
             .header("content-type", "application/octet-stream")
-            .header(
-                "x-constantinople-relayer-leader-fanout",
-                self.leader_fanout.to_string(),
-            );
+            .header("x-constantinople-relayer-leader-fanout", "1");
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
         }
@@ -326,7 +316,7 @@ mod tests {
         let stats = Arc::new(Stats::new());
         let (url, requests) =
             spawn_response_server(vec![json_response(r#"{"status":"dropped"}"#)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
         let batch = test_batch();
         let count = batch.len() as u64;
 
@@ -343,7 +333,7 @@ mod tests {
         let stats = Arc::new(Stats::new());
         let (url, requests) =
             spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
@@ -363,7 +353,7 @@ mod tests {
             r#"{{"status":"partially_finalized","height":7,"included":["{included}"],"filtered":["{filtered}"]}}"#
         );
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
@@ -392,7 +382,7 @@ mod tests {
         let second = r#"{"status":"finalized","height":4}"#.to_string();
         let (url, requests) =
             spawn_response_server(vec![json_response(&first), json_response(&second)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(5), submitter.land_mints(vec![batch]))
             .await
@@ -425,7 +415,7 @@ mod tests {
         );
         let responses = vec![json_response(&body); super::WARM_UP_STALLED_ATTEMPTS];
         let (url, requests) = spawn_response_server(responses).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(60), submitter.land_mints(vec![batch]))
             .await

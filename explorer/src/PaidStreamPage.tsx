@@ -326,22 +326,6 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         }
     };
 
-    /// Resubmits the persisted open verbatim. Advisory rather than
-    /// authoritative: the registration that follows verifies the open by
-    /// digest against the chain, so an unresolved status here just falls
-    /// through. (Known demo edge: if the open's response was lost AND the
-    /// wallet reused the rolled-back nonce on another transaction before a
-    /// retry, this open can never land and registration will keep answering
-    /// 503 — recover by clearing the stream channel from localStorage.)
-    // (A duplicate of an already-finalized open reports dropped; the
-    // registration that follows is the check that actually decides.)
-    const resubmitOpen = async (record: ChannelRecord) => {
-        await submitTransactions(
-            mempoolUrl,
-            encodeTransactionBatch([fromHex(record.signedOpenTxHex)]),
-        );
-    };
-
     /// Open the channel from the wallet (one passkey ceremony) and register
     /// it with the operator.
     const startSession = async () => {
@@ -419,7 +403,17 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                     );
                 }
                 setNote('confirming the channel open on-chain…');
-                await resubmitOpen(record);
+                // Resubmit the persisted open verbatim. This is advisory:
+                // registration verifies the digest against the chain, so a
+                // duplicate finalized open may report dropped and still
+                // register successfully. Known demo edge: if the first
+                // response was lost and the wallet reused the rolled-back
+                // nonce before retry, the open cannot land; clear the stream
+                // channel from localStorage to recover from repeated 503s.
+                await submitTransactions(
+                    mempoolUrl,
+                    encodeTransactionBatch([fromHex(record.signedOpenTxHex)]),
+                );
             }
 
             // Register with the operator (idempotent, retried through

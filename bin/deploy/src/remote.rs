@@ -280,7 +280,6 @@ fn remote_spammer_config(
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
         rayon_threads: args.spammer_rayon_threads,
-        http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
         relayer_submitters: args.validators as usize,
         presigned_batches: args.spammer_presigned_batches,
@@ -304,9 +303,9 @@ fn remote_operator_config(
         relayer_url: relayer_url(args, remote, material),
         indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
         qmdb_url: format!("http://{QMDB_INDEXER_HOST}:{}", remote.qmdb_indexer_port),
-        operator_seed: crate::default_operator_seed(),
-        min_runway: crate::default_operator_min_runway(),
-        settle_margin: crate::default_operator_settle_margin(),
+        operator_seed: crate::DEFAULT_OPERATOR_SEED,
+        min_runway: crate::DEFAULT_MIN_RUNWAY,
+        settle_margin: crate::DEFAULT_SETTLE_MARGIN,
     })
 }
 

@@ -406,9 +406,8 @@ impl ChannelRunner {
         let vouchers = self.next_voucher_count();
         let cumulative = vouchers.saturating_mul(self.operator.voucher_value);
         let deposit_value = self.next_deposit(cumulative);
-        let Some(deposit) = NonZeroU64::new(deposit_value) else {
-            return;
-        };
+        let deposit = NonZeroU64::new(deposit_value)
+            .expect("positive voucher count and value produce a non-zero deposit");
 
         // On-chain: open the channel. The expiry gives the operator plenty of
         // runway; if anything below strands the deposit, the reclaim queue

@@ -272,8 +272,6 @@ pub(crate) struct SpammerConfig {
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
-    /// Local HTTP port the spammer serves on.
-    pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
     /// Independent target-leader streams to run when submitting through a relayer.
@@ -527,18 +525,6 @@ const fn default_spammer_rayon_threads() -> usize {
 
 const fn default_spammer_channel_vouchers() -> u64 {
     DEFAULT_SPAMMER_CHANNEL_VOUCHERS
-}
-
-const fn default_operator_seed() -> u64 {
-    DEFAULT_OPERATOR_SEED
-}
-
-const fn default_operator_min_runway() -> u64 {
-    DEFAULT_MIN_RUNWAY
-}
-
-const fn default_operator_settle_margin() -> u64 {
-    DEFAULT_SETTLE_MARGIN
 }
 
 fn main() {

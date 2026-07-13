@@ -241,7 +241,7 @@ async fn run_relayer_mode(
     for index in 0..relayer_submitters {
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
         let target = relayer_target_for(&relayer_targets, index);
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         let strategy = strategy.clone();
         // Channels use their own account ring (a disjoint seed range) so their
         // nonces never collide with the transfer presigner's accounts.

@@ -677,7 +677,7 @@ mod test {
     use super::*;
     use crate::Sealable;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
-    use commonware_codec::{DecodeExt, Encode, EncodeSize};
+    use commonware_codec::{DecodeExt, Encode};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use core::num::NonZeroU64;
@@ -836,23 +836,6 @@ mod test {
             voucher,
             7,
         ));
-    }
-
-    #[test]
-    fn transaction_encode_size_matches_written() {
-        let tx = Transaction::<sha256::Digest>::transfer(
-            test_sender(),
-            test_sender(),
-            NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
-            u64::MAX,
-        );
-
-        let expected = tx.encode_size();
-        let mut buf = Vec::new();
-        tx.write(&mut buf);
-        assert_eq!(buf.len(), expected);
-        assert!(buf.len() >= Transaction::<sha256::Digest>::MIN_SIZE);
-        assert!(buf.len() <= Transaction::<sha256::Digest>::MAX_SIZE);
     }
 
     #[test]

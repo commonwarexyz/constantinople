@@ -11,7 +11,6 @@ export const CHANNEL_EXPIRY_SLACK = 7_200n;
 
 /// The operator's `/public-key` advertisement, parsed.
 export interface OperatorAdvertisement {
-    readonly publicKeyHex: string;
     readonly accountHex: string;
     readonly height: bigint;
     readonly minRunway: bigint;
@@ -26,7 +25,6 @@ export interface OperatorAdvertisement {
 export function parseAdvertisement(body: unknown): OperatorAdvertisement {
     const record = asRecord(body, 'operator advertisement');
     return {
-        publicKeyHex: stringField(record, 'public_key'),
         accountHex: stringField(record, 'account'),
         height: numberField(record, 'height'),
         minRunway: numberField(record, 'min_runway'),
@@ -163,7 +161,7 @@ export function settleRequestBody(channelHex: string, capability: string): strin
     return JSON.stringify({ channel: channelHex, capability });
 }
 
-/// Serializes the authorized `GET /stream` query (`StreamRequest`).
+/// Serializes the authorized `GET /stream` query.
 export function streamRequestQuery(channelHex: string, capability: string): string {
     return new URLSearchParams({ channel: channelHex, capability }).toString();
 }

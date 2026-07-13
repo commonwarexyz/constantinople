@@ -70,4 +70,3 @@ export async function fetchTransactionStatus(baseUrl: string, batchId: string): 
     }
     return response.json();
 }
-
