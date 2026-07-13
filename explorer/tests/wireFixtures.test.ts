@@ -81,6 +81,7 @@ interface StreamFixture {
 
 interface RequestFixture {
     readonly registerSample: string;
+    readonly capability: string;
     readonly voucherSample: string;
     readonly settleSample: string;
 }
@@ -266,7 +267,7 @@ test('operator request bodies match the Rust wire types', () => {
         JSON.parse(fixture.requests.voucherSample),
     );
     assert.deepEqual(
-        JSON.parse(settleRequestBody(channel.addressHex)),
+        JSON.parse(settleRequestBody(channel.addressHex, fixture.requests.capability)),
         JSON.parse(fixture.requests.settleSample),
     );
 });

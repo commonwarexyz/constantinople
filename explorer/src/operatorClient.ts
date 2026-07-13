@@ -15,6 +15,7 @@ import {
     StreamEnd,
     StreamMeter,
     parseAdvertisement,
+    parseRegisterCapability,
     parseSettleOutcome,
     parseStats,
     parseStreamChunk,
@@ -22,6 +23,7 @@ import {
     parseStreamMeter,
     registerRequestBody,
     settleRequestBody,
+    streamRequestQuery,
     voucherRequestBody,
 } from './paidStream';
 import { sleep, trimTrailingSlash } from './util';
@@ -82,19 +84,19 @@ export async function registerChannel(
         openTxDigestHex: string;
         zeroVoucherSignature: Uint8Array;
     },
-): Promise<void> {
+): Promise<string> {
     const payload = registerRequestBody({
         openTxDigestHex: request.openTxDigestHex,
         zeroVoucherSignatureHex: toHex(request.zeroVoucherSignature),
     });
     for (let attempt = 1; ; attempt++) {
         try {
-            await requestJson(`${trimTrailingSlash(operatorUrl)}/channels`, {
+            const body = await requestJson(`${trimTrailingSlash(operatorUrl)}/channels`, {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
                 body: payload,
             });
-            return;
+            return parseRegisterCapability(body);
         } catch (error) {
             const retryable =
                 error instanceof OperatorRequestError &&
@@ -126,11 +128,12 @@ export async function postVoucher(
 export async function settleChannel(
     operatorUrl: string,
     channel: Uint8Array,
+    capability: string,
 ): Promise<SettleOutcome> {
     const body = await requestJson(`${trimTrailingSlash(operatorUrl)}/settle`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: settleRequestBody(toHex(channel)),
+        body: settleRequestBody(toHex(channel), capability),
     });
     return parseSettleOutcome(body);
 }
@@ -148,11 +151,11 @@ export interface StreamHandlers {
 export function openStream(
     operatorUrl: string,
     channel: Uint8Array,
+    capability: string,
     handlers: StreamHandlers,
 ): () => void {
-    const source = new EventSource(
-        `${trimTrailingSlash(operatorUrl)}/stream?channel=${toHex(channel)}`,
-    );
+    const query = streamRequestQuery(toHex(channel), capability);
+    const source = new EventSource(`${trimTrailingSlash(operatorUrl)}/stream?${query}`);
     const guarded = (parse: (data: string) => void) => (event: MessageEvent<string>) => {
         try {
             parse(event.data);

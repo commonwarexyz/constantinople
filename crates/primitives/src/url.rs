@@ -8,7 +8,7 @@
 //! (built from `commonware_deployer::aws::Hosts`, which primitives
 //! deliberately does not depend on).
 
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 
 /// Resolves a deployer-named `http://<name>:<port>[/<path>]` URL through
 /// `lookup`, replacing the name with its IP.
@@ -30,8 +30,11 @@ pub fn resolve_named_http_url(url: &str, lookup: impl Fn(&str) -> Option<IpAddr>
     let Some(ip) = lookup(host) else {
         return url.to_string();
     };
+    let Ok(port) = port.parse() else {
+        return url.to_string();
+    };
 
-    format!("http://{ip}:{port}{suffix}")
+    format!("http://{}{suffix}", SocketAddr::new(ip, port))
 }
 
 #[cfg(test)]
@@ -43,6 +46,7 @@ mod tests {
         BTreeMap::from([
             ("chain-indexer".to_string(), "203.0.113.9".parse().unwrap()),
             ("relayer-node".to_string(), "203.0.113.8".parse().unwrap()),
+            ("ipv6-node".to_string(), "2001:db8::1".parse().unwrap()),
         ])
     }
 
@@ -68,6 +72,14 @@ mod tests {
     }
 
     #[test]
+    fn ipv6_address_is_bracketed() {
+        assert_eq!(
+            resolve("http://ipv6-node:8090/transactions"),
+            "http://[2001:db8::1]:8090/transactions"
+        );
+    }
+
+    #[test]
     fn unknown_host_passes_through() {
         assert_eq!(resolve("http://unknown:8090"), "http://unknown:8090");
     }
@@ -83,6 +95,14 @@ mod tests {
     #[test]
     fn url_without_port_passes_through() {
         assert_eq!(resolve("http://chain-indexer"), "http://chain-indexer");
+    }
+
+    #[test]
+    fn invalid_port_passes_through() {
+        assert_eq!(
+            resolve("http://chain-indexer:not-a-port"),
+            "http://chain-indexer:not-a-port"
+        );
     }
 
     #[test]

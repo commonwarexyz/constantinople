@@ -77,19 +77,19 @@ export interface VoucherPolicyInputs {
 
 /// Decides whether the payer should sign a fresh voucher, and for how much.
 ///
-/// Policy: once the unpaid debt reaches half the operator's window, pay up
-/// to half a window *ahead* of what was served, so payment stays in front of
-/// the stream and the pause path only triggers when payments actually stop.
-/// The cumulative never exceeds the deposit (the chain would reject the
-/// voucher). Returns the new cumulative to sign, or null if no voucher is
-/// due.
+/// Policy: once the unpaid debt reaches half the operator's window, pay the
+/// cumulative cost already served. This leaves half a window for the voucher
+/// round trip without giving the operator an enforceable claim on content it
+/// has not delivered. The cumulative never exceeds the deposit (the chain
+/// would reject the voucher). Returns the new cumulative to sign, or null if
+/// no voucher is due.
 export function voucherTopUp(inputs: VoucherPolicyInputs): bigint | null {
     const paid = inputs.paid > inputs.lastSigned ? inputs.paid : inputs.lastSigned;
     const debt = inputs.served > paid ? inputs.served - paid : 0n;
     if (debt * 2n < inputs.debtLimit) {
         return null;
     }
-    let target = inputs.served + inputs.debtLimit / 2n;
+    let target = inputs.served;
     if (target > inputs.deposit) {
         target = inputs.deposit;
     }
@@ -97,6 +97,29 @@ export function voucherTopUp(inputs: VoucherPolicyInputs): bigint | null {
         return null;
     }
     return target;
+}
+
+/// Returns the final delivered cumulative that an auto-paying client should
+/// flush before settlement. Unlike the streaming policy, settlement does not
+/// wait for a batching threshold because no later chunk can trigger it.
+export function voucherFinalTopUp(
+    inputs: Pick<VoucherPolicyInputs, 'served' | 'paid' | 'lastSigned' | 'deposit'>,
+): bigint | null {
+    if (inputs.served > inputs.deposit) {
+        throw new Error('delivered cumulative exceeds the channel deposit');
+    }
+    const paid = inputs.paid > inputs.lastSigned ? inputs.paid : inputs.lastSigned;
+    return inputs.served > paid ? inputs.served : null;
+}
+
+/// Whether a voucher rejection means settlement is already inevitable, so
+/// the client should query the idempotent settlement endpoint for its final
+/// outcome instead of retrying a voucher the operator can no longer accept.
+export function isSettlementBoundaryMessage(message: string): boolean {
+    return (
+        message === 'channel settlement already started' ||
+        message === 'channel is about to expire'
+    );
 }
 
 /// Serializes the `POST /channels` body (`RegisterRequest` in
@@ -114,6 +137,14 @@ export function registerRequestBody(request: {
     });
 }
 
+/// Parses the capability granted by a successful channel registration.
+/// The value is intentionally opaque: clients persist and present it, but do
+/// not derive authorization from public channel data.
+export function parseRegisterCapability(body: unknown): string {
+    const record = asRecord(body, 'register response');
+    return stringField(record, 'capability');
+}
+
 /// Serializes the `POST /vouchers` body (`VoucherRequest`).
 export function voucherRequestBody(request: {
     readonly channelHex: string;
@@ -127,9 +158,14 @@ export function voucherRequestBody(request: {
     });
 }
 
-/// Serializes the `POST /settle` body (`SettleRequest`).
-export function settleRequestBody(channelHex: string): string {
-    return JSON.stringify({ channel: channelHex });
+/// Serializes the authorized `POST /settle` body (`SettleRequest`).
+export function settleRequestBody(channelHex: string, capability: string): string {
+    return JSON.stringify({ channel: channelHex, capability });
+}
+
+/// Serializes the authorized `GET /stream` query (`StreamRequest`).
+export function streamRequestQuery(channelHex: string, capability: string): string {
+    return new URLSearchParams({ channel: channelHex, capability }).toString();
 }
 
 /// Serializes a u64 wire field: JSON carries u64s as numbers, so a value

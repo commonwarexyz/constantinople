@@ -57,6 +57,7 @@ struct Fixture {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct RequestFixture {
+    capability: String,
     register_sample: String,
     voucher_sample: String,
     settle_sample: String,
@@ -217,6 +218,7 @@ fn build_fixture() -> Fixture {
         zero_voucher_signature_hex: hex(&zero_voucher.signature.encode()),
     };
     let request_fixture = RequestFixture {
+        capability: "fixture-capability".to_string(),
         register_sample: serde_json::to_string(&RegisterRequest::new(
             open.message_digest(),
             &zero_voucher.signature,
@@ -224,7 +226,7 @@ fn build_fixture() -> Fixture {
         .expect("register request serializes"),
         voucher_sample: serde_json::to_string(&VoucherRequest::new(&voucher))
             .expect("voucher request serializes"),
-        settle_sample: serde_json::to_string(&SettleRequest::new(&channel))
+        settle_sample: serde_json::to_string(&SettleRequest::new(&channel, "fixture-capability"))
             .expect("settle request serializes"),
     };
     let close = sign(

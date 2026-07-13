@@ -75,6 +75,7 @@ use constantinople_primitives::{
 };
 use exoware_qmdb::{OperationLogClient, proto::qmdb::v1::GetOperationRangeRequest};
 use exoware_sdk::{StoreClient, proto::PreferZstdHttpClient};
+use rand_core::{OsRng, RngCore as _};
 use serde::Deserialize;
 use std::{
     collections::BTreeMap,
@@ -93,6 +94,40 @@ type TransactionProofClient =
 type ConsensusScheme = ThresholdScheme<ed25519::PublicKey, MinSig>;
 type Service = OperatorService<commonware_runtime::tokio::Context, RelayerAdapter, ChannelVerifier>;
 
+/// HTTP-layer state beside the chain-facing operator service.
+struct AppState {
+    service: Arc<Service>,
+    /// Capabilities are retained beside the service's in-memory channel state.
+    capabilities: tokio::sync::RwLock<BTreeMap<AccountKey, String>>,
+}
+
+impl AppState {
+    fn new(service: Arc<Service>) -> Self {
+        Self {
+            service,
+            capabilities: tokio::sync::RwLock::new(BTreeMap::new()),
+        }
+    }
+
+    /// Issues fresh OS-random bearer material for a new channel. Concurrent
+    /// and later idempotent registration replays retain the original value.
+    async fn issue_capability(&self, channel: AccountKey) -> String {
+        let mut capabilities = self.capabilities.write().await;
+        capabilities
+            .entry(channel)
+            .or_insert_with(generate_capability)
+            .clone()
+    }
+
+    async fn authorizes(&self, channel: &AccountKey, presented: &str) -> bool {
+        self.capabilities
+            .read()
+            .await
+            .get(channel)
+            .is_some_and(|expected| capability_matches(expected, presented))
+    }
+}
+
 const HEIGHT_POLL_INTERVAL: Duration = Duration::from_millis(500);
 const SETTLEMENT_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
@@ -110,7 +145,6 @@ const STREAM_GRACE: Duration = Duration::from_secs(5);
 const STREAM_POLL_INTERVAL: Duration = Duration::from_millis(200);
 /// Delay between streamed tokens (the typewriter pace).
 const STREAM_PACE: Duration = Duration::from_millis(50);
-
 #[derive(Debug, Parser)]
 #[command(name = "constantinople-operator")]
 struct Cli {
@@ -184,6 +218,7 @@ fn main() {
         );
         tokio::spawn(track_height(service.clone()));
         tokio::spawn(settlement_sweep(service.clone()));
+        let state = Arc::new(AppState::new(service));
 
         let addr = SocketAddr::new(config.listen_addr, config.http_port);
         let app = Router::new()
@@ -197,7 +232,7 @@ fn main() {
             // The explorer polls /stats from the browser (a different
             // origin), so answer preflights like the indexer facades do.
             .layer(tower_http::cors::CorsLayer::very_permissive())
-            .with_state(service);
+            .with_state(state);
 
         info!(%addr, "constantinople operator listening");
         let listener = tokio::net::TcpListener::bind(addr)
@@ -253,6 +288,34 @@ fn resolve_named_http_url(url: &str, hosts: Option<&BTreeMap<String, IpAddr>>) -
     constantinople_primitives::resolve_named_http_url(url, |name| hosts.get(name).copied())
 }
 
+fn generate_capability() -> String {
+    let mut secret = [0u8; 32];
+    OsRng.fill_bytes(&mut secret);
+    hex_lower(&secret)
+}
+
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        encoded.push(HEX[(byte >> 4) as usize] as char);
+        encoded.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    encoded
+}
+
+/// Compares fixed-size bearer secrets without leaking the matching prefix.
+fn capability_matches(expected: &str, presented: &str) -> bool {
+    if expected.len() != presented.len() {
+        return false;
+    }
+    expected
+        .bytes()
+        .zip(presented.bytes())
+        .fold(0u8, |difference, (left, right)| difference | (left ^ right))
+        == 0
+}
+
 async fn health() -> &'static str {
     "ok"
 }
@@ -299,7 +362,8 @@ async fn settlement_sweep(service: Arc<Service>) {
     }
 }
 
-async fn public_key(State(service): State<Arc<Service>>) -> Json<PublicKeyResponse> {
+async fn public_key(State(state): State<Arc<AppState>>) -> Json<PublicKeyResponse> {
+    let service = &state.service;
     let margins = service.margins();
     Json(PublicKeyResponse::new(
         service.operator_public_key(),
@@ -312,7 +376,8 @@ async fn public_key(State(service): State<Arc<Service>>) -> Json<PublicKeyRespon
     ))
 }
 
-async fn stats(State(service): State<Arc<Service>>) -> Json<StatsResponse> {
+async fn stats(State(state): State<Arc<AppState>>) -> Json<StatsResponse> {
+    let service = &state.service;
     let stats = service.stats().await;
     Json(StatsResponse {
         channels: stats.channels,
@@ -325,7 +390,7 @@ async fn stats(State(service): State<Arc<Service>>) -> Json<StatsResponse> {
 }
 
 async fn register_channel(
-    State(service): State<Arc<Service>>,
+    State(state): State<Arc<AppState>>,
     Json(request): Json<RegisterRequest>,
 ) -> Result<Json<RegisterResponse>, ApiError> {
     let open_tx_digest = request
@@ -333,31 +398,41 @@ async fn register_channel(
         .map_err(ApiError::bad_request)?;
     let zero_voucher = request.zero_voucher().map_err(ApiError::bad_request)?;
 
-    let (_channel, registered) = service
+    let (channel, registered) = state
+        .service
         .register_channel(&open_tx_digest, zero_voucher)
         .await?;
-    Ok(Json(RegisterResponse { registered }))
+    let capability = state.issue_capability(channel).await;
+    Ok(Json(RegisterResponse {
+        registered,
+        capability,
+    }))
 }
 
 async fn serve_voucher(
-    State(service): State<Arc<Service>>,
+    State(state): State<Arc<AppState>>,
     Json(request): Json<VoucherRequest>,
 ) -> Result<Json<VoucherResponse>, ApiError> {
     let voucher = request.voucher().map_err(ApiError::bad_request)?;
-    let cumulative = service.serve_voucher(voucher).await?;
+    let cumulative = state.service.serve_voucher(voucher).await?;
     Ok(Json(VoucherResponse { cumulative }))
 }
 
 async fn settle_channel(
-    State(service): State<Arc<Service>>,
+    State(state): State<Arc<AppState>>,
     Json(request): Json<SettleRequest>,
 ) -> Result<Json<SettleResponse>, ApiError> {
     let channel = request.channel().map_err(ApiError::bad_request)?;
-    let outcome = spawn_settlement(service, channel).await.map_err(|error| {
-        ApiError::from(OperatorError::unavailable(format!(
-            "settlement task failed: {error}"
-        )))
-    })??;
+    if !state.authorizes(&channel, &request.capability).await {
+        return Err(ApiError::forbidden("invalid channel capability"));
+    }
+    let outcome = spawn_settlement(state.service.clone(), channel)
+        .await
+        .map_err(|error| {
+            ApiError::from(OperatorError::unavailable(format!(
+                "settlement task failed: {error}"
+            )))
+        })??;
     Ok(Json(SettleResponse {
         settled: outcome.settled,
         cumulative: outcome.cumulative,
@@ -367,6 +442,7 @@ async fn settle_channel(
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     channel: Option<String>,
+    capability: Option<String>,
 }
 
 /// The x402 handshake: `GET /stream` without a servable, registered channel
@@ -385,7 +461,7 @@ fn payment_required(message: impl ToString) -> Response {
 /// behind. Content position derives from the channel's served total, so a
 /// reconnect resumes where the meter left off.
 async fn stream_content(
-    State(service): State<Arc<Service>>,
+    State(state): State<Arc<AppState>>,
     Query(query): Query<StreamQuery>,
 ) -> Response {
     let Some(channel) = query.channel else {
@@ -395,19 +471,30 @@ async fn stream_content(
         Ok(channel) => channel,
         Err(error) => return payment_required(error),
     };
+    let Some(capability) = query.capability else {
+        return payment_required("registration capability required");
+    };
+    if !state.authorizes(&channel, &capability).await {
+        return payment_required("invalid channel capability");
+    }
     // Zero-cost probe: surfaces an unregistered or closed channel as the
     // 402 handshake instead of an empty stream.
-    let meter = match service.consume(&channel, 0, STREAM_DEBT_LIMIT).await {
+    let meter = match state
+        .service
+        .consume_bounded(&channel, 0, STREAM_DEBT_LIMIT, stream_content_limit())
+        .await
+    {
         Ok(
             ConsumeOutcome::Served(meter)
             | ConsumeOutcome::PaymentRequired(meter)
-            | ConsumeOutcome::DepositExhausted(meter),
+            | ConsumeOutcome::DepositExhausted(meter)
+            | ConsumeOutcome::ContentExhausted(meter),
         ) => meter,
         Err(error) => return payment_required(error),
     };
 
     let session = StreamSession {
-        service,
+        service: state.service.clone(),
         channel,
         meter,
         grace_deadline: None,
@@ -423,6 +510,13 @@ async fn stream_content(
     Sse::new(stream)
         .keep_alive(KeepAlive::default())
         .into_response()
+}
+
+/// Maximum chain-unit meter value backed by actual stream content.
+fn stream_content_limit() -> u64 {
+    u64::try_from(content::tokens().len())
+        .expect("stream token count fits u64")
+        .saturating_mul(STREAM_PRICE_PER_TOKEN)
 }
 
 /// One client's stream position: the channel it pays with, the last meter
@@ -443,12 +537,6 @@ impl StreamSession {
     /// after emitting them.
     async fn next_event(&mut self) -> Event {
         loop {
-            // Content bound first, so the meter never charges for a token
-            // past the essay's end.
-            let next_token = (self.meter.served / STREAM_PRICE_PER_TOKEN) as usize;
-            if content::tokens().get(next_token).is_none() {
-                return self.end(StreamEndReason::Complete);
-            }
             // Pace before charging: a client that disconnects mid-pace has
             // paid for nothing undelivered (charging first would strand the
             // in-flight token — a resume skips past it). A paused stream has
@@ -458,22 +546,24 @@ impl StreamSession {
             }
             match self
                 .service
-                .consume(&self.channel, STREAM_PRICE_PER_TOKEN, STREAM_DEBT_LIMIT)
+                .consume_bounded(
+                    &self.channel,
+                    STREAM_PRICE_PER_TOKEN,
+                    STREAM_DEBT_LIMIT,
+                    stream_content_limit(),
+                )
                 .await
             {
                 Ok(ConsumeOutcome::Served(meter)) => {
                     self.meter = meter;
                     self.grace_deadline = None;
-                    // The token the charge actually bought, derived from the
-                    // returned meter: a concurrent session on this channel
-                    // may have advanced the shared meter past the bound
-                    // check above, and past the essay's end the charged
-                    // token does not exist (bounded at one token of slack) —
-                    // end rather than mislabel content.
+                    // The token the atomic bounded charge bought, derived from
+                    // the returned shared meter. Concurrent sessions may split
+                    // the content, but none can advance past its final token.
                     let index = (meter.served / STREAM_PRICE_PER_TOKEN - 1) as usize;
-                    let Some(text) = content::tokens().get(index) else {
-                        return self.end(StreamEndReason::Complete);
-                    };
+                    let text = content::tokens()
+                        .get(index)
+                        .expect("bounded consume only advances over existing content");
                     return event(
                         STREAM_CHUNK_EVENT,
                         &StreamChunk {
@@ -508,6 +598,10 @@ impl StreamSession {
                 Ok(ConsumeOutcome::DepositExhausted(meter)) => {
                     self.meter = meter;
                     return self.end(StreamEndReason::DepositExhausted);
+                }
+                Ok(ConsumeOutcome::ContentExhausted(meter)) => {
+                    self.meter = meter;
+                    return self.end(StreamEndReason::Complete);
                 }
                 Err(_) => return self.end(StreamEndReason::ChannelClosed),
             }
@@ -751,6 +845,13 @@ impl ApiError {
             message: message.to_string(),
         }
     }
+
+    fn forbidden(message: impl ToString) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            message: message.to_string(),
+        }
+    }
 }
 
 impl From<OperatorError> for ApiError {
@@ -775,5 +876,31 @@ impl IntoResponse for ApiError {
             }),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capability_is_fresh_256_bit_bearer_material() {
+        let first = generate_capability();
+        let second = generate_capability();
+
+        assert_eq!(first.len(), 64);
+        assert!(first.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_ne!(first, second);
+        assert!(capability_matches(&first, &first));
+        assert!(!capability_matches(&first, &second));
+    }
+
+    #[test]
+    fn content_limit_prices_every_existing_token_once() {
+        assert_eq!(
+            stream_content_limit(),
+            u64::try_from(content::tokens().len()).expect("token count fits u64")
+                * STREAM_PRICE_PER_TOKEN
+        );
     }
 }

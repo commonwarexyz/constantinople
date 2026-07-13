@@ -5,11 +5,16 @@ import {
     CHANNEL_EXPIRY_SLACK,
     channelDeposit,
     channelExpiry,
+    isSettlementBoundaryMessage,
     parseAdvertisement,
+    parseRegisterCapability,
     parseStats,
     parseStreamChunk,
     parseStreamEnd,
     parseStreamMeter,
+    settleRequestBody,
+    streamRequestQuery,
+    voucherFinalTopUp,
     voucherTopUp,
 } from '../src/paidStream.ts';
 
@@ -45,6 +50,16 @@ test('operator stats parse the voucher counter', () => {
     assert.throws(() => parseStats({ streamed: 100 }), /vouchers/);
 });
 
+test('authorized operator requests carry the registration capability', () => {
+    assert.equal(parseRegisterCapability({ registered: true, capability: 'secret-token' }), 'secret-token');
+    assert.throws(() => parseRegisterCapability({ registered: true }), /capability/);
+    assert.deepEqual(JSON.parse(settleRequestBody('aa', 'secret token')), {
+        channel: 'aa',
+        capability: 'secret token',
+    });
+    assert.equal(streamRequestQuery('aa', 'secret token'), 'channel=aa&capability=secret+token');
+});
+
 test('advertisement missing a knob is rejected, not zero-defaulted', () => {
     const { debt_limit: _dropped, ...partial } = advertisementBody;
     assert.throws(() => parseAdvertisement(partial), /debt_limit/);
@@ -56,7 +71,7 @@ function topUp(served: bigint, paid: bigint, debtLimit: bigint, deposit: bigint)
     return voucherTopUp({ served, paid, lastSigned: 0n, deadTarget: null, debtLimit, deposit });
 }
 
-test('voucher top-up stays half a window ahead of the stream', () => {
+test('voucher top-up triggers at half a window without paying ahead', () => {
     const limit = 32n;
     const deposit = 1_000n;
 
@@ -64,17 +79,20 @@ test('voucher top-up stays half a window ahead of the stream', () => {
     assert.equal(topUp(0n, 0n, limit, deposit), null);
     // Below half the window, streaming continues unpaid.
     assert.equal(topUp(15n, 0n, limit, deposit), null);
-    // At half the window, pay half a window past what was served.
-    assert.equal(topUp(16n, 0n, limit, deposit), 32n);
-    // Prepaid: no new voucher until the debt builds again.
-    assert.equal(topUp(20n, 32n, limit, deposit), null);
-    assert.equal(topUp(48n, 32n, limit, deposit), 64n);
+    // At half the window, pay only for content already delivered.
+    assert.equal(topUp(16n, 0n, limit, deposit), 16n);
+    // No new voucher until another half-window has been delivered.
+    assert.equal(topUp(20n, 16n, limit, deposit), null);
+    assert.equal(topUp(32n, 16n, limit, deposit), 32n);
 });
 
 test('voucher top-up never exceeds the deposit', () => {
     const limit = 32n;
-    // Near the deposit the target clamps to it...
-    assert.equal(topUp(90n, 74n, limit, 100n), 100n);
+    // Near the deposit the voucher covers only the delivered cumulative.
+    assert.equal(topUp(90n, 74n, limit, 100n), 90n);
+    // A defensive clamp still protects against an impossible over-deposit
+    // served value.
+    assert.equal(topUp(110n, 94n, limit, 100n), 100n);
     // ...and once the deposit is fully paid, no voucher can help.
     assert.equal(topUp(100n, 100n, limit, 100n), null);
 });
@@ -82,19 +100,45 @@ test('voucher top-up never exceeds the deposit', () => {
 test('voucher top-up never signs below an in-flight cumulative', () => {
     // The operator still reports paid=0, but a voucher for 32 is already
     // signed (its post may not be acknowledged yet): the debt is measured
-    // against 32, and any new target must exceed it.
+    // against 32, and any new target must exceed it without paying ahead.
     const inputs = { paid: 0n, lastSigned: 32n, deadTarget: null, debtLimit: 32n, deposit: 1_000n };
     assert.equal(voucherTopUp({ served: 20n, ...inputs }), null);
-    assert.equal(voucherTopUp({ served: 48n, ...inputs }), 64n);
+    assert.equal(voucherTopUp({ served: 48n, ...inputs }), 48n);
     // Deposit clamp below the in-flight cumulative: nothing left to sign.
     assert.equal(voucherTopUp({ served: 40n, ...inputs, deposit: 32n }), null);
 });
 
 test('voucher top-up never re-signs a rejected cumulative', () => {
     const inputs = { paid: 0n, lastSigned: 0n, debtLimit: 32n, deposit: 1_000n };
-    assert.equal(voucherTopUp({ served: 16n, deadTarget: 32n, ...inputs }), null);
+    assert.equal(voucherTopUp({ served: 16n, deadTarget: 16n, ...inputs }), null);
     // A different target is still signable.
-    assert.equal(voucherTopUp({ served: 17n, deadTarget: 32n, ...inputs }), 33n);
+    assert.equal(voucherTopUp({ served: 17n, deadTarget: 16n, ...inputs }), 17n);
+});
+
+test('settlement flushes delivered content below the batching threshold', () => {
+    assert.equal(
+        voucherFinalTopUp({ served: 7n, paid: 0n, lastSigned: 0n, deposit: 100n }),
+        7n,
+    );
+    assert.equal(
+        voucherFinalTopUp({ served: 7n, paid: 7n, lastSigned: 0n, deposit: 100n }),
+        null,
+    );
+    assert.equal(
+        voucherFinalTopUp({ served: 9n, paid: 0n, lastSigned: 7n, deposit: 100n }),
+        9n,
+    );
+    assert.throws(
+        () => voucherFinalTopUp({ served: 101n, paid: 100n, lastSigned: 100n, deposit: 100n }),
+        /exceeds the channel deposit/,
+    );
+});
+
+test('only settlement-boundary voucher errors permit the close to continue', () => {
+    assert.equal(isSettlementBoundaryMessage('channel settlement already started'), true);
+    assert.equal(isSettlementBoundaryMessage('channel is about to expire'), true);
+    assert.equal(isSettlementBoundaryMessage('voucher rejected: BadSignature'), false);
+    assert.equal(isSettlementBoundaryMessage('channel metadata missing'), false);
 });
 
 test('stream payloads parse and reject malformed data', () => {

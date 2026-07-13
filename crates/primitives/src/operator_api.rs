@@ -146,6 +146,11 @@ pub struct RegisterResponse {
     /// idempotent replay, e.g. a retry after a lost response). Failures are
     /// HTTP errors, never `registered: false`.
     pub registered: bool,
+    /// Opaque bearer capability authorizing this channel's stream and manual
+    /// settlement endpoints. Channel addresses are public chain data, so
+    /// clients must keep this value private and present it on those requests.
+    /// An idempotent registration replay returns the original capability.
+    pub capability: String,
 }
 
 /// Request to `POST /vouchers`: one off-chain payment step.
@@ -190,6 +195,28 @@ pub struct VoucherResponse {
 /// Parses the hex-encoded `channel` query parameter of `GET /stream`.
 pub fn parse_channel(value: &str) -> Result<AccountKey, FieldError> {
     decode_field("channel", value)
+}
+
+/// Query parameters for an authorized `GET /stream` request.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct StreamRequest {
+    /// Hex-encoded channel account key.
+    pub channel: String,
+    /// Opaque capability returned by the channel's registration.
+    pub capability: String,
+}
+
+impl StreamRequest {
+    pub fn new(channel: &AccountKey, capability: impl Into<String>) -> Self {
+        Self {
+            channel: encode_field(channel),
+            capability: capability.into(),
+        }
+    }
+
+    pub fn channel(&self) -> Result<AccountKey, FieldError> {
+        parse_channel(&self.channel)
+    }
 }
 
 /// SSE event name carrying a [`StreamChunk`].
@@ -258,12 +285,15 @@ pub struct StreamEnd {
 pub struct SettleRequest {
     /// Hex-encoded channel account key.
     pub channel: String,
+    /// Opaque capability returned by the channel's registration.
+    pub capability: String,
 }
 
 impl SettleRequest {
-    pub fn new(channel: &AccountKey) -> Self {
+    pub fn new(channel: &AccountKey, capability: impl Into<String>) -> Self {
         Self {
             channel: encode_field(channel),
+            capability: capability.into(),
         }
     }
 
@@ -410,9 +440,24 @@ mod tests {
     fn bad_hex_names_the_field() {
         let request = SettleRequest {
             channel: "zz".to_string(),
+            capability: "capability".to_string(),
         };
         let error = request.channel().expect_err("bad hex must fail");
         assert_eq!(error.field, "channel");
         assert_eq!(error.to_string(), "bad channel");
+    }
+
+    #[test]
+    fn authorized_channel_requests_roundtrip() {
+        let channel = AccountKey::from([8u8; AccountKey::SIZE]);
+        let capability = "opaque-capability";
+
+        let stream = StreamRequest::new(&channel, capability);
+        assert_eq!(stream.channel().expect("channel parses"), channel);
+        assert_eq!(stream.capability, capability);
+
+        let settle = SettleRequest::new(&channel, capability);
+        assert_eq!(settle.channel().expect("channel parses"), channel);
+        assert_eq!(settle.capability, capability);
     }
 }

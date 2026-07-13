@@ -1857,6 +1857,7 @@ dependencies = [
  "exoware-qmdb",
  "exoware-sdk",
  "futures",
+ "rand_core 0.6.4",
  "serde",
  "serde_yaml",
  "tokio",

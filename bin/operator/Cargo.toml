@@ -31,6 +31,7 @@ commonware-storage.workspace = true
 axum.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
+rand_core.workspace = true
 exoware-qmdb.workspace = true
 exoware-sdk.workspace = true
 serde = { workspace = true, features = ["derive"] }

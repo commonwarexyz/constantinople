@@ -22,6 +22,8 @@ import {
 import {
     channelDeposit,
     channelExpiry,
+    isSettlementBoundaryMessage,
+    voucherFinalTopUp,
     voucherTopUp,
     type OperatorAdvertisement,
     type StreamEnd,
@@ -58,6 +60,10 @@ interface ChannelRecord {
     /// voucherKey.ts for the demo-posture tradeoff).
     readonly voucherPublicKeyHex: string;
     readonly voucherKeyJwk: JsonWebKey;
+    /// Opaque bearer credential granted by registration. Optional only for
+    /// records written by an older build; the registration retry fills it in
+    /// before streaming or settlement becomes available.
+    readonly capability?: string;
 }
 
 /// What the wallet hands back for persistence after signing the open,
@@ -132,7 +138,10 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     const [endReason, setEndReason] = useState<StreamEnd['reason'] | null>(null);
 
     const payingRef = useRef(true);
-    const voucherInflightRef = useRef(false);
+    /// The current voucher post, if any. Settlement waits for this before
+    /// flushing the final delivered cumulative, so closing can never race an
+    /// older in-flight voucher.
+    const voucherPostRef = useRef<Promise<void> | null>(null);
     const lastSignedRef = useRef(0n);
     /// A cumulative the operator permanently rejected; never re-sign it, or
     /// a doomed voucher would re-post on every chunk.
@@ -220,7 +229,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     /// which every stream event updates first) says one is due. Called from
     /// every stream event; a ref guards against overlapping posts.
     const maybePay = () => {
-        if (!payingRef.current || voucherInflightRef.current) return;
+        if (!payingRef.current || voucherPostRef.current) return;
         const voucherKey = voucherKeyRef.current;
         if (!voucherKey || !advertisement || !channel || !channelKey) return;
         const target = voucherTopUp({
@@ -232,9 +241,9 @@ export const PaidStreamPage = memo(function PaidStreamPage({
             deposit: BigInt(channel.deposit),
         });
         if (target === null) return;
-        voucherInflightRef.current = true;
         const generation = sessionGenerationRef.current;
-        void (async () => {
+        let pending!: Promise<void>;
+        pending = (async () => {
             try {
                 const signature = await voucherKey.signVoucher(channelKey, target);
                 await postVoucher(operatorUrl, { channel: channelKey, cumulative: target, signature });
@@ -258,12 +267,63 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 }, VOUCHER_RETRY_MS);
             } finally {
                 // A post stalled across a reset must not clear the NEW
-                // session's inflight flag out from under it.
-                if (generation === sessionGenerationRef.current) {
-                    voucherInflightRef.current = false;
+                // session's post out from under it.
+                if (
+                    generation === sessionGenerationRef.current &&
+                    voucherPostRef.current === pending
+                ) {
+                    voucherPostRef.current = null;
                 }
             }
         })();
+        voucherPostRef.current = pending;
+    };
+
+    /// Stops batching at settlement time: after the stream is closed and its
+    /// meter can no longer advance, wait for an older post and then cover any
+    /// delivered remainder exactly. This preserves the no-prepayment policy
+    /// without making the operator forfeit the last partial voucher window.
+    const flushDeliveredVoucher = async () => {
+        await voucherPostRef.current;
+        if (!payingRef.current || !channel || !channelKey) return;
+
+        const served = meterRef.current.served;
+        const target = voucherFinalTopUp({
+            served,
+            paid: meterRef.current.paid,
+            lastSigned: lastSignedRef.current,
+            deposit: BigInt(channel.deposit),
+        });
+        if (target === null) return;
+        if (deadTargetRef.current === target) {
+            throw new Error(`the operator previously rejected the final voucher ${target}`);
+        }
+
+        const voucherKey = voucherKeyRef.current;
+        if (!voucherKey) throw new Error('voucher key unavailable');
+        const generation = sessionGenerationRef.current;
+        const pending = (async () => {
+            const signature = await voucherKey.signVoucher(channelKey, target);
+            await postVoucher(operatorUrl, {
+                channel: channelKey,
+                cumulative: target,
+                signature,
+            });
+            if (generation !== sessionGenerationRef.current) return;
+            lastSignedRef.current = target;
+            setPayments((current) => [target, ...current].slice(0, 8));
+        })();
+        voucherPostRef.current = pending;
+        try {
+            await pending;
+        } finally {
+            if (
+                generation === sessionGenerationRef.current &&
+                voucherPostRef.current === pending
+            ) {
+                voucherPostRef.current = null;
+            }
+        }
     };
 
     /// Resubmits the persisted open verbatim. Advisory rather than
@@ -373,10 +433,13 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 parseAccountKeyHex(record.channelHex),
                 0n,
             );
-            await registerChannel(operatorUrl, {
+            const capability = await registerChannel(operatorUrl, {
                 openTxDigestHex: record.openTxDigestHex,
                 zeroVoucherSignature,
             });
+            record = { ...record, capability };
+            persistChannel(record);
+            setChannel(record);
             setNote('channel registered — start the stream');
             setPhase('ready');
         } catch (error) {
@@ -393,12 +456,12 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     // reconnect the existing prefix is exactly what precedes the next chunk.
     // Only a fresh channel (resetSession) starts a blank pane.
     const startStream = () => {
-        if (!channelKey) return;
+        if (!channelKey || !channel?.capability) return;
         closeStream();
         setEndReason(null);
         setNote('');
         setPhase('streaming');
-        closeStreamRef.current = openStream(operatorUrl, channelKey, {
+        closeStreamRef.current = openStream(operatorUrl, channelKey, channel.capability, {
             onChunk: (chunk) => {
                 setText((current) => current + chunk.text);
                 updateMeter(chunk);
@@ -430,7 +493,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     };
 
     const settle = async () => {
-        if (!channelKey) return;
+        if (!channelKey || !channel?.capability) return;
         closeStream();
         // A failure returns to the phase the action started from ('ended'
         // when it started mid-stream: the stream was just closed). Landing
@@ -439,20 +502,36 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         // channel) no longer renders.
         const origin: Phase = phase === 'streaming' ? 'ended' : phase;
         setPhase('settling');
-        setNote('closing the channel on-chain…');
         try {
-            const outcome = await settleChannel(operatorUrl, channelKey);
+            setNote('paying for delivered content…');
+            try {
+                await flushDeliveredVoucher();
+            } catch (error) {
+                const settlementStarted =
+                    error instanceof OperatorRequestError &&
+                    !error.transient &&
+                    isSettlementBoundaryMessage(error.message);
+                if (!settlementStarted) throw error;
+            }
+            setNote('closing the channel on-chain…');
+            const outcome = await settleChannel(operatorUrl, channelKey, channel.capability);
             setNote(
                 outcome.settled
                     ? `settled: one close paid ${outcome.cumulative} for ${payments.length ? 'all the vouchers you watched' : 'the session'} — the remainder refunded to the wallet`
                     : 'close abandoned — the channel expired first',
             );
-            // Settled is the one outcome that may forget the channel: the
-            // close resolved the escrow, so there is nothing left to
-            // reclaim.
-            localStorage.removeItem(CHANNEL_STORAGE_KEY);
-            setChannel(null);
-            setPhase('settled');
+            if (outcome.settled) {
+                // A finalized close resolved the escrow, so there is
+                // nothing left to reclaim.
+                localStorage.removeItem(CHANNEL_STORAGE_KEY);
+                setChannel(null);
+                setPhase('settled');
+            } else {
+                // An abandoned close leaves the escrow live. Keep its only
+                // persisted recovery record and return to controls that
+                // expose the post-expiry timeout reclaim.
+                setPhase(origin);
+            }
         } catch (error) {
             setNote(`settlement failed: ${String(error)}`);
             setPhase(origin);
@@ -510,7 +589,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         voucherKeyRef.current = null;
         // The generation bump above stops any straggling post from clearing
         // this, so the reset clears it itself.
-        voucherInflightRef.current = false;
+        voucherPostRef.current = null;
         setText('');
         updateMeter({ served: 0n, paid: 0n });
         setPayments([]);
@@ -731,7 +810,8 @@ function isChannelRecord(value: unknown): value is ChannelRecord {
         typeof record.expiry === 'string' &&
         typeof record.voucherPublicKeyHex === 'string' &&
         typeof record.voucherKeyJwk === 'object' &&
-        record.voucherKeyJwk !== null
+        record.voucherKeyJwk !== null &&
+        (record.capability === undefined || typeof record.capability === 'string')
     );
 }
 

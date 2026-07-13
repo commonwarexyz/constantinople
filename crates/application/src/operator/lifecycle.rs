@@ -365,13 +365,20 @@ fn operator_settles_and_abandons_against_live_chain() {
             let voucher = payer.voucher(channel, i * STEP);
             assert_eq!(service.serve_voucher(voucher).await, Ok(i * STEP));
         }
-        // Stale and over-deposit vouchers are refused.
-        assert!(
+        // Exact retry is idempotent (its acknowledgement may have been
+        // lost), while a lower and an over-deposit voucher are refused.
+        assert_eq!(
             service
                 .serve_voucher(payer.voucher(channel, 3 * STEP))
+                .await,
+            Ok(3 * STEP)
+        );
+        assert!(
+            service
+                .serve_voucher(payer.voucher(channel, 2 * STEP))
                 .await
                 .is_err(),
-            "stale voucher must be refused"
+            "lower voucher must be refused"
         );
         assert!(
             service

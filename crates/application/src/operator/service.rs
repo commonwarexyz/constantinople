@@ -76,8 +76,9 @@ impl Margins {
 
     /// Whether a channel expiring at `expiry` still has the registration
     /// runway required to serve and settle it safely.
-    const fn has_runway(&self, height: u64, expiry: u64) -> bool {
-        expiry > height.saturating_add(self.min_runway)
+    fn has_runway(&self, height: u64, expiry: u64) -> bool {
+        let required_runway = self.min_runway.max(self.settle_margin);
+        expiry > height.saturating_add(required_runway)
     }
 }
 
@@ -168,8 +169,7 @@ enum SettlementState {
 pub enum ServeError {
     /// The voucher signature did not verify against the payer's key.
     BadSignature,
-    /// The cumulative does not exceed the already-served total (a stale or
-    /// replayed voucher).
+    /// The cumulative is lower than the latest accepted voucher.
     Stale,
     /// The cumulative amount exceeds the channel's escrowed deposit (an
     /// over-claim the chain would reject).
@@ -190,6 +190,9 @@ pub struct MeterSnapshot {
 pub enum ConsumeOutcome {
     /// The chunk was paid for (within the debt limit); the meter advanced.
     Served(MeterSnapshot),
+    /// Serving would exceed the caller's content limit; the meter did not
+    /// advance.
+    ContentExhausted(MeterSnapshot),
     /// Serving would exceed the debt limit; a fresher voucher unblocks it.
     PaymentRequired(MeterSnapshot),
     /// Serving would exceed the deposit; no voucher can unblock it.
@@ -238,16 +241,33 @@ impl RegisteredChannel {
         }
     }
 
-    /// Meters `cost` stream tokens against the channel's credit.
+    /// Test convenience for metering without a content bound.
+    #[cfg(test)]
+    pub(crate) const fn consume(&mut self, cost: u64, debt_limit: u64) -> ConsumeOutcome {
+        self.consume_bounded(cost, debt_limit, u64::MAX)
+    }
+
+    /// Meters `cost` stream tokens without allowing the served total to
+    /// exceed `max_served`.
     ///
     /// Serving is allowed while the served total stays within `debt_limit`
-    /// of the paid cumulative (the latest voucher) and never exceeds the
-    /// deposit — tokens beyond the deposit could not be settled even with a
-    /// voucher in hand. Refusals do not advance the meter, so a `cost` of
+    /// of the paid cumulative (the latest voucher), below `max_served`, and
+    /// within the deposit. Refusals do not advance the meter, so a `cost` of
     /// zero is a free probe of the channel's credit.
-    pub(crate) const fn consume(&mut self, cost: u64, debt_limit: u64) -> ConsumeOutcome {
+    pub(crate) const fn consume_bounded(
+        &mut self,
+        cost: u64,
+        debt_limit: u64,
+        max_served: u64,
+    ) -> ConsumeOutcome {
         let paid = self.latest.cumulative;
         let next = self.served.saturating_add(cost);
+        if next > max_served {
+            return ConsumeOutcome::ContentExhausted(MeterSnapshot {
+                served: self.served,
+                paid,
+            });
+        }
         if next > self.deposit.get() {
             return ConsumeOutcome::DepositExhausted(MeterSnapshot {
                 served: self.served,
@@ -283,8 +303,16 @@ impl RegisteredChannel {
         if voucher.cumulative > self.deposit.get() {
             return Err(ServeError::Overdraft);
         }
-        if voucher.cumulative <= self.latest.cumulative {
+        if voucher.cumulative < self.latest.cumulative {
             return Err(ServeError::Stale);
+        }
+
+        // Posting a voucher is idempotent: the client may retry after the
+        // operator accepted it but its HTTP acknowledgement was lost. The
+        // signature was verified above, so an equal cumulative authorizes
+        // exactly the claim already retained.
+        if voucher.cumulative == self.latest.cumulative {
+            return Ok(voucher.cumulative);
         }
 
         let cumulative = voucher.cumulative;
@@ -641,10 +669,13 @@ where
         let state = &mut *guard;
         let registered =
             servable_channel(self.margins, height, &mut state.channels, &voucher.channel)?;
+        let replayed = voucher.cumulative == registered.latest.cumulative;
         let cumulative = registered
             .serve(voucher)
             .map_err(|error| OperatorError::rejected(format!("voucher rejected: {error:?}")))?;
-        state.vouchers_served += 1;
+        if !replayed {
+            state.vouchers_served += 1;
+        }
         Ok(cumulative)
     }
 
@@ -654,7 +685,7 @@ where
     /// Applies the same gates as voucher serving — the channel must be
     /// registered, its settlement not started, and its expiry far enough
     /// away — then the credit policy documented on the channel-level
-    /// `RegisteredChannel::consume`. Terminal channel states are errors;
+    /// `RegisteredChannel::consume_bounded`. Terminal channel states are errors;
     /// running out of credit is a [`ConsumeOutcome`], not an error, because
     /// the caller's next move differs (wait for a voucher vs. give up).
     pub async fn consume(
@@ -663,11 +694,27 @@ where
         cost: u64,
         debt_limit: u64,
     ) -> Result<ConsumeOutcome, OperatorError> {
+        self.consume_bounded(channel, cost, debt_limit, u64::MAX)
+            .await
+    }
+
+    /// Meters `cost` stream tokens while atomically enforcing a maximum
+    /// served total supplied by the content provider.
+    ///
+    /// The content bound is checked under the same state lock that advances
+    /// the meter, so concurrent streams cannot reserve the same final chunk.
+    pub async fn consume_bounded(
+        &self,
+        channel: &AccountKey,
+        cost: u64,
+        debt_limit: u64,
+        max_served: u64,
+    ) -> Result<ConsumeOutcome, OperatorError> {
         let height = self.height();
         let mut guard = self.state.lock().await;
         let state = &mut *guard;
         let registered = servable_channel(self.margins, height, &mut state.channels, channel)?;
-        let outcome = registered.consume(cost, debt_limit);
+        let outcome = registered.consume_bounded(cost, debt_limit, max_served);
         if matches!(outcome, ConsumeOutcome::Served(_)) {
             state.tokens_streamed = state.tokens_streamed.saturating_add(cost);
         }
@@ -1027,6 +1074,41 @@ mod tests {
     use super::*;
     use commonware_codec::FixedSize as _;
     use commonware_cryptography::Signer as _;
+    use commonware_runtime::{Runner as _, deterministic};
+    use futures::future::join_all;
+
+    #[derive(Clone, Copy)]
+    struct UnusedIo;
+
+    impl Relayer for UnusedIo {
+        async fn submit(&self, _tx: Tx) -> Result<SubmitOutcome, String> {
+            unreachable!("metering does not submit transactions")
+        }
+
+        async fn fetch_nonce(
+            &self,
+            _public_key: &TransactionPublicKey,
+        ) -> Result<Option<Nonce>, String> {
+            Ok(None)
+        }
+    }
+
+    impl ChainReader for UnusedIo {
+        async fn latest_height(&self) -> Result<Option<u64>, String> {
+            Ok(None)
+        }
+
+        async fn verify_open_channel(
+            &self,
+            _digest: &Digest,
+        ) -> Result<VerifiedOpenChannel, OperatorError> {
+            unreachable!("metering does not verify channel opens")
+        }
+
+        async fn is_finalized(&self, _digest: &Digest) -> Result<bool, String> {
+            unreachable!("metering does not inspect finality")
+        }
+    }
 
     /// A registered channel with deposit 50, plus the delegated voucher key
     /// that signs its vouchers.
@@ -1057,30 +1139,45 @@ mod tests {
     }
 
     #[test]
-    fn serves_strictly_increasing_vouchers() {
+    fn registration_runway_is_never_weaker_than_settle_margin() {
+        let margins = Margins {
+            min_runway: 2,
+            settle_margin: 10,
+        };
+
+        assert!(!margins.has_runway(100, 110));
+        assert!(margins.has_runway(100, 111));
+        assert_eq!(margins.expiry_phase(100, 111), ExpiryPhase::Serving);
+    }
+
+    #[test]
+    fn registration_runway_still_honors_larger_minimum() {
+        let margins = Margins {
+            min_runway: 10,
+            settle_margin: 2,
+        };
+
+        assert!(!margins.has_runway(100, 110));
+        assert!(margins.has_runway(100, 111));
+    }
+
+    #[test]
+    fn serves_increasing_vouchers() {
         let (payer, channel, mut registered) = metered_channel();
         for i in 1..=4u64 {
             let voucher = Voucher::sign(&payer, channel, i * 5);
             assert_eq!(registered.serve(voucher), Ok(i * 5));
         }
         assert_eq!(registered.latest.cumulative, 20);
-        // Each serve requires a strictly larger cumulative: replaying the
-        // last accepted voucher buys nothing.
-        assert_eq!(
-            registered.serve(Voucher::sign(&payer, channel, 20)),
-            Err(ServeError::Stale)
-        );
     }
 
     #[test]
-    fn rejects_stale_voucher() {
+    fn accepts_exact_replay_but_rejects_lower_voucher() {
         let (payer, channel, mut registered) = metered_channel();
         assert_eq!(registered.serve(Voucher::sign(&payer, channel, 10)), Ok(10));
-        // An equal or lower cumulative does not exceed the served total.
-        assert_eq!(
-            registered.serve(Voucher::sign(&payer, channel, 10)),
-            Err(ServeError::Stale)
-        );
+        // An exact retry can follow a lost acknowledgement and is a no-op.
+        assert_eq!(registered.serve(Voucher::sign(&payer, channel, 10)), Ok(10));
+        // Moving backward would replace the operator's stronger claim.
         assert_eq!(
             registered.serve(Voucher::sign(&payer, channel, 9)),
             Err(ServeError::Stale)
@@ -1185,6 +1282,103 @@ mod tests {
     }
 
     #[test]
+    fn bounded_consume_stops_at_content_limit_without_advancing() {
+        let (_payer, _channel, mut registered) = metered_channel();
+
+        assert_eq!(
+            registered.consume_bounded(3, 10, 3),
+            ConsumeOutcome::Served(MeterSnapshot { served: 3, paid: 0 })
+        );
+        assert_eq!(
+            registered.consume_bounded(1, 10, 3),
+            ConsumeOutcome::ContentExhausted(MeterSnapshot { served: 3, paid: 0 })
+        );
+        assert_eq!(
+            registered.consume(0, 10),
+            ConsumeOutcome::Served(MeterSnapshot { served: 3, paid: 0 })
+        );
+    }
+
+    #[test]
+    fn concurrent_bounded_consumes_reserve_each_chunk_once() {
+        deterministic::Runner::default().start(|context| async move {
+            let service = OperatorService::init(
+                context,
+                UnusedIo,
+                UnusedIo,
+                ed25519::PrivateKey::from_seed(99),
+                Margins {
+                    min_runway: 10,
+                    settle_margin: 5,
+                },
+            )
+            .await;
+            let (_payer, channel, registered) = metered_channel();
+            service
+                .state
+                .lock()
+                .await
+                .channels
+                .insert(channel, registered);
+
+            let outcomes =
+                join_all((0..8).map(|_| service.consume_bounded(&channel, 1, u64::MAX, 3))).await;
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, Ok(ConsumeOutcome::Served(_))))
+                    .count(),
+                3
+            );
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| {
+                        matches!(
+                            outcome,
+                            Ok(ConsumeOutcome::ContentExhausted(MeterSnapshot {
+                                served: 3,
+                                paid: 0
+                            }))
+                        )
+                    })
+                    .count(),
+                5
+            );
+            assert_eq!(service.stats().await.streamed, 3);
+        });
+    }
+
+    #[test]
+    fn voucher_replay_is_idempotent_and_not_counted_twice() {
+        deterministic::Runner::default().start(|context| async move {
+            let service = OperatorService::init(
+                context,
+                UnusedIo,
+                UnusedIo,
+                ed25519::PrivateKey::from_seed(99),
+                Margins {
+                    min_runway: 10,
+                    settle_margin: 5,
+                },
+            )
+            .await;
+            let (payer, channel, registered) = metered_channel();
+            service
+                .state
+                .lock()
+                .await
+                .channels
+                .insert(channel, registered);
+            let voucher = Voucher::sign(&payer, channel, 10);
+
+            assert_eq!(service.serve_voucher(voucher.clone()).await, Ok(10));
+            assert_eq!(service.serve_voucher(voucher).await, Ok(10));
+            assert_eq!(service.stats().await.vouchers, 1);
+        });
+    }
+
+    #[test]
     fn nonce_window_bounds_runahead_and_serializes_unaligned() {
         let mut state = OperatorState::new(0, true);
         fn reserve(state: &mut OperatorState) -> Option<u64> {
@@ -1280,8 +1474,12 @@ mod tests {
         assert_eq!(registered.settlement, SettlementState::Settling);
         assert_eq!(
             registered.serve(voucher),
-            Err(ServeError::Stale),
+            Ok(10),
             "duplicate registration must not reset the latest-voucher accounting"
+        );
+        assert_eq!(
+            registered.serve(Voucher::sign(&voucher_key, channel, 9)),
+            Err(ServeError::Stale)
         );
     }
 }

@@ -46,8 +46,8 @@ use commonware_parallel::Sequential;
 use constantinople_primitives::{
     AccountKey, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey, Voucher, channel_address,
     operator_api::{
-        OperatorError, PublicKeyResponse, RegisterRequest, SettleRequest, SettleResponse,
-        VoucherRequest,
+        OperatorError, PublicKeyResponse, RegisterRequest, RegisterResponse, SettleRequest,
+        SettleResponse, VoucherRequest,
     },
 };
 use core::num::NonZeroU64;
@@ -437,7 +437,7 @@ impl ChannelRunner {
         // ingested it yet. Retry through transient lag (503/transport); a 400
         // rejection will keep failing, so go straight to the timeout reclaim.
         let zero_voucher = Voucher::sign(&self.accounts[payer_i].private_key, channel, 0).signature;
-        let mut registered = false;
+        let mut capability = None;
         for attempt in 1..=REGISTRATION_ATTEMPTS {
             match self
                 .operator
@@ -445,8 +445,8 @@ impl ChannelRunner {
                 .register_channel(&open_tx_digest, &zero_voucher)
                 .await
             {
-                Ok(()) => {
-                    registered = true;
+                Ok(granted) => {
+                    capability = Some(granted);
                     break;
                 }
                 Err(error @ OperatorError::Rejected(_)) => {
@@ -459,10 +459,10 @@ impl ChannelRunner {
                 }
             }
         }
-        if !registered {
+        let Some(capability) = capability else {
             self.queue_reclaim(payer_i, open_nonce, expiry);
             return;
-        }
+        };
 
         let mut served = 0u64;
         for i in 1..=vouchers {
@@ -482,7 +482,12 @@ impl ChannelRunner {
             return;
         }
 
-        if let Err(error) = self.operator.client.settle_channel(channel).await {
+        if let Err(error) = self
+            .operator
+            .client
+            .settle_channel(channel, &capability)
+            .await
+        {
             warn!(%error, %channel, "operator settlement failed");
             self.queue_reclaim(payer_i, open_nonce, expiry);
             return;
@@ -718,13 +723,22 @@ impl OperatorClient {
         &self,
         open_tx_digest: &sha256::Digest,
         zero_voucher: &ed25519::Signature,
-    ) -> Result<(), OperatorError> {
-        self.post_json(
-            "/channels",
-            &RegisterRequest::new(open_tx_digest, zero_voucher),
-        )
-        .await
-        .map(|_| ())
+    ) -> Result<String, OperatorError> {
+        let body = self
+            .post_json(
+                "/channels",
+                &RegisterRequest::new(open_tx_digest, zero_voucher),
+            )
+            .await?;
+        let response: RegisterResponse = serde_json::from_slice(&body).map_err(|error| {
+            OperatorError::unavailable(format!("operator register response invalid: {error}"))
+        })?;
+        if response.capability.is_empty() {
+            return Err(OperatorError::unavailable(
+                "operator register response has an empty capability",
+            ));
+        }
+        Ok(response.capability)
     }
 
     async fn serve_voucher(&self, voucher: &Voucher) -> Result<(), String> {
@@ -734,9 +748,9 @@ impl OperatorClient {
             .map_err(|error| error.to_string())
     }
 
-    async fn settle_channel(&self, channel: AccountKey) -> Result<(), String> {
+    async fn settle_channel(&self, channel: AccountKey, capability: &str) -> Result<(), String> {
         let body = self
-            .post_json("/settle", &SettleRequest::new(&channel))
+            .post_json("/settle", &SettleRequest::new(&channel, capability))
             .await
             .map_err(|error| error.to_string())?;
         let settle: SettleResponse = serde_json::from_slice(&body)
