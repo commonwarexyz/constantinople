@@ -1,4 +1,4 @@
-use crate::tests::common::ValidatorState;
+use crate::tests::common::{RestartBarrier, ValidatorState};
 use commonware_cryptography::PublicKey;
 use commonware_glue::simulate::{
     exit::ExitCondition, property::Property, tracker::ProgressTracker,
@@ -83,6 +83,96 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState> for BlockAgre
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizedHeightAtLeast {
     height: u64,
+}
+
+#[derive(Clone)]
+pub(crate) struct RestartRecoveryComplete {
+    barrier: RestartBarrier,
+}
+
+impl RestartRecoveryComplete {
+    pub(crate) const fn new(barrier: RestartBarrier) -> Self {
+        Self { barrier }
+    }
+}
+
+impl<P: PublicKey> ExitCondition<P, ValidatorState> for RestartRecoveryComplete {
+    fn name(&self) -> &str {
+        "restart_recovery_complete"
+    }
+
+    fn requires_polling(&self) -> bool {
+        true
+    }
+
+    fn reached<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<P>,
+        states: &'a [&'a ValidatorState],
+        target_count: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
+        Box::pin(async move {
+            let recovered_finalized = self.barrier.recovered_finalized();
+            if recovered_finalized == 0 || self.barrier.observed_processed().is_none() {
+                return Ok(false);
+            }
+
+            let mut recovered = 0;
+            for state in states {
+                if state.processed_height().await >= recovered_finalized {
+                    recovered += 1;
+                }
+            }
+
+            Ok(recovered >= target_count)
+        })
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct RestartPreservesProcessedHeight {
+    barrier: RestartBarrier,
+}
+
+impl RestartPreservesProcessedHeight {
+    pub(crate) const fn new(barrier: RestartBarrier) -> Self {
+        Self { barrier }
+    }
+}
+
+impl Property<crate::tests::common::TestPublicKey, ValidatorState>
+    for RestartPreservesProcessedHeight
+{
+    fn name(&self) -> &str {
+        "restart_preserves_processed_height"
+    }
+
+    fn check<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<crate::tests::common::TestPublicKey>,
+        _states: &'a [&'a ValidatorState],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let recovered_finalized = self.barrier.recovered_finalized();
+            if recovered_finalized <= 1 {
+                return Err(format!(
+                    "restart recovered finalization {recovered_finalized}, expected a height above the held processed floor"
+                ));
+            }
+
+            let observed_processed = self
+                .barrier
+                .observed_processed()
+                .ok_or_else(|| "restart processed height was not observed".to_string())?;
+            if observed_processed != 0 {
+                return Err(format!(
+                    "restart moved processed height from 0 to {observed_processed} before acknowledgement; recovered finalization was {recovered_finalized}"
+                ));
+            }
+
+            Ok(())
+        })
+    }
 }
 
 impl FinalizedHeightAtLeast {

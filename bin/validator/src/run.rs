@@ -852,19 +852,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let startup = match startup {
             StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
-            StartupModeConfig::StateSync => {
-                let finalization = probe_mailbox
-                    .subscribe()
-                    .await
-                    .expect("probe actor exited before selecting a state-sync floor");
-                StartupMode::StateSync { finalization }
-            }
+            StartupModeConfig::StateSync => StartupMode::StateSync,
         };
         let startup_mode = match &startup {
             StartupMode::MarshalSync => "marshal_sync",
-            StartupMode::StateSync { .. } => "state_sync",
+            StartupMode::StateSync => "state_sync",
         };
-        info!(startup_mode, "selected validator startup mode");
+        info!(startup_mode, "requested validator startup mode");
 
         // Build the indexer wiring up-front. This consumes `indexer` from the
         // loaded config and returns `None` for primaries or validators that
