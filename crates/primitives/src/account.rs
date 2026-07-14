@@ -12,9 +12,6 @@ use commonware_utils::{Array, Span};
 use core::ops::Deref;
 use derive_more::{Debug, Display};
 
-/// Default starting balance for accounts that have not been written yet.
-pub const DEFAULT_ACCOUNT_BALANCE: u64 = 100;
-
 /// Number of future nonce uses tracked on each account.
 pub const NONCE_BITMAP_CAPACITY: u64 = u64::BITS as u64;
 
@@ -43,10 +40,16 @@ impl AccountKey {
                     .expect("ed25519 account-key slice has account-key length")
             }
             TransactionPublicKey::Secp256r1 { encoded } => {
-                Self::try_from(sha256::Sha256::hash(encoded).as_ref())
-                    .expect("sha256 digest has account-key length")
+                Self::from_digest(&sha256::Sha256::hash(encoded))
             }
         }
+    }
+
+    /// Creates an account key from a sha256 digest (the two are the same
+    /// width). This is how keyless accounts — hashed Secp256r1 accounts,
+    /// derived channel addresses — enter the account key space.
+    pub fn from_digest(digest: &sha256::Digest) -> Self {
+        Self::try_from(digest.as_ref()).expect("sha256 digest has account-key length")
     }
 
     /// Creates an account key from encoded transaction public-key bytes.
@@ -57,7 +60,7 @@ impl AccountKey {
 
         match bytes[0] {
             ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
-            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(bytes).as_ref()).ok(),
+            SECP256R1_SCHEME => Some(Self::from_digest(&sha256::Sha256::hash(bytes))),
             _ => None,
         }
     }
@@ -156,6 +159,16 @@ impl Nonce {
         *self = next;
         true
     }
+
+    /// Whether `nonce` has already been consumed by this account: below
+    /// [`Self::base`], or recorded in the run-ahead bitmap.
+    pub const fn is_consumed(&self, nonce: u64) -> bool {
+        if nonce < self.base {
+            return true;
+        }
+        let delta = nonce - self.base;
+        delta != 0 && delta <= NONCE_BITMAP_CAPACITY && self.bitmap & (1 << (delta - 1)) != 0
+    }
 }
 
 impl FixedSize for Nonce {
@@ -181,7 +194,11 @@ impl Read for Nonce {
 }
 
 /// An account, as represented in the state of the chain.
-#[derive(Debug, Display, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+///
+/// An account that has never been written reads as the default: empty. There
+/// is no implicit starting balance — tokens enter circulation only through
+/// explicit [`crate::Operation::Mint`] transactions.
+#[derive(Debug, Display, Default, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(any(feature = "arbitrary", test), derive(arbitrary::Arbitrary))]
 #[display("Account {{ balance: {}, nonce: {} }}", balance, nonce)]
 pub struct Account {
@@ -190,15 +207,6 @@ pub struct Account {
     pub balance: u64,
     /// Consumed and run-ahead transaction nonce state.
     pub nonce: Nonce,
-}
-
-impl Default for Account {
-    fn default() -> Self {
-        Self {
-            balance: DEFAULT_ACCOUNT_BALANCE,
-            nonce: Nonce::default(),
-        }
-    }
 }
 
 impl FixedSize for Account {
@@ -275,6 +283,23 @@ mod tests {
     };
 
     #[test]
+    fn is_consumed_covers_base_and_bitmap() {
+        // Bit 0 records base + 1, bit 63 records base + 64.
+        let nonce = Nonce::new(10, 0b101);
+        assert!(nonce.is_consumed(9), "below base is stale");
+        assert!(!nonce.is_consumed(10), "base itself is the next free nonce");
+        assert!(nonce.is_consumed(11), "bit 0 set");
+        assert!(!nonce.is_consumed(12), "bit 1 clear");
+        assert!(nonce.is_consumed(13), "bit 2 set");
+        assert!(
+            !nonce.is_consumed(10 + NONCE_BITMAP_CAPACITY + 1),
+            "beyond the run-ahead window is unrecorded"
+        );
+        let full = Nonce::new(10, u64::MAX);
+        assert!(full.is_consumed(10 + NONCE_BITMAP_CAPACITY), "bit 63 set");
+    }
+
+    #[test]
     fn account_key_roundtrip_does_not_validate_public_key() {
         let mut raw = vec![0u8; AccountKey::SIZE];
         raw[0] = 1;
@@ -323,11 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn account_default_starts_funded() {
+    fn account_default_starts_empty() {
         assert_eq!(
             Account::default(),
             Account {
-                balance: DEFAULT_ACCOUNT_BALANCE,
+                balance: 0,
                 nonce: Nonce::default(),
             }
         );

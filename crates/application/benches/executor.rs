@@ -148,7 +148,7 @@ impl TestSigner {
     }
 
     fn sign(&self, to: ed25519::PublicKey, value: u64, nonce: u64) -> TestTransaction {
-        Transaction::new(
+        Transaction::transfer(
             TransactionPublicKey::ed25519(self.key.public_key()),
             TransactionPublicKey::ed25519(to),
             NonZeroU64::new(value).expect("bench value must be non-zero"),

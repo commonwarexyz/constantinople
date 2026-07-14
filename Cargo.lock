@@ -1718,6 +1718,7 @@ dependencies = [
  "commonware-formatting",
  "commonware-math",
  "commonware-utils",
+ "constantinople-primitives",
  "mimalloc",
  "rand_core 0.6.4",
  "serde",
@@ -1795,6 +1796,7 @@ dependencies = [
  "rand 0.8.6",
  "rand_core 0.6.4",
  "serde",
+ "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",
@@ -1837,6 +1839,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "constantinople-operator"
+version = "0.0.0"
+dependencies = [
+ "axum",
+ "clap",
+ "commonware-codec",
+ "commonware-cryptography",
+ "commonware-deployer",
+ "commonware-formatting",
+ "commonware-runtime",
+ "commonware-storage",
+ "constantinople-application",
+ "constantinople-engine",
+ "constantinople-indexer",
+ "constantinople-mempool",
+ "constantinople-primitives",
+ "exoware-qmdb",
+ "exoware-sdk",
+ "futures",
+ "rand_core 0.6.4",
+ "serde",
+ "serde_yaml",
+ "tokio",
+ "tower-http 0.6.11",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "constantinople-primitives"
 version = "0.0.0"
 dependencies = [
@@ -1854,6 +1885,7 @@ dependencies = [
  "p256",
  "rand 0.8.6",
  "rand_core 0.6.4",
+ "serde",
  "serde_json",
 ]
 

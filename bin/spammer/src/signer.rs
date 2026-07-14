@@ -11,6 +11,38 @@ use core::num::NonZeroU64;
 /// Concrete signed transaction type.
 pub type Tx = SignedTransaction<Sha256>;
 
+/// Number of mints per warm-up batch, matching a comfortable submit size.
+const MINT_BATCH_SIZE: usize = 4096;
+
+/// Signs the warm-up mint batches for an account ring.
+///
+/// Accounts start empty (the chain has no implicit balance), so every ring
+/// account's first transaction — nonce 0 — mints its working funds. Callers
+/// submit these before any spend and start subsequent nonces at 1.
+pub fn sign_mint_batches<St: Strategy>(
+    strategy: &St,
+    accounts: &[SpamAccount],
+    amount: NonZeroU64,
+) -> Vec<Vec<Tx>> {
+    accounts
+        .chunks(MINT_BATCH_SIZE)
+        .map(|chunk| {
+            strategy.map_collect_vec(chunk.iter(), |account| {
+                Transaction::mint(
+                    TransactionPublicKey::ed25519(account.public_key.clone()),
+                    amount,
+                    0,
+                )
+                .seal_and_sign(
+                    &account.private_key,
+                    TRANSACTION_NAMESPACE,
+                    &mut Sha256::default(),
+                )
+            })
+        })
+        .collect()
+}
+
 /// Signs one transaction for a single sender in the ring.
 fn sign_one(
     sender: &SpamAccount,
@@ -18,7 +50,7 @@ fn sign_one(
     value: NonZeroU64,
     nonce: u64,
 ) -> Tx {
-    let tx = Transaction::new(
+    let tx = Transaction::transfer(
         TransactionPublicKey::ed25519(sender.public_key.clone()),
         TransactionPublicKey::ed25519(recipient.clone()),
         value,

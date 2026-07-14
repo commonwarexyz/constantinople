@@ -1,3 +1,5 @@
+import { trimTrailingSlash } from './util.js';
+
 export interface HistoryScope {
     readonly indexerUrl: string;
     readonly qmdbUrl: string;
@@ -26,5 +28,5 @@ export function submittedTransactionHistoryKey(
 }
 
 function normalizeScopeValue(value: string): string {
-    return encodeURIComponent(value.trim().replace(/\/+$/, '').toLowerCase());
+    return encodeURIComponent(trimTrailingSlash(value.trim()).toLowerCase());
 }

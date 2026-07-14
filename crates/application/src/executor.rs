@@ -20,14 +20,14 @@
 //! and written once. A sender spends only the balance it held at the start of the
 //! block, never funds credited to it within the same block.
 //!
-//! Execution is all or nothing: if any transfer fails its nonce or balance check
-//! or overflows its recipient, the whole batch is rejected. Because a successful
-//! batch has no failed debits, every loaded account effect produces one final
-//! write.
+//! Execution is all or nothing: if any transfer fails its nonce or balance
+//! check, the whole batch is rejected. Recipient credits cannot fail — they
+//! saturate at `u64::MAX` (see `saturating_credit`) — so a successful batch
+//! has no failed effects and every loaded account produces one final write.
 
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey, Operation, SignedTransaction};
 use core::marker::PhantomData;
 
 /// Fully loaded base account state for one in-memory execution batch.
@@ -101,13 +101,16 @@ where
 {
     let transfer = transaction.value();
     let sender = AccountKey::from_public_key(transfer.sender_lazy().get()?);
-    let recipient = transfer.to;
+    let Operation::Transfer { to, value } = transfer.op() else {
+        return None;
+    };
+    let recipient = *to;
     Some(PreparedTransfer {
         sender,
         recipient,
         sender_prefix: sender.prefix(),
         recipient_prefix: recipient.prefix(),
-        value: transfer.value.get(),
+        value: value.get(),
         nonce: transfer.nonce,
     })
 }
@@ -292,9 +295,13 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<Execution
         if transfer.sender == transfer.recipient {
             sender.self_transfer_floor = sender.self_transfer_floor.max(transfer.value);
         } else {
+            // The debit total stays checked: overflowing it requires the
+            // sender to sign transfers totaling more than `u64::MAX`, which no
+            // balance can cover, so rejecting the batch only punishes the
+            // signer. The credit total saturates like the credit itself.
             sender.debit = sender.debit.checked_add(transfer.value)?;
             let recipient = general.account(transfer.recipient_prefix, &transfer.recipient);
-            recipient.credit = recipient.credit.checked_add(transfer.value)?;
+            recipient.credit = recipient.credit.saturating_add(transfer.value);
         }
     }
 
@@ -310,10 +317,20 @@ pub(crate) fn execution_plan(transfers: &[PreparedTransfer]) -> Option<Execution
     })
 }
 
-/// Applies one credit to an account.
-pub(crate) fn apply_credit(account: &mut Account, value: u64) -> Option<()> {
-    account.balance = account.balance.checked_add(value)?;
-    Some(())
+/// Credits an account, saturating at `u64::MAX`.
+///
+/// This is the chain's one credit policy, shared by the transfer and channel
+/// lanes. Credits must never fail on the recipient's balance: mints are
+/// permissionless, so a third party can inflate any account (mint to self,
+/// transfer out) — the per-mint cap and the chain's bounded throughput make
+/// `u64::MAX` practically unreachable, but the executor must not rely on
+/// that. A checked credit would let a saturated balance become a grief
+/// vector: any batch paying the saturated account would be rejected whole,
+/// and every close paying a saturated receiver (or the operator's
+/// nonce-burning `Mint(1)`) would fail forever. The saturated excess is
+/// forfeited, which costs nothing on a chain where anyone can mint.
+pub(crate) const fn saturating_credit(account: &mut Account, value: u64) {
+    account.balance = account.balance.saturating_add(value);
 }
 
 /// Applies account-owned effects to loaded accounts.
@@ -343,7 +360,7 @@ pub(crate) fn apply_general_accounts(
             return None;
         }
         account.balance -= effect.debit;
-        apply_credit(&mut account, effect.credit)?;
+        saturating_credit(&mut account, effect.credit);
         writes.push((**key, account));
     }
     Some(writes)
@@ -369,7 +386,7 @@ fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Change
             continue;
         }
         let mut recipient = state.get(&transfer.recipient).copied().unwrap_or_default();
-        apply_credit(&mut recipient, transfer.value)?;
+        saturating_credit(&mut recipient, transfer.value);
         changeset.push((transfer.recipient, recipient));
     }
 
@@ -379,7 +396,7 @@ fn execute_discrete(state: &State, plan: &DiscreteWorkload<'_>) -> Option<Change
 /// Computes a batch changeset against an in-memory base state.
 ///
 /// Returns the sorted changeset, or `None` if any transfer fails its nonce or
-/// balance check or any recipient credit overflows.
+/// balance check.
 pub fn compute(state: &State, transfers: &[PreparedTransfer]) -> Option<Changeset> {
     let plan = execution_plan(transfers)?;
     let mut changeset = execute_discrete(state, &plan.discrete)?;

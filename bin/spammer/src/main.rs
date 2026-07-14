@@ -8,19 +8,21 @@
 //! latency without queueing multiple batches at a proposer.
 
 mod accounts;
+mod channels;
 mod cli;
 mod config;
 mod signer;
 mod submitter;
 
 use accounts::{SpamAccount, generate_accounts};
+use channels::{LifecyclePool, OperatorClient, OperatorContext};
 use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
-use commonware_utils::NZUsize;
-use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
+use commonware_utils::{NZU64, NZUsize};
+use constantinople_primitives::{AccountKey, Operation, TransactionPublicKey};
 use core::num::NonZeroU64;
-use signer::{Tx, sign_batch};
+use signer::{Tx, sign_batch, sign_mint_batches};
 use std::{
     sync::{Arc, atomic::Ordering},
     time::Instant,
@@ -36,17 +38,8 @@ fn main() {
     let cli = Cli::parse();
 
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
-    let (
-        accounts_count,
-        value,
-        seed_offset,
-        relayer_url,
-        relayer_submitters,
-        presigned_batches,
-        primary_validators,
-        rayon_threads,
-        accounts_jitter,
-    ) = if let Some(config_path) = &cli.config {
+    let hosts = cli.hosts.as_deref().map(config::load_hosts);
+    let (config, rayon_threads) = if let Some(config_path) = &cli.config {
         let cfg = config::load_config(config_path);
         let relayer_submitters = if cfg.relayer_submitters == 0 {
             cfg.primary_validators.len().max(1)
@@ -54,49 +47,83 @@ fn main() {
             cfg.relayer_submitters
         };
         (
-            cfg.accounts,
-            cfg.value,
-            cfg.seed_offset,
-            config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
-            relayer_submitters,
-            cfg.presigned_batches,
-            if cfg.primary_validators.is_empty() {
-                cli.relayer_targets.clone()
-            } else {
-                cfg.primary_validators
+            RelayerModeConfig {
+                relayer_url: config::resolve_named_http_url(&cfg.relayer_url, hosts.as_ref()),
+                accounts_count: cfg.accounts,
+                value: NonZeroU64::new(cfg.value).expect("transfer value must be > 0"),
+                seed_offset: cfg.seed_offset,
+                accounts_jitter: cfg.accounts_jitter,
+                relayer_submitters,
+                presigned_batches: cfg.presigned_batches,
+                relayer_targets: if cfg.primary_validators.is_empty() {
+                    cli.relayer_targets.clone()
+                } else {
+                    cfg.primary_validators
+                },
+                channel_fraction: cfg.channel_fraction,
+                channel_operator_url: cfg
+                    .channel_operator_url
+                    .map(|url| config::resolve_named_http_url(&url, hosts.as_ref())),
+                channel_vouchers: cfg.channel_vouchers,
             },
             cfg.rayon_threads,
-            cfg.accounts_jitter,
         )
     } else {
         (
-            cli.accounts,
-            cli.value,
-            cli.seed_offset,
-            cli.relayer_url
-                .clone()
-                .expect("provide --relayer-url or --config"),
-            cli.relayer_submitters.max(1),
-            cli.presigned_batches,
-            cli.relayer_targets.clone(),
+            RelayerModeConfig {
+                relayer_url: cli
+                    .relayer_url
+                    .clone()
+                    .expect("provide --relayer-url or --config"),
+                accounts_count: cli.accounts,
+                value: NonZeroU64::new(cli.value).expect("transfer value must be > 0"),
+                seed_offset: cli.seed_offset,
+                accounts_jitter: cli.accounts_jitter,
+                relayer_submitters: cli.relayer_submitters.max(1),
+                presigned_batches: cli.presigned_batches,
+                relayer_targets: cli.relayer_targets.clone(),
+                channel_fraction: cli.channel_fraction,
+                channel_operator_url: cli.channel_operator_url.clone(),
+                channel_vouchers: cli.channel_vouchers,
+            },
             cli.rayon_threads,
-            cli.accounts_jitter,
         )
     };
     assert!(
-        (0.0..=1.0).contains(&accounts_jitter),
+        (0.0..=1.0).contains(&config.accounts_jitter),
         "--accounts-jitter must be between 0 and 1"
     );
-    assert!(presigned_batches > 0, "--presigned-batches must be > 0");
+    assert!(
+        config.presigned_batches > 0,
+        "--presigned-batches must be > 0"
+    );
+    assert!(
+        (0.0..=1.0).contains(&config.channel_fraction),
+        "--channel-fraction must be between 0 and 1"
+    );
+    assert!(
+        config.channel_vouchers >= 1,
+        "--channel-vouchers must be >= 1"
+    );
 
     // Validate parameters.
-    assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
-    assert!(value > 0, "transfer value must be > 0");
     assert!(
-        value <= DEFAULT_ACCOUNT_BALANCE,
-        "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
+        config.accounts_count >= 2,
+        "need at least 2 accounts for a ring"
     );
-    let value = NonZeroU64::new(value).expect("checked above");
+    let value = config.value.get();
+    assert!(
+        value <= RING_MINT_AMOUNT.get(),
+        "transfer value ({value}) must be <= RING_MINT_AMOUNT ({RING_MINT_AMOUNT})"
+    );
+    if config.channel_fraction > 0.0 {
+        assert!(
+            config.channel_operator_url.is_some(),
+            "--channel-fraction > 0 requires --channel-operator-url"
+        );
+        // Each voucher steps the cumulative by --value; deposits scale with it.
+        assert_channel_deposit_fits(config.channel_vouchers, value);
+    }
 
     let runtime_cfg = commonware_runtime::tokio::Config::default();
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
@@ -118,19 +145,16 @@ fn main() {
             .create_strategy(NZUsize!(rayon_threads))
             .expect("failed to create parallel strategy");
 
-        let config = RelayerModeConfig {
-            relayer_url,
-            accounts_count,
-            value,
-            seed_offset,
-            accounts_jitter,
-            relayer_submitters,
-            presigned_batches,
-            relayer_targets: primary_validators,
-        };
         run_relayer_mode(config, strategy).await;
     });
 }
+
+/// Amount every ring account mints for itself during warm-up: the largest
+/// mint a single transaction may carry. Accounts start empty, so this is the
+/// working balance for both the transfer ring (which is roughly flow-neutral)
+/// and the channel ring (which drains by the settled cumulative per lifecycle
+/// — this funds a very long run).
+pub(crate) const RING_MINT_AMOUNT: NonZeroU64 = NZU64!(Operation::MAX_MINT_AMOUNT);
 
 struct RelayerModeConfig {
     relayer_url: String,
@@ -141,6 +165,14 @@ struct RelayerModeConfig {
     relayer_submitters: usize,
     presigned_batches: usize,
     relayer_targets: Vec<String>,
+    /// Probability that a submitter iteration starts a (concurrently run)
+    /// channel lifecycle instead of submitting a transfer batch. `0` disables
+    /// channels.
+    channel_fraction: f64,
+    /// Operator URL used for payment-channel voucher serving and settlement.
+    channel_operator_url: Option<String>,
+    /// Average off-chain vouchers streamed per channel before settling.
+    channel_vouchers: u64,
 }
 
 async fn run_relayer_mode(
@@ -156,6 +188,9 @@ async fn run_relayer_mode(
         relayer_submitters,
         presigned_batches,
         relayer_targets,
+        channel_fraction,
+        channel_operator_url,
+        channel_vouchers,
     } = config;
 
     info!(
@@ -166,27 +201,120 @@ async fn run_relayer_mode(
         accounts_jitter,
         %relayer_url,
         presigned_batches,
+        channel_fraction,
+        channel_operator_url = channel_operator_url.as_deref().unwrap_or(""),
+        channel_vouchers,
         "starting spammer relayer mode"
     );
 
     let stats = Arc::new(Stats::new());
     let start = Instant::now();
+    let operator = match channel_operator_url {
+        Some(url) if channel_fraction > 0.0 => {
+            let client = OperatorClient::new(url);
+            let (public_key, advertised) = loop {
+                match client.public_key().await {
+                    Ok(response) => break response,
+                    Err(error) => {
+                        tracing::warn!(%error, "operator public key unavailable, retrying");
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                    }
+                }
+            };
+            // Seed the fleet-wide height so the first channel expiries are
+            // sane before any submission has finalized.
+            stats.height.fetch_max(advertised.height, Ordering::Relaxed);
+            Some(OperatorContext {
+                client,
+                account: AccountKey::from_public_key(&public_key),
+                // Channel expiries derive from the operator's advertised
+                // margins so the two cannot drift apart on what "enough
+                // runway" means.
+                expiry_runway: channels::channel_expiry_runway(&advertised),
+                voucher_value: value.get(),
+            })
+        }
+        _ => None,
+    };
 
+    assert_seed_ranges_disjoint(relayer_submitters, accounts_count);
     for index in 0..relayer_submitters {
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
-        let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         let strategy = strategy.clone();
-        let batches = spawn_presigner(
-            strategy,
-            accounts,
-            value,
-            accounts_jitter,
-            account_offset,
-            presigned_batches,
-        );
-        tokio::spawn(submit_presigned_batches(submitter, batches));
+        // Channels use their own account ring (a disjoint seed range) so their
+        // nonces never collide with the transfer presigner's accounts.
+        let channel_offset = channel_account_offset(seed_offset, index, accounts_count);
+        let operator = operator.clone();
+        let operator_account = operator.as_ref().map(|operator| operator.account);
+        let stats = stats.clone();
+        tokio::spawn(async move {
+            // Generate the rings and sign the warm-up mints inside the task so
+            // each submitter's keygen and signing run concurrently instead of
+            // serializing startup — on the blocking pool (like the presigner)
+            // so a large ring cannot pin this Tokio worker.
+            let sign_strategy = strategy.clone();
+            let channels_enabled = operator.is_some();
+            let (accounts, mint_batches, channel_accounts) =
+                tokio::task::spawn_blocking(move || {
+                    let accounts = generate_accounts(accounts_count, account_offset);
+                    // Accounts start empty; every account's first transaction
+                    // (nonce 0) mints its working balance. These land before
+                    // any transfer spends.
+                    let mint_batches =
+                        sign_mint_batches(&sign_strategy, &accounts, RING_MINT_AMOUNT);
+                    let channel_accounts =
+                        channels_enabled.then(|| generate_accounts(accounts_count, channel_offset));
+                    // The spammer holds the operator's actual account (it
+                    // names it in every channel address), so a ring that
+                    // generated the operator's key would spend its nonces and
+                    // balance out from under it.
+                    if let Some(operator_account) = operator_account {
+                        assert_no_operator_account_collision(&accounts, &operator_account);
+                        if let Some(channel_accounts) = &channel_accounts {
+                            assert_no_operator_account_collision(
+                                channel_accounts,
+                                &operator_account,
+                            );
+                        }
+                    }
+                    (accounts, mint_batches, channel_accounts)
+                })
+                .await
+                .expect("spammer warm-up signing panicked");
+            let batches = spawn_presigner(
+                strategy,
+                accounts,
+                value,
+                accounts_jitter,
+                account_offset,
+                presigned_batches,
+            );
+            let lifecycles = operator.as_ref().zip(channel_accounts).map_or_else(
+                LifecyclePool::disabled,
+                |(operator, accounts)| {
+                    LifecyclePool::split(
+                        accounts,
+                        operator.clone(),
+                        channel_vouchers,
+                        channel_offset,
+                        &stats,
+                    )
+                },
+            );
+            run_submitter(
+                submitter,
+                mint_batches,
+                batches,
+                lifecycles,
+                channel_fraction,
+                // Distinct seed from the runners' own voucher-count RNGs so
+                // the channel/transfer coin flip is an independent stream.
+                JitterRng::new(channel_offset.wrapping_add(1)),
+            )
+            .await;
+        });
     }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -196,6 +324,8 @@ async fn run_relayer_mode(
         let filtered = stats.filtered.load(Ordering::Relaxed);
         let dropped = stats.dropped.load(Ordering::Relaxed);
         let errors = stats.errors.load(Ordering::Relaxed);
+        let channel_txs = stats.channel_txs.load(Ordering::Relaxed);
+        let vouchers = stats.vouchers.load(Ordering::Relaxed);
         let elapsed = start.elapsed().as_secs_f64();
         let tps = if elapsed > 0.0 {
             finalized as f64 / elapsed
@@ -207,6 +337,8 @@ async fn run_relayer_mode(
             filtered,
             dropped,
             errors,
+            channel_txs,
+            vouchers,
             tps = format!("{tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"
@@ -230,7 +362,8 @@ where
     // worker threads; `sign_batch` uses the shared Rayon strategy for CPU parallelism.
     tokio::task::spawn_blocking(move || {
         let mut rng = JitterRng::new(account_offset.wrapping_add(1));
-        let mut nonces = vec![0; accounts.len()];
+        // Nonce 0 of every account is its warm-up mint; transfers follow.
+        let mut nonces = vec![1; accounts.len()];
         let mut cursor = 0;
 
         loop {
@@ -251,13 +384,100 @@ where
     receiver
 }
 
-async fn submit_presigned_batches(
+/// Drives one submitter: each iteration either starts a channel lifecycle
+/// (with probability `channel_fraction`, when the pool has runners) or
+/// submits the next presigned transfer batch. Lifecycles run concurrently in
+/// the pool — most of their wall-clock is off-chain — so transfers keep
+/// landing while several channels open, stream, and settle in staggered
+/// phases. The runners count their progress directly in the shared stats.
+async fn run_submitter(
     submitter: RelayerSubmitter,
+    mint_batches: Vec<Vec<Tx>>,
     mut batches: mpsc::Receiver<Vec<Tx>>,
+    mut lifecycles: LifecyclePool,
+    channel_fraction: f64,
+    mut rng: JitterRng,
 ) {
-    while let Some(batch) = batches.recv().await {
-        submitter.submit(batch).await;
+    // Warm-up: land the ring's funding mints before any transfer spends — an
+    // unfunded account would poison every later transfer batch it appears in.
+    // (Each lifecycle runner warms its own slice on its first run.)
+    submitter.land_mints(mint_batches).await;
+
+    loop {
+        // When the draw picks channels but every runner is already
+        // mid-lifecycle (the steady state), fall through to the transfer
+        // batch instead of idling — sleeping here would deflate transfer
+        // TPS by roughly the channel fraction.
+        if !lifecycles.is_empty()
+            && rng.bernoulli(channel_fraction)
+            && lifecycles.fill(&submitter) > 0
+        {
+            continue;
+        }
+        match batches.recv().await {
+            Some(batch) => submitter.submit(batch).await,
+            None => return,
+        }
     }
+}
+
+/// Seed-space gap between the transfer rings and the channel rings. Both must
+/// also stay below the operator's settling key (seed 2_000_000_000 by default
+/// in bin/operator), which no ring approaches at any realistic fleet size.
+const CHANNEL_SEED_BASE: u64 = 1_000_000_000;
+
+/// Seed offset for a submitter's channel account ring. Placed far above the
+/// transfer accounts' range (`seed_offset + index * accounts`) so the two never
+/// share keys; [`assert_seed_ranges_disjoint`] enforces the "far above".
+fn channel_account_offset(seed_offset: u64, index: usize, accounts: u32) -> u64 {
+    seed_offset
+        .saturating_add(CHANNEL_SEED_BASE)
+        .saturating_add((index as u64).saturating_mul(u64::from(accounts)))
+}
+
+/// Panics if the fleet's transfer rings would reach into the channel rings'
+/// seed range (they start [`CHANNEL_SEED_BASE`] above the transfer base).
+fn assert_seed_ranges_disjoint(submitters: usize, accounts: u32) {
+    assert!(
+        (submitters as u64).saturating_mul(u64::from(accounts)) <= CHANNEL_SEED_BASE,
+        "transfer ring seeds would overlap the channel rings"
+    );
+}
+
+/// Panics if a generated spam account is the operator's own settling account:
+/// the operator's seed (bin/operator's `--operator-seed`, default
+/// 2_000_000_000) must stay outside every ring's seed range, or the spammer
+/// would spend the operator's nonces and balance out from under it.
+fn assert_no_operator_account_collision(accounts: &[SpamAccount], operator: &AccountKey) {
+    for account in accounts {
+        let key =
+            AccountKey::from_public_key(&TransactionPublicKey::ed25519(account.public_key.clone()));
+        assert!(
+            key != *operator,
+            "spam account {key} is the operator's settling account; \
+             the ring's seed range overlaps the operator's seed \
+             (adjust --seed-offset or the operator's --operator-seed)"
+        );
+    }
+}
+
+/// Panics if the peak channel deposit exceeds the minted working balance.
+///
+/// A channel's deposit is `vouchers * value` and is debited from the payer up
+/// front; the jittered count peaks at `avg + avg/2` plus the refund slack.
+/// Keeping the peak deposit within the minted balance means opens don't fail
+/// outright.
+fn assert_channel_deposit_fits(channel_vouchers: u64, value: u64) {
+    let max_vouchers = channel_vouchers
+        .saturating_add(channel_vouchers / 2)
+        .saturating_add(channels::MAX_REFUND_VOUCHERS);
+    let max_deposit = max_vouchers.saturating_mul(value);
+    assert!(
+        max_deposit <= RING_MINT_AMOUNT.get(),
+        "channel deposit (up to {max_vouchers} vouchers x value {value} = {max_deposit}) \
+         must be <= RING_MINT_AMOUNT ({RING_MINT_AMOUNT}); \
+         lower --channel-vouchers or --value"
+    );
 }
 
 fn jittered_batch_size(accounts: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {
@@ -314,6 +534,18 @@ impl JitterRng {
         debug_assert!(lo <= hi);
         let span = (hi - lo) as u64 + 1;
         lo + (self.next_u64() % span) as usize
+    }
+
+    /// Returns `true` with probability `p` (clamped to `0..=1`).
+    fn bernoulli(&mut self, p: f64) -> bool {
+        if p <= 0.0 {
+            return false;
+        }
+        if p >= 1.0 {
+            return true;
+        }
+        // Map the draw into the unit interval; xorshift quality is ample here.
+        (self.next_u64() as f64) / (u64::MAX as f64) < p
     }
 }
 
@@ -412,8 +644,10 @@ mod tests {
         let mut batches =
             spawn_presigner(Sequential, accounts, value, 0.0, 1000, presigned_batches);
 
+        // Nonce 0 of every account is reserved for its warm-up mint, so the
+        // presigner's transfers start at nonce 1.
         let first = batches.recv().await.expect("first batch should be signed");
-        assert_eq!(batch_nonces(&first), vec![0, 0, 0]);
+        assert_eq!(batch_nonces(&first), vec![1, 1, 1]);
 
         wait_for_presigned_batches(&batches, presigned_batches).await;
         assert_eq!(batches.len(), presigned_batches);
@@ -422,7 +656,7 @@ mod tests {
         assert_eq!(batches.len(), presigned_batches);
 
         let second = batches.recv().await.expect("second batch should be ready");
-        assert_eq!(batch_nonces(&second), vec![1, 1, 1]);
+        assert_eq!(batch_nonces(&second), vec![2, 2, 2]);
     }
 
     async fn wait_for_presigned_batches(

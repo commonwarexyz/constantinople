@@ -33,7 +33,8 @@ pub struct Cli {
     #[arg(long, default_value_t = 10)]
     pub accounts: u32,
 
-    /// Value to transfer per transaction (must be > 0 and <= 100).
+    /// Value to transfer per transaction (must be > 0 and <= the warm-up
+    /// mint amount every ring account starts with, RING_MINT_AMOUNT).
     #[arg(long, default_value_t = 1)]
     pub value: u64,
 
@@ -49,16 +50,35 @@ pub struct Cli {
     ///
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per
     /// batch. Must be in `0..=1`.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
     pub accounts_jitter: f64,
+
+    /// Fraction of submitter iterations that start a payment-channel
+    /// lifecycle (open -> stream off-chain vouchers -> close) instead of
+    /// submitting a transfer batch. Lifecycles run concurrently, so transfers
+    /// keep flowing while channels open and settle. `0` (default) disables
+    /// channels. Must be in `0..=1`.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
+    pub channel_fraction: f64,
+
+    /// Operator base URL for payment-channel voucher serving and settlement.
+    #[arg(long)]
+    pub channel_operator_url: Option<String>,
+
+    /// Average number of off-chain vouchers streamed per channel before it is
+    /// settled — the per-channel payment count. Must be >= 1.
+    #[arg(long, default_value_t = crate::config::DEFAULT_CHANNEL_VOUCHERS, value_parser = clap::value_parser!(u64).range(1..))]
+    pub channel_vouchers: u64,
 }
 
-fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
+/// Parses a fraction in `0..=1` (shared by `--accounts-jitter` and
+/// `--channel-fraction`).
+fn parse_unit_fraction(value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
-        .map_err(|error| format!("invalid jitter: {error}"))?;
+        .map_err(|error| format!("invalid fraction: {error}"))?;
     if !(0.0..=1.0).contains(&parsed) {
-        return Err("jitter must be between 0 and 1".to_string());
+        return Err("must be between 0 and 1".to_string());
     }
     Ok(parsed)
 }

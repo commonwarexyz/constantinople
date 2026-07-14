@@ -1,4 +1,4 @@
-import { fromHex, toArrayBuffer, toHex } from './codec';
+import { assertByteLength, fromHex, toArrayBuffer, toHex } from './codec';
 
 const META_STORAGE_KEY = 'constantinople.wallets.v1';
 const SESSION_STORAGE_KEY = 'constantinople.session.v1';
@@ -21,10 +21,6 @@ export interface WalletProfile {
 export interface ActiveWallet extends WalletProfile {
     readonly publicKey: Uint8Array;
     readonly sign: (message: Uint8Array) => Promise<Uint8Array>;
-}
-
-export function listWallets(): WalletProfile[] {
-    return readProfiles().sort((a, b) => b.createdAt - a.createdAt);
 }
 
 export function readSession(): string | null {
@@ -361,12 +357,6 @@ function decodeBase64Url(value: string): ArrayBuffer {
         bytes[i] = raw.charCodeAt(i);
     }
     return bytes.buffer;
-}
-
-function assertByteLength(bytes: Uint8Array, expected: number, label: string) {
-    if (bytes.length !== expected) {
-        throw new Error(`${label} must be ${expected} bytes`);
-    }
 }
 
 function writeU16Be(bytes: Uint8Array, offset: number, value: number) {

@@ -21,7 +21,9 @@
         "src/codec.ts",
         "src/historyKey.ts",
         "src/nonce.ts",
+        "src/paidStream.ts",
         "src/proofMath.ts",
-        "src/proofRetry.ts"
+        "src/proofRetry.ts",
+        "src/sqlContract.ts"
     ]
 }

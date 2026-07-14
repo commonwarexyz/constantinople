@@ -35,46 +35,10 @@ export function collectLiveBlocks<T extends HeightedBlock>(
         if (cursor.latestHeight === null || block.height > cursor.latestHeight) {
             cursor.latestHeight = block.height;
         }
-        addIfNew(cursor, next, block);
+        rememberHeight(cursor, block.height);
+        next.push(block);
     }
     return next;
-}
-
-export async function collectNewBlocks<T extends HeightedBlock>(
-    cursor: BlockSequenceCursor,
-    blocks: Iterable<T>,
-    fetchMissing: (fromHeight: bigint, toHeight: bigint) => Promise<readonly T[]>,
-): Promise<T[]> {
-    const next: T[] = [];
-    for (const block of blocks) {
-        if (hasSeen(cursor, block.height)) {
-            continue;
-        }
-
-        if (cursor.latestHeight !== null && block.height > cursor.latestHeight + 1n) {
-            for (const missing of await fetchMissing(cursor.latestHeight + 1n, block.height - 1n)) {
-                addIfNew(cursor, next, missing);
-            }
-        }
-
-        if (cursor.latestHeight === null || block.height > cursor.latestHeight) {
-            cursor.latestHeight = block.height;
-        }
-        addIfNew(cursor, next, block);
-    }
-    return next;
-}
-
-function addIfNew<T extends HeightedBlock>(
-    cursor: BlockSequenceCursor,
-    blocks: T[],
-    block: T,
-): void {
-    if (hasSeen(cursor, block.height)) {
-        return;
-    }
-    rememberHeight(cursor, block.height);
-    blocks.push(block);
 }
 
 function hasSeen(cursor: BlockSequenceCursor, height: bigint): boolean {

@@ -12,7 +12,7 @@ pub use signed::{
 };
 
 mod account;
-pub use account::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce};
+pub use account::{Account, AccountKey, NONCE_BITMAP_CAPACITY, Nonce};
 
 mod auth;
 pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignature};
@@ -24,7 +24,18 @@ mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};
 
 mod transaction;
-pub use transaction::{SignedTransaction, Transaction, VerifiedTransaction};
+pub use transaction::{
+    CHANNEL_NEVER_EXPIRES, Operation, SignedTransaction, Transaction, VerifiedTransaction,
+};
+
+pub mod operator_api;
+pub mod operator_config;
+
+mod channel;
+pub use channel::{VOUCHER_NAMESPACE, Voucher, channel_address, verify_voucher, voucher_message};
+
+mod url;
+pub use url::resolve_named_http_url;
 
 /// Signing namespace for transaction signatures.
 pub const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-tx";

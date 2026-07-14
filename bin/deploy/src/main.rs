@@ -16,6 +16,10 @@ use commonware_cryptography::{
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, TryCollect};
+use constantinople_primitives::operator_config::{
+    DEFAULT_HTTP_PORT as DEFAULT_OPERATOR_PORT, DEFAULT_MIN_RUNWAY, DEFAULT_OPERATOR_SEED,
+    DEFAULT_SETTLE_MARGIN, OperatorConfig as SharedOperatorConfig,
+};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -42,6 +46,9 @@ const PEERS_CONFIG_FILE: &str = "peers.yaml";
 const VALIDATOR_BINARY_FILE: &str = "validator";
 const SPAMMER_BINARY_FILE: &str = "spammer";
 const SPAMMER_CONFIG_FILE: &str = "spammer.yaml";
+const OPERATOR_BINARY_FILE: &str = "operator";
+const OPERATOR_CONFIG_FILE: &str = "operator.yaml";
+const OPERATOR_HOST: &str = "operator";
 const CHAIN_INDEXER_BINARY_FILE: &str = "chain-indexer";
 const CHAIN_INDEXER_CONFIG_FILE: &str = "chain-indexer.yaml";
 const CHAIN_INDEXER_DATA_DIR: &str = "chain-indexer";
@@ -60,6 +67,9 @@ const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
+/// Mirrors the spammer's own default (see `bin/spammer/src/config.rs` for
+/// why the count is high: it sets the off-chain/on-chain volume ratio).
+const DEFAULT_SPAMMER_CHANNEL_VOUCHERS: u64 = 320;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -140,11 +150,19 @@ pub(crate) struct GenerateArgs {
     ///
     /// `0.2` submits `spammer_accounts + rand(0..=floor(spammer_accounts * 0.2))`
     /// txs per batch.
-    #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
     spammer_accounts_jitter: f64,
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Fraction of spammer iterations that start a payment-channel lifecycle
+    /// (open -> off-chain vouchers -> close) instead of submitting a transfer
+    /// batch; lifecycles run concurrently. `0` disables channels.
+    #[arg(long, default_value_t = 0.0, value_parser = parse_unit_fraction)]
+    spammer_channel_fraction: f64,
+    /// Average off-chain vouchers streamed per channel before settling.
+    #[arg(long, default_value_t = DEFAULT_SPAMMER_CHANNEL_VOUCHERS, value_parser = clap::value_parser!(u64).range(1..))]
+    spammer_channel_vouchers: u64,
 
     /// Deployment target (local or remote).
     #[command(subcommand)]
@@ -254,8 +272,6 @@ pub(crate) struct SpammerConfig {
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
-    /// Local HTTP port the spammer serves on.
-    pub http_port: u16,
     /// Relayer URL used for transaction submission.
     pub relayer_url: String,
     /// Independent target-leader streams to run when submitting through a relayer.
@@ -276,7 +292,19 @@ pub(crate) struct SpammerConfig {
     /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
     #[serde(default)]
     pub accounts_jitter: f64,
+    /// Fraction of submitter iterations that run a payment-channel lifecycle
+    /// instead of a transfer batch. `0` disables channels.
+    #[serde(default)]
+    pub channel_fraction: f64,
+    /// Operator URL used for payment-channel voucher serving and settlement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_operator_url: Option<String>,
+    /// Average off-chain vouchers streamed per channel before settling.
+    #[serde(default = "default_spammer_channel_vouchers")]
+    pub channel_vouchers: u64,
 }
+
+pub(crate) type OperatorConfig = SharedOperatorConfig;
 
 /// Relayer configuration written into the relayer secondary's YAML.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -293,12 +321,14 @@ pub(crate) struct RelayerLeaderConfig {
     pub url: String,
 }
 
-fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
+/// Parses a fraction in `0..=1` (shared by `--spammer-accounts-jitter` and
+/// `--spammer-channel-fraction`).
+fn parse_unit_fraction(value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
-        .map_err(|error| format!("invalid jitter: {error}"))?;
+        .map_err(|error| format!("invalid fraction: {error}"))?;
     if !(0.0..=1.0).contains(&parsed) {
-        return Err("jitter must be between 0 and 1".to_string());
+        return Err("must be between 0 and 1".to_string());
     }
     Ok(parsed)
 }
@@ -493,6 +523,10 @@ const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
 }
 
+const fn default_spammer_channel_vouchers() -> u64 {
+    DEFAULT_SPAMMER_CHANNEL_VOUCHERS
+}
+
 fn main() {
     init_tracing();
     let cli = Cli::parse();
@@ -569,6 +603,14 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
+    );
+    assert!(
+        args.spammer || args.spammer_channel_fraction == 0.0,
+        "--spammer-channel-fraction > 0 requires --spammer"
+    );
+    assert!(
+        args.indexer || args.spammer_channel_fraction == 0.0,
+        "--spammer-channel-fraction > 0 requires --indexer"
     );
 }
 

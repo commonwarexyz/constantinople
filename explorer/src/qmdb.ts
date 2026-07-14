@@ -1,5 +1,40 @@
-import { fromHex, toArrayBuffer } from './codec';
+import {
+    assertByteLength,
+    fromHex,
+    parseAccountKeyHex,
+    signedTransactionBodyLength,
+    toArrayBuffer,
+    toHex,
+} from './codec';
+import { shortHex, trimTrailingSlash } from './util';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
+import {
+    ACCOUNT_META_ACCOUNT,
+    ACCOUNT_META_BALANCE,
+    ACCOUNT_META_DELETED,
+    ACCOUNT_META_NONCE_BASE,
+    ACCOUNT_META_NONCE_BITMAP,
+    ACCOUNT_META_QMDB_LOCATION,
+    ACCOUNT_META_TABLE,
+    QMDB_STATE_ROUTE,
+    QMDB_TRANSACTIONS_ROUTE,
+    TX_ACTIVITY_ACCOUNT,
+    TX_ACTIVITY_COUNTERPARTY,
+    TX_ACTIVITY_DIGEST,
+    TX_ACTIVITY_HEIGHT,
+    TX_ACTIVITY_INDEX,
+    TX_ACTIVITY_KIND,
+    TX_ACTIVITY_KINDS,
+    TX_ACTIVITY_NONCE,
+    TX_ACTIVITY_ROLE,
+    TX_ACTIVITY_ROLES,
+    TX_ACTIVITY_TABLE,
+    TX_ACTIVITY_VALUE,
+    TX_META_BODY_HEX,
+    TX_META_DIGEST,
+    TX_META_QMDB_LOCATION,
+    TX_META_TABLE,
+} from './sqlContract';
 import {
     SqlClient,
     type CellValue,
@@ -17,6 +52,7 @@ import {
     type VerifiedFixedKeylessAppendProof,
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
+import type { NonceState } from './nonce';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
@@ -25,37 +61,8 @@ const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
 const COMMITMENT_BYTES = 3 * DIGEST_BYTES + 4;
 const ED25519_PUBLIC_KEY_BYTES = 32;
-const TRANSACTION_PUBLIC_KEY_BYTES = 34;
-const TRANSACTION_VALUE_BYTES = 8;
-const TRANSACTION_NONCE_BYTES = 8;
-const TRANSACTION_BODY_BYTES =
-    TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
-
-const TX_META_TABLE = 'tx_meta';
-const TX_META_DIGEST = 'tx_digest';
-const TX_META_QMDB_LOCATION = 'qmdb_location';
-const TX_META_BODY_HEX = 'body_hex';
-
-const TX_ACTIVITY_TABLE = 'tx_activity';
-const TX_ACTIVITY_ACCOUNT = 'account';
-const TX_ACTIVITY_HEIGHT = 'height';
-const TX_ACTIVITY_INDEX = 'index';
-const TX_ACTIVITY_ROLE = 'role';
-const TX_ACTIVITY_DIGEST = 'tx_digest';
-const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
-const TX_ACTIVITY_VALUE = 'value';
-const TX_ACTIVITY_NONCE = 'nonce';
-const TX_ACTIVITY_ROLE_SENDER = 0n;
-const TX_ACTIVITY_ROLE_RECEIVER = 1n;
-
-const ACCOUNT_META_TABLE = 'account_meta';
-const ACCOUNT_META_ACCOUNT = 'account';
-const ACCOUNT_META_BALANCE = 'balance';
-const ACCOUNT_META_NONCE_BASE = 'nonce_base';
-const ACCOUNT_META_NONCE_BITMAP = 'nonce_bitmap';
-const ACCOUNT_META_QMDB_LOCATION = 'qmdb_location';
 
 export interface VerifiedTransactionProof {
     readonly location: bigint;
@@ -86,12 +93,27 @@ interface FinalizedTransactionTarget {
     readonly transactionsTip: bigint;
 }
 
-export interface LatestProofTarget extends FinalizedTransactionTarget {}
+export type LatestProofTarget = FinalizedTransactionTarget;
 
 export type AccountActivityMode = 'all' | 'sent' | 'received';
 
+/// Whether the account index has observed an account and, if so, whether its
+/// latest state operation deleted it. Channel accounts are deleted when they
+/// settle or time out, so this is the stream page's authoritative recovery
+/// signal after restoring browser-local channel state.
+export type IndexedAccountState = 'missing' | 'live' | 'deleted';
+
+// The kind of operation an activity row describes.
+export type TransactionKind =
+    | 'transfer'
+    | 'channel-open'
+    | 'channel-close'
+    | 'channel-timeout'
+    | 'mint';
+
 export interface AccountTransactionRow {
     readonly digest: string;
+    readonly kind: TransactionKind;
     readonly direction: 'sent' | 'received';
     readonly counterparty: string;
     readonly value: bigint;
@@ -133,11 +155,10 @@ export async function fetchAndVerifyTransactionProof({
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
-    const target = await finalizedTransactionTarget(
+    const target = await fetchFinalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
         BigInt(height),
-        signal,
     );
     onFinalizationVerified?.(target);
     const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, target, signal);
@@ -149,7 +170,7 @@ export async function fetchAndVerifyTransactionProof({
     let verification: VerifiedFixedKeylessAppendProof;
     try {
         verification = await fetchFixedKeylessAppendProof(
-            `${trimTrailingSlash(qmdbUrl)}/transactions`,
+            `${trimTrailingSlash(qmdbUrl)}${QMDB_TRANSACTIONS_ROUTE}`,
             metadata.location,
             tip,
             target.transactionsRoot,
@@ -172,13 +193,14 @@ export async function fetchAndVerifyTransactionProof({
 export async function fetchLatestProofTarget({
     storeUrl,
     simplexVerificationMaterial,
-    signal,
 }: {
     storeUrl: string;
     simplexVerificationMaterial: string;
+    /// Accepted for signature symmetry; the Simplex client offers no
+    /// cancellation, so aborting cannot interrupt the fetch.
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
-    return latestProofTarget(storeUrl, simplexVerificationMaterial, signal);
+    return fetchLatestFinalizedTarget(storeUrl, simplexVerificationMaterial);
 }
 
 export async function fetchAccountTransactionsPage({
@@ -192,13 +214,90 @@ export async function fetchAccountTransactionsPage({
     cursor?: Uint8Array | null;
     mode?: AccountActivityMode;
 }): Promise<AccountTransactionPage> {
-    const accountBytes = parseAccountBytes(account);
+    const accountBytes = parseAccountKeyHex(account);
     const rows = await fetchAccountActivityRows(sqlUrl, accountBytes, cursor ?? null, mode);
     const visible = rows.slice(0, ACCOUNT_PAGE_SIZE);
     const last = visible[visible.length - 1];
     return {
         rows: visible.map(decodeAccountActivityRow),
         nextCursor: rows.length > ACCOUNT_PAGE_SIZE && last ? encodeActivityCursor(last) : null,
+    };
+}
+
+/// Reads the latest indexed lifecycle state for any account key.
+///
+/// A missing row is deliberately distinct from a deleted row: it may mean a
+/// freshly submitted channel open has not reached the indexer yet and must
+/// never cause the browser to discard its recovery record.
+export async function fetchIndexedAccountState({
+    sqlUrl,
+    account,
+    signal,
+}: {
+    sqlUrl: string;
+    account: string;
+    signal?: AbortSignal;
+}): Promise<IndexedAccountState> {
+    const accountBytes = parseAccountKeyHex(account);
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${ACCOUNT_META_DELETED}
+            FROM ${ACCOUNT_META_TABLE}
+            WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(accountBytes)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) return 'missing';
+
+    const deleted = expectBigint(row.values[ACCOUNT_META_DELETED], ACCOUNT_META_DELETED);
+    if (deleted === 0n) return 'live';
+    if (deleted === 1n) return 'deleted';
+    throw new Error(`invalid account deletion marker ${deleted.toString()}`);
+}
+
+/// Reads the committed replay-protection state for an account. A missing or
+/// deleted account has no usable nonce state.
+///
+/// Only meaningful for signing accounts: a channel account repurposes the
+/// nonce base slot to store its expiry height, so calling this on one would
+/// return that expiry disguised as a nonce base, without error.
+export async function fetchIndexedNonceState({
+    sqlUrl,
+    account,
+    signal,
+}: {
+    sqlUrl: string;
+    account: string;
+    signal?: AbortSignal;
+}): Promise<NonceState | null> {
+    const accountBytes = parseAccountKeyHex(account);
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT
+                ${ACCOUNT_META_NONCE_BASE},
+                ${ACCOUNT_META_NONCE_BITMAP},
+                ${ACCOUNT_META_DELETED}
+            FROM ${ACCOUNT_META_TABLE}
+            WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(accountBytes)}
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) return null;
+
+    const deleted = expectBigint(row.values[ACCOUNT_META_DELETED], ACCOUNT_META_DELETED);
+    if (deleted === 1n) return null;
+    if (deleted !== 0n) {
+        throw new Error(`invalid account deletion marker ${deleted.toString()}`);
+    }
+    return {
+        base: expectBigint(row.values[ACCOUNT_META_NONCE_BASE], ACCOUNT_META_NONCE_BASE),
+        bitmap: expectBigint(row.values[ACCOUNT_META_NONCE_BITMAP], ACCOUNT_META_NONCE_BITMAP),
     };
 }
 
@@ -215,7 +314,7 @@ export async function fetchAndVerifyAccountProof({
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
-    const accountBytes = parseAccountBytes(account);
+    const accountBytes = parseAccountKeyHex(account);
     const row = await fetchAccountProofRow(sqlUrl, accountBytes, signal);
     const stateEnd = target.stateTip;
     if (row.location < target.stateStart || row.location >= stateEnd) {
@@ -224,7 +323,7 @@ export async function fetchAndVerifyAccountProof({
 
     const tip = transactionProofTip(stateEnd);
     const verification = await fetchFixedUnorderedUpdateProof(
-        `${trimTrailingSlash(qmdbUrl)}/state`,
+        `${trimTrailingSlash(qmdbUrl)}${QMDB_STATE_ROUTE}`,
         row.location,
         tip,
         target.stateRoot,
@@ -272,7 +371,7 @@ export async function fetchAndVerifyTransactionRowProof({
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
-        `${trimTrailingSlash(qmdbUrl)}/transactions`,
+        `${trimTrailingSlash(qmdbUrl)}${QMDB_TRANSACTIONS_ROUTE}`,
         metadata.location,
         tip,
         target.transactionsRoot,
@@ -311,10 +410,11 @@ async function fetchVerifiedSqlTransactionMetadata(
 
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
     const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
-    if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
+    const bodyLength = signedTransactionBodyLength(signedTransaction);
+    if (signedTransaction.length < bodyLength) {
         throw new Error('SQL transaction body is truncated');
     }
-    const transactionBody = signedTransaction.slice(0, TRANSACTION_BODY_BYTES);
+    const transactionBody = signedTransaction.slice(0, bodyLength);
     const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(transactionBody)));
     if (!bytesEqual(actual, digest)) {
         throw new Error('SQL transaction body does not match transaction digest');
@@ -414,33 +514,10 @@ async function fetchFixedUnorderedUpdateProof(
     );
 }
 
-function finalizedTransactionTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    height: bigint,
-    signal?: AbortSignal,
-): Promise<FinalizedTransactionTarget> {
-    return fetchFinalizedTransactionTarget(
-        storeUrl,
-        simplexVerificationMaterial,
-        height,
-        signal,
-    );
-}
-
-function latestProofTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    return fetchLatestFinalizedTarget(storeUrl, simplexVerificationMaterial, signal);
-}
-
 async function fetchFinalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
     height: bigint,
-    _signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
     const certificate = await simplex.getFinalizationByHeight(height.toString());
@@ -457,7 +534,6 @@ async function fetchFinalizedTransactionTarget(
 async function fetchLatestFinalizedTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
-    _signal?: AbortSignal,
 ): Promise<LatestProofTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
     const certificate = await simplex.latestFinalization();
@@ -467,16 +543,36 @@ async function fetchLatestFinalizedTarget(
     return finalizedTargetFromCertificate(certificate);
 }
 
-async function verifiedSimplexClient(
+/// Both inputs are page-lifetime constants, and building the verifier means
+/// instantiating WASM and parsing the BLS verification material — cache the
+/// client instead of rebuilding it on every proof fetch (the proof-retry
+/// path would otherwise rebuild it every second per pending transaction). A
+/// failed build is not cached so a retry can succeed.
+let simplexClientCache: {
+    key: string;
+    client: Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>>;
+} | null = null;
+
+function verifiedSimplexClient(
     storeUrl: string,
     simplexVerificationMaterial: string,
 ): Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
-    if (simplexVerificationMaterial.trim().length === 0) {
-        throw new Error('Simplex verification material is not configured');
-    }
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(trimTrailingSlash(storeUrl), {
-        verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
+    const key = `${trimTrailingSlash(storeUrl)} ${simplexVerificationMaterial}`;
+    if (simplexClientCache?.key === key) return simplexClientCache.client;
+    const client = (async () => {
+        if (simplexVerificationMaterial.trim().length === 0) {
+            throw new Error('Simplex verification material is not configured');
+        }
+        return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(
+            trimTrailingSlash(storeUrl),
+            { verifier: await simplexFinalizationVerifier(simplexVerificationMaterial) },
+        );
+    })();
+    simplexClientCache = { key, client };
+    client.catch(() => {
+        if (simplexClientCache?.client === client) simplexClientCache = null;
     });
+    return client;
 }
 
 function simplexFinalizationVerifier(
@@ -637,7 +733,8 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE}
+                ${TX_ACTIVITY_NONCE},
+                ${TX_ACTIVITY_KIND}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
             ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
@@ -657,15 +754,25 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         TX_ACTIVITY_COUNTERPARTY,
         ACCOUNT_KEY_BYTES,
     );
+    const kind = expectBigint(row.values[TX_ACTIVITY_KIND], TX_ACTIVITY_KIND);
     return {
         digest: toHex(digest),
-        direction: role === TX_ACTIVITY_ROLE_RECEIVER ? 'received' : 'sent',
+        kind: decodeTransactionKind(kind),
+        direction: role === TX_ACTIVITY_ROLES.receiver ? 'received' : 'sent',
         counterparty: toHex(counterparty),
         value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
         nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
         height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
         blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
     };
+}
+
+function decodeTransactionKind(kind: bigint): TransactionKind {
+    if (kind === TX_ACTIVITY_KINDS.channelOpen) return 'channel-open';
+    if (kind === TX_ACTIVITY_KINDS.channelClose) return 'channel-close';
+    if (kind === TX_ACTIVITY_KINDS.channelTimeout) return 'channel-timeout';
+    if (kind === TX_ACTIVITY_KINDS.mint) return 'mint';
+    return 'transfer';
 }
 
 async function fetchAccountProofRow(
@@ -680,7 +787,8 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_BALANCE},
                 ${ACCOUNT_META_NONCE_BASE},
                 ${ACCOUNT_META_NONCE_BITMAP},
-                ${ACCOUNT_META_QMDB_LOCATION}
+                ${ACCOUNT_META_QMDB_LOCATION},
+                ${ACCOUNT_META_DELETED}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
             LIMIT 1
@@ -691,7 +799,7 @@ async function fetchAccountProofRow(
     if (!row) {
         throw new Error(`account ${shortHex(toHex(account))} is not indexed`);
     }
-    return {
+    const decoded = {
         balance: expectBigint(row.values[ACCOUNT_META_BALANCE], ACCOUNT_META_BALANCE),
         nonce: expectBigint(row.values[ACCOUNT_META_NONCE_BASE], ACCOUNT_META_NONCE_BASE),
         nonceBitmap: expectBigint(
@@ -700,11 +808,18 @@ async function fetchAccountProofRow(
         ),
         location: expectBigint(row.values[ACCOUNT_META_QMDB_LOCATION], ACCOUNT_META_QMDB_LOCATION),
     };
+    // The indexer marks an account deletion (a settled or timed-out channel)
+    // with the `deleted` column; the row's location points at the delete
+    // operation. There is no update proof at that location, so surface the
+    // account as gone instead of attempting one.
+    if (expectBigint(row.values[ACCOUNT_META_DELETED], ACCOUNT_META_DELETED) !== 0n) {
+        throw new Error(
+            `account ${shortHex(toHex(account))} was deleted (a settled or expired channel)`,
+        );
+    }
+    return decoded;
 }
 
-function shortHex(value: string): string {
-    return value.length <= 18 ? value : `${value.slice(0, 10)}...${value.slice(-8)}`;
-}
 
 async function sqlQuery(
     sqlUrl: string,
@@ -720,8 +835,8 @@ function fixedBinaryLiteral(bytes: Uint8Array): string {
 }
 
 function activityModeRole(mode: AccountActivityMode): bigint | null {
-    if (mode === 'sent') return TX_ACTIVITY_ROLE_SENDER;
-    if (mode === 'received') return TX_ACTIVITY_ROLE_RECEIVER;
+    if (mode === 'sent') return TX_ACTIVITY_ROLES.sender;
+    if (mode === 'received') return TX_ACTIVITY_ROLES.receiver;
     return null;
 }
 
@@ -799,12 +914,6 @@ function expectHexBytes(value: CellValue, column: string): Uint8Array {
     return fromHex(normalized);
 }
 
-function assertByteLength(bytes: Uint8Array, length: number, field: string) {
-    if (bytes.length !== length) {
-        throw new Error(`${field} must be ${length} bytes`);
-    }
-}
-
 function decodeAccountValue(
     value: Uint8Array,
 ): Pick<AccountProofRow, 'balance' | 'nonce' | 'nonceBitmap'> {
@@ -816,14 +925,6 @@ function decodeAccountValue(
         nonce: readU64Be(value, 8),
         nonceBitmap: readU64Be(value, 16),
     };
-}
-
-function parseAccountBytes(account: string): Uint8Array {
-    const normalized = account.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(normalized)) {
-        throw new Error('expected a 32-byte hex account key');
-    }
-    return fromHex(normalized);
 }
 
 function readU64Be(bytes: Uint8Array, offset: number): bigint {
@@ -848,14 +949,6 @@ function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
         if (left[index] !== right[index]) return false;
     }
     return true;
-}
-
-function toHex(bytes: Uint8Array): string {
-    return [...bytes].map((byte) => byte.toString(16).padStart(2, '0')).join('');
-}
-
-function trimTrailingSlash(value: string): string {
-    return value.replace(/\/+$/, '');
 }
 
 interface AccountProofRow {

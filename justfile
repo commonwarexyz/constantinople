@@ -5,6 +5,7 @@ import 'docker/justfile'
 alias f := fmt-fix
 alias l := lint
 alias t := test
+alias tf := test-fast
 
 # default recipe to display help information
 default:
@@ -29,6 +30,10 @@ lint: fmt-check docs-check
 # Run Rust tests
 test *args='': docs-test
   cargo nextest run --workspace --all --all-features $@
+
+# Run Rust tests, skipping the multi-minute `_slow_` soak tests
+test-fast *args='':
+  cargo nextest run --workspace --all --all-features -E 'not test(/_slow_/)' $@
 
 # Test the Rust documentation
 docs-test *args='--all':

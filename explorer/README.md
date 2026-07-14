@@ -31,6 +31,24 @@ transaction bytes, verifies the SQL bytes hash to that digest, fetches a
 transaction operation-log proof from `qmdb-indexer` under `/transactions`, and
 shows a checkmark after browser-side QMDB and Simplex verification succeeds.
 
+### Paid stream (x402-style demo)
+
+With `VITE_OPERATOR_URL` set, the header gains a **paid stream** view: an
+end-to-end metered-service demo against the channel operator's `GET /stream`
+endpoint. The passkey wallet signs a single `OpenChannel` that escrows the
+deposit and delegates voucher signing to a fresh in-browser WebCrypto ed25519
+*voucher key* (one user ceremony per channel; the key can sign vouchers and
+nothing else), and the operator then streams an essay token by token over
+SSE while the page signs a voucher whenever the unpaid debt reaches half the
+operator's advertised credit window. A "stop paying" toggle demonstrates
+enforcement — the stream pauses at the debt limit and hangs up after a grace
+window — and "settle on-chain" collapses the whole session into a single close
+transaction that refunds the deposit remainder straight to the wallet, linked
+from the channel's account page. The channel record (voucher key included)
+survives page reloads via `localStorage`; the byte formats the page signs are
+locked to the Rust codec by `tests/fixtures/wire.json` (including
+deterministic ed25519 signature reproduction).
+
 ### Why SQL?
 
 The indexer publishes every finalized block to complementary surfaces
@@ -58,6 +76,7 @@ The indexer publishes every finalized block to complementary surfaces
 | `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction submission/status endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
 | `VITE_VERIFY_CERTIFICATES` | `true` | Set to `false` to disable block-list certificate verification while profiling live block streaming. |
+| `VITE_OPERATOR_URL` | empty | The channel operator's HTTP base. Enables the operator voucher stat and the **paid stream** view. Local deploy sets it whenever the indexer and relayer run. |
 
 The metadata and QMDB services enable permissive CORS layers, so the dev
 server can talk to them cross-origin without a Vite proxy.

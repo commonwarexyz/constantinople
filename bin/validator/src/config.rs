@@ -14,6 +14,7 @@ use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
+use constantinople_primitives::resolve_named_http_url;
 use serde::Deserialize;
 use std::{net::SocketAddr, path::Path};
 
@@ -285,24 +286,6 @@ fn parse_socket(name: &str, socket: &str) -> SocketAddr {
         .unwrap_or_else(|_| panic!("failed to parse {name} socket"))
 }
 
-fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return url.to_string();
-    };
-    let (authority, suffix) = match rest.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{suffix}")),
-        None => (rest, String::new()),
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return url.to_string();
-    };
-    let Some(ip) = hosts_by_name.get(host) else {
-        return url.to_string();
-    };
-
-    format!("http://{ip}:{port}{suffix}")
-}
-
 fn decode_with_network(
     config: ValidatorConfig,
     public_listen: SocketAddr,
@@ -463,13 +446,14 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .map(|host| (host.name.as_str(), host.ip))
         .collect::<AHashMap<_, _>>();
 
+    let resolve_url =
+        |url: &str| resolve_named_http_url(url, |name| hosts_by_name.get(name).copied());
     if let Some(indexer) = config.indexer.as_mut() {
-        indexer.chain_indexer_url =
-            resolve_named_http_url(&indexer.chain_indexer_url, &hosts_by_name);
+        indexer.chain_indexer_url = resolve_url(&indexer.chain_indexer_url);
     }
     if let Some(relayer) = config.relayer.as_mut() {
         for leader in &mut relayer.leaders {
-            leader.url = resolve_named_http_url(&leader.url, &hosts_by_name);
+            leader.url = resolve_url(&leader.url);
         }
     }
 

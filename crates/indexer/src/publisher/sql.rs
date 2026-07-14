@@ -1,8 +1,18 @@
 //! SQL row encoding shared by the combined publisher.
 
-use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
+use crate::sql_schema::{
+    self, ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE,
+};
 use bytes::Bytes;
+use commonware_codec::FixedSize as _;
+use constantinople_primitives::AccountKey;
 use exoware_sql::CellValue;
+
+pub(crate) fn account_key_array(key: &AccountKey) -> [u8; AccountKey::SIZE] {
+    key.as_ref()
+        .try_into()
+        .expect("account key has fixed width")
+}
 
 /// One row destined for a SQL metadata table.
 ///
@@ -19,10 +29,36 @@ pub(crate) struct BlockMetaRow {
     pub height: u64,
     pub digest: [u8; 32],
     pub tx_count: u64,
+    pub kinds: KindCounts,
     pub transactions_root: [u8; 32],
     pub transactions_tip: u64,
     pub view: u64,
     pub finalized_ts_micros: i64,
+}
+
+/// Per-kind transaction counts for one block, streamed to the explorer via
+/// `block_meta` so its live stats can break traffic down without extra
+/// queries.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct KindCounts {
+    pub transfers: u64,
+    pub channel_opens: u64,
+    pub channel_closes: u64,
+    pub channel_timeouts: u64,
+    pub mints: u64,
+}
+
+impl KindCounts {
+    /// Counts one transaction of `kind`.
+    pub const fn count(&mut self, kind: TxKind) {
+        match kind {
+            TxKind::Transfer => self.transfers += 1,
+            TxKind::ChannelOpen => self.channel_opens += 1,
+            TxKind::ChannelClose => self.channel_closes += 1,
+            TxKind::ChannelTimeout => self.channel_timeouts += 1,
+            TxKind::Mint => self.mints += 1,
+        }
+    }
 }
 
 /// Transaction row fields stored in `tx_meta`.
@@ -42,8 +78,59 @@ pub(crate) enum TxActivityRole {
 impl TxActivityRole {
     const fn as_u64(self) -> u64 {
         match self {
-            Self::Sender => 0,
-            Self::Receiver => 1,
+            Self::Sender => sql_schema::TX_ACTIVITY_ROLE_SENDER,
+            Self::Receiver => sql_schema::TX_ACTIVITY_ROLE_RECEIVER,
+        }
+    }
+}
+
+/// The kind of operation an activity row describes.
+///
+/// Lets the explorer render a transfer, a channel reservation (open), and a
+/// channel settlement (close) differently, since they interpret the
+/// `value`/`counterparty`/`role` columns differently.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TxKind {
+    /// A plain account transfer.
+    Transfer,
+    /// A channel open: the sender reserves `value` for a channel with the
+    /// counterparty (no funds are credited to anyone yet).
+    ChannelOpen,
+    /// A channel settlement: `value` is paid from the payer to the receiver.
+    ChannelClose,
+    /// A channel timeout: the sender (payer) reclaims the expired channel's
+    /// escrow. The reclaimed amount is not in the transaction, so `value` is
+    /// zero.
+    ChannelTimeout,
+    /// A mint: the sender credits itself `value` new tokens (the chain's only
+    /// token source).
+    Mint,
+}
+
+impl TxKind {
+    const fn as_u64(self) -> u64 {
+        match self {
+            Self::Transfer => sql_schema::TX_ACTIVITY_KIND_TRANSFER,
+            Self::ChannelOpen => sql_schema::TX_ACTIVITY_KIND_CHANNEL_OPEN,
+            Self::ChannelClose => sql_schema::TX_ACTIVITY_KIND_CHANNEL_CLOSE,
+            Self::ChannelTimeout => sql_schema::TX_ACTIVITY_KIND_CHANNEL_TIMEOUT,
+            Self::Mint => sql_schema::TX_ACTIVITY_KIND_MINT,
+        }
+    }
+}
+
+/// The single exhaustive `Operation` -> [`TxKind`] mapping: a new operation
+/// variant fails to compile here until it is assigned a kind (and a number in
+/// [`TxKind::as_u64`] above).
+impl From<&constantinople_primitives::Operation> for TxKind {
+    fn from(op: &constantinople_primitives::Operation) -> Self {
+        use constantinople_primitives::Operation;
+        match op {
+            Operation::Transfer { .. } => Self::Transfer,
+            Operation::OpenChannel { .. } => Self::ChannelOpen,
+            Operation::CloseChannel { .. } => Self::ChannelClose,
+            Operation::TimeoutChannel { .. } => Self::ChannelTimeout,
+            Operation::Mint { .. } => Self::Mint,
         }
     }
 }
@@ -58,6 +145,7 @@ pub(crate) struct TxActivityRow {
     pub counterparty: [u8; 32],
     pub value: u64,
     pub nonce: u64,
+    pub kind: TxKind,
 }
 
 /// Latest account row stored in `account_meta`.
@@ -67,6 +155,9 @@ pub(crate) struct AccountMetaRow {
     pub nonce_base: u64,
     pub nonce_bitmap: u64,
     pub qmdb_location: u64,
+    /// Whether this row records the account's deletion (a settled or
+    /// timed-out channel) rather than a live state update.
+    pub deleted: bool,
 }
 
 /// Encode the SQL rows for a finalized block.
@@ -86,6 +177,11 @@ pub(crate) fn encode_block_meta_row(block: BlockMetaRow) -> SqlRow {
             CellValue::UInt64(block.height),
             CellValue::FixedBinary(block.digest.to_vec()),
             CellValue::UInt64(block.tx_count),
+            CellValue::UInt64(block.kinds.transfers),
+            CellValue::UInt64(block.kinds.channel_opens),
+            CellValue::UInt64(block.kinds.channel_closes),
+            CellValue::UInt64(block.kinds.channel_timeouts),
+            CellValue::UInt64(block.kinds.mints),
             CellValue::FixedBinary(block.transactions_root.to_vec()),
             CellValue::UInt64(block.transactions_tip),
             CellValue::UInt64(block.view),
@@ -119,6 +215,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
             CellValue::FixedBinary(tx.counterparty.to_vec()),
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
+            CellValue::UInt64(tx.kind.as_u64()),
         ],
     }
 }
@@ -133,6 +230,7 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
             CellValue::UInt64(account.nonce_base),
             CellValue::UInt64(account.nonce_bitmap),
             CellValue::UInt64(account.qmdb_location),
+            CellValue::UInt64(u64::from(account.deleted)),
         ],
     }
 }
