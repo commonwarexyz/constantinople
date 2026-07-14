@@ -27,9 +27,17 @@ export interface EncodedTransaction {
     readonly bytes: Uint8Array;
 }
 
-export function parseAccountKeyHex(value: string): Uint8Array {
+/// Normalizes user-supplied account-key hex (trim, strip `0x`, lowercase);
+/// null when the result is not 32 bytes of hex. The one home for what
+/// counts as a valid address string.
+export function normalizeAccountKeyHex(value: string): string | null {
     const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(normalized)) {
+    return /^[0-9a-f]{64}$/.test(normalized) ? normalized : null;
+}
+
+export function parseAccountKeyHex(value: string): Uint8Array {
+    const normalized = normalizeAccountKeyHex(value);
+    if (normalized === null) {
         throw new Error('expected a 32-byte account key');
     }
     return fromHex(normalized);
@@ -356,7 +364,7 @@ function bytesConcat(...chunks: Uint8Array[]): Uint8Array {
     return out;
 }
 
-function assertByteLength(bytes: Uint8Array, expected: number, label: string) {
+export function assertByteLength(bytes: Uint8Array, expected: number, label: string) {
     if (bytes.length !== expected) {
         throw new Error(`${label} must be ${expected} bytes`);
     }

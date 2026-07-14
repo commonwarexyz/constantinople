@@ -3,13 +3,11 @@
 // pages, and the paid-stream view.
 
 export function AddressValue({
-    disabled = false,
     plain = false,
     value,
     display,
     onOpenAddress,
 }: {
-    disabled?: boolean;
     plain?: boolean;
     value: string;
     /// Text to render instead of the full value (e.g. an abbreviation);
@@ -29,7 +27,6 @@ export function AddressValue({
         <button
             aria-label={`view account ${value}`}
             className={className}
-            disabled={disabled}
             onClick={() => onOpenAddress(value)}
             title="view account"
             type="button"

@@ -7,6 +7,11 @@ export function shortHex(value: string): string {
     return value.length <= 18 ? value : `${value.slice(0, 10)}…${value.slice(-8)}`;
 }
 
+/// The human-readable message of any thrown value.
+export function errorMessage(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+}
+
 /// Resolves after `ms`, or rejects when `signal` aborts.
 export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
     return new Promise((resolve, reject) => {

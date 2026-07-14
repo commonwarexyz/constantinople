@@ -39,7 +39,7 @@ import {
 } from './paidStream';
 import { fetchIndexedAccountState, fetchIndexedNonceState } from './qmdb';
 import { createVoucherKey, importVoucherKey, type VoucherKey } from './voucherKey';
-import { readStoredJson, shortHex } from './util';
+import { errorMessage, readStoredJson, shortHex } from './util';
 
 /// Retry delay for a transiently failed voucher post — well inside the
 /// operator's grace window, so a blip cannot kill a paying stream.
@@ -315,7 +315,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         const stored = readChannelRecord();
         if (stored !== null && stored.channelHex !== record.channelHex) return;
         if (stored !== null) {
-            localStorage.removeItem(CHANNEL_STORAGE_KEY);
+            clearChannelRecord();
         }
         setChannel((current) =>
             current?.channelHex === record.channelHex ? null : current,
@@ -650,12 +650,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         if (!channelKey || !channel?.capability) return;
         closeStream();
         setPaymentNotice('');
-        // A failure returns to the phase the action started from ('ended'
-        // when it started mid-stream: the stream was just closed). Landing
-        // anywhere else strands the user — notably in 'ended' from 'idle',
-        // where the start button (the only path that registers a restored
-        // channel) no longer renders.
-        const origin: Phase = phase === 'streaming' ? 'ended' : phase;
+        const origin = settlementOrigin(phase);
         setPhase('settling');
         try {
             setNote('paying for delivered content…');
@@ -680,7 +675,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 );
                 // A finalized close resolved the escrow, so there is
                 // nothing left to reclaim.
-                localStorage.removeItem(CHANNEL_STORAGE_KEY);
+                clearChannelRecord();
                 setChannel(null);
                 setEndReason(null);
                 setPhase('settled');
@@ -711,7 +706,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         if (!channel) return;
         closeStream();
         // See `settle`: failure must return whence it came.
-        const origin: Phase = phase === 'streaming' ? 'ended' : phase;
+        const origin = settlementOrigin(phase);
         setPhase('settling');
         setNote('reclaiming the deposit…');
         try {
@@ -751,7 +746,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                     `timeout reclaim was ${status?.status ?? 'not signed'} — the channel may already be closed`,
                 );
             }
-            localStorage.removeItem(CHANNEL_STORAGE_KEY);
+            clearChannelRecord();
             setChannel(null);
             setEndReason(null);
             setNote('');
@@ -1080,6 +1075,15 @@ function SessionAddress({
     return <AddressValue plain value={hex} display={shortHex(hex)} onOpenAddress={onOpenAddress} />;
 }
 
+/// The phase a failed settlement action returns to: the phase it started
+/// from ('ended' when it started mid-stream — the stream was just closed).
+/// Landing anywhere else strands the user — notably in 'ended' from 'idle',
+/// where the start button (the only path that registers a restored channel)
+/// no longer renders.
+function settlementOrigin(phase: Phase): Phase {
+    return phase === 'streaming' ? 'ended' : phase;
+}
+
 /// The freshest of two optionally-known block heights.
 function maxHeight(a: bigint | null, b: bigint | null): bigint | null {
     if (a === null) return b;
@@ -1126,6 +1130,13 @@ function persistChannel(record: ChannelRecord): void {
     localStorage.setItem(CHANNEL_STORAGE_KEY, JSON.stringify(record));
 }
 
+/// The record is the only copy of the signed open and the voucher key;
+/// every deletion goes through here so the (few, safety-critical) flows
+/// that may forget a channel are greppable in one place.
+function clearChannelRecord(): void {
+    localStorage.removeItem(CHANNEL_STORAGE_KEY);
+}
+
 function streamEndMessage(reason: StreamEnd['reason'] | null, paying: boolean): string {
     switch (reason) {
         case 'complete':
@@ -1141,8 +1152,4 @@ function streamEndMessage(reason: StreamEnd['reason'] | null, paying: boolean): 
         default:
             return '';
     }
-}
-
-function errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
 }

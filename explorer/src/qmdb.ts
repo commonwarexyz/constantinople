@@ -1,4 +1,11 @@
-import { fromHex, signedTransactionBodyLength, toArrayBuffer, toHex } from './codec';
+import {
+    assertByteLength,
+    fromHex,
+    parseAccountKeyHex,
+    signedTransactionBodyLength,
+    toArrayBuffer,
+    toHex,
+} from './codec';
 import { shortHex, trimTrailingSlash } from './util';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import {
@@ -86,7 +93,7 @@ interface FinalizedTransactionTarget {
     readonly transactionsTip: bigint;
 }
 
-export interface LatestProofTarget extends FinalizedTransactionTarget {}
+export type LatestProofTarget = FinalizedTransactionTarget;
 
 export type AccountActivityMode = 'all' | 'sent' | 'received';
 
@@ -148,11 +155,10 @@ export async function fetchAndVerifyTransactionProof({
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
-    const target = await finalizedTransactionTarget(
+    const target = await fetchFinalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
         BigInt(height),
-        signal,
     );
     onFinalizationVerified?.(target);
     const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, target, signal);
@@ -187,13 +193,14 @@ export async function fetchAndVerifyTransactionProof({
 export async function fetchLatestProofTarget({
     storeUrl,
     simplexVerificationMaterial,
-    signal,
 }: {
     storeUrl: string;
     simplexVerificationMaterial: string;
+    /// Accepted for signature symmetry; the Simplex client offers no
+    /// cancellation, so aborting cannot interrupt the fetch.
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
-    return latestProofTarget(storeUrl, simplexVerificationMaterial, signal);
+    return fetchLatestFinalizedTarget(storeUrl, simplexVerificationMaterial);
 }
 
 export async function fetchAccountTransactionsPage({
@@ -207,7 +214,7 @@ export async function fetchAccountTransactionsPage({
     cursor?: Uint8Array | null;
     mode?: AccountActivityMode;
 }): Promise<AccountTransactionPage> {
-    const accountBytes = parseAccountBytes(account);
+    const accountBytes = parseAccountKeyHex(account);
     const rows = await fetchAccountActivityRows(sqlUrl, accountBytes, cursor ?? null, mode);
     const visible = rows.slice(0, ACCOUNT_PAGE_SIZE);
     const last = visible[visible.length - 1];
@@ -231,7 +238,7 @@ export async function fetchIndexedAccountState({
     account: string;
     signal?: AbortSignal;
 }): Promise<IndexedAccountState> {
-    const accountBytes = parseAccountBytes(account);
+    const accountBytes = parseAccountKeyHex(account);
     const result = await sqlQuery(
         sqlUrl,
         `
@@ -266,7 +273,7 @@ export async function fetchIndexedNonceState({
     account: string;
     signal?: AbortSignal;
 }): Promise<NonceState | null> {
-    const accountBytes = parseAccountBytes(account);
+    const accountBytes = parseAccountKeyHex(account);
     const result = await sqlQuery(
         sqlUrl,
         `
@@ -307,7 +314,7 @@ export async function fetchAndVerifyAccountProof({
     target: LatestProofTarget;
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
-    const accountBytes = parseAccountBytes(account);
+    const accountBytes = parseAccountKeyHex(account);
     const row = await fetchAccountProofRow(sqlUrl, accountBytes, signal);
     const stateEnd = target.stateTip;
     if (row.location < target.stateStart || row.location >= stateEnd) {
@@ -507,33 +514,10 @@ async function fetchFixedUnorderedUpdateProof(
     );
 }
 
-function finalizedTransactionTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    height: bigint,
-    signal?: AbortSignal,
-): Promise<FinalizedTransactionTarget> {
-    return fetchFinalizedTransactionTarget(
-        storeUrl,
-        simplexVerificationMaterial,
-        height,
-        signal,
-    );
-}
-
-function latestProofTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    return fetchLatestFinalizedTarget(storeUrl, simplexVerificationMaterial, signal);
-}
-
 async function fetchFinalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
     height: bigint,
-    _signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
     const certificate = await simplex.getFinalizationByHeight(height.toString());
@@ -550,7 +534,6 @@ async function fetchFinalizedTransactionTarget(
 async function fetchLatestFinalizedTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
-    _signal?: AbortSignal,
 ): Promise<LatestProofTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
     const certificate = await simplex.latestFinalization();
@@ -560,16 +543,36 @@ async function fetchLatestFinalizedTarget(
     return finalizedTargetFromCertificate(certificate);
 }
 
-async function verifiedSimplexClient(
+/// Both inputs are page-lifetime constants, and building the verifier means
+/// instantiating WASM and parsing the BLS verification material — cache the
+/// client instead of rebuilding it on every proof fetch (the proof-retry
+/// path would otherwise rebuild it every second per pending transaction). A
+/// failed build is not cached so a retry can succeed.
+let simplexClientCache: {
+    key: string;
+    client: Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>>;
+} | null = null;
+
+function verifiedSimplexClient(
     storeUrl: string,
     simplexVerificationMaterial: string,
 ): Promise<SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>> {
-    if (simplexVerificationMaterial.trim().length === 0) {
-        throw new Error('Simplex verification material is not configured');
-    }
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(trimTrailingSlash(storeUrl), {
-        verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
+    const key = `${trimTrailingSlash(storeUrl)} ${simplexVerificationMaterial}`;
+    if (simplexClientCache?.key === key) return simplexClientCache.client;
+    const client = (async () => {
+        if (simplexVerificationMaterial.trim().length === 0) {
+            throw new Error('Simplex verification material is not configured');
+        }
+        return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(
+            trimTrailingSlash(storeUrl),
+            { verifier: await simplexFinalizationVerifier(simplexVerificationMaterial) },
+        );
+    })();
+    simplexClientCache = { key, client };
+    client.catch(() => {
+        if (simplexClientCache?.client === client) simplexClientCache = null;
     });
+    return client;
 }
 
 function simplexFinalizationVerifier(
@@ -911,12 +914,6 @@ function expectHexBytes(value: CellValue, column: string): Uint8Array {
     return fromHex(normalized);
 }
 
-function assertByteLength(bytes: Uint8Array, length: number, field: string) {
-    if (bytes.length !== length) {
-        throw new Error(`${field} must be ${length} bytes`);
-    }
-}
-
 function decodeAccountValue(
     value: Uint8Array,
 ): Pick<AccountProofRow, 'balance' | 'nonce' | 'nonceBitmap'> {
@@ -928,14 +925,6 @@ function decodeAccountValue(
         nonce: readU64Be(value, 8),
         nonceBitmap: readU64Be(value, 16),
     };
-}
-
-function parseAccountBytes(account: string): Uint8Array {
-    const normalized = account.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]{64}$/.test(normalized)) {
-        throw new Error('expected a 32-byte hex account key');
-    }
-    return fromHex(normalized);
 }
 
 function readU64Be(bytes: Uint8Array, offset: number): bigint {

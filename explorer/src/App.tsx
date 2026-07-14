@@ -17,6 +17,7 @@ import {
     encodeSignedTransaction,
     encodeTransactionBatch,
     fromHex,
+    normalizeAccountKeyHex,
     parseAccountKeyHex,
     parseU64,
     toHex,
@@ -70,7 +71,7 @@ import {
     type OpenStreamChannelRequest,
     type ReclaimStreamChannelRequest,
 } from './PaidStreamPage';
-import { shortHex, sleep } from './util';
+import { errorMessage, shortHex, sleep } from './util';
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
@@ -119,6 +120,9 @@ function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
 
 /** How often to refresh the operator's self-reported counters. */
 const OPERATOR_STATS_POLL_MS = 2_000;
+
+/** Trailing debounce for persisting submitted-transaction history. */
+const HISTORY_WRITE_DEBOUNCE_MS = 250;
 
 // Display labels per transaction kind, in stats-row order. The exhaustive
 // Record ties the list to `BlockKindCounts`, so the zero record, the
@@ -172,6 +176,9 @@ interface SubmittedTransaction {
     readonly resolvedInMs: number | null;
     readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
     readonly detail: string;
+    /// Whether the mempool rejected (filtered) this transaction. Stored as
+    /// structured data so the UI never has to parse `detail`.
+    readonly rejected: boolean;
     readonly finalizedHeight: number | null;
     readonly certificate: BlockCertificateState;
     readonly proof: TransactionProofState;
@@ -229,6 +236,12 @@ interface ObservedRateWindow {
     readonly latestBlockAt: number | null;
 }
 
+/// Machine-readable wallet lifecycle; `walletMessage` is display-only.
+type WalletStatus = 'idle' | 'busy' | 'signed-in' | 'error';
+/// Machine-readable account-metadata lifecycle; `accountMessage` is
+/// display-only.
+type AccountStatus = 'idle' | 'loading' | 'loaded' | 'error';
+
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
     // Cumulative counter across every block observed on the stream. Tracked
@@ -258,17 +271,17 @@ export default function App() {
     /// Bumped to re-run the account-key derivation after a failure (the only
     /// other recovery is signing out and back in).
     const [walletKeyAttempt, setWalletKeyAttempt] = useState(0);
+    const [walletStatus, setWalletStatus] = useState<WalletStatus>('idle');
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
+    const [accountStatus, setAccountStatus] = useState<AccountStatus>('idle');
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
-    const [accountLoadFailed, setAccountLoadFailed] = useState(false);
     const [toKey, setToKey] = useState('');
     const [value, setValue] = useState('1');
     const [nonce, setNonce] = useState('0');
     const [submitMessage, setSubmitMessage] = useState('');
     const [pendingSubmissionCount, setPendingSubmissionCount] = useState(0);
     const [history, setHistory] = useState<SubmittedTransaction[]>([]);
-    const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
     const [isStreamOpen, setIsStreamOpen] = useState(false);
     const [accountInput, setAccountInput] = useState(() => accountFromLocation());
@@ -288,23 +301,38 @@ export default function App() {
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const toastTimeoutRef = useRef<number | null>(null);
-    const walletWasOpenRef = useRef(false);
+    /// Which key the current `history` state was loaded from; gates the
+    /// write-back effect so it never writes one key's history to another.
+    const loadedHistoryKeyRef = useRef<string | null>(null);
+    /// Set by the load effect, consumed by the write effect's next run
+    /// (which still closes over the pre-load `history`).
+    const historyJustLoadedRef = useRef(false);
+    const pendingHistoryWriteRef = useRef<{
+        timer: number;
+        key: string;
+        history: SubmittedTransaction[];
+    } | null>(null);
+    const flushPendingHistoryWrite = () => {
+        const pending = pendingHistoryWriteRef.current;
+        if (pending === null) return;
+        pendingHistoryWriteRef.current = null;
+        window.clearTimeout(pending.timer);
+        writeHistory(pending.key, pending.history);
+    };
     const isSubmitting = pendingSubmissionCount > 0;
-    const isWalletBusy =
-        walletMessage === 'opening passkey prompt' ||
-        accountMessage === 'loading account metadata' ||
-        isSubmitting;
-    const spinner = useBrailleSpinner(status.kind === 'connecting' || isWalletBusy);
-    const signedInAccountKey = walletAccountKey;
-    const historyKey = submittedTransactionHistoryKey(
-        {
-            indexerUrl,
-            qmdbUrl,
-            storeUrl,
-            mempoolUrl,
-            simplexVerificationMaterial,
-        },
-        signedInAccountKey,
+    const historyKey = useMemo(
+        () =>
+            submittedTransactionHistoryKey(
+                {
+                    indexerUrl,
+                    qmdbUrl,
+                    storeUrl,
+                    mempoolUrl,
+                    simplexVerificationMaterial,
+                },
+                walletAccountKey,
+            ),
+        [walletAccountKey],
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
@@ -346,9 +374,13 @@ export default function App() {
 
     // Poll the operator's self-reported counters; unlike everything else on
     // the page they are not proof-verified, and the strip labels them so.
+    // A self-re-arming timeout (rather than an interval) means polls never
+    // overlap, and hidden tabs skip the fetch until they are visible again.
     useEffect(() => {
         if (!operatorUrl) return;
         let cancelled = false;
+        let timer: number | null = null;
+
         const poll = async () => {
             try {
                 const vouchers = Number((await fetchStats(operatorUrl)).vouchers);
@@ -366,11 +398,29 @@ export default function App() {
                 // Operator not up yet (or between restarts); keep polling.
             }
         };
-        void poll();
-        const interval = window.setInterval(() => void poll(), OPERATOR_STATS_POLL_MS);
+
+        const loop = async () => {
+            timer = null;
+            if (!document.hidden) {
+                await poll();
+                if (cancelled) return;
+            }
+            timer = window.setTimeout(() => void loop(), OPERATOR_STATS_POLL_MS);
+        };
+
+        void loop();
+        const onVisibilityChange = () => {
+            if (cancelled || document.hidden) return;
+            // Back in the foreground: poll now instead of waiting out the
+            // idle re-arm timer.
+            if (timer !== null) window.clearTimeout(timer);
+            void loop();
+        };
+        document.addEventListener('visibilitychange', onVisibilityChange);
         return () => {
             cancelled = true;
-            window.clearInterval(interval);
+            if (timer !== null) window.clearTimeout(timer);
+            document.removeEventListener('visibilitychange', onVisibilityChange);
         };
     }, []);
 
@@ -378,6 +428,7 @@ export default function App() {
         const restoredWallet = restoreWalletSession();
         if (!restoredWallet) return;
         setWallet(restoredWallet);
+        setWalletStatus('signed-in');
         setWalletMessage('signed in');
     }, []);
 
@@ -400,7 +451,7 @@ export default function App() {
                 if (cancelled || controller.signal.aborted) return;
                 setStatus({
                     kind: 'error',
-                    message: error instanceof Error ? error.message : String(error),
+                    message: errorMessage(error),
                 });
             }
         })();
@@ -412,8 +463,12 @@ export default function App() {
     }, []);
 
     useEffect(() => {
+        // A pending debounced write always belongs to the previous key;
+        // flush it before this key's history replaces the state it captured.
+        flushPendingHistoryWrite();
         setHistory(historyKey === null ? [] : readHistory(historyKey));
-        setLoadedHistoryKey(historyKey);
+        loadedHistoryKeyRef.current = historyKey;
+        historyJustLoadedRef.current = true;
     }, [historyKey]);
 
     useEffect(() => {
@@ -431,7 +486,8 @@ export default function App() {
             .catch((error) => {
                 if (cancelled) return;
                 setWalletAccountKey(null);
-                setWalletMessage(error instanceof Error ? error.message : String(error));
+                setWalletStatus('error');
+                setWalletMessage(errorMessage(error));
             });
 
         return () => {
@@ -441,9 +497,27 @@ export default function App() {
 
     useEffect(() => {
         if (historyKey === null) return;
-        if (loadedHistoryKey !== historyKey) return;
-        writeHistory(historyKey, history);
-    }, [historyKey, loadedHistoryKey, history]);
+        if (loadedHistoryKeyRef.current !== historyKey) return;
+        // The run in the same commit as a load still closes over the
+        // previous key's history; skip it (the post-load run re-arms with
+        // the freshly loaded state).
+        if (historyJustLoadedRef.current) {
+            historyJustLoadedRef.current = false;
+            return;
+        }
+        // Debounce: history changes in bursts while a submission resolves,
+        // and localStorage writes are synchronous.
+        const pending = pendingHistoryWriteRef.current;
+        if (pending !== null) window.clearTimeout(pending.timer);
+        const timer = window.setTimeout(() => {
+            pendingHistoryWriteRef.current = null;
+            writeHistory(historyKey, history);
+        }, HISTORY_WRITE_DEBOUNCE_MS);
+        pendingHistoryWriteRef.current = { timer, key: historyKey, history };
+    }, [historyKey, history]);
+
+    // Flush any pending debounced history write on unmount.
+    useEffect(() => () => flushPendingHistoryWrite(), []);
 
     useEffect(() => {
         const onPopState = () => {
@@ -483,7 +557,7 @@ export default function App() {
                 });
                 return { target, proof };
             } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
+                const detail = errorMessage(error);
                 if (isMissingAccountProofError(detail)) {
                     return { target, proof: null };
                 }
@@ -508,7 +582,7 @@ export default function App() {
                 if (controller.signal.aborted) return;
                 setAccountProof({
                     status: 'error',
-                    detail: error instanceof Error ? error.message : String(error),
+                    detail: errorMessage(error),
                 });
             });
 
@@ -574,7 +648,7 @@ export default function App() {
                         if (result.status === 'fulfilled') {
                             return { ...entry, proof: verifiedProofState(result.value) };
                         }
-                        const detail = result.reason instanceof Error ? result.reason.message : String(result.reason);
+                        const detail = errorMessage(result.reason);
                         return { ...entry, proof: { status: 'error', detail } };
                     }),
                 );
@@ -583,14 +657,14 @@ export default function App() {
                 if (controller.signal.aborted) return;
                 setAccountTransactions([]);
                 setAccountNextCursor(null);
-                setAccountActivityError(error instanceof Error ? error.message : String(error));
+                setAccountActivityError(errorMessage(error));
             });
 
         return () => controller.abort();
     }, [lookupAccount, currentAccountCursor, accountActivityMode]);
 
     useEffect(() => {
-        const signedInSender = signedInAccountKey;
+        const signedInSender = walletAccountKey;
         if (hasFetchingProof(history, signedInSender)) return;
 
         const tx = history.find((entry) => shouldFetchTransactionProof(entry, signedInSender));
@@ -628,7 +702,7 @@ export default function App() {
                 );
             })
             .catch((error) => {
-                const detail = error instanceof Error ? error.message : String(error);
+                const detail = errorMessage(error);
                 if (isRetryableProofError(detail)) {
                     setHistory((current) =>
                         updateTransactionProof(
@@ -659,7 +733,7 @@ export default function App() {
                     ),
                 );
             });
-    }, [history, signedInAccountKey]);
+    }, [history, walletAccountKey]);
 
     useEffect(() => {
         return () => {
@@ -672,43 +746,6 @@ export default function App() {
         };
     }, []);
 
-    useEffect(() => {
-        if (!wallet) {
-            setAccount(null);
-            setLocalNonceState(emptyNonceState());
-            setAccountMessage('account metadata unavailable');
-            setAccountLoadFailed(false);
-            return;
-        }
-
-        let cancelled = false;
-        setAccountMessage('loading account metadata');
-        setAccountLoadFailed(false);
-
-        fetchAccount(mempoolUrl, wallet.publicKeyHex)
-            .then((nextAccount) => {
-                if (cancelled) return;
-                setAccount(nextAccount);
-                setAccountLoadFailed(false);
-                mergeLocalNonceState(accountNonceState(nextAccount));
-                setAccountMessage(
-                    nextAccount
-                        ? 'committed account loaded'
-                        : 'no committed account yet; mint to fund it',
-                );
-            })
-            .catch((error) => {
-                if (cancelled) return;
-                setAccount(null);
-                setAccountLoadFailed(true);
-                setAccountMessage(error instanceof Error ? error.message : String(error));
-            });
-
-        return () => {
-            cancelled = true;
-        };
-    }, [wallet]);
-
     const refreshAccount = async () => {
         if (!wallet) return;
         const key = wallet.publicKeyHex;
@@ -716,57 +753,59 @@ export default function App() {
         // the old wallet's nonce state would poison the new one's local
         // nonce window.
         const superseded = () => walletRef.current?.publicKeyHex !== key;
+        setAccountStatus('loading');
         setAccountMessage('loading account metadata');
-        setAccountLoadFailed(false);
         try {
             const nextAccount = await fetchAccount(mempoolUrl, key);
             if (superseded()) return;
             setAccount(nextAccount);
-            setAccountLoadFailed(false);
             mergeLocalNonceState(accountNonceState(nextAccount));
+            setAccountStatus('loaded');
             setAccountMessage(
                 nextAccount ? 'committed account loaded' : 'no committed account yet; mint to fund it',
             );
         } catch (error) {
             if (superseded()) return;
-            setAccountLoadFailed(true);
-            setAccountMessage(error instanceof Error ? error.message : String(error));
+            setAccountStatus('error');
+            setAccountMessage(errorMessage(error));
         }
     };
 
     useEffect(() => {
-        const justOpened = isWalletOpen && !walletWasOpenRef.current;
-        walletWasOpenRef.current = isWalletOpen;
-        if (justOpened && wallet) {
-            void refreshAccount();
+        if (!wallet) {
+            setAccount(null);
+            setLocalNonceState(emptyNonceState());
+            setAccountStatus('idle');
+            setAccountMessage('account metadata unavailable');
+            return;
         }
-    }, [isWalletOpen, wallet]);
+        // refreshAccount's `superseded()` guard (via walletRef) already
+        // discards responses for a wallet that changed mid-flight.
+        void refreshAccount();
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [wallet]);
 
-    const handleCreateWallet = async () => {
+    const connectWallet = async (open: () => Promise<ActiveWallet>) => {
+        setWalletStatus('busy');
         setWalletMessage('opening passkey prompt');
         try {
-            const nextWallet = await createWallet();
+            const nextWallet = await open();
             setWallet(nextWallet);
+            setWalletStatus('signed-in');
             setWalletMessage('signed in');
         } catch (error) {
-            setWalletMessage(error instanceof Error ? error.message : String(error));
+            setWalletStatus('error');
+            setWalletMessage(errorMessage(error));
         }
     };
 
-    const handleSignIn = async () => {
-        setWalletMessage('opening passkey prompt');
-        try {
-            const nextWallet = await signInWithPasskey();
-            setWallet(nextWallet);
-            setWalletMessage('signed in');
-        } catch (error) {
-            setWalletMessage(error instanceof Error ? error.message : String(error));
-        }
-    };
+    const handleCreateWallet = () => connectWallet(createWallet);
+    const handleSignIn = () => connectWallet(signInWithPasskey);
 
     const handleSignOut = () => {
         clearSession();
         setWallet(null);
+        setWalletStatus('idle');
         setWalletMessage('signed out');
     };
 
@@ -788,30 +827,31 @@ export default function App() {
             await navigator.clipboard.writeText(value);
             showToast('copied', 1_400);
         } catch (error) {
-            showToast(error instanceof Error ? error.message : String(error), 1_400);
+            showToast(errorMessage(error), 1_400);
         }
     }, [showToast]);
 
     const openAccountPage = useCallback((value: string): boolean => {
-        const normalized = normalizeAccountInput(value);
+        const normalized = normalizeAccountKeyHex(value);
         if (!normalized) return false;
 
         setSearchMessage('');
         setLookupAccount(normalized);
         setAccountInput(normalized);
         setAccountCursorStack([null]);
-        const url = new URL(window.location.href);
-        url.searchParams.set('account', normalized);
-        const nextLocation = `${url.pathname}${url.search}${url.hash}`;
-        if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
-            window.history.pushState(null, '', nextLocation);
-        }
+        pushAccountLocation(normalized);
         setIsWalletOpen(false);
         setIsSearchOpen(false);
         return true;
     }, []);
 
-    const openWalletDialog = useCallback(() => setIsWalletOpen(true), []);
+    // Opening the wallet dialog also refreshes the account snapshot it shows.
+    const openWalletDialog = useStableCallback(() => {
+        setIsWalletOpen(true);
+        if (wallet) void refreshAccount();
+    });
+    const closeWalletDialog = useCallback(() => setIsWalletOpen(false), []);
+    const closeSearchDialog = useCallback(() => setIsSearchOpen(false), []);
 
     const submitAccountLookup = () => {
         if (openAccountPage(accountInput)) return;
@@ -823,28 +863,23 @@ export default function App() {
         setAccountInput('');
         setAccountCursorStack([null]);
         setSearchMessage('');
-        const url = new URL(window.location.href);
-        url.searchParams.delete('account');
-        const nextLocation = `${url.pathname}${url.search}${url.hash}`;
-        if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
-            window.history.pushState(null, '', nextLocation);
-        }
+        pushAccountLocation(null);
     };
 
-    const nextAccountPage = () => {
+    const nextAccountPage = useStableCallback(() => {
         if (!accountNextCursor) return;
         setAccountCursorStack((current) => [...current, accountNextCursor]);
-    };
+    });
 
-    const previousAccountPage = () => {
+    const previousAccountPage = useCallback(() => {
         setAccountCursorStack((current) => current.length <= 1 ? current : current.slice(0, -1));
-    };
+    }, []);
 
-    const changeAccountActivityMode = (mode: AccountActivityMode) => {
+    const changeAccountActivityMode = useCallback((mode: AccountActivityMode) => {
         setAccountActivityMode(mode);
         setAccountCursorStack([null]);
         setAccountNextCursor(null);
-    };
+    }, []);
 
     /**
      * Shared submit flow: reserve the next nonce (rolled back if nothing was
@@ -898,9 +933,10 @@ export default function App() {
                 resolvedInMs: null,
                 status: 'pending',
                 detail: 'submitted to mempool',
+                rejected: false,
                 finalizedHeight: null,
-                certificate: { status: 'waiting', detail: 'waiting for finalization' },
-                proof: { status: 'waiting', detail: 'waiting for finalization' },
+                certificate: WAITING_FINALIZATION_CERTIFICATE,
+                proof: WAITING_FINALIZATION_CERTIFICATE,
             };
             setHistory((current) => prependTransaction(pending, current));
             setSubmitMessage('submitting');
@@ -922,7 +958,7 @@ export default function App() {
             if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
                 setLocalNonceState(reservation.previous);
             }
-            setSubmitMessage(error instanceof Error ? error.message : String(error));
+            setSubmitMessage(errorMessage(error));
             return null;
         } finally {
             setPendingSubmissionCount((count) => Math.max(0, count - 1));
@@ -1043,7 +1079,7 @@ export default function App() {
                         <span className="accent">constantinople</span>
                     </h1>
                     <div className="app__header-actions">
-                        <StatusBadge status={status} spinner={spinner} />
+                        <StatusBadge status={status} />
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
@@ -1093,7 +1129,7 @@ export default function App() {
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
-                        <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
+                        <button className="wallet-trigger" onClick={openWalletDialog}>
                             {walletAccountKey ? 'wallet' : 'sign in'}
                         </button>
                     </div>
@@ -1149,20 +1185,20 @@ export default function App() {
                     </section>
                 </main>
                 {isWalletOpen && (
-                    <WalletModal onClose={() => setIsWalletOpen(false)}>
+                    <Modal title="wallet" ariaLabel="wallet" onClose={closeWalletDialog}>
                         <WalletPanel
                             wallet={wallet}
                             walletAccountKey={walletAccountKey}
+                            walletStatus={walletStatus}
                             walletMessage={walletMessage}
                             account={account}
+                            accountStatus={accountStatus}
                             accountMessage={accountMessage}
                             toKey={toKey}
                             value={value}
                             nonce={nonce}
                             submitMessage={submitMessage}
                             isSubmitting={isSubmitting}
-                            accountLoadFailed={accountLoadFailed}
-                            spinner={spinner}
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
@@ -1176,15 +1212,20 @@ export default function App() {
                         />
                         <TransactionHistory
                             transactions={history}
-                            signedInAccountKey={signedInAccountKey}
+                            signedInAccountKey={walletAccountKey}
                             onCopy={copyValue}
                             onOpenAddress={openAccountPage}
                             verifyCertificates={verifyCertificates}
                         />
-                    </WalletModal>
+                    </Modal>
                 )}
                 {isSearchOpen && (
-                    <SearchModal onClose={() => setIsSearchOpen(false)}>
+                    <Modal
+                        title="search"
+                        ariaLabel="account search"
+                        panelClassName="modal__panel--search"
+                        onClose={closeSearchDialog}
+                    >
                         <AccountSearchPanel
                             accountInput={accountInput}
                             message={searchMessage}
@@ -1194,7 +1235,7 @@ export default function App() {
                             }}
                             onSubmit={submitAccountLookup}
                         />
-                    </SearchModal>
+                    </Modal>
                 )}
                 {toast && <TerminalToast message={toast} />}
             </div>
@@ -1202,7 +1243,7 @@ export default function App() {
     );
 }
 
-function AccountPage({
+const AccountPage = memo(function AccountPage({
     account,
     onCopy,
     onOpenAddress,
@@ -1357,7 +1398,7 @@ function AccountPage({
             </div>
         </section>
     );
-}
+});
 
 // The value column means different things per kind: a transfer's amount, the
 // escrow a channel open reserves, or the amount a channel close pays out. A
@@ -1397,12 +1438,18 @@ function ProofMark({ proof }: { proof: TransactionProofState }) {
     return <span className="tx-proof-spinner" title={proof.detail} />;
 }
 
-function SearchModal({
-    children,
+function Modal({
+    title,
+    ariaLabel,
+    panelClassName,
     onClose,
+    children,
 }: {
-    children: React.ReactNode;
+    title: string;
+    ariaLabel: string;
+    panelClassName?: string;
     onClose: () => void;
+    children: React.ReactNode;
 }) {
     useEffect(() => {
         const closeOnEscape = (event: KeyboardEvent) => {
@@ -1421,9 +1468,14 @@ function SearchModal({
                 if (event.target === event.currentTarget) onClose();
             }}
         >
-            <section className="modal__panel modal__panel--search" role="dialog" aria-modal="true" aria-label="account search">
+            <section
+                className={panelClassName ? `modal__panel ${panelClassName}` : 'modal__panel'}
+                role="dialog"
+                aria-modal="true"
+                aria-label={ariaLabel}
+            >
                 <header className="modal__header">
-                    <h2>search</h2>
+                    <h2>{title}</h2>
                     <button className="modal__close" onClick={onClose}>
                         close
                     </button>
@@ -1471,56 +1523,19 @@ function AccountSearchPanel({
     );
 }
 
-function WalletModal({
-    children,
-    onClose,
-}: {
-    children: React.ReactNode;
-    onClose: () => void;
-}) {
-    useEffect(() => {
-        const closeOnEscape = (event: KeyboardEvent) => {
-            if (event.key !== 'Escape') return;
-            onClose();
-        };
-        window.addEventListener('keydown', closeOnEscape);
-        return () => window.removeEventListener('keydown', closeOnEscape);
-    }, [onClose]);
-
-    return (
-        <div
-            className="modal"
-            role="presentation"
-            onMouseDown={(event) => {
-                if (event.target === event.currentTarget) onClose();
-            }}
-        >
-            <section className="modal__panel" role="dialog" aria-modal="true" aria-label="wallet">
-                <header className="modal__header">
-                    <h2>wallet</h2>
-                    <button className="modal__close" onClick={onClose}>
-                        close
-                    </button>
-                </header>
-                {children}
-            </section>
-        </div>
-    );
-}
-
 function WalletPanel({
     wallet,
     walletAccountKey,
+    walletStatus,
     walletMessage,
     account,
+    accountStatus,
     accountMessage,
     toKey,
     value,
     nonce,
     submitMessage,
     isSubmitting,
-    accountLoadFailed,
-    spinner,
     onCreateWallet,
     onSignIn,
     onSignOut,
@@ -1534,16 +1549,16 @@ function WalletPanel({
 }: {
     wallet: ActiveWallet | null;
     walletAccountKey: string | null;
+    walletStatus: WalletStatus;
     walletMessage: string;
     account: AccountView | null;
+    accountStatus: AccountStatus;
     accountMessage: string;
     toKey: string;
     value: string;
     nonce: string;
     submitMessage: string;
     isSubmitting: boolean;
-    accountLoadFailed: boolean;
-    spinner: string;
     onCreateWallet: () => void;
     onSignIn: () => void;
     onSignOut: () => void;
@@ -1556,11 +1571,13 @@ function WalletPanel({
     onMint: () => void;
 }) {
     const balance = account?.balance ?? 0;
-    const isWalletLoading = walletMessage === 'opening passkey prompt';
-    const isAccountLoading = accountMessage === 'loading account metadata';
-    const showWalletMessage =
-        walletMessage !== 'sign in or create a wallet' && walletMessage !== 'signed out';
-    const walletKeyFailed = walletAccountKey === null && walletMessage !== 'signed in';
+    const isWalletLoading = walletStatus === 'busy';
+    const isAccountLoading = accountStatus === 'loading';
+    const accountLoadFailed = accountStatus === 'error';
+    // 'idle' covers the onboarding prompt and 'signed out' — neither is
+    // worth echoing back.
+    const showWalletMessage = walletStatus !== 'idle';
+    const walletKeyFailed = walletAccountKey === null && walletStatus !== 'signed-in';
 
     if (!wallet) {
         return (
@@ -1570,7 +1587,7 @@ function WalletPanel({
                     <p>sign in with a passkey, or create one. you'll approve each transaction.</p>
                     {showWalletMessage && (
                         <div className="wallet__status" role="status">
-                            <SpinnerText active={isWalletLoading} spinner={spinner}>
+                            <SpinnerText active={isWalletLoading}>
                                 {walletMessage}
                             </SpinnerText>
                         </div>
@@ -1624,7 +1641,7 @@ function WalletPanel({
                     {!walletKeyFailed && (isAccountLoading || accountLoadFailed) && (
                         <div className="wallet__account-status">
                             <div className="wallet__status" role="status">
-                                <SpinnerText active={isAccountLoading} spinner={spinner}>
+                                <SpinnerText active={isAccountLoading}>
                                     {isAccountLoading ? 'updating…' : accountMessage}
                                 </SpinnerText>
                             </div>
@@ -1708,7 +1725,7 @@ function WalletPanel({
             </form>
             {submitMessage && (
                 <div className="wallet__activity" role="status">
-                    <SpinnerText active={isSubmitting} spinner={spinner}>
+                    <SpinnerText active={isSubmitting}>
                         {submitMessage}
                     </SpinnerText>
                 </div>
@@ -1762,7 +1779,7 @@ function AccountPageAddressValue({
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
 }) {
-    if (normalizeAccountInput(value) === account) {
+    if (normalizeAccountKeyHex(value) === account) {
         return <CopyableValue value={value} onCopy={onCopy} />;
     }
     return <AddressValue value={value} onOpenAddress={onOpenAddress} />;
@@ -1780,12 +1797,13 @@ function TerminalToast({ message }: { message: string }) {
 function SpinnerText({
     active,
     children,
-    spinner,
 }: {
     active: boolean;
     children: React.ReactNode;
-    spinner: string;
 }) {
+    // Ticking lives here, in a leaf, so an active spinner never re-renders
+    // anything but itself.
+    const spinner = useBrailleSpinner(active);
     if (!active) return <>{children}</>;
     return (
         <>
@@ -1844,7 +1862,7 @@ function TransactionHistory({
     );
 }
 
-function TransactionRecord({
+const TransactionRecord = memo(function TransactionRecord({
     formatter,
     onCopy,
     onOpenAddress,
@@ -1860,16 +1878,14 @@ function TransactionRecord({
     verifyCertificates: boolean;
 }) {
     const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
-    const rejected = tx.status === 'partially_finalized' && tx.detail.startsWith('rejected');
-    const included = submittedTransactionWasIncluded(tx.status, tx.detail);
+    const included = submittedTransactionWasIncluded(tx.status, tx.rejected);
     const outcome =
         tx.finalizedHeight !== null
-            ? `${rejected ? 'rejected · ' : ''}block ${tx.finalizedHeight}`
+            ? `${tx.rejected ? 'rejected · ' : ''}block ${tx.finalizedHeight}`
             : null;
     const showDetail = tx.status === 'pending' || tx.status === 'error';
     const showVerification = tx.status === 'pending' || included;
     const dropped = tx.status === 'dropped';
-    const showResolution = dropped && tx.resolvedInMs !== null;
     const showSecondary = showDetail || showVerification || dropped;
 
     return (
@@ -1921,13 +1937,7 @@ function TransactionRecord({
                             <ProofCell ownsTx={ownsTx} proof={tx.proof} />
                         </>
                     )}
-                    {included && tx.resolvedInMs !== null && (
-                        <>
-                            <span className="tx-sep" aria-hidden="true">·</span>
-                            <span>took {tx.resolvedInMs}ms</span>
-                        </>
-                    )}
-                    {showResolution && (
+                    {(included || dropped) && tx.resolvedInMs !== null && (
                         <>
                             <span className="tx-sep" aria-hidden="true">·</span>
                             <span>took {tx.resolvedInMs}ms</span>
@@ -1937,7 +1947,7 @@ function TransactionRecord({
             )}
         </div>
     );
-}
+});
 
 function CertificateCell({
     certificate,
@@ -2069,6 +2079,9 @@ function updateTransactionStatus(
             ...tx,
             status: status.status,
             detail,
+            // Structured, so nothing downstream has to parse `detail`.
+            rejected:
+                status.status === 'partially_finalized' && status.filtered.includes(digest),
             resolvedInMs: Date.now() - tx.submittedAt,
             finalizedHeight,
             certificate: nextBlockCertificateState(status),
@@ -2079,12 +2092,9 @@ function updateTransactionStatus(
 
 function submittedTransactionWasIncluded(
     status: SubmittedTransaction['status'],
-    detail: string,
+    rejected: boolean,
 ): boolean {
-    return (
-        status === 'finalized' ||
-        (status === 'partially_finalized' && !detail.startsWith('rejected'))
-    );
+    return status === 'finalized' || (status === 'partially_finalized' && !rejected);
 }
 
 function updateTransactionProof(
@@ -2127,8 +2137,7 @@ function shouldFetchTransactionProof(
         signedInSender !== null &&
         tx.sender === signedInSender &&
         tx.finalizedHeight !== null &&
-        (tx.status === 'finalized' ||
-            (tx.status === 'partially_finalized' && !tx.detail.startsWith('rejected'))) &&
+        submittedTransactionWasIncluded(tx.status, tx.rejected) &&
         (tx.proof.status === 'waiting' ||
             (tx.proof.status === 'error' && isRetryableProofError(tx.proof.detail)))
     );
@@ -2148,7 +2157,7 @@ function nextBlockCertificateState(status: TxStatus): BlockCertificateState {
     if (status.status === 'dropped') {
         return { status: 'waiting', detail: 'not finalized' };
     }
-    return { status: 'waiting', detail: 'waiting for block certificate' };
+    return WAITING_BLOCK_CERTIFICATE;
 }
 
 function nextProofState(
@@ -2199,7 +2208,7 @@ async function retryAccountPageStep<T>(
             return await run();
         } catch (error) {
             lastError = error;
-            const detail = error instanceof Error ? error.message : String(error);
+            const detail = errorMessage(error);
             if (!isRetryableAccountProofError(detail)) {
                 throw error;
             }
@@ -2222,12 +2231,19 @@ function formatTxStatus(status: TxStatus, digest: string): string {
     return status.status;
 }
 
-function normalizeAccountInput(value: string): string | null {
-    const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (isAccountKeyHex(normalized)) {
-        return normalized;
+/// Builds the explorer location for `account` (null clears the lookup) and
+/// pushes it when it differs from the current one.
+function pushAccountLocation(account: string | null) {
+    const url = new URL(window.location.href);
+    if (account === null) {
+        url.searchParams.delete('account');
+    } else {
+        url.searchParams.set('account', account);
     }
-    return null;
+    const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+    if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+        window.history.pushState(null, '', nextLocation);
+    }
 }
 
 function accountNonceState(account: AccountView | null): NonceState {
@@ -2244,8 +2260,8 @@ function accountNonceState(account: AccountView | null): NonceState {
 function accountFromLocation(): string {
     const url = new URL(window.location.href);
     const queryAccount = url.searchParams.get('account');
-    const fromQuery = queryAccount?.trim().replace(/^0x/i, '').toLowerCase();
-    if (fromQuery && isAccountKeyHex(fromQuery)) return fromQuery;
+    const fromQuery = queryAccount === null ? null : normalizeAccountKeyHex(queryAccount);
+    if (fromQuery) return fromQuery;
 
     const pathMatch = /^\/account\/([0-9a-fA-F]{64})$/.exec(url.pathname);
     return pathMatch ? pathMatch[1].toLowerCase() : '';
@@ -2322,6 +2338,12 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         status !== 'dropped' && typeof transaction.finalizedHeight === 'number'
             ? transaction.finalizedHeight
             : null;
+    // Legacy migration: records persisted before the explicit `rejected`
+    // flag encoded rejection only in the display string.
+    const rejected =
+        typeof transaction.rejected === 'boolean'
+            ? transaction.rejected
+            : status === 'partially_finalized' && transaction.detail.startsWith('rejected');
 
     return {
         digest: transaction.digest,
@@ -2334,6 +2356,7 @@ function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | n
         resolvedInMs,
         status,
         detail: transaction.detail,
+        rejected,
         finalizedHeight,
         certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
         proof: normalizeTransactionProof(transaction.proof),
@@ -2368,8 +2391,10 @@ function normalizeTransactionKind(value: unknown): TransactionKind {
     }
 }
 
+/// Whether `value` is an already-normalized account key (exactly 32 bytes
+/// of lowercase hex, no `0x`, no padding) — the form persisted records use.
 function isAccountKeyHex(value: string): boolean {
-    return /^[0-9a-f]{64}$/.test(value);
+    return normalizeAccountKeyHex(value) === value;
 }
 
 function normalizeBlockCertificate(
@@ -2411,7 +2436,7 @@ function defaultBlockCertificate(finalizedHeight: number | null): BlockCertifica
 
 function normalizeTransactionProof(value: unknown): TransactionProofState {
     if (typeof value !== 'object' || value === null) {
-        return { status: 'waiting', detail: 'waiting for finalization' };
+        return WAITING_FINALIZATION_CERTIFICATE;
     }
     const proof = value as Record<string, unknown>;
     if (proof.status === 'verified' && typeof proof.detail === 'string') {
@@ -2429,17 +2454,14 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
     if (proof.status === 'error') {
         return { status: 'waiting', detail: 'retrying QMDB proof' };
     }
-    return { status: 'waiting', detail: 'waiting for finalization' };
+    return WAITING_FINALIZATION_CERTIFICATE;
 }
 
-function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {
+function StatusBadge({ status }: { status: Status }) {
     if (status.kind === 'connecting') {
         return (
             <span className="app__status">
-                <span className="spinner" aria-hidden="true">
-                    {spinner}
-                </span>
-                connecting
+                <SpinnerText active>connecting</SpinnerText>
             </span>
         );
     }

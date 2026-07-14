@@ -59,14 +59,3 @@ export async function submitTransactions(
     }
     return response.json();
 }
-
-export async function fetchTransactionStatus(baseUrl: string, batchId: string): Promise<TxStatus | null> {
-    const response = await fetch(`${trimTrailingSlash(baseUrl)}/transactions/${batchId}`);
-    if (response.status === 404) {
-        return null;
-    }
-    if (!response.ok) {
-        throw new Error(`transaction status failed with HTTP ${response.status}`);
-    }
-    return response.json();
-}
