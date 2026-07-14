@@ -253,6 +253,10 @@ export async function fetchIndexedAccountState({
 
 /// Reads the committed replay-protection state for an account. A missing or
 /// deleted account has no usable nonce state.
+///
+/// Only meaningful for signing accounts: a channel account repurposes the
+/// nonce base slot to store its expiry height, so calling this on one would
+/// return that expiry disguised as a nonce base, without error.
 export async function fetchIndexedNonceState({
     sqlUrl,
     account,

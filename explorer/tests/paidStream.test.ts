@@ -12,6 +12,7 @@ import {
     parseStreamChunk,
     parseStreamEnd,
     parseStreamMeter,
+    resolveChannelRecordState,
     settleRequestBody,
     streamRequestQuery,
     voucherFinalTopUp,
@@ -154,4 +155,40 @@ test('stream payloads parse and reject malformed data', () => {
     assert.throws(() => parseStreamChunk('{"served":1,"paid":0}'), /text/);
     assert.throws(() => parseStreamEnd('{"reason":"whatever","served":1,"paid":0}'), /reason/);
     assert.throws(() => parseStreamMeter('{"served":-1,"paid":0}'), /served/);
+});
+
+test('channel record resolution clears only on proof', () => {
+    // A deleted channel account is proof the escrow resolved on-chain,
+    // whatever the nonce reads say.
+    for (const openNonceAvailable of [true, false, null]) {
+        assert.equal(
+            resolveChannelRecordState({ channelState: 'deleted', openNonceAvailable }),
+            'settled',
+        );
+    }
+
+    // A missing channel is proof the open never landed only when the open
+    // nonce was observed consumed FIRST (see the read-order contract).
+    assert.equal(
+        resolveChannelRecordState({ channelState: 'missing', openNonceAvailable: false }),
+        'never-opened',
+    );
+    // Nonce still available: the open may still land.
+    assert.equal(
+        resolveChannelRecordState({ channelState: 'missing', openNonceAvailable: true }),
+        'keep',
+    );
+    // Nonce unknowable (payer unknown, mismatched, or unindexed): no proof.
+    assert.equal(
+        resolveChannelRecordState({ channelState: 'missing', openNonceAvailable: null }),
+        'keep',
+    );
+
+    // A live channel guards live escrow, regardless of the nonce reads.
+    for (const openNonceAvailable of [true, false, null]) {
+        assert.equal(
+            resolveChannelRecordState({ channelState: 'live', openNonceAvailable }),
+            'keep',
+        );
+    }
 });

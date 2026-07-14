@@ -811,7 +811,6 @@ body {
     min-width: 0;
 }
 
-.tx-record__arrow,
 .tx-record__label {
     color: var(--theme-text-dim);
     flex-shrink: 0;
@@ -1552,10 +1551,6 @@ body {
 .paid-stream__facts dd {
     margin: 0.2rem 0 0;
     overflow-wrap: anywhere;
-}
-
-.paid-stream__fact-note {
-    color: var(--theme-text-dim);
 }
 
 .paid-stream__controls {

@@ -250,7 +250,14 @@ export default function App() {
     const [isWalletOpen, setIsWalletOpen] = useState(false);
     const [isSearchOpen, setIsSearchOpen] = useState(false);
     const [wallet, setWallet] = useState<ActiveWallet | null>(null);
+    /// Render-synced mirror so async wallet work can detect a switch that
+    /// happened while it awaited (its closed-over `wallet` is stale).
+    const walletRef = useRef<ActiveWallet | null>(null);
+    walletRef.current = wallet;
     const [walletAccountKey, setWalletAccountKey] = useState<string | null>(null);
+    /// Bumped to re-run the account-key derivation after a failure (the only
+    /// other recovery is signing out and back in).
+    const [walletKeyAttempt, setWalletKeyAttempt] = useState(0);
     const [walletMessage, setWalletMessage] = useState('sign in or create a wallet');
     const [account, setAccount] = useState<AccountView | null>(null);
     const [accountMessage, setAccountMessage] = useState('account metadata unavailable');
@@ -430,7 +437,7 @@ export default function App() {
         return () => {
             cancelled = true;
         };
-    }, [wallet]);
+    }, [wallet, walletKeyAttempt]);
 
     useEffect(() => {
         if (historyKey === null) return;
@@ -704,10 +711,16 @@ export default function App() {
 
     const refreshAccount = async () => {
         if (!wallet) return;
+        const key = wallet.publicKeyHex;
+        // If the wallet was switched while the fetch was in flight, merging
+        // the old wallet's nonce state would poison the new one's local
+        // nonce window.
+        const superseded = () => walletRef.current?.publicKeyHex !== key;
         setAccountMessage('loading account metadata');
         setAccountLoadFailed(false);
         try {
-            const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
+            const nextAccount = await fetchAccount(mempoolUrl, key);
+            if (superseded()) return;
             setAccount(nextAccount);
             setAccountLoadFailed(false);
             mergeLocalNonceState(accountNonceState(nextAccount));
@@ -715,6 +728,7 @@ export default function App() {
                 nextAccount ? 'committed account loaded' : 'no committed account yet; mint to fund it',
             );
         } catch (error) {
+            if (superseded()) return;
             setAccountLoadFailed(true);
             setAccountMessage(error instanceof Error ? error.message : String(error));
         }
@@ -1153,6 +1167,7 @@ export default function App() {
                             onSignIn={handleSignIn}
                             onSignOut={handleSignOut}
                             onRefreshAccount={refreshAccount}
+                            onRetryWalletKey={() => setWalletKeyAttempt((n) => n + 1)}
                             onCopy={copyValue}
                             onToKeyChange={setToKey}
                             onValueChange={setValue}
@@ -1510,6 +1525,7 @@ function WalletPanel({
     onSignIn,
     onSignOut,
     onRefreshAccount,
+    onRetryWalletKey,
     onCopy,
     onToKeyChange,
     onValueChange,
@@ -1532,6 +1548,7 @@ function WalletPanel({
     onSignIn: () => void;
     onSignOut: () => void;
     onRefreshAccount: () => void;
+    onRetryWalletKey: () => void;
     onCopy: (value: string) => void;
     onToKeyChange: (value: string) => void;
     onValueChange: (value: string) => void;
@@ -1550,7 +1567,7 @@ function WalletPanel({
             <section className="wallet wallet--onboarding">
                 <div className="wallet__onboarding">
                     <h3>sign in to transact</h3>
-                    <p>sign in with a passkey, or create one. you’ll approve each transaction.</p>
+                    <p>sign in with a passkey, or create one. you'll approve each transaction.</p>
                     {showWalletMessage && (
                         <div className="wallet__status" role="status">
                             <SpinnerText active={isWalletLoading} spinner={spinner}>
@@ -1595,8 +1612,13 @@ function WalletPanel({
                               : 'connecting wallet'}
                     </div>
                     {walletKeyFailed && (
-                        <div className="wallet__status" role="alert">
-                            {walletMessage}
+                        <div className="wallet__account-status">
+                            <div className="wallet__status" role="alert">
+                                {walletMessage}
+                            </div>
+                            <button className="wallet__retry" onClick={onRetryWalletKey} type="button">
+                                retry
+                            </button>
                         </div>
                     )}
                     {!walletKeyFailed && (isAccountLoading || accountLoadFailed) && (

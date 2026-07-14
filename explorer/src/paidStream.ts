@@ -110,6 +110,37 @@ export function voucherFinalTopUp(
     return inputs.served > paid ? inputs.served : null;
 }
 
+/// The account index's view of a channel account's lifecycle (mirrors
+/// qmdb.ts's `IndexedAccountState`; kept structural so this module stays
+/// node-testable without the query stack).
+export type ChannelIndexState = 'missing' | 'live' | 'deleted';
+
+/// Decides the fate of a persisted channel recovery record from the indexed
+/// channel state and whether the record's open nonce is still available on
+/// the payer account (`null` = unknown: payer unknown, mismatched, or not
+/// yet indexed). The record is the only copy of the signed open and the
+/// voucher key, so anything short of proof keeps it.
+///
+/// SOUNDNESS REQUIRES READ ORDER: the payer nonce must be read BEFORE the
+/// channel state. `account_meta` rows are never removed, so "open nonce
+/// consumed, then channel still missing" proves a different transaction
+/// consumed the nonce and the open can never land. Read the other way
+/// around, the indexer can ingest the open between the two reads — the
+/// nonce then reads as consumed BY the open while the already-answered
+/// channel query said missing, and a record guarding live escrow would be
+/// discarded.
+export function resolveChannelRecordState({
+    channelState,
+    openNonceAvailable,
+}: {
+    channelState: ChannelIndexState;
+    openNonceAvailable: boolean | null;
+}): 'settled' | 'never-opened' | 'keep' {
+    if (channelState === 'deleted') return 'settled';
+    if (channelState === 'missing' && openNonceAvailable === false) return 'never-opened';
+    return 'keep';
+}
+
 /// Whether a voucher rejection means settlement is already inevitable, so
 /// the client should query the idempotent settlement endpoint for its final
 /// outcome instead of retrying a voucher the operator can no longer accept.

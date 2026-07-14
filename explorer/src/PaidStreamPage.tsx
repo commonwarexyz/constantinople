@@ -30,6 +30,7 @@ import {
     channelDeposit,
     channelExpiry,
     isSettlementBoundaryMessage,
+    resolveChannelRecordState,
     voucherFinalTopUp,
     voucherTopUp,
     type OperatorAdvertisement,
@@ -250,44 +251,55 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         record: ChannelRecord,
         cancelled?: () => boolean,
     ): Promise<boolean> => {
+        // A resolution that outlives its session (the user reset and opened
+        // a fresh channel while a query stalled) must not touch the new
+        // session's phase.
+        const generation = sessionGenerationRef.current;
+        const stale = () =>
+            (cancelled?.() ?? false) || generation !== sessionGenerationRef.current;
         try {
-            const state = await fetchIndexedAccountState({
+            // The payer nonce is read BEFORE the channel state — see
+            // `resolveChannelRecordState` for why the reverse order races
+            // the indexer ingesting the open and can discard the only
+            // recovery record for live escrow.
+            let openNonceAvailable: boolean | null = null;
+            const payerHex = record.payerHex ?? walletAccountHex;
+            if (payerHex && (await channelMatchesPayer(record, payerHex))) {
+                if (stale()) return false;
+                const payerNonce = await fetchIndexedNonceState({
+                    sqlUrl,
+                    account: payerHex,
+                });
+                if (payerNonce !== null) {
+                    openNonceAvailable =
+                        consumeNonce(payerNonce, BigInt(record.openNonce)) !== null;
+                }
+            }
+            if (stale()) return false;
+            const channelState = await fetchIndexedAccountState({
                 sqlUrl,
                 account: record.channelHex,
             });
-            if (cancelled?.()) return false;
-            if (state === 'deleted') {
-                clearStoredChannel(
-                    record,
-                    'channel resolved on-chain; no deposit remains locked.',
-                    'settled',
-                );
-                return true;
-            }
-            if (state !== 'missing') return false;
+            if (stale()) return false;
 
-            const payerHex = record.payerHex ?? walletAccountHex;
-            if (!payerHex || !(await channelMatchesPayer(record, payerHex)) || cancelled?.()) {
-                return false;
+            switch (resolveChannelRecordState({ channelState, openNonceAvailable })) {
+                case 'settled':
+                    clearStoredChannel(
+                        record,
+                        'channel resolved on-chain; no deposit remains locked.',
+                        'settled',
+                    );
+                    return true;
+                case 'never-opened':
+                    clearStoredChannel(
+                        record,
+                        'channel open never finalized; no deposit was locked.',
+                        'idle',
+                    );
+                    return true;
+                case 'keep':
+                    return false;
             }
-            const payerNonce = await fetchIndexedNonceState({
-                sqlUrl,
-                account: payerHex,
-            });
-            if (
-                payerNonce === null ||
-                consumeNonce(payerNonce, BigInt(record.openNonce)) !== null ||
-                cancelled?.()
-            ) {
-                return false;
-            }
-
-            clearStoredChannel(
-                record,
-                'channel open never finalized; no deposit was locked.',
-                'idle',
-            );
-            return true;
         } catch {
             // Reconciliation is recovery assistance, not a prerequisite for
             // normal operation. A transient indexer failure leaves the only
@@ -297,8 +309,12 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     };
 
     const clearStoredChannel = (record: ChannelRecord, message: string, nextPhase: Phase) => {
+        // A different channel may have superseded this record (adopted from
+        // another tab) while its resolution was in flight; leave the
+        // successor's record — and the page state now describing it — alone.
         const stored = readChannelRecord();
-        if (stored?.channelHex === record.channelHex) {
+        if (stored !== null && stored.channelHex !== record.channelHex) return;
+        if (stored !== null) {
             localStorage.removeItem(CHANNEL_STORAGE_KEY);
         }
         setChannel((current) =>
@@ -508,12 +524,12 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                     throw new Error('channel open was not signed');
                 }
                 record = signedRecord;
-                if (
-                    openStatus?.status === 'partially_finalized' &&
-                    openStatus.filtered.includes(signedRecord.openTxDigestHex)
-                ) {
-                    throw new Error('channel open was rejected on-chain');
-                }
+                // NOTE: an open rejected at execution is indistinguishable
+                // from a dropped proposal here — a 1-tx batch with nothing
+                // included always reports `dropped` with no height (never
+                // `partially_finalized`). Surfacing the difference needs the
+                // mempool to report judged drops with a height (deferred);
+                // until then the registration retry loop is the only signal.
                 // A dropped proposal or lost submission response does not
                 // require another passkey ceremony. Resubmit the exact
                 // persisted bytes; the signed nonce makes this idempotent if
@@ -676,6 +692,10 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 setPhase(origin);
             }
         } catch (error) {
+            // The operator may have settled (or swept) this channel and
+            // forgotten it; reconcile against the chain before surfacing a
+            // retry that can only fail the same way.
+            if (await resolveStoredChannel(channel)) return;
             setNote(`settlement failed: ${errorMessage(error)}`);
             setPhase(origin);
         }
@@ -685,7 +705,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
     /// the wallet — the exit for a channel the operator will never close
     /// (e.g. one whose registration never completed). The chain refuses the
     /// reclaim until the block height passes the channel's expiry, so the
-    /// operator's advertised height gates the attempt with a useful message
+    /// freshest available height gates the attempt with a useful message
     /// instead of a doomed submission.
     const reclaimDeposit = async () => {
         if (!channel) return;
@@ -695,11 +715,27 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         setPhase('settling');
         setNote('reclaiming the deposit…');
         try {
-            const ad = await fetchAdvertisement(operatorUrl);
-            const expiry = BigInt(channel.expiry);
-            if (ad.height <= expiry) {
+            // Only the payer's wallet derives this channel's address; any
+            // other signer would submit a doomed transaction and burn a
+            // wallet nonce for nothing.
+            if (
+                !walletAccountHex ||
+                !(await channelMatchesPayer(channel, walletAccountHex))
+            ) {
                 throw new Error(
-                    `channel not expired yet — reclaimable after block ${expiry} (chain is at ${ad.height})`,
+                    'this channel was opened by a different wallet — sign in with the wallet that opened it',
+                );
+            }
+            // The reclaim goes to the mempool, not the operator: when the
+            // operator is unreachable (the very case a timeout reclaim
+            // exists for), fall back to the page's own view of the chain
+            // height rather than refusing.
+            const ad = await fetchAdvertisement(operatorUrl).catch(() => null);
+            const height = maxHeight(ad?.height ?? null, currentHeight);
+            const expiry = BigInt(channel.expiry);
+            if (height !== null && height <= expiry) {
+                throw new Error(
+                    `channel not expired yet — reclaimable after block ${expiry} (chain is at ${height})`,
                 );
             }
             setNote('approve the reclaim in the wallet…');
@@ -768,13 +804,7 @@ export const PaidStreamPage = memo(function PaidStreamPage({
         : 0n;
     const streaming = phase === 'streaming';
     const channelExpiryBlock = channel ? BigInt(channel.expiry) : null;
-    const advertisedHeight = advertisement?.height ?? null;
-    const currentHeight =
-        chainHeight === null
-            ? advertisedHeight
-            : advertisedHeight === null || chainHeight > advertisedHeight
-              ? chainHeight
-              : advertisedHeight;
+    const currentHeight = maxHeight(chainHeight, advertisement?.height ?? null);
     const reclaimable =
         channelExpiryBlock !== null &&
         currentHeight !== null &&
@@ -787,6 +817,12 @@ export const PaidStreamPage = memo(function PaidStreamPage({
               : currentHeight === channelExpiryBlock
                 ? 'expires this block'
                 : `${(channelExpiryBlock - currentHeight).toString()} blocks left`;
+    // Known-wrong wallet for the persisted channel (old records lack
+    // payerHex; those fall through to reclaimDeposit's derivation check).
+    const payerMismatch =
+        channel?.payerHex !== undefined &&
+        walletAccountHex !== null &&
+        channel.payerHex.toLowerCase() !== walletAccountHex.toLowerCase();
     const terminalStream =
         phase === 'ended' && endReason !== null && endReason !== 'payment_timeout';
     const endMessage = streamEndMessage(endReason, paying);
@@ -959,7 +995,13 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                         (phase === 'idle' || phase === 'ready' || phase === 'ended') && (
                         <button
                             className="action-button action-button--danger"
+                            disabled={payerMismatch}
                             onClick={() => void reclaimDeposit()}
+                            title={
+                                payerMismatch
+                                    ? 'sign in with the wallet that opened this channel'
+                                    : 'reclaim the escrow after the channel expiry (the exit when settle is refused)'
+                            }
                             type="button"
                         >
                             reclaim deposit
@@ -979,7 +1021,9 @@ export const PaidStreamPage = memo(function PaidStreamPage({
                 </p>
             )}
             {endMessage && (
-                <p className="paid-stream__note">{endMessage}</p>
+                <p className="paid-stream__note" role="status">
+                    {endMessage}
+                </p>
             )}
 
             {showStreamOutput && (
@@ -1034,6 +1078,13 @@ function SessionAddress({
     onOpenAddress: (accountHex: string) => void;
 }) {
     return <AddressValue plain value={hex} display={shortHex(hex)} onOpenAddress={onOpenAddress} />;
+}
+
+/// The freshest of two optionally-known block heights.
+function maxHeight(a: bigint | null, b: bigint | null): bigint | null {
+    if (a === null) return b;
+    if (b === null) return a;
+    return a > b ? a : b;
 }
 
 async function channelMatchesPayer(record: ChannelRecord, payerHex: string): Promise<boolean> {
