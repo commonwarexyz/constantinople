@@ -164,17 +164,8 @@ pub(crate) type MarshaledApp<E, H, P, V, I, B, St> = Marshaled<
     FixedEpocher,
 >;
 
-pub(crate) type ShardsEngine<E, B, M, H, P, V, T> = shards::Engine<
-    E,
-    SchemeProvider<P, V>,
-    B,
-    M,
-    ReedSolomon<H>,
-    H,
-    EngineBlock<H, P>,
-    P,
-    T,
->;
+pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
+    shards::Engine<E, SchemeProvider<P, V>, B, M, ReedSolomon<H>, H, EngineBlock<H, P>, P, T>;
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 

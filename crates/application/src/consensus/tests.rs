@@ -30,7 +30,7 @@ use constantinople_primitives::{
     Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, SealedBlock,
     SignedTransaction, Transaction, TransactionPublicKey,
 };
-use std::{future::ready, num::NonZeroU64, time::Duration};
+use std::{future::ready, num::NonZeroU64, sync::Arc, time::Duration};
 
 type TestApp = Application<
     deterministic::Context,
@@ -248,8 +248,8 @@ fn verify_rejects_invalid_body() {
         let result = app
             .verify_child(
                 (context.child("verify"), consensus_context),
-                block,
-                std::future::ready(Some(parent)),
+                Arc::new(block),
+                std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
@@ -288,7 +288,7 @@ fn verify_rejects_missing_parent() {
         let result = app
             .verify_child(
                 (context.child("verify"), consensus_context),
-                block,
+                Arc::new(block),
                 std::future::ready(None),
                 dbs.new_batches().await,
             )
@@ -331,7 +331,7 @@ fn propose_drops_inapplicable_and_refills() {
         let proposed = app
             .propose_child(
                 (context.child("propose"), consensus_context.clone()),
-                parent.clone(),
+                Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut input,
             )
@@ -347,8 +347,8 @@ fn propose_drops_inapplicable_and_refills() {
         let accepted = app
             .verify_child(
                 (context.child("verify"), consensus_context),
-                proposed.block.clone(),
-                ready(Some(parent)),
+                Arc::new(proposed.block.clone()),
+                ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
@@ -380,7 +380,7 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let proposed = app
             .propose_child(
                 (context.child("propose"), consensus_context.clone()),
-                parent.clone(),
+                Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut input,
             )
@@ -391,8 +391,8 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let accepted = app
             .verify_child(
                 (context.child("verify"), consensus_context.clone()),
-                proposed.block.clone(),
-                std::future::ready(Some(parent.clone())),
+                Arc::new(proposed.block.clone()),
+                std::future::ready(Some(Arc::new(parent.clone()))),
                 dbs.new_batches().await,
             )
             .await;
@@ -411,8 +411,8 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let rejected = app
             .verify_child(
                 (context.child("verify_stale"), consensus_context),
-                stale,
-                std::future::ready(Some(parent)),
+                Arc::new(stale),
+                std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
@@ -602,7 +602,7 @@ fn build_timeout_bounds_refill_rounds() {
         let proposed = app
             .propose_child(
                 (context.child("propose_deadline"), ctx1),
-                harness.parent.clone(),
+                Arc::new(harness.parent.clone()),
                 harness.dbs.new_batches().await,
                 &mut input,
             )

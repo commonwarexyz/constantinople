@@ -52,7 +52,7 @@ where
     pub async fn propose_child(
         &mut self,
         (runtime, context): (E, Context<C, P>),
-        parent: SealedBlock<C, P, H>,
+        parent: Arc<SealedBlock<C, P, H>>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
         input: &mut I,
     ) -> Option<Proposed<Self, E>>
@@ -87,8 +87,9 @@ where
         )
         .await;
 
-        // The parent (a full block of decoded transactions) is released on
-        // the strategy's pool so the drop stays off the propose path.
+        // The parent reference (possibly the last one to a full block of
+        // decoded transactions) is released on the strategy's pool so the
+        // drop stays off the propose path.
         let drop_span = info_span!("application.propose.drop_parent");
         drop(
             self.strategy
@@ -139,8 +140,8 @@ where
     pub async fn verify_child(
         &mut self,
         (runtime, _context): (E, Context<C, P>),
-        block: SealedBlock<C, P, H>,
-        parent: impl Future<Output = Option<SealedBlock<C, P, H>>> + Send,
+        block: Arc<SealedBlock<C, P, H>>,
+        parent: impl Future<Output = Option<Arc<SealedBlock<C, P, H>>>> + Send,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
@@ -149,13 +150,17 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
-        let Block { header, body } = block.into_inner();
+        // The glue actor retains its own references to the block, so the
+        // header and lazy body are cloned out of the shared reference
+        // (per-transaction refcount bumps) instead of moved.
+        let header = block.header.clone();
+        let body = Arc::new(block.body.clone());
+        drop(block);
 
         // Signature verification needs only the block body, so it starts
         // immediately and overlaps the parent fetch below. The child context
         // serves only as an owned CryptoRng for the pool job; no runtime task
         // is spawned under its label.
-        let body = Arc::new(body);
         let (state_batch, transaction_batch) = batches;
         let signatures = verify_signatures::<E, H, St>(
             runtime.child("verify_signatures"),
@@ -203,8 +208,9 @@ where
 
         let result = futures::try_join!(signatures, execution, wait);
 
-        // The parent (a full block of decoded transactions) is released on
-        // the strategy's pool so the drop stays off the verify path.
+        // The parent reference (possibly the last one to a full block of
+        // decoded transactions) is released on the strategy's pool so the
+        // drop stays off the verify path.
         let drop_span = info_span!("application.verify.drop_parent");
         drop(
             self.strategy

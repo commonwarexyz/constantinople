@@ -94,32 +94,11 @@ const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 // are rare and transient, while a pooled class sized for them would retain
 // gigabytes after any burst.
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
-// Global cap: worst case ~3.5 GiB across the 1 KiB..2 MiB classes that keep
-// it (sum ~3.5 MiB * 1,024 — the two per-class overrides below are carved
-// out of the old ~4 GiB figure).
+// Worst case ~4 GiB across the 1 KiB..2 MiB classes (sum ~4 MiB * 1,024).
+// The 1 KiB vote class exhausts even at a 65,536 cap (demand is effectively
+// unbounded at 51 peers and 100k+ TPS), so exhaustion fallback to unpooled
+// allocation is its normal steady state and not worth buying with memory.
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
-// Per-class raises for the two classes measured exhausting the 1,024 global
-// cap across two consecutive 51-validator deployments at 190k TPS. Note the
-// pool's thread-local caches can strand ~half of a class in idle threads, so
-// only ~half of each cap is dependable shared capacity.
-//
-// Shards are ~290 KiB, so shard payloads land in the 512 KiB power-of-two
-// class, which exhausted its cap continuously (~560 fallback allocations/s
-// per node, ~280 MB/s of unpooled 512 KiB churn). 4,096 buffers (~2,048
-// effective after TLS stranding) bound worst-case retention at
-// 4,096 * 512 KiB = 2 GiB — an explicit price, unlike the 65,536 cap that
-// retained ~20 GiB and OOM'd.
-const NETWORK_BUFFER_POOL_512KIB_CLASS_SIZE: NonZeroUsize = NZUsize!(512 * 1024);
-const NETWORK_BUFFER_POOL_512KIB_CLASS_MAX: NonZeroU32 = NZU32!(4_096);
-// The 1 KiB vote class exhausts at ~1,080 fallback allocations/s/node. Its
-// demand is effectively unbounded at 51 peers, so it may still exhaust at
-// 65,536, but the worst case is only 65,536 * 1 KiB = 64 MiB — cheap next to
-// the 512 KiB raise that dominates the budget.
-//
-// Total network-pool worst case: ~3.5 GiB (global cap) + 2 GiB + 64 MiB
-// ~= 5.6 GiB, up from ~4 GiB — bounded, and affordable on 32 GiB hosts.
-const NETWORK_BUFFER_POOL_1KIB_CLASS_SIZE: NonZeroUsize = NZUsize!(1024);
-const NETWORK_BUFFER_POOL_1KIB_CLASS_MAX: NonZeroU32 = NZU32!(65_536);
 // Worst case ~2 GiB across the 4 KiB..8 MiB classes (sum ~16 MiB * 128). At
 // 110k TPS the 1 MiB class retained 4.1 GiB and the 8 MiB class 2.1 GiB
 // under a 262,144 cap. The two 512 MiB page caches hold their pages either
@@ -158,23 +137,7 @@ fn buffer_pool_configs(
     let network_cfg = BufferPoolConfig::for_network()
         .with_parallelism(network_parallelism)
         .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
-        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS)
-        .with_class_max(
-            NETWORK_BUFFER_POOL_512KIB_CLASS_SIZE,
-            NETWORK_BUFFER_POOL_512KIB_CLASS_MAX,
-        )
-        .with_class_max(
-            NETWORK_BUFFER_POOL_1KIB_CLASS_SIZE,
-            NETWORK_BUFFER_POOL_1KIB_CLASS_MAX,
-        )
-        // Shard buffers are allocated on network-reader/encode threads but
-        // freed on engine/worker threads, so TLS caches on the freeing
-        // threads strand the entire class and every alloc misses (measured:
-        // raising the cap 4x left ~540 fallback allocs/s/node and tripled
-        // erasure-encode time). Disable TLS caching for this class: the
-        // shared freelist is lock-free and ~1k ops/s/node is negligible,
-        // and the full class cap becomes dependable shared capacity.
-        .with_class_thread_cache(NETWORK_BUFFER_POOL_512KIB_CLASS_SIZE, 0);
+        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.
