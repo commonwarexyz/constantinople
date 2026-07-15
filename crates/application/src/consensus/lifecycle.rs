@@ -189,11 +189,10 @@ where
         // Execution stays on this async task; CPU-heavy stages are dispatched
         // to the strategy's pool, so a failure surfaces as a graceful
         // rejection below. Signatures verify concurrently with execution on
-        // the shared pool: a contention benchmark (storage `contention`
-        // bench) measured the concurrent join ~2ms FASTER than sequencing
-        // the merkleize after the signature burst — work-stealing packs the
-        // two workloads at ideal throughput, and the merkleize's stretched
-        // wall during the burst is overlap accounting, not lost work.
+        // the shared pool: work-stealing packs the two workloads, joining
+        // them measures slightly faster (~2ms) than sequencing the merkleize
+        // after the signature burst, and the merkleize's stretched wall time
+        // during the burst reflects pool sharing, not lost work.
         let execution = execute_body(
             self.strategy.clone(),
             state_batch,
@@ -201,10 +200,7 @@ where
             parent_transactions_inactivity_floor(&parent),
             body,
         );
-        let wait = wait_for_timestamp(
-            runtime.child("wait"),
-            time::block_deadline(header.timestamp),
-        );
+        let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
         let result = futures::try_join!(signatures, execution, wait);
 

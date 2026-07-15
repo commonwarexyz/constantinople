@@ -34,7 +34,7 @@
 //!        +--> general lane -- check/apply each account once      |
 //!        |                                                       |
 //!        v                                                       |
-//! indexed StateUpdates -------------------------------------------+
+//! indexed StateUpdates ------------------------------------------+
 //!        |
 //!        v
 //! staged state batch + transaction-history batch

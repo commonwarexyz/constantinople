@@ -41,14 +41,15 @@ const MIN_U64_VARINT_BYTES: usize = 1;
 /// Maximum ingress batches admitted to CPU verification concurrently, shared
 /// across both POST endpoints.
 ///
-/// Ingress decode and verification run on the dedicated ingress pool, which
-/// is sized to a fraction of the machine. Admitting one batch at a time keeps
-/// a burst of relayer posts from stacking CPU bursts on that pool; excess
-/// requests wait cheaply on the semaphore in the async layer instead. The
-/// owned permit is acquired in `verify_body` -- after the request body is
-/// buffered, before the pool job dispatches -- and moves into the job itself,
-/// so slow uploads and mailbox waits never hold it and a client disconnect
-/// cannot release it while the job runs.
+/// Ingress decode and verification run on the strategy's worker pool, which
+/// consensus execution and block verification also share. Admitting one
+/// batch at a time keeps a burst of relayer posts from queueing CPU bursts
+/// ahead of consensus-critical work; excess requests wait cheaply on the
+/// semaphore in the async layer instead. The owned permit is acquired in
+/// `verify_body` -- after the request body is buffered, before the pool job
+/// dispatches -- and moves into the job itself, so slow uploads and mailbox
+/// waits never hold it and a client disconnect cannot release it while the
+/// job runs.
 pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
 
 /// Shared state for HTTP handlers.

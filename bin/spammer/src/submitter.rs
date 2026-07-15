@@ -39,7 +39,8 @@ impl Metrics {
     }
 }
 
-/// Shared counters for progress reporting.
+/// Prometheus counters shared across submitters, exported via the metrics endpoint and read back
+/// by [`Stats::totals`] for the periodic progress log.
 pub struct Stats {
     metrics: Metrics,
 }

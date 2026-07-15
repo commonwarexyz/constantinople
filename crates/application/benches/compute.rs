@@ -482,7 +482,7 @@ fn main() {
                     }
 
                     println!(
-                        "loads    {n} txs / {ACCOUNTS} accounts / {} / {} shards\n  sequential: {:?}\n  overlap:    {:?}\n  combined:   {:?}",
+                        "loads    {n} txs / {ACCOUNTS} accounts / {} / {} workers\n  sequential: {:?}\n  overlap:    {:?}\n  combined:   {:?}",
                         fixture.name(),
                         workers,
                         seq_total / iters,
@@ -532,7 +532,7 @@ fn main() {
                     let avg = total / iters;
                     let tps = n as f64 / avg.as_secs_f64() / 1e6;
                     println!(
-                        "prepare+compute  {n} txs / {ACCOUNTS} accounts / {} / {} shards\n  compute: {avg:?}  ({tps:.2} Melem/s) / {writes} writes",
+                        "prepare+compute  {n} txs / {ACCOUNTS} accounts / {} / {} workers\n  compute: {avg:?}  ({tps:.2} Melem/s) / {writes} writes",
                         fixture.name(),
                         workers,
                     );

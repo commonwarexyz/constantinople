@@ -166,7 +166,7 @@ pub(crate) struct GenerateArgs {
 #[derive(Debug, Subcommand)]
 #[expect(
     clippy::large_enum_variant,
-    reason = "constructed once per invocation; boxing fights the clap derive"
+    reason = "constructed once per invocation, so the size imbalance is harmless"
 )]
 enum GenerateTarget {
     Local(LocalArgs),

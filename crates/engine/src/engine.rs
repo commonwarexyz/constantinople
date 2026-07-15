@@ -251,7 +251,7 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Clone + Sync,
+    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
@@ -480,12 +480,6 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
-        // Shard-bundle forwarding is disabled: production traces showed the
-        // bundle cannot beat the 50-way parallel rebroadcast wave it shares
-        // the leader's NIC with (reconstruction p50 was unchanged), so the
-        // extra ~block of prime-time leader egress buys nothing. The
-        // upstream machinery remains available behind a router if a design
-        // that does not compete with the fan-out emerges.
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
             shards::Config {

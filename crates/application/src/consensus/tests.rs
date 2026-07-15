@@ -30,7 +30,7 @@ use constantinople_primitives::{
     Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, SealedBlock,
     SignedTransaction, Transaction, TransactionPublicKey,
 };
-use std::{future::ready, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
 type TestApp = Application<
     deterministic::Context,
@@ -348,7 +348,7 @@ fn propose_drops_inapplicable_and_refills() {
             .verify_child(
                 (context.child("verify"), consensus_context),
                 Arc::new(proposed.block.clone()),
-                ready(Some(Arc::new(parent))),
+                std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
@@ -499,19 +499,6 @@ fn body_digests(block: &TestBlock) -> Vec<sha256::Digest> {
         .collect()
 }
 
-fn consensus_context(
-    view: u64,
-    leader: &ed25519::PrivateKey,
-    parent_view: u64,
-    parent: &TestBlock,
-) -> SimplexContext<sha256::Digest, ed25519::PublicKey> {
-    SimplexContext {
-        round: Round::new(Epoch::zero(), View::new(view)),
-        leader: leader.public_key(),
-        parent: (View::new(parent_view), *parent.seal()),
-    }
-}
-
 /// Wraps a static source with a virtual-time delay so a test can control how
 /// much of the build budget each mempool round trip consumes.
 struct DelayedSource {
@@ -520,6 +507,8 @@ struct DelayedSource {
     inner: TestSource,
 }
 
+// Required by `TransactionSource`'s `Reporter: Clone` supertrait; never
+// invoked in these tests.
 impl Clone for DelayedSource {
     fn clone(&self) -> Self {
         Self {
@@ -598,7 +587,11 @@ fn build_timeout_bounds_refill_rounds() {
             vec![refill_one.clone()],
             vec![never_pulled],
         ]);
-        let ctx1 = consensus_context(1, &harness.leader, 0, &harness.parent);
+        let ctx1 = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: harness.leader.public_key(),
+            parent: (View::zero(), *harness.parent.seal()),
+        };
         let proposed = app
             .propose_child(
                 (context.child("propose_deadline"), ctx1),

@@ -26,7 +26,7 @@ commonware-runtime.workspace = true
 bytes.workspace = true
 p256.workspace = true
 tracing.workspace = true
-rand = { workspace = true, features = ["std_rng"] }
+rand.workspace = true
 arbitrary = { workspace = true, features = ["derive"], optional = true }
 derive_more = { workspace = true, features = ["full"] }
 serde_json.workspace = true
@@ -40,7 +40,7 @@ commonware-consensus = { workspace = true, features = ["arbitrary"] }
 commonware-cryptography = { workspace = true, features = ["arbitrary"] }
 
 # Other
-rand.workspace = true
+rand = { workspace = true, features = ["std_rng"] }
 arbitrary = { workspace = true, features = ["derive"] }
 
 [features]

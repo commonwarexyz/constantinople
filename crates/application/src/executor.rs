@@ -436,8 +436,6 @@ struct WorkingAccount {
     nonce: Nonce,
     /// Total non-self debits applied so far.
     debit: u64,
-    /// Largest applied self-transfer (must be affordable from start).
-    self_floor: u64,
     /// Total credits applied so far.
     credit: u64,
     /// Whether any applied transfer touched this account.
@@ -494,7 +492,6 @@ impl SelectiveExecutor {
                 start_balance: start.balance,
                 nonce: start.nonce,
                 debit: 0,
-                self_floor: 0,
                 credit: 0,
                 touched: false,
             });
@@ -524,7 +521,6 @@ impl SelectiveExecutor {
             if account.start_balance < transfer.value || !account.nonce.consume(transfer.nonce) {
                 return false;
             }
-            account.self_floor = account.self_floor.max(transfer.value);
             account.touched = true;
             return true;
         }

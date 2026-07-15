@@ -37,7 +37,7 @@ The AMD build uses `x86_64-unknown-linux-gnu` with `target-cpu=znver5`, which ma
 AMD EPYC 9R45 processors. Do not deploy the Intel build to C8a instances: the Granite Rapids
 target can emit instructions that crash with `SIGILL` on AMD hosts.
 
-Both builder images are built for the local Docker host architecture and then cross-compile the
+All builder images are built for the local Docker host architecture and then cross-compile the
 requested binary to the target triple. This avoids running `rustc` inside an emulated
 `linux/amd64` container on Apple Silicon.
 

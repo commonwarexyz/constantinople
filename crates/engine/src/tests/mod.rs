@@ -563,9 +563,9 @@ fn run_many_crashes(engine: TestEngineDefinition) {
 
 fn run_total_shutdown(engine: TestEngineDefinition) {
     // One deterministic full blackout: every validator crashes at once and
-    // restarts together. This replaces repeated `Crash::Random` cycles, which
-    // could finish the run before their first tick now that finalization is
-    // faster.
+    // restarts together. A fixed schedule guarantees the outage actually
+    // happens; `Crash::Random` cycles can miss the run entirely when the
+    // exit height finalizes before their first tick.
     let mut schedule = Schedule::new();
     let participants = engine.participants();
     for participant in participants.iter().cloned() {

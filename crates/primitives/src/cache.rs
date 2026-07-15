@@ -308,14 +308,14 @@ mod tests {
         });
     }
 
-    /// Regression: `decompress` once held the cache's read guard across the
-    /// strategy's parallel map while the miss path queued the write lock. A
-    /// pool worker waiting inside the map steals other jobs; a stolen
-    /// `decompress` then blocks on the lock its own thread still holds
-    /// (parking_lot blocks new readers once a writer queues), deadlocking the
-    /// entire pool. This drives many concurrent miss-heavy batches through a
-    /// tiny work-stealing pool; under the broken locking it wedges within a
-    /// few rounds (the test hangs), while correct locking finishes quickly.
+    /// Holding the cache's read guard across the strategy's parallel map
+    /// deadlocks: a pool worker waiting inside the map steals other jobs, and a
+    /// stolen `decompress` then blocks on the lock its own thread still holds
+    /// (parking_lot blocks new readers once a writer queues), wedging the
+    /// entire pool. This test drives many concurrent miss-heavy batches through
+    /// a tiny work-stealing pool to exercise that interleaving: if `decompress`
+    /// ever holds the guard across pool work it wedges within a few rounds (the
+    /// test hangs), while correct locking finishes quickly.
     ///
     /// Runs on the tokio runtime: reproducing the steal interleaving needs a
     /// real work-stealing pool, which the deterministic runtime cannot wait
@@ -341,7 +341,8 @@ mod tests {
             for round in 0..64 {
                 // Run every decompress INSIDE a pool job (as verification
                 // does in production): a worker mid-map steals sibling jobs,
-                // which is the interleaving the old locking deadlocked on.
+                // the interleaving that deadlocks if the read guard is held
+                // across the map.
                 let pending: Vec<_> = (0..16)
                     .map(|task| {
                         let cache = cache.clone();

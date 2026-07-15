@@ -128,8 +128,9 @@ pub struct Config<St: Strategy> {
     /// batch as [`TxStatus::Dropped`].
     pub drop_grace_blocks: u64,
     /// Parallel execution strategy for ingress batch verification (decoding,
-    /// seal hashing, batch signature verification), the actor's pool
-    /// maintenance, and cheap HTTP formatting.
+    /// seal hashing, batch signature verification), finalized-block digest
+    /// extraction and block release in the actor, and hex-encoding digest
+    /// lists for status responses.
     pub strategy: St,
     /// Shared cache of decompressed transaction public keys.
     pub public_key_cache: PublicKeyCache,
@@ -1019,10 +1020,11 @@ mod tests {
         );
     }
 
-    /// The pre-split behavior is unchanged when a whole selection lands in
-    /// one block or dies untouched.
+    /// A whole selection that lands entirely in one block resolves
+    /// immediately; one that is never included drops once the grace window
+    /// expires.
     #[test]
-    fn whole_batch_resolution_is_unchanged() {
+    fn whole_selection_finalizes_in_one_block_or_drops_after_grace() {
         let mut rng = StdRng::from_seed([23; 32]);
         let a = sha256::Digest::random(&mut rng);
         let b = sha256::Digest::random(&mut rng);

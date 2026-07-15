@@ -27,14 +27,11 @@ where
     H: Hasher,
 {
     let parent_body_len = u64::try_from(parent.body.len()).expect("transaction count exceeded u64");
-    transactions_inactivity_floor(parent.header.transactions_range.end(), parent_body_len)
-}
-
-/// Computes the transaction-history inactivity floor a child inherits from a
-/// parent described only by its header range and body length.
-pub(super) fn transactions_inactivity_floor(range_end: u64, body_len: u64) -> mmr::Location {
-    let floor = range_end
-        .checked_sub(body_len)
+    let floor = parent
+        .header
+        .transactions_range
+        .end()
+        .checked_sub(parent_body_len)
         .and_then(|end| end.checked_sub(1))
         .expect("parent transaction range must include the parent commit");
     mmr::Location::new(floor)

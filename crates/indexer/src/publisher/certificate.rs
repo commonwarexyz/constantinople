@@ -216,9 +216,12 @@ where
     client
         .stage_upload(&prepared, &mut batch)
         .expect("prepared simplex block upload must stage");
-    let seq =
-        super::commit_with_retry(client.store_client().client(), &batch, "certificate upload")
-            .await;
+    let seq = super::commit_with_retry(
+        client.store_client().client(),
+        &batch,
+        "simplex block upload",
+    )
+    .await;
     let receipt = client.mark_upload_persisted(prepared, seq).await;
     debug!(
         headers = receipt.summary.headers,

@@ -101,9 +101,10 @@ const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
 // Worst case ~2 GiB across the 4 KiB..8 MiB classes (sum ~16 MiB * 128). At
 // 110k TPS the 1 MiB class retained 4.1 GiB and the 8 MiB class 2.1 GiB
-// under a 262,144 cap. The two 512 MiB page caches hold their pages either
-// way — a page served from exhaustion fallback costs one unpooled 8 KiB
-// allocation, the same memory without idle pool retention on top.
+// under a 262,144 cap. The engine's two page caches (sized by
+// `page_cache_bytes`) hold their pages either way — a page served from
+// exhaustion fallback costs one unpooled 8 KiB allocation, the same memory
+// without idle pool retention on top.
 const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);

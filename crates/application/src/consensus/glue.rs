@@ -73,8 +73,8 @@ where
         let parent = ancestry.next().await?;
         let result = self.propose_child(context, parent, batches, input).await;
         // propose_child releases the parent on the strategy's pool, so only
-        // the drained ancestry stream remains. Keep the span so before/after
-        // traces stay comparable.
+        // the drained ancestry stream remains; the span keeps its drop cost
+        // visible in traces.
         {
             let _cleanup = tracing::info_span!("application.propose.cleanup").entered();
             drop(ancestry);
@@ -99,8 +99,8 @@ where
         // On completed verifications the block body's references die in
         // verify_child's offloaded tasks and the parent is released on the
         // strategy's pool; early rejections drop what they hold inline.
-        // Either way only the drained ancestry stream remains here. Keep the
-        // span so before/after traces stay comparable.
+        // Either way only the drained ancestry stream remains here; the span
+        // keeps its drop cost visible in traces.
         {
             let _cleanup = tracing::info_span!("application.verify.cleanup").entered();
             drop(ancestry);

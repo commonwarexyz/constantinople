@@ -1690,7 +1690,7 @@ function shouldFetchTransactionProof(
         tx.sender === signedInSender &&
         tx.finalizedHeight !== null &&
         (tx.status === 'finalized' ||
-            (tx.status === 'partially_finalized' && !tx.detail.startsWith('rejected'))) &&
+            (tx.status === 'partially_finalized' && tx.proof.detail !== 'not included')) &&
         (tx.proof.status === 'waiting' ||
             (tx.proof.status === 'error' && isRetryableProofError(tx.proof.detail)))
     );

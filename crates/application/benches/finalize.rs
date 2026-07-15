@@ -2,10 +2,10 @@
 //! awaits versus `futures::join!` versus spawning the transaction-history
 //! merkleize on its own task. The spawned variant measures ~1ms faster at 32k
 //! txs (the state merkleize has long single-threaded phases that leave pool
-//! workers idle), but production runs the merkleizes back to back: a spawned
-//! child makes glue's verify cancellation observable mid-finalize, and the
-//! gain is too small to carry that hazard. Asserts all three schedules
-//! produce identical roots.
+//! workers idle), but production joins both merkleizes on a single task: a
+//! spawned child makes glue's verify cancellation observable mid-finalize,
+//! and the gain is too small to carry that hazard. Asserts all three
+//! schedules produce identical roots.
 
 use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
@@ -154,7 +154,7 @@ fn main() {
                             let transactions = transaction_batch.merkleize().await.expect("txs");
                             (state, transactions)
                         }
-                        // futures::join! on one task (the old finalize_execution).
+                        // futures::join! on one task (production's finalize_execution).
                         1 => {
                             let (state, transactions) = futures::join!(
                                 staged.merkleize(updates, Vec::new()),
@@ -162,7 +162,7 @@ fn main() {
                             );
                             (state.expect("state"), transactions.expect("txs"))
                         }
-                        // Spawned concurrent (the new finalize_execution).
+                        // Spawned concurrent (the rejected alternative; see module docs).
                         _ => {
                             let handle = context
                                 .child("tx_merkleize")
