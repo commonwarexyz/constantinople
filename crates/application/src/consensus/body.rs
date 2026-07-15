@@ -15,11 +15,6 @@ pub(super) type PreparedBody<H> = Arc<Vec<LazySignedTransaction<H>>>;
 
 /// Starts signature verification on the strategy's pool, returning a future
 /// that resolves to the outcome.
-///
-/// The job is dispatched eagerly (not on first poll), so verification overlaps
-/// whatever the caller does before awaiting -- e.g. fetching the parent block.
-/// Hosting it on a pool member (rather than a blocking thread) lets the host
-/// work-steal within the parallel batch verification instead of parking.
 pub(super) fn verify_signatures<E, H, St>(
     mut rng: E,
     namespace: &'static [u8],

@@ -430,11 +430,10 @@ where
         return true;
     }
 
-    // Resolve every sender's decompressed key on the strategy: cache hits
-    // share the read lock, and misses pay their curve decompression in
-    // parallel instead of serially in the queueing loop below. When the
-    // active account set exceeds the cache capacity, misses dominate and
-    // would otherwise stall the batch on one thread.
+    // Resolve every sender's decompressed key up front: when the active
+    // account set exceeds the cache capacity, misses dominate and would
+    // otherwise pay their curve decompression serially in the queueing
+    // loop below.
     let mut senders = Vec::with_capacity(transactions.len());
     for lazy in transactions {
         let Some(transaction) = lazy.get() else {
@@ -689,85 +688,6 @@ mod test {
                 .is_none(),
             "nested sender decode should still fail after reading pending bytes"
         );
-    }
-
-    /// Measures ed25519 batch-verification wall time across Rayon pool sizes,
-    /// using the same `verify_transaction_batch` path the application verify
-    /// and mempool ingress bursts run in production.
-    ///
-    /// Run with:
-    ///
-    /// ```text
-    /// cargo test -p constantinople-primitives --release \
-    ///     sig_verify_thread_scaling -- --ignored --nocapture
-    /// ```
-    #[test]
-    #[ignore = "manual measurement of signature-verification thread scaling"]
-    fn sig_verify_thread_scaling() {
-        use commonware_parallel::Rayon;
-
-        // Production-shaped batch: 51.6k-tx blocks.
-        const TXS: usize = 51_600;
-        const SENDERS: usize = 8_192;
-        const WARMUPS: usize = 3;
-        const SAMPLES: usize = 5;
-
-        deterministic::Runner::default().start(|context| async move {
-            let mut rng = test_rng();
-            let hasher = &mut sha256::Sha256::default();
-            let keys: Vec<ed25519::PrivateKey> = (0..SENDERS)
-                .map(|_| ed25519::PrivateKey::random(&mut rng))
-                .collect();
-            let transactions: Vec<LazySignedTransaction<sha256::Sha256>> = (0..TXS)
-                .map(|i| {
-                    let key = &keys[i % SENDERS];
-                    let public_key = TransactionPublicKey::ed25519(key.public_key());
-                    let signed = Transaction::new(
-                        public_key.clone(),
-                        public_key,
-                        NonZeroU64::new(1).expect("non-zero"),
-                        (i / SENDERS) as u64,
-                    )
-                    .seal_and_sign(key, NAMESPACE, hasher);
-                    LazySignedTransaction::new(signed)
-                })
-                .collect();
-            let cache = PublicKeyCache::new(context, NZUsize!(SENDERS * 2));
-
-            for threads in [1usize, 4, 6, 8, 10, 13, 16] {
-                let strategy = Rayon::new(NZUsize!(threads)).expect("pool must build");
-                // Warm the key cache, the lazy decode caches, and the
-                // strategy's adaptive policy before timing.
-                for _ in 0..WARMUPS {
-                    assert!(super::verify_transaction_batch::<sha256::Sha256, _>(
-                        NAMESPACE,
-                        &mut rng,
-                        &cache,
-                        &transactions,
-                        &strategy,
-                    ));
-                }
-                let mut samples = Vec::with_capacity(SAMPLES);
-                for _ in 0..SAMPLES {
-                    let start = std::time::Instant::now();
-                    assert!(super::verify_transaction_batch::<sha256::Sha256, _>(
-                        NAMESPACE,
-                        &mut rng,
-                        &cache,
-                        &transactions,
-                        &strategy,
-                    ));
-                    samples.push(start.elapsed());
-                }
-                samples.sort();
-                println!(
-                    "threads={threads:>2} min={:?} median={:?} max={:?}",
-                    samples[0],
-                    samples[samples.len() / 2],
-                    samples[samples.len() - 1],
-                );
-            }
-        });
     }
 
     fn invalid_public_key_bytes() -> [u8; TransactionPublicKey::SIZE] {

@@ -428,13 +428,11 @@ where
             break;
         }
 
-        // Prepare the candidates on the pool, dropping malformed ones. Unlike
-        // verification's all-or-nothing preparation, a proposer chooses its
-        // body: a candidate that fails preparation is simply excluded. The
-        // prepared results stay index-aligned with the untouched candidate
-        // vector — no transaction is moved through the parallel map — and the
-        // same job compacts the well-formed transfers and records the
-        // accounts this round touches for the first time.
+        // Prepare the candidates on the pool: a proposer chooses its body,
+        // so a candidate that fails preparation is simply excluded (unlike
+        // verification's all-or-nothing preparation). Results stay
+        // index-aligned with the candidate vector; the same job compacts the
+        // well-formed transfers and records first-touched accounts.
         let prepare_span = info_span!(
             "application.execute.prepare",
             txs = candidates.len().traced()

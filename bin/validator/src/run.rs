@@ -86,25 +86,8 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-// Pooled buffers are retained forever, so every size class's worst-case
-// memory is max_per_class * class_size and the cap must be cheap even when
-// a class pins it: at 110k TPS the 512 KiB class alone retained ~20 GiB
-// under a 65,536 cap and OOM'd 30 GiB hosts. Block-sized payloads (~6 MiB
-// marshal backfill) stay unpooled (buffer_pool_oversized) by design — they
-// are rare and transient, while a pooled class sized for them would retain
-// gigabytes after any burst.
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
-// Worst case ~4 GiB across the 1 KiB..2 MiB classes (sum ~4 MiB * 1,024).
-// The 1 KiB vote class exhausts even at a 65,536 cap (demand is effectively
-// unbounded at 51 peers and 100k+ TPS), so exhaustion fallback to unpooled
-// allocation is its normal steady state and not worth buying with memory.
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
-// Worst case ~2 GiB across the 4 KiB..8 MiB classes (sum ~16 MiB * 128). At
-// 110k TPS the 1 MiB class retained 4.1 GiB and the 8 MiB class 2.1 GiB
-// under a 262,144 cap. The engine's two page caches (sized by
-// `page_cache_bytes`) hold their pages either way — a page served from
-// exhaustion fallback costs one unpooled 8 KiB allocation, the same memory
-// without idle pool retention on top.
 const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
@@ -741,16 +724,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        // One shared rayon pool for all CPU-parallel work. Gate-path ed25519
-        // batch verification scales near-linearly with threads (measured 7.2x
-        // at 13 threads in constantinople-primitives'
-        // `sig_verify_thread_scaling`; production traces show ~470 core-ms
-        // finishing in ~36ms wall on 13 threads), so carving it onto a
-        // smaller sub-pool would only lengthen the deferred-verify gate that
-        // bounds view latency. Its contention with qmdb merkleize (merkleize
-        // wall 8.9ms uncontended -> 31.3ms mid-burst) is instead resolved by
-        // ordering: application verify gates the merkleize on signature
-        // completion (see `execute_body` in constantinople-application).
+        // One shared rayon pool for all CPU-parallel work.
         let strategy = context.strategy(NZUsize!(rayon_threads));
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),

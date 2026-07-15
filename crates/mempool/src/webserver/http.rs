@@ -238,15 +238,11 @@ where
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    // Hashing, decoding, and verifying a relayer batch is a ~470 core-ms CPU
-    // burst at production sizes, so all of it runs on the strategy pool
-    // instead of a core worker; only the cheap length checks above stay
-    // inline. Hosting the job on a pool member (rather than a blocking
-    // thread) also lets it work-steal during the nested parallel signature
-    // verification instead of parking. Pool threads have an empty tracing
-    // context, so capture the caller's span explicitly; handlers currently
-    // run without a request-level span (making these spans trace roots), but
-    // the stitching holds if one is added.
+    // Hashing, decoding, and verifying a relayer batch is a ~470 core-ms
+    // burst at production sizes, so it runs on the strategy pool; a pool
+    // member (unlike a blocking thread) work-steals during the nested
+    // parallel signature verification. Pool threads have an empty tracing
+    // context, so capture the caller's span explicitly.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;

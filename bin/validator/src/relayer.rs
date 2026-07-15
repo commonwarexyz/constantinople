@@ -233,11 +233,9 @@ async fn submit_transactions<St: Strategy>(
     }
 
     // Decoding seal-hashes every transaction, so it runs on the strategy's
-    // pool along with hashing the batch id. The owned permit rides in the
-    // job to bound concurrent decode CPU (the pool is shared with the
-    // co-located engine). The job itself is single-threaded because the wire
-    // format has no per-transaction framing to split on; the digest index is
-    // deferred to first use instead of paying it here on every submission.
+    // pool with the owned permit riding in the job to bound concurrent
+    // decode CPU. Single-threaded: the wire format has no per-transaction
+    // framing to split on.
     let Ok(permit) = state.decode_permits.clone().acquire_owned().await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
     };
@@ -289,16 +287,12 @@ async fn submit_with_retries<St: Strategy>(
     let mut digest_index: Option<DigestIndex> = None;
     let mut height = 0;
     let mut accepted_any = false;
-    // Every (batch id, leader) pair POSTed at least once; each is polled for
-    // status every round, which also recovers outcomes whose accept response
-    // was lost in transit.
+    // Every (batch id, leader) pair POSTed at least once; polled every
+    // round, which recovers accepts lost in transit.
     let mut posted = Vec::<(String, Leader)>::new();
-    // Pairs whose POST was accepted are never re-POSTed; a pair that failed
-    // (or whose response was lost) is re-POSTed only while its leader remains
-    // in the current targeting window. Suppression loses nothing: the leader
-    // caches every batch id's status, so a repeat POST of a known batch id is
-    // acknowledged without re-admitting its transactions — even one whose
-    // status has resolved to dropped.
+    // Accepted pairs are never re-POSTed. Repeat POSTs elsewhere are safe:
+    // leaders cache each batch id's status and acknowledge repeats without
+    // re-admitting transactions.
     let mut accepted: HashSet<(String, String)> = HashSet::new();
     let mut views = state.view_clock.current_view.subscribe();
     let mut view = *views.borrow();

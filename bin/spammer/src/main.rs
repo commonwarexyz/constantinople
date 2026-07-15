@@ -105,11 +105,9 @@ fn main() {
     runner.start(|context| async move {
         // In deployer mode (--hosts), use JSON logs so Loki/Promtail can scrape them.
         let json_logs = cli.hosts.is_some();
-        // In deployer mode the spammer runs on a dedicated instance whose
-        // metrics are scraped at the deployer's fixed port, so that is the
-        // fallback; ad-hoc runs serve metrics only when a port is given,
-        // since the deployer's port doubles as the first co-located
-        // validator's metrics port.
+        // Deployer mode runs on a dedicated instance scraped at the
+        // deployer's fixed port; ad-hoc runs serve metrics only when a port
+        // is given, since the default collides with a co-located validator.
         let metrics_address = cli
             .metrics_port
             .or_else(|| {

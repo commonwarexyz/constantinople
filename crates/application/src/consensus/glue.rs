@@ -96,11 +96,9 @@ where
         let result = self
             .verify_child(context, block, ancestry.next(), batches)
             .await;
-        // On completed verifications the block body's references die in
-        // verify_child's offloaded tasks and the parent is released on the
-        // strategy's pool; early rejections drop what they hold inline.
-        // Either way only the drained ancestry stream remains here; the span
-        // keeps its drop cost visible in traces.
+        // verify_child's offloaded tasks release the body and parent (early
+        // rejections drop inline), so only the drained ancestry stream
+        // remains; the span keeps its drop cost visible in traces.
         {
             let _cleanup = tracing::info_span!("application.verify.cleanup").entered();
             drop(ancestry);
