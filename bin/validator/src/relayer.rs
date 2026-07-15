@@ -28,7 +28,6 @@ use tokio::sync::{Semaphore, watch};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
-const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
@@ -107,6 +106,9 @@ pub struct ServerConfig<St: Strategy> {
     pub account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     pub view_clock: ViewClock,
     pub strategy: St,
+    /// Must match the validators' mempool `max_propose_bytes` so a batch
+    /// the relayer accepts is never rejected by a leader for size.
+    pub max_batch_bytes: usize,
 }
 
 #[derive(Clone)]
@@ -180,7 +182,7 @@ pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
     let state = AppState {
         leaders: Arc::new(normalize_leaders(config.relayer.leaders)),
         max_retry_views: config.relayer.max_retry_views,
-        max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
+        max_batch_bytes: config.max_batch_bytes,
         account_reader: config.account_reader,
         view_clock: config.view_clock,
         http: reqwest::Client::new(),
@@ -770,6 +772,8 @@ mod tests {
     use super::*;
     use axum::http::HeaderValue;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
     fn leader(key: &str) -> Leader {
         Leader {

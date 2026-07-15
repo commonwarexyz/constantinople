@@ -870,6 +870,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 account_reader: account_reader.clone(),
                 view_clock,
                 strategy: strategy.clone(),
+                max_batch_bytes: max_propose_bytes,
             }))
         } else {
             info!("secondary node: skipping mempool webserver");

@@ -14,7 +14,7 @@ use commonware_runtime::{
 use commonware_utils::{cache::Clock, sync::RwLock};
 use core::num::NonZeroUsize;
 use p256::ecdsa::VerifyingKey;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 /// A public key decompressed into the form used by signature verification.
 ///
@@ -48,9 +48,10 @@ impl PublicKeyCache {
     }
 
     /// Resolves every key in `keys` to its decompressed form: hits share the
-    /// read lock, misses are decompressed on `strategy` and inserted under a
-    /// single write lock, so a miss-heavy batch pays neither serial curve
-    /// arithmetic nor per-key lock traffic.
+    /// read lock, unique misses are decompressed once each on `strategy` and
+    /// inserted under a single write lock, so a miss-heavy batch pays neither
+    /// serial curve arithmetic nor per-key lock traffic — even when one cold
+    /// sender signs every transaction in the batch.
     ///
     /// Returns `None` if any key does not encode a valid curve point.
     pub fn decompress(
@@ -77,30 +78,52 @@ impl PublicKeyCache {
             keys.iter().map(|&key| cache.get(key).cloned()).collect()
         };
 
-        // Decompress the misses on the pool with no lock held.
-        let missing: Vec<(usize, &TransactionPublicKey)> = resolved
-            .iter()
-            .enumerate()
-            .filter(|(_, hit)| hit.is_none())
-            .map(|(index, _)| (index, keys[index]))
-            .collect();
-        let missed = missing.len() as u64;
+        // Deduplicate the misses (one cold sender may sign every transaction
+        // in a batch), then decompress each unique key once on the pool with
+        // no lock held.
+        let mut slots: HashMap<&TransactionPublicKey, usize> = HashMap::new();
+        let mut unique_keys: Vec<&TransactionPublicKey> = Vec::new();
+        let mut missing: Vec<(usize, usize)> = Vec::new();
+        for (index, hit) in resolved.iter().enumerate() {
+            if hit.is_none() {
+                let key = keys[index];
+                let slot = *slots.entry(key).or_insert_with(|| {
+                    unique_keys.push(key);
+                    unique_keys.len() - 1
+                });
+                missing.push((index, slot));
+            }
+        }
+        let missed = unique_keys.len() as u64;
         span.record("misses", missed.traced());
         if missed > 0 {
-            self.misses.inc_by(missed);
+            let work: Vec<(usize, &TransactionPublicKey)> =
+                unique_keys.iter().copied().enumerate().collect();
             let decompressed: Vec<(usize, DecompressedPublicKey)> = strategy
-                .try_map_collect_vec(missing, |(index, key)| {
+                .try_map_collect_vec(work, |(slot, key)| {
                     Self::decompress_uncached(key)
-                        .map(|decompressed| (index, decompressed))
+                        .map(|decompressed| (slot, decompressed))
                         .ok_or(())
                 })
                 .ok()?;
+            self.misses.inc_by(missed);
 
-            // Insert all misses under one write lock.
-            let mut cache = self.inner.write();
-            for (index, value) in decompressed {
-                cache.put(keys[index].clone(), value.clone());
-                resolved[index] = Some(value);
+            // Insert the unique misses under one write lock, then fan the
+            // values back out to every index that referenced them.
+            let mut by_slot: Vec<Option<DecompressedPublicKey>> = vec![None; unique_keys.len()];
+            {
+                let mut cache = self.inner.write();
+                for (slot, value) in decompressed {
+                    cache.put(unique_keys[slot].clone(), value.clone());
+                    by_slot[slot] = Some(value);
+                }
+            }
+            for (index, slot) in missing {
+                resolved[index] = Some(
+                    by_slot[slot]
+                        .clone()
+                        .expect("every unique miss decompressed above"),
+                );
             }
         }
 

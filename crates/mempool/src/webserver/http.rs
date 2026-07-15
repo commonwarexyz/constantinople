@@ -16,11 +16,11 @@ use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use commonware_runtime::telemetry::traces::TracedExt as _;
+use commonware_utils::sys_rng;
 use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
     TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
 };
-use rand::rng;
 use std::{fmt::Display, sync::Arc};
 use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
@@ -286,7 +286,7 @@ where
             .collect::<Vec<_>>();
         let transactions = verify_transaction_chunks::<H, _>(
             namespace,
-            &mut rng(),
+            &mut sys_rng(),
             &public_key_cache,
             signed_lazy,
             &strategy,

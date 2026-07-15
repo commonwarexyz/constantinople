@@ -360,6 +360,10 @@ async fn time_loads(batch: &Batch, plan: &LoadPlan<'_>, overlap: bool) -> Durati
         (true, true, true) => {
             futures::join!(load_discrete(batch, plan), load_general(batch, plan));
         }
+        (true, true, false) => {
+            load_discrete(batch, plan).await;
+            load_general(batch, plan).await;
+        }
         (true, _, _) => load_discrete(batch, plan).await,
         (_, true, _) => load_general(batch, plan).await,
         (false, false, _) => {}

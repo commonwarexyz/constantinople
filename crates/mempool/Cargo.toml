@@ -34,7 +34,6 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 reqwest.workspace = true
 tracing.workspace = true
-rand = { workspace = true, features = ["thread_rng"] }
 serde_json.workspace = true
 derive_more = { workspace = true, features = ["display"] }
 futures.workspace = true
@@ -50,6 +49,7 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 bytes.workspace = true
+rand.workspace = true
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true, features = ["executor"] }
 criterion.workspace = true
