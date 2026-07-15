@@ -364,7 +364,10 @@ async fn submit_with_retries<St: Strategy>(
         }
 
         if retry == state.max_retry_views {
-            if !accepted_any {
+            // A lost accept response must not mask polled progress: report
+            // total failure only when no leader returned 202 AND no status
+            // poll ever reported finalization for a posted batch id.
+            if !accepted_any && included.is_empty() && height == 0 {
                 return (StatusCode::SERVICE_UNAVAILABLE, String::new());
             }
             return json_response(best_effort_status(total, included.len(), height));
@@ -1160,5 +1163,48 @@ mod tests {
         let bodies = bodies.lock().expect("bodies lock");
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[1], vec![second].encode());
+    }
+
+    /// A leader that admits a batch but whose accept responses are all lost
+    /// (transient POST failures) is still polled for status; progress those
+    /// polls recover must surface as a best-effort outcome, not a 503.
+    #[tokio::test]
+    async fn unpinned_final_round_reports_polled_progress_when_accepts_lost() {
+        let first = signed_transfer(1, 0);
+        let second = signed_transfer(2, 0);
+        let partial = BatchStatus::PartiallyFinalized {
+            height: 5,
+            included: vec![first.message_digest().to_string()],
+            filtered: vec![second.message_digest().to_string()],
+        };
+        // Every POST "loses" its response (500 -> transient), while the
+        // round-0 status poll reports the batch partially finalized.
+        let (router, bodies) = scripted_leader(
+            vec![
+                StatusCode::INTERNAL_SERVER_ERROR,
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ],
+            vec![Some(partial)],
+        );
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 1);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![first, second].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::PartiallyFinalized {
+                height: 5,
+                included: 1,
+                filtered: 1,
+            },
+        );
+        assert_eq!(bodies.lock().expect("bodies lock").len(), 2);
     }
 }
