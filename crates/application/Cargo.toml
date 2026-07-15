@@ -40,6 +40,7 @@ ahash.workspace = true
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 
 # Commonware
+commonware-actor.workspace = true
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
@@ -56,6 +57,10 @@ harness = false
 
 [[bench]]
 name = "compute"
+harness = false
+
+[[bench]]
+name = "selective"
 harness = false
 
 [[bench]]

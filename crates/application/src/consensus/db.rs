@@ -24,7 +24,7 @@ use commonware_storage::{
 };
 use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_primitives::{Account, AccountKey};
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
@@ -101,10 +101,15 @@ where
         .fold(batch, |batch, digest| batch.append(*digest))
 }
 
+/// Merkleizes the staged state batch and the transaction-history batch
+/// concurrently. `transaction_batch` is a future so a caller can keep
+/// appending to the history batch on the strategy's pool while the state
+/// merkleize runs; callers holding a finished batch pass it via
+/// [`core::future::ready`].
 pub(super) async fn finalize_execution<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
-    transaction_batch: TransactionBatch<E, H, S>,
+    transaction_batch: impl Future<Output = TransactionBatch<E, H, S>>,
 ) -> Result<MerkleizedDatabases<E, H, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -117,7 +122,7 @@ where
     // concurrently.
     let (state_merkleized, transaction_merkleized) = futures::join!(
         state_staged.merkleize(state_updates, Vec::new()),
-        transaction_batch.merkleize(),
+        async move { transaction_batch.await.merkleize().await },
     );
     Ok((state_merkleized?, transaction_merkleized?))
 }

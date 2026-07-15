@@ -3,7 +3,7 @@
 use super::actor::{IngestStatus, StoredBatchStatus, TxStatus};
 use crate::TransactionSource;
 use commonware_actor::Feedback;
-use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
+use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::channel::fallible::AsyncFallibleExt;
 use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
@@ -43,9 +43,12 @@ where
         batch_id: String,
         response: oneshot::Sender<Option<StoredBatchStatus<H::Digest>>>,
     },
-    /// Consensus requests transactions for the next proposal.
+    /// Consensus requests transactions for the next proposal. `filled` is
+    /// the encoded size the proposal already holds; the served batch stays
+    /// within the remaining budget (strictly, once the block is non-empty).
     Propose {
         height: u64,
+        filled: usize,
         response: oneshot::Sender<Vec<VerifiedTransaction<H>>>,
     },
     /// Consensus reports a finalized or tip block.
@@ -167,11 +170,16 @@ where
     async fn propose(
         &mut self,
         parent: &Header<C, H::Digest, P>,
-        _context: &Context<C, P>,
+        _round: Round,
+        filled: usize,
     ) -> Vec<VerifiedTransaction<H>> {
         let height = parent.height + 1;
         self.sender
-            .request(|response| Message::Propose { height, response })
+            .request(|response| Message::Propose {
+                height,
+                filled,
+                response,
+            })
             .await
             .expect("mempool actor mailbox closed")
     }

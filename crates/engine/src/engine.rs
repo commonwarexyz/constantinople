@@ -81,7 +81,6 @@ const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
 const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
-const PAGE_CACHE_CAPACITY: NonZero<usize> = NZUsize!(65536); // 512 MiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
@@ -177,6 +176,12 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
+    /// Capacity in bytes of each of the engine's two storage page caches.
+    ///
+    /// Must hold the state journal's working set: 512 MiB thrashed once the
+    /// live account set passed ~2M (build/verify doubled on ~200k journal
+    /// cache misses/s/node).
+    pub page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -246,7 +251,7 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>>,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    I: TransactionSource<Commitment, C::PublicKey, H> + Clone + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
@@ -277,15 +282,18 @@ where
     /// Initializes the full engine stack.
     #[boxed]
     pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
+        let page_cache_capacity =
+            NonZero::new(config.page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("page cache must hold at least one page");
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
-            PAGE_CACHE_CAPACITY,
+            page_cache_capacity,
         );
         let storage_page_cache = CacheRef::from_pooler(
             &context.child("state"),
             PAGE_CACHE_PAGE_SIZE,
-            PAGE_CACHE_CAPACITY,
+            page_cache_capacity,
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
@@ -472,6 +480,12 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
+        // Shard-bundle forwarding is disabled: production traces showed the
+        // bundle cannot beat the 50-way parallel rebroadcast wave it shares
+        // the leader's NIC with (reconstruction p50 was unchanged), so the
+        // extra ~block of prime-time leader egress buys nothing. The
+        // upstream machinery remains available behind a router if a design
+        // that does not compete with the fan-out emerges.
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
             shards::Config {

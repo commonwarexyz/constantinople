@@ -294,6 +294,9 @@ impl EngineDefinition for TestEngineDefinition {
                     manager,
                     blocker,
                     namespace: ENGINE_NAMESPACE.to_vec(),
+                    // Small: simulation state is tiny and large caches slow
+                    // deterministic runs.
+                    page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
                     input,

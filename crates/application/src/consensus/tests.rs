@@ -27,10 +27,10 @@ use commonware_storage::{
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
-    Block, Header, PublicKeyCache, Sealable, SealedBlock, SignedTransaction, Transaction,
-    TransactionPublicKey,
+    Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, SealedBlock,
+    SignedTransaction, Transaction, TransactionPublicKey,
 };
-use std::{num::NonZeroU64, time::Duration};
+use std::{future::ready, num::NonZeroU64, sync::Arc, time::Duration};
 
 type TestApp = Application<
     deterministic::Context,
@@ -101,13 +101,19 @@ fn sync_range_from_bounds(
 type TestBlock = SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
 
 /// Genesis-backed fixture shared by the propose/verify tests.
+///
+/// `sender` and `alt_sender` are funded at genesis so tests can execute real
+/// transfers; `recipient` starts empty.
 struct VerifyHarness {
     app: TestApp,
     dbs: TestDbs,
     parent: TestBlock,
     leader: ed25519::PrivateKey,
     sender: ed25519::PrivateKey,
+    alt_sender: ed25519::PrivateKey,
     recipient: ed25519::PrivateKey,
+    state_target: StateSyncTarget<sha256::Digest>,
+    transaction_target: TransactionHistoryTarget<sha256::Digest>,
 }
 
 async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
@@ -120,7 +126,22 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         ),
     )
     .await;
-    let (state_batch, transaction_batch) = dbs.new_batches().await;
+
+    let leader = ed25519::PrivateKey::from_seed(21);
+    let sender = ed25519::PrivateKey::from_seed(22);
+    let recipient = ed25519::PrivateKey::from_seed(23);
+    let alt_sender = ed25519::PrivateKey::from_seed(24);
+
+    let (mut state_batch, transaction_batch) = dbs.new_batches().await;
+    for funded in [&sender, &alt_sender] {
+        state_batch = state_batch.write(
+            AccountKey::from_public_key(&TransactionPublicKey::ed25519(funded.public_key())),
+            Some(Account {
+                balance: 1_000_000,
+                nonce: Nonce::default(),
+            }),
+        );
+    }
     let state = state_batch.merkleize().await.expect("genesis state");
     let transactions = transaction_batch
         .merkleize()
@@ -133,37 +154,37 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     );
     dbs.finalize((state, transactions)).await;
 
-    let leader = ed25519::PrivateKey::from_seed(21);
-    let sender = ed25519::PrivateKey::from_seed(22);
-    let recipient = ed25519::PrivateKey::from_seed(23);
-    let app = TestApp::new(
-        context.child("app"),
-        Sequential,
-        leader.public_key(),
-        sha256::Digest::EMPTY,
-        TEST_TX_NS,
-        PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(64)),
-        state_target.clone(),
-        transaction_target.clone(),
-        None,
-    );
     let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
         leader.public_key(),
         0,
-        state_target,
-        transaction_target,
+        state_target.clone(),
+        transaction_target.clone(),
     );
-
     VerifyHarness {
-        app,
+        app: TestApp::new(
+            context.child("app"),
+            Sequential,
+            leader.public_key(),
+            sha256::Digest::EMPTY,
+            TEST_TX_NS,
+            PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(64)),
+            state_target.clone(),
+            transaction_target.clone(),
+            None,
+        ),
         dbs,
         parent,
         leader,
         sender,
+        alt_sender,
         recipient,
+        state_target,
+        transaction_target,
     }
 }
+
+type TestSource = StaticTransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
 
 fn transfer(
     sender: &ed25519::PrivateKey,
@@ -206,6 +227,7 @@ fn verify_rejects_invalid_body() {
             leader,
             sender,
             recipient,
+            ..
         } = verify_harness(&context).await;
 
         let consensus_context = SimplexContext {
@@ -226,8 +248,8 @@ fn verify_rejects_invalid_body() {
         let result = app
             .verify_child(
                 (context.child("verify"), consensus_context),
-                block,
-                std::future::ready(Some(parent)),
+                Arc::new(block),
+                std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
@@ -246,6 +268,7 @@ fn verify_rejects_missing_parent() {
             leader,
             sender,
             recipient,
+            ..
         } = verify_harness(&context).await;
 
         let consensus_context = SimplexContext {
@@ -265,7 +288,7 @@ fn verify_rejects_missing_parent() {
         let result = app
             .verify_child(
                 (context.child("verify"), consensus_context),
-                block,
+                Arc::new(block),
                 std::future::ready(None),
                 dbs.new_batches().await,
             )
@@ -276,7 +299,7 @@ fn verify_rejects_missing_parent() {
 }
 
 #[test]
-fn propose_drops_proposal_on_rejected_batch() {
+fn propose_drops_inapplicable_and_refills() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
             mut app,
@@ -284,7 +307,9 @@ fn propose_drops_proposal_on_rejected_batch() {
             parent,
             leader,
             sender,
+            alt_sender,
             recipient,
+            ..
         } = verify_harness(&context).await;
 
         context.sleep(Duration::from_millis(10)).await;
@@ -294,23 +319,40 @@ fn propose_drops_proposal_on_rejected_batch() {
             leader: leader.public_key(),
             parent: (View::zero(), *parent.seal()),
         };
-        // Both transfers consume the same nonce, so execution rejects the
-        // candidate batch and the proposal is dropped: consensus skips the
-        // view instead of receiving a block whose commitments could carry
-        // the rejected digests.
-        let mut input = StaticTransactionSource::new(vec![vec![
-            transfer(&sender, &recipient, 1),
-            transfer(&sender, &recipient, 2),
-        ]]);
+        // Both selected transfers consume the same nonce: proposing keeps the
+        // first, drops the duplicate, and tops the block up from the mempool
+        // toward the proposal budget. The proposed block is the applicable
+        // subset plus the top-up.
+        let keep = transfer(&sender, &recipient, 1);
+        let duplicate = transfer(&sender, &recipient, 2);
+        let refill = transfer(&alt_sender, &recipient, 3);
+        let mut input =
+            StaticTransactionSource::new(vec![vec![keep.clone(), duplicate], vec![refill.clone()]]);
         let proposed = app
             .propose_child(
-                (context.child("propose"), consensus_context),
-                parent,
+                (context.child("propose"), consensus_context.clone()),
+                Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut input,
             )
+            .await
+            .expect("best-effort proposal must succeed");
+        assert_eq!(
+            body_digests(&proposed.block),
+            vec![*keep.message_digest(), *refill.message_digest()]
+        );
+
+        // The surviving subset re-executes cleanly under all-or-nothing
+        // verification.
+        let accepted = app
+            .verify_child(
+                (context.child("verify"), consensus_context),
+                Arc::new(proposed.block.clone()),
+                ready(Some(Arc::new(parent))),
+                dbs.new_batches().await,
+            )
             .await;
-        assert!(proposed.is_none());
+        assert!(accepted.is_some());
     });
 }
 
@@ -338,7 +380,7 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let proposed = app
             .propose_child(
                 (context.child("propose"), consensus_context.clone()),
-                parent.clone(),
+                Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut input,
             )
@@ -349,8 +391,8 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let accepted = app
             .verify_child(
                 (context.child("verify"), consensus_context.clone()),
-                proposed.block.clone(),
-                std::future::ready(Some(parent.clone())),
+                Arc::new(proposed.block.clone()),
+                std::future::ready(Some(Arc::new(parent.clone()))),
                 dbs.new_batches().await,
             )
             .await;
@@ -369,8 +411,8 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
         let rejected = app
             .verify_child(
                 (context.child("verify_stale"), consensus_context),
-                stale,
-                std::future::ready(Some(parent)),
+                Arc::new(stale),
+                std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
@@ -442,4 +484,135 @@ fn genesis_block_uses_the_initialized_transaction_target() {
 
     assert_eq!(block.header.transactions_root, target.root);
     assert_eq!(block.header.transactions_range, non_empty_range!(0, 1));
+}
+
+/// Digests of a sealed block's body transactions.
+fn body_digests(block: &TestBlock) -> Vec<sha256::Digest> {
+    block
+        .body
+        .iter()
+        .map(|tx| {
+            *tx.get()
+                .expect("test bodies are materialized")
+                .message_digest()
+        })
+        .collect()
+}
+
+fn consensus_context(
+    view: u64,
+    leader: &ed25519::PrivateKey,
+    parent_view: u64,
+    parent: &TestBlock,
+) -> SimplexContext<sha256::Digest, ed25519::PublicKey> {
+    SimplexContext {
+        round: Round::new(Epoch::zero(), View::new(view)),
+        leader: leader.public_key(),
+        parent: (View::new(parent_view), *parent.seal()),
+    }
+}
+
+/// Wraps a static source with a virtual-time delay so a test can control how
+/// much of the build budget each mempool round trip consumes.
+struct DelayedSource {
+    context: deterministic::Context,
+    delay: Duration,
+    inner: TestSource,
+}
+
+impl Clone for DelayedSource {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.child("clone"),
+            delay: self.delay,
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl constantinople_mempool::TransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>
+    for DelayedSource
+{
+    async fn propose(
+        &mut self,
+        parent: &Header<sha256::Digest, sha256::Digest, ed25519::PublicKey>,
+        round: Round,
+        filled: usize,
+    ) -> Vec<constantinople_primitives::VerifiedTransaction<sha256::Sha256>> {
+        self.context.sleep(self.delay).await;
+        self.inner.propose(parent, round, filled).await
+    }
+}
+
+impl commonware_consensus::Reporter for DelayedSource {
+    type Activity = commonware_consensus::marshal::Update<TestBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> commonware_actor::Feedback {
+        self.inner.report(activity)
+    }
+}
+
+#[test]
+fn build_timeout_bounds_refill_rounds() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let seed_keep = transfer(&harness.sender, &harness.recipient, 1);
+        let seed_dup = transfer(&harness.sender, &harness.recipient, 2);
+        let refill_one = transfer(&harness.alt_sender, &harness.recipient, 3);
+        let never_pulled = transfer(&harness.recipient, &harness.sender, 4);
+
+        // Each mempool round trip burns 60ms of virtual time — past the 50ms
+        // build deadline after one refill.
+        let slow = |batches| DelayedSource {
+            context: context.child("slow_clock"),
+            delay: Duration::from_millis(60),
+            inner: StaticTransactionSource::new(batches),
+        };
+        let mut app: Application<
+            deterministic::Context,
+            sha256::Sha256,
+            sha256::Digest,
+            threshold::Scheme<ed25519::PublicKey, MinSig>,
+            ed25519::PublicKey,
+            DelayedSource,
+            (),
+            Sequential,
+        > = Application::new(
+            context.child("deadline_app"),
+            Sequential,
+            harness.leader.public_key(),
+            sha256::Digest::EMPTY,
+            TEST_TX_NS,
+            PublicKeyCache::new(context.child("deadline_pkc"), NZUsize!(64)),
+            harness.state_target.clone(),
+            harness.transaction_target.clone(),
+            None,
+        );
+
+        context.sleep(Duration::from_millis(10)).await;
+        // The seed pull happens before the build deadline starts; the first
+        // refill (delayed 60ms) lands past the deadline, so a second refill
+        // is never requested even though headroom and candidates remain.
+        let mut input = slow(vec![
+            vec![seed_keep.clone(), seed_dup],
+            vec![refill_one.clone()],
+            vec![never_pulled],
+        ]);
+        let ctx1 = consensus_context(1, &harness.leader, 0, &harness.parent);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_deadline"), ctx1),
+                Arc::new(harness.parent.clone()),
+                harness.dbs.new_batches().await,
+                &mut input,
+            )
+            .await
+            .expect("proposal must succeed");
+
+        assert_eq!(
+            body_digests(&proposed.block),
+            vec![*seed_keep.message_digest(), *refill_one.message_digest()],
+            "the deadline must stop the loop after the first refill"
+        );
+    });
 }

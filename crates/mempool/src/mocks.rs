@@ -2,7 +2,7 @@
 
 use crate::TransactionSource;
 use commonware_actor::Feedback;
-use commonware_consensus::{Reporter, marshal::Update, simplex::types::Context};
+use commonware_consensus::{Reporter, marshal::Update, types::Round};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::Acknowledgement;
 use constantinople_primitives::{Header, VerifiedTransaction};
@@ -50,10 +50,12 @@ where
     H: Hasher + Send + 'static,
     H::Digest: Send,
 {
+    // The byte budget is ignored: static batches are returned as queued.
     fn propose(
         &mut self,
         _parent: &Header<C, H::Digest, P>,
-        _context: &Context<C, P>,
+        _round: Round,
+        _filled: usize,
     ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
         ready(self.proposals.pop_front().unwrap_or_default())
     }
@@ -137,9 +139,10 @@ mod tests {
             transactions_range: non_empty_range!(0, 1),
         };
 
-        let first = futures::executor::block_on(source.propose(&parent, &test_context()));
-        let second = futures::executor::block_on(source.propose(&parent, &test_context()));
-        let third = futures::executor::block_on(source.propose(&parent, &test_context()));
+        let round = Round::new(Epoch::zero(), View::zero());
+        let first = futures::executor::block_on(source.propose(&parent, round, 0));
+        let second = futures::executor::block_on(source.propose(&parent, round, 0));
+        let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].value().nonce, tx1.value().nonce);
