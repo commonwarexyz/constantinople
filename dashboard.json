@@ -4852,233 +4852,12 @@
       "type": "timeseries"
     },
     {
-      "datasource": {
-        "type": "loki",
-        "uid": "P8E80F9AEF21F6940"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
+      "collapsed": false,
       "gridPos": {
-        "h": 10,
+        "h": 1,
         "w": 24,
         "x": 0,
         "y": 164
-      },
-      "id": 44,
-      "options": {
-        "dedupStrategy": "none",
-        "enableInfiniteScrolling": false,
-        "enableLogDetails": true,
-        "prettifyLogMessage": false,
-        "showCommonLabels": false,
-        "showLabels": false,
-        "showTime": false,
-        "sortOrder": "Descending",
-        "wrapLogMessage": false
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "loki",
-            "uid": "P8E80F9AEF21F6940"
-          },
-          "direction": "backward",
-          "editorMode": "builder",
-          "expr": "{deployer_name=~\"$Validator\"} | json",
-          "queryType": "range",
-          "refId": "A"
-        }
-      ],
-      "title": "Logs",
-      "transparent": true,
-      "type": "logs"
-    },
-    {
-      "datasource": {
-        "type": "loki",
-        "uid": "P8E80F9AEF21F6940"
-      },
-      "fieldConfig": {
-        "defaults": {},
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 9,
-        "w": 24,
-        "x": 0,
-        "y": 174
-      },
-      "id": 45,
-      "options": {
-        "dedupStrategy": "none",
-        "enableInfiniteScrolling": false,
-        "enableLogDetails": true,
-        "prettifyLogMessage": false,
-        "showCommonLabels": false,
-        "showLabels": false,
-        "showTime": false,
-        "sortOrder": "Descending",
-        "wrapLogMessage": false
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "loki",
-            "uid": "P8E80F9AEF21F6940"
-          },
-          "direction": "backward",
-          "editorMode": "code",
-          "expr": "{deployer_name=\"spammer\"}",
-          "queryType": "range",
-          "refId": "A"
-        }
-      ],
-      "title": "Spammer Logs",
-      "type": "logs"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 183
-      },
-      "id": 60,
-      "panels": [],
-      "title": "Speculation",
-      "type": "row"
-    },
-    {
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "description": "Stateful-actor propose cycle. Speculation hits collapse this to header+seal; if p50 does not drop with a healthy hit rate, the pre-built path is not being taken.",
-      "fieldConfig": {
-        "defaults": {
-          "color": {
-            "mode": "palette-classic"
-          },
-          "custom": {
-            "axisBorderShow": false,
-            "axisCenteredZero": false,
-            "axisColorMode": "text",
-            "axisLabel": "",
-            "axisPlacement": "auto",
-            "barAlignment": 0,
-            "barWidthFactor": 0.6,
-            "drawStyle": "line",
-            "fillOpacity": 0,
-            "gradientMode": "none",
-            "hideFrom": {
-              "legend": false,
-              "tooltip": false,
-              "viz": false
-            },
-            "insertNulls": false,
-            "lineInterpolation": "linear",
-            "lineWidth": 1,
-            "pointSize": 5,
-            "scaleDistribution": {
-              "type": "linear"
-            },
-            "showPoints": "auto",
-            "spanNulls": false,
-            "stacking": {
-              "group": "A",
-              "mode": "none"
-            },
-            "thresholdsStyle": {
-              "mode": "off"
-            }
-          },
-          "mappings": [],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "green",
-                "value": null
-              },
-              {
-                "color": "red",
-                "value": 80
-              }
-            ]
-          },
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "gridPos": {
-        "h": 8,
-        "w": 6,
-        "x": 18,
-        "y": 184
-      },
-      "id": 64,
-      "options": {
-        "legend": {
-          "calcs": [],
-          "displayMode": "list",
-          "placement": "bottom",
-          "showLegend": true
-        },
-        "tooltip": {
-          "hideZeros": false,
-          "mode": "single",
-          "sort": "none"
-        }
-      },
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.5, sum by(le) (rate(engine_stateful_propose_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "legendFormat": "p50",
-          "range": true,
-          "refId": "A",
-          "useBackend": false
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "disableTextWrap": false,
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by(le) (rate(engine_stateful_propose_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "fullMetaSearch": false,
-          "includeNullMetadata": true,
-          "legendFormat": "p99",
-          "range": true,
-          "refId": "B",
-          "useBackend": false
-        }
-      ],
-      "title": "Propose Duration (p50 / p99)",
-      "transparent": true,
-      "type": "timeseries"
-    },
-    {
-      "collapsed": false,
-      "gridPos": {
-        "h": 1,
-        "w": 24,
-        "x": 0,
-        "y": 192
       },
       "id": 65,
       "panels": [],
@@ -5150,7 +4929,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 193
+        "y": 165
       },
       "id": 66,
       "options": {
@@ -5184,7 +4963,7 @@
           "useBackend": false
         }
       ],
-      "title": "Network Pool Buffers Created",
+      "title": "Network Buffers Created",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5193,7 +4972,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Allocations denied because a network size class hit max_per_class \u2014 the direct signal the network pool is too small. Any sustained non-zero rate warrants raising the cap for that class.",
+      "description": "Allocations denied because a network size class hit max_per_class — the direct signal the network pool is too small. Any sustained non-zero rate warrants raising the cap for that class.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5253,7 +5032,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 193
+        "y": 165
       },
       "id": 67,
       "options": {
@@ -5287,7 +5066,7 @@
           "useBackend": false
         }
       ],
-      "title": "Network Pool Exhaustions per Second",
+      "title": "Network Exhaustions/s",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5356,7 +5135,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 193
+        "y": 165
       },
       "id": 68,
       "options": {
@@ -5405,7 +5184,7 @@
           "useBackend": false
         }
       ],
-      "title": "Pool Oversized Requests per Second",
+      "title": "Oversized Requests/s",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5474,7 +5253,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 193
+        "y": 165
       },
       "id": 69,
       "options": {
@@ -5508,7 +5287,7 @@
           "useBackend": false
         }
       ],
-      "title": "Storage Pool Buffers Created",
+      "title": "Storage Buffers Created",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5577,7 +5356,7 @@
         "h": 8,
         "w": 6,
         "x": 0,
-        "y": 201
+        "y": 173
       },
       "id": 70,
       "options": {
@@ -5611,7 +5390,7 @@
           "useBackend": false
         }
       ],
-      "title": "Storage Pool Exhaustions per Second",
+      "title": "Storage Exhaustions/s",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5682,7 +5461,7 @@
         "h": 8,
         "w": 6,
         "x": 6,
-        "y": 201
+        "y": 173
       },
       "id": 71,
       "options": {
@@ -5716,7 +5495,7 @@
           "useBackend": false
         }
       ],
-      "title": "Journal Page-Cache Hit Rate",
+      "title": "Journal Cache Hit Rate",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5785,7 +5564,7 @@
         "h": 8,
         "w": 6,
         "x": 12,
-        "y": 201
+        "y": 173
       },
       "id": 72,
       "options": {
@@ -5819,7 +5598,7 @@
           "useBackend": false
         }
       ],
-      "title": "Journal Cache Misses per Second (by journal)",
+      "title": "Journal Cache Misses/s",
       "transparent": true,
       "type": "timeseries"
     },
@@ -5888,7 +5667,7 @@
         "h": 8,
         "w": 6,
         "x": 18,
-        "y": 201
+        "y": 173
       },
       "id": 73,
       "options": {
@@ -5922,9 +5701,98 @@
           "useBackend": false
         }
       ],
-      "title": "Storage Backend Reads per Second",
+      "title": "Backend Reads/s",
       "transparent": true,
       "type": "timeseries"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "P8E80F9AEF21F6940"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 10,
+        "w": 24,
+        "x": 0,
+        "y": 181
+      },
+      "id": 44,
+      "options": {
+        "dedupStrategy": "none",
+        "enableInfiniteScrolling": false,
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": false,
+        "sortOrder": "Descending",
+        "wrapLogMessage": false
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "P8E80F9AEF21F6940"
+          },
+          "direction": "backward",
+          "editorMode": "builder",
+          "expr": "{deployer_name=~\"$Validator\"} | json",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Logs",
+      "transparent": true,
+      "type": "logs"
+    },
+    {
+      "datasource": {
+        "type": "loki",
+        "uid": "P8E80F9AEF21F6940"
+      },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 24,
+        "x": 0,
+        "y": 191
+      },
+      "id": 45,
+      "options": {
+        "dedupStrategy": "none",
+        "enableInfiniteScrolling": false,
+        "enableLogDetails": true,
+        "prettifyLogMessage": false,
+        "showCommonLabels": false,
+        "showLabels": false,
+        "showTime": false,
+        "sortOrder": "Descending",
+        "wrapLogMessage": false
+      },
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "loki",
+            "uid": "P8E80F9AEF21F6940"
+          },
+          "direction": "backward",
+          "editorMode": "code",
+          "expr": "{deployer_name=\"spammer\"}",
+          "queryType": "range",
+          "refId": "A"
+        }
+      ],
+      "title": "Spammer Logs",
+      "type": "logs"
     }
   ],
   "preload": false,
