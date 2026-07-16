@@ -7,8 +7,7 @@
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
 use exoware_simulator::{
-    AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack,
-    rocksdb::{BlockBasedOptions, Cache, DBCompressionType, Options, UniversalCompactOptions},
+    AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack, rocksdb::Options,
 };
 use serde::Deserialize;
 use std::{
@@ -25,22 +24,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
-const ROCKS_WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-const ROCKS_DB_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024 * 1024;
-const ROCKS_MEMTABLE_MEMORY_BUDGET: usize = ROCKS_DB_WRITE_BUFFER_SIZE;
-const ROCKS_TARGET_FILE_SIZE_BASE: u64 = 512 * 1024 * 1024;
-const ROCKS_MAX_BYTES_FOR_LEVEL_BASE: u64 = 16 * 1024 * 1024 * 1024;
-const ROCKS_LEVEL_ZERO_COMPACTION_TRIGGER: i32 = 64;
-const ROCKS_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER: i32 = 1024;
-const ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER: i32 = 2048;
-const ROCKS_UNIVERSAL_COMPACTION_SIZE_RATIO: i32 = 10;
-const ROCKS_UNIVERSAL_COMPACTION_MIN_MERGE_WIDTH: i32 = 4;
 const ROCKS_SYNC_BYTES: u64 = 8 * 1024 * 1024;
 const ROCKS_COMPACTION_READAHEAD_SIZE: usize = 8 * 1024 * 1024;
-const ROCKS_MIN_BLOB_SIZE: u64 = 16 * 1024;
-const ROCKS_BLOB_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const ROCKS_BLOCK_CACHE_SIZE: usize = 1024 * 1024 * 1024;
-const ROCKS_BLOB_CACHE_SIZE: usize = 4 * 1024 * 1024 * 1024;
 const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Debug, Parser)]
@@ -123,62 +108,26 @@ async fn health() -> &'static str {
     "ok"
 }
 
-fn block_based_options(block_cache: &Cache) -> BlockBasedOptions {
-    let mut opts = BlockBasedOptions::default();
-    opts.set_block_cache(block_cache);
-    opts.set_cache_index_and_filter_blocks(true);
-    opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    opts.set_pin_top_level_index_and_filter(true);
-    opts
-}
-
-fn write_heavy_options(
-    db_parallelism: Option<i32>,
-    block_cache: &Cache,
-    blob_cache: &Cache,
-) -> Options {
+/// DB-scoped RocksDB options for the chain-indexer store.
+///
+/// Only DB-scoped options apply here: the store opens every column family
+/// with stock options, and its ingest path writes SSTs directly (no WAL or
+/// memtables), so CF-scoped and write-path tuning has no effect.
+fn chain_indexer_db_options(db_parallelism: Option<i32>) -> Options {
     let mut opts = Options::default();
-    let block_opts = block_based_options(block_cache);
     if let Some(jobs) = db_parallelism {
         opts.increase_parallelism(jobs);
         opts.set_max_background_jobs(jobs);
     }
     opts.set_max_subcompactions(ROCKS_MAX_SUBCOMPACTIONS);
-    opts.set_block_based_table_factory(&block_opts);
-    opts.optimize_universal_style_compaction(ROCKS_MEMTABLE_MEMORY_BUDGET);
-    let mut universal = UniversalCompactOptions::default();
-    universal.set_size_ratio(ROCKS_UNIVERSAL_COMPACTION_SIZE_RATIO);
-    universal.set_min_merge_width(ROCKS_UNIVERSAL_COMPACTION_MIN_MERGE_WIDTH);
-    opts.set_universal_compaction_options(&universal);
-    opts.set_compression_type(DBCompressionType::None);
-    opts.set_bottommost_compression_type(DBCompressionType::None);
-    opts.set_wal_compression_type(DBCompressionType::None);
-    opts.set_write_buffer_size(ROCKS_WRITE_BUFFER_SIZE);
-    opts.set_db_write_buffer_size(ROCKS_DB_WRITE_BUFFER_SIZE);
-    opts.set_max_write_buffer_number(8);
-    opts.set_target_file_size_base(ROCKS_TARGET_FILE_SIZE_BASE);
-    opts.set_max_bytes_for_level_base(ROCKS_MAX_BYTES_FOR_LEVEL_BASE);
-    opts.set_level_zero_file_num_compaction_trigger(ROCKS_LEVEL_ZERO_COMPACTION_TRIGGER);
-    opts.set_level_zero_slowdown_writes_trigger(ROCKS_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER);
-    opts.set_level_zero_stop_writes_trigger(ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER);
     opts.set_bytes_per_sync(ROCKS_SYNC_BYTES);
-    opts.set_wal_bytes_per_sync(ROCKS_SYNC_BYTES);
     opts.set_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE);
-    opts.set_enable_blob_files(true);
-    opts.set_min_blob_size(ROCKS_MIN_BLOB_SIZE);
-    opts.set_blob_file_size(ROCKS_BLOB_FILE_SIZE);
-    opts.set_blob_compression_type(DBCompressionType::None);
-    opts.set_blob_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE as u64);
-    opts.set_blob_cache(blob_cache);
     opts
 }
 
 fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
-    let block_cache = Cache::new_lru_cache(ROCKS_BLOCK_CACHE_SIZE);
-    let blob_cache = Cache::new_lru_cache(ROCKS_BLOB_CACHE_SIZE);
-
     RocksConfig {
-        db_options: write_heavy_options(db_parallelism, &block_cache, &blob_cache),
+        db_options: chain_indexer_db_options(db_parallelism),
         write_pipeline: RocksWritePipelineConfig {
             max_commit_batch_bytes: NonZeroUsize::new(ROCKS_MAX_COMMIT_BATCH_BYTES)
                 .expect("rocks write commit batch byte limit must be nonzero"),
