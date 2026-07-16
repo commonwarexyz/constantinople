@@ -1,7 +1,7 @@
 [package]
 name = "constantinople-primitives"
 description = "Types for constantinople"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -19,15 +19,15 @@ commonware-formatting.workspace = true
 commonware-utils.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
-commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-runtime.workspace = true
 
 # Other
 bytes.workspace = true
 p256.workspace = true
-rand = { workspace = true, features = ["std_rng"] }
+tracing.workspace = true
+rand.workspace = true
 arbitrary = { workspace = true, features = ["derive"], optional = true }
-rand_core.workspace = true
 derive_more = { workspace = true, features = ["full"] }
 serde_json.workspace = true
 
@@ -40,7 +40,7 @@ commonware-consensus = { workspace = true, features = ["arbitrary"] }
 commonware-cryptography = { workspace = true, features = ["arbitrary"] }
 
 # Other
-rand.workspace = true
+rand = { workspace = true, features = ["std_rng"] }
 arbitrary = { workspace = true, features = ["derive"] }
 
 [features]

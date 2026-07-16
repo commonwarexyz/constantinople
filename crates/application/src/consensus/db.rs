@@ -1,10 +1,12 @@
 //! Database aliases and batch helpers for consensus execution.
 
-use crate::executor::ShardWrites;
 use commonware_cryptography::Hasher;
-use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized, any::AnyUnmerkleized};
+use commonware_glue::stateful::db::{
+    DatabaseSet, Unmerkleized,
+    any::{AnyStaged, AnyUnmerkleized},
+};
 use commonware_parallel::Strategy;
-use commonware_runtime::{Clock, Metrics, Storage};
+use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use commonware_storage::{
     index::unordered::Index as UnorderedIndex,
     journal::contiguous::fixed::Journal as FixedJournal,
@@ -22,7 +24,7 @@ use commonware_storage::{
 };
 use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_primitives::{Account, AccountKey};
-use std::sync::Arc;
+use std::{future::Future, sync::Arc};
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
@@ -43,7 +45,7 @@ pub type TransactionDatabase<E, H, S> = Arc<TracedAsyncRwLock<TransactionHistory
 /// The backing databases owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
 
-/// Unmerkleized application state batch used for executor read-through.
+/// Unmerkleized application state batch, staged by the executor before writes.
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
@@ -53,6 +55,24 @@ pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
     S,
 >;
+
+/// Staged application state batch: touched keys are read and their resolved
+/// locations retained, so indexed updates skip key re-resolution at merkleize.
+pub type StateStaged<E, H, T, S> = AnyStaged<
+    mmr::Family,
+    E,
+    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
+    UnorderedIndex<T, mmr::Location>,
+    H,
+    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    S,
+>;
+
+/// Final account values for staged reads, keyed by staged read index.
+///
+/// The state root depends only on the final key->value set each index resolves
+/// to, so entry order is not consensus relevant.
+pub type StateUpdates = Vec<(usize, Option<Account>)>;
 
 pub(super) type TransactionBatch<E, H, S> =
     <TransactionDatabase<E, H, S> as DatabaseSet<E>>::Unmerkleized;
@@ -67,57 +87,12 @@ pub(super) type MerkleizedDatabases<E, H, S> = (
     TransactionMerkleized<E, H, S>,
 );
 
-/// Per-shard account writes produced by compute.
-///
-/// This is a state diff, not an ordered log: shard order is not consensus
-/// relevant, and each account should be emitted by at most one shard.
-pub struct StateWrites {
-    pub(super) shards: Vec<ShardWrites>,
-}
-
-impl StateWrites {
-    pub(super) const fn new(shards: Vec<ShardWrites>) -> Self {
-        Self { shards }
-    }
-
-    pub fn len(&self) -> usize {
-        self.shards.iter().map(Vec::len).sum()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.shards.iter().all(Vec::is_empty)
-    }
-}
-
-/// Writes each shard's mutated accounts to a state batch.
-///
-/// The resulting `state_root` depends only on the final key->value set, so the
-/// shards (and accounts within them) may be folded in any order.
-pub(super) fn apply_shard_maps<E, H, S>(
-    batch: StateBatch<E, H, EightCap, S>,
-    state_writes: StateWrites,
-) -> StateBatch<E, H, EightCap, S>
-where
-    E: Storage + Clock + Metrics,
-    H: Hasher,
-    S: Strategy,
-{
-    let StateWrites { shards } = state_writes;
-    shards.into_iter().fold(batch, |batch, shard_map| {
-        shard_map
-            .into_iter()
-            .fold(batch, |batch, (account_key, account)| {
-                batch.write(account_key, Some(account))
-            })
-    })
-}
-
 pub(super) fn apply_transaction_digests<E, H, S>(
     batch: TransactionBatch<E, H, S>,
     digests: &[H::Digest],
 ) -> TransactionBatch<E, H, S>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
@@ -126,23 +101,35 @@ where
         .fold(batch, |batch, digest| batch.append(*digest))
 }
 
+/// Merkleizes the staged state batch and the transaction-history batch
+/// concurrently. `transaction_batch` is a future so a caller can keep
+/// appending to the history batch on the strategy's pool while the state
+/// merkleize runs; callers holding a finished batch pass it via
+/// [`core::future::ready`].
 pub(super) async fn finalize_execution<E, H, S>(
-    state_batch: StateBatch<E, H, EightCap, S>,
-    transaction_batch: TransactionBatch<E, H, S>,
+    state_staged: StateStaged<E, H, EightCap, S>,
+    state_updates: StateUpdates,
+    transaction_batch: impl Future<Output = TransactionBatch<E, H, S>>,
 ) -> Result<MerkleizedDatabases<E, H, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let (state_merkleized, transaction_merkleized) =
-        futures::join!(state_batch.merkleize(), transaction_batch.merkleize());
+    // The two batches own separate databases and locks, and each merkleize
+    // dispatches its CPU to the strategy's pool internally, so joining the
+    // futures runs the state and transaction-history merkleizes
+    // concurrently.
+    let (state_merkleized, transaction_merkleized) = futures::join!(
+        state_staged.merkleize(state_updates, Vec::new()),
+        async move { transaction_batch.await.merkleize().await },
+    );
     Ok((state_merkleized?, transaction_merkleized?))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{StateDatabase, StateWrites, apply_shard_maps};
+    use super::{StateDatabase, StateUpdates};
     use commonware_codec::FixedSize as _;
     use commonware_cryptography::Sha256;
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
@@ -174,11 +161,12 @@ mod tests {
                 write_buffer: NZUsize!(4096),
             },
             translator: EightCap,
+            init_cache_size: Some(NZUsize!(1024)),
         }
     }
 
     #[test]
-    fn state_root_ignores_write_order() {
+    fn state_root_ignores_update_order() {
         deterministic::Runner::default().start(|context| async move {
             let cache = CacheRef::from_pooler(&context, NZU16!(16), NZUsize!(4096));
             let db =
@@ -199,29 +187,43 @@ mod tests {
             let seed = seed.merkleize().await.expect("seed state");
             db.finalize(seed).await;
 
-            let x = apply_shard_maps(
-                db.new_batches().await,
-                StateWrites::new(vec![
-                    vec![(c, account(301)), (a, account(101))],
-                    vec![(d, account(401)), (b, account(201))],
-                ]),
-            )
-            .merkleize()
-            .await
-            .expect("first order")
-            .root();
+            // The same final key->value set must produce the same root
+            // regardless of staged read order or update-entry order.
+            let (_, staged) = db
+                .new_batches()
+                .await
+                .stage(&[&a, &b, &c, &d])
+                .await
+                .expect("first stage");
+            let first: StateUpdates = vec![
+                (2, Some(account(301))),
+                (0, Some(account(101))),
+                (3, Some(account(401))),
+                (1, Some(account(201))),
+            ];
+            let x = staged
+                .merkleize(first, Vec::new())
+                .await
+                .expect("first order")
+                .root();
 
-            let y = apply_shard_maps(
-                db.new_batches().await,
-                StateWrites::new(vec![
-                    vec![(b, account(201)), (d, account(401))],
-                    vec![(a, account(101)), (c, account(301))],
-                ]),
-            )
-            .merkleize()
-            .await
-            .expect("second order")
-            .root();
+            let (_, staged) = db
+                .new_batches()
+                .await
+                .stage(&[&d, &c, &b, &a])
+                .await
+                .expect("second stage");
+            let second: StateUpdates = vec![
+                (3, Some(account(101))),
+                (1, Some(account(301))),
+                (2, Some(account(201))),
+                (0, Some(account(401))),
+            ];
+            let y = staged
+                .merkleize(second, Vec::new())
+                .await
+                .expect("second order")
+                .root();
 
             assert_eq!(x, y);
         });

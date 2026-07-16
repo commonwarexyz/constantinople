@@ -1,6 +1,6 @@
 [package]
 name = "constantinople-engine"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -43,7 +43,6 @@ rand.workspace = true
 bytes.workspace = true
 futures.workspace = true
 tracing.workspace = true
-rand_core.workspace = true
 thiserror.workspace = true
 prometheus-client.workspace = true
 

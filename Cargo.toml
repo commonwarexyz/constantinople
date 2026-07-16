@@ -1,4 +1,5 @@
 [workspace.package]
+version = "2026.7.0"
 edition = "2024"
 license = "MIT"
 rust-version = "1.88"
@@ -46,38 +47,38 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
-commonware-actor = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dc1a3dfc159caa89e0cbcd21ae995bf48a54f23a", default-features = false }
+commonware-actor = "2026.7.0"
+commonware-p2p = "2026.7.0"
+commonware-glue = "2026.7.0"
+commonware-math = "2026.7.0"
+commonware-codec = "2026.7.0"
+commonware-formatting = "2026.7.0"
+commonware-utils = "2026.7.0"
+commonware-coding = "2026.7.0"
+commonware-macros = "2026.7.0"
+commonware-runtime = "2026.7.0"
+commonware-storage = "2026.7.0"
+commonware-deployer = "2026.7.0"
+commonware-parallel = "2026.7.0"
+commonware-resolver = "2026.7.0"
+commonware-broadcast = "2026.7.0"
+commonware-consensus = "2026.7.0"
+commonware-cryptography = { version = "2026.7.0", default-features = false }
 
 # Exoware
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "c1febc520113dbb98078dfb59eef1f4bed4ee93e" }
+exoware-sdk = "2026.7.1"
+exoware-server = "2026.7.1"
+exoware-qmdb = "2026.7.1"
+exoware-simplex = "2026.7.1"
+exoware-simulator = "2026.7.1"
+exoware-sql = "2026.7.1"
 datafusion = "52"
 
 # Other
 axum = "0.8"
-p256 = { version = "0.13.2", default-features = false, features = ["ecdsa"] }
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
 clap = { version = "4", default-features = false }
-rand = { version = "0.8.5", default-features = false }
+rand = { version = "0.10.2", default-features = false }
 bytes = { version = "1.11.1", default-features = false }
 criterion = "0.7.0"
 rayon = "1.10"
@@ -89,8 +90,7 @@ futures = { version = "0.3.31", default-features = false }
 tracing = { version = "0.1.41", default-features = false }
 arbitrary = { version = "1.4.2", features = ["derive"] }
 ahash = "0.8.12"
-rand_core = "0.6.4"
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.13.4", default-features = false }
 thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
 serde_yaml = "0.9"

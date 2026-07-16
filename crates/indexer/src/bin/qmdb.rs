@@ -12,7 +12,7 @@ use commonware_cryptography::sha256::Sha256;
 use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
-use constantinople_indexer::publisher::qmdb::{state_qmdb_client, transactions_qmdb_client};
+use constantinople_indexer::namespaces::{state_qmdb_client, transactions_qmdb_client};
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::{
     KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
@@ -130,11 +130,8 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
 
 fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send + Sync>> {
     let base = StoreClient::new(store_url);
-    let state = Arc::new(StateClient::from_client(state_qmdb_client(&base)?, ()));
-    let transactions = Arc::new(TransactionClient::from_client(
-        transactions_qmdb_client(&base)?,
-        (),
-    ));
+    let state = Arc::new(StateClient::new(state_qmdb_client(&base)?, ()));
+    let transactions = Arc::new(TransactionClient::new(transactions_qmdb_client(&base)?, ()));
 
     Ok(Router::new()
         .route("/health", get(health))

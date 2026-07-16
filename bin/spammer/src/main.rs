@@ -16,13 +16,14 @@ mod submitter;
 use accounts::{SpamAccount, generate_accounts};
 use clap::Parser;
 use cli::Cli;
-use commonware_runtime::{Runner as _, Supervisor as _, ThreadPooler as _, tokio::telemetry};
+use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
 use signer::{Tx, sign_batch};
 use std::{
-    sync::{Arc, atomic::Ordering},
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    sync::Arc,
     time::Instant,
 };
 use submitter::{RelayerSubmitter, Stats};
@@ -104,19 +105,29 @@ fn main() {
     runner.start(|context| async move {
         // In deployer mode (--hosts), use JSON logs so Loki/Promtail can scrape them.
         let json_logs = cli.hosts.is_some();
+
+        // Deployer mode runs on a dedicated instance scraped at the
+        // deployer's fixed port; ad-hoc runs serve metrics only when a port
+        // is given, since the default collides with a co-located validator.
+        let metrics_address = cli
+            .metrics_port
+            .or_else(|| {
+                cli.hosts
+                    .is_some()
+                    .then_some(commonware_deployer::aws::METRICS_PORT)
+            })
+            .map(|port| SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port));
         telemetry::init(
             context.child("telemetry"),
             telemetry::Logs {
                 level: tracing::Level::INFO,
                 json: json_logs,
             },
-            None,
+            metrics_address,
             None,
         );
 
-        let strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create parallel strategy");
+        let strategy = context.strategy(NZUsize!(rayon_threads));
 
         let config = RelayerModeConfig {
             relayer_url,
@@ -128,7 +139,8 @@ fn main() {
             presigned_batches,
             relayer_targets: primary_validators,
         };
-        run_relayer_mode(config, strategy).await;
+        let stats = Arc::new(Stats::new(context.child("spammer")));
+        run_relayer_mode(config, strategy, stats).await;
     });
 }
 
@@ -146,6 +158,7 @@ struct RelayerModeConfig {
 async fn run_relayer_mode(
     config: RelayerModeConfig,
     strategy: impl commonware_parallel::Strategy + 'static,
+    stats: Arc<Stats>,
 ) {
     let RelayerModeConfig {
         relayer_url,
@@ -169,7 +182,6 @@ async fn run_relayer_mode(
         "starting spammer relayer mode"
     );
 
-    let stats = Arc::new(Stats::new());
     let start = Instant::now();
 
     for index in 0..relayer_submitters {
@@ -192,21 +204,18 @@ async fn run_relayer_mode(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
     loop {
         interval.tick().await;
-        let finalized = stats.finalized.load(Ordering::Relaxed);
-        let filtered = stats.filtered.load(Ordering::Relaxed);
-        let dropped = stats.dropped.load(Ordering::Relaxed);
-        let errors = stats.errors.load(Ordering::Relaxed);
+        let totals = stats.totals();
         let elapsed = start.elapsed().as_secs_f64();
         let tps = if elapsed > 0.0 {
-            finalized as f64 / elapsed
+            totals.finalized as f64 / elapsed
         } else {
             0.0
         };
         info!(
-            finalized,
-            filtered,
-            dropped,
-            errors,
+            finalized = totals.finalized,
+            filtered = totals.filtered,
+            dropped = totals.dropped,
+            errors = totals.errors,
             tps = format!("{tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"

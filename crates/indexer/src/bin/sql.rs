@@ -10,7 +10,7 @@ use ahash::AHashMap;
 use axum::{Router, routing::get};
 use clap::{ArgGroup, Parser};
 use commonware_deployer::aws::Hosts;
-use constantinople_indexer::sql_schema::build_meta_schema;
+use constantinople_indexer::{namespaces::sql_meta_client, sql_schema::build_meta_schema};
 use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
 use serde::Deserialize;
@@ -115,7 +115,7 @@ fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
 fn build_server(
     store_url: &str,
 ) -> Result<Arc<SqlServer>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = StoreClient::new(store_url);
+    let client = sql_meta_client(&StoreClient::new(store_url))?;
     let schema = build_meta_schema(client).map_err(|e| format!("configure schema: {e}"))?;
     let server = SqlServer::new(schema)?;
     Ok(Arc::new(server))

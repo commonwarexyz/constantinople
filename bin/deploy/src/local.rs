@@ -3,9 +3,9 @@ use crate::{
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    default_max_pool_bytes, default_max_propose_bytes, ensure_output_dir_missing,
-    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
+    total_secondaries, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -110,8 +110,10 @@ fn build_validators(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            state_page_cache_bytes: args.state_page_cache_bytes,
+            other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
@@ -184,8 +186,10 @@ fn build_secondaries(
             rayon_threads: args.rayon_threads,
             http_port,
             metrics_port,
-            max_propose_bytes: default_max_propose_bytes(),
-            max_pool_bytes: default_max_pool_bytes(),
+            max_propose_bytes: args.max_propose_bytes,
+            max_pool_bytes: args.max_pool_bytes,
+            state_page_cache_bytes: args.state_page_cache_bytes,
+            other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
@@ -302,11 +306,16 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
+        let db_parallelism = local
+            .chain_indexer_db_parallelism
+            .map(|jobs| format!(" --db-parallelism {jobs}"))
+            .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}",
+            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             data_dir.display(),
+            db_parallelism,
         ));
         // `metadata-indexer`: exposes Constantinople's `block_meta` /
         // `tx_meta` tables over `store.sql.v1.Service`. The explorer
@@ -348,6 +357,13 @@ fn local_run_commands(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
         );
+
+        // Place the spammer's metrics port past the primary and secondary ranges
+        // so it does not collide with any validator on the loopback host.
+        let metrics_port = local
+            .base_metrics_port
+            .checked_add(args.validators as u16 + total_secondaries as u16)
+            .expect("spammer metrics port overflow");
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -356,7 +372,8 @@ fn local_run_commands(
              --seed-offset {} \
              --rayon-threads {} \
              --accounts-jitter {} \
-             --presigned-batches {}",
+             --presigned-batches {} \
+             --metrics-port {metrics_port}",
             args.spammer_accounts,
             args.spammer_value,
             args.spammer_seed_offset,
@@ -380,7 +397,8 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_public_key_cache_size,
+        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
+        default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
         generate_local_cluster_material, total_secondaries,
     };
     use std::path::{Path, PathBuf};
@@ -397,6 +415,10 @@ mod tests {
             worker_threads: 2,
             rayon_threads: 2,
             public_key_cache_size: default_public_key_cache_size(),
+            max_propose_bytes: default_max_propose_bytes(),
+            max_pool_bytes: default_max_pool_bytes(),
+            state_page_cache_bytes: default_page_cache_bytes(),
+            other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,
@@ -415,6 +437,7 @@ mod tests {
             base_http_port: 8080,
             base_metrics_port: 9090,
             chain_indexer_port: 8090,
+            chain_indexer_db_parallelism: None,
             metadata_indexer_port: 8091,
             qmdb_indexer_port: 8092,
         }

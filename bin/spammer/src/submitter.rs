@@ -5,32 +5,89 @@
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
-use constantinople_mempool::webserver::client::SubmitError;
-use std::{
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
-    time::Duration,
+use commonware_runtime::{
+    Metrics as RuntimeMetrics,
+    telemetry::metrics::{Counter, MetricsExt as _},
 };
+use constantinople_mempool::webserver::SubmitError;
+use std::{sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
-/// Shared counters for progress reporting.
+struct Metrics {
+    submitted_batches: Counter,
+    submitted_transactions: Counter,
+    finalized_transactions: Counter,
+    filtered_transactions: Counter,
+    dropped_transactions: Counter,
+    submit_errors: Counter,
+}
+
+impl Metrics {
+    fn init(context: &impl RuntimeMetrics) -> Self {
+        Self {
+            submitted_batches: context
+                .counter("submitted_batches", "Submitted transaction batches"),
+            submitted_transactions: context
+                .counter("submitted_transactions", "Submitted transactions"),
+            finalized_transactions: context
+                .counter("finalized_transactions", "Finalized transactions"),
+            filtered_transactions: context
+                .counter("filtered_transactions", "Filtered transactions"),
+            dropped_transactions: context.counter("dropped_transactions", "Dropped transactions"),
+            submit_errors: context.counter("submit_errors", "Relayer submit errors"),
+        }
+    }
+}
+
+/// Prometheus counters shared across submitters, exported via the metrics endpoint and read back
+/// by [`Stats::totals`] for the periodic progress log.
 pub struct Stats {
-    pub finalized: AtomicU64,
-    pub filtered: AtomicU64,
-    pub dropped: AtomicU64,
-    pub errors: AtomicU64,
+    metrics: Metrics,
+}
+
+#[derive(Clone, Copy)]
+pub struct Totals {
+    pub finalized: u64,
+    pub filtered: u64,
+    pub dropped: u64,
+    pub errors: u64,
 }
 
 impl Stats {
-    pub const fn new() -> Self {
+    pub fn new(context: impl RuntimeMetrics) -> Self {
         Self {
-            finalized: AtomicU64::new(0),
-            filtered: AtomicU64::new(0),
-            dropped: AtomicU64::new(0),
-            errors: AtomicU64::new(0),
+            metrics: Metrics::init(&context),
         }
+    }
+
+    pub fn totals(&self) -> Totals {
+        Totals {
+            finalized: self.metrics.finalized_transactions.get(),
+            filtered: self.metrics.filtered_transactions.get(),
+            dropped: self.metrics.dropped_transactions.get(),
+            errors: self.metrics.submit_errors.get(),
+        }
+    }
+
+    fn record_submitted(&self, count: u64) {
+        self.metrics.submitted_batches.inc();
+        self.metrics.submitted_transactions.inc_by(count);
+    }
+
+    fn record_finalized(&self, count: u64) {
+        self.metrics.finalized_transactions.inc_by(count);
+    }
+
+    fn record_filtered(&self, count: u64) {
+        self.metrics.filtered_transactions.inc_by(count);
+    }
+
+    fn record_dropped(&self, count: u64) {
+        self.metrics.dropped_transactions.inc_by(count);
+    }
+
+    fn record_error(&self) {
+        self.metrics.submit_errors.inc();
     }
 }
 
@@ -53,8 +110,8 @@ enum RelayerBatchStatus {
     },
     PartiallyFinalized {
         height: u64,
-        included: Vec<String>,
-        filtered: Vec<String>,
+        included: u64,
+        filtered: u64,
     },
     Dropped,
 }
@@ -80,9 +137,10 @@ impl RelayerSubmitter {
     pub async fn submit(&self, batch: Vec<Tx>) {
         let count = batch.len() as u64;
         let body = batch.encode();
+        self.stats.record_submitted(count);
         match self.submit_encoded(body).await {
             Ok(RelayerBatchStatus::Finalized { height }) => {
-                self.stats.finalized.fetch_add(count, Ordering::Relaxed);
+                self.stats.record_finalized(count);
                 debug!(height, count, "relayed batch finalized");
             }
             Ok(RelayerBatchStatus::PartiallyFinalized {
@@ -90,25 +148,19 @@ impl RelayerSubmitter {
                 included,
                 filtered,
             }) => {
-                self.stats
-                    .finalized
-                    .fetch_add(included.len() as u64, Ordering::Relaxed);
-                self.stats
-                    .filtered
-                    .fetch_add(filtered.len() as u64, Ordering::Relaxed);
+                self.stats.record_finalized(included);
+                self.stats.record_filtered(filtered);
                 info!(
                     height,
-                    included = included.len(),
-                    filtered = filtered.len(),
-                    "relayed batch partially finalized, advancing"
+                    included, filtered, "relayed batch partially finalized, advancing"
                 );
             }
             Ok(RelayerBatchStatus::Dropped) => {
-                self.stats.dropped.fetch_add(count, Ordering::Relaxed);
+                self.stats.record_dropped(count);
                 debug!(count, "relayed batch dropped, advancing");
             }
             Err(error) => {
-                self.stats.errors.fetch_add(1, Ordering::Relaxed);
+                self.stats.record_error();
                 warn!(
                     error = %error,
                     backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
@@ -155,6 +207,10 @@ mod tests {
         signer::{Tx, sign_batch},
     };
     use commonware_parallel::Sequential;
+    use commonware_runtime::{
+        Metrics as RuntimeMetrics, Name, Supervisor,
+        telemetry::metrics::{Metric, Registered, Registration},
+    };
     use std::{
         num::NonZeroU64,
         sync::{
@@ -170,7 +226,7 @@ mod tests {
 
     #[tokio::test]
     async fn dropped_batch_advances_without_retrying() {
-        let stats = Arc::new(Stats::new());
+        let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![json_response(r#"{"status":"dropped"}"#)]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
@@ -181,13 +237,13 @@ mod tests {
             .await
             .expect("dropped batch should not be retried");
 
-        assert_eq!(stats.dropped.load(Ordering::Relaxed), count);
+        assert_eq!(stats.totals().dropped, count);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn submit_error_advances_without_retrying() {
-        let stats = Arc::new(Stats::new());
+        let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
@@ -196,19 +252,16 @@ mod tests {
             .await
             .expect("submit error should not be retried");
 
-        assert_eq!(stats.errors.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.totals().errors, 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]
     async fn partially_finalized_batch_does_not_resubmit_filtered_transactions() {
-        let stats = Arc::new(Stats::new());
+        let stats = test_stats();
         let batch = test_batch();
-        let included = batch[0].message_digest().to_string();
-        let filtered = batch[1].message_digest().to_string();
-        let body = format!(
-            r#"{{"status":"partially_finalized","height":7,"included":["{included}"],"filtered":["{filtered}"]}}"#
-        );
+        let body =
+            r#"{"status":"partially_finalized","height":7,"included":1,"filtered":1}"#.to_string();
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 
@@ -216,9 +269,46 @@ mod tests {
             .await
             .expect("filtered transactions should not be retried");
 
-        assert_eq!(stats.finalized.load(Ordering::Relaxed), 1);
-        assert_eq!(stats.filtered.load(Ordering::Relaxed), 1);
+        let totals = stats.totals();
+        assert_eq!(totals.finalized, 1);
+        assert_eq!(totals.filtered, 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
+    }
+
+    #[derive(Clone, Default)]
+    struct TestMetrics;
+
+    impl Supervisor for TestMetrics {
+        fn name(&self) -> Name {
+            Name::default()
+        }
+
+        fn child(&self, _label: &'static str) -> Self {
+            Self
+        }
+
+        fn with_attribute(self, _key: &'static str, _value: impl std::fmt::Display) -> Self {
+            self
+        }
+    }
+
+    impl RuntimeMetrics for TestMetrics {
+        fn register<N: Into<String>, H: Into<String>, M: Metric>(
+            &self,
+            _name: N,
+            _help: H,
+            metric: M,
+        ) -> Registered<M> {
+            Registered::with_registration(metric, Registration::from(()))
+        }
+
+        fn encode(&self) -> String {
+            String::new()
+        }
+    }
+
+    fn test_stats() -> Arc<Stats> {
+        Arc::new(Stats::new(TestMetrics))
     }
 
     fn test_batch() -> Vec<Tx> {

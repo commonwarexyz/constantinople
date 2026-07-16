@@ -1,6 +1,6 @@
 [package]
 name = "constantinople-application"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -32,7 +32,6 @@ rand.workspace = true
 bytes.workspace = true
 futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
-rand_core.workspace = true
 prometheus-client.workspace = true
 ahash.workspace = true
 
@@ -41,6 +40,7 @@ ahash.workspace = true
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 
 # Commonware
+commonware-actor.workspace = true
 commonware-math.workspace = true
 commonware-runtime.workspace = true
 commonware-parallel.workspace = true
@@ -49,6 +49,7 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 # Other
 rand.workspace = true
 criterion.workspace = true
+mimalloc.workspace = true
 
 [[bench]]
 name = "executor"
@@ -56,4 +57,12 @@ harness = false
 
 [[bench]]
 name = "compute"
+harness = false
+
+[[bench]]
+name = "selective"
+harness = false
+
+[[bench]]
+name = "finalize"
 harness = false

@@ -16,7 +16,7 @@ use commonware_cryptography::{
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, TryCollect};
-use rand_core::OsRng;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
@@ -117,6 +117,22 @@ pub(crate) struct GenerateArgs {
     /// Capacity of each node's decompressed public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
+    /// Maximum bytes proposed per block (also the maximum accepted
+    /// submission batch size).
+    #[arg(long = "max-propose-bytes", default_value_t = default_max_propose_bytes())]
+    max_propose_bytes: usize,
+    /// Maximum mempool size in bytes.
+    #[arg(long = "max-pool-bytes", default_value_t = default_max_pool_bytes())]
+    max_pool_bytes: usize,
+    /// Capacity in bytes of each validator's state QMDB page cache. Must
+    /// hold the state journal's working set: 512 MiB thrashed once the live
+    /// account set passed ~2M and build/verify doubled on cache misses.
+    #[arg(long = "state-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    state_page_cache_bytes: usize,
+    /// Capacity in bytes of each validator's non-state page cache
+    /// (archives, transaction history, journal).
+    #[arg(long = "other-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    other_page_cache_bytes: usize,
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
@@ -152,6 +168,10 @@ pub(crate) struct GenerateArgs {
 }
 
 #[derive(Debug, Subcommand)]
+#[expect(
+    clippy::large_enum_variant,
+    reason = "constructed once per invocation, so the size imbalance is harmless"
+)]
 enum GenerateTarget {
     Local(LocalArgs),
     Remote(RemoteArgs),
@@ -171,6 +191,10 @@ pub(crate) struct LocalArgs {
     /// Local `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
+    /// RocksDB parallelism for the local `chain-indexer` store. Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[arg(long = "chain-indexer-db-parallelism")]
+    chain_indexer_db_parallelism: Option<i32>,
     /// Local `metadata-indexer` read-service port.
     /// The explorer reads from this port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
@@ -191,6 +215,15 @@ pub(crate) struct RemoteArgs {
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
+    /// Provisioned IOPS for validator gp3 volumes (EBS default when unset).
+    #[arg(long = "storage-iops")]
+    storage_iops: Option<i32>,
+    /// Provisioned throughput (MiB/s) for validator gp3 volumes (EBS default
+    /// when unset). Validators write ~4x the raw block per view; the gp3
+    /// default of 125 MiB/s throttles the cluster before either the NIC or
+    /// consensus does.
+    #[arg(long = "storage-throughput")]
+    storage_throughput: Option<i32>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,
@@ -221,6 +254,10 @@ pub(crate) struct RemoteArgs {
     /// Shared `chain-indexer` Store port.
     #[arg(long = "chain-indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
+    /// RocksDB parallelism for the shared `chain-indexer` store. Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[arg(long = "chain-indexer-db-parallelism")]
+    chain_indexer_db_parallelism: Option<i32>,
     /// Shared `metadata-indexer` query/stream port.
     #[arg(long = "metadata-indexer-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
@@ -361,6 +398,11 @@ pub(crate) struct ValidatorConfig {
     max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
     max_pool_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    other_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,
@@ -399,6 +441,10 @@ pub(crate) struct ChainIndexerConfig {
     pub port: u16,
     /// Directory for chain-indexer data.
     pub data_dir: PathBuf,
+    /// RocksDB parallelism (background compaction/flush jobs). Omitted
+    /// leaves RocksDB's stock parallelism.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub db_parallelism: Option<i32>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -593,21 +639,22 @@ pub(crate) fn generate_remote_cluster_material(
     validators: u32,
     secondaries: u32,
 ) -> ClusterMaterial {
+    let mut rng = UnwrapErr(SysRng);
     let mut signers = (0..validators)
-        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .map(|_| ed25519::PrivateKey::random(rng))
         .collect::<Vec<_>>();
     signers.sort_by_key(Signer::public_key);
     let mut secondary_signers = (0..secondaries)
-        .map(|_| ed25519::PrivateKey::random(&mut OsRng))
+        .map(|_| ed25519::PrivateKey::random(rng))
         .collect::<Vec<_>>();
     secondary_signers.sort_by_key(Signer::public_key);
-    build_cluster_material(signers, secondary_signers, &mut OsRng)
+    build_cluster_material(signers, secondary_signers, &mut rng)
 }
 
 fn build_cluster_material(
     signers: Vec<ed25519::PrivateKey>,
     secondary_signers: Vec<ed25519::PrivateKey>,
-    rng: &mut impl rand_core::CryptoRngCore,
+    rng: &mut impl rand::CryptoRng,
 ) -> ClusterMaterial {
     let public_keys = signers.iter().map(Signer::public_key).collect::<Vec<_>>();
     let secondary_public_keys = secondary_signers
@@ -684,6 +731,10 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) const fn default_page_cache_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
 }
 
 pub(crate) const fn default_public_key_cache_size() -> usize {

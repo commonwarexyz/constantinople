@@ -101,7 +101,7 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
         values: vec![
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::UInt64(tx.qmdb_location),
-            CellValue::Utf8(hex_lower(&tx.body)),
+            CellValue::Binary(tx.body.to_vec()),
         ],
     }
 }
@@ -135,14 +135,4 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
             CellValue::UInt64(account.qmdb_location),
         ],
     }
-}
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for &byte in bytes {
-        out.push(HEX[(byte >> 4) as usize] as char);
-        out.push(HEX[(byte & 0x0f) as usize] as char);
-    }
-    out
 }

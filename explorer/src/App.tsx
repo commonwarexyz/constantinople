@@ -759,7 +759,7 @@ export default function App() {
             setSubmitMessage('submitting');
 
             const txStatus = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
-            const detail = formatTxStatus(txStatus, encoded.digestHex);
+            const detail = formatTxStatus(txStatus);
             setHistory((current) =>
                 updateTransactionStatus(
                     encoded.digestHex,
@@ -1644,7 +1644,7 @@ function updateTransactionStatus(
             finalizedInMs: Date.now() - tx.submittedAt,
             finalizedHeight,
             certificate: nextBlockCertificateState(status),
-            proof: nextProofState(status, digest),
+            proof: nextProofState(status),
         };
     });
 }
@@ -1690,7 +1690,7 @@ function shouldFetchTransactionProof(
         tx.sender === signedInSender &&
         tx.finalizedHeight !== null &&
         (tx.status === 'finalized' ||
-            (tx.status === 'partially_finalized' && !tx.detail.startsWith('rejected'))) &&
+            (tx.status === 'partially_finalized' && tx.proof.detail !== 'not included')) &&
         (tx.proof.status === 'waiting' ||
             (tx.proof.status === 'error' && isRetryableProofError(tx.proof.detail)))
     );
@@ -1713,14 +1713,11 @@ function nextBlockCertificateState(status: TxStatus): BlockCertificateState {
     return { status: 'waiting', detail: 'waiting for block certificate' };
 }
 
-function nextProofState(
-    status: TxStatus,
-    digest: string,
-): TransactionProofState {
+function nextProofState(status: TxStatus): TransactionProofState {
     if (status.status === 'dropped') {
         return { status: 'waiting', detail: 'not finalized' };
     }
-    if (status.status === 'partially_finalized' && status.filtered.includes(digest)) {
+    if (status.status === 'partially_finalized' && status.included === 0) {
         return { status: 'waiting', detail: 'not included' };
     }
     return { status: 'waiting', detail: 'waiting for QMDB proof' };
@@ -1775,15 +1772,12 @@ async function retryAccountPageStep<T>(
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function formatTxStatus(status: TxStatus, digest: string): string {
+function formatTxStatus(status: TxStatus): string {
     if (status.status === 'finalized') {
         return `finalized at ${status.height}`;
     }
     if (status.status === 'partially_finalized') {
-        if (status.filtered.includes(digest)) {
-            return `rejected at ${status.height}: filtered ${shortHex(digest)}`;
-        }
-        return `partial at ${status.height}: filtered ${status.filtered.map(shortHex).join(', ')}`;
+        return `partial at ${status.height}: ${status.included} included, ${status.filtered} filtered`;
     }
     return status.status;
 }

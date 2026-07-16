@@ -6,6 +6,7 @@ import {
     type DecodedQueryResult,
     type DecodedRow,
 } from '@exowarexyz/sql';
+import { Client, StoreKeyPrefix } from '@exowarexyz/sdk';
 import {
     SimplexClient,
     type VerifiedSimplexCertificate,
@@ -20,6 +21,7 @@ import {
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
+const SIMPLEX_STORE_PREFIX = new Uint8Array([0x02]);
 const ACCOUNT_PAGE_SIZE = 10;
 const ACCOUNT_KEY_BYTES = 32;
 const DIGEST_BYTES = 32;
@@ -36,7 +38,7 @@ const ACCOUNT_CURSOR_BYTES = 24;
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
-const TX_META_BODY_HEX = 'body_hex';
+const TX_META_BODY = 'body';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -297,7 +299,7 @@ async function fetchVerifiedSqlTransactionMetadata(
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY_HEX}
+            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
             FROM ${TX_META_TABLE}
             WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
             LIMIT 1
@@ -310,7 +312,7 @@ async function fetchVerifiedSqlTransactionMetadata(
     }
 
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
-    const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
+    const signedTransaction = expectVariableBytes(row.values[TX_META_BODY], TX_META_BODY);
     if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
         throw new Error('SQL transaction body is truncated');
     }
@@ -474,7 +476,10 @@ async function verifiedSimplexClient(
     if (simplexVerificationMaterial.trim().length === 0) {
         throw new Error('Simplex verification material is not configured');
     }
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(trimTrailingSlash(storeUrl), {
+    const store = new Client(trimTrailingSlash(storeUrl)).store(
+        new StoreKeyPrefix(SIMPLEX_STORE_PREFIX),
+    );
+    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(store, {
         verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
     });
 }
@@ -788,15 +793,11 @@ function expectBytes(value: CellValue, column: string, length: number): Uint8Arr
     return value;
 }
 
-function expectHexBytes(value: CellValue, column: string): Uint8Array {
-    if (typeof value !== 'string') {
-        throw new Error(`SQL column ${column} must be Utf8 hex`);
+function expectVariableBytes(value: CellValue, column: string): Uint8Array {
+    if (!(value instanceof Uint8Array)) {
+        throw new Error(`SQL column ${column} must be Binary`);
     }
-    const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]*$/.test(normalized) || normalized.length % 2 !== 0) {
-        throw new Error(`SQL column ${column} must be even-length hex`);
-    }
-    return fromHex(normalized);
+    return value;
 }
 
 function assertByteLength(bytes: Uint8Array, length: number, field: string) {

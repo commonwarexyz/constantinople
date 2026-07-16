@@ -13,6 +13,15 @@ pub struct Cli {
     #[arg(long)]
     pub hosts: Option<PathBuf>,
 
+    /// Port for the Prometheus metrics endpoint.
+    ///
+    /// Defaults to the deployer's scrape port when running with `--hosts`
+    /// (a dedicated instance); otherwise metrics are served only when a
+    /// port is given, so ad-hoc runs cannot collide with co-located
+    /// validators' metrics ports.
+    #[arg(long)]
+    pub metrics_port: Option<u16>,
+
     /// Relayer base URL for transaction submission.
     #[arg(long)]
     pub relayer_url: Option<String>,

@@ -312,6 +312,10 @@ impl EngineDefinition for TestEngineDefinition {
                     manager,
                     blocker,
                     namespace: ENGINE_NAMESPACE.to_vec(),
+                    // Small: simulation state is tiny and large caches slow
+                    // deterministic runs.
+                    state_page_cache_bytes: 32 * 1024 * 1024,
+                    other_page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
                     input,
@@ -461,11 +465,8 @@ fn run_crash_restart(engine: TestEngineDefinition) {
         .seeds(0..2)
         .crash(Crash::Schedule(
             Schedule::new()
-                .at(
-                    Duration::from_millis(2_500),
-                    Action::Crash(validator.clone()),
-                )
-                .at(Duration::from_millis(5_000), Action::Restart(validator)),
+                .at(Duration::from_millis(500), Action::Crash(validator.clone()))
+                .at(Duration::from_millis(1_000), Action::Restart(validator)),
         ))
         .exit_condition(FinalizedHeightAtLeast::new(50))
         .property(BlockAgreementAtHeight::new(50))
@@ -638,16 +639,23 @@ fn run_many_crashes(engine: TestEngineDefinition) {
 }
 
 fn run_total_shutdown(engine: TestEngineDefinition) {
-    let count = engine.participants().len();
+    // One deterministic full blackout: every validator crashes at once and
+    // restarts together. A fixed schedule guarantees the outage actually
+    // happens; `Crash::Random` cycles can miss the run entirely when the
+    // exit height finalizes before their first tick.
+    let mut schedule = Schedule::new();
+    let participants = engine.participants();
+    for participant in participants.iter().cloned() {
+        schedule = schedule.at(Duration::from_secs(3), Action::Crash(participant));
+    }
+    for participant in participants.iter().cloned() {
+        schedule = schedule.at(Duration::from_millis(3_300), Action::Restart(participant));
+    }
 
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..3)
-        .crash(Crash::Random {
-            frequency: Duration::from_secs(5),
-            downtime: Duration::from_millis(300),
-            count,
-        })
+        .crash(Crash::Schedule(schedule))
         .timeout(Duration::from_secs(90))
         .exit_condition(FinalizedHeightAtLeast::new(100))
         .property(BlockAgreementAtHeight::new(100))

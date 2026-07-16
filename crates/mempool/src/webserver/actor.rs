@@ -7,7 +7,7 @@
 use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
 use ahash::{AHashMap, AHashSet};
 use commonware_codec::EncodeSize;
-use commonware_consensus::{marshal::Update, types::Round};
+use commonware_consensus::marshal::Update;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{ContextCell, Handle, Metrics, Spawner, spawn_cell};
@@ -20,7 +20,7 @@ use std::{
     hash::Hash,
     sync::{Arc, OnceLock},
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{Semaphore, mpsc, oneshot};
 use tracing::warn;
 
 const MAX_STATUS_ENTRIES: usize = 1_000_000;
@@ -31,15 +31,38 @@ const MAX_STATUS_ENTRIES: usize = 1_000_000;
 pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
 
 /// Outcome of a submitted batch, delivered when the result is known.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Submitters already know their batch's digests, so partial finalization
+/// reports counts rather than digest lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum TxStatus {
     /// The batch's block was finalized.
     Finalized { height: u64 },
     /// The batch's block was finalized, but some transactions were filtered.
-    ///
-    /// The `included` and `filtered` digests are hex-encoded transaction
-    /// message digests in the original batch order.
+    PartiallyFinalized {
+        height: u64,
+        included: u64,
+        filtered: u64,
+    },
+    /// The batch was proposed but its block was not finalized.
+    Dropped,
+}
+
+/// Latest known status for a submitted batch, as served by the status API.
+///
+/// Fully finalized, dropped, and accepted batches are described by the status
+/// alone (the submitter knows which digests it sent); only partial
+/// finalization carries hex-encoded digest lists, so callers can tell which
+/// transactions landed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum BatchStatus {
+    /// The batch is accepted by this validator but has not resolved yet.
+    Accepted,
+    /// The batch's block was finalized.
+    Finalized { height: u64 },
+    /// The batch's block was finalized, but some transactions were filtered.
     PartiallyFinalized {
         height: u64,
         included: Vec<String>,
@@ -49,22 +72,47 @@ pub enum TxStatus {
     Dropped,
 }
 
-/// Latest known status for a submitted batch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum BatchStatus {
-    /// The batch is accepted by this validator but has not resolved yet.
-    Accepted { digests: Vec<String> },
-    /// The batch's block was finalized.
-    Finalized { height: u64, included: Vec<String> },
-    /// The batch's block was finalized, but some transactions were filtered.
+/// Actor-internal batch status.
+///
+/// Digests stay raw so the actor's bookkeeping never formats hex strings;
+/// [`StoredBatchStatus::to_wire`] converts at the HTTP boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum StoredBatchStatus<D> {
+    Accepted,
+    Finalized {
+        height: u64,
+    },
     PartiallyFinalized {
         height: u64,
-        included: Vec<String>,
-        filtered: Vec<String>,
+        included: Vec<D>,
+        filtered: Vec<D>,
     },
-    /// The batch was proposed but its block was not finalized.
-    Dropped { filtered: Vec<String> },
+    Dropped,
+}
+
+impl<D: Display> StoredBatchStatus<D> {
+    /// Converts to the wire form, hex-encoding any digest lists.
+    pub(super) fn to_wire(&self) -> BatchStatus {
+        match self {
+            Self::Accepted => BatchStatus::Accepted,
+            Self::Finalized { height } => BatchStatus::Finalized { height: *height },
+            Self::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            } => BatchStatus::PartiallyFinalized {
+                height: *height,
+                included: included.iter().map(ToString::to_string).collect(),
+                filtered: filtered.iter().map(ToString::to_string).collect(),
+            },
+            Self::Dropped => BatchStatus::Dropped,
+        }
+    }
+
+    /// Whether the wire form carries digest lists (nontrivial to encode).
+    pub(super) const fn has_digest_lists(&self) -> bool {
+        matches!(self, Self::PartiallyFinalized { .. })
+    }
 }
 
 /// Mempool actor configuration.
@@ -79,8 +127,10 @@ pub struct Config<St: Strategy> {
     /// Number of finalized blocks to wait before marking a proposed
     /// batch as [`TxStatus::Dropped`].
     pub drop_grace_blocks: u64,
-    /// Parallel execution strategy for transaction verification: decoding, seal
-    /// hashing, and batch signature verification.
+    /// Parallel execution strategy for ingress batch verification (decoding,
+    /// seal hashing, batch signature verification), finalized-block digest
+    /// extraction and block release in the actor, and hex-encoding digest
+    /// lists for status responses.
     pub strategy: St,
     /// Shared cache of decompressed transaction public keys.
     pub public_key_cache: PublicKeyCache,
@@ -93,9 +143,9 @@ struct PoolEntry<H: Hasher> {
 }
 
 /// A batch proposed at a given height.
-struct ProposedBatch<H: Hasher> {
+struct ProposedBatch<D> {
     height: u64,
-    digests: Vec<H::Digest>,
+    digests: Vec<D>,
 }
 
 #[derive(Clone, Copy)]
@@ -116,24 +166,24 @@ fn status_for_finalized_block<D>(
     finalized: &AHashSet<D>,
 ) -> Option<TxStatus>
 where
-    D: Copy + Display + Eq + Hash,
+    D: Copy + Eq + Hash,
 {
-    let mut included = Vec::new();
-    let mut filtered = Vec::new();
+    let mut included = 0;
+    let mut filtered = 0;
 
     for digest in digests {
         if finalized.contains(digest) {
-            included.push(digest.to_string());
+            included += 1;
         } else {
-            filtered.push(digest.to_string());
+            filtered += 1;
         }
     }
 
-    if included.is_empty() {
+    if included == 0 {
         return None;
     }
 
-    if filtered.is_empty() {
+    if filtered == 0 {
         return Some(TxStatus::Finalized { height });
     }
 
@@ -147,9 +197,9 @@ where
 fn batch_status_from_outcomes<D>(
     digests: &[D],
     outcomes: &AHashMap<D, DigestOutcome>,
-) -> Option<BatchStatus>
+) -> Option<StoredBatchStatus<D>>
 where
-    D: Copy + Display + Eq + Hash,
+    D: Copy + Eq + Hash,
 {
     let mut included = Vec::new();
     let mut filtered = Vec::new();
@@ -159,65 +209,55 @@ where
         match outcomes.get(digest) {
             Some(DigestOutcome::Finalized { height }) => {
                 finalized_height = finalized_height.max(*height);
-                included.push(digest.to_string());
+                included.push(*digest);
             }
-            Some(DigestOutcome::Dropped) => filtered.push(digest.to_string()),
+            Some(DigestOutcome::Dropped) => filtered.push(*digest),
             None => return None,
         }
     }
 
     if included.is_empty() {
-        return Some(BatchStatus::Dropped { filtered });
+        return Some(StoredBatchStatus::Dropped);
     }
 
     if filtered.is_empty() {
-        return Some(BatchStatus::Finalized {
+        return Some(StoredBatchStatus::Finalized {
             height: finalized_height,
-            included,
         });
     }
 
-    Some(BatchStatus::PartiallyFinalized {
+    Some(StoredBatchStatus::PartiallyFinalized {
         height: finalized_height,
         included,
         filtered,
     })
 }
 
-fn tx_status_from_batch(status: &BatchStatus) -> Option<TxStatus> {
+const fn tx_status_from_batch<D>(status: &StoredBatchStatus<D>) -> Option<TxStatus> {
     match status {
-        BatchStatus::Accepted { .. } => None,
-        BatchStatus::Finalized { height, .. } => Some(TxStatus::Finalized { height: *height }),
-        BatchStatus::PartiallyFinalized {
+        StoredBatchStatus::Accepted => None,
+        StoredBatchStatus::Finalized { height } => Some(TxStatus::Finalized { height: *height }),
+        StoredBatchStatus::PartiallyFinalized {
             height,
             included,
             filtered,
         } => Some(TxStatus::PartiallyFinalized {
             height: *height,
-            included: included.clone(),
-            filtered: filtered.clone(),
+            included: included.len() as u64,
+            filtered: filtered.len() as u64,
         }),
-        BatchStatus::Dropped { .. } => Some(TxStatus::Dropped),
+        StoredBatchStatus::Dropped => Some(TxStatus::Dropped),
     }
 }
 
-fn accepted_status<D>(digests: &[D]) -> BatchStatus
-where
-    D: Display,
-{
-    BatchStatus::Accepted {
-        digests: digests.iter().map(ToString::to_string).collect(),
-    }
-}
-
-fn remember_status(
-    statuses: &mut AHashMap<String, BatchStatus>,
-    status_order: &mut VecDeque<String>,
-    batch_id: String,
-    status: BatchStatus,
-) -> Vec<String> {
+fn remember_status<D>(
+    statuses: &mut AHashMap<Arc<str>, StoredBatchStatus<D>>,
+    status_order: &mut VecDeque<Arc<str>>,
+    batch_id: Arc<str>,
+    status: StoredBatchStatus<D>,
+) -> Vec<Arc<str>> {
     if !statuses.contains_key(&batch_id) {
-        status_order.push_back(batch_id.clone());
+        status_order.push_back(Arc::clone(&batch_id));
     }
     statuses.insert(batch_id, status);
 
@@ -232,10 +272,10 @@ fn remember_status(
     expired
 }
 
-fn send_pending_waiters(
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+fn send_pending_waiters<D>(
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
     batch_id: &str,
-    status: &BatchStatus,
+    status: &StoredBatchStatus<D>,
 ) {
     let Some(status) = tx_status_from_batch(status) else {
         return;
@@ -244,11 +284,11 @@ fn send_pending_waiters(
         return;
     };
     for waiter in waiters {
-        let _ = waiter.send(status.clone());
+        let _ = waiter.send(status);
     }
 }
 
-fn watch_batch<D>(batch_id: &str, digests: &[D], watchers: &mut AHashMap<D, Vec<String>>)
+fn watch_batch<D>(batch_id: &Arc<str>, digests: &[D], watchers: &mut AHashMap<D, Vec<Arc<str>>>)
 where
     D: Copy + Eq + Hash,
 {
@@ -260,16 +300,16 @@ where
         watchers
             .entry(*digest)
             .or_default()
-            .push(batch_id.to_string());
+            .push(Arc::clone(batch_id));
     }
 }
 
 fn forget_batch<D>(
     batch_id: &str,
-    batch_digests: &mut AHashMap<String, Vec<D>>,
-    watchers: &mut AHashMap<D, Vec<String>>,
+    batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+    watchers: &mut AHashMap<D, Vec<Arc<str>>>,
     outcomes: &mut AHashMap<D, DigestOutcome>,
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Eq + Hash,
 {
@@ -286,7 +326,7 @@ fn forget_batch<D>(
         let Some(batch_ids) = watchers.get_mut(&digest) else {
             continue;
         };
-        batch_ids.retain(|known| known != batch_id);
+        batch_ids.retain(|known| known.as_ref() != batch_id);
         if batch_ids.is_empty() {
             watchers.remove(&digest);
             outcomes.remove(&digest);
@@ -295,11 +335,11 @@ fn forget_batch<D>(
 }
 
 fn forget_expired_batches<D>(
-    expired: Vec<String>,
-    batch_digests: &mut AHashMap<String, Vec<D>>,
-    watchers: &mut AHashMap<D, Vec<String>>,
+    expired: Vec<Arc<str>>,
+    batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+    watchers: &mut AHashMap<D, Vec<Arc<str>>>,
     outcomes: &mut AHashMap<D, DigestOutcome>,
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
 ) where
     D: Copy + Eq + Hash,
 {
@@ -314,11 +354,14 @@ fn forget_expired_batches<D>(
     }
 }
 
-fn watched_batches_for<D>(digests: &[D], watchers: &AHashMap<D, Vec<String>>) -> AHashSet<String>
+fn watched_batches_for<D>(
+    digests: &[D],
+    watchers: &AHashMap<D, Vec<Arc<str>>>,
+) -> AHashSet<Arc<str>>
 where
     D: Copy + Eq + Hash,
 {
-    let mut affected: AHashSet<String> = AHashSet::new();
+    let mut affected: AHashSet<Arc<str>> = AHashSet::new();
     for digest in digests {
         let Some(batch_ids) = watchers.get(digest) else {
             continue;
@@ -328,30 +371,130 @@ where
     affected
 }
 
-fn resolve_batch_if_terminal<D>(
-    batch_id: &str,
-    statuses: &mut AHashMap<String, BatchStatus>,
-    status_order: &mut VecDeque<String>,
-    batch_digests: &mut AHashMap<String, Vec<D>>,
-    digest_watchers: &mut AHashMap<D, Vec<String>>,
-    digest_outcomes: &mut AHashMap<D, DigestOutcome>,
-    pending_waiters: &mut AHashMap<String, Vec<oneshot::Sender<TxStatus>>>,
-) where
-    D: Copy + Display + Eq + Hash,
+/// Pops pool entries for a proposal at `height`, recording each served batch.
+///
+/// `filled` is the encoded size the proposal already holds, so the served
+/// batch stays within `max_propose_bytes - filled`. A refill for a non-empty
+/// block (`filled > 0`) never overshoots that headroom, so refills cannot
+/// inflate the block; an initial selection (`filled == 0`) may overshoot by
+/// one entry so an oversized head entry cannot wedge the pool.
+fn pop_proposal<H>(
+    pool: &mut VecDeque<PoolEntry<H>>,
+    pool_bytes: &mut usize,
+    proposed: &mut VecDeque<ProposedBatch<H::Digest>>,
+    height: u64,
+    filled: usize,
+    max_propose_bytes: usize,
+) -> Vec<VerifiedTransaction<H>>
+where
+    H: Hasher,
 {
-    let Some(digests) = batch_digests.get(batch_id) else {
+    let budget = max_propose_bytes.saturating_sub(filled);
+    let strict = filled > 0;
+    let mut batch_txs = Vec::new();
+    let mut batch_bytes = 0;
+
+    while let Some(entry) = pool.front() {
+        if batch_bytes + entry.total_bytes > budget && (strict || !batch_txs.is_empty()) {
+            break;
+        }
+        let entry = pool.pop_front().expect("front was Some");
+        *pool_bytes -= entry.total_bytes;
+        batch_bytes += entry.total_bytes;
+        let mut digests = Vec::with_capacity(entry.transactions.len());
+        for tx in &entry.transactions {
+            digests.push(*tx.message_digest());
+        }
+        proposed.push_back(ProposedBatch { height, digests });
+        batch_txs.extend(entry.transactions);
+    }
+    batch_txs
+}
+
+/// Applies one finalized block's digest set to the outstanding proposed
+/// batches, recording per-digest outcomes and pruning `known_digests`.
+///
+/// A partial match does not prove the unmatched digests are dead: a
+/// speculative reuse can split one selection across two finalized blocks (the
+/// filtered digests land in the parent, the remainder in the next block this
+/// node proposes). Matched digests finalize immediately; the remainder stays
+/// outstanding until its own block is reported or the grace window expires.
+///
+/// Returns the batch ids whose digests gained outcomes, for terminal-status
+/// resolution by the caller.
+fn resolve_proposed_batches<D>(
+    proposed: &mut VecDeque<ProposedBatch<D>>,
+    finalized: &AHashSet<D>,
+    height: u64,
+    drop_grace_blocks: u64,
+    known_digests: &mut AHashSet<D>,
+    digest_outcomes: &mut AHashMap<D, DigestOutcome>,
+    digest_watchers: &AHashMap<D, Vec<Arc<str>>>,
+) -> AHashSet<Arc<str>>
+where
+    D: Copy + Eq + Hash,
+{
+    let mut affected: AHashSet<Arc<str>> = AHashSet::new();
+    let mut remaining = VecDeque::new();
+    for batch in proposed.drain(..) {
+        let expired = height >= batch.height + drop_grace_blocks;
+        let any_finalized = batch
+            .digests
+            .iter()
+            .any(|digest| finalized.contains(digest));
+        if !any_finalized && !expired {
+            remaining.push_back(batch);
+            continue;
+        }
+
+        affected.extend(watched_batches_for(&batch.digests, digest_watchers));
+        let mut outstanding = Vec::new();
+        for digest in &batch.digests {
+            if finalized.contains(digest) {
+                digest_outcomes.insert(*digest, DigestOutcome::Finalized { height });
+                known_digests.remove(digest);
+            } else if expired {
+                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
+                known_digests.remove(digest);
+            } else {
+                outstanding.push(*digest);
+            }
+        }
+        if !outstanding.is_empty() {
+            remaining.push_back(ProposedBatch {
+                height: batch.height,
+                digests: outstanding,
+            });
+        }
+    }
+    *proposed = remaining;
+    affected
+}
+
+fn resolve_batch_if_terminal<D>(
+    batch_id: &Arc<str>,
+    statuses: &mut AHashMap<Arc<str>, StoredBatchStatus<D>>,
+    status_order: &mut VecDeque<Arc<str>>,
+    batch_digests: &mut AHashMap<Arc<str>, Vec<D>>,
+    digest_watchers: &mut AHashMap<D, Vec<Arc<str>>>,
+    digest_outcomes: &mut AHashMap<D, DigestOutcome>,
+    pending_waiters: &mut AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>>,
+) where
+    D: Copy + Eq + Hash,
+{
+    let Some(digests) = batch_digests.get(batch_id.as_ref()) else {
         return;
     };
     let Some(status) = batch_status_from_outcomes(digests, digest_outcomes) else {
         return;
     };
 
-    let expired = remember_status(statuses, status_order, batch_id.to_string(), status);
-    if let Some(status) = statuses.get(batch_id) {
-        send_pending_waiters(pending_waiters, batch_id, status);
+    let expired = remember_status(statuses, status_order, Arc::clone(batch_id), status);
+    if let Some(status) = statuses.get(batch_id.as_ref()) {
+        send_pending_waiters(pending_waiters, batch_id.as_ref(), status);
     }
     forget_batch(
-        batch_id,
+        batch_id.as_ref(),
         batch_digests,
         digest_watchers,
         digest_outcomes,
@@ -401,10 +544,6 @@ where
     H: Hasher,
 {
     transactions.iter().map(EncodeSize::encode_size).sum()
-}
-
-const fn rotation_round(round: Round) -> u64 {
-    round.epoch().get().wrapping_add(round.view().get())
 }
 
 /// The mempool actor.
@@ -499,24 +638,25 @@ where
             mailbox,
             namespace,
             max_batch_bytes: max_propose_bytes,
-            strategy,
+            strategy: strategy.clone(),
             public_key_cache,
             account_reader,
+            ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
         });
         let app = http::router::<C, P, H, St>(app_state);
         let _http_handle = context.as_present().child("http").spawn(|_| async {
             let _ = axum::serve(listener, app).await;
         });
 
-        let mut proposed: VecDeque<ProposedBatch<H>> = VecDeque::new();
-        let mut statuses: AHashMap<String, BatchStatus> = AHashMap::new();
+        let mut proposed: VecDeque<ProposedBatch<H::Digest>> = VecDeque::new();
+        let mut statuses: AHashMap<Arc<str>, StoredBatchStatus<H::Digest>> = AHashMap::new();
         let mut status_order = VecDeque::new();
-        let mut batch_digests: AHashMap<String, Vec<H::Digest>> = AHashMap::new();
-        let mut digest_watchers: AHashMap<H::Digest, Vec<String>> = AHashMap::new();
+        let mut batch_digests: AHashMap<Arc<str>, Vec<H::Digest>> = AHashMap::new();
+        let mut digest_watchers: AHashMap<H::Digest, Vec<Arc<str>>> = AHashMap::new();
         let mut digest_outcomes: AHashMap<H::Digest, DigestOutcome> = AHashMap::new();
-        let mut pending_waiters: AHashMap<String, Vec<oneshot::Sender<TxStatus>>> = AHashMap::new();
+        let mut pending_waiters: AHashMap<Arc<str>, Vec<oneshot::Sender<TxStatus>>> =
+            AHashMap::new();
         let mut known_digests: AHashSet<H::Digest> = AHashSet::new();
-        let mut highest_consensus_round = 0;
 
         while let Some(message) = rx.recv().await {
             match message {
@@ -528,7 +668,8 @@ where
                     result,
                     ingest_result,
                 } => {
-                    if let Some(status) = statuses.get(&batch_id) {
+                    let batch_id: Arc<str> = batch_id.into();
+                    if let Some(status) = statuses.get(batch_id.as_ref()) {
                         if let Some(ingest_result) = ingest_result {
                             let _ = ingest_result.send(IngestStatus::Accepted);
                         }
@@ -558,11 +699,11 @@ where
                     let expired = remember_status(
                         &mut statuses,
                         &mut status_order,
-                        batch_id.clone(),
-                        accepted_status(&digests),
+                        Arc::clone(&batch_id),
+                        StoredBatchStatus::Accepted,
                     );
-                    batch_digests.insert(batch_id.clone(), digests.clone());
                     watch_batch(&batch_id, &digests, &mut digest_watchers);
+                    batch_digests.insert(Arc::clone(&batch_id), digests);
                     forget_expired_batches(
                         expired,
                         &mut batch_digests,
@@ -572,7 +713,7 @@ where
                     );
                     if let Some(result) = result {
                         pending_waiters
-                            .entry(batch_id.clone())
+                            .entry(Arc::clone(&batch_id))
                             .or_default()
                             .push(result);
                     }
@@ -588,98 +729,74 @@ where
                     }
                 }
                 Message::QueryStatus { batch_id, response } => {
-                    let _ = response.send(statuses.get(&batch_id).cloned());
+                    let _ = response.send(statuses.get(batch_id.as_str()).cloned());
                 }
-                Message::QueryConsensusRound { response } => {
-                    let _ = response.send(highest_consensus_round);
-                }
-                Message::Propose { height, response } => {
-                    let mut batch_txs = Vec::new();
-                    let mut batch_bytes = 0;
-
-                    while let Some(entry) = pool.front() {
-                        if batch_bytes + entry.total_bytes > max_propose_bytes
-                            && !batch_txs.is_empty()
-                        {
-                            break;
-                        }
-                        let entry = pool.pop_front().expect("front was Some");
-                        pool_bytes -= entry.total_bytes;
-                        batch_bytes += entry.total_bytes;
-                        let mut digests = Vec::with_capacity(entry.transactions.len());
-                        for tx in &entry.transactions {
-                            digests.push(*tx.message_digest());
-                        }
-                        proposed.push_back(ProposedBatch { height, digests });
-                        batch_txs.extend(entry.transactions);
-                    }
+                Message::Propose {
+                    height,
+                    filled,
+                    response,
+                } => {
+                    let batch_txs = pop_proposal(
+                        &mut pool,
+                        &mut pool_bytes,
+                        &mut proposed,
+                        height,
+                        filled,
+                        max_propose_bytes,
+                    );
                     response.send_lossy(batch_txs);
                 }
                 Message::Report(Update::Block(block, acknowledgement)) => {
-                    highest_consensus_round =
-                        highest_consensus_round.max(rotation_round(block.header.context.round));
-                    let height = block.header.height;
-                    let finalized: AHashSet<H::Digest> = block
-                        .body
-                        .iter()
-                        .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
-                        .collect();
-
-                    let mut remaining = VecDeque::new();
-                    for batch in proposed.drain(..) {
-                        let affected = watched_batches_for(&batch.digests, &digest_watchers);
-                        if batch
-                            .digests
-                            .iter()
-                            .any(|digest| finalized.contains(digest))
-                        {
-                            for digest in &batch.digests {
-                                if finalized.contains(digest) {
-                                    digest_outcomes
-                                        .insert(*digest, DigestOutcome::Finalized { height });
-                                } else {
-                                    digest_outcomes.insert(*digest, DigestOutcome::Dropped);
-                                }
-                                known_digests.remove(digest);
-                            }
-                            for batch_id in affected {
-                                resolve_batch_if_terminal(
-                                    &batch_id,
-                                    &mut statuses,
-                                    &mut status_order,
-                                    &mut batch_digests,
-                                    &mut digest_watchers,
-                                    &mut digest_outcomes,
-                                    &mut pending_waiters,
-                                );
-                            }
-                        } else if height >= batch.height + drop_grace_blocks {
-                            for digest in &batch.digests {
-                                digest_outcomes.insert(*digest, DigestOutcome::Dropped);
-                                known_digests.remove(digest);
-                            }
-                            for batch_id in affected {
-                                resolve_batch_if_terminal(
-                                    &batch_id,
-                                    &mut statuses,
-                                    &mut status_order,
-                                    &mut batch_digests,
-                                    &mut digest_watchers,
-                                    &mut digest_outcomes,
-                                    &mut pending_waiters,
-                                );
-                            }
-                        } else {
-                            remaining.push_back(batch);
-                        }
+                    // Only this node's outstanding proposals consume the
+                    // finalized-digest set (~1 in `participants` views), so
+                    // the full-body decode is skipped otherwise; the block is
+                    // still released on the strategy's pool off this loop.
+                    if proposed.is_empty() {
+                        drop(strategy.spawn(move |_: St| drop(block)));
+                        acknowledgement.acknowledge();
+                        continue;
                     }
-                    proposed = remaining;
+
+                    let height = block.header.height;
+
+                    // Deriving the finalized set decodes any transaction the
+                    // application has not already materialized, so it runs on
+                    // the strategy's pool (which also releases the block
+                    // there).
+                    let finalized: AHashSet<H::Digest> = strategy
+                        .spawn(move |_: St| {
+                            block
+                                .body
+                                .iter()
+                                .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))
+                                .collect()
+                        })
+                        .await;
+
+                    let affected = resolve_proposed_batches(
+                        &mut proposed,
+                        &finalized,
+                        height,
+                        drop_grace_blocks,
+                        &mut known_digests,
+                        &mut digest_outcomes,
+                        &digest_watchers,
+                    );
+                    for batch_id in affected {
+                        resolve_batch_if_terminal(
+                            &batch_id,
+                            &mut statuses,
+                            &mut status_order,
+                            &mut batch_digests,
+                            &mut digest_watchers,
+                            &mut digest_outcomes,
+                            &mut pending_waiters,
+                        );
+                    }
 
                     acknowledgement.acknowledge();
                 }
-                Message::Report(Update::Tip(round, ..)) => {
-                    highest_consensus_round = highest_consensus_round.max(rotation_round(round));
-                }
+                Message::Report(Update::Tip(..)) => {}
             }
         }
         warn!("mempool actor stopped: all senders dropped");
@@ -689,7 +806,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        BatchStatus, DigestOutcome, TxStatus, batch_status_from_outcomes, new_transactions,
+        DigestOutcome, PoolEntry, ProposedBatch, StoredBatchStatus, TxStatus,
+        batch_status_from_outcomes, new_transactions, pop_proposal, resolve_proposed_batches,
         status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
@@ -698,6 +816,7 @@ mod tests {
     use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
+    use std::collections::VecDeque;
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {
@@ -714,8 +833,8 @@ mod tests {
             status,
             Some(TxStatus::PartiallyFinalized {
                 height: 42,
-                included: vec![first.to_string(), third.to_string()],
-                filtered: vec![second.to_string()],
+                included: 2,
+                filtered: 1,
             }),
         );
     }
@@ -789,11 +908,240 @@ mod tests {
 
         assert_eq!(
             status,
-            Some(BatchStatus::PartiallyFinalized {
+            Some(StoredBatchStatus::PartiallyFinalized {
                 height: 7,
-                included: vec![first.to_string()],
-                filtered: vec![second.to_string()],
+                included: vec![first],
+                filtered: vec![second],
             }),
         );
+    }
+
+    /// A speculative reuse can split one selection across two finalized
+    /// blocks: the filtered digest lands in the parent, the remainder in the
+    /// next block this node proposes. Both must resolve as finalized.
+    #[test]
+    fn split_selection_finalizes_across_two_blocks() {
+        let mut rng = StdRng::from_seed([17; 32]);
+        let filtered = sha256::Digest::random(&mut rng);
+        let reused = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![filtered, reused],
+        }]);
+        let mut known: AHashSet<_> = [filtered, reused].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        let watchers = AHashMap::new();
+
+        // The parent block (containing the filtered digest) finalizes first.
+        let parent_body: AHashSet<_> = [filtered].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &parent_body,
+            2,
+            10,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert_eq!(proposed.len(), 1, "remainder must stay outstanding");
+        assert_eq!(proposed[0].digests, vec![reused]);
+        assert_eq!(
+            batch_status_from_outcomes(&[filtered, reused], &outcomes),
+            None,
+            "batch must not resolve until the remainder settles"
+        );
+
+        // The reuse block (containing the remainder) finalizes next.
+        let reuse_body: AHashSet<_> = [reused].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &reuse_body,
+            3,
+            10,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert!(proposed.is_empty());
+        assert!(known.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[filtered, reused], &outcomes),
+            Some(StoredBatchStatus::Finalized { height: 3 }),
+            "both digests finalized, split across blocks"
+        );
+    }
+
+    /// A remainder that never finalizes still ages out at the grace bound.
+    #[test]
+    fn split_selection_remainder_drops_after_grace() {
+        let mut rng = StdRng::from_seed([19; 32]);
+        let included = sha256::Digest::random(&mut rng);
+        let dead = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![included, dead],
+        }]);
+        let mut known: AHashSet<_> = [included, dead].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        let watchers = AHashMap::new();
+
+        let first_body: AHashSet<_> = [included].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &first_body,
+            2,
+            3,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert_eq!(proposed.len(), 1);
+
+        // Nothing includes the remainder; grace (height 2 + 3) expires it.
+        let empty_body = AHashSet::new();
+        resolve_proposed_batches(
+            &mut proposed,
+            &empty_body,
+            5,
+            3,
+            &mut known,
+            &mut outcomes,
+            &watchers,
+        );
+        assert!(proposed.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[included, dead], &outcomes),
+            Some(StoredBatchStatus::PartiallyFinalized {
+                height: 2,
+                included: vec![included],
+                filtered: vec![dead],
+            }),
+        );
+    }
+
+    /// A whole selection that lands entirely in one block resolves
+    /// immediately; one that is never included drops once the grace window
+    /// expires.
+    #[test]
+    fn whole_selection_finalizes_in_one_block_or_drops_after_grace() {
+        let mut rng = StdRng::from_seed([23; 32]);
+        let a = sha256::Digest::random(&mut rng);
+        let b = sha256::Digest::random(&mut rng);
+
+        // Full inclusion resolves immediately.
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![a, b],
+        }]);
+        let mut known: AHashSet<_> = [a, b].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        let body: AHashSet<_> = [a, b].into_iter().collect();
+        resolve_proposed_batches(
+            &mut proposed,
+            &body,
+            2,
+            10,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+        );
+        assert!(proposed.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[a, b], &outcomes),
+            Some(StoredBatchStatus::Finalized { height: 2 }),
+        );
+
+        // No inclusion within grace keeps the batch pending, then drops it.
+        let c = sha256::Digest::random(&mut rng);
+        let mut proposed = VecDeque::from([ProposedBatch {
+            height: 2,
+            digests: vec![c],
+        }]);
+        let mut known: AHashSet<_> = [c].into_iter().collect();
+        let mut outcomes = AHashMap::new();
+        resolve_proposed_batches(
+            &mut proposed,
+            &AHashSet::new(),
+            3,
+            3,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+        );
+        assert_eq!(proposed.len(), 1, "still within grace");
+        resolve_proposed_batches(
+            &mut proposed,
+            &AHashSet::new(),
+            5,
+            3,
+            &mut known,
+            &mut outcomes,
+            &AHashMap::new(),
+        );
+        assert!(proposed.is_empty());
+        assert_eq!(
+            batch_status_from_outcomes(&[c], &outcomes),
+            Some(StoredBatchStatus::Dropped),
+        );
+    }
+
+    fn pool_entry(seed: u64, txs: usize, total_bytes: usize) -> PoolEntry<sha256::Sha256> {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 100).public_key();
+        let transactions = (0..txs as u64)
+            .map(|nonce| {
+                Transaction::new(
+                    TransactionPublicKey::ed25519(signer.public_key()),
+                    TransactionPublicKey::ed25519(recipient.clone()),
+                    NonZeroU64::new(1).expect("non-zero"),
+                    nonce,
+                )
+                .seal_and_sign(
+                    &signer,
+                    TRANSACTION_NAMESPACE,
+                    &mut sha256::Sha256::default(),
+                )
+            })
+            .collect();
+        PoolEntry {
+            transactions,
+            total_bytes,
+        }
+    }
+
+    /// A refill for a non-empty block never overshoots the remaining
+    /// headroom; an initial selection may overshoot by exactly one entry.
+    #[test]
+    fn pop_proposal_respects_remaining_headroom() {
+        let mut pool = VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]);
+        let mut pool_bytes = 900;
+        let mut proposed = VecDeque::new();
+
+        // Refill headroom (1_000 - 500) below the head entry: nothing served.
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 500, 1_000);
+        assert!(txs.is_empty());
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool_bytes, 900);
+        assert!(proposed.is_empty());
+
+        // Headroom covering only the head entry stops before the next.
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 1_000);
+        assert_eq!(txs.len(), 2);
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool_bytes, 300);
+        assert_eq!(proposed.len(), 1);
+
+        // A full block has no headroom and nothing is served.
+        let mut pool = VecDeque::from([pool_entry(3, 1, 400)]);
+        let mut pool_bytes = 400;
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 300);
+        assert!(txs.is_empty(), "no headroom left");
+
+        // An initial selection overshoots by one entry so an oversized head
+        // cannot wedge the pool.
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 0, 300);
+        assert_eq!(txs.len(), 1);
+        assert!(pool.is_empty());
+        assert_eq!(pool_bytes, 0);
     }
 }

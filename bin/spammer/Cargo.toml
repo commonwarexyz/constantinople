@@ -1,7 +1,7 @@
 [package]
 name = "constantinople-spammer"
 description = "Spam bot for Constantinople load testing"
-version = "0.0.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -19,7 +19,7 @@ constantinople-mempool.workspace = true
 
 # Commonware
 commonware-codec.workspace = true
-commonware-cryptography = { workspace = true, features = ["std", "sha2-asm"] }
+commonware-cryptography = { workspace = true, features = ["std"] }
 commonware-deployer.workspace = true
 commonware-formatting.workspace = true
 commonware-parallel.workspace = true

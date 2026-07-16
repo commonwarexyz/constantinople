@@ -21,14 +21,16 @@
 //! checked credit addition, the whole block body is invalid and no partial state
 //! is applied.
 //!
-//! State writes are folded into the unordered state QMDB, whose commitment
+//! Touched accounts are staged out of the unordered state QMDB in one read,
+//! and final account values are recorded against the staged read indices, so
+//! merkleization reuses each key's resolved location. The state commitment
 //! depends on the final key/value set. Transaction history is append-only, so
 //! transaction digests are still appended in block order.
 
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
-    Clock, Metrics, Storage,
+    BufferPooler, Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
@@ -46,8 +48,9 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, StateBatch, StateDatabase, StateSyncTarget, StateWrites, TransactionDatabase,
-    TransactionHistoryDb, TransactionHistoryOperation, TransactionHistoryTarget,
+    Databases, StateBatch, StateDatabase, StateStaged, StateSyncTarget, StateUpdates,
+    TransactionDatabase, TransactionHistoryDb, TransactionHistoryOperation,
+    TransactionHistoryTarget,
 };
 pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
@@ -64,7 +67,6 @@ pub type FinalizedHookFn<E, C, H, P, St> = Arc<
 type Result<T> = core::result::Result<T, &'static str>;
 
 const INVALID_SIGNATURE: &str = "invalid signature";
-const SIGNATURE_TASK_CLOSED: &str = "signature verification task closed";
 const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
@@ -72,7 +74,7 @@ const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 pub struct Application<E, H, C, S, P, I, B, St>
 where
     H: Hasher,
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     St: Strategy,
@@ -92,7 +94,7 @@ where
 impl<E, H, C, S, P, I, B, St> Clone for Application<E, H, C, S, P, I, B, St>
 where
     H: Hasher,
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     P: Clone,
@@ -117,7 +119,7 @@ where
 impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
 where
     H: Hasher,
-    E: Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics,
     C: Digest,
     P: PublicKey,
     St: Strategy,

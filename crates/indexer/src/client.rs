@@ -6,7 +6,12 @@
 //! path without fetching the full body. Transaction bodies and lookup metadata
 //! are stored in SQL `tx_meta` rows.
 
-use crate::{codec, publisher::certificate::CertifiedHeader, sql_schema::build_meta_schema};
+use crate::{
+    codec,
+    namespaces::{simplex_client, sql_meta_client},
+    publisher::certificate::CertifiedHeader,
+    sql_schema::build_meta_schema,
+};
 use bytes::Bytes;
 use commonware_codec::{FixedSize as _, Read};
 use commonware_consensus::{
@@ -17,7 +22,7 @@ use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
 use datafusion::{
-    arrow::array::{Array, StringArray},
+    arrow::array::{Array, BinaryArray},
     prelude::SessionContext,
 };
 use exoware_sdk::{ClientError, StoreClient};
@@ -79,11 +84,11 @@ impl IndexerClient {
     /// Wrap existing [`StoreClient`]s for block and SQL metadata families.
     pub fn try_new(blocks: StoreClient, metadata: StoreClient) -> Result<Self, ReadError> {
         let sql = SessionContext::new();
-        build_meta_schema(metadata)
+        build_meta_schema(sql_meta_client(&metadata).map_err(ClientError::from)?)
             .map_err(ReadError::SqlSchema)?
             .register_all(&sql)?;
         Ok(Self {
-            blocks: SimplexClient::from_client(blocks),
+            blocks: SimplexClient::new(simplex_client(&blocks).map_err(ClientError::from)?),
             sql,
         })
     }
@@ -269,7 +274,7 @@ impl IndexerClient {
         H: Hasher,
     {
         let sql = format!(
-            "SELECT body_hex FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
+            "SELECT body FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
             hex_lower(digest.as_ref())
         );
         let batches = self.sql.sql(&sql).await?.collect().await?;
@@ -277,17 +282,17 @@ impl IndexerClient {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let body_hex = batch
+            let body = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<StringArray>()
-                .ok_or_else(|| ReadError::SqlRow("tx_meta.body_hex must be Utf8".to_string()))?;
-            if body_hex.is_null(0) {
+                .downcast_ref::<BinaryArray>()
+                .ok_or_else(|| ReadError::SqlRow("tx_meta.body must be Binary".to_string()))?;
+            if body.is_null(0) {
                 return Err(ReadError::SqlRow(
-                    "tx_meta.body_hex must not be null".to_string(),
+                    "tx_meta.body must not be null".to_string(),
                 ));
             }
-            let bytes = decode_hex(body_hex.value(0))?;
+            let bytes = body.value(0).to_vec();
             verify_signed_transaction_digest::<H>(&bytes, digest)?;
             return Ok(Some(Bytes::from(bytes)));
         }
@@ -369,31 +374,6 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
-}
-
-fn decode_hex(value: &str) -> Result<Vec<u8>, ReadError> {
-    let bytes = value.as_bytes();
-    if !bytes.len().is_multiple_of(2) {
-        return Err(ReadError::Hex("odd number of hex characters".to_string()));
-    }
-    let mut out = Vec::with_capacity(bytes.len() / 2);
-    for pair in bytes.as_chunks::<2>().0 {
-        let high = decode_hex_nibble(pair[0])?;
-        let low = decode_hex_nibble(pair[1])?;
-        out.push((high << 4) | low);
-    }
-    Ok(out)
-}
-
-fn decode_hex_nibble(byte: u8) -> Result<u8, ReadError> {
-    match byte {
-        b'0'..=b'9' => Ok(byte - b'0'),
-        b'a'..=b'f' => Ok(byte - b'a' + 10),
-        b'A'..=b'F' => Ok(byte - b'A' + 10),
-        _ => Err(ReadError::Hex(format!(
-            "invalid hex character 0x{byte:02x}"
-        ))),
-    }
 }
 
 fn verify_signed_transaction_digest<H>(bytes: &[u8], digest: &H::Digest) -> Result<(), ReadError>

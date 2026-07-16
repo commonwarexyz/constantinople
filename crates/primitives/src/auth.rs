@@ -1,6 +1,6 @@
 //! Transaction account keys and signatures.
 
-use crate::{DecompressedPublicKey, PublicKeyCache};
+use crate::DecompressedPublicKey;
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error, FixedSize, Read, ReadExt as _, Write};
 use commonware_cryptography::{
@@ -14,7 +14,7 @@ use core::{
     ops::Deref,
 };
 use p256::ecdsa::{Signature as P256Signature, VerifyingKey, signature::Verifier as _};
-use rand_core::CryptoRngCore;
+use rand::CryptoRng;
 
 pub(crate) const ED25519_SCHEME: u8 = 0;
 pub(crate) const SECP256R1_SCHEME: u8 = 1;
@@ -35,7 +35,7 @@ const WEBAUTHN_USER_VERIFIED_FLAG: u8 = 0x04;
 /// Decoding is intentionally cheap: it validates only the scheme byte and (for
 /// Ed25519) the trailing padding. The expensive compressed-to-decompressed
 /// point conversion is deferred to signature verification, where it is served
-/// from a shared [`PublicKeyCache`] so a recurring sender's key is decompressed
+/// from a shared [`PublicKeyCache`](crate::PublicKeyCache) so a recurring sender's key is decompressed
 /// at most once.
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TransactionPublicKey {
@@ -370,31 +370,22 @@ struct Secp256r1Item {
 }
 
 impl TransactionBatchVerifier {
-    /// Creates an empty transaction batch verifier.
-    pub fn new() -> Self {
+    /// Creates an empty transaction batch verifier with capacity for at least
+    /// `capacity` signatures.
+    pub fn new(capacity: usize) -> Self {
         Self {
-            ed25519: ed25519::Batch::new(),
+            ed25519: ed25519::Batch::new(capacity),
             secp256r1: Vec::new(),
         }
     }
 
-    /// Adds a transaction signature to the appropriate verification group,
-    /// decompressing the sender public key through `cache`.
+    /// Adds a transaction signature to the appropriate verification group.
+    ///
+    /// The sender public key must already be decompressed (see
+    /// [`PublicKeyCache::decompress`](crate::PublicKeyCache::decompress)),
+    /// which lets batch callers resolve keys in parallel before queueing.
+    /// Returns `false` if the key and signature schemes do not match.
     pub fn add(
-        &mut self,
-        namespace: &[u8],
-        message: &[u8],
-        public_key: &TransactionPublicKey,
-        signature: &TransactionSignature,
-        cache: &PublicKeyCache,
-    ) -> bool {
-        let Some(key) = cache.decompress(public_key) else {
-            return false;
-        };
-        self.add_decompressed(namespace, message, &key, signature)
-    }
-
-    fn add_decompressed(
         &mut self,
         namespace: &[u8],
         message: &[u8],
@@ -429,7 +420,7 @@ impl TransactionBatchVerifier {
     }
 
     /// Verifies every queued signature.
-    pub fn verify<R: CryptoRngCore>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
+    pub fn verify<R: CryptoRng>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
         if !self.ed25519.verify(rng, strategy) {
             return false;
         }
@@ -440,7 +431,7 @@ impl TransactionBatchVerifier {
 
 impl Default for TransactionBatchVerifier {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -546,13 +537,16 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, deterministic};
     use commonware_utils::{NZUsize, test_rng};
-    use p256::ecdsa::{SigningKey, signature::Signer as _};
+    use p256::{
+        ecdsa::{SigningKey, signature::Signer as _},
+        elliptic_curve::Generate as _,
+    };
 
     const NAMESPACE: &[u8] = b"constantinople-tx";
 
     #[test]
     fn public_key_codec_carries_scheme_byte() {
-        let signer = secp256r1::PrivateKey::random(&mut test_rng());
+        let signer = secp256r1::PrivateKey::random(test_rng());
         let key = TransactionPublicKey::secp256r1(signer.public_key());
         let encoded = key.encode();
 
@@ -562,7 +556,7 @@ mod tests {
 
     #[test]
     fn signature_codec_carries_scheme_byte() {
-        let signer = ed25519::PrivateKey::random(&mut test_rng());
+        let signer = ed25519::PrivateKey::random(test_rng());
         let signature = TransactionSignature::ed25519(signer.sign(NAMESPACE, b"hello"));
         let encoded = signature.encode();
 
@@ -577,26 +571,24 @@ mod tests {
     fn mixed_batch_verifier_accepts_both_schemes() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let ed25519 = ed25519::PrivateKey::random(&mut test_rng());
+            let ed25519 = ed25519::PrivateKey::random(test_rng());
             let ed_message = sha256::Sha256::hash(b"ed25519").to_vec();
             let r1_message = sha256::Sha256::hash(b"secp256r1").to_vec();
             let (r1_public_key, r1_signature) = webauthn_signature(&r1_message);
 
-            let mut verifier = TransactionBatchVerifier::new();
+            let ed_public_key = TransactionPublicKey::ed25519(ed25519.public_key());
+            let keys = cache
+                .decompress(&[&ed_public_key, &r1_public_key], &Sequential)
+                .expect("valid keys");
+
+            let mut verifier = TransactionBatchVerifier::new(1);
             assert!(verifier.add(
                 NAMESPACE,
                 &ed_message,
-                &TransactionPublicKey::ed25519(ed25519.public_key()),
+                &keys[0],
                 &TransactionSignature::ed25519(ed25519.sign(NAMESPACE, &ed_message)),
-                &cache,
             ));
-            assert!(verifier.add(
-                NAMESPACE,
-                &r1_message,
-                &r1_public_key,
-                &r1_signature,
-                &cache
-            ));
+            assert!(verifier.add(NAMESPACE, &r1_message, &keys[1], &r1_signature));
 
             assert!(verifier.verify(&mut test_rng(), &Sequential));
 
@@ -609,18 +601,17 @@ mod tests {
     fn mixed_batch_verifier_rejects_scheme_mismatch() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let ed25519 = ed25519::PrivateKey::random(&mut test_rng());
+            let ed25519 = ed25519::PrivateKey::random(test_rng());
             let message = sha256::Sha256::hash(b"message").to_vec();
             let (_, signature) = webauthn_signature(&message);
 
-            let mut verifier = TransactionBatchVerifier::new();
-            assert!(!verifier.add(
-                NAMESPACE,
-                &message,
-                &TransactionPublicKey::ed25519(ed25519.public_key()),
-                &signature,
-                &cache,
-            ));
+            let public_key = TransactionPublicKey::ed25519(ed25519.public_key());
+            let key = &cache
+                .decompress(&[&public_key], &Sequential)
+                .expect("valid ed25519 key")[0];
+
+            let mut verifier = TransactionBatchVerifier::new(1);
+            assert!(!verifier.add(NAMESPACE, &message, key, &signature));
         });
     }
 
@@ -631,9 +622,12 @@ mod tests {
             let message = sha256::Sha256::hash(b"message").to_vec();
             let wrong_message = sha256::Sha256::hash(b"wrong").to_vec();
             let (public_key, signature) = webauthn_signature(&wrong_message);
+            let key = &cache
+                .decompress(&[&public_key], &Sequential)
+                .expect("valid r1 key")[0];
 
-            let mut verifier = TransactionBatchVerifier::new();
-            assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
+            let mut verifier = TransactionBatchVerifier::new(1);
+            assert!(verifier.add(NAMESPACE, &message, key, &signature));
             assert!(!verifier.verify(&mut test_rng(), &Sequential));
         });
     }
@@ -657,9 +651,12 @@ mod tests {
             signature =
                 TransactionSignature::secp256r1(inner, authenticator_data, client_data_json)
                     .unwrap();
+            let key = &cache
+                .decompress(&[&public_key], &Sequential)
+                .expect("valid r1 key")[0];
 
-            let mut verifier = TransactionBatchVerifier::new();
-            assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
+            let mut verifier = TransactionBatchVerifier::new(1);
+            assert!(verifier.add(NAMESPACE, &message, key, &signature));
             assert!(!verifier.verify(&mut test_rng(), &Sequential));
         });
     }
@@ -700,15 +697,21 @@ mod tests {
             let message = sha256::Sha256::hash(b"secp256r1").to_vec();
             let (public_key, signature) = webauthn_signature(&message);
 
-            let mut verifier = TransactionBatchVerifier::new();
-            assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
+            let key = &cache
+                .decompress(&[&public_key], &Sequential)
+                .expect("valid r1 key")[0];
+            let mut verifier = TransactionBatchVerifier::new(1);
+            assert!(verifier.add(NAMESPACE, &message, key, &signature));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
             assert_eq!(cache.len(), 1);
             assert!(cache.contains(&public_key));
 
             // A second verification of the same key reuses the cached decompression.
-            let mut verifier = TransactionBatchVerifier::new();
-            assert!(verifier.add(NAMESPACE, &message, &public_key, &signature, &cache));
+            let key = &cache
+                .decompress(&[&public_key], &Sequential)
+                .expect("valid r1 key")[0];
+            let mut verifier = TransactionBatchVerifier::new(1);
+            assert!(verifier.add(NAMESPACE, &message, key, &signature));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
             assert_eq!(cache.len(), 1);
         });
@@ -728,13 +731,13 @@ mod tests {
         payload.extend_from_slice(&authenticator_data);
         payload.extend_from_slice(client_data_hash.as_ref());
 
-        let signer = SigningKey::random(&mut test_rng());
+        let signer = SigningKey::generate_from_rng(&mut test_rng());
         let public_key = TransactionPublicKey::secp256r1(
-            secp256r1::PublicKey::decode(signer.verifying_key().to_encoded_point(true).as_bytes())
+            secp256r1::PublicKey::decode(signer.verifying_key().to_sec1_point(true).as_bytes())
                 .unwrap(),
         );
         let raw_signature: p256::ecdsa::Signature = signer.sign(&payload);
-        let raw_signature = raw_signature.normalize_s().unwrap_or(raw_signature);
+        let raw_signature = raw_signature.normalize_s();
         let signature = secp256r1::Signature::decode(raw_signature.to_bytes().as_slice()).unwrap();
         let signature =
             TransactionSignature::secp256r1(signature, authenticator_data, client_data_json)

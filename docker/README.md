@@ -1,7 +1,7 @@
 # `constantinople-docker`
 
 This directory contains the Docker build configuration used to compile Constantinople's deployable
-binaries for both AWS Graviton and Intel instances.
+binaries for AWS Graviton, AMD, and Intel instances.
 
 ## Install Dependencies
 
@@ -27,7 +27,17 @@ just build-intel-image
 The Intel build uses `x86_64-unknown-linux-gnu` with `target-cpu=graniterapids`, which is the
 closest Rust CPU target to AWS C8i's Intel Xeon 6 processors.
 
-Both builder images are built for the local Docker host architecture and then cross-compile the
+To build the AMD image, e.g. for `c8a` instances, run:
+
+```sh
+just build-amd-image
+```
+
+The AMD build uses `x86_64-unknown-linux-gnu` with `target-cpu=znver5`, which matches AWS C8a's
+AMD EPYC 9R45 processors. Do not deploy the Intel build to C8a instances: the Granite Rapids
+target can emit instructions that crash with `SIGILL` on AMD hosts.
+
+All builder images are built for the local Docker host architecture and then cross-compile the
 requested binary to the target triple. This avoids running `rustc` inside an emulated
 `linux/amd64` container on Apple Silicon.
 
@@ -43,6 +53,12 @@ To build the Intel validator binary, run:
 
 ```sh
 just validator-intel-binary
+```
+
+To build the AMD validator binary, run:
+
+```sh
+just validator-amd-binary
 ```
 
 To build the shared indexer binaries for Graviton, run:
@@ -61,7 +77,16 @@ just metadata-indexer-intel-binary
 just qmdb-indexer-intel-binary
 ```
 
-`just graviton-binaries` and `just intel-binaries` build the full remote-deploy set:
+To build the shared indexer binaries for AMD, run:
+
+```sh
+just chain-indexer-amd-binary
+just metadata-indexer-amd-binary
+just qmdb-indexer-amd-binary
+```
+
+`just graviton-binaries`, `just intel-binaries`, and `just amd-binaries` build the full
+remote-deploy set:
 
 * `deploy/validator`
 * `deploy/validator-debug`

@@ -37,6 +37,10 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
+pub(crate) const fn default_page_cache_bytes() -> usize {
+    2 * 1024 * 1024 * 1024
+}
+
 pub(crate) const fn default_relayer_retry_views() -> u64 {
     8
 }
@@ -117,6 +121,13 @@ pub struct ValidatorConfig {
     /// Maximum mempool size in bytes.
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    #[serde(default = "default_page_cache_bytes")]
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    #[serde(default = "default_page_cache_bytes")]
+    pub other_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
@@ -224,6 +235,11 @@ pub struct LoadedConfig {
     pub max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    pub other_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     pub public_key_cache_size: usize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
@@ -354,6 +370,8 @@ fn decode_with_network(
         http_listen,
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
+        state_page_cache_bytes: config.state_page_cache_bytes,
+        other_page_cache_bytes: config.other_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
         public_key_cache_size: config.public_key_cache_size,
         otel,
@@ -513,8 +531,9 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_public_key_cache_size,
-        default_upload_buffer, load_deployer_config, load_local_config,
+        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
+        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
+        load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -633,6 +652,8 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                other_page_cache_bytes: default_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
@@ -667,6 +688,8 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                other_page_cache_bytes: default_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,

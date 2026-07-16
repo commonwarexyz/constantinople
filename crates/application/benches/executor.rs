@@ -9,6 +9,9 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 use rand::{SeedableRng, rngs::StdRng};
 use std::hint::black_box;
 
+#[global_allocator]
+static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 type TestHasher = sha256::Sha256;
 type TestTransaction = VerifiedTransaction<TestHasher>;
 type Transfers = Vec<PreparedTransfer>;
@@ -142,7 +145,7 @@ struct TestSigner {
 
 impl TestSigner {
     fn new(index: u64) -> Self {
-        let key = ed25519::PrivateKey::random(&mut StdRng::seed_from_u64(index));
+        let key = ed25519::PrivateKey::random(StdRng::seed_from_u64(index));
         let public_key = key.public_key();
         Self { key, public_key }
     }

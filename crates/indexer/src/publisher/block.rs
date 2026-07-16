@@ -328,20 +328,10 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        let Some(CellValue::Utf8(body_hex)) = meta.values.get(2) else {
-            panic!("tx_meta body should be hex");
+        let Some(CellValue::Binary(body)) = meta.values.get(2) else {
+            panic!("tx_meta body should be binary");
         };
-        assert_eq!(body_hex, &hex_lower(expected_body));
-    }
-
-    fn hex_lower(bytes: &[u8]) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-        let mut out = String::with_capacity(bytes.len() * 2);
-        for &byte in bytes {
-            out.push(HEX[(byte >> 4) as usize] as char);
-            out.push(HEX[(byte & 0x0f) as usize] as char);
-        }
-        out
+        assert_eq!(body.as_slice(), expected_body);
     }
 
     fn test_header(

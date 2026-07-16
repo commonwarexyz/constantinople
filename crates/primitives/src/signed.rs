@@ -17,9 +17,8 @@ use commonware_codec::{
     types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
-use commonware_parallel::{Sequential, Strategy};
-use rand::{SeedableRng, rngs::StdRng};
-use rand_core::CryptoRngCore;
+use commonware_parallel::Strategy;
+use rand::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.
@@ -418,7 +417,7 @@ where
 /// `false` otherwise.
 pub fn verify_transaction_batch<H, St>(
     namespace: &[u8],
-    rng: &mut impl CryptoRngCore,
+    rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
     transactions: &[LazySignedTransaction<H>],
     signature_strategy: &St,
@@ -431,60 +430,43 @@ where
         return true;
     }
 
-    // Build and verify independent sub-batches in parallel. The serial per
-    // signature work (cache decompression, the SHA-512 challenge hash, and the
-    // coalescing map) runs inside each shard rather than ahead of a single
-    // batch, so it scales with the strategy instead of bottlenecking on one
-    // thread. Each shard draws its batch-verification randomness from a seed
-    // generated here, since the source rng cannot be shared across threads.
-    let parallelism = signature_strategy.parallelism_hint().max(1);
-    let shard_size = transactions.len().div_ceil(parallelism).max(1);
-    let shards: Vec<(&[LazySignedTransaction<H>], [u8; 32])> = transactions
-        .chunks(shard_size)
-        .map(|shard| {
-            let mut seed = [0u8; 32];
-            rng.fill_bytes(&mut seed);
-            (shard, seed)
-        })
-        .collect();
-
-    signature_strategy.fold(
-        shards,
-        || true,
-        |valid, (shard, seed)| valid && verify_shard(namespace, cache, shard, seed),
-        |left, right| left && right,
-    )
-}
-
-/// Builds and verifies a single sub-batch sequentially.
-fn verify_shard<H>(
-    namespace: &[u8],
-    cache: &PublicKeyCache,
-    shard: &[LazySignedTransaction<H>],
-    seed: [u8; 32],
-) -> bool
-where
-    H: Hasher,
-{
-    let mut verifier = TransactionBatchVerifier::new();
-    for lazy in shard {
+    // Resolve every sender's decompressed key up front: when the active
+    // account set exceeds the cache capacity, misses dominate and would
+    // otherwise pay their curve decompression serially in the queueing
+    // loop below.
+    let mut senders = Vec::with_capacity(transactions.len());
+    for lazy in transactions {
         let Some(transaction) = lazy.get() else {
             return false;
         };
         let Some(sender) = transaction.value().sender() else {
             return false;
         };
+        senders.push(sender);
+    }
+    let Some(keys) = cache.decompress(&senders, signature_strategy) else {
+        return false;
+    };
+
+    // Queueing is cheap: transactions are preloaded and sender keys were
+    // resolved above. The expensive per-signature challenge hashing and the
+    // serial-vs-parallel split happen inside `verify`, which shards the batch
+    // across `signature_strategy` internally.
+    let mut verifier = TransactionBatchVerifier::new(transactions.len());
+    for (lazy, key) in transactions.iter().zip(&keys) {
+        let Some(transaction) = lazy.get() else {
+            return false;
+        };
         if !verifier.add(
             namespace,
             transaction.message_digest().as_ref(),
-            sender,
+            key,
             transaction.signature(),
-            cache,
         ) {
             return false;
         }
     }
-    verifier.verify(&mut StdRng::from_seed(seed), &Sequential)
+    verifier.verify(rng, signature_strategy)
 }
 
 /// Verifies lazily-encoded transactions.
@@ -494,7 +476,7 @@ where
 /// `strategy`. Returns `None` if any transaction is invalid or undecodable.
 pub fn verify_transaction_chunks<H, St>(
     namespace: &'static [u8],
-    rng: &mut impl CryptoRngCore,
+    rng: &mut impl CryptoRng,
     cache: &PublicKeyCache,
     transactions: Vec<LazySignedTransaction<H>>,
     strategy: &St,
@@ -558,7 +540,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_ed25519() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -567,7 +549,7 @@ mod test {
     #[test]
     fn signed_verify_works_for_secp256r1() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = secp256r1::PrivateKey::random(&mut test_rng());
+        let private_key = secp256r1::PrivateKey::random(test_rng());
         let signed = MockValue([5, 6, 7, 8]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(signed.verify(NAMESPACE, &private_key.public_key()));
@@ -576,7 +558,7 @@ mod test {
     #[test]
     fn signed_into_inner_returns_sealed() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let signed = MockValue([9, 10, 11, 12]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         let seal = *signed.message_digest();
@@ -589,7 +571,7 @@ mod test {
     #[test]
     fn wrong_namespace_fails_verification() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let signed = MockValue([1, 2, 3, 4]).seal_and_sign(&private_key, NAMESPACE, hasher);
 
         assert!(!signed.verify(b"wrong namespace", &private_key.public_key()));
@@ -609,7 +591,7 @@ mod test {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let hasher = &mut sha256::Sha256::default();
-            let private_key = ed25519::PrivateKey::random(&mut test_rng());
+            let private_key = ed25519::PrivateKey::random(test_rng());
             let public_key = TransactionPublicKey::ed25519(private_key.public_key());
             let signed = Transaction::new(
                 public_key.clone(),
@@ -621,19 +603,20 @@ mod test {
 
             assert_eq!(signed.value().sender(), Some(&public_key));
 
-            let mut verifier = TransactionBatchVerifier::new();
-            assert!(
-                verifier.add(
-                    NAMESPACE,
-                    signed.message_digest().as_ref(),
-                    signed
-                        .value()
-                        .sender()
-                        .expect("signed sender should decode"),
-                    signed.signature(),
-                    &cache,
-                )
-            );
+            let sender = signed
+                .value()
+                .sender()
+                .expect("signed sender should decode");
+            let keys = cache
+                .decompress(&[sender], &Sequential)
+                .expect("valid sender key");
+            let mut verifier = TransactionBatchVerifier::new(1);
+            assert!(verifier.add(
+                NAMESPACE,
+                signed.message_digest().as_ref(),
+                &keys[0],
+                signed.signature(),
+            ));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
         });
     }
@@ -641,7 +624,7 @@ mod test {
     #[test]
     fn preload_transaction_chunks_forces_nested_signature_inputs() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),
@@ -675,7 +658,7 @@ mod test {
     #[test]
     fn lazy_signed_transaction_exposes_pending_bytes_without_materializing() {
         let hasher = &mut sha256::Sha256::default();
-        let private_key = ed25519::PrivateKey::random(&mut test_rng());
+        let private_key = ed25519::PrivateKey::random(test_rng());
         let public_key = TransactionPublicKey::ed25519(private_key.public_key());
         let signed = Transaction::new(
             public_key.clone(),

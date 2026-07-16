@@ -1,6 +1,6 @@
 [package]
 name = "constantinople-mempool"
-version = "0.1.0"
+version.workspace = true
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
@@ -34,7 +34,6 @@ serde = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, features = ["sync", "time"] }
 reqwest.workspace = true
 tracing.workspace = true
-rand_core.workspace = true
 serde_json.workspace = true
 derive_more = { workspace = true, features = ["display"] }
 futures.workspace = true
@@ -49,7 +48,13 @@ commonware-math.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
-rand.workspace = true
 bytes.workspace = true
+rand.workspace = true
 tower = { workspace = true, features = ["util"] }
 futures = { workspace = true, features = ["executor"] }
+criterion.workspace = true
+mimalloc.workspace = true
+
+[[bench]]
+name = "decode"
+harness = false

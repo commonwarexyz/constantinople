@@ -98,3 +98,50 @@ qmdb-indexer-intel-binary: build-intel-image prepare-docker-cache
 
 # Build all Intel binaries into deploy/
 intel-binaries: validator-intel-binary spammer-intel-binary chain-indexer-intel-binary metadata-indexer-intel-binary qmdb-indexer-intel-binary
+
+# Build the AMD/C8a Docker builder image
+build-amd-image:
+  docker buildx bake --progress plain -f docker/docker-bake.hcl amd
+
+# Build the AMD validator binary into deploy/
+validator-amd-binary: build-amd-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-validator \
+    -e BINARY_NAME=constantinople \
+    -e OUTPUT_NAME=validator \
+    constantinople-builder:amd-local
+
+# Build the AMD spammer binary into deploy/
+spammer-amd-binary: build-amd-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-spammer \
+    -e BINARY_NAME=constantinople-spammer \
+    -e OUTPUT_NAME=spammer \
+    constantinople-builder:amd-local
+
+# Build the AMD chain-indexer binary into deploy/
+chain-indexer-amd-binary: build-amd-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=chain-indexer \
+    -e OUTPUT_NAME=chain-indexer \
+    constantinople-builder:amd-local
+
+# Build the AMD metadata-indexer binary into deploy/
+metadata-indexer-amd-binary: build-amd-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=metadata-indexer \
+    -e OUTPUT_NAME=metadata-indexer \
+    constantinople-builder:amd-local
+
+# Build the AMD qmdb-indexer binary into deploy/
+qmdb-indexer-amd-binary: build-amd-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-indexer \
+    -e BINARY_NAME=qmdb-indexer \
+    -e OUTPUT_NAME=qmdb-indexer \
+    constantinople-builder:amd-local
+
+# Build all AMD binaries into deploy/
+amd-binaries: validator-amd-binary spammer-amd-binary chain-indexer-amd-binary metadata-indexer-amd-binary qmdb-indexer-amd-binary

@@ -29,7 +29,7 @@ use commonware_macros::boxed;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    BufferPoolConfig, Quota, Runner as _, Supervisor as _, ThreadPooler as _,
+    BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
     buffer::paged::CacheRef,
     tokio::{
         Context as RuntimeContext,
@@ -55,7 +55,10 @@ use constantinople_engine::{
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher,
-    publisher::qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+    publisher::{
+        StoreCommitMetrics,
+        qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+    },
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
@@ -87,9 +90,9 @@ const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(1024 * 1024);
-const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(8_192);
-const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
+const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
@@ -178,15 +181,20 @@ struct LazyPublisher {
     context: RuntimeContext,
     store_url: String,
     buffer: usize,
+    commit_metrics: StoreCommitMetrics,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
     fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
+        // Registered once here: `connect` is retried on failure and must not
+        // re-register.
+        let commit_metrics = StoreCommitMetrics::new(&context);
         Self {
             context,
             store_url,
             buffer,
+            commit_metrics,
             publisher: Mutex::new(None),
         }
     }
@@ -201,6 +209,7 @@ impl LazyPublisher {
                 self.context.child("publisher"),
                 &self.store_url,
                 self.buffer,
+                self.commit_metrics.clone(),
             )
             .await
             {
@@ -574,8 +583,11 @@ async fn maybe_build_indexer(
         chain_indexer_url = %cfg.chain_indexer_url,
         "starting full indexer uploaders",
     );
-    let (cert_reporter, cert_join) =
-        EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
+    let (cert_reporter, cert_join) = EngineCertReporter::connect(
+        &cfg.chain_indexer_url,
+        cfg.upload_buffer,
+        StoreCommitMetrics::new(&context.child("simplex_upload")),
+    );
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
         cfg.chain_indexer_url,
@@ -679,6 +691,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         metrics_listen,
         max_propose_bytes,
         max_pool_bytes,
+        state_page_cache_bytes,
+        other_page_cache_bytes,
         public_key_cache_size,
         otel,
         json_logs,
@@ -724,9 +738,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        let strategy = context
-            .create_strategy(NZUsize!(rayon_threads))
-            .expect("failed to create worker strategy");
+        let strategy = context.strategy(NZUsize!(rayon_threads));
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),
             NonZeroUsize::new(public_key_cache_size)
@@ -844,6 +856,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 relayer: relayer_config,
                 account_reader: account_reader.clone(),
                 view_clock,
+                strategy: strategy.clone(),
+                max_batch_bytes: max_propose_bytes,
             }))
         } else {
             info!("secondary node: skipping mempool webserver");
@@ -907,6 +921,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
                 prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+                state_page_cache_bytes,
+                other_page_cache_bytes,
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle

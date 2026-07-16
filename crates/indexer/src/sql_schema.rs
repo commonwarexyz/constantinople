@@ -8,7 +8,8 @@
 //!   Height/latest block reads start with a certified header and only fetch the
 //!   body when needed.
 //! - **Metadata and lookup storage (SQL)** — columnar tables registered onto
-//!   the same `StoreClient` via [`KvSchema`]. The `block_meta` table is what
+//!   the SQL metadata namespace (see [`crate::namespaces`]) via [`KvSchema`].
+//!   The `block_meta` table is what
 //!   the explorer subscribes to over the `store.sql.v1.Service` `Subscribe`
 //!   RPC. `tx_meta` stores one row per finalized transaction with proof and
 //!   body data. `tx_activity` stores one account-ordered row for each sender
@@ -20,7 +21,7 @@
 //! exact same identifiers without an out-of-band agreement.
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
-use exoware_sdk::StoreClient;
+use exoware_sdk::PrefixedStoreClient;
 use exoware_sql::{KvSchema, TableColumnConfig};
 
 /// Name of the SQL table that the explorer subscribes to.
@@ -56,8 +57,8 @@ pub const BLOCK_META_FINALIZED_TS: &str = "finalized_ts";
 pub const TX_META_DIGEST: &str = "tx_digest";
 /// `tx_meta`: transaction-hash QMDB operation location for this digest.
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
-/// `tx_meta`: encoded signed transaction bytes as lowercase hex.
-pub const TX_META_BODY_HEX: &str = "body_hex";
+/// `tx_meta`: encoded signed transaction bytes.
+pub const TX_META_BODY: &str = "body";
 
 // ---------- tx_activity columns ----------
 
@@ -94,7 +95,7 @@ pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
 /// The returned schema declares all metadata tables on top of the supplied
-/// [`StoreClient`]. Callers can either:
+/// [`PrefixedStoreClient`]. Callers can either:
 ///
 /// - Hand the schema to a fresh [`SessionContext`] via
 ///   [`KvSchema::register_all`] (the `exoware-sql` SQL server does this),
@@ -105,7 +106,7 @@ pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 ///
 /// [`BatchWriter`]: exoware_sql::BatchWriter
 /// [`SessionContext`]: datafusion::prelude::SessionContext
-pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
+pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String> {
     KvSchema::new(client)
         .table(
             BLOCK_META_TABLE,
@@ -134,7 +135,7 @@ pub fn build_meta_schema(client: StoreClient) -> Result<KvSchema, String> {
             vec![
                 TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
-                TableColumnConfig::new(TX_META_BODY_HEX, DataType::Utf8, false),
+                TableColumnConfig::new(TX_META_BODY, DataType::Binary, false),
             ],
             vec![TX_META_DIGEST.to_string()],
             vec![],
@@ -202,7 +203,10 @@ mod tests {
     /// `SessionContext` without error.
     #[tokio::test]
     async fn schema_registers_into_session_context() {
-        let client = StoreClient::new("http://127.0.0.1:0");
+        let client = crate::namespaces::sql_meta_client(&exoware_sdk::StoreClient::new(
+            "http://127.0.0.1:0",
+        ))
+        .expect("sql metadata client");
         let schema = build_meta_schema(client).expect("build schema");
         let ctx = SessionContext::new();
         schema.register_all(&ctx).expect("register");
@@ -249,7 +253,7 @@ mod tests {
         assert_eq!(BLOCK_META_FINALIZED_TS, "finalized_ts");
         assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
-        assert_eq!(TX_META_BODY_HEX, "body_hex");
+        assert_eq!(TX_META_BODY, "body");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
         assert_eq!(TX_ACTIVITY_HEIGHT, "height");
         assert_eq!(TX_ACTIVITY_INDEX, "index");

@@ -4,11 +4,21 @@
 //! direct local invocations (`--port`, `--data-dir`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
 
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use clap::{ArgGroup, Parser};
 use exoware_simulator::{
-    AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack,
-    rocksdb::{BlockBasedOptions, Cache, DBCompressionType, Options, UniversalCompactOptions},
+    AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack, rocksdb::Options,
+};
+use prometheus_client::{
+    encoding::text::encode,
+    metrics::{counter::Counter, gauge::Gauge, histogram::Histogram},
+    registry::Registry,
 };
 use serde::Deserialize;
 use std::{
@@ -16,6 +26,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -24,25 +35,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const ROCKS_BACKGROUND_JOBS: i32 = 16;
 const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
-const ROCKS_WRITE_BUFFER_SIZE: usize = 256 * 1024 * 1024;
-const ROCKS_DB_WRITE_BUFFER_SIZE: usize = 4 * 1024 * 1024 * 1024;
-const ROCKS_MEMTABLE_MEMORY_BUDGET: usize = ROCKS_DB_WRITE_BUFFER_SIZE;
-const ROCKS_TARGET_FILE_SIZE_BASE: u64 = 512 * 1024 * 1024;
-const ROCKS_MAX_BYTES_FOR_LEVEL_BASE: u64 = 16 * 1024 * 1024 * 1024;
-const ROCKS_LEVEL_ZERO_COMPACTION_TRIGGER: i32 = 64;
-const ROCKS_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER: i32 = 1024;
-const ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER: i32 = 2048;
-const ROCKS_UNIVERSAL_COMPACTION_SIZE_RATIO: i32 = 10;
-const ROCKS_UNIVERSAL_COMPACTION_MIN_MERGE_WIDTH: i32 = 4;
 const ROCKS_SYNC_BYTES: u64 = 8 * 1024 * 1024;
 const ROCKS_COMPACTION_READAHEAD_SIZE: usize = 8 * 1024 * 1024;
-const ROCKS_MIN_BLOB_SIZE: u64 = 16 * 1024;
-const ROCKS_BLOB_FILE_SIZE: u64 = 512 * 1024 * 1024;
-const ROCKS_BLOCK_CACHE_SIZE: usize = 1024 * 1024 * 1024;
-const ROCKS_BLOB_CACHE_SIZE: usize = 4 * 1024 * 1024 * 1024;
-const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 1024 * 1024 * 1024;
+const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 256 * 1024 * 1024;
+const ROCKS_STAGE_WORKERS: usize = 4;
+const ROCKS_MAX_QUEUED_WAVES: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -70,12 +68,20 @@ struct Cli {
     /// Path to the deployer-provided chain-indexer config YAML.
     #[arg(long, requires = "hosts", conflicts_with = "data_dir")]
     config: Option<PathBuf>,
+
+    /// RocksDB parallelism (background compaction/flush jobs). Leaves
+    /// RocksDB's stock parallelism when omitted.
+    #[arg(long, conflicts_with_all = ["hosts", "config"])]
+    db_parallelism: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
 struct DeployerConfig {
     port: u16,
     data_dir: PathBuf,
+    /// Leaves RocksDB's stock parallelism when omitted.
+    #[serde(default)]
+    db_parallelism: Option<i32>,
 }
 
 fn load_deployer_config(path: &Path) -> DeployerConfig {
@@ -94,16 +100,21 @@ fn resolve_data_dir(config_path: &Path, data_dir: PathBuf) -> PathBuf {
         .join(data_dir)
 }
 
-fn load_settings(cli: Cli) -> (PathBuf, u16) {
+fn load_settings(cli: Cli) -> (PathBuf, u16, Option<i32>) {
     if let Some(config_path) = cli.config {
         let config = load_deployer_config(&config_path);
-        return (resolve_data_dir(&config_path, config.data_dir), config.port);
+        return (
+            resolve_data_dir(&config_path, config.data_dir),
+            config.port,
+            config.db_parallelism,
+        );
     }
 
     (
         cli.data_dir
             .expect("clap should require --data-dir or --hosts"),
         cli.port,
+        cli.db_parallelism,
     )
 }
 
@@ -111,76 +122,137 @@ async fn health() -> &'static str {
     "ok"
 }
 
-fn block_based_options(block_cache: &Cache) -> BlockBasedOptions {
-    let mut opts = BlockBasedOptions::default();
-    opts.set_block_cache(block_cache);
-    opts.set_cache_index_and_filter_blocks(true);
-    opts.set_pin_l0_filter_and_index_blocks_in_cache(true);
-    opts.set_pin_top_level_index_and_filter(true);
-    opts
+/// Port the deployer scrapes for binary metrics.
+const METRICS_PORT: u16 = 9090;
+/// Ingest latency buckets: 1ms to 60s.
+const INGEST_DURATION_BUCKETS: [f64; 12] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 15.0, 60.0,
+];
+
+/// Observability for store Put requests (the upload ingest path).
+#[derive(Clone)]
+struct IngestMetrics {
+    in_flight: Gauge,
+    requests: Counter,
+    duration: Histogram,
 }
 
-fn write_heavy_options(block_cache: &Cache, blob_cache: &Cache) -> Options {
+fn ingest_metrics() -> (Arc<Registry>, IngestMetrics) {
+    let mut registry = Registry::default();
+    let metrics = IngestMetrics {
+        in_flight: Gauge::default(),
+        requests: Counter::default(),
+        duration: Histogram::new(INGEST_DURATION_BUCKETS),
+    };
+    registry.register(
+        "ingest_in_flight",
+        "Store Put requests in flight",
+        metrics.in_flight.clone(),
+    );
+    registry.register(
+        "ingest_requests",
+        "Store Put requests served",
+        metrics.requests.clone(),
+    );
+    registry.register(
+        "ingest_duration",
+        "Store Put request latency (s)",
+        metrics.duration.clone(),
+    );
+    (Arc::new(registry), metrics)
+}
+
+/// Decrements in-flight on drop so a client disconnect cannot leak the gauge.
+struct InFlight(Gauge);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+async fn track_ingest(
+    State(metrics): State<IngestMetrics>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !request.uri().path().ends_with("/Put") {
+        return next.run(request).await;
+    }
+    metrics.in_flight.inc();
+    let in_flight = InFlight(metrics.in_flight.clone());
+    let start = Instant::now();
+    let response = next.run(request).await;
+    drop(in_flight);
+    metrics.requests.inc();
+    metrics.duration.observe(start.elapsed().as_secs_f64());
+    response
+}
+
+async fn serve_metrics(State(registry): State<Arc<Registry>>) -> String {
+    let mut out = String::new();
+    encode(&mut out, &registry).expect("metrics encoding cannot fail");
+    out
+}
+
+/// DB-scoped RocksDB options for the chain-indexer store.
+///
+/// Only DB-scoped options apply here: the store owns its column-family
+/// options (tuned to its write path), and its ingest path writes SSTs
+/// directly (no WAL or memtables), so write-path tuning has no effect.
+fn chain_indexer_db_options(db_parallelism: Option<i32>) -> Options {
     let mut opts = Options::default();
-    let block_opts = block_based_options(block_cache);
-    opts.increase_parallelism(ROCKS_BACKGROUND_JOBS);
-    opts.set_max_background_jobs(ROCKS_BACKGROUND_JOBS);
+    if let Some(jobs) = db_parallelism {
+        opts.increase_parallelism(jobs);
+        opts.set_max_background_jobs(jobs);
+    }
     opts.set_max_subcompactions(ROCKS_MAX_SUBCOMPACTIONS);
-    opts.set_block_based_table_factory(&block_opts);
-    opts.optimize_universal_style_compaction(ROCKS_MEMTABLE_MEMORY_BUDGET);
-    let mut universal = UniversalCompactOptions::default();
-    universal.set_size_ratio(ROCKS_UNIVERSAL_COMPACTION_SIZE_RATIO);
-    universal.set_min_merge_width(ROCKS_UNIVERSAL_COMPACTION_MIN_MERGE_WIDTH);
-    opts.set_universal_compaction_options(&universal);
-    opts.set_compression_type(DBCompressionType::None);
-    opts.set_bottommost_compression_type(DBCompressionType::None);
-    opts.set_wal_compression_type(DBCompressionType::None);
-    opts.set_write_buffer_size(ROCKS_WRITE_BUFFER_SIZE);
-    opts.set_db_write_buffer_size(ROCKS_DB_WRITE_BUFFER_SIZE);
-    opts.set_max_write_buffer_number(8);
-    opts.set_target_file_size_base(ROCKS_TARGET_FILE_SIZE_BASE);
-    opts.set_max_bytes_for_level_base(ROCKS_MAX_BYTES_FOR_LEVEL_BASE);
-    opts.set_level_zero_file_num_compaction_trigger(ROCKS_LEVEL_ZERO_COMPACTION_TRIGGER);
-    opts.set_level_zero_slowdown_writes_trigger(ROCKS_LEVEL_ZERO_SLOWDOWN_WRITES_TRIGGER);
-    opts.set_level_zero_stop_writes_trigger(ROCKS_LEVEL_ZERO_STOP_WRITES_TRIGGER);
     opts.set_bytes_per_sync(ROCKS_SYNC_BYTES);
-    opts.set_wal_bytes_per_sync(ROCKS_SYNC_BYTES);
     opts.set_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE);
-    opts.set_enable_blob_files(true);
-    opts.set_min_blob_size(ROCKS_MIN_BLOB_SIZE);
-    opts.set_blob_file_size(ROCKS_BLOB_FILE_SIZE);
-    opts.set_blob_compression_type(DBCompressionType::None);
-    opts.set_blob_compaction_readahead_size(ROCKS_COMPACTION_READAHEAD_SIZE as u64);
-    opts.set_blob_cache(blob_cache);
     opts
 }
 
-fn chain_indexer_rocks_config() -> RocksConfig {
-    let block_cache = Cache::new_lru_cache(ROCKS_BLOCK_CACHE_SIZE);
-    let blob_cache = Cache::new_lru_cache(ROCKS_BLOB_CACHE_SIZE);
-
+fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
     RocksConfig {
-        db_options: write_heavy_options(&block_cache, &blob_cache),
-        default_cf_options: write_heavy_options(&block_cache, &blob_cache),
-        meta_cf_options: Options::default(),
-        log_cf_options: write_heavy_options(&block_cache, &blob_cache),
+        db_options: chain_indexer_db_options(db_parallelism),
         write_pipeline: RocksWritePipelineConfig {
             max_commit_batch_bytes: NonZeroUsize::new(ROCKS_MAX_COMMIT_BATCH_BYTES)
                 .expect("rocks write commit batch byte limit must be nonzero"),
+            stage_workers: NonZeroUsize::new(ROCKS_STAGE_WORKERS)
+                .expect("rocks stage worker count must be nonzero"),
+            max_queued_waves: NonZeroUsize::new(ROCKS_MAX_QUEUED_WAVES)
+                .expect("rocks queued wave limit must be nonzero"),
         },
     }
 }
 
-async fn run(data_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run(
+    data_dir: &Path,
+    port: u16,
+    db_parallelism: Option<i32>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let engine = Arc::new(RocksStore::open(
         data_dir,
-        Some(chain_indexer_rocks_config()),
+        Some(chain_indexer_rocks_config(db_parallelism)),
     )?);
+    let (registry, metrics) = ingest_metrics();
     let connect = connect_stack(AppState::new(engine));
     let app = Router::new()
         .route("/health", get(health))
         .fallback_service(connect)
+        .layer(middleware::from_fn_with_state(metrics, track_ingest))
         .layer(CorsLayer::very_permissive());
+
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], METRICS_PORT));
+    let metrics_app = Router::new()
+        .route("/metrics", get(serve_metrics))
+        .with_state(registry);
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(metrics_listener, metrics_app).await {
+            tracing::warn!(?error, "metrics server exited");
+        }
+    });
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     info!(%addr, directory = %data_dir.display(), "chain indexer listening");
@@ -191,7 +263,7 @@ async fn run(data_dir: &Path, port: u16) -> Result<(), Box<dyn std::error::Error
 
 fn main() {
     let cli = Cli::parse();
-    let (data_dir, port) = load_settings(cli);
+    let (data_dir, port, db_parallelism) = load_settings(cli);
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -204,7 +276,7 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async move {
-        if let Err(error) = run(&data_dir, port).await {
+        if let Err(error) = run(&data_dir, port, db_parallelism).await {
             eprintln!("chain-indexer exited with error: {error}");
             std::process::exit(1);
         }
@@ -277,9 +349,10 @@ mod tests {
         ])
         .expect("deployer invocation should parse");
 
-        let (data_dir, port) = load_settings(cli);
+        let (data_dir, port, db_parallelism) = load_settings(cli);
 
         assert_eq!(port, 18_090);
+        assert_eq!(db_parallelism, None);
         assert_eq!(
             data_dir,
             config_path.parent().unwrap().join("chain-indexer")

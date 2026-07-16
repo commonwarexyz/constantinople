@@ -1,4 +1,5 @@
-use super::{Changeset, State, compute, prepare_transfer};
+use super::{Changeset, PreparedTransfer, State, compute, prepare_transfer};
+use commonware_codec::FixedSize as _;
 use commonware_cryptography::{Signer, ed25519, sha256};
 use constantinople_primitives::{
     Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY, Nonce, Transaction,
@@ -419,4 +420,217 @@ fn failed_debit_rejects_batch() {
     let transfers = prepared(&transactions);
 
     assert!(compute(&accounts, &transfers).is_none());
+}
+
+#[test]
+fn prefix_collision_only_demotes_to_the_general_lane() {
+    // Touch counting keys accounts by their 64-bit prefix, so two distinct
+    // keys sharing a prefix look contended and route to the general lane.
+    // That demotion must not change the computed accounts.
+    let key = |bytes: [u8; 2]| {
+        let mut raw = [0u8; AccountKey::SIZE];
+        raw[..8].copy_from_slice(&[7; 8]);
+        raw[8..10].copy_from_slice(&bytes);
+        AccountKey::from(raw)
+    };
+    let sender_a = key([1, 0]);
+    let sender_b = key([2, 0]);
+    assert_ne!(sender_a, sender_b);
+    assert_eq!(sender_a.prefix(), sender_b.prefix());
+    let recipient_a = AccountKey::from([3; AccountKey::SIZE]);
+    let recipient_b = AccountKey::from([4; AccountKey::SIZE]);
+
+    let transfer = |sender: AccountKey, recipient: AccountKey, value, nonce| PreparedTransfer {
+        sender,
+        recipient,
+        sender_prefix: sender.prefix(),
+        recipient_prefix: recipient.prefix(),
+        value,
+        nonce,
+    };
+    let transfers = [
+        transfer(sender_a, recipient_a, 3, 0),
+        transfer(sender_b, recipient_b, 5, 0),
+    ];
+
+    let mut accounts = State::new();
+    accounts.insert(sender_a, account(10, 0));
+    accounts.insert(sender_b, account(20, 0));
+
+    let changeset = compute(&accounts, &transfers).expect("collision batch executes");
+
+    let balance = |key: AccountKey| {
+        changeset
+            .iter()
+            .find_map(|(candidate, account)| (*candidate == key).then_some(account.balance))
+            .expect("account should be in changeset")
+    };
+    assert_eq!(changeset.len(), 4);
+    assert_eq!(balance(sender_a), 7);
+    assert_eq!(balance(sender_b), 15);
+    assert_eq!(balance(recipient_a), DEFAULT_ACCOUNT_BALANCE + 3);
+    assert_eq!(balance(recipient_b), DEFAULT_ACCOUNT_BALANCE + 5);
+}
+
+/// Runs the selective executor over `transfers` against `state`, returning
+/// the applied flags and the final account values keyed by account.
+fn run_selective(
+    state: &State,
+    transfers: &[PreparedTransfer],
+) -> (Vec<bool>, Vec<(AccountKey, Account)>) {
+    let mut executor = super::SelectiveExecutor::new();
+    let keys = executor.begin_round(transfers);
+    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
+    executor.register(&values);
+    let applied = executor.apply(transfers);
+    let changes = executor
+        .into_updates()
+        .into_iter()
+        .map(|(index, account)| (keys[index], account.expect("touched accounts are written")))
+        .collect();
+    (applied, changes)
+}
+
+/// The load-bearing invariant of best-effort proposing: the surviving subset
+/// re-executes cleanly under the all-or-nothing path with identical writes.
+fn assert_survivors_verify(
+    state: &State,
+    transfers: &[PreparedTransfer],
+    applied: &[bool],
+    selective_changes: &[(AccountKey, Account)],
+) {
+    let survivors: Vec<PreparedTransfer> = transfers
+        .iter()
+        .zip(applied)
+        .filter_map(|(transfer, applied)| applied.then_some(*transfer))
+        .collect();
+    let baseline = compute(state, &survivors).expect("survivors must verify all-or-nothing");
+    let mut selective = selective_changes.to_vec();
+    selective.sort_unstable_by_key(|(key, _)| *key);
+    assert_eq!(baseline, selective, "proposer and verifier writes diverge");
+}
+
+fn one_prepared(
+    sender: &TestSigner,
+    to: &ed25519::PublicKey,
+    value: u64,
+    nonce: u64,
+) -> PreparedTransfer {
+    prepare_transfer(&sender.sign(to.clone(), value, nonce)).expect("prepare must succeed")
+}
+
+#[test]
+fn selective_drops_stale_and_duplicate_nonces() {
+    let alice = TestSigner::from_seed(1);
+    let bob = TestSigner::from_seed(2);
+    let carol = TestSigner::from_seed(3);
+    let mut state = State::new();
+    // Alice's nonce 0 was already consumed upstream.
+    state.insert(account_key(&alice.public_key), account(1_000, 1));
+    state.insert(account_key(&bob.public_key), account(1_000, 0));
+
+    let transfers = vec![
+        one_prepared(&alice, &carol.public_key, 10, 0), // stale: consumed upstream
+        one_prepared(&alice, &carol.public_key, 20, 1), // valid
+        one_prepared(&bob, &carol.public_key, 30, 0),   // valid
+        one_prepared(&bob, &carol.public_key, 40, 0),   // duplicate of the previous nonce
+    ];
+    let (applied, changes) = run_selective(&state, &transfers);
+    assert_eq!(applied, vec![false, true, true, false]);
+    assert_survivors_verify(&state, &transfers, &applied, &changes);
+
+    let carol_final = changeset_account(&changes, carol.public_key);
+    assert_eq!(carol_final.balance, DEFAULT_ACCOUNT_BALANCE + 50);
+}
+
+#[test]
+fn selective_enforces_block_start_balances() {
+    let alice = TestSigner::from_seed(4);
+    let bob = TestSigner::from_seed(5);
+    let carol = TestSigner::from_seed(6);
+    let mut state = State::new();
+    state.insert(account_key(&alice.public_key), account(100, 0));
+    state.insert(account_key(&bob.public_key), account(30, 0));
+
+    let transfers = vec![
+        // Alice funds Bob, but the credit cannot fund Bob's spend below.
+        one_prepared(&alice, &bob.public_key, 100, 0),
+        one_prepared(&bob, &carol.public_key, 50, 0), // exceeds Bob's start balance
+        one_prepared(&bob, &carol.public_key, 30, 0), // affordable from start
+    ];
+    let (applied, changes) = run_selective(&state, &transfers);
+    assert_eq!(applied, vec![true, false, true]);
+    assert_survivors_verify(&state, &transfers, &applied, &changes);
+
+    let bob_final = changeset_account(&changes, bob.public_key);
+    assert_eq!(bob_final.balance, 100); // 30 - 30 + 100
+}
+
+#[test]
+fn selective_drops_unaffordable_self_transfers_and_credit_overflow() {
+    let alice = TestSigner::from_seed(7);
+    let bob = TestSigner::from_seed(8);
+    let rich = TestSigner::from_seed(9);
+    let mut state = State::new();
+    state.insert(account_key(&alice.public_key), account(50, 0));
+    state.insert(account_key(&rich.public_key), account(u64::MAX - 10, 0));
+    state.insert(account_key(&bob.public_key), account(100, 0));
+
+    let transfers = vec![
+        one_prepared(&alice, &alice.public_key, 60, 0), // self-transfer above start
+        one_prepared(&alice, &alice.public_key, 50, 0), // affordable self-transfer
+        one_prepared(&bob, &rich.public_key, 20, 0),    // would overflow rich
+        one_prepared(&bob, &alice.public_key, 10, 0),   // fine
+    ];
+    let (applied, changes) = run_selective(&state, &transfers);
+    assert_eq!(applied, vec![false, true, false, true]);
+    assert_survivors_verify(&state, &transfers, &applied, &changes);
+
+    // The failed self-transfer consumed nothing: nonce 0 stayed available.
+    let alice_final = changeset_account(&changes, alice.public_key);
+    assert_eq!(alice_final.balance, 60); // 50 + 10
+}
+
+#[test]
+fn selective_multi_round_matches_single_pass() {
+    let alice = TestSigner::from_seed(10);
+    let bob = TestSigner::from_seed(11);
+    let carol = TestSigner::from_seed(12);
+    let mut state = State::new();
+    state.insert(account_key(&alice.public_key), account(1_000, 0));
+    state.insert(account_key(&bob.public_key), account(1_000, 0));
+
+    let first = vec![
+        one_prepared(&alice, &carol.public_key, 10, 0),
+        one_prepared(&alice, &carol.public_key, 10, 0), // duplicate: dropped
+    ];
+    let second = vec![
+        one_prepared(&bob, &carol.public_key, 5, 0), // refill round, new accounts
+        one_prepared(&alice, &carol.public_key, 7, 1), // refill touching known accounts
+    ];
+
+    // Two rounds through one executor (the refill shape)...
+    let mut executor = super::SelectiveExecutor::new();
+    let keys = executor.begin_round(&first);
+    let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
+    executor.register(&values);
+    assert_eq!(executor.apply(&first), vec![true, false]);
+    let more = executor.begin_round(&second);
+    assert_eq!(more.len(), 1, "only Bob's account is new");
+    let values: Vec<Option<Account>> = more.iter().map(|key| state.get(key).copied()).collect();
+    executor.register(&values);
+    assert_eq!(executor.apply(&second), vec![true, true]);
+    let mut all_keys = keys;
+    all_keys.extend(more);
+    let mut multi: Vec<(AccountKey, Account)> = executor
+        .into_updates()
+        .into_iter()
+        .map(|(index, account)| (all_keys[index], account.expect("written")))
+        .collect();
+    multi.sort_unstable_by_key(|(key, _)| *key);
+
+    // ...must match the survivors executed in one all-or-nothing pass.
+    let survivors = vec![first[0], second[0], second[1]];
+    let baseline = compute(&state, &survivors).expect("survivors verify");
+    assert_eq!(baseline, multi);
 }
