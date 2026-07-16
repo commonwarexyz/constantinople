@@ -41,7 +41,11 @@ where
     S: Scheme,
 {
     /// Build a reporter and background uploader.
-    pub fn connect(store_url: &str, buffer: usize) -> (Self, JoinHandle<()>)
+    pub fn connect(
+        store_url: &str,
+        buffer: usize,
+        commit_metrics: super::StoreCommitMetrics,
+    ) -> (Self, JoinHandle<()>)
     where
         H: Hasher + Send + Sync + 'static,
         P: PublicKey + Send + Sync + 'static,
@@ -53,7 +57,7 @@ where
                 .expect("simplex namespace prefix must be valid"),
         );
         let (tx, rx) = mpsc::channel(buffer);
-        let join = tokio::spawn(run_uploader::<H, P, S>(client, rx));
+        let join = tokio::spawn(run_uploader::<H, P, S>(client, rx, commit_metrics));
         (Self { tx }, join)
     }
 
@@ -163,8 +167,11 @@ const MAX_BLOCK_BYTES_PER_COMMIT: usize = 64 * 1024 * 1024;
 /// Maximum inputs drained into one store commit.
 const MAX_INPUTS_PER_COMMIT: usize = 256;
 
-async fn run_uploader<H, P, S>(client: SimplexClient, mut rx: mpsc::Receiver<SimplexInput<H, P, S>>)
-where
+async fn run_uploader<H, P, S>(
+    client: SimplexClient,
+    mut rx: mpsc::Receiver<SimplexInput<H, P, S>>,
+    commit_metrics: super::StoreCommitMetrics,
+) where
     H: Hasher + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
     S: Scheme + Send + Sync + 'static,
@@ -215,9 +222,13 @@ where
         client
             .stage_upload(&prepared, &mut batch)
             .expect("prepared simplex upload must stage");
-        let seq =
-            super::commit_with_retry(client.store_client().client(), &batch, "simplex upload")
-                .await;
+        let seq = super::commit_with_retry(
+            client.store_client().client(),
+            &batch,
+            "simplex upload",
+            &commit_metrics,
+        )
+        .await;
         let receipt = client.mark_upload_persisted(prepared, seq).await;
         debug!(
             headers = receipt.summary.headers,

@@ -283,6 +283,7 @@ async fn submit_with_retries<St: Strategy>(
     let total = batch.transactions.len();
     let mut pending: HashSet<usize> = (0..total).collect();
     let mut included: HashSet<usize> = HashSet::new();
+    let mut filtered: HashSet<usize> = HashSet::new();
     let mut sent: HashMap<String, Vec<usize>> = HashMap::new();
     let mut digest_index: Option<DigestIndex> = None;
     let mut height = 0;
@@ -352,6 +353,7 @@ async fn submit_with_retries<St: Strategy>(
             &batch,
             &mut digest_index,
             &mut included,
+            &mut filtered,
             &mut height,
         )
         .await;
@@ -363,17 +365,17 @@ async fn submit_with_retries<St: Strategy>(
         if retry == state.max_retry_views {
             // A lost accept response must not mask polled progress: report
             // total failure only when no leader returned 202 AND no status
-            // poll ever reported finalization for a posted batch id.
-            if !accepted_any && included.is_empty() && height == 0 {
+            // poll ever reported an outcome for a posted batch id.
+            if !accepted_any && included.is_empty() && filtered.is_empty() && height == 0 {
                 return (StatusCode::SERVICE_UNAVAILABLE, String::new());
             }
-            return json_response(best_effort_status(total, included.len(), height));
+            return json_response(best_effort_status(&included, &filtered, height));
         }
 
         wait_for_view_advance(&mut views, &mut view).await;
     }
 
-    json_response(best_effort_status(total, included.len(), height))
+    json_response(best_effort_status(&included, &filtered, height))
 }
 
 struct ForwardSummary {
@@ -414,6 +416,7 @@ async fn forward_to_targets(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn merge_statuses<St: Strategy>(
     state: &AppState<St>,
     posted: &[(String, Leader)],
@@ -421,6 +424,7 @@ async fn merge_statuses<St: Strategy>(
     batch: &Arc<DecodedBatch>,
     digest_index: &mut Option<DigestIndex>,
     included: &mut HashSet<usize>,
+    filtered: &mut HashSet<usize>,
     height: &mut u64,
 ) {
     let fetches = posted.iter().map(|(batch_id, leader)| {
@@ -452,7 +456,7 @@ async fn merge_statuses<St: Strategy>(
             BatchStatus::PartiallyFinalized {
                 height: finalized_height,
                 included: leader_included,
-                ..
+                filtered: leader_filtered,
             } => {
                 *height = (*height).max(finalized_height);
                 if digest_index.is_none() {
@@ -468,6 +472,11 @@ async fn merge_statuses<St: Strategy>(
                 for digest in leader_included {
                     if let Some(indices) = index.get(&digest) {
                         included.extend(indices.iter().copied());
+                    }
+                }
+                for digest in leader_filtered {
+                    if let Some(indices) = index.get(&digest) {
+                        filtered.extend(indices.iter().copied());
                     }
                 }
             }
@@ -488,17 +497,23 @@ async fn wait_for_view_advance(views: &mut watch::Receiver<u64>, current: &mut u
     }
 }
 
-const fn best_effort_status(total: usize, included: usize, height: u64) -> TxStatus {
-    if included == 0 {
+/// Best-effort outcome when the retry budget ends with transactions still
+/// unresolved. Only leader-reported exclusions count as filtered: a
+/// transaction with no observed outcome may still land and must not be
+/// misreported as filtered.
+fn best_effort_status(
+    included: &HashSet<usize>,
+    filtered: &HashSet<usize>,
+    height: u64,
+) -> TxStatus {
+    let filtered = filtered.difference(included).count();
+    if included.is_empty() && filtered == 0 {
         return TxStatus::Dropped;
-    }
-    if included == total {
-        return TxStatus::Finalized { height };
     }
     TxStatus::PartiallyFinalized {
         height,
-        included: included as u64,
-        filtered: (total - included) as u64,
+        included: included.len() as u64,
+        filtered: filtered as u64,
     }
 }
 
@@ -880,16 +895,31 @@ mod tests {
     }
 
     #[test]
-    fn retry_budget_returns_partial_status() {
-        let status = best_effort_status(2, 1, 7);
+    fn retry_budget_counts_only_observed_filters() {
+        let included: HashSet<usize> = [0].into_iter().collect();
+        let observed: HashSet<usize> = [0, 1].into_iter().collect();
 
+        // An index reported both included and filtered counts as included.
         assert_eq!(
-            status,
+            best_effort_status(&included, &observed, 7),
             TxStatus::PartiallyFinalized {
                 height: 7,
                 included: 1,
                 filtered: 1
             }
+        );
+        // Unresolved transactions are not misreported as filtered.
+        assert_eq!(
+            best_effort_status(&included, &HashSet::new(), 7),
+            TxStatus::PartiallyFinalized {
+                height: 7,
+                included: 1,
+                filtered: 0
+            }
+        );
+        assert_eq!(
+            best_effort_status(&HashSet::new(), &HashSet::new(), 0),
+            TxStatus::Dropped
         );
     }
 
@@ -1164,6 +1194,39 @@ mod tests {
         let bodies = bodies.lock().expect("bodies lock");
         assert_eq!(bodies.len(), 2);
         assert_eq!(bodies[1], vec![second].encode());
+    }
+
+    /// A transaction the leader never reported filtered is still pending when
+    /// the retry budget ends; it must not be counted as filtered.
+    #[tokio::test]
+    async fn unpinned_retry_budget_does_not_report_pending_as_filtered() {
+        let first = signed_transfer(1, 0);
+        let second = signed_transfer(2, 0);
+        let partial = BatchStatus::PartiallyFinalized {
+            height: 5,
+            included: vec![first.message_digest().to_string()],
+            filtered: Vec::new(),
+        };
+        let (router, _) = scripted_leader(Vec::new(), vec![Some(partial)]);
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 1);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![first, second].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::PartiallyFinalized {
+                height: 5,
+                included: 1,
+                filtered: 0,
+            },
+        );
     }
 
     /// A leader that admits a batch but whose accept responses are all lost

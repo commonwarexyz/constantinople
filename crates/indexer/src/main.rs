@@ -4,10 +4,21 @@
 //! direct local invocations (`--port`, `--data-dir`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
 
-use axum::{Router, routing::get};
+use axum::{
+    Router,
+    extract::{Request, State},
+    middleware::{self, Next},
+    response::Response,
+    routing::get,
+};
 use clap::{ArgGroup, Parser};
 use exoware_simulator::{
     AppState, RocksConfig, RocksStore, RocksWritePipelineConfig, connect_stack, rocksdb::Options,
+};
+use prometheus_client::{
+    encoding::text::encode,
+    metrics::{counter::Counter, gauge::Gauge, histogram::Histogram},
+    registry::Registry,
 };
 use serde::Deserialize;
 use std::{
@@ -15,6 +26,7 @@ use std::{
     num::NonZeroUsize,
     path::{Path, PathBuf},
     sync::Arc,
+    time::Instant,
 };
 use tower_http::cors::CorsLayer;
 use tracing::info;
@@ -108,6 +120,79 @@ async fn health() -> &'static str {
     "ok"
 }
 
+/// Port the deployer scrapes for binary metrics.
+const METRICS_PORT: u16 = 9090;
+/// Ingest latency buckets: 1ms to 60s.
+const INGEST_DURATION_BUCKETS: [f64; 12] = [
+    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 15.0, 60.0,
+];
+
+/// Observability for store Put requests (the upload ingest path).
+#[derive(Clone)]
+struct IngestMetrics {
+    in_flight: Gauge,
+    requests: Counter,
+    duration: Histogram,
+}
+
+fn ingest_metrics() -> (Arc<Registry>, IngestMetrics) {
+    let mut registry = Registry::default();
+    let metrics = IngestMetrics {
+        in_flight: Gauge::default(),
+        requests: Counter::default(),
+        duration: Histogram::new(INGEST_DURATION_BUCKETS),
+    };
+    registry.register(
+        "ingest_in_flight",
+        "Store Put requests in flight",
+        metrics.in_flight.clone(),
+    );
+    registry.register(
+        "ingest_requests",
+        "Store Put requests served",
+        metrics.requests.clone(),
+    );
+    registry.register(
+        "ingest_duration",
+        "Store Put request latency (s)",
+        metrics.duration.clone(),
+    );
+    (Arc::new(registry), metrics)
+}
+
+/// Decrements in-flight on drop so a client disconnect cannot leak the gauge.
+struct InFlight(Gauge);
+
+impl Drop for InFlight {
+    fn drop(&mut self) {
+        self.0.dec();
+    }
+}
+
+async fn track_ingest(
+    State(metrics): State<IngestMetrics>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if !request.uri().path().ends_with("/Put") {
+        return next.run(request).await;
+    }
+    metrics.in_flight.inc();
+    let in_flight = InFlight(metrics.in_flight.clone());
+    let start = Instant::now();
+    let response = next.run(request).await;
+    drop(in_flight);
+    metrics.requests.inc();
+    metrics.duration.observe(start.elapsed().as_secs_f64());
+    response
+}
+
+async fn serve_metrics(State(registry): State<Arc<Registry>>) -> String {
+    let mut out = String::new();
+    encode(&mut out, &registry).expect("metrics encoding cannot fail");
+    out
+}
+
 /// DB-scoped RocksDB options for the chain-indexer store.
 ///
 /// Only DB-scoped options apply here: the store opens every column family
@@ -144,11 +229,24 @@ async fn run(
         data_dir,
         Some(chain_indexer_rocks_config(db_parallelism)),
     )?);
+    let (registry, metrics) = ingest_metrics();
     let connect = connect_stack(AppState::new(engine));
     let app = Router::new()
         .route("/health", get(health))
         .fallback_service(connect)
+        .layer(middleware::from_fn_with_state(metrics, track_ingest))
         .layer(CorsLayer::very_permissive());
+
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], METRICS_PORT));
+    let metrics_app = Router::new()
+        .route("/metrics", get(serve_metrics))
+        .with_state(registry);
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    tokio::spawn(async move {
+        if let Err(error) = axum::serve(metrics_listener, metrics_app).await {
+            tracing::warn!(?error, "metrics server exited");
+        }
+    });
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     info!(%addr, directory = %data_dir.display(), "chain indexer listening");

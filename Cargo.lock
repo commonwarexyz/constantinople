@@ -1680,6 +1680,7 @@ dependencies = [
  "exoware-sql",
  "futures",
  "mimalloc",
+ "prometheus-client",
  "rand 0.10.2",
  "serde",
  "serde_yaml",

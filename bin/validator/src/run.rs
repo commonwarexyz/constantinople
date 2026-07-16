@@ -55,7 +55,10 @@ use constantinople_engine::{
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher,
-    publisher::qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+    publisher::{
+        StoreCommitMetrics,
+        qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+    },
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
@@ -177,15 +180,20 @@ struct LazyPublisher {
     context: RuntimeContext,
     store_url: String,
     buffer: usize,
+    commit_metrics: StoreCommitMetrics,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
     fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
+        // Registered once here: `connect` is retried on failure and must not
+        // re-register.
+        let commit_metrics = StoreCommitMetrics::new(&context);
         Self {
             context,
             store_url,
             buffer,
+            commit_metrics,
             publisher: Mutex::new(None),
         }
     }
@@ -200,6 +208,7 @@ impl LazyPublisher {
                 self.context.child("publisher"),
                 &self.store_url,
                 self.buffer,
+                self.commit_metrics.clone(),
             )
             .await
             {
@@ -573,8 +582,11 @@ async fn maybe_build_indexer(
         chain_indexer_url = %cfg.chain_indexer_url,
         "starting full indexer uploaders",
     );
-    let (cert_reporter, cert_join) =
-        EngineCertReporter::connect(&cfg.chain_indexer_url, cfg.upload_buffer);
+    let (cert_reporter, cert_join) = EngineCertReporter::connect(
+        &cfg.chain_indexer_url,
+        cfg.upload_buffer,
+        StoreCommitMetrics::new(&context.child("simplex_upload")),
+    );
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
         cfg.chain_indexer_url,

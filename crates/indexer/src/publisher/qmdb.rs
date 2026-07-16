@@ -313,6 +313,7 @@ where
 {
     commits: &'a mut JoinSet<CommittedQmdbBatch>,
     commit_client: &'a StoreClient,
+    commit_metrics: &'a super::StoreCommitMetrics,
     state_writer: &'a Arc<StateWriter<H>>,
     transaction_writer: &'a Arc<TransactionWriter<H>>,
 }
@@ -354,6 +355,7 @@ where
         context: Cx,
         store_url: &str,
         buffer: usize,
+        commit_metrics: super::StoreCommitMetrics,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
@@ -382,6 +384,7 @@ where
         let commit_join = tokio::spawn(run_qmdb_committer(
             commit_context,
             commit_client.clone(),
+            commit_metrics,
             sql_writer,
             state_writer.clone(),
             transaction_writer.clone(),
@@ -720,9 +723,11 @@ where
     })
 }
 
+#[expect(clippy::too_many_arguments, reason = "single spawn site in connect")]
 async fn run_qmdb_committer<Cx, H>(
     context: Cx,
     commit_client: StoreClient,
+    commit_metrics: super::StoreCommitMetrics,
     mut sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
@@ -754,6 +759,7 @@ async fn run_qmdb_committer<Cx, H>(
                 CommitPipeline {
                     commits: &mut commits,
                     commit_client: &commit_client,
+                    commit_metrics: &commit_metrics,
                     state_writer: &state_writer,
                     transaction_writer: &transaction_writer,
                 },
@@ -769,6 +775,7 @@ async fn run_qmdb_committer<Cx, H>(
                 context.child("watermarks"),
                 &mut pending_completions,
                 &commit_client,
+                &commit_metrics,
                 &state_writer,
                 &transaction_writer,
             )
@@ -792,6 +799,7 @@ async fn run_qmdb_committer<Cx, H>(
                             CommitPipeline {
                                 commits: &mut commits,
                                 commit_client: &commit_client,
+                                commit_metrics: &commit_metrics,
                                 state_writer: &state_writer,
                                 transaction_writer: &transaction_writer,
                             },
@@ -831,6 +839,7 @@ async fn run_qmdb_committer<Cx, H>(
                     context.child("watermarks"),
                     &mut pending_completions,
                     &commit_client,
+                    &commit_metrics,
                     &state_writer,
                     &transaction_writer,
                 )
@@ -869,6 +878,7 @@ where
         pipeline.commits,
         context.child("store_commit"),
         pipeline.commit_client.clone(),
+        pipeline.commit_metrics.clone(),
         batch,
     );
     sql_writer
@@ -1013,6 +1023,7 @@ fn spawn_commit<Cx>(
     commits: &mut JoinSet<CommittedQmdbBatch>,
     context: Cx,
     commit_client: StoreClient,
+    commit_metrics: super::StoreCommitMetrics,
     commit: QmdbCommitBatch,
 ) where
     Cx: Spawner,
@@ -1021,6 +1032,7 @@ fn spawn_commit<Cx>(
         let store_seq = commit_required_batch_blocking(
             context.child("finalized_upload"),
             commit_client,
+            commit_metrics,
             commit.store_batch,
         )
         .await;
@@ -1101,6 +1113,7 @@ where
 async fn flush_qmdb_watermarks<Cx, H>(
     context: Cx,
     commit_client: &StoreClient,
+    commit_metrics: &super::StoreCommitMetrics,
     state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
 ) -> Option<u64>
@@ -1136,6 +1149,7 @@ where
     let seq = commit_required_batch_blocking(
         context.child("watermark_store_commit"),
         commit_client.clone(),
+        commit_metrics.clone(),
         batch,
     )
     .await;
@@ -1152,6 +1166,7 @@ async fn flush_and_complete_published_uploads<Cx, H>(
     context: Cx,
     pending: &mut VecDeque<PendingUploadCompletion>,
     commit_client: &StoreClient,
+    commit_metrics: &super::StoreCommitMetrics,
     state_writer: &StateWriter<H>,
     transaction_writer: &TransactionWriter<H>,
 ) where
@@ -1171,8 +1186,14 @@ async fn flush_and_complete_published_uploads<Cx, H>(
         return;
     }
 
-    let watermark_seq =
-        flush_qmdb_watermarks(context, commit_client, state_writer, transaction_writer).await;
+    let watermark_seq = flush_qmdb_watermarks(
+        context,
+        commit_client,
+        commit_metrics,
+        state_writer,
+        transaction_writer,
+    )
+    .await;
     let completed = complete_published_uploads(pending, state_writer, transaction_writer).await;
     if completed > 0 || watermark_seq.is_some() {
         debug!(
@@ -1526,17 +1547,22 @@ const fn next_writer_location(watermark: Option<Location<QmdbFamily>>) -> u64 {
     }
 }
 
-async fn commit_required_batch(client: StoreClient, batch: StoreWriteBatch) -> u64 {
+async fn commit_required_batch(
+    client: StoreClient,
+    metrics: super::StoreCommitMetrics,
+    batch: StoreWriteBatch,
+) -> u64 {
     assert!(
         !batch.is_empty(),
         "QMDB component batches must contain at least one row"
     );
-    super::commit_with_retry(&client, &batch, "finalized index upload").await
+    super::commit_with_retry(&client, &batch, "finalized index upload", &metrics).await
 }
 
 async fn commit_required_batch_blocking<Cx>(
     context: Cx,
     client: StoreClient,
+    metrics: super::StoreCommitMetrics,
     batch: StoreWriteBatch,
 ) -> u64
 where
@@ -1544,7 +1570,7 @@ where
 {
     context
         .shared(true)
-        .spawn(move |_| async move { commit_required_batch(client, batch).await })
+        .spawn(move |_| async move { commit_required_batch(client, metrics, batch).await })
         .await
         .expect("QMDB Store commit task exited")
 }
@@ -1797,6 +1823,7 @@ mod tests {
                 context.child("grouped_watermark"),
                 &mut pending,
                 &client,
+                &crate::publisher::StoreCommitMetrics::new(&context),
                 &state_writer,
                 &transaction_writer,
             )
@@ -1926,6 +1953,7 @@ mod tests {
                 context.child("watermarks"),
                 &mut pending,
                 &client,
+                &crate::publisher::StoreCommitMetrics::new(&context),
                 &state_writer,
                 &transaction_writer,
             )
@@ -1948,6 +1976,7 @@ mod tests {
                 context.child("qmdb_publisher"),
                 &url,
                 2,
+                crate::publisher::StoreCommitMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -1974,6 +2003,7 @@ mod tests {
                 context.child("qmdb_publisher"),
                 &url,
                 2,
+                crate::publisher::StoreCommitMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -2060,7 +2090,12 @@ mod tests {
             let publisher = Publisher::<
                 commonware_cryptography::sha256::Sha256,
                 commonware_cryptography::ed25519::PublicKey,
-            >::connect(context.child("qmdb_publisher"), &url, 1)
+            >::connect(
+                context.child("qmdb_publisher"),
+                &url,
+                1,
+                crate::publisher::StoreCommitMetrics::new(&context),
+            )
             .await
             .expect("publisher connects");
 
