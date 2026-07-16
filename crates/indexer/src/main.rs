@@ -38,8 +38,6 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
 const ROCKS_SYNC_BYTES: u64 = 8 * 1024 * 1024;
 const ROCKS_COMPACTION_READAHEAD_SIZE: usize = 8 * 1024 * 1024;
-// Small enough that a backlog splits into several waves for the store's
-// parallel stage workers; large enough to amortize per-wave ingest costs.
 const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 256 * 1024 * 1024;
 const ROCKS_STAGE_WORKERS: usize = 4;
 const ROCKS_MAX_QUEUED_WAVES: usize = 4;
