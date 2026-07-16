@@ -395,6 +395,7 @@ where
                 stateful_partition_prefix.clone(),
             )
             .await;
+
         // The durable plan distinguishes normal recovery from peer state sync. Normal recovery
         // stays floorless so marshal restores its acknowledged progress; only a requested or
         // interrupted state sync discovers a new floor.
