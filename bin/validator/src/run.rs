@@ -679,7 +679,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         max_propose_bytes,
         max_pool_bytes,
         state_page_cache_bytes,
-        archive_page_cache_bytes,
+        other_page_cache_bytes,
         public_key_cache_size,
         otel,
         json_logs,
@@ -914,7 +914,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 block_codec: Default::default(),
                 state_page_cache_bytes,
-                archive_page_cache_bytes,
+                other_page_cache_bytes,
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle

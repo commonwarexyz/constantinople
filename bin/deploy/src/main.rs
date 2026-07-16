@@ -129,9 +129,10 @@ pub(crate) struct GenerateArgs {
     /// account set passed ~2M and build/verify doubled on cache misses.
     #[arg(long = "state-page-cache-bytes", default_value_t = default_page_cache_bytes())]
     state_page_cache_bytes: usize,
-    /// Capacity in bytes of each validator's archive/journal page cache.
-    #[arg(long = "archive-page-cache-bytes", default_value_t = default_page_cache_bytes())]
-    archive_page_cache_bytes: usize,
+    /// Capacity in bytes of each validator's non-state page cache
+    /// (archives, transaction history, journal).
+    #[arg(long = "other-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    other_page_cache_bytes: usize,
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
@@ -399,8 +400,9 @@ pub(crate) struct ValidatorConfig {
     max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
     state_page_cache_bytes: usize,
-    /// Capacity in bytes of the engine's archive/journal page cache.
-    archive_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's non-state page cache (archives,
+    /// transaction history, journal).
+    other_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,

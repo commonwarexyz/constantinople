@@ -186,7 +186,7 @@ where
     /// certificate archives, transaction history, simplex journal). Separate
     /// from the state cache so backfill and replay scans cannot evict its
     /// working set.
-    pub archive_page_cache_bytes: usize,
+    pub other_page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -288,10 +288,10 @@ where
     #[boxed]
     pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
-            &context.child("archive"),
+            &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
-            NonZero::new(config.archive_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
-                .expect("archive page cache must hold at least one page"),
+            NonZero::new(config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("page cache must hold at least one page"),
         );
         let storage_page_cache = CacheRef::from_pooler(
             &context.child("state"),
