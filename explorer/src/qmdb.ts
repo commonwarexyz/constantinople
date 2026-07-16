@@ -38,7 +38,7 @@ const ACCOUNT_CURSOR_BYTES = 24;
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
-const TX_META_BODY_HEX = 'body_hex';
+const TX_META_BODY = 'body';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -299,7 +299,7 @@ async function fetchVerifiedSqlTransactionMetadata(
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY_HEX}
+            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
             FROM ${TX_META_TABLE}
             WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
             LIMIT 1
@@ -312,7 +312,7 @@ async function fetchVerifiedSqlTransactionMetadata(
     }
 
     const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
-    const signedTransaction = expectHexBytes(row.values[TX_META_BODY_HEX], TX_META_BODY_HEX);
+    const signedTransaction = expectVariableBytes(row.values[TX_META_BODY], TX_META_BODY);
     if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
         throw new Error('SQL transaction body is truncated');
     }
@@ -793,15 +793,11 @@ function expectBytes(value: CellValue, column: string, length: number): Uint8Arr
     return value;
 }
 
-function expectHexBytes(value: CellValue, column: string): Uint8Array {
-    if (typeof value !== 'string') {
-        throw new Error(`SQL column ${column} must be Utf8 hex`);
+function expectVariableBytes(value: CellValue, column: string): Uint8Array {
+    if (!(value instanceof Uint8Array)) {
+        throw new Error(`SQL column ${column} must be Binary`);
     }
-    const normalized = value.trim().replace(/^0x/i, '').toLowerCase();
-    if (!/^[0-9a-f]*$/.test(normalized) || normalized.length % 2 !== 0) {
-        throw new Error(`SQL column ${column} must be even-length hex`);
-    }
-    return fromHex(normalized);
+    return value;
 }
 
 function assertByteLength(bytes: Uint8Array, length: number, field: string) {

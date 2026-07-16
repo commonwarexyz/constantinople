@@ -57,8 +57,8 @@ pub const BLOCK_META_FINALIZED_TS: &str = "finalized_ts";
 pub const TX_META_DIGEST: &str = "tx_digest";
 /// `tx_meta`: transaction-hash QMDB operation location for this digest.
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
-/// `tx_meta`: encoded signed transaction bytes as lowercase hex.
-pub const TX_META_BODY_HEX: &str = "body_hex";
+/// `tx_meta`: encoded signed transaction bytes.
+pub const TX_META_BODY: &str = "body";
 
 // ---------- tx_activity columns ----------
 
@@ -135,7 +135,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
             vec![
                 TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
-                TableColumnConfig::new(TX_META_BODY_HEX, DataType::Utf8, false),
+                TableColumnConfig::new(TX_META_BODY, DataType::Binary, false),
             ],
             vec![TX_META_DIGEST.to_string()],
             vec![],
@@ -253,7 +253,7 @@ mod tests {
         assert_eq!(BLOCK_META_FINALIZED_TS, "finalized_ts");
         assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
-        assert_eq!(TX_META_BODY_HEX, "body_hex");
+        assert_eq!(TX_META_BODY, "body");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
         assert_eq!(TX_ACTIVITY_HEIGHT, "height");
         assert_eq!(TX_ACTIVITY_INDEX, "index");

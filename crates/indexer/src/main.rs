@@ -38,7 +38,11 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const ROCKS_MAX_SUBCOMPACTIONS: u32 = 8;
 const ROCKS_SYNC_BYTES: u64 = 8 * 1024 * 1024;
 const ROCKS_COMPACTION_READAHEAD_SIZE: usize = 8 * 1024 * 1024;
-const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 1024 * 1024 * 1024;
+// Small enough that a backlog splits into several waves for the store's
+// parallel stage workers; large enough to amortize per-wave ingest costs.
+const ROCKS_MAX_COMMIT_BATCH_BYTES: usize = 256 * 1024 * 1024;
+const ROCKS_STAGE_WORKERS: usize = 4;
+const ROCKS_MAX_QUEUED_WAVES: usize = 4;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -195,9 +199,9 @@ async fn serve_metrics(State(registry): State<Arc<Registry>>) -> String {
 
 /// DB-scoped RocksDB options for the chain-indexer store.
 ///
-/// Only DB-scoped options apply here: the store opens every column family
-/// with stock options, and its ingest path writes SSTs directly (no WAL or
-/// memtables), so CF-scoped and write-path tuning has no effect.
+/// Only DB-scoped options apply here: the store owns its column-family
+/// options (tuned to its write path), and its ingest path writes SSTs
+/// directly (no WAL or memtables), so write-path tuning has no effect.
 fn chain_indexer_db_options(db_parallelism: Option<i32>) -> Options {
     let mut opts = Options::default();
     if let Some(jobs) = db_parallelism {
@@ -216,6 +220,10 @@ fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
         write_pipeline: RocksWritePipelineConfig {
             max_commit_batch_bytes: NonZeroUsize::new(ROCKS_MAX_COMMIT_BATCH_BYTES)
                 .expect("rocks write commit batch byte limit must be nonzero"),
+            stage_workers: NonZeroUsize::new(ROCKS_STAGE_WORKERS)
+                .expect("rocks stage worker count must be nonzero"),
+            max_queued_waves: NonZeroUsize::new(ROCKS_MAX_QUEUED_WAVES)
+                .expect("rocks queued wave limit must be nonzero"),
         },
     }
 }

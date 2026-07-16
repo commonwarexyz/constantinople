@@ -9,11 +9,11 @@ if [ -d ./deploy ]; then
     [ "$answer" = "y" ] || exit 1
     rm -rf ./deploy
 fi
-# ~49k spammer accounts drives ~250k TPS (lowered to avoid overwhelming
+# ~49k spammer accounts reaches ~250k TPS (lowered to avoid overwhelming
 # simulator)
 cargo run --bin constantinople-deploy -- generate \
     --validators 50 --relayer --spammer --indexer \
-    --spammer-accounts 8192 --spammer-accounts-jitter 0.1 \
+    --spammer-accounts 4096 --spammer-accounts-jitter 0.1 \
     --spammer-rayon-threads 14 \
     --output-dir ./deploy --worker-threads 3 --rayon-threads 13 \
     --public-key-cache-size 5000000 \

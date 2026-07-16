@@ -1638,7 +1638,7 @@ mod tests {
                 values: vec![
                     CellValue::FixedBinary(vec![3u8; 32]),
                     CellValue::UInt64(1),
-                    CellValue::Utf8("010203".to_string()),
+                    CellValue::Binary(vec![0x01, 0x02, 0x03]),
                 ],
             },
         ];
