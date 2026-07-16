@@ -20,7 +20,6 @@ use commonware_consensus::{
         coding::{Marshaled, MarshaledConfig, shards, types::coding_config_for_participants},
         core::{Actor as MarshalActor, Variant as MarshalVariant},
         resolver::p2p as marshal_resolver,
-        store::Blocks,
     },
     simplex::{
         self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
@@ -47,17 +46,16 @@ use commonware_runtime::{
     buffer::paged::CacheRef, spawn_cell,
 };
 use commonware_storage::{
-    archive::{Identifier as ArchiveIdentifier, prunable, prunable::Archive as PrunableArchive},
+    archive::{prunable, prunable::Archive as PrunableArchive},
     journal::contiguous::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::full::Config as MmrConfig,
-    metadata::{Config as MetadataConfig, Metadata},
     mmr,
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, sequence::U64, union};
+use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
     Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
@@ -85,7 +83,6 @@ const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
-const CANONICAL_GENESIS_KEY: U64 = U64::new(0);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -411,51 +408,19 @@ where
             startup_plan = startup_plan.with_floor(finalization);
         }
 
-        // Height zero must outlive the prunable block archive. The archive fallback migrates
-        // existing storage; the database fallback is only reachable on first boot.
-        let mut genesis_metadata = Metadata::<_, U64, CodingBlock<H, C::PublicKey>>::init(
-            context.child("canonical_genesis"),
-            MetadataConfig {
-                partition: format!("{}-canonical-genesis", config.partition_prefix),
-                codec_config: config.block_codec.clone(),
-            },
-        )
-        .await
-        .expect("failed to initialize canonical genesis metadata");
-        let stored_genesis = genesis_metadata.get(&CANONICAL_GENESIS_KEY).cloned();
-        let persist_genesis = stored_genesis.is_none();
-        let stored_genesis = match stored_genesis {
-            Some(stored_genesis) => Some(stored_genesis),
-            None => finalized_blocks
-                .get(ArchiveIdentifier::Index(0))
-                .await
-                .expect("failed to read canonical genesis block"),
-        };
-        let canonical_genesis = if let Some(stored_genesis) = stored_genesis {
-            stored_genesis.into()
-        } else {
-            // First boot: the genesis targets are the canonical empty-database roots, leaving
-            // the long-lived databases untouched for Stateful to open.
-            let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
-                &mut H::default(),
-                config.genesis_leader.clone(),
-                (commonware_consensus::types::View::zero(), genesis_parent),
-                0,
-                <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
-                <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
-            );
-            EngineCodedBlock::new(genesis_block, coding_config, &config.strategy)
-        };
-        if persist_genesis {
-            genesis_metadata.put(CANONICAL_GENESIS_KEY, canonical_genesis.clone().into());
-            genesis_metadata
-                .sync()
-                .await
-                .expect("failed to persist canonical genesis block");
-        }
-        let application_genesis = <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(
-            canonical_genesis.clone(),
+        // The canonical genesis is a pure function of configuration: the leader, the
+        // participant-derived coding config, and the canonical empty-database roots.
+        let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
+            &mut H::default(),
+            config.genesis_leader.clone(),
+            (commonware_consensus::types::View::zero(), genesis_parent),
+            0,
+            <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+            <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
         );
+        let coded_genesis = EngineCodedBlock::new(genesis_block, coding_config, &config.strategy);
+        let application_genesis =
+            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(coded_genesis.clone());
         let (application_state_target, application_transactions_target) =
             block_targets(&application_genesis);
 
@@ -463,12 +428,12 @@ where
         let startup_sync_floor = startup_plan.floor().cloned();
         // Simplex adopts the peer floor only for state sync. Otherwise it independently replays
         // its journal from canonical genesis while marshal restores application progress.
-        let genesis_commitment = canonical_genesis.commitment();
+        let genesis_commitment = coded_genesis.commitment();
         let simplex_floor = startup_plan.floor().map_or_else(
             || SimplexFloor::Genesis(genesis_commitment),
             |finalization| SimplexFloor::Finalized(finalization.clone()),
         );
-        let marshal_start = startup_plan.marshal_start(canonical_genesis);
+        let marshal_start = startup_plan.marshal_start(coded_genesis);
 
         let (marshal, marshal_mailbox, _) = MarshalActor::init(
             context.child("marshal"),
