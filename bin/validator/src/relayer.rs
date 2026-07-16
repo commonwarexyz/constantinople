@@ -287,9 +287,11 @@ async fn submit_with_retries<St: Strategy>(
     let mut digest_index: Option<DigestIndex> = None;
     let mut height = 0;
     let mut accepted_any = false;
+
     // Every (batch id, leader) pair POSTed at least once; polled every
     // round, which recovers accepts lost in transit.
     let mut posted = Vec::<(String, Leader)>::new();
+
     // Accepted pairs are never re-POSTed. Repeat POSTs elsewhere are safe:
     // leaders cache each batch id's status and acknowledge repeats without
     // re-admitting transactions.
@@ -317,6 +319,7 @@ async fn submit_with_retries<St: Strategy>(
         };
         sent.entry(sent_batch_id.clone())
             .or_insert_with(|| pending.iter().copied().collect());
+
         // POST only to leaders that have not already accepted this batch id:
         // consecutive next-two-leaders windows overlap by one, and a resend
         // to an accepting leader only re-burns its ingress decode and verify.
@@ -435,6 +438,7 @@ async fn merge_statuses<St: Strategy>(
         };
         match status {
             BatchStatus::Accepted | BatchStatus::Dropped => {}
+
             // A fully finalized batch includes everything that was sent
             // under that batch id.
             BatchStatus::Finalized {
@@ -1089,6 +1093,7 @@ mod tests {
             serde_json::from_str::<TxStatus>(&response).expect("status json"),
             TxStatus::Finalized { height: 7 },
         );
+
         // Both leaders accepted in round 0 and are polled (not re-POSTed) in
         // every later round.
         assert_eq!(bodies_a.lock().expect("bodies lock").len(), 1);
@@ -1116,6 +1121,7 @@ mod tests {
             serde_json::from_str::<TxStatus>(&response).expect("status json"),
             TxStatus::Finalized { height: 3 },
         );
+
         // The transient round-0 failure is retried in round 1 because the
         // single leader stays in the targeting window; the accepted POST is
         // never repeated.
@@ -1151,6 +1157,7 @@ mod tests {
                 filtered: 1,
             },
         );
+
         // The partial finalization builds the on-demand digest index, shrinks
         // the pending set, and round 1 re-POSTs only the pending subset under
         // a fresh batch id.
@@ -1171,6 +1178,7 @@ mod tests {
             included: vec![first.message_digest().to_string()],
             filtered: vec![second.message_digest().to_string()],
         };
+
         // Every POST "loses" its response (500 -> transient), while the
         // round-0 status poll reports the batch partially finalized.
         let (router, bodies) = scripted_leader(

@@ -319,6 +319,7 @@ fn propose_drops_inapplicable_and_refills() {
             leader: leader.public_key(),
             parent: (View::zero(), *parent.seal()),
         };
+
         // Both selected transfers consume the same nonce: proposing keeps the
         // first, drops the duplicate, and tops the block up from the mempool
         // toward the proposal budget. The proposed block is the applicable
@@ -579,6 +580,7 @@ fn build_timeout_bounds_refill_rounds() {
         );
 
         context.sleep(Duration::from_millis(10)).await;
+
         // The seed pull happens before the build deadline starts; the first
         // refill (delayed 60ms) lands past the deadline, so a second refill
         // is never requested even though headroom and candidates remain.

@@ -9,7 +9,7 @@ use commonware_runtime::{
     Metrics as RuntimeMetrics,
     telemetry::metrics::{Counter, MetricsExt as _},
 };
-use constantinople_mempool::webserver::client::SubmitError;
+use constantinople_mempool::webserver::SubmitError;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 

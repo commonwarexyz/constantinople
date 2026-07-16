@@ -758,6 +758,7 @@ where
                     }
 
                     let height = block.header.height;
+
                     // Deriving the finalized set decodes any transaction the
                     // application has not already materialized, so it runs on
                     // the strategy's pool (which also releases the block

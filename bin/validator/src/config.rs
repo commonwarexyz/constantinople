@@ -121,9 +121,12 @@ pub struct ValidatorConfig {
     /// Maximum mempool size in bytes.
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
-    /// Capacity in bytes of each of the engine's two storage page caches.
+    /// Capacity in bytes of the engine's state QMDB page cache.
     #[serde(default = "default_page_cache_bytes")]
-    pub page_cache_bytes: usize,
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's archive/journal page cache.
+    #[serde(default = "default_page_cache_bytes")]
+    pub archive_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
@@ -231,8 +234,10 @@ pub struct LoadedConfig {
     pub max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
-    /// Capacity in bytes of each of the engine's two storage page caches.
-    pub page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's state QMDB page cache.
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's archive/journal page cache.
+    pub archive_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     pub public_key_cache_size: usize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
@@ -363,7 +368,8 @@ fn decode_with_network(
         http_listen,
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
-        page_cache_bytes: config.page_cache_bytes,
+        state_page_cache_bytes: config.state_page_cache_bytes,
+        archive_page_cache_bytes: config.archive_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
         public_key_cache_size: config.public_key_cache_size,
         otel,
@@ -644,7 +650,8 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
-                page_cache_bytes: default_page_cache_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                archive_page_cache_bytes: default_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
@@ -679,7 +686,8 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
-                page_cache_bytes: default_page_cache_bytes(),
+                state_page_cache_bytes: default_page_cache_bytes(),
+                archive_page_cache_bytes: default_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,

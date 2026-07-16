@@ -176,12 +176,17 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
-    /// Capacity in bytes of each of the engine's two storage page caches.
+    /// Capacity in bytes of the state QMDB page cache.
     ///
     /// Must hold the state journal's working set: 512 MiB thrashed once the
     /// live account set passed ~2M (build/verify doubled on ~200k journal
     /// cache misses/s/node).
-    pub page_cache_bytes: usize,
+    pub state_page_cache_bytes: usize,
+    /// Capacity in bytes of the page cache for everything else (block and
+    /// certificate archives, transaction history, simplex journal). Separate
+    /// from the state cache so backfill and replay scans cannot evict its
+    /// working set.
+    pub archive_page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up; this slot is fanned out via
@@ -282,18 +287,17 @@ where
     /// Initializes the full engine stack.
     #[boxed]
     pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
-        let page_cache_capacity =
-            NonZero::new(config.page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
-                .expect("page cache must hold at least one page");
         let page_cache = CacheRef::from_pooler(
-            &context.child("other"),
+            &context.child("archive"),
             PAGE_CACHE_PAGE_SIZE,
-            page_cache_capacity,
+            NonZero::new(config.archive_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("archive page cache must hold at least one page"),
         );
         let storage_page_cache = CacheRef::from_pooler(
             &context.child("state"),
             PAGE_CACHE_PAGE_SIZE,
-            page_cache_capacity,
+            NonZero::new(config.state_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+                .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);

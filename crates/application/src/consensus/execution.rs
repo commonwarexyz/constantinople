@@ -416,6 +416,7 @@ where
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
+
     // The history append for a round's accepted digests runs on the pool
     // while later rounds refill, prepare, stage, and select; rounds chain on
     // the batch, so the previous append is joined before the next is spawned.
@@ -630,6 +631,7 @@ where
 
     let transaction_count = transfers.len();
     let transfers = Arc::new(transfers);
+
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
@@ -637,6 +639,7 @@ where
         apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
+
     // Join the append before surfacing a rejection so its panics propagate
     // and no job outlives this call.
     let transaction_batch = apply.await;
@@ -668,6 +671,7 @@ where
     S: Strategy,
 {
     let transfers = Arc::new(transfers);
+
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
@@ -678,6 +682,7 @@ where
         })
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
+
     // Join the append before surfacing a rejection so its panics propagate
     // and no job outlives this call.
     let transaction_batch = apply.await;

@@ -105,6 +105,7 @@ fn main() {
     runner.start(|context| async move {
         // In deployer mode (--hosts), use JSON logs so Loki/Promtail can scrape them.
         let json_logs = cli.hosts.is_some();
+
         // Deployer mode runs on a dedicated instance scraped at the
         // deployer's fixed port; ad-hoc runs serve metrics only when a port
         // is given, since the default collides with a co-located validator.

@@ -72,6 +72,7 @@ where
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
         let result = self.propose_child(context, parent, batches, input).await;
+
         // propose_child releases the parent on the strategy's pool, so only
         // the drained ancestry stream remains; the span keeps its drop cost
         // visible in traces.
@@ -90,12 +91,14 @@ where
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let mut ancestry = Box::pin(ancestry);
         let block = ancestry.next().await?;
+
         // The parent fetch is passed as a future so verify_child can start
         // signature verification (which needs only the block body) while the
         // parent is still in flight.
         let result = self
             .verify_child(context, block, ancestry.next(), batches)
             .await;
+
         // verify_child's offloaded tasks release the body and parent (early
         // rejections drop inline), so only the drained ancestry stream
         // remains; the span keeps its drop cost visible in traces.

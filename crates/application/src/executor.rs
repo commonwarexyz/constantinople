@@ -516,6 +516,7 @@ impl SelectiveExecutor {
 
         if transfer.sender == transfer.recipient {
             let account = &mut self.accounts[sender];
+
             // Affordable from the start balance (self-transfers never debit),
             // with the nonce as the final, mutating gate.
             if account.start_balance < transfer.value || !account.nonce.consume(transfer.nonce) {
@@ -537,6 +538,7 @@ impl SelectiveExecutor {
         if self.accounts[sender].start_balance < debit {
             return false;
         }
+
         // The recipient's final value is `start - debits + credits`; its
         // debits only grow after this point, so checking against the current
         // debit total is conservative.
