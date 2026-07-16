@@ -725,7 +725,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             metrics_listen = %metrics_listen,
             "starting validator"
         );
-        // One shared rayon pool for all CPU-parallel work.
         let strategy = context.strategy(NZUsize!(rayon_threads));
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),
