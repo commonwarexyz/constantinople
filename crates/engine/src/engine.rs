@@ -434,46 +434,15 @@ where
         let canonical_genesis = if let Some(stored_genesis) = stored_genesis {
             stored_genesis.into()
         } else {
-            let state_db = StateDb::<E, H, St>::init(
-                context.child("genesis_state"),
-                state_db_config(
-                    &config.partition_prefix,
-                    &storage_page_cache,
-                    config.strategy.clone(),
-                ),
-            )
-            .await
-            .expect("state db must initialize for genesis target");
-            let database_state_target =
-                <StateDb<E, H, St> as ManagedDb<E>>::sync_target(&state_db);
-            let transaction_db = TransactionDb::<E, H, St>::init(
-                context.child("genesis_transactions"),
-                transaction_db_config.clone(),
-            )
-            .await
-            .expect("transaction history db must initialize for genesis target");
-            let database_transactions_target =
-                <TransactionDb<E, H, St> as ManagedDb<E>>::sync_target(&transaction_db);
-            let state_is_empty = *database_state_target.range.start() == mmr::Location::new(0)
-                && *database_state_target.range.end() == mmr::Location::new(1);
-            let transactions_are_empty =
-                database_transactions_target.leaf_count == mmr::Location::new(1);
-            assert!(
-                state_is_empty && transactions_are_empty,
-                "canonical genesis is missing but application databases are not empty",
-            );
-            // Stateful owns the long-lived database initialization after selecting its startup
-            // path. These handles only derive the first-boot genesis targets.
-            drop(state_db);
-            drop(transaction_db);
-
+            // First boot: the genesis targets are the canonical empty-database roots, leaving
+            // the long-lived databases untouched for Stateful to open.
             let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
                 &mut H::default(),
                 config.genesis_leader.clone(),
                 (commonware_consensus::types::View::zero(), genesis_parent),
                 0,
-                database_state_target,
-                database_transactions_target,
+                <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+                <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
             );
             EngineCodedBlock::new(genesis_block, coding_config, &config.strategy)
         };
