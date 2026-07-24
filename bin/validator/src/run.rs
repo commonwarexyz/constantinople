@@ -4,29 +4,31 @@ use crate::{
     config::{
         IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
     },
-    state_reader::StateDbReader,
+    state_reader::{ConnectedPeersReader, FinalizedHeight, StateDbReader},
 };
 use commonware_actor::Feedback;
-use commonware_codec::Encode;
+use commonware_codec::{Encode, RangeCfg};
 use commonware_consensus::{
-    Reporter,
+    Heightable as _, Reporter,
+    marshal::Update,
     simplex::elector::RoundRobin,
     types::{Epoch, coding::Commitment},
 };
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
-    certificate::ConstantProvider,
     ed25519::{self, Batch, PublicKey},
     sha256::Sha256,
 };
 use commonware_formatting::hex;
-use commonware_glue::stateful::{
-    PruneConfig,
-    db::SyncEngineConfig,
-    probe::{Config as ProbeConfig, Probe},
+use commonware_glue::{
+    dkg::{
+        network::Addresses,
+        types::{EpochInfo, EpochOutcome, Payload},
+    },
+    stateful::{PruneConfig, db::SyncEngineConfig},
 };
 use commonware_macros::boxed;
-use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
+use commonware_p2p::{CheckedSender as _, LimitedSender as _, Recipients, authenticated::lookup};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
@@ -43,14 +45,17 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+    NZU16, NZU32, NZU64, NZUsize, TryCollect,
+    ordered::{Map, Set},
+    sequence::U64,
 };
 use constantinople_application::consensus::{Databases, FinalizedHookFn};
 use constantinople_engine::{
-    CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL,
-    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme,
-    VOTE_CHANNEL,
+    CERTIFICATE_CHANNEL, COMMITTEE_RESOLVER_CHANNEL, Channels, Config as EngineConfig, DKG_CHANNEL,
+    DKG_PROBE_CHANNEL, EPOCH_LENGTH, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
+    MAX_PENDING_ACKS, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
+    secret_store::FileSecretStore,
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
@@ -60,14 +65,16 @@ use constantinople_indexer::{
         qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
     },
 };
-use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
-use constantinople_primitives::PublicKeyCache;
+use constantinople_mempool::webserver::{self, AccountReader, CommitteeReader, Mailbox};
+use constantinople_primitives::{
+    Block as ChainBlock, Header as ChainHeader, PublicKeyCache, Sealable as _, SealedBlock,
+};
 use std::{
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{Arc, Mutex as StdMutex, OnceLock},
     time::Duration,
 };
 use tokio::{
@@ -77,6 +84,7 @@ use tokio::{
 use tracing::{info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
+const DKG_NAMESPACE: &[u8] = b"_CONSTANTINOPLE_DKG";
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
@@ -96,6 +104,7 @@ const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
+const CURSOR_COMMITTEE_KEY: U64 = U64::new(2);
 
 /// Returns the default finalized-block window before a proposed mempool batch
 /// is marked dropped.
@@ -123,9 +132,12 @@ fn buffer_pool_configs(
         NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
 
     let network_cfg = BufferPoolConfig::for_network()
-        .with_parallelism(network_parallelism)
-        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
-        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
+        .with_size_class_range(
+            NZUsize!(1024),
+            NETWORK_BUFFER_POOL_MAX_SIZE,
+            NETWORK_BUFFER_POOL_MAX_PER_CLASS,
+        )
+        .with_parallelism(network_parallelism);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.
@@ -142,10 +154,20 @@ fn buffer_pool_configs(
 /// stays the same whether or not the indexer is enabled. Validators that opt
 /// out simply pass `simplex_observer: None`.
 type EngineCertReporter =
-    CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
-type EnginePublisher = Publisher<Sha256, PublicKey>;
+    CertificateReporter<Sha256, ed25519::PrivateKey, MinSig, ThresholdScheme<PublicKey, MinSig>>;
+type EnginePublisher = Publisher<Sha256, ed25519::PrivateKey, MinSig>;
 type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
-type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
+type ValidatorPayload = Payload<MinSig, ed25519::PrivateKey, Addresses<PublicKey>>;
+type ValidatorEngineBlock = EngineBlock<Sha256, ed25519::PrivateKey, MinSig>;
+type EngineFinalizedHook = FinalizedHookFn<
+    commonware_runtime::tokio::Context,
+    Commitment,
+    Sha256,
+    PublicKey,
+    ValidatorPayload,
+    Rayon,
+>;
+type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, ed25519::PrivateKey, MinSig>;
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
 type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
@@ -164,6 +186,43 @@ impl Reporter for SimplexObserver {
             Self::Indexer(reporter) => reporter.report(activity),
             Self::Relayer(reporter) => reporter.report(activity),
         }
+    }
+}
+
+/// Adapts payload-bearing engine blocks to the execution-only block view used
+/// by the mempool's finalized-batch tracker.
+#[derive(Clone)]
+struct MempoolReporter(Mailbox<Commitment, PublicKey, Sha256>);
+
+impl Reporter for MempoolReporter {
+    type Activity = Update<ValidatorEngineBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        let activity = match activity {
+            Update::Tip(round, height, digest) => Update::Tip(round, height, digest),
+            Update::Block(block, acknowledgement) => {
+                let header = ChainHeader {
+                    context: block.header.context.clone(),
+                    parent: block.header.parent,
+                    height: block.header.height,
+                    timestamp: block.header.timestamp,
+                    state_root: block.header.state_root,
+                    state_range: block.header.state_range.clone(),
+                    transactions_root: block.header.transactions_root,
+                    transactions_range: block.header.transactions_range.clone(),
+                    committee_root: block.header.committee_root,
+                    committee_range: block.header.committee_range.clone(),
+                    payload: None,
+                };
+                let block: SealedBlock<Commitment, PublicKey, Sha256> = ChainBlock {
+                    header,
+                    body: block.body.clone(),
+                }
+                .seal(&mut Sha256::default());
+                Update::Block(Arc::new(block), acknowledgement)
+            }
+        };
+        self.0.report(activity)
     }
 }
 
@@ -234,7 +293,7 @@ impl LazyPublisher {
 #[derive(Clone)]
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
-    metadata: Arc<Mutex<CursorMetadata>>,
+    metadata: Arc<Mutex<Option<CursorMetadata>>>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
     publisher: Arc<LazyPublisher>,
 }
@@ -243,6 +302,7 @@ struct FinalizedUploadProducer {
 struct FinalizedUploadCursor {
     state_next: u64,
     transaction_next: u64,
+    committee_next: u64,
 }
 
 impl FinalizedUploadCursor {
@@ -252,14 +312,20 @@ impl FinalizedUploadCursor {
             .get(&CURSOR_TRANSACTION_KEY)
             .cloned()
             .map(u64::from);
-        Self::from_parts(state_next, transaction_next)
+        let committee_next = metadata.get(&CURSOR_COMMITTEE_KEY).cloned().map(u64::from);
+        Self::from_parts(state_next, transaction_next, committee_next)
     }
 
-    const fn from_parts(state_next: Option<u64>, transaction_next: Option<u64>) -> Option<Self> {
-        match (state_next, transaction_next) {
-            (Some(state_next), Some(transaction_next)) => Some(Self {
+    const fn from_parts(
+        state_next: Option<u64>,
+        transaction_next: Option<u64>,
+        committee_next: Option<u64>,
+    ) -> Option<Self> {
+        match (state_next, transaction_next, committee_next) {
+            (Some(state_next), Some(transaction_next), Some(committee_next)) => Some(Self {
                 state_next,
                 transaction_next,
+                committee_next,
             }),
             _ => None,
         }
@@ -269,6 +335,7 @@ impl FinalizedUploadCursor {
         Self {
             state_next: upload.state_end(),
             transaction_next: upload.transaction_end(),
+            committee_next: upload.committee_end(),
         }
     }
 
@@ -280,7 +347,9 @@ impl FinalizedUploadCursor {
     const fn max(self, other: Self) -> Self {
         if other.state_next > self.state_next
             || (other.state_next == self.state_next
-                && other.transaction_next > self.transaction_next)
+                && (other.transaction_next > self.transaction_next
+                    || (other.transaction_next == self.transaction_next
+                        && other.committee_next > self.committee_next)))
         {
             other
         } else {
@@ -300,7 +369,7 @@ impl FinalizedUploadProducer {
     async fn enqueue(
         self,
         context: RuntimeContext,
-        block: &EngineBlock<Sha256, PublicKey>,
+        block: &ValidatorEngineBlock,
         databases: &EngineDatabases,
     ) {
         loop {
@@ -309,6 +378,7 @@ impl FinalizedUploadProducer {
                 context.child("build"),
                 cursor.state_next,
                 cursor.transaction_next,
+                cursor.committee_next,
                 block,
                 databases,
             )
@@ -317,8 +387,9 @@ impl FinalizedUploadProducer {
                 Ok(upload) => upload,
                 Err(PublishError::StoreEmptyPastGenesis { .. }) if cursor.state_next == 0 => {
                     let publisher = self.publisher.publisher().await;
-                    let (state_next, transaction_next) = publisher.next_locations().await;
-                    if state_next == 0 && transaction_next == 0 {
+                    let (state_next, transaction_next, committee_next) =
+                        publisher.next_locations().await;
+                    if state_next == 0 && transaction_next == 0 && committee_next == 0 {
                         warn!(
                             height = block.header.height,
                             "finalized index cursor is empty and remote Store has no cursor, retrying",
@@ -330,6 +401,7 @@ impl FinalizedUploadProducer {
                     *cursor = FinalizedUploadCursor {
                         state_next,
                         transaction_next,
+                        committee_next,
                     };
                     continue;
                 }
@@ -354,6 +426,7 @@ impl FinalizedUploadProducer {
                         position,
                         state_next = next.state_next,
                         transaction_next = next.transaction_next,
+                        committee_next = next.committee_next,
                         "queued finalized index upload"
                     );
                     return;
@@ -373,27 +446,22 @@ impl FinalizedUploadProducer {
 }
 
 async fn persist_finalized_cursor(
-    metadata: &Arc<Mutex<CursorMetadata>>,
+    metadata: &Arc<Mutex<Option<CursorMetadata>>>,
     cursor: FinalizedUploadCursor,
 ) {
-    loop {
-        let mut metadata = metadata.lock().await;
-        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        match metadata.sync().await {
-            Ok(()) => return,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    state_next = cursor.state_next,
-                    transaction_next = cursor.transaction_next,
-                    "failed to persist finalized index cursor, retrying",
-                );
-            }
-        }
-        drop(metadata);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    let mut slot = metadata.lock().await;
+    let mut store = slot
+        .take()
+        .expect("finalized index cursor metadata must be present");
+    store.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+    store.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+    store.put(CURSOR_COMMITTEE_KEY, U64::new(cursor.committee_next));
+    *slot = Some(
+        store
+            .sync()
+            .await
+            .expect("failed to persist finalized index cursor"),
+    );
 }
 
 async fn scan_finalized_queue_cursor(
@@ -406,7 +474,10 @@ async fn scan_finalized_queue_cursor(
                 cursor = Some(FinalizedUploadCursor::from_upload(&upload));
             }
             Ok(None) => {
-                reader.reset().await;
+                reader
+                    .reset()
+                    .await
+                    .expect("failed to reset finalized index queue reader");
                 return cursor;
             }
             Err(error) => {
@@ -626,12 +697,13 @@ async fn maybe_build_indexer(
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        metadata
+        metadata.put(CURSOR_COMMITTEE_KEY, U64::new(cursor.committee_next));
+        metadata = metadata
             .sync()
             .await
             .expect("failed to persist finalized index cursor");
     }
-    let metadata = Arc::new(Mutex::new(metadata));
+    let metadata = Arc::new(Mutex::new(Some(metadata)));
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         metadata,
@@ -654,10 +726,7 @@ async fn maybe_build_indexer(
     })
 }
 
-fn indexer_finalized_hook(
-    indexer: Option<&IndexerHandle>,
-) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
-{
+fn indexer_finalized_hook(indexer: Option<&IndexerHandle>) -> Option<EngineFinalizedHook> {
     let indexer = indexer?;
     let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
@@ -668,6 +737,21 @@ fn indexer_finalized_hook(
             databases,
         ))
     }))
+}
+
+fn track_finalized_height(
+    finalized_height: FinalizedHeight,
+    inner: Option<EngineFinalizedHook>,
+) -> EngineFinalizedHook {
+    Arc::new(move |block, databases| {
+        finalized_height.observe(block.height().get());
+        let inner = inner.clone();
+        Box::pin(async move {
+            if let Some(inner) = inner {
+                inner(block, databases).await;
+            }
+        })
+    })
 }
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
@@ -705,6 +789,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         .parent()
         .expect("config file has no parent directory");
     let storage_dir = config_dir.join(&decoded.partition_prefix);
+    let secret_store_dir = storage_dir.join("dkg-secrets");
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
         .with_worker_threads(worker_threads);
@@ -733,7 +818,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         info!(
             validator = %hex(&decoded.public_key.encode()),
             listen_bind = %decoded.listen_bind,
-            listen_advertise = %decoded.listen_advertise,
+            secondary_participants = decoded.secondary_participants.len(),
             http_listen = %http_listen,
             metrics_listen = %metrics_listen,
             "starting validator"
@@ -746,40 +831,52 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         );
 
         let p2p_config = if deployer_managed {
-            discovery::Config::recommended(
+            lookup::Config::recommended(
                 decoded.signer.clone(),
                 b"constantinople",
                 decoded.listen_bind,
-                Ingress::Socket(decoded.listen_advertise),
-                decoded.bootstrappers,
                 32 * 1024 * 1024,
             )
         } else {
-            discovery::Config::local(
+            lookup::Config::local(
                 decoded.signer.clone(),
                 b"constantinople",
                 decoded.listen_bind,
-                Ingress::Socket(decoded.listen_advertise),
-                decoded.bootstrappers,
                 32 * 1024 * 1024,
             )
         };
 
-        let (mut network, mut oracle) = discovery::Network::new(context.child("p2p"), p2p_config);
+        let (mut network, oracle) = lookup::Network::new(context.child("p2p"), p2p_config);
 
         let mempool_drop_grace_blocks =
             default_mempool_drop_grace_blocks(decoded.primary_participants.len());
         let primary: Set<ed25519::PublicKey> = decoded
             .primary_participants
-            .into_iter()
+            .iter()
+            .cloned()
             .try_collect()
             .unwrap();
-        let secondary: Set<ed25519::PublicKey> = decoded
-            .secondary_participants
-            .into_iter()
-            .try_collect()
-            .unwrap();
-        oracle.track(0, TrackedPeers::new(primary, secondary));
+        assert_eq!(
+            &primary,
+            decoded.dkg_output.players(),
+            "configured primary validators must match the epoch-zero DKG output",
+        );
+        let primary_addresses = Map::from_iter_dedup(primary.iter().map(|peer| {
+            let address = decoded
+                .eligible_peers
+                .get_value(peer)
+                .expect("primary participant missing eligible address")
+                .clone();
+            (peer.clone(), address)
+        }));
+        let genesis = EpochInfo {
+            outcome: EpochOutcome::Success,
+            epoch: Epoch::zero(),
+            output: decoded.dkg_output.clone(),
+            players: primary.clone(),
+            next_players: primary.clone(),
+            directory: Addresses::from(primary_addresses),
+        };
 
         // TODO: Add reasonable RL
         let quota = Quota::per_second(std::num::NonZeroU32::MAX);
@@ -792,26 +889,25 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota, backlog),
             state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
             transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
+            committee_resolver: network.register(COMMITTEE_RESOLVER_CHANNEL, quota, backlog),
+            dkg: network.register(DKG_CHANNEL, quota, backlog),
         };
-        let probe_network = network.register(PROBE_CHANNEL, quota, backlog);
-        let provider =
-            ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
-                &union(b"constantinople", b"_CONSENSUS"),
-                decoded.dkg_output.players().clone(),
-                decoded.dkg_output.public().clone(),
-            ));
-        let (probe, probe_mailbox) = Probe::new(ProbeConfig {
-            context: context.child("probe"),
-            provider,
-            strategy: strategy.clone(),
-            capacity: NZUsize!(32),
-            blocker: oracle.clone(),
-            minimum_epoch: Epoch::zero(),
-            retry_timeout: NZDuration!(Duration::from_secs(1)),
-        });
-        let probe_handle = probe.start(probe_network);
-        let probe_handle: CriticalTask = Box::pin(async move {
-            let _ = probe_handle.await;
+        let dkg_probe_network = network.register(DKG_PROBE_CHANNEL, quota, backlog);
+        let connected_state = Arc::new(StdMutex::new((dkg_probe_network.0.clone(), Vec::new())));
+        let local_public_key = decoded.public_key.clone();
+        let connected_peers: ConnectedPeersReader = Arc::new(move || {
+            let mut state = connected_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (sender, last_connected) = &mut *state;
+            if let Ok(checked) = sender.check(Recipients::All) {
+                *last_connected = checked.recipients();
+            }
+            let mut connected = last_connected.clone();
+            if !connected.contains(&local_public_key) {
+                connected.push(local_public_key.clone());
+            }
+            connected
         });
         let network_handle = network.start();
 
@@ -823,6 +919,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
         let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
+        let committee_reader: Arc<OnceLock<Arc<dyn CommitteeReader>>> = Arc::new(OnceLock::new());
         let mempool_actor = webserver::Actor::new(
             context.child("mempool"),
             webserver::Config {
@@ -836,6 +933,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             mempool_mailbox.clone(),
             mempool_receiver,
             account_reader.clone(),
+            committee_reader.clone(),
         );
         let is_primary = decoded.share.is_some();
         let mempool_handle: Pin<Box<dyn Future<Output = ()> + Send>> = if is_primary {
@@ -875,6 +973,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         };
         info!(startup_mode, "requested validator startup mode");
 
+        // FileSecretStore persists plaintext threshold material with restrictive
+        // local permissions. This is explicit bootstrap wiring, not production-
+        // grade secret management; deployments requiring encryption, rotation,
+        // or hardware isolation must replace it before handling real value.
+        let secret_store = FileSecretStore::load(secret_store_dir)
+            .expect("failed to initialize validator-local DKG secret store");
+
         // Build the indexer wiring up-front. This consumes `indexer` from the
         // loaded config and returns `None` for primaries or validators that
         // did not declare an `indexer` block.
@@ -886,7 +991,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             &indexer_partition_prefix,
         )
         .await;
-        let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
+        let finalized_height = FinalizedHeight::default();
+        let finalized_hook = track_finalized_height(
+            finalized_height.clone(),
+            indexer_finalized_hook(indexer_handle.as_ref()),
+        );
 
         info!("initializing engine");
         let engine = Engine::<
@@ -910,28 +1019,40 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 namespace: b"constantinople".to_vec(),
                 output: decoded.dkg_output,
                 share: decoded.share,
+                genesis,
+                eligible_peers: decoded.eligible_peers.clone(),
+                secret_store,
+                dkg_namespace: DKG_NAMESPACE,
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
                 strategy,
                 public_key_cache,
                 startup,
+                blocks_per_epoch: EPOCH_LENGTH,
                 sync_config: production_sync_config(),
                 prune_config: Some(PRUNE_CONFIG),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                block_codec: Default::default(),
+                block_codec: constantinople_primitives::BlockCfg {
+                    max_transactions: RangeCfg::new(0..=usize::MAX),
+                    payload: (
+                        NZU32!(64),
+                        commonware_cryptography::bls12381::primitives::sharing::ModeVersion::v0(),
+                        RangeCfg::new(0..=192),
+                    ),
+                },
                 prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                 state_page_cache_bytes,
                 other_page_cache_bytes,
-                probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
                     indexer_handle
                         .as_ref()
                         .map(|h| h.cert_reporter.clone())
                         .map(SimplexObserver::Indexer)
                 }),
-                finalized_hook,
+                finalized_hook: Some(finalized_hook),
             },
+            dkg_probe_network,
         )
         .await;
 
@@ -940,38 +1061,45 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // listener can come up immediately; account lookups return 503 until
         // the cell is populated.
         let subscribe_fut = engine.subscribe_databases_detached();
+        let subscribe_committee_fut = engine.subscribe_committee_detached();
         let account_reader_setter = account_reader.clone();
+        let committee_reader_setter = committee_reader.clone();
+        let committee_eligible = decoded.eligible_peers.clone();
+        let genesis_current = primary.clone();
+        let genesis_scheduled = primary;
         let _account_reader_setup = tokio::spawn(async move {
-            let db = subscribe_fut.await;
-            let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(db));
-            let _ = account_reader_setter.set(reader);
-            info!("account reader attached");
+            let (db, committee) = tokio::join!(subscribe_fut, subscribe_committee_fut);
+            let reader = Arc::new(StateDbReader::new(
+                db,
+                committee,
+                finalized_height,
+                committee_eligible,
+                genesis_current,
+                genesis_scheduled,
+                connected_peers,
+            ));
+            let account: Arc<dyn AccountReader> = reader.clone();
+            let committee: Arc<dyn CommitteeReader> = reader;
+            let _ = account_reader_setter.set(account);
+            let _ = committee_reader_setter.set(committee);
+            info!("state readers attached");
         });
 
         info!("starting engine");
         // Primaries report to the local mempool. Secondaries upload index data
         // from the finalized hook and do not need marshal updates here.
-        let reporter: Option<Mailbox<Commitment, PublicKey, Sha256>> = if is_primary {
-            Some(mempool_mailbox.clone())
+        let reporter: Option<MempoolReporter> = if is_primary {
+            Some(MempoolReporter(mempool_mailbox.clone()))
         } else {
             None
         };
         let engine_handle = engine.start(channels, reporter);
 
-        wait_for_critical_task_exit(
-            Some(probe_handle),
-            engine_handle,
-            mempool_handle,
-            network_handle,
-        )
-        .await;
+        wait_for_critical_task_exit(engine_handle, mempool_handle, network_handle).await;
     });
 }
 
-type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
-
 async fn wait_for_critical_task_exit<E, M, N>(
-    probe_handle: Option<CriticalTask>,
     engine_handle: E,
     mempool_handle: M,
     network_handle: N,
@@ -980,9 +1108,7 @@ async fn wait_for_critical_task_exit<E, M, N>(
     M: Future,
     N: Future,
 {
-    let mut probe_handle = probe_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
     tokio::select! {
-        _ = probe_handle.as_mut() => tracing::warn!("probe exited"),
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
         _ = network_handle => tracing::warn!("network exited"),
@@ -1004,9 +1130,9 @@ mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, default_mempool_drop_grace_blocks,
-        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
-        wait_for_critical_task_exit,
+        FinalizedQueueWriter, FinalizedUploadCursor, ValidatorPayload,
+        default_mempool_drop_grace_blocks, maybe_build_indexer, recovered_finalized_upload_cursor,
+        scan_finalized_queue_cursor, wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
     use commonware_codec::{FixedSize as _, Read as _, Write as _};
@@ -1017,7 +1143,7 @@ mod tests {
     };
     use commonware_cryptography::{
         Digest as _, Signer as _,
-        ed25519::PrivateKey,
+        ed25519::{PrivateKey, PublicKey},
         sha256::{Digest as Sha256Digest, Sha256},
     };
     use commonware_runtime::{Runner as _, Supervisor as _};
@@ -1050,7 +1176,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_critical_task_exit(None, pending::<()>(), pending::<()>(), pending::<()>()),
+            wait_for_critical_task_exit(pending::<()>(), pending::<()>(), pending::<()>()),
         )
         .await;
 
@@ -1087,20 +1213,30 @@ mod tests {
         let older = FinalizedUploadCursor {
             state_next: 10,
             transaction_next: 20,
+            committee_next: 30,
         };
         let newer_state = FinalizedUploadCursor {
             state_next: 11,
             transaction_next: 1,
+            committee_next: 1,
         };
         let newer_transaction = FinalizedUploadCursor {
             state_next: 10,
             transaction_next: 21,
+            committee_next: 1,
+        };
+        let newer_committee = FinalizedUploadCursor {
+            state_next: 10,
+            transaction_next: 20,
+            committee_next: 31,
         };
 
         assert_eq!(older.max(newer_state), newer_state);
         assert_eq!(older.max(newer_transaction), newer_transaction);
+        assert_eq!(older.max(newer_committee), newer_committee);
         assert_eq!(newer_state.max(older), newer_state);
         assert_eq!(newer_transaction.max(older), newer_transaction);
+        assert_eq!(newer_committee.max(older), newer_committee);
     }
 
     #[test]
@@ -1108,10 +1244,12 @@ mod tests {
         let metadata = FinalizedUploadCursor {
             state_next: 10,
             transaction_next: 20,
+            committee_next: 30,
         };
         let queue = FinalizedUploadCursor {
             state_next: 11,
             transaction_next: 1,
+            committee_next: 1,
         };
 
         assert_eq!(
@@ -1134,15 +1272,30 @@ mod tests {
     }
 
     #[test]
-    fn finalized_upload_cursor_ignores_partial_metadata_pairs() {
-        assert_eq!(FinalizedUploadCursor::from_parts(None, None), None);
-        assert_eq!(FinalizedUploadCursor::from_parts(Some(10), None), None);
-        assert_eq!(FinalizedUploadCursor::from_parts(None, Some(20)), None);
+    fn finalized_upload_cursor_ignores_partial_metadata_triples() {
+        assert_eq!(FinalizedUploadCursor::from_parts(None, None, None), None);
         assert_eq!(
-            FinalizedUploadCursor::from_parts(Some(10), Some(20)),
+            FinalizedUploadCursor::from_parts(Some(10), None, None),
+            None
+        );
+        assert_eq!(
+            FinalizedUploadCursor::from_parts(None, Some(20), None),
+            None
+        );
+        assert_eq!(
+            FinalizedUploadCursor::from_parts(None, None, Some(30)),
+            None
+        );
+        assert_eq!(
+            FinalizedUploadCursor::from_parts(Some(10), Some(20), None),
+            None,
+        );
+        assert_eq!(
+            FinalizedUploadCursor::from_parts(Some(10), Some(20), Some(30)),
             Some(FinalizedUploadCursor {
                 state_next: 10,
                 transaction_next: 20,
+                committee_next: 30,
             }),
         );
     }
@@ -1169,8 +1322,8 @@ mod tests {
                 )
                 .await
                 .expect("queue initializes");
-            let first = queued_upload(1, 0, 2, 0, 2);
-            let second = queued_upload(2, 2, 5, 2, 3);
+            let first = queued_upload(1, 0, 2, 0, 2, 0, 2);
+            let second = queued_upload(2, 2, 5, 2, 3, 2, 4);
             writer.enqueue(first.clone()).await.expect("enqueue first");
             writer
                 .enqueue(second.clone())
@@ -1200,6 +1353,8 @@ mod tests {
         state_end: u64,
         transaction_start: u64,
         transaction_end: u64,
+        committee_start: u64,
+        committee_end: u64,
     ) -> EngineQueuedUpload {
         let leader = PrivateKey::from_seed(height).public_key();
         let parent_commitment = Commitment::from((
@@ -1208,7 +1363,7 @@ mod tests {
             Sha256Digest::EMPTY,
             coding_config_for_participants(4),
         ));
-        let header = Header {
+        let header: Header<Commitment, Sha256Digest, PublicKey, ValidatorPayload> = Header {
             context: SimplexContext {
                 round: Round::zero(),
                 leader,
@@ -1221,6 +1376,9 @@ mod tests {
             state_range: non_empty_range!(state_start, state_end),
             transactions_root: Sha256Digest::EMPTY,
             transactions_range: non_empty_range!(transaction_start, transaction_end),
+            committee_root: Sha256Digest::EMPTY,
+            committee_range: non_empty_range!(committee_start, committee_end),
+            payload: None,
         };
         let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
             .seal(&mut Sha256::default());
@@ -1233,7 +1391,9 @@ mod tests {
         0i64.write(&mut encoded);
         state_start.write(&mut encoded);
         transaction_start.write(&mut encoded);
+        committee_start.write(&mut encoded);
         state_delta.write(&mut encoded);
+        Vec::<constantinople_application::consensus::CommitteeOperation>::new().write(&mut encoded);
 
         let mut encoded = encoded.freeze();
         EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())

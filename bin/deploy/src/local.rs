@@ -2,7 +2,7 @@ use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
-    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
+    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, eligible_peer_entries,
     ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
     total_secondaries, validate_generate_args, write_simplex_verification_material,
     write_yaml_config,
@@ -69,7 +69,7 @@ fn build_validators(
 ) -> Vec<GeneratedValidator> {
     let mut validators = Vec::with_capacity(args.validators as usize);
 
-    let bootstrappers = default_bootstrappers(&material.public_keys);
+    let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
 
@@ -116,7 +116,7 @@ fn build_validators(
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
-            bootstrappers: bootstrappers.clone(),
+            eligible_peers: eligible_peers.clone(),
             indexer: None,
             relayer: None,
         };
@@ -143,7 +143,7 @@ fn build_secondaries(
 ) -> Vec<GeneratedValidator> {
     let roles = secondary_roles(args);
     let mut secondaries = Vec::with_capacity(roles.len());
-    let bootstrappers = default_bootstrappers(&material.public_keys);
+    let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
     // Secondary ports start after the primary range to avoid collisions on
@@ -192,7 +192,7 @@ fn build_secondaries(
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
-            bootstrappers: bootstrappers.clone(),
+            eligible_peers: eligible_peers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| local_indexer_config(local.chain_indexer_port)),
             relayer: matches!(role, SecondaryRole::Relayer)
@@ -764,6 +764,16 @@ mod tests {
 
         // Primaries never get indexer wiring.
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+        assert!(
+            validators
+                .iter()
+                .all(|v| v.config.eligible_peers.len() == 4)
+        );
+        assert!(
+            secondaries
+                .iter()
+                .all(|v| v.config.eligible_peers.len() == 4)
+        );
 
         // Secondaries point at the configured shared store URL.
         let indexer = secondaries[0]

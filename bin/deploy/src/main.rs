@@ -56,7 +56,6 @@ const SIMPLEX_VERIFICATION_MATERIAL_FILE: &str = "simplex-verification-material.
 const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
-const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
@@ -351,10 +350,10 @@ fn parse_sampling_rate(value: &str) -> Result<f64, String> {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct NamedBootstrapperEntry {
-    /// Hex-encoded ed25519 public key of the bootstrapper.
+pub(crate) struct EligiblePeerEntry {
+    /// Hex-encoded ed25519 public key of the eligible peer.
     public_key: String,
-    /// Host name used to resolve the bootstrapper's address.
+    /// Host name used to resolve the peer's immutable p2p address.
     name: String,
 }
 
@@ -379,7 +378,7 @@ pub(crate) struct ValidatorConfig {
     num_validators: u32,
     /// Hex-encoded ed25519 public keys of the primary (voting) validators,
     /// in DKG order. Must be identical across every validator config in the
-    /// deployment so all peers agree on the discovery bitvec ordering.
+    /// deployment so all peers agree on the epoch-zero committee ordering.
     primary_validators: Vec<String>,
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
@@ -409,8 +408,8 @@ pub(crate) struct ValidatorConfig {
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
-    /// Bootstrapper peers used for initial p2p discovery.
-    bootstrappers: Vec<NamedBootstrapperEntry>,
+    /// Complete immutable catalog of peers eligible for committee membership.
+    eligible_peers: Vec<EligiblePeerEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.
     /// Primaries always leave this unset; the validator runtime ignores it for
@@ -709,15 +708,14 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
     hex(&dkg_output.public().public().encode())
 }
 
-pub(crate) fn default_bootstrappers(
-    public_keys: &[ed25519::PublicKey],
-) -> Vec<NamedBootstrapperEntry> {
-    public_keys
+pub(crate) fn eligible_peer_entries(material: &ClusterMaterial) -> Vec<EligiblePeerEntry> {
+    material
+        .public_keys
         .iter()
-        .take(DEFAULT_BOOTSTRAPPERS.min(public_keys.len()))
+        .chain(&material.secondary_public_keys)
         .map(|public_key| {
             let name = hex(&public_key.encode());
-            NamedBootstrapperEntry {
+            EligiblePeerEntry {
                 public_key: name.clone(),
                 name,
             }
@@ -753,7 +751,7 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
+        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE, eligible_peer_entries,
         generate_local_cluster_material, simplex_verification_material_from_config,
         write_simplex_verification_material,
     };
@@ -976,6 +974,29 @@ mod tests {
 
         fs::remove_file(path).expect("failed to remove material");
         fs::remove_dir(output_dir).expect("failed to remove temp dir");
+    }
+
+    #[test]
+    fn eligible_catalog_contains_every_generated_identity() {
+        let material = generate_local_cluster_material(4, 2);
+
+        let eligible = eligible_peer_entries(&material);
+
+        assert_eq!(eligible.len(), 6);
+        let expected = material
+            .public_keys
+            .iter()
+            .chain(&material.secondary_public_keys)
+            .map(|public_key| hex(&public_key.encode()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            eligible
+                .iter()
+                .map(|entry| entry.public_key.clone())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert!(eligible.iter().all(|entry| entry.public_key == entry.name));
     }
 
     #[test]

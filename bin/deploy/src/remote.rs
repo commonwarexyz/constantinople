@@ -7,7 +7,7 @@ use crate::{
     QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
+    eligible_peer_entries, ensure_output_dir_missing, generate_deployer_tag,
     generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
     validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
@@ -135,7 +135,7 @@ fn build_validators(
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
     let mut validators = Vec::with_capacity(args.validators as usize);
-    let bootstrappers = default_bootstrappers(&material.public_keys);
+    let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
 
@@ -170,7 +170,7 @@ fn build_validators(
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
-            bootstrappers: bootstrappers.clone(),
+            eligible_peers: eligible_peers.clone(),
             indexer: None,
             relayer: None,
         };
@@ -196,7 +196,7 @@ fn build_secondaries(
 ) -> Vec<GeneratedValidator> {
     let roles = secondary_roles(args);
     let mut secondaries = Vec::with_capacity(roles.len());
-    let bootstrappers = default_bootstrappers(&material.public_keys);
+    let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
     for (secondary_index, role) in roles.into_iter().enumerate() {
@@ -226,7 +226,7 @@ fn build_secondaries(
             other_page_cache_bytes: args.other_page_cache_bytes,
             public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
-            bootstrappers: bootstrappers.clone(),
+            eligible_peers: eligible_peers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
                 .then(|| remote_indexer_config(remote.chain_indexer_port)),
             relayer: matches!(role, SecondaryRole::Relayer)
@@ -485,7 +485,10 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, build_validators, port_configs,
+        remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
@@ -588,7 +591,7 @@ mod tests {
                 other_page_cache_bytes: default_page_cache_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
-                bootstrappers: Vec::new(),
+                eligible_peers: Vec::new(),
                 indexer: None,
                 relayer: None,
             },
@@ -631,8 +634,8 @@ mod tests {
         let mut args = generate_args();
         args.relayer = true;
         let remote = remote_args();
-        let validators = vec![validator(0), validator(1), validator(2)];
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let validators = build_validators(&args, &remote, Path::new("/tmp"), &material);
         let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
         let config = build_deployer_config(
             &args,
@@ -655,6 +658,12 @@ mod tests {
             .expect("relayer secondary instance should be present");
         assert_eq!(instance.binary, VALIDATOR_BINARY_FILE);
         assert_eq!(instance.config, relayer.config_name);
+        assert!(
+            validators
+                .iter()
+                .chain(&secondaries)
+                .all(|validator| validator.config.eligible_peers.len() == 4)
+        );
     }
 
     #[test]

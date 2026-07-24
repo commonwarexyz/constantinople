@@ -12,8 +12,8 @@ use commonware_cryptography::{
 };
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
-use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
-use commonware_utils::NZU32;
+use commonware_p2p::Address;
+use commonware_utils::{NZU32, TryCollect, ordered::Map};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::Path};
 
@@ -98,7 +98,7 @@ pub struct ValidatorConfig {
     pub num_validators: u32,
     /// Hex-encoded ed25519 public keys of the primary (voting) validators,
     /// in DKG order. Must be identical across every validator config in the
-    /// deployment so all peers agree on the discovery bitvec ordering.
+    /// deployment so all peers agree on the epoch-zero committee ordering.
     pub primary_validators: Vec<String>,
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
@@ -135,8 +135,8 @@ pub struct ValidatorConfig {
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
     pub traces: f64,
-    /// Bootstrapper peers used for initial p2p discovery.
-    pub bootstrappers: Vec<NamedBootstrapperEntry>,
+    /// Complete immutable catalog of peers eligible for committee membership.
+    pub eligible_peers: Vec<EligiblePeerEntry>,
     /// Optional indexer wiring. Honored only for secondary (non-voting)
     /// validators when this section is present.
     #[serde(default)]
@@ -164,10 +164,10 @@ pub struct RelayerLeaderConfig {
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-pub struct NamedBootstrapperEntry {
-    /// Hex-encoded ed25519 public key of the bootstrapper.
+pub struct EligiblePeerEntry {
+    /// Hex-encoded ed25519 public key of the eligible peer.
     pub public_key: String,
-    /// Host name used to resolve the bootstrapper's address.
+    /// Host name used to resolve the peer's immutable p2p address.
     pub name: String,
 }
 
@@ -204,14 +204,12 @@ pub struct DecodedConfig {
     pub genesis_leader: ed25519::PublicKey,
     /// Local p2p bind address.
     pub listen_bind: SocketAddr,
-    /// Advertised p2p address other peers dial.
-    pub listen_advertise: SocketAddr,
     /// Primary (voting) validators in DKG order.
     pub primary_participants: Vec<ed25519::PublicKey>,
     /// Secondary (non-voting) validators.
     pub secondary_participants: Vec<ed25519::PublicKey>,
-    /// Bootstrapper peers with resolved addresses.
-    pub bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    /// Immutable address catalog for every peer eligible to join a committee.
+    pub eligible_peers: Map<ed25519::PublicKey, Address>,
     /// Storage partition prefix for this validator.
     pub partition_prefix: String,
 }
@@ -321,10 +319,9 @@ fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::Ip
 
 fn decode_with_network(
     config: ValidatorConfig,
-    public_listen: SocketAddr,
     primary_participants: Vec<ed25519::PublicKey>,
     secondary_participants: Vec<ed25519::PublicKey>,
-    bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
+    eligible_peers: Map<ed25519::PublicKey, Address>,
     otel: Option<(String, f64)>,
     json_logs: bool,
 ) -> LoadedConfig {
@@ -357,10 +354,9 @@ fn decode_with_network(
             share,
             genesis_leader,
             listen_bind,
-            listen_advertise: public_listen,
             primary_participants,
             secondary_participants,
-            bootstrappers,
+            eligible_peers,
             partition_prefix: config.partition_prefix,
         },
         startup: config.startup,
@@ -406,6 +402,22 @@ fn decode_participants(
     (primary, secondary)
 }
 
+/// Ensure every peer active at genesis has an immutable address. The eligible
+/// catalog may be a superset so future committee members can be registered
+/// without changing genesis configuration.
+fn validate_eligible_catalog(
+    primary: &[ed25519::PublicKey],
+    secondary: &[ed25519::PublicKey],
+    eligible: &Map<ed25519::PublicKey, Address>,
+) {
+    for public_key in primary.iter().chain(secondary) {
+        if eligible.get_value(public_key).is_none() {
+            let public_key = hex(&public_key.encode());
+            panic!("participant '{public_key}' missing from eligible_peers");
+        }
+    }
+}
+
 pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig {
     let config = load_validator_config(config_path);
     let signer = decode_private_key(&config.private_key);
@@ -434,28 +446,33 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
     let self_peer = peers_by_name
         .get(&self_name)
         .unwrap_or_else(|| panic!("missing self peer '{self_name}'"));
-    let public_listen = parse_socket("self p2p", &self_peer.p2p);
+    let _self_p2p = parse_socket("self p2p", &self_peer.p2p);
     let _self_http = parse_socket("self http", &self_peer.http);
 
-    let bootstrappers = config
-        .bootstrappers
+    let eligible_peers = config
+        .eligible_peers
         .iter()
-        .map(|bootstrapper| {
-            let public_key = decode_public_key("bootstrapper public_key", &bootstrapper.public_key);
+        .map(|eligible| {
+            let public_key = decode_public_key("eligible public_key", &eligible.public_key);
             let peer = peers_by_name
-                .get(&bootstrapper.name)
-                .unwrap_or_else(|| panic!("missing bootstrapper peer '{}'", bootstrapper.name));
-            let address = parse_socket("bootstrapper p2p", &peer.p2p);
-            (public_key, Ingress::Socket(address))
+                .get(&eligible.name)
+                .unwrap_or_else(|| panic!("missing eligible peer '{}'", eligible.name));
+            let address = parse_socket("eligible peer p2p", &peer.p2p);
+            (public_key, Address::Symmetric(address))
         })
-        .collect();
+        .try_collect()
+        .expect("eligible_peers contains duplicate public keys");
+    validate_eligible_catalog(
+        &primary_participants,
+        &secondary_participants,
+        &eligible_peers,
+    );
 
     decode_with_network(
         config,
-        public_listen,
         primary_participants,
         secondary_participants,
-        bootstrappers,
+        eligible_peers,
         None,
         false,
     )
@@ -491,23 +508,28 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         }
     }
 
-    let self_ip = hosts_by_name
+    let _self_ip = hosts_by_name
         .get(self_name.as_str())
         .unwrap_or_else(|| panic!("missing self host '{self_name}'"));
-    let public_listen = SocketAddr::new(*self_ip, config.listen_port);
 
-    let bootstrappers = config
-        .bootstrappers
+    let eligible_peers = config
+        .eligible_peers
         .iter()
-        .map(|bootstrapper| {
-            let public_key = decode_public_key("bootstrapper public_key", &bootstrapper.public_key);
+        .map(|eligible| {
+            let public_key = decode_public_key("eligible public_key", &eligible.public_key);
             let ip = hosts_by_name
-                .get(bootstrapper.name.as_str())
-                .unwrap_or_else(|| panic!("missing bootstrapper host '{}'", bootstrapper.name));
+                .get(eligible.name.as_str())
+                .unwrap_or_else(|| panic!("missing eligible host '{}'", eligible.name));
             let address = SocketAddr::new(*ip, config.listen_port);
-            (public_key, Ingress::Socket(address))
+            (public_key, Address::Symmetric(address))
         })
-        .collect();
+        .try_collect()
+        .expect("eligible_peers contains duplicate public keys");
+    validate_eligible_catalog(
+        &primary_participants,
+        &secondary_participants,
+        &eligible_peers,
+    );
 
     let otel = (config.traces > 0.0).then(|| {
         (
@@ -518,10 +540,9 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 
     decode_with_network(
         config,
-        public_listen,
         primary_participants,
         secondary_participants,
-        bootstrappers,
+        eligible_peers,
         otel,
         true,
     )
@@ -530,7 +551,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
+        EligiblePeerEntry, IndexerConfig, StartupModeConfig, ValidatorConfig,
         default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
         default_public_key_cache_size, default_upload_buffer, load_deployer_config,
         load_local_config,
@@ -549,7 +570,6 @@ mod tests {
     use std::{
         collections::BTreeMap,
         fs,
-        net::SocketAddr,
         path::PathBuf,
         sync::atomic::{AtomicU64, Ordering},
         time::{SystemTime, UNIX_EPOCH},
@@ -626,12 +646,20 @@ mod tests {
                 .collect()
         }
 
-        /// Build a [`ValidatorConfig`] for primary slot `index`, with the given bootstrapper list.
+        fn eligible_entries(&self) -> Vec<EligiblePeerEntry> {
+            self.primary_keys
+                .iter()
+                .chain(&self.secondary_keys)
+                .map(eligible_peer_entry)
+                .collect()
+        }
+
+        /// Build a [`ValidatorConfig`] for primary slot `index`.
         fn primary_config(
             &self,
             index: usize,
             startup: StartupModeConfig,
-            bootstrappers: Vec<NamedBootstrapperEntry>,
+            eligible_peers: Vec<EligiblePeerEntry>,
         ) -> ValidatorConfig {
             let signer = &self.primary_signers[index];
             let share = self.shares.get(&self.primary_keys[index]).expect("share");
@@ -657,7 +685,7 @@ mod tests {
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
-                bootstrappers,
+                eligible_peers,
                 indexer: None,
                 relayer: None,
             }
@@ -668,7 +696,7 @@ mod tests {
             &self,
             index: usize,
             startup: StartupModeConfig,
-            bootstrappers: Vec<NamedBootstrapperEntry>,
+            eligible_peers: Vec<EligiblePeerEntry>,
         ) -> ValidatorConfig {
             let signer = &self.secondary_signers[index];
             ValidatorConfig {
@@ -693,23 +721,32 @@ mod tests {
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
-                bootstrappers,
+                eligible_peers,
                 indexer: None,
                 relayer: None,
             }
         }
     }
 
-    fn bootstrapper_entry(public_key: &ed25519::PublicKey) -> NamedBootstrapperEntry {
+    fn eligible_peer_entry(public_key: &ed25519::PublicKey) -> EligiblePeerEntry {
         let name = hex(&public_key.encode());
-        NamedBootstrapperEntry {
+        EligiblePeerEntry {
             public_key: name.clone(),
             name,
         }
     }
 
     #[test]
-    fn local_config_resolves_bootstrapper_peers() {
+    #[should_panic(expected = "missing from eligible_peers")]
+    fn eligible_catalog_must_cover_genesis_participants() {
+        let cluster = Cluster::new(1, 0);
+        let eligible = commonware_utils::ordered::Map::default();
+
+        super::validate_eligible_catalog(&cluster.primary_keys, &[], &eligible);
+    }
+
+    #[test]
+    fn local_config_resolves_complete_eligible_catalog() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
         let peer_key = &cluster.primary_keys[1];
@@ -719,7 +756,7 @@ mod tests {
         let mut config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(peer_key)],
+            cluster.eligible_entries(),
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
@@ -755,26 +792,25 @@ mod tests {
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
-        assert_eq!(
-            loaded.decoded.listen_advertise,
-            "127.0.0.1:9000".parse::<SocketAddr>().unwrap()
-        );
         assert!(loaded.decoded.share.is_some());
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert!(loaded.decoded.primary_participants.contains(self_key));
         assert!(loaded.decoded.primary_participants.contains(peer_key));
         assert!(loaded.decoded.secondary_participants.is_empty());
         assert_eq!(
-            loaded.decoded.bootstrappers[0].1,
-            commonware_p2p::Ingress::Socket("127.0.0.1:9001".parse().unwrap())
+            loaded.decoded.eligible_peers.get_value(peer_key),
+            Some(&commonware_p2p::Address::Symmetric(
+                "127.0.0.1:9001".parse().unwrap()
+            ))
         );
+        assert_eq!(loaded.decoded.eligible_peers.len(), 2);
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(peers_path);
     }
 
     #[test]
-    fn deployer_config_resolves_bootstrapper_hosts() {
+    fn deployer_config_resolves_complete_eligible_catalog() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
         let peer_key = &cluster.primary_keys[1];
@@ -786,7 +822,7 @@ mod tests {
         let mut config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(peer_key)],
+            cluster.eligible_entries(),
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
@@ -823,19 +859,18 @@ hosts:
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
-        assert_eq!(
-            loaded.decoded.listen_advertise,
-            "203.0.113.1:9000".parse::<SocketAddr>().unwrap()
-        );
         assert!(loaded.decoded.share.is_some());
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert!(loaded.decoded.primary_participants.contains(self_key));
         assert!(loaded.decoded.primary_participants.contains(peer_key));
         assert!(loaded.decoded.secondary_participants.is_empty());
         assert_eq!(
-            loaded.decoded.bootstrappers[0].1,
-            commonware_p2p::Ingress::Socket("203.0.113.2:9000".parse().unwrap())
+            loaded.decoded.eligible_peers.get_value(peer_key),
+            Some(&commonware_p2p::Address::Symmetric(
+                "203.0.113.2:9000".parse().unwrap()
+            ))
         );
+        assert_eq!(loaded.decoded.eligible_peers.len(), 2);
         assert!(loaded.otel.is_none());
 
         let _ = fs::remove_file(config_path);
@@ -855,7 +890,7 @@ hosts:
         let mut config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(peer_key)],
+            cluster.eligible_entries(),
         );
         config.traces = 0.25;
         fs::write(
@@ -892,13 +927,13 @@ hosts:
     }
 
     #[test]
-    fn deployer_config_tracks_all_participants_not_only_bootstrappers() {
+    fn deployer_config_catalog_includes_all_participants() {
         let cluster = Cluster::new(3, 0);
         let self_key = &cluster.primary_keys[0];
-        let bootstrapper_key = &cluster.primary_keys[1];
+        let eligible_peer_key = &cluster.primary_keys[1];
         let third_key = &cluster.primary_keys[2];
         let self_name = hex(&self_key.encode());
-        let bootstrapper_name = hex(&bootstrapper_key.encode());
+        let eligible_peer_name = hex(&eligible_peer_key.encode());
         let third_name = hex(&third_key.encode());
         let config_path = temp_path("validator-config", ".yaml");
         let hosts_path = temp_path("validator-hosts", ".yaml");
@@ -906,7 +941,7 @@ hosts:
         let config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(bootstrapper_key)],
+            cluster.eligible_entries(),
         );
         fs::write(
             &config_path,
@@ -923,7 +958,7 @@ hosts:
   - name: "{self_name}"
     region: us-east-1
     ip: 203.0.113.1
-  - name: "{bootstrapper_name}"
+  - name: "{eligible_peer_name}"
     region: us-west-2
     ip: 203.0.113.2
   - name: "{third_name}"
@@ -942,10 +977,10 @@ hosts:
             loaded
                 .decoded
                 .primary_participants
-                .contains(bootstrapper_key)
+                .contains(eligible_peer_key)
         );
         assert!(loaded.decoded.primary_participants.contains(third_key));
-        assert_eq!(loaded.decoded.bootstrappers.len(), 1);
+        assert_eq!(loaded.decoded.eligible_peers.len(), 3);
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);
@@ -964,7 +999,7 @@ hosts:
         let config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(peer_key)],
+            cluster.eligible_entries(),
         );
         fs::write(
             &config_path,
@@ -1011,11 +1046,8 @@ hosts:
         let config_path = temp_path("validator-config", ".yaml");
         let peers_path = temp_path("validator-peers", ".yaml");
 
-        let config = cluster.primary_config(
-            0,
-            StartupModeConfig::StateSync,
-            vec![bootstrapper_entry(peer_key)],
-        );
+        let config =
+            cluster.primary_config(0, StartupModeConfig::StateSync, cluster.eligible_entries());
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -1061,7 +1093,7 @@ hosts:
         let mut config = cluster.secondary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(primary0_key)],
+            cluster.eligible_entries(),
         );
         config.indexer = Some(IndexerConfig {
             chain_indexer_url: "http://chain-indexer:8090".to_string(),
@@ -1123,7 +1155,7 @@ hosts:
         let config = cluster.secondary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(primary0_key)],
+            cluster.eligible_entries(),
         );
         fs::write(
             &config_path,
@@ -1161,11 +1193,7 @@ hosts:
         assert!(loaded.decoded.primary_participants.contains(primary1_key));
         assert_eq!(loaded.decoded.secondary_participants.len(), 1);
         assert!(loaded.decoded.secondary_participants.contains(self_key));
-        // Self IP resolved from hosts file via the secondary's hex name.
-        assert_eq!(
-            loaded.decoded.listen_advertise,
-            "203.0.113.3:9000".parse::<SocketAddr>().unwrap()
-        );
+        assert_eq!(loaded.decoded.eligible_peers.len(), 3);
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);
@@ -1191,7 +1219,7 @@ hosts:
         let config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(primary1_key)],
+            cluster.eligible_entries(),
         );
         fs::write(
             &config_path,
@@ -1268,7 +1296,7 @@ hosts:
         let config = cluster.primary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(primary1_key)],
+            cluster.eligible_entries(),
         );
         fs::write(
             &config_path,
@@ -1337,7 +1365,7 @@ hosts:
         let config = cluster.secondary_config(
             0,
             StartupModeConfig::MarshalSync,
-            vec![bootstrapper_entry(primary0_key)],
+            cluster.eligible_entries(),
         );
         fs::write(
             &config_path,
@@ -1373,8 +1401,10 @@ secondaries:
         assert_eq!(loaded.decoded.secondary_participants.len(), 1);
         assert!(loaded.decoded.secondary_participants.contains(self_key));
         assert_eq!(
-            loaded.decoded.listen_advertise,
-            "127.0.0.1:9100".parse::<SocketAddr>().unwrap()
+            loaded.decoded.eligible_peers.get_value(self_key),
+            Some(&commonware_p2p::Address::Symmetric(
+                "127.0.0.1:9100".parse().unwrap()
+            ))
         );
 
         let _ = fs::remove_file(config_path);

@@ -483,8 +483,8 @@ npm --prefix explorer run dev
 
 Secondary validators join the P2P network and observe consensus, but do **not** participate in
 consensus. They receive an ed25519 identity during setup but **no DKG share**, so they cannot sign
-consensus messages. They are registered through the `p2p::discovery` secondary peer set, which
-every node (primary and secondary) tracks identically.
+consensus messages. Every generated node carries the same immutable `eligible_peers` catalog,
+which maps each primary and secondary identity to the host used to resolve its lookup address.
 
 Secondaries do **not** run the mempool HTTP webserver — since they cannot propose blocks, they
 have no need to ingest transactions. Submit transactions to a primary validator instead.
@@ -505,7 +505,7 @@ cargo run --bin constantinople-deploy -- generate \
 
 This writes `secondary-0.yaml` and/or `secondary-1.yaml` alongside the primary
 `validator-*.yaml` files. `peers.yaml` gains a `secondaries:` block that every
-node consumes to populate the secondary peer set.
+node consumes to resolve the corresponding entries in `eligible_peers`.
 
 Run a secondary manually (same binary, same flags as a primary):
 
@@ -523,9 +523,10 @@ flags.
 
 Notes:
 
-- Every node in the deployment (primary and secondary) must agree on the full primary+secondary
-  set. The deploy tool emits identical lists into every YAML to guarantee this. Editing one
-  config in isolation will break `discovery`.
+- Every node in the deployment (primary and secondary) must agree on the full `eligible_peers`
+  catalog. The deploy tool emits the complete catalog into every YAML. Changing an identity or
+  address requires a coordinated new genesis/restart; editing one config in isolation will break
+  lookup connectivity and committee eligibility.
 - The DKG polynomial is sized to the primary count only — adding secondaries does not change
   consensus quorum thresholds.
 
