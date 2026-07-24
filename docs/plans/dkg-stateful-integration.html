@@ -1,0 +1,717 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Constantinople DKG + Stateful Integration Plan</title>
+  <style>
+    :root {
+      --background: oklch(0.97 0.005 260);
+      --foreground: oklch(0.18 0.02 260);
+      --card: oklch(1 0 0);
+      --card-foreground: oklch(0.18 0.02 260);
+      --muted: oklch(0.94 0.008 260);
+      --muted-foreground: oklch(0.46 0.02 260);
+      --border: oklch(0.86 0.012 260);
+      --primary: oklch(0.52 0.16 264);
+      --primary-foreground: oklch(0.98 0.005 260);
+      --accent: oklch(0.58 0.14 200);
+      --success: oklch(0.57 0.14 150);
+      --warning: oklch(0.7 0.16 75);
+      --destructive: oklch(0.58 0.2 25);
+      --code-bg: oklch(0.18 0.02 260);
+      --radius: 10px;
+      --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+      --font-mono: 'JetBrains Mono', 'Fira Code', ui-monospace, monospace;
+      --font-display: ui-serif, Georgia, 'Times New Roman', serif;
+    }
+
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--background);
+      color: var(--foreground);
+      line-height: 1.65;
+      font-size: 15px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container { max-width: 1080px; margin: 0 auto; padding: 64px 24px 96px; }
+    header { margin-bottom: 8px; }
+    .eyebrow, .prompt-label, .stat-label, .section-number, .when, .tag,
+    .badge, .decide-with, .micro, .mock-kicker, .phase-label {
+      font-family: var(--font-mono);
+    }
+
+    .eyebrow {
+      font-size: 0.72rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted-foreground);
+    }
+
+    h1, h2, h3, .stat-value { font-family: var(--font-display); font-weight: 500; }
+    header h1 { font-size: 2.35rem; margin: 8px 0 24px; line-height: 1.12; max-width: 780px; }
+    .lede { max-width: 70ch; font-size: 1.02rem; color: var(--muted-foreground); margin-bottom: 24px; }
+
+    .prompt-box {
+      background: var(--muted);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 24px;
+    }
+
+    .prompt-label {
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted-foreground);
+      display: block;
+      margin-bottom: 4px;
+    }
+
+    .prompt-box p { font-size: 0.92rem; color: var(--muted-foreground); line-height: 1.55; }
+
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+      gap: 16px;
+      margin: 32px 0;
+    }
+
+    .stat-card {
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 16px 18px;
+      text-align: center;
+      background: var(--card);
+    }
+
+    .stat-value { font-size: 1.8rem; display: block; color: var(--foreground); }
+    .stat-label {
+      font-size: 0.67rem;
+      font-weight: 500;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--muted-foreground);
+      margin-top: 4px;
+      display: block;
+    }
+
+    section { margin-top: 72px; }
+    .section-header {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      margin-bottom: 24px;
+      padding-bottom: 8px;
+      border-bottom: 1.5px solid var(--border);
+    }
+
+    .section-number { font-size: 0.75rem; font-weight: 600; color: var(--primary); }
+    .section-header h2 { font-size: 1.55rem; }
+    .section-intro { max-width: 72ch; color: var(--muted-foreground); margin-bottom: 24px; }
+
+    .diagram-panel {
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      background: var(--card);
+      overflow-x: auto;
+    }
+
+    .diagram-caption {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      color: var(--muted-foreground);
+      display: block;
+      padding: 10px 6px 0;
+    }
+
+    .epoch-flow {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .phase-card {
+      position: relative;
+      background: var(--card);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 18px;
+      min-height: 190px;
+    }
+
+    .phase-card:not(:last-child)::after {
+      content: '→';
+      position: absolute;
+      right: -12px;
+      top: 82px;
+      width: 22px;
+      height: 22px;
+      border-radius: 50%;
+      background: var(--background);
+      color: var(--primary);
+      display: grid;
+      place-items: center;
+      z-index: 2;
+    }
+
+    .phase-label {
+      display: block;
+      color: var(--primary);
+      font-size: 0.7rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      margin-bottom: 8px;
+    }
+
+    .phase-card h3 { font-size: 1.08rem; margin-bottom: 8px; }
+    .phase-card p { color: var(--muted-foreground); font-size: 0.86rem; line-height: 1.5; }
+    .phase-card code { font-family: var(--font-mono); color: var(--foreground); font-size: 0.8rem; }
+
+    .milestones { display: flex; flex-direction: column; gap: 0; }
+    .milestone { display: grid; grid-template-columns: 110px 28px 1fr; gap: 0 18px; }
+    .milestone .when {
+      text-align: right;
+      font-size: 0.75rem;
+      color: var(--muted-foreground);
+      padding-top: 4px;
+    }
+
+    .dot-col { display: flex; flex-direction: column; align-items: center; }
+    .dot { width: 14px; height: 14px; border-radius: 50%; background: var(--card); border: 3px solid var(--primary); flex-shrink: 0; }
+    .dot.done { background: var(--success); border-color: var(--success); }
+    .line { width: 2px; flex: 1; background: var(--border); margin: 4px 0; }
+    .milestone:last-child .line { display: none; }
+    .milestone .body { padding-bottom: 38px; }
+    .milestone .body h3 { font-size: 1.16rem; margin-bottom: 5px; }
+    .milestone .body p { font-size: 0.89rem; color: var(--muted-foreground); max-width: 720px; margin-bottom: 10px; }
+    .deliverables { margin: 7px 0 12px 18px; color: var(--card-foreground); font-size: 0.88rem; }
+    .deliverables li { margin: 5px 0; padding-left: 3px; }
+
+    .tags { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 10px; }
+    .tag {
+      font-size: 0.68rem;
+      padding: 2px 8px;
+      border-radius: calc(var(--radius) - 4px);
+      background: var(--muted);
+      color: var(--muted-foreground);
+    }
+    .tag.highlight { background: color-mix(in oklab, var(--primary) 12%, transparent); color: var(--primary); }
+
+    .two-col { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+    .card {
+      background: var(--card);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 22px;
+    }
+    .card h3 { font-size: 1.12rem; margin-bottom: 8px; }
+    .card p { color: var(--muted-foreground); font-size: 0.89rem; }
+    .card ul { margin: 12px 0 0 18px; font-size: 0.88rem; }
+    .card li { margin: 6px 0; }
+
+    .code-panel {
+      background: var(--code-bg);
+      border: 1px solid color-mix(in oklab, var(--border) 50%, transparent);
+      border-radius: var(--radius);
+      overflow: hidden;
+      margin-top: 16px;
+    }
+    .code-title {
+      display: block;
+      border-bottom: 1px solid color-mix(in oklab, var(--border) 40%, transparent);
+      padding: 9px 14px;
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+      color: oklch(0.75 0.02 260);
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+    }
+    pre { overflow-x: auto; padding: 16px; }
+    code { font-family: var(--font-mono); }
+    pre code { font-size: 0.79rem; line-height: 1.62; color: oklch(0.9 0.01 260); }
+    .kw { color: oklch(0.72 0.16 285); }
+    .ty { color: oklch(0.75 0.13 200); }
+    .str { color: oklch(0.77 0.13 150); }
+    .cm { color: oklch(0.63 0.02 260); font-style: italic; }
+    .num { color: oklch(0.8 0.13 75); }
+
+    .mock-shell {
+      background: oklch(0.16 0.018 260);
+      color: oklch(0.9 0.012 260);
+      border: 1px solid oklch(0.32 0.02 260);
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: 0 18px 50px color-mix(in oklab, var(--foreground) 12%, transparent);
+    }
+    .mock-nav {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid oklch(0.3 0.02 260);
+      padding: 13px 18px;
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+    }
+    .mock-brand { color: oklch(0.78 0.14 150); letter-spacing: 0.09em; }
+    .mock-navlinks { display: flex; gap: 18px; color: oklch(0.62 0.02 260); }
+    .mock-navlinks .active { color: oklch(0.9 0.01 260); }
+    .mock-body { padding: 24px; }
+    .mock-top { display: flex; justify-content: space-between; gap: 20px; align-items: end; margin-bottom: 18px; }
+    .mock-kicker { font-size: 0.65rem; color: oklch(0.7 0.1 150); text-transform: uppercase; letter-spacing: 0.08em; }
+    .mock-top h3 { font-family: var(--font-mono); font-size: 1.25rem; margin-top: 4px; }
+    .mock-status { font-family: var(--font-mono); font-size: 0.7rem; color: oklch(0.78 0.12 75); text-align: right; }
+    .mock-summary { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-bottom: 14px; }
+    .mock-stat { border: 1px solid oklch(0.31 0.02 260); padding: 11px; border-radius: 7px; }
+    .mock-stat b { display: block; font-family: var(--font-mono); font-size: 0.96rem; font-weight: 500; }
+    .mock-stat span { color: oklch(0.59 0.02 260); font-family: var(--font-mono); font-size: 0.6rem; text-transform: uppercase; }
+    .mock-table { border: 1px solid oklch(0.31 0.02 260); border-radius: 7px; overflow: hidden; }
+    .mock-row {
+      display: grid;
+      grid-template-columns: 38px 1.3fr 1fr .7fr .7fr;
+      gap: 12px;
+      align-items: center;
+      padding: 10px 12px;
+      border-bottom: 1px solid oklch(0.27 0.02 260);
+      font-family: var(--font-mono);
+      font-size: 0.68rem;
+    }
+    .mock-row:last-child { border-bottom: none; }
+    .mock-row.head { color: oklch(0.57 0.02 260); text-transform: uppercase; font-size: 0.58rem; }
+    .toggle { width: 27px; height: 15px; border-radius: 999px; background: oklch(0.35 0.02 260); position: relative; }
+    .toggle::after { content: ''; width: 11px; height: 11px; background: oklch(0.75 0.01 260); border-radius: 50%; position: absolute; top: 2px; left: 2px; }
+    .toggle.on { background: oklch(0.53 0.13 150); }
+    .toggle.on::after { left: 14px; background: white; }
+    .online { color: oklch(0.73 0.13 150); }
+    .offline { color: oklch(0.67 0.08 25); }
+    .mock-actions { display: flex; justify-content: space-between; align-items: center; margin-top: 14px; gap: 16px; }
+    .mock-actions p { color: oklch(0.6 0.02 260); font-family: var(--font-mono); font-size: 0.65rem; }
+    .mock-button { border: 1px solid oklch(0.6 0.13 150); color: oklch(0.81 0.13 150); padding: 8px 13px; border-radius: 5px; font-family: var(--font-mono); font-size: 0.67rem; }
+
+    .risk-grid { border: 1.5px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+    .risk-row {
+      display: grid;
+      grid-template-columns: 1.05fr auto 1.5fr;
+      gap: 24px;
+      padding: 16px 24px;
+      align-items: center;
+      border-bottom: 1px solid var(--border);
+      background: var(--card);
+    }
+    .risk-row:last-child { border-bottom: none; }
+    .risk-name { font-weight: 500; }
+    .risk-mitigation { font-size: 0.88rem; color: var(--muted-foreground); }
+    .badge { font-size: 0.66rem; font-weight: 600; padding: 2px 8px; border-radius: calc(var(--radius) - 4px); text-transform: uppercase; }
+    .badge.high { background: color-mix(in oklab, var(--destructive) 15%, transparent); color: var(--destructive); }
+    .badge.med { background: color-mix(in oklab, var(--warning) 15%, transparent); color: var(--warning); }
+    .badge.low { background: color-mix(in oklab, var(--success) 15%, transparent); color: var(--success); }
+
+    .callout { border-left: 3px solid var(--primary); padding: 16px 24px; margin: 16px 0; background: var(--card); border-radius: 0 var(--radius) var(--radius) 0; }
+    .callout h3 { font-size: 1.05rem; margin-bottom: 4px; }
+    .callout p { font-size: 0.9rem; color: var(--muted-foreground); line-height: 1.55; }
+    .decide-with { font-size: 0.72rem; color: var(--primary); font-weight: 500; display: block; margin-top: 8px; }
+
+    .acceptance { display: grid; grid-template-columns: repeat(2, 1fr); gap: 12px; }
+    .acceptance-item { display: flex; gap: 11px; align-items: flex-start; padding: 14px 16px; background: var(--card); border: 1.5px solid var(--border); border-radius: var(--radius); font-size: 0.88rem; }
+    .check { color: var(--success); font-family: var(--font-mono); font-weight: 700; }
+    .footnote { margin-top: 28px; font-size: 0.77rem; color: var(--muted-foreground); font-family: var(--font-mono); }
+
+    @media (max-width: 820px) {
+      .epoch-flow, .two-col, .acceptance { grid-template-columns: 1fr; }
+      .phase-card:not(:last-child)::after { content: '↓'; right: 50%; top: auto; bottom: -12px; }
+      .mock-summary { grid-template-columns: repeat(2, 1fr); }
+      .mock-row { grid-template-columns: 32px 1.4fr .8fr; }
+      .mock-row > :nth-child(4), .mock-row > :nth-child(5) { display: none; }
+      .risk-row { grid-template-columns: 1fr auto; gap: 8px 16px; }
+      .risk-mitigation { grid-column: 1 / -1; }
+    }
+
+    @media (max-width: 560px) {
+      .container { padding: 36px 15px 72px; }
+      header h1 { font-size: 1.9rem; }
+      .milestone { grid-template-columns: 25px 1fr; }
+      .milestone .when { display: none; }
+      .milestone .dot-col { grid-column: 1; }
+      .milestone .body { grid-column: 2; }
+      .mock-top, .mock-actions { align-items: flex-start; flex-direction: column; }
+      .mock-status { text-align: left; }
+    }
+  </style>
+</head>
+<body>
+  <main class="container">
+    <header>
+      <span class="eyebrow">Implementation plan · Constantinople</span>
+      <h1>Continuous DKG resharing over stateful consensus</h1>
+      <p class="lede">Replace the epoch-zero engine with a 1,024-block epoch lifecycle in which committee state is consensus-committed, lookup addresses travel with DKG epoch artifacts, and validators can join or leave through signed transactions.</p>
+      <div class="prompt-box">
+        <span class="prompt-label">Brief</span>
+        <p>Move Commonware to <code>cl/dkg-peer-manager</code>; layer <code>glue::dkg</code> over <code>glue::stateful</code>; migrate discovery to lookup; add register/remove committee transactions and an epoch-indexed QMDB with carry-forward; and add a participant-selection page that respects the provider lock boundary.</p>
+      </div>
+    </header>
+
+    <div class="summary-strip">
+      <div class="stat-card"><span class="stat-value">1,024</span><span class="stat-label">Blocks per epoch</span></div>
+      <div class="stat-card"><span class="stat-value">E+2</span><span class="stat-label">Membership target</span></div>
+      <div class="stat-card"><span class="stat-value">3</span><span class="stat-label">Consensus QMDBs</span></div>
+      <div class="stat-card"><span class="stat-value">10</span><span class="stat-label">Planned P2P channels</span></div>
+      <div class="stat-card"><span class="stat-value">6</span><span class="stat-label">Delivery milestones</span></div>
+    </div>
+
+    <section>
+      <div class="section-header"><span class="section-number">01</span><h2>Target data flow</h2></div>
+      <p class="section-intro">The application remains the owner of transactions and QMDB commitments. The DKG layer reads only stable, epoch-addressed committee state and turns it into certified <code>EpochInfo</code>. Lookup consumes the exact address directory carried by that artifact.</p>
+      <div class="diagram-panel">
+        <svg viewBox="0 0 1040 540" xmlns="http://www.w3.org/2000/svg" style="width:100%;min-width:800px">
+          <defs>
+            <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--muted-foreground)"/></marker>
+            <marker id="arrow-primary" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--primary)"/></marker>
+            <marker id="arrow-success" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0,0 L10,5 L0,10 z" fill="var(--success)"/></marker>
+          </defs>
+          <style>
+            .box { fill: var(--card); stroke: var(--border); stroke-width: 1.5; }
+            .hot { fill: color-mix(in oklab, var(--primary) 8%, var(--card)); stroke: var(--primary); stroke-width: 2; }
+            .support { fill: var(--muted); stroke: var(--border); stroke-width: 1.5; }
+            .label { font-family: var(--font-sans); font-size: 13px; fill: var(--foreground); font-weight: 500; }
+            .sub { font-family: var(--font-mono); font-size: 10px; fill: var(--muted-foreground); }
+            .edge { stroke: var(--muted-foreground); stroke-width: 1.5; fill: none; }
+            .edge.hotline { stroke: var(--primary); stroke-width: 2; }
+            .edge.async { stroke-dasharray: 6 5; }
+            .edge-label { font-family: var(--font-mono); font-size: 9px; fill: var(--muted-foreground); }
+          </style>
+
+          <rect x="20" y="48" width="190" height="82" rx="9" class="hot"/>
+          <text x="115" y="82" text-anchor="middle" class="label">Committee page</text>
+          <text x="115" y="101" text-anchor="middle" class="sub">select + sign per-peer diffs</text>
+
+          <rect x="285" y="48" width="190" height="82" rx="9" class="box"/>
+          <text x="380" y="82" text-anchor="middle" class="label">Mempool + HTTP</text>
+          <text x="380" y="101" text-anchor="middle" class="sub">admit, queue, expose status</text>
+
+          <rect x="550" y="48" width="210" height="82" rx="9" class="hot"/>
+          <text x="655" y="82" text-anchor="middle" class="label">stateful application</text>
+          <text x="655" y="101" text-anchor="middle" class="sub">execute + verify consensus rules</text>
+
+          <rect x="830" y="48" width="190" height="82" rx="9" class="hot"/>
+          <text x="925" y="82" text-anchor="middle" class="label">Committee QMDB</text>
+          <text x="925" y="101" text-anchor="middle" class="sub">Epoch → canonical Set&lt;Peer&gt;</text>
+
+          <line x1="210" y1="89" x2="285" y2="89" class="edge hotline" marker-end="url(#arrow-primary)"/>
+          <text x="247" y="78" text-anchor="middle" class="edge-label">signed tx</text>
+          <line x1="475" y1="89" x2="550" y2="89" class="edge" marker-end="url(#arrow)"/>
+          <line x1="760" y1="89" x2="830" y2="89" class="edge hotline" marker-end="url(#arrow-primary)"/>
+          <text x="795" y="78" text-anchor="middle" class="edge-label">root + range</text>
+
+          <rect x="830" y="225" width="190" height="88" rx="9" class="hot"/>
+          <text x="925" y="258" text-anchor="middle" class="label">ParticipantsProvider</text>
+          <text x="925" y="278" text-anchor="middle" class="sub">row(E+2) ?? row(E+1)</text>
+          <text x="925" y="294" text-anchor="middle" class="sub">exact Addresses directory</text>
+
+          <rect x="550" y="225" width="210" height="88" rx="9" class="hot"/>
+          <text x="655" y="258" text-anchor="middle" class="label">reshare::Application</text>
+          <text x="655" y="278" text-anchor="middle" class="sub">wraps stateful mailbox</text>
+          <text x="655" y="294" text-anchor="middle" class="sub">reserves final DKG payload</text>
+
+          <rect x="285" y="225" width="190" height="88" rx="9" class="hot"/>
+          <text x="380" y="258" text-anchor="middle" class="label">DKG orchestrator</text>
+          <text x="380" y="278" text-anchor="middle" class="sub">Marshaled + epoch Simplex</text>
+          <text x="380" y="294" text-anchor="middle" class="sub">dynamic scheme registrar</text>
+
+          <rect x="20" y="225" width="190" height="88" rx="9" class="hot"/>
+          <text x="115" y="258" text-anchor="middle" class="label">lookup::Network</text>
+          <text x="115" y="278" text-anchor="middle" class="sub">AddressableManager adapter</text>
+          <text x="115" y="294" text-anchor="middle" class="sub">epoch-scoped peer sets</text>
+
+          <line x1="925" y1="130" x2="925" y2="225" class="edge hotline" marker-end="url(#arrow-primary)"/>
+          <text x="935" y="180" class="edge-label">stable parent state</text>
+          <line x1="830" y1="269" x2="760" y2="269" class="edge hotline" marker-end="url(#arrow-primary)"/>
+          <text x="795" y="258" text-anchor="middle" class="edge-label">EpochInfo</text>
+          <line x1="550" y1="269" x2="475" y2="269" class="edge hotline" marker-end="url(#arrow-primary)"/>
+          <line x1="285" y1="269" x2="210" y2="269" class="edge" marker-end="url(#arrow)"/>
+
+          <rect x="830" y="405" width="190" height="72" rx="9" class="support"/>
+          <text x="925" y="433" text-anchor="middle" class="label">Eligible peer catalog</text>
+          <text x="925" y="452" text-anchor="middle" class="sub">key → lookup Address</text>
+
+          <rect x="550" y="405" width="210" height="72" rx="9" class="support"/>
+          <text x="655" y="433" text-anchor="middle" class="label">Reshare recovery stores</text>
+          <text x="655" y="452" text-anchor="middle" class="sub">public journal + durable secrets</text>
+
+          <rect x="285" y="405" width="190" height="72" rx="9" class="support"/>
+          <text x="380" y="433" text-anchor="middle" class="label">Shared SyncPlan</text>
+          <text x="380" y="452" text-anchor="middle" class="sub">stateful + DKG recovery floor</text>
+
+          <line x1="925" y1="405" x2="925" y2="313" class="edge async" marker-end="url(#arrow)"/>
+          <line x1="655" y1="405" x2="655" y2="313" class="edge async" marker-end="url(#arrow)"/>
+          <line x1="380" y1="405" x2="380" y2="313" class="edge async" marker-end="url(#arrow)"/>
+          <path d="M380 405 C380 360 540 360 610 313" class="edge async" marker-end="url(#arrow)"/>
+
+          <path d="M380 225 C380 175 655 175 655 130" class="edge async" marker-end="url(#arrow-success)"/>
+          <text x="517" y="166" text-anchor="middle" class="edge-label">finalized reporter fan-out</text>
+        </svg>
+        <span class="diagram-caption">Solid lines are consensus/data dependencies. Dashed lines are recovery or finalized-event paths. Highlighted components are new or substantially replaced.</span>
+      </div>
+
+      <div class="epoch-flow">
+        <article class="phase-card">
+          <span class="phase-label">Epoch E · heights 0–1022</span>
+          <h3>Stage E+2 membership</h3>
+          <p>Each <code>SetCommitteeMember</code> transaction clones row E+1 on first use, then idempotently registers or removes one peer in row E+2. Block order resolves multiple updates.</p>
+        </article>
+        <article class="phase-card">
+          <span class="phase-label">Epoch E · height 1023</span>
+          <h3>Lock and announce</h3>
+          <p>The proposer and verifier exclude committee transactions. The provider returns row E+2, or row E+1 when absent, then resolves the exact address union for the DKG payload.</p>
+        </article>
+        <article class="phase-card">
+          <span class="phase-label">Final-block system transition</span>
+          <h3>Materialize fallback</h3>
+          <p>After the wrapper supplies <code>EpochInfo</code>, the inner application writes its <code>next_players</code> to row E+2. Every epoch becomes explicit and state-syncable.</p>
+        </article>
+        <article class="phase-card">
+          <span class="phase-label">Epoch E+1 → E+2</span>
+          <h3>Reshare, then activate</h3>
+          <p>E+1 runs the ceremony with the announced next players. The orchestrator installs the resulting signer/verifier and activates the selected lookup peer set in E+2.</p>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header"><span class="section-number">02</span><h2>Delivery sequence</h2></div>
+      <div class="milestones">
+        <article class="milestone">
+          <span class="when">Applied</span><div class="dot-col"><span class="dot done"></span><span class="line"></span></div>
+          <div class="body">
+            <h3>Pin the integration branch and expose API drift</h3>
+            <p>Patch every Commonware crate to the same Git source so direct and Exoware-transitive types cannot split. Raise the workspace MSRV to the branch’s Rust 1.95 requirement and lock commit <code>ce9746e8</code>.</p>
+            <ul class="deliverables"><li>Adapt hash construction/finalization and manual clone bounds.</li><li>Migrate the stateful trait from <code>InputProvider</code> to separate <code>Provider</code> and upstream <code>Input</code>.</li></ul>
+            <div class="tags"><span class="tag highlight">Cargo.toml</span><span class="tag">Cargo.lock</span><span class="tag">crates/primitives</span><span class="tag">consensus/glue.rs</span></div>
+          </div>
+        </article>
+
+        <article class="milestone">
+          <span class="when">Milestone 1</span><div class="dot-col"><span class="dot"></span><span class="line"></span></div>
+          <div class="body">
+            <h3>Make committee state part of the chain format</h3>
+            <p>Introduce a tagged action envelope while preserving sender, nonce, and signature semantics. Add the tiny variable-value QMDB and commit its root/range in every block.</p>
+            <ul class="deliverables"><li><code>Transfer</code> and <code>SetCommitteeMember { target_epoch, peer, registered }</code> actions with bounded canonical codecs.</li><li>Consensus checks: any valid signed account may update this demo; still enforce target exactly E+2, eligible peer, non-empty/max-size result, and no committee action in the final block.</li><li>Third DB resolver, state-sync target, header fields, indexer namespace, genesis rows 0/1, and DKG payload on the block via <code>ReshareBlock</code>.</li></ul>
+            <div class="tags"><span class="tag highlight">transaction.rs</span><span class="tag highlight">block.rs</span><span class="tag highlight">consensus/db.rs</span><span class="tag">execution.rs</span><span class="tag">indexer</span></div>
+          </div>
+        </article>
+
+        <article class="milestone">
+          <span class="when">Milestone 2</span><div class="dot-col"><span class="dot"></span><span class="line"></span></div>
+          <div class="body">
+            <h3>Replace discovery with lookup and certified directories</h3>
+            <p>Deployment config becomes a full eligible catalog of Ed25519 identities and dial addresses. Lookup no longer needs discovery bootstrappers or a separate advertised address.</p>
+            <ul class="deliverables"><li>Construct <code>lookup::Config::{recommended,local}</code> and keep at least four tracked peer sets.</li><li>Use the lookup oracle unchanged for marshal/resolvers; wrap a clone with DKG’s <code>network::AddressableManager</code>.</li><li>Implement <code>ParticipantsProvider::directory</code> with <code>Addresses</code>; this is the branch-tip replacement for the older <code>AddressProvider</code> API.</li><li>Remove the epoch-zero manual <code>oracle.track</code>; DKG activation owns epoch peer tracking.</li></ul>
+            <div class="tags"><span class="tag highlight">validator/config.rs</span><span class="tag highlight">validator/run.rs</span><span class="tag">deploy</span><span class="tag">peers.yaml</span><span class="tag">README + dashboards</span></div>
+          </div>
+        </article>
+
+        <article class="milestone">
+          <span class="when">Milestone 3</span><div class="dot-col"><span class="dot"></span><span class="line"></span></div>
+          <div class="body">
+            <h3>Install the continuous reshare actor graph</h3>
+            <p>Preserve Constantinople’s erasure-coded marshal, but replace the one-off epoch-zero Simplex actor with Commonware’s dynamic registrar, reshare wrapper, and orchestrator.</p>
+            <ul class="deliverables"><li><code>FixedEpocher(1024)</code>, dynamic scheme provider/registrar, genesis <code>EpochInfo(0)</code>, DKG probe, and shared DKG/stateful sync plan.</li><li>Validator-local durable <code>SecretStore</code> plus Commonware’s reshare public recovery journal; seed only epoch zero from current deployment material.</li><li>Actor stack: stateful mailbox → <code>reshare::Application</code> → existing <code>Marshaled</code> → DKG orchestrator.</li><li>Reporter fan-out to stateful, reshare, orchestrator, indexer, and relayer; start/join all actors and new channels.</li></ul>
+            <div class="tags"><span class="tag highlight">engine.rs</span><span class="tag">engine/types.rs</span><span class="tag">validator/run.rs</span><span class="tag">dkg secret partition</span></div>
+          </div>
+        </article>
+
+        <article class="milestone">
+          <span class="when">Milestone 4</span><div class="dot-col"><span class="dot"></span><span class="line"></span></div>
+          <div class="body">
+            <h3>Expose committee state and ship the selection page</h3>
+            <p>Add one authoritative read model to the validator and relayer, then build a route in the existing React application without introducing a routing or state framework.</p>
+            <ul class="deliverables"><li><code>GET /committee</code>: height, epoch, target, update lock, current/scheduled sets, and every eligible peer with advisory connectivity.</li><li>Committee reader attached to the third QMDB; runtime lookup status is display-only and never affects transaction validity.</li><li>The page computes a per-peer diff and submits multiple signed transactions with sequential nonce reservations; backend proposal/verification remains authoritative at the cutoff.</li></ul>
+            <div class="tags"><span class="tag highlight">CommitteePage.tsx</span><span class="tag">committee.ts</span><span class="tag">codec.ts</span><span class="tag">mempool/http.rs</span><span class="tag">relayer.rs</span></div>
+          </div>
+        </article>
+
+        <article class="milestone">
+          <span class="when">Milestone 5</span><div class="dot-col"><span class="dot"></span><span class="line"></span></div>
+          <div class="body">
+            <h3>Prove multi-epoch safety and cut over with a new genesis</h3>
+            <p>The block, transaction, and state formats all change. Treat this as a coordinated network restart, then exercise normal operation, committee changes, fallback, restart, and state sync across at least three epochs.</p>
+            <ul class="deliverables"><li>Golden Rust/TypeScript codecs; provider ordering/exact-directory tests; proposal and verifier boundary tests.</li><li>Add/remove/fallback/failed-reshare scenarios; signer-to-verifier transitions; restart at heights 1023/1024; future-player state sync.</li><li>Assert <code>max_pending_acks + 1 + retained_marshal_blocks ≥ 1024</code>.</li><li>Run <code>just fmt-fix</code>, <code>just lint</code>, <code>just test</code>, <code>just build</code>, plus explorer test/build.</li></ul>
+            <div class="tags"><span class="tag highlight">integration harness</span><span class="tag">fault tests</span><span class="tag">frontend goldens</span><span class="tag">deployment smoke test</span></div>
+          </div>
+        </article>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header"><span class="section-number">03</span><h2>Consensus-critical contracts</h2></div>
+      <div class="two-col">
+        <div>
+          <div class="code-panel">
+            <span class="code-title">Tagged transaction action</span>
+            <pre><code><span class="kw">enum</span> <span class="ty">Action</span> {
+  <span class="ty">Transfer</span> { to: <span class="ty">AccountKey</span>, value: <span class="ty">NonZeroU64</span> },
+  <span class="ty">SetCommitteeMember</span> {
+    target_epoch: <span class="ty">Epoch</span>, <span class="cm">// must equal current + 2</span>
+    peer: ed25519::<span class="ty">PublicKey</span>,
+    registered: <span class="ty">bool</span>, <span class="cm">// idempotent desired state</span>
+  },
+}
+
+<span class="kw">struct</span> <span class="ty">Transaction</span> {
+  sender: <span class="ty">AccountKey</span>,
+  nonce: <span class="ty">Nonce</span>,
+  action: <span class="ty">Action</span>,
+}</code></pre>
+          </div>
+
+          <div class="code-panel">
+            <span class="code-title">QMDB reducer + fallback</span>
+            <pre><code><span class="kw">fn</span> <span class="ty">apply_member</span>(tx, epoch, rows) {
+  require(tx.target_epoch == epoch + <span class="num">2</span>);
+  require(!epocher.is_last(height));
+  <span class="kw">let</span> set = rows.get(epoch + <span class="num">2</span>)
+      .unwrap_or_else(|| rows.get(epoch + <span class="num">1</span>));
+  set.assign(tx.peer, tx.registered);
+  require(!set.is_empty() && set.len() <= MAX);
+  rows.put(epoch + <span class="num">2</span>, set.canonical());
+}
+
+<span class="kw">async fn</span> <span class="ty">participants</span>(requested) {
+  db.get(requested)
+    .or_else(|| db.get(requested - <span class="num">1</span>))
+    .expect(<span class="str">"genesis rows guarantee a predecessor"</span>)
+}</code></pre>
+          </div>
+        </div>
+
+        <div>
+          <div class="code-panel">
+            <span class="code-title">Actor composition from the Commonware harness</span>
+            <pre><code><span class="kw">let</span> app = reshare::<span class="ty">Application</span>::new(
+  stateful_mailbox,
+  reshare_mailbox,
+  <span class="ty">NZU64</span>!(<span class="num">1024</span>),
+);
+
+<span class="kw">let</span> automaton = marshal::coding::<span class="ty">Marshaled</span>::new(
+  app, shards, marshal_mailbox, dynamic_provider,
+);
+
+<span class="kw">let</span> consensus = dkg::orchestrator::<span class="ty">Actor</span>::new(
+  epocher, automaton, registrar,
+  addressable_lookup_manager,
+  shared_sync_plan,
+);
+
+<span class="cm">// Finalized blocks fan out to:</span>
+<span class="cm">// stateful + reshare + orchestrator + observers</span></code></pre>
+          </div>
+
+          <div class="code-panel">
+            <span class="code-title">Committee read contract</span>
+            <pre><code>{
+  <span class="str">"height"</span>: <span class="str">"17890"</span>,
+  <span class="str">"epoch"</span>: <span class="str">"17"</span>,
+  <span class="str">"targetEpoch"</span>: <span class="str">"19"</span>,
+  <span class="str">"updatesOpen"</span>: <span class="kw">true</span>,
+  <span class="str">"lockHeight"</span>: <span class="str">"18431"</span>,
+  <span class="str">"current"</span>: [<span class="str">"ed25519:…"</span>],
+  <span class="str">"scheduled"</span>: [<span class="str">"ed25519:…"</span>],
+  <span class="str">"available"</span>: [{
+    <span class="str">"peer"</span>: <span class="str">"ed25519:…"</span>,
+    <span class="str">"address"</span>: <span class="str">"validator-4:9000"</span>,
+    <span class="str">"connected"</span>: <span class="kw">false</span>
+  }]
+}</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header"><span class="section-number">04</span><h2>Committee page mockup</h2></div>
+      <p class="section-intro">The page starts from the scheduled E+2 set, shows all peers in the immutable eligible catalog, and emits one register/remove action for each changed row. Connectivity is deliberately advisory.</p>
+      <div class="mock-shell">
+        <div class="mock-nav"><span class="mock-brand">CONSTANTINOPLE</span><div class="mock-navlinks"><span>blocks</span><span>accounts</span><span class="active">committee</span><span>wallet 0x7e…42</span></div></div>
+        <div class="mock-body">
+          <div class="mock-top">
+            <div><span class="mock-kicker">Committee controls</span><h3>Committee / epoch 19</h3></div>
+            <div class="mock-status">UPDATES OPEN<br>LOCKS AT BLOCK 18431</div>
+          </div>
+          <div class="mock-summary">
+            <div class="mock-stat"><b>17</b><span>current epoch</span></div>
+            <div class="mock-stat"><b>19</b><span>effective epoch</span></div>
+            <div class="mock-stat"><b>4 / 7</b><span>selected peers</span></div>
+            <div class="mock-stat"><b>541</b><span>blocks to lock</span></div>
+          </div>
+          <div class="mock-table">
+            <div class="mock-row head"><span></span><span>Participant</span><span>Address</span><span>Current</span><span>Network</span></div>
+            <div class="mock-row"><span class="toggle on"></span><span>validator-alpha · 9f32…0a</span><span>10.0.0.11:9000</span><span>member</span><span class="online">connected</span></div>
+            <div class="mock-row"><span class="toggle on"></span><span>validator-bravo · 28bd…f1</span><span>10.0.0.12:9000</span><span>member</span><span class="online">connected</span></div>
+            <div class="mock-row"><span class="toggle"></span><span>validator-charlie · c401…85</span><span>10.0.0.13:9000</span><span>member</span><span class="offline">offline</span></div>
+            <div class="mock-row"><span class="toggle on"></span><span>validator-delta · e83a…b6</span><span>10.0.0.14:9000</span><span>standby</span><span class="online">connected</span></div>
+            <div class="mock-row"><span class="toggle on"></span><span>validator-echo · 51aa…29</span><span>10.0.0.15:9000</span><span>member</span><span class="online">connected</span></div>
+            <div class="mock-row"><span class="toggle"></span><span>validator-foxtrot · 72b0…ce</span><span>10.0.0.16:9000</span><span>standby</span><span class="offline">offline</span></div>
+          </div>
+          <div class="mock-actions"><p>2 pending changes · remove charlie · add delta<br>Transactions remain independently retryable and status-tracked.</p><span class="mock-button">SIGN &amp; SUBMIT 2 UPDATES</span></div>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header"><span class="section-number">05</span><h2>Risks and mitigations</h2></div>
+      <div class="risk-grid">
+        <div class="risk-row"><div class="risk-name">Permissionless committee changes are demo-only</div><div><span class="badge low">Low</span></div><div class="risk-mitigation">Accept updates from every valid signed account as requested, document the trust model prominently, and leave the execution policy behind a narrow authorization hook for later production hardening.</div></div>
+        <div class="risk-row"><div class="risk-name">Provider sees unstable boundary state</div><div><span class="badge high">High</span></div><div class="risk-mitigation">Follow the upstream call order exactly: <code>epoch_info</code> runs before inner propose/verify at height 1023, so reject committee actions in that block and derive E+2 only from its height-1022 parent state.</div></div>
+        <div class="risk-row"><div class="risk-name">Eligible address catalogs diverge</div><div><span class="badge high">High</span></div><div class="risk-mitigation">Generate one canonical catalog for every node, commit its digest at genesis, and reject startup if selected peers lack an address. Directory coverage must be exact.</div></div>
+        <div class="risk-row"><div class="risk-name">DKG secrets are lost or returned before durable</div><div><span class="badge high">High</span></div><div class="risk-mitigation">Implement atomic, fsynced, permission-restricted secret writes before futures resolve; test crash/restart after each share, seed, and dealing write.</div></div>
+        <div class="risk-row"><div class="risk-name">Chain schema is incompatible</div><div><span class="badge high">High</span></div><div class="risk-mitigation">Use a coordinated new genesis: transaction tags, block payloads, a third state commitment, and epoch semantics all change hashes.</div></div>
+        <div class="risk-row"><div class="risk-name">Boundary block pruned before recovery</div><div><span class="badge med">Medium</span></div><div class="risk-mitigation">Keep the existing 1,024 marshal-block retention and assert the Commonware pending-ack retention inequality in config tests.</div></div>
+        <div class="risk-row"><div class="risk-name">Discovery and lookup nodes cannot interoperate</div><div><span class="badge med">Medium</span></div><div class="risk-mitigation">Coordinate a full-cluster cutover and validate symmetric versus asymmetric/NAT addresses in generated local and remote bundles.</div></div>
+        <div class="risk-row"><div class="risk-name">Browser races the lock height</div><div><span class="badge low">Low</span></div><div class="risk-mitigation">Poll and disable optimistically, but let proposer filtering and verifier rejection decide. Preserve typed rejection status for each submitted transaction.</div></div>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header"><span class="section-number">06</span><h2>Resolved protocol choices</h2></div>
+      <div class="callout">
+        <h3>Resolved: every signed account may alter the demo committee</h3>
+        <p>No governance allowlist is added in this integration. The normal transaction signature and nonce still prevent spoofing and replay, while peer eligibility, epoch targeting, committee bounds, and the final-block lock remain consensus-enforced. Keep this as an explicit policy hook so a production deployment can replace it.</p>
+        <span class="decide-with">Decision: permissionless demo policy</span>
+      </div>
+      <div class="callout">
+        <h3>Resolved: the upstream final-block call is the lock boundary</h3>
+        <p>For epoch E, <code>reshare::Application</code> calls <code>epoch_info</code> before invoking the inner application’s propose or verify at height <code>E×1024+1023</code>. Therefore E+2 membership is exactly the parent state through height <code>E×1024+1022</code>: committee actions are accepted in non-final blocks and consensus-rejected in the final block. There is no configurable earlier cutoff.</p>
+        <span class="decide-with">Decision: lock immediately before the final block</span>
+      </div>
+      <div class="callout">
+        <h3>Resolved: eligible peer addresses are immutable</h3>
+        <p>Registration/removal selects from a genesis-hashed key-to-address catalog. This integration adds no address-update transaction or mutable address registry; changing an eligible peer address requires a coordinated new genesis/restart.</p>
+        <span class="decide-with">Decision: immutable catalog</span>
+      </div>
+    </section>
+
+    <section>
+      <div class="section-header"><span class="section-number">07</span><h2>Definition of done</h2></div>
+      <div class="acceptance">
+        <div class="acceptance-item"><span class="check">✓</span><span>All Commonware packages resolve to the branch commit from one source, with Rust 1.95 and a passing workspace build.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>Blocks 1023→1024 and 2047→2048 rotate through DKG-orchestrated Simplex epochs without restarting the application.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>Register/remove transactions deterministically produce the E+2 set; absent updates carry E+1 forward and materialize it.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>Final blocks reject committee mutations, while transfers remain valid and the DKG payload matches the stable parent state.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>Lookup activates the exact dealers/players/next-players union from certified addresses; missing or extra directory entries fail.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>A node can restart or state-sync across a boundary, recover DKG state, and join as a future player before activation.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>The explorer lists the full eligible catalog, submits multiple per-peer updates, and reports boundary, eligibility, or committee-size failures.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span><code>just lint</code>, <code>just test</code>, <code>just build</code>, and explorer test/build pass on the new genesis configuration.</span></div>
+      </div>
+      <p class="footnote">Reference implementation: commonware/glue/src/dkg/tests/reshare/harness.rs · target branch lock: ce9746e8d4b7cf4ab10f9d09c31002a8761ff5b0</p>
+    </section>
+  </main>
+</body>
+</html>

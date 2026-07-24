@@ -43,7 +43,7 @@ impl AccountKey {
                     .expect("ed25519 account-key slice has account-key length")
             }
             TransactionPublicKey::Secp256r1 { encoded } => {
-                Self::try_from(sha256::Sha256::hash(encoded).as_ref())
+                Self::try_from(sha256::Sha256::hash(&[encoded]).as_ref())
                     .expect("sha256 digest has account-key length")
             }
         }
@@ -57,7 +57,7 @@ impl AccountKey {
 
         match bytes[0] {
             ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
-            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(bytes).as_ref()).ok(),
+            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(&[bytes]).as_ref()).ok(),
             _ => None,
         }
     }
@@ -303,7 +303,7 @@ mod tests {
 
         assert_eq!(
             key.as_ref(),
-            sha256::Sha256::hash(public_key.as_ref()).as_ref()
+            sha256::Sha256::hash(&[public_key.as_ref()]).as_ref()
         );
     }
 
