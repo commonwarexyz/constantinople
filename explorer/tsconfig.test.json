@@ -24,6 +24,7 @@
         "src/historyKey.ts",
         "src/nonce.ts",
         "src/proofMath.ts",
-        "src/proofRetry.ts"
+        "src/proofRetry.ts",
+        "src/refreshQueue.ts"
     ]
 }

@@ -34,8 +34,10 @@ shows a checkmark after browser-side QMDB and Simplex verification succeeds.
 ### Committee controls
 
 The manually routed `/committee` page reads finalized `block_meta`,
-`committee_meta`, and `eligible_peer` rows from `VITE_SQL_URL`. It starts from
-the scheduled E+2 set and renders every peer in the immutable eligible catalog.
+`committee_meta`, and `eligible_peer` rows from `VITE_SQL_URL`. The existing
+live `block_meta` stream refreshes this view after every finalized block, while
+route entry, manual refreshes, and submissions use the same coalesced loader.
+It starts from the scheduled E+2 set and renders every peer in the immutable eligible catalog.
 Committee mutations remain ordinary signed transactions submitted through
 `VITE_MEMPOOL_URL`; validators expose no separate committee read API.
 

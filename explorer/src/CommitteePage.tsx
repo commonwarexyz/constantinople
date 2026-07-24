@@ -1,8 +1,9 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
     blocksUntilCommitteeLock,
     committeeChanges,
     committeeLockDetail,
+    reconcileCommitteeSelection,
     validateCommitteeSelection,
     type CommitteeChange,
     type CommitteeSnapshot,
@@ -30,12 +31,21 @@ export default function CommitteePage({
     onSubmit: (changes: readonly CommitteeChange[]) => void;
 }) {
     const [selected, setSelected] = useState<Set<string>>(new Set());
+    const previousSnapshotRef = useRef<CommitteeSnapshot | null>(null);
     const selectionBaseline = snapshot
-        ? `${snapshot.targetEpoch.toString()}:${snapshot.scheduled.join(',')}`
+        ? [
+              snapshot.targetEpoch.toString(),
+              snapshot.scheduled.join(','),
+              snapshot.available.map(({ peer }) => peer).join(','),
+          ].join(':')
         : '';
 
     useEffect(() => {
-        setSelected(new Set(snapshot?.scheduled ?? []));
+        const previousSnapshot = previousSnapshotRef.current;
+        setSelected((current) =>
+            reconcileCommitteeSelection(previousSnapshot, snapshot, current),
+        );
+        previousSnapshotRef.current = snapshot;
     }, [selectionBaseline]);
 
     const selectionError = validateCommitteeSelection(selected);
@@ -87,6 +97,7 @@ export default function CommitteePage({
             </div>
 
             <div className="committee-summary">
+                <CommitteeDatum label="finalized height" value={snapshot.height.toString()} />
                 <CommitteeDatum label="current epoch" value={snapshot.epoch.toString()} />
                 <CommitteeDatum label="effective epoch" value={snapshot.targetEpoch.toString()} />
                 <CommitteeDatum label="selected / eligible" value={`${selected.size} / ${snapshot.available.length}`} />

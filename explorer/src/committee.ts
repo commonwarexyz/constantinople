@@ -59,6 +59,30 @@ export interface CommitteeTransactionPlan {
     readonly nextNonceState: NonceState;
 }
 
+/** Rebase explicit peer choices onto a newly indexed committee snapshot. */
+export function reconcileCommitteeSelection(
+    previous: CommitteeSnapshot | null,
+    next: CommitteeSnapshot | null,
+    selected: ReadonlySet<string>,
+): Set<string> {
+    if (next === null) return new Set();
+
+    const eligible = new Set(next.available.map(({ peer }) => peer));
+    const reconciled = new Set(next.scheduled.filter((peer) => eligible.has(peer)));
+    if (previous === null || previous.targetEpoch !== next.targetEpoch) {
+        return reconciled;
+    }
+
+    const previousSchedule = new Set(previous.scheduled);
+    for (const { peer } of next.available) {
+        const userSelected = selected.has(peer);
+        if (userSelected === previousSchedule.has(peer)) continue;
+        if (userSelected) reconciled.add(peer);
+        else reconciled.delete(peer);
+    }
+    return reconciled;
+}
+
 /** Read the finalized committee view and immutable peer catalog from SQL. */
 export async function fetchCommittee(
     sqlUrl: string,

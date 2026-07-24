@@ -7,6 +7,7 @@ import {
     committeeLockDetail,
     fetchCommittee,
     planCommitteeTransactions,
+    reconcileCommitteeSelection,
     validateCommitteeSelection,
     type CommitteeSnapshot,
 } from '../src/committee.ts';
@@ -66,6 +67,39 @@ test('selection diff includes every indexed eligible peer', () => {
     assert.equal(
         validateCommitteeSelection(new Set(Array.from({ length: 65 }, (_, index) => peer(index)))),
         'committee must contain at most 64 peers',
+    );
+});
+
+test('selection reconciliation preserves edits across height-only refreshes', () => {
+    const previous = response();
+    const next = { ...previous, height: previous.height + 1n };
+
+    assert.deepEqual(
+        reconcileCommitteeSelection(previous, next, new Set([PEER_A, PEER_B])),
+        new Set([PEER_A, PEER_B]),
+    );
+});
+
+test('selection reconciliation rebases edits onto same-target schedule changes', () => {
+    const previous = committeeSnapshot([PEER_A], [PEER_A, PEER_B, PEER_C]);
+    const next = committeeSnapshot([PEER_A, PEER_C], [PEER_A, PEER_B, PEER_C]);
+
+    assert.deepEqual(
+        reconcileCommitteeSelection(previous, next, new Set([PEER_A, PEER_B])),
+        new Set([PEER_A, PEER_B, PEER_C]),
+    );
+});
+
+test('selection reconciliation resets at a target epoch change', () => {
+    const previous = committeeSnapshot([PEER_A], [PEER_A, PEER_B, PEER_C]);
+    const next = {
+        ...committeeSnapshot([PEER_C], [PEER_A, PEER_B, PEER_C]),
+        targetEpoch: previous.targetEpoch + 1n,
+    };
+
+    assert.deepEqual(
+        reconcileCommitteeSelection(previous, next, new Set([PEER_A, PEER_B])),
+        new Set([PEER_C]),
     );
 });
 

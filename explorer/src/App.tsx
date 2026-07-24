@@ -55,6 +55,7 @@ import {
     isRetryableAccountProofError,
     isRetryableProofError,
 } from './proofRetry';
+import { createRefreshQueue } from './refreshQueue';
 import {
     clearSession,
     createWallet,
@@ -222,6 +223,7 @@ export default function App() {
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
+    const committeeRefreshRef = useRef<(() => Promise<void>) | null>(null);
     const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
         walletMessage === 'opening passkey prompt' ||
@@ -298,6 +300,7 @@ export default function App() {
                 })) {
                     if (cancelled) return;
                     queueObservedBlocks([block]);
+                    void committeeRefreshRef.current?.();
                 }
             } catch (error) {
                 if (cancelled || controller.signal.aborted) return;
@@ -364,31 +367,25 @@ export default function App() {
     useEffect(() => {
         if (!isCommitteePage) return;
 
-        const controller = new AbortController();
-        let loading = false;
-        const load = async () => {
-            if (loading) return;
-            loading = true;
-            setCommitteeLoading(true);
-            try {
-                const snapshot = await fetchCommittee(indexerUrl, controller.signal);
-                if (controller.signal.aborted) return;
+        const refreshQueue = createRefreshQueue({
+            load: (signal) => fetchCommittee(indexerUrl, signal),
+            onResult: (snapshot) => {
                 setCommittee(snapshot);
                 setCommitteeError('');
-            } catch (error) {
-                if (controller.signal.aborted) return;
+            },
+            onError: (error) => {
                 setCommitteeError(error instanceof Error ? error.message : String(error));
-            } finally {
-                if (!controller.signal.aborted) setCommitteeLoading(false);
-                loading = false;
-            }
-        };
+            },
+            onLoading: setCommitteeLoading,
+        });
+        committeeRefreshRef.current = refreshQueue.request;
 
-        void load();
-        const interval = window.setInterval(() => void load(), 5_000);
+        void refreshQueue.request();
         return () => {
-            controller.abort();
-            window.clearInterval(interval);
+            if (committeeRefreshRef.current === refreshQueue.request) {
+                committeeRefreshRef.current = null;
+            }
+            refreshQueue.dispose();
         };
     }, [isCommitteePage]);
 
@@ -677,16 +674,7 @@ export default function App() {
     };
 
     const refreshCommittee = async () => {
-        setCommitteeLoading(true);
-        try {
-            const snapshot = await fetchCommittee(indexerUrl);
-            setCommittee(snapshot);
-            setCommitteeError('');
-        } catch (error) {
-            setCommitteeError(error instanceof Error ? error.message : String(error));
-        } finally {
-            setCommitteeLoading(false);
-        }
+        await committeeRefreshRef.current?.();
     };
 
     const copyValue = async (value: string) => {
