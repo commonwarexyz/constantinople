@@ -48,7 +48,7 @@ use exoware_qmdb::{
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch};
 use exoware_sql::{BatchWriter, PreparedBatch};
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     marker::PhantomData,
     num::NonZeroU64,
     sync::Arc,
@@ -357,6 +357,7 @@ where
 struct PreparedQmdbUpload {
     height: u64,
     sql_rows: Vec<super::SqlRow>,
+    committee_epochs: Vec<u64>,
     state: PreparedUpload<QmdbFamily>,
     transactions: PreparedUpload<QmdbFamily>,
     committee: PreparedUpload<QmdbFamily>,
@@ -377,6 +378,7 @@ struct QmdbCommitBatch {
     state_watermark: Option<PreparedWatermark<QmdbFamily>>,
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
     committee_watermark: Option<PreparedWatermark<QmdbFamily>>,
+    committee_order: Option<CommitteeCommitOrder>,
     store_batch: StoreWriteBatch,
     rows: usize,
 }
@@ -430,6 +432,16 @@ struct CommittedQmdbBatch {
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
     committee_watermark: Option<PreparedWatermark<QmdbFamily>>,
     store_seq: u64,
+}
+
+/// Orders Store batches that overwrite the same `committee_meta` epoch key.
+///
+/// The batch remains atomic with its QMDB and other SQL rows. Only batches
+/// touching an epoch already being committed wait; unrelated finalized
+/// uploads and committee writes for different epochs retain full concurrency.
+struct CommitteeCommitOrder {
+    predecessors: Vec<oneshot::Receiver<()>>,
+    completions: Vec<oneshot::Sender<()>>,
 }
 
 struct PendingUploadCompletion {
@@ -877,6 +889,15 @@ where
     } = block_rows;
     let mut sql = sql;
     sql.extend(account_rows);
+    let mut committee_epochs = committee_rows
+        .iter()
+        .map(|row| match row.values.first() {
+            Some(exoware_sql::CellValue::UInt64(epoch)) => *epoch,
+            _ => unreachable!("committee SQL rows begin with a UInt64 epoch"),
+        })
+        .collect::<Vec<_>>();
+    committee_epochs.sort_unstable();
+    committee_epochs.dedup();
     sql.extend(committee_rows);
     sql.extend(eligible_peer_rows);
 
@@ -901,6 +922,7 @@ where
     Ok(PreparedQmdbUpload {
         height,
         sql_rows: sql,
+        committee_epochs,
         state,
         transactions,
         committee,
@@ -927,6 +949,7 @@ async fn run_qmdb_committer<Cx, H>(
     let mut rx_closed = false;
     let mut commits = JoinSet::new();
     let mut pending_completions = VecDeque::new();
+    let mut committee_commits = HashMap::new();
     loop {
         while commits.len() < max_in_flight_commits {
             let upload = match rx.try_recv() {
@@ -953,6 +976,7 @@ async fn run_qmdb_committer<Cx, H>(
                 sql_writer,
                 upload,
                 inline_watermarks,
+                &mut committee_commits,
             )
             .await;
         }
@@ -995,6 +1019,7 @@ async fn run_qmdb_committer<Cx, H>(
                             sql_writer,
                             upload,
                             inline_watermarks,
+                            &mut committee_commits,
                         )
                         .await;
                     }
@@ -1048,12 +1073,14 @@ async fn stage_and_spawn_commit<Cx, H>(
     sql_writer: BatchWriter,
     upload: PreparedQmdbUpload,
     inline_watermarks: bool,
+    committee_commits: &mut HashMap<u64, oneshot::Receiver<()>>,
 ) -> BatchWriter
 where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
+    let committee_epochs = upload.committee_epochs.clone();
     let prepared = prepare_commit_batch_blocking(
         context.child("stage_commit_batch"),
         sql_writer,
@@ -1066,7 +1093,8 @@ where
     .await
     .expect("prepared QMDB commit batch must stage");
     let sql_writer = prepared.0;
-    let batch = prepared.1;
+    let mut batch = prepared.1;
+    batch.committee_order = reserve_committee_commit_order(committee_commits, &committee_epochs);
     spawn_commit(
         pipeline.commits,
         context.child("store_commit"),
@@ -1156,6 +1184,7 @@ where
         state_watermark,
         transaction_watermark,
         committee_watermark,
+        committee_order: None,
         store_batch,
     };
     Ok((sql_writer, batch))
@@ -1232,16 +1261,50 @@ where
         .expect("QMDB commit batch staging task exited")
 }
 
+fn reserve_committee_commit_order(
+    latest: &mut HashMap<u64, oneshot::Receiver<()>>,
+    epochs: &[u64],
+) -> Option<CommitteeCommitOrder> {
+    if epochs.is_empty() {
+        return None;
+    }
+
+    let mut predecessors = Vec::with_capacity(epochs.len());
+    let mut completions = Vec::with_capacity(epochs.len());
+    for epoch in epochs {
+        if let Some(predecessor) = latest.remove(epoch) {
+            predecessors.push(predecessor);
+        }
+        let (completion, receiver) = oneshot::channel();
+        latest.insert(*epoch, receiver);
+        completions.push(completion);
+    }
+    Some(CommitteeCommitOrder {
+        predecessors,
+        completions,
+    })
+}
+
 fn spawn_commit<Cx>(
     commits: &mut JoinSet<CommittedQmdbBatch>,
     context: Cx,
     commit_client: StoreClient,
     commit_metrics: super::StoreCommitMetrics,
-    commit: QmdbCommitBatch,
+    mut commit: QmdbCommitBatch,
 ) where
     Cx: Spawner,
 {
     commits.spawn(async move {
+        let committee_completions = if let Some(order) = commit.committee_order.take() {
+            for predecessor in order.predecessors {
+                predecessor
+                    .await
+                    .expect("preceding committee SQL commit must complete");
+            }
+            order.completions
+        } else {
+            Vec::new()
+        };
         let store_seq = commit_required_batch_blocking(
             context.child("finalized_upload"),
             commit_client,
@@ -1249,6 +1312,9 @@ fn spawn_commit<Cx>(
             commit.store_batch,
         )
         .await;
+        for completion in committee_completions {
+            let _ = completion.send(());
+        }
         debug!(
             store_sequence = store_seq,
             "indexer persisted finalized index batch"
@@ -1978,6 +2044,10 @@ mod tests {
         Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
     };
+    use datafusion::{
+        arrow::array::{Array, BinaryArray},
+        prelude::SessionContext,
+    };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
     use std::num::NonZeroU64 as StdNonZeroU64;
@@ -2083,6 +2153,7 @@ mod tests {
             let upload = PreparedQmdbUpload {
                 height: u64::from(seed),
                 sql_rows: Vec::new(),
+                committee_epochs: Vec::new(),
                 state,
                 transactions,
                 committee,
@@ -2294,6 +2365,7 @@ mod tests {
             let first_upload = PreparedQmdbUpload {
                 height: 1,
                 sql_rows: Vec::new(),
+                committee_epochs: Vec::new(),
                 state: state_writer
                     .prepare_upload(&state_ops(1))
                     .await
@@ -2325,6 +2397,7 @@ mod tests {
             let second_upload = PreparedQmdbUpload {
                 height: 2,
                 sql_rows: Vec::new(),
+                committee_epochs: Vec::new(),
                 state: state_writer
                     .prepare_upload(&state_ops(2))
                     .await
@@ -2411,6 +2484,165 @@ mod tests {
             assert!(pending.is_empty());
             first_rx.try_recv().expect("first upload completed");
             second_rx.try_recv().expect("second upload completed");
+            handle.abort();
+        });
+    }
+
+    #[test]
+    fn same_epoch_committee_sql_remains_newest_when_newer_commit_starts_first() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (handle, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let client = StoreClient::new(&url);
+            let state_writer = Arc::new(StateWriter::<Sha256>::fresh(
+                state_qmdb_client(&client).expect("state client"),
+            ));
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::fresh(
+                transactions_qmdb_client(&client).expect("transaction client"),
+            ));
+            let committee_writer = Arc::new(CommitteeWriter::<Sha256>::fresh(
+                committee_qmdb_client(&client).expect("committee client"),
+            ));
+            let schema = build_meta_schema(sql_meta_client(&client).expect("sql metadata client"))
+                .expect("schema");
+            let mut sql_writer = schema.batch_writer();
+            let sql = SessionContext::new();
+            schema.register_all(&sql).expect("register SQL schema");
+
+            let epoch = 7;
+            let older_members = vec![1u8; ed25519::PublicKey::SIZE];
+            let newer_members = vec![2u8; ed25519::PublicKey::SIZE];
+            let (older_completion, _older_rx) = oneshot::channel();
+            let older_upload = PreparedQmdbUpload {
+                height: 1,
+                sql_rows: vec![encode_committee_meta_row(CommitteeMetaRow {
+                    epoch,
+                    members: older_members,
+                })],
+                committee_epochs: vec![epoch],
+                state: state_writer
+                    .prepare_upload(&state_ops(1))
+                    .await
+                    .expect("older state upload"),
+                transactions: transaction_writer
+                    .prepare_upload(&transaction_ops(1))
+                    .await
+                    .expect("older transaction upload"),
+                committee: committee_writer
+                    .prepare_upload(&committee_ops(1))
+                    .await
+                    .expect("older committee upload"),
+                completion: older_completion,
+            };
+            let (next_sql_writer, mut older_batch) = prepare_commit_batch_blocking(
+                context.child("older"),
+                sql_writer,
+                state_writer.clone(),
+                transaction_writer.clone(),
+                committee_writer.clone(),
+                older_upload,
+                true,
+            )
+            .await
+            .expect("older batch stages");
+            sql_writer = next_sql_writer;
+
+            let (newer_completion, _newer_rx) = oneshot::channel();
+            let newer_upload = PreparedQmdbUpload {
+                height: 2,
+                sql_rows: vec![encode_committee_meta_row(CommitteeMetaRow {
+                    epoch,
+                    members: newer_members.clone(),
+                })],
+                committee_epochs: vec![epoch],
+                state: state_writer
+                    .prepare_upload(&state_ops(2))
+                    .await
+                    .expect("newer state upload"),
+                transactions: transaction_writer
+                    .prepare_upload(&transaction_ops(2))
+                    .await
+                    .expect("newer transaction upload"),
+                committee: committee_writer
+                    .prepare_upload(&committee_ops(2))
+                    .await
+                    .expect("newer committee upload"),
+                completion: newer_completion,
+            };
+            let (next_sql_writer, mut newer_batch) = prepare_commit_batch_blocking(
+                context.child("newer"),
+                sql_writer,
+                state_writer.clone(),
+                transaction_writer.clone(),
+                committee_writer.clone(),
+                newer_upload,
+                false,
+            )
+            .await
+            .expect("newer batch stages");
+            sql_writer = next_sql_writer;
+
+            let mut committee_commits = HashMap::new();
+            older_batch.committee_order =
+                reserve_committee_commit_order(&mut committee_commits, &[epoch]);
+            newer_batch.committee_order =
+                reserve_committee_commit_order(&mut committee_commits, &[epoch]);
+
+            let metrics = crate::publisher::StoreCommitMetrics::new(&context);
+            let mut commits = JoinSet::new();
+            spawn_commit(
+                &mut commits,
+                context.child("newer_first"),
+                client.clone(),
+                metrics.clone(),
+                newer_batch,
+            );
+            tokio::task::yield_now().await;
+            assert!(
+                commits.try_join_next().is_none(),
+                "newer same-epoch batch must wait for its predecessor"
+            );
+            spawn_commit(
+                &mut commits,
+                context.child("older_second"),
+                client.clone(),
+                metrics,
+                older_batch,
+            );
+
+            let first = commits
+                .join_next()
+                .await
+                .expect("older commit completes")
+                .expect("older commit task");
+            let second = commits
+                .join_next()
+                .await
+                .expect("newer commit completes")
+                .expect("newer commit task");
+            assert_eq!((first.upload.height, second.upload.height), (1, 2));
+
+            let batches = sql
+                .sql("SELECT members FROM committee_meta WHERE epoch = 7")
+                .await
+                .expect("committee query plans")
+                .collect()
+                .await
+                .expect("committee query executes");
+            let batch = batches
+                .iter()
+                .find(|batch| batch.num_rows() > 0)
+                .expect("committee row exists");
+            let members = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .expect("committee members are binary");
+            assert!(!members.is_null(0));
+            assert_eq!(members.value(0), newer_members);
+
+            drop(sql_writer);
             handle.abort();
         });
     }
