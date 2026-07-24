@@ -15,7 +15,7 @@ use commonware_consensus::{
     types::{Epoch, coding::Commitment},
 };
 use commonware_cryptography::{
-    PublicKey as CryptographicPublicKey,
+    Digestible as _, PublicKey as CryptographicPublicKey,
     bls12381::primitives::variant::MinSig,
     ed25519::{self, Batch, PublicKey},
     sha256::Sha256,
@@ -254,6 +254,30 @@ type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, ed25519::PrivateKey, Min
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
 type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
+
+/// Logs every finalized block delivered by marshal.
+///
+/// This mirrors Commonware's `examples/reshare` reporter and participates in
+/// the native acknowledgement tree so logging never holds back pruning.
+#[derive(Clone)]
+struct FinalizedBlockLogger;
+
+impl Reporter for FinalizedBlockLogger {
+    type Activity = Update<ValidatorEngineBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        if let Update::Block(block, acknowledgement) = activity {
+            info!(
+                epoch = block.header.context.round.epoch().get(),
+                height = block.height().get(),
+                digest = %hex(&block.digest()),
+                "finalized block"
+            );
+            acknowledgement.acknowledge();
+        }
+        Feedback::Ok
+    }
+}
 
 /// Adapts ordered marshal block updates to the certificate stream consumed by
 /// the indexer. The engine itself only sees this as a native marshal reporter.
@@ -1228,9 +1252,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 None
             };
         type EngineReporters =
-            Reporters<Update<ValidatorEngineBlock>, MempoolReporter, ObserverReporters>;
-        let reporter: EngineReporters =
-            Reporters::from((Some(mempool_reporter), observer_reporters));
+            Reporters<Update<ValidatorEngineBlock>, MempoolReporter, LogAndObserverReporters>;
+        type LogAndObserverReporters =
+            Reporters<Update<ValidatorEngineBlock>, FinalizedBlockLogger, ObserverReporters>;
+        let reporter: EngineReporters = Reporters::from((
+            mempool_reporter,
+            Reporters::from((FinalizedBlockLogger, observer_reporters)),
+        ));
         let engine_handle = engine.start(channels, Some(reporter));
 
         wait_for_critical_task_exit(
@@ -1276,15 +1304,18 @@ const fn production_sync_config() -> SyncEngineConfig {
 mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
-        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, ValidatorPayload, add_persistent_secondaries,
-        default_mempool_drop_grace_blocks, maybe_build_indexer, recovered_finalized_upload_cursor,
-        scan_finalized_queue_cursor, wait_for_critical_task_exit,
+        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedBlockLogger,
+        FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor, ValidatorPayload,
+        add_persistent_secondaries, default_mempool_drop_grace_blocks, maybe_build_indexer,
+        recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
+    use commonware_actor::Feedback;
     use commonware_codec::{FixedSize as _, Read as _, Write as _};
     use commonware_consensus::{
-        marshal::coding::types::coding_config_for_participants,
+        Reporter as _,
+        marshal::{Update, coding::types::coding_config_for_participants},
         simplex::types::Context as SimplexContext,
         types::{Round, View, coding::Commitment},
     };
@@ -1300,10 +1331,14 @@ mod tests {
         qmdb::any::{unordered::Operation as UnorderedOperation, value::FixedEncoding},
         queue,
     };
-    use commonware_utils::{non_empty_range, ordered::Map, sequence::FixedBytes};
+    use commonware_utils::{
+        Acknowledgement as _, acknowledgement::Exact, non_empty_range, ordered::Map,
+        sequence::FixedBytes,
+    };
     use constantinople_primitives::{
         Account, AccountKey, Block, Header, Sealable, SignedTransaction,
     };
+    use futures::FutureExt as _;
     use std::{future::pending, time::Duration};
 
     type TestAccountValue = FixedBytes<{ Account::SIZE }>;
@@ -1350,6 +1385,19 @@ mod tests {
         assert!(peers.secondary.get_value(&primary).is_none());
         assert!(peers.secondary.get_value(&scheduled).is_some());
         assert!(peers.secondary.get_value(&removed).is_some());
+    }
+
+    #[test]
+    fn finalized_block_logger_acknowledges_delivery() {
+        let block = queued_upload(7, 0, 1, 0, 1, 0, 1).block();
+        let (acknowledgement, waiter) = Exact::handle();
+        let mut reporter = FinalizedBlockLogger;
+
+        assert_eq!(
+            reporter.report(Update::Block(block, acknowledgement)),
+            Feedback::Ok
+        );
+        assert!(waiter.now_or_never().unwrap().is_ok());
     }
 
     #[tokio::test]
