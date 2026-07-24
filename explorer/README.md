@@ -37,7 +37,9 @@ The manually routed `/committee` page reads finalized `block_meta`,
 `committee_meta`, and `eligible_peer` rows from `VITE_SQL_URL`. The existing
 live `block_meta` stream refreshes this view after every finalized block, while
 route entry, manual refreshes, and submissions use the same coalesced loader.
-It starts from the scheduled E+2 set and renders every peer in the immutable eligible catalog.
+It presents the committee as a three-stage lifecycle: the active epoch, the
+already-locked next epoch, and the later epoch currently open for edits. The
+table renders every peer in the immutable eligible catalog across all three stages.
 Committee mutations remain ordinary signed transactions submitted through
 `VITE_MEMPOOL_URL`; validators expose no separate committee read API.
 

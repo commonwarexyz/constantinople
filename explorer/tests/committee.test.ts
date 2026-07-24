@@ -30,6 +30,9 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
                 // forward the most recent materialized committee.
                 return result({ epoch: 140n, members: peerBytes(PEER_A, PEER_C) });
             }
+            if (sql.includes('FROM committee_meta') && sql.includes('<= 140')) {
+                return result({ epoch: 140n, members: peerBytes(PEER_A, PEER_B) });
+            }
             if (sql.includes('FROM committee_meta')) {
                 return result({ epoch: 139n, members: peerBytes(PEER_A, PEER_C) });
             }
@@ -49,8 +52,9 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
     assert.equal(snapshot.targetEpoch, 141n);
     assert.equal(snapshot.lockHeight, 17_918n);
     assert.equal(snapshot.updatesOpen, true);
+    assert.deepEqual(snapshot.next, [PEER_A, PEER_B]);
     assert.deepEqual(snapshot.available.map(({ peer }) => peer), [PEER_A, PEER_B, PEER_C]);
-    assert.equal(queries.length, 4);
+    assert.equal(queries.length, 5);
     assert.ok(queries.some((query) => query.includes('FROM committee_meta')));
     assert.ok(queries.some((query) => query.includes('FROM eligible_peer')));
 });
@@ -100,6 +104,16 @@ test('selection reconciliation resets at a target epoch change', () => {
     assert.deepEqual(
         reconcileCommitteeSelection(previous, next, new Set([PEER_A, PEER_B])),
         new Set([PEER_C]),
+    );
+});
+
+test('selection reconciliation discards unsendable edits when submissions close', () => {
+    const previous = committeeSnapshot([PEER_A], [PEER_A, PEER_B, PEER_C]);
+    const next = { ...previous, updatesOpen: false };
+
+    assert.deepEqual(
+        reconcileCommitteeSelection(previous, next, new Set([PEER_A, PEER_B])),
+        new Set([PEER_A]),
     );
 });
 
@@ -235,6 +249,7 @@ function response(): CommitteeSnapshot {
         updatesOpen: true,
         lockHeight: 17_918n,
         current: [PEER_A, PEER_C],
+        next: [PEER_A, PEER_C],
         scheduled: [PEER_A, PEER_C],
         available: [
             { peer: PEER_A, address: 'validator-a:9000' },
@@ -265,6 +280,7 @@ function committeeSnapshot(scheduled: readonly string[], available: readonly str
     return {
         ...response(),
         current: scheduled,
+        next: scheduled,
         scheduled,
         available: available.map((candidate, index) => ({
             peer: candidate,

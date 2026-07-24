@@ -35,6 +35,7 @@ export default function CommitteePage({
     const selectionBaseline = snapshot
         ? [
               snapshot.targetEpoch.toString(),
+              snapshot.updatesOpen ? 'open' : 'closed',
               snapshot.scheduled.join(','),
               snapshot.available.map(({ peer }) => peer).join(','),
           ].join(':')
@@ -50,7 +51,10 @@ export default function CommitteePage({
 
     const selectionError = validateCommitteeSelection(selected);
     const changes = useMemo(
-        () => (snapshot && selectionError === null ? committeeChanges(snapshot, selected) : []),
+        () =>
+            snapshot?.updatesOpen && selectionError === null
+                ? committeeChanges(snapshot, selected)
+                : [],
         [snapshot, selected, selectionError],
     );
 
@@ -66,7 +70,9 @@ export default function CommitteePage({
     }
 
     const current = new Set(snapshot.current);
+    const next = new Set(snapshot.next);
     const scheduled = new Set(snapshot.scheduled);
+    const visibleSelection = snapshot.updatesOpen ? selected : scheduled;
     const blockDistance = blocksUntilCommitteeLock(snapshot);
     const canSubmit =
         snapshot.updatesOpen &&
@@ -88,7 +94,7 @@ export default function CommitteePage({
             <div className="committee-page__topline">
                 <div>
                     <div className="committee-page__kicker">committee controls</div>
-                    <h2>committee / epoch {snapshot.targetEpoch.toString()}</h2>
+                    <h2>committee</h2>
                 </div>
                 <div className={snapshot.updatesOpen ? 'committee-lock committee-lock--open' : 'committee-lock committee-lock--closed'}>
                     <strong>{snapshot.updatesOpen ? 'updates open' : 'updates locked'}</strong>
@@ -99,25 +105,55 @@ export default function CommitteePage({
             <div className="committee-summary">
                 <CommitteeDatum label="finalized height" value={snapshot.height.toString()} />
                 <CommitteeDatum label="current epoch" value={snapshot.epoch.toString()} />
-                <CommitteeDatum label="effective epoch" value={snapshot.targetEpoch.toString()} />
-                <CommitteeDatum label="selected / eligible" value={`${selected.size} / ${snapshot.available.length}`} />
+                <CommitteeDatum label="selected / eligible" value={`${visibleSelection.size} / ${snapshot.available.length}`} />
                 <CommitteeDatum label="blocks until submissions close" value={blockDistance.toString()} />
             </div>
 
+            <div className="committee-lifecycle" role="group" aria-label="committee lifecycle">
+                <CommitteeStage
+                    stage="01 / now"
+                    epoch={snapshot.epoch}
+                    detail={`${snapshot.current.length} validating`}
+                    tone="active"
+                />
+                <CommitteeStage
+                    stage="02 / next · locked"
+                    epoch={snapshot.epoch + 1n}
+                    detail={`${snapshot.next.length} validators already set`}
+                />
+                <CommitteeStage
+                    stage={snapshot.updatesOpen ? '03 / editing' : '03 / scheduled · locked'}
+                    epoch={snapshot.targetEpoch}
+                    detail={`${visibleSelection.size} selected · ${snapshot.updatesOpen ? 'submissions open' : 'submissions closed'}`}
+                    tone="editing"
+                />
+            </div>
+
             <div className="committee-page__notice">
-                <span>permissionless demo: any signed account may submit an eligible E+2 change</span>
+                <span>
+                    {snapshot.updatesOpen
+                        ? 'changes made here apply to the committee shown in the editing stage'
+                        : 'the final stage shows the locked committee for its scheduled epoch'}
+                </span>
                 <span>committee state and the eligible catalog are read from finalized index data</span>
             </div>
 
             <div className="committee-table" role="table" aria-label="eligible committee peers">
                 <div className="committee-row committee-row--head" role="row">
-                    <span role="columnheader">select</span>
+                    <span role="columnheader">edit</span>
                     <span role="columnheader">eligible peer</span>
                     <span role="columnheader">address</span>
-                    <span role="columnheader">current / E+2</span>
+                    <span role="columnheader">now · epoch {snapshot.epoch.toString()}</span>
+                    <span role="columnheader">next · epoch {(snapshot.epoch + 1n).toString()}</span>
+                    <span role="columnheader">
+                        {snapshot.updatesOpen ? 'editing' : 'scheduled'} · epoch {snapshot.targetEpoch.toString()}
+                    </span>
                 </div>
                 {snapshot.available.map((candidate) => {
-                    const isSelected = selected.has(candidate.peer);
+                    const isCurrent = current.has(candidate.peer);
+                    const isNext = next.has(candidate.peer);
+                    const isSelected = visibleSelection.has(candidate.peer);
+                    const isScheduled = scheduled.has(candidate.peer);
                     return (
                         <label className="committee-row" role="row" key={candidate.peer}>
                             <span role="cell">
@@ -132,11 +168,23 @@ export default function CommitteePage({
                             <span className="committee-row__peer" role="cell" title={candidate.peer}>
                                 {candidate.peer}
                             </span>
-                            <span role="cell">{candidate.address}</span>
-                            <span role="cell">
-                                {current.has(candidate.peer) ? 'member' : 'standby'} /{' '}
-                                {isSelected ? 'selected' : 'not selected'}
-                                {scheduled.has(candidate.peer) !== isSelected && <em> changed</em>}
+                            <span className="committee-row__address" role="cell" title={candidate.address}>
+                                {candidate.address}
+                            </span>
+                            <span className="committee-row__status" role="cell">
+                                <strong>{isCurrent ? 'validating' : 'standby'}</strong>
+                                <span>{isCurrent ? 'active now' : 'not active'}</span>
+                            </span>
+                            <span className="committee-row__status" role="cell">
+                                <strong>{isNext ? 'included' : 'excluded'}</strong>
+                                <span>locked</span>
+                            </span>
+                            <span className="committee-row__status" role="cell">
+                                <strong>{isSelected ? 'included' : 'excluded'}</strong>
+                                {isScheduled !== isSelected && (
+                                    <em>{isSelected ? 'pending addition' : 'pending removal'}</em>
+                                )}
+                                {isScheduled === isSelected && <span>current plan</span>}
                             </span>
                         </label>
                     );
@@ -178,6 +226,29 @@ function CommitteeDatum({ label, value }: { label: string; value: string }) {
         <div className="committee-summary__datum">
             <strong>{value}</strong>
             <span>{label}</span>
+        </div>
+    );
+}
+
+function CommitteeStage({
+    stage,
+    epoch,
+    detail,
+    tone,
+}: {
+    stage: string;
+    epoch: bigint;
+    detail: string;
+    tone?: 'active' | 'editing';
+}) {
+    const className = tone
+        ? `committee-lifecycle__stage committee-lifecycle__stage--${tone}`
+        : 'committee-lifecycle__stage';
+    return (
+        <div className={className}>
+            <span>{stage}</span>
+            <strong>epoch {epoch.toString()}</strong>
+            <small>{detail}</small>
         </div>
     );
 }

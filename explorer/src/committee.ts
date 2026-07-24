@@ -39,6 +39,8 @@ export interface CommitteeSnapshot {
     /** The first of the epoch's final two blocks, which reject committee mutations. */
     readonly lockHeight: bigint;
     readonly current: readonly string[];
+    /** The immutable committee for the epoch immediately after `epoch`. */
+    readonly next: readonly string[];
     readonly scheduled: readonly string[];
     /** The complete immutable eligible catalog. */
     readonly available: readonly EligibleCommitteePeer[];
@@ -69,7 +71,11 @@ export function reconcileCommitteeSelection(
 
     const eligible = new Set(next.available.map(({ peer }) => peer));
     const reconciled = new Set(next.scheduled.filter((peer) => eligible.has(peer)));
-    if (previous === null || previous.targetEpoch !== next.targetEpoch) {
+    if (
+        !next.updatesOpen ||
+        previous === null ||
+        previous.targetEpoch !== next.targetEpoch
+    ) {
         return reconciled;
     }
 
@@ -105,10 +111,12 @@ export async function fetchCommittee(
     }
     const height = expectBigint(tip.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT);
     const epoch = expectBigint(tip.values[BLOCK_META_EPOCH], BLOCK_META_EPOCH);
+    const nextEpoch = checkedAdd(epoch, 1n, 'next committee epoch');
     const targetEpoch = checkedAdd(epoch, 2n, 'committee target epoch');
 
-    const [currentResult, scheduledResult, availableResult] = await Promise.all([
+    const [currentResult, nextResult, scheduledResult, availableResult] = await Promise.all([
         fetchCommitteeAt(client, epoch, signal),
+        fetchCommitteeAt(client, nextEpoch, signal),
         fetchCommitteeAt(client, targetEpoch, signal),
         sqlQuery(
             client,
@@ -121,16 +129,18 @@ export async function fetchCommittee(
         ),
     ]);
     const current = decodeCommittee(currentResult, epoch);
+    const next = decodeCommittee(nextResult, nextEpoch);
     const scheduled = decodeCommittee(scheduledResult, targetEpoch);
     const available = availableResult.rows.map(decodeEligiblePeer);
     if (new Set(available.map(({ peer }) => peer)).size !== available.length) {
         throw new Error('eligible peer index contains duplicate peers');
     }
     assertCommitteeSize(current.length, 'current committee');
+    assertCommitteeSize(next.length, 'next committee');
     assertCommitteeSize(scheduled.length, 'scheduled committee');
 
     const eligible = new Set(available.map(({ peer }) => peer));
-    for (const peer of [...current, ...scheduled]) {
+    for (const peer of [...current, ...next, ...scheduled]) {
         if (!eligible.has(peer)) {
             throw new Error(`committee member ${peer} is missing from available`);
         }
@@ -151,6 +161,7 @@ export async function fetchCommittee(
         updatesOpen: height < submissionLockHeight,
         lockHeight,
         current,
+        next,
         scheduled,
         available,
     };
