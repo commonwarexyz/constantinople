@@ -129,25 +129,14 @@ export default function CommitteePage({
                 />
             </div>
 
-            <div className="committee-page__notice">
-                <span>
-                    {snapshot.updatesOpen
-                        ? 'changes made here apply to the committee shown in the editing stage'
-                        : 'the final stage shows the locked committee for its scheduled epoch'}
-                </span>
-                <span>committee state and the eligible catalog are read from finalized index data</span>
-            </div>
-
-            <div className="committee-table" role="table" aria-label="eligible committee peers">
+            <div className="committee-table" role="table" aria-label="committee peers">
                 <div className="committee-row committee-row--head" role="row">
-                    <span role="columnheader">edit</span>
-                    <span role="columnheader">eligible peer</span>
+                    <span role="columnheader" aria-label="selection" />
+                    <span role="columnheader">peer</span>
                     <span role="columnheader">address</span>
-                    <span role="columnheader">now · epoch {snapshot.epoch.toString()}</span>
-                    <span role="columnheader">next · epoch {(snapshot.epoch + 1n).toString()}</span>
-                    <span role="columnheader">
-                        {snapshot.updatesOpen ? 'editing' : 'scheduled'} · epoch {snapshot.targetEpoch.toString()}
-                    </span>
+                    <span role="columnheader">now</span>
+                    <span role="columnheader">next</span>
+                    <span role="columnheader">{snapshot.updatesOpen ? 'editing' : 'scheduled'}</span>
                 </div>
                 {snapshot.available.map((candidate) => {
                     const isCurrent = current.has(candidate.peer);
@@ -172,19 +161,16 @@ export default function CommitteePage({
                                 {candidate.address}
                             </span>
                             <span className="committee-row__status" role="cell">
-                                <strong>{isCurrent ? 'validating' : 'standby'}</strong>
-                                <span>{isCurrent ? 'active now' : 'not active'}</span>
+                                <strong>{isCurrent ? 'active' : 'standby'}</strong>
                             </span>
                             <span className="committee-row__status" role="cell">
                                 <strong>{isNext ? 'included' : 'excluded'}</strong>
-                                <span>locked</span>
                             </span>
                             <span className="committee-row__status" role="cell">
                                 <strong>{isSelected ? 'included' : 'excluded'}</strong>
                                 {isScheduled !== isSelected && (
                                     <em>{isSelected ? 'pending addition' : 'pending removal'}</em>
                                 )}
-                                {isScheduled === isSelected && <span>current plan</span>}
                             </span>
                         </label>
                     );
