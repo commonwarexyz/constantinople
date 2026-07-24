@@ -8,10 +8,12 @@
 //! backups, key rotation, or hardware isolation should provide a different
 //! [`SecretStore`] implementation.
 //!
-//! Each put writes a temporary file in the destination directory, flushes the
-//! file, atomically renames it over the destination, and flushes the directory
-//! before returning. Files are created with mode `0600` and store-owned
-//! directories with mode `0700` on Unix.
+//! Each put writes a temporary file in the destination directory and flushes
+//! the file before replacing the destination. On Unix, replacement is an atomic
+//! rename followed by a directory flush. Other platforms use a best-effort
+//! remove-then-rename fallback when replacing an existing file, so repeat writes
+//! work but replacement is not crash-atomic. Files are created with mode `0600`
+//! and store-owned directories with mode `0700` on Unix.
 
 use commonware_codec::{DecodeExt as _, Encode as _};
 use commonware_consensus::types::Epoch;
@@ -67,6 +69,7 @@ impl FileSecretStore {
         ensure_private_dir(&root.join(SHARES))?;
         ensure_private_dir(&root.join(SEEDS))?;
         ensure_private_dir(&root.join(DEALINGS))?;
+        cleanup_stale_temporary_files(&root)?;
 
         sync_directory(&root)?;
         sync_directory(parent_or_current(&root))?;
@@ -177,6 +180,8 @@ impl SecretStore for FileSecretStore {
     }
 
     async fn prune(&mut self, min: Epoch) {
+        cleanup_stale_temporary_files(&self.root)
+            .expect("failed to prune stale DKG temporary files");
         prune_epoch_files(&self.root.join(SHARES), min).expect("failed to prune old DKG shares");
         prune_epoch_files(&self.root.join(SEEDS), min)
             .expect("failed to prune old DKG dealer seeds");
@@ -212,7 +217,7 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
         file.write_all(contents)?;
         file.sync_all()?;
         drop(file);
-        fs::rename(&temporary, path)?;
+        replace_file(&temporary, path)?;
         sync_directory(parent)
     })();
 
@@ -223,16 +228,26 @@ fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
 }
 
 fn create_temporary(path: &Path) -> io::Result<(PathBuf, File)> {
+    create_temporary_with(path, std::process::id(), || {
+        NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed)
+    })
+}
+
+fn create_temporary_with(
+    path: &Path,
+    process_id: u32,
+    mut next_id: impl FnMut() -> u64,
+) -> io::Result<(PathBuf, File)> {
     let parent = parent_or_current(path);
     let file_name = path
         .file_name()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "secret path has no file name"))?;
 
     for _ in 0..16 {
-        let id = NEXT_TEMP_ID.fetch_add(1, Ordering::Relaxed);
+        let id = next_id();
         let mut temporary_name = OsString::from(".");
         temporary_name.push(file_name);
-        temporary_name.push(format!(".{}.{}.tmp", std::process::id(), id));
+        temporary_name.push(format!(".{process_id}.{id}.tmp"));
         let temporary = parent.join(temporary_name);
 
         let mut options = OpenOptions::new();
@@ -242,7 +257,22 @@ fn create_temporary(path: &Path) -> io::Result<(PathBuf, File)> {
 
         match options.open(&temporary) {
             Ok(file) => return Ok((temporary, file)),
-            Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+            Err(error) if error.kind() == ErrorKind::AlreadyExists => {
+                // IDs are process-global, so an existing candidate for this PID
+                // can only be a crash remnant (or an uncoordinated external
+                // writer). Reclaim it so a stale 16-name window cannot
+                // permanently prevent future writes.
+                match fs::remove_file(&temporary) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(_) => continue,
+                }
+                match options.open(&temporary) {
+                    Ok(file) => return Ok((temporary, file)),
+                    Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
             Err(error) => return Err(error),
         }
     }
@@ -251,6 +281,113 @@ fn create_temporary(path: &Path) -> io::Result<(PathBuf, File)> {
         ErrorKind::AlreadyExists,
         "could not allocate a temporary secret file",
     ))
+}
+
+#[cfg(unix)]
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    fs::rename(temporary, destination)
+}
+
+#[cfg(not(unix))]
+fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
+    match fs::rename(temporary, destination) {
+        Ok(()) => Ok(()),
+        Err(rename_error) => {
+            // Some non-Unix platforms do not replace an existing destination
+            // with rename. Removing it first makes repeat writes functional,
+            // but leaves a crash window with no destination. This store is
+            // explicitly a non-production-grade fallback on these platforms.
+            match fs::remove_file(destination) {
+                Ok(()) => fs::rename(temporary, destination),
+                Err(error) if error.kind() == ErrorKind::NotFound => Err(rename_error),
+                Err(error) => Err(error),
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TemporaryTarget {
+    InitialShareMarker,
+    Epoch,
+    Hex,
+}
+
+fn cleanup_stale_temporary_files(root: &Path) -> io::Result<()> {
+    cleanup_temporary_files(root, TemporaryTarget::InitialShareMarker)?;
+    cleanup_temporary_files(&root.join(SHARES), TemporaryTarget::Epoch)?;
+    cleanup_temporary_files(&root.join(SEEDS), TemporaryTarget::Epoch)?;
+
+    let dealings = root.join(DEALINGS);
+    for entry in fs::read_dir(&dealings)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() || !is_canonical_u64(&entry.file_name().to_string_lossy()) {
+            continue;
+        }
+        cleanup_temporary_files(&entry.path(), TemporaryTarget::Hex)?;
+    }
+    Ok(())
+}
+
+fn cleanup_temporary_files(path: &Path, target: TemporaryTarget) -> io::Result<()> {
+    let mut changed = false;
+    for entry in fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !is_store_temporary_file(&entry.file_name(), target) {
+            continue;
+        }
+        fs::remove_file(entry.path())?;
+        changed = true;
+    }
+    if changed {
+        sync_directory(path)?;
+    }
+    Ok(())
+}
+
+fn is_store_temporary_file(name: &std::ffi::OsStr, target_kind: TemporaryTarget) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(body) = name
+        .strip_prefix('.')
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((target_and_pid, id)) = body.rsplit_once('.') else {
+        return false;
+    };
+    let Some((target, pid)) = target_and_pid.rsplit_once('.') else {
+        return false;
+    };
+    if !is_canonical_u32(pid) || !is_canonical_u64(id) {
+        return false;
+    }
+
+    match target_kind {
+        TemporaryTarget::InitialShareMarker => target == INITIAL_SHARE_MARKER,
+        TemporaryTarget::Epoch => is_canonical_u64(target),
+        TemporaryTarget::Hex => {
+            !target.is_empty()
+                && target.len().is_multiple_of(2)
+                && target
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        }
+    }
+}
+
+fn is_canonical_u32(value: &str) -> bool {
+    value
+        .parse::<u32>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
+}
+
+fn is_canonical_u64(value: &str) -> bool {
+    value
+        .parse::<u64>()
+        .is_ok_and(|parsed| parsed.to_string() == value)
 }
 
 fn ensure_private_dir(path: &Path) -> io::Result<()> {
@@ -414,6 +551,109 @@ mod tests {
             assert_eq!(store.get_seed(epoch).await, Some(seed));
             assert_eq!(store.get_dealing(epoch, &dealer).await, Some(dealing));
         });
+    }
+
+    #[test]
+    fn repeated_writes_replace_existing_material() {
+        let directory = TestDirectory::new();
+        let mut store = FileSecretStore::load(directory.store_path()).unwrap();
+        let epoch = Epoch::new(8);
+        let (first_share, first_seed, dealer, first_dealing) = materials(11);
+        let (second_share, second_seed, _, second_dealing) = materials(12);
+
+        block_on(async {
+            store.put_share(epoch, first_share).await;
+            store.put_seed(epoch, first_seed).await;
+            store
+                .put_dealing(epoch, dealer.clone(), first_dealing)
+                .await;
+
+            store.put_share(epoch, second_share.clone()).await;
+            store.put_seed(epoch, second_seed).await;
+            store
+                .put_dealing(epoch, dealer.clone(), second_dealing.clone())
+                .await;
+
+            assert_eq!(store.get_share(epoch).await, Some(second_share));
+            assert_eq!(store.get_seed(epoch).await, Some(second_seed));
+            assert_eq!(
+                store.get_dealing(epoch, &dealer).await,
+                Some(second_dealing)
+            );
+        });
+    }
+
+    #[test]
+    fn load_removes_only_recognized_stale_temporary_files() {
+        let directory = TestDirectory::new();
+        let path = directory.store_path();
+        let store = FileSecretStore::load(&path).unwrap();
+        let dealing_epoch = store.dealing_epoch_path(Epoch::new(9));
+        ensure_private_dir(&dealing_epoch).unwrap();
+
+        let recognized = [
+            path.join(format!(".{INITIAL_SHARE_MARKER}.123.1.tmp")),
+            path.join(SHARES).join(".7.123.2.tmp"),
+            path.join(SEEDS).join(".8.123.3.tmp"),
+            dealing_epoch.join(".deadbeef.123.4.tmp"),
+        ];
+        for temporary in &recognized {
+            fs::write(temporary, b"stale secret").unwrap();
+        }
+
+        let unrelated = [
+            path.join(".other-marker.123.1.tmp"),
+            path.join(SHARES).join(".07.123.2.tmp"),
+            path.join(SEEDS).join(".8.not-a-pid.3.tmp"),
+            dealing_epoch.join(".not-hex.123.4.tmp"),
+            dealing_epoch.join("notes.tmp"),
+        ];
+        for file in &unrelated {
+            fs::write(file, b"unrelated").unwrap();
+        }
+        drop(store);
+
+        let _reopened = FileSecretStore::load(path).unwrap();
+        for temporary in recognized {
+            assert!(
+                !temporary.exists(),
+                "recognized stale temporary survived: {}",
+                temporary.display()
+            );
+        }
+        for file in unrelated {
+            assert!(
+                file.exists(),
+                "unrecognized file was removed: {}",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_name_exhaustion_recovers_from_crash_leftovers() {
+        let directory = TestDirectory::new();
+        let parent = directory.0.join("temporary-collisions");
+        ensure_private_dir(&parent).unwrap();
+        let destination = parent.join("17");
+        let process_id = 4_242;
+        for id in 0..16 {
+            fs::write(
+                parent.join(format!(".17.{process_id}.{id}.tmp")),
+                b"stale secret",
+            )
+            .unwrap();
+        }
+
+        let mut ids = 0..16;
+        let (temporary, file) = create_temporary_with(&destination, process_id, || {
+            ids.next().expect("temporary allocator exceeded its window")
+        })
+        .expect("stale names must not exhaust temporary allocation");
+        drop(file);
+
+        assert_eq!(temporary, parent.join(".17.4242.0.tmp"));
+        fs::remove_file(temporary).unwrap();
     }
 
     #[test]
