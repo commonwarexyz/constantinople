@@ -10,10 +10,14 @@ use crate::{
 use commonware_codec::Encode;
 use commonware_formatting::hex;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
 use tracing::info;
+
+const MAX_LOCAL_VALIDATORS: u32 = 64;
+const DEFAULT_EXPLORER_PORT: u16 = 5173;
 
 struct GeneratedValidator {
     config_file: PathBuf,
@@ -21,9 +25,144 @@ struct GeneratedValidator {
     peer: PeerEntry,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct LocalNodePorts {
+    p2p: u16,
+    http: u16,
+    metrics: u16,
+}
+
+/// Complete loopback port allocation for one generated local deployment.
+///
+/// Validator and secondary base ranges are explicit operator choices, so they
+/// must already be disjoint. Auxiliary services retain their existing
+/// preferred ports when available and move upward deterministically when a
+/// larger node range occupies those ports.
+#[derive(Debug)]
+struct LocalPortPlan {
+    nodes: Vec<LocalNodePorts>,
+    chain_indexer: Option<u16>,
+    chain_indexer_metrics: Option<u16>,
+    metadata_indexer: Option<u16>,
+    qmdb_indexer: Option<u16>,
+    explorer: Option<u16>,
+    spammer_metrics: Option<u16>,
+    relayer_http: Option<u16>,
+}
+
+impl LocalPortPlan {
+    fn new(args: &GenerateArgs, local: &LocalArgs) -> Self {
+        assert!(args.validators >= 1, "need at least one validator");
+        assert!(
+            args.validators <= MAX_LOCAL_VALIDATORS,
+            "local deployments support at most {MAX_LOCAL_VALIDATORS} validators"
+        );
+
+        let validators =
+            usize::try_from(args.validators).expect("local validator count must fit in usize");
+        let secondaries = usize::try_from(total_secondaries(args))
+            .expect("local secondary count must fit in usize");
+        let node_count = validators
+            .checked_add(secondaries)
+            .expect("local node count overflow");
+        let mut allocator = PortAllocator::default();
+        let mut nodes = Vec::with_capacity(node_count);
+
+        for index in 0..node_count {
+            let p2p = offset_port(local.base_port, index, "node p2p");
+            let http = offset_port(local.base_http_port, index, "node HTTP");
+            let metrics = offset_port(local.base_metrics_port, index, "node metrics");
+            allocator.reserve_exact(p2p, format!("node {index} p2p"));
+            allocator.reserve_exact(http, format!("node {index} HTTP"));
+            allocator.reserve_exact(metrics, format!("node {index} metrics"));
+            nodes.push(LocalNodePorts { p2p, http, metrics });
+        }
+
+        let spammer_metrics = args.spammer.then(|| {
+            let preferred = offset_port(local.base_metrics_port, node_count, "spammer metrics");
+            allocator.reserve_preferred(preferred, "spammer metrics")
+        });
+        let chain_indexer_metrics = indexer_enabled(args).then(|| {
+            let offset = node_count
+                .checked_add(usize::from(args.spammer))
+                .expect("chain-indexer metrics offset overflow");
+            let preferred = offset_port(local.base_metrics_port, offset, "chain-indexer metrics");
+            allocator.reserve_preferred(preferred, "chain-indexer metrics")
+        });
+        let chain_indexer = indexer_enabled(args).then(|| {
+            allocator.reserve_preferred(local.chain_indexer_port, "chain-indexer service")
+        });
+        let metadata_indexer = indexer_enabled(args).then(|| {
+            allocator.reserve_preferred(local.metadata_indexer_port, "metadata-indexer service")
+        });
+        let qmdb_indexer = indexer_enabled(args)
+            .then(|| allocator.reserve_preferred(local.qmdb_indexer_port, "qmdb-indexer service"));
+        let explorer = indexer_enabled(args)
+            .then(|| allocator.reserve_preferred(DEFAULT_EXPLORER_PORT, "explorer service"));
+        let relayer_http = args.relayer.then(|| {
+            let secondary_index = usize::from(args.indexer);
+            nodes[validators + secondary_index].http
+        });
+
+        Self {
+            nodes,
+            chain_indexer,
+            chain_indexer_metrics,
+            metadata_indexer,
+            qmdb_indexer,
+            explorer,
+            spammer_metrics,
+            relayer_http,
+        }
+    }
+
+    fn validator(&self, index: u32) -> LocalNodePorts {
+        self.nodes[index as usize]
+    }
+
+    fn secondary(&self, validators: u32, index: usize) -> LocalNodePorts {
+        self.nodes[validators as usize + index]
+    }
+}
+
+#[derive(Debug, Default)]
+struct PortAllocator {
+    reserved: BTreeMap<u16, String>,
+}
+
+impl PortAllocator {
+    fn reserve_exact(&mut self, port: u16, owner: impl Into<String>) {
+        let owner = owner.into();
+        assert_ne!(port, 0, "local port for {owner} must be non-zero");
+        if let Some(existing) = self.reserved.get(&port) {
+            panic!("local port {port} is assigned to both {existing} and {owner}");
+        }
+        self.reserved.insert(port, owner);
+    }
+
+    fn reserve_preferred(&mut self, preferred: u16, owner: &'static str) -> u16 {
+        assert_ne!(preferred, 0, "preferred local port for {owner} is zero");
+        for port in preferred..=u16::MAX {
+            if self.reserved.contains_key(&port) {
+                continue;
+            }
+            self.reserved.insert(port, owner.to_string());
+            return port;
+        }
+        panic!("no local port is available for {owner} at or above {preferred}");
+    }
+}
+
+fn offset_port(base: u16, offset: usize, owner: &str) -> u16 {
+    let offset = u16::try_from(offset)
+        .unwrap_or_else(|_| panic!("local port offset for {owner} does not fit in u16"));
+    base.checked_add(offset)
+        .unwrap_or_else(|| panic!("local port range for {owner} overflows u16"))
+}
+
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     validate_generate_args(args);
-    assert!(args.validators >= 1, "need at least one validator");
+    let _port_plan = LocalPortPlan::new(args, local);
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -67,6 +206,7 @@ fn build_validators(
     output_dir: &std::path::Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
+    let ports = LocalPortPlan::new(args, local);
     let mut validators = Vec::with_capacity(args.validators as usize);
 
     let eligible_peers = eligible_peer_entries(material);
@@ -81,25 +221,14 @@ fn build_validators(
             .shares
             .get(public_key)
             .expect("missing share for validator");
-        let listen_port = local
-            .base_port
-            .checked_add(index as u16)
-            .expect("listen port overflow");
-        let http_port = local
-            .base_http_port
-            .checked_add(index as u16)
-            .expect("http port overflow");
-        let metrics_port = local
-            .base_metrics_port
-            .checked_add(index as u16)
-            .expect("metrics port overflow");
+        let node_ports = ports.validator(index);
 
         let config = ValidatorConfig {
             private_key: hex(&material.signers[validator_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: hex(&share.encode()),
             startup: args.startup,
-            listen_port,
+            listen_port: node_ports.p2p,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
             num_validators: args.validators,
@@ -108,8 +237,8 @@ fn build_validators(
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
-            http_port,
-            metrics_port,
+            http_port: node_ports.http,
+            metrics_port: node_ports.metrics,
             max_propose_bytes: args.max_propose_bytes,
             max_pool_bytes: args.max_pool_bytes,
             state_page_cache_bytes: args.state_page_cache_bytes,
@@ -126,8 +255,8 @@ fn build_validators(
             config,
             peer: PeerEntry {
                 name: public_key_hex,
-                p2p: format!("127.0.0.1:{listen_port}"),
-                http: format!("127.0.0.1:{http_port}"),
+                p2p: format!("127.0.0.1:{}", node_ports.p2p),
+                http: format!("127.0.0.1:{}", node_ports.http),
             },
         });
     }
@@ -141,41 +270,25 @@ fn build_secondaries(
     output_dir: &std::path::Path,
     material: &ClusterMaterial,
 ) -> Vec<GeneratedValidator> {
+    let ports = LocalPortPlan::new(args, local);
     let roles = secondary_roles(args);
     let mut secondaries = Vec::with_capacity(roles.len());
     let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
-    // Secondary ports start after the primary range to avoid collisions on
-    // the same loopback host.
-    let primary_span = args.validators as u16;
 
     for (secondary_index, role) in roles.into_iter().enumerate() {
         let index = secondary_index as u32;
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
-        let offset = primary_span
-            .checked_add(index as u16)
-            .expect("secondary port offset overflow");
-        let listen_port = local
-            .base_port
-            .checked_add(offset)
-            .expect("secondary listen port overflow");
-        let http_port = local
-            .base_http_port
-            .checked_add(offset)
-            .expect("secondary http port overflow");
-        let metrics_port = local
-            .base_metrics_port
-            .checked_add(offset)
-            .expect("secondary metrics port overflow");
+        let node_ports = ports.secondary(args.validators, secondary_index);
 
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: String::new(),
             startup: args.startup,
-            listen_port,
+            listen_port: node_ports.p2p,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("secondary-{index}"),
             num_validators: args.validators,
@@ -184,8 +297,8 @@ fn build_secondaries(
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
-            http_port,
-            metrics_port,
+            http_port: node_ports.http,
+            metrics_port: node_ports.metrics,
             max_propose_bytes: args.max_propose_bytes,
             max_pool_bytes: args.max_pool_bytes,
             state_page_cache_bytes: args.state_page_cache_bytes,
@@ -193,10 +306,15 @@ fn build_secondaries(
             public_key_cache_size: args.public_key_cache_size,
             traces: 0.0,
             eligible_peers: eligible_peers.clone(),
-            indexer: matches!(role, SecondaryRole::Indexer)
-                .then(|| local_indexer_config(local.chain_indexer_port)),
+            indexer: matches!(role, SecondaryRole::Indexer).then(|| {
+                local_indexer_config(
+                    ports
+                        .chain_indexer
+                        .expect("indexer role requires an allocated service port"),
+                )
+            }),
             relayer: matches!(role, SecondaryRole::Relayer)
-                .then(|| local_relayer_config(local, material)),
+                .then(|| local_relayer_config(&ports, material)),
         };
 
         secondaries.push(GeneratedValidator {
@@ -204,8 +322,8 @@ fn build_secondaries(
             config,
             peer: PeerEntry {
                 name: public_key_hex,
-                p2p: format!("127.0.0.1:{listen_port}"),
-                http: format!("127.0.0.1:{http_port}"),
+                p2p: format!("127.0.0.1:{}", node_ports.p2p),
+                http: format!("127.0.0.1:{}", node_ports.http),
             },
         });
     }
@@ -213,7 +331,7 @@ fn build_secondaries(
     secondaries
 }
 
-fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> RelayerConfig {
+fn local_relayer_config(ports: &LocalPortPlan, material: &ClusterMaterial) -> RelayerConfig {
     let leaders = material
         .public_keys
         .iter()
@@ -221,13 +339,7 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
         .enumerate()
         .map(|(index, public_key)| RelayerLeaderConfig {
             public_key: hex(&public_key.encode()),
-            url: format!(
-                "http://127.0.0.1:{}",
-                local
-                    .base_http_port
-                    .checked_add(index as u16)
-                    .expect("validator http port overflow")
-            ),
+            url: format!("http://127.0.0.1:{}", ports.nodes[index].http),
         })
         .collect();
 
@@ -283,6 +395,7 @@ fn local_run_commands(
     relayer_targets: &[String],
     simplex_verification_material: &str,
 ) -> Vec<String> {
+    let ports = LocalPortPlan::new(args, local);
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
@@ -307,7 +420,21 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
-        let metrics_port = chain_indexer_metrics_port(args, local);
+        let chain_indexer_port = ports
+            .chain_indexer
+            .expect("indexer stack requires an allocated chain-indexer port");
+        let chain_indexer_metrics_port = ports
+            .chain_indexer_metrics
+            .expect("indexer stack requires an allocated metrics port");
+        let metadata_indexer_port = ports
+            .metadata_indexer
+            .expect("indexer stack requires an allocated metadata-indexer port");
+        let qmdb_indexer_port = ports
+            .qmdb_indexer
+            .expect("indexer stack requires an allocated qmdb-indexer port");
+        let explorer_port = ports
+            .explorer
+            .expect("indexer stack requires an allocated explorer port");
         let db_parallelism = local
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
@@ -315,8 +442,8 @@ fn local_run_commands(
         commands.push(format!(
             "cargo run --release -p constantinople-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
-            local.chain_indexer_port,
-            metrics_port,
+            chain_indexer_port,
+            chain_indexer_metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
@@ -327,34 +454,37 @@ fn local_run_commands(
         commands.push(format!(
             "cargo run --release -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
-            METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
+            METADATA_INDEXER_BINARY_FILE, chain_indexer_port, metadata_indexer_port,
         ));
         commands.push(format!(
             "cargo run --release -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
-            QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
+            QMDB_INDEXER_BINARY_FILE, chain_indexer_port, qmdb_indexer_port,
         ));
         // Bring up the React explorer dev server alongside the metadata and
         // QMDB facades so operators get a live view and browser-verified
         // submitted-transaction proofs.
         // The defaults in `explorer/src/App.tsx` match these ports, but pass
-        // both URLs explicitly so non-default deployer ports still work.
-        let relayer_env = relayer_http_port(args, local)
+        // all URLs explicitly so relocated or non-default ports still work.
+        let relayer_env = ports
+            .relayer_http
             .map(|port| format!(" VITE_MEMPOOL_URL=http://127.0.0.1:{port}"))
             .unwrap_or_default();
         commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev",
-            local.metadata_indexer_port,
-            local.qmdb_indexer_port,
-            local.chain_indexer_port,
+            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev -- --port {}",
+            metadata_indexer_port,
+            qmdb_indexer_port,
+            chain_indexer_port,
             simplex_verification_material,
             relayer_env,
+            explorer_port,
         ));
     }
 
     if args.spammer {
-        let relayer_port =
-            relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
+        let relayer_port = ports
+            .relayer_http
+            .expect("--spammer requires a relayer secondary");
         let mut network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {}",
             relayer_port, args.validators,
@@ -363,9 +493,9 @@ fn local_run_commands(
             network_source.push_str(&format!(" --relayer-targets {}", relayer_targets.join(",")));
         }
 
-        // Place the spammer's metrics port past the primary and secondary ranges
-        // so it does not collide with any validator on the loopback host.
-        let metrics_port = spammer_metrics_port(args, local);
+        let metrics_port = ports
+            .spammer_metrics
+            .expect("--spammer requires an allocated metrics port");
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -388,32 +518,9 @@ fn local_run_commands(
     commands
 }
 
-fn spammer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
-    local
-        .base_metrics_port
-        .checked_add(args.validators as u16 + total_secondaries(args) as u16)
-        .expect("spammer metrics port overflow")
-}
-
-fn chain_indexer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
-    let auxiliary_offset =
-        args.validators as u16 + total_secondaries(args) as u16 + u16::from(args.spammer);
-    local
-        .base_metrics_port
-        .checked_add(auxiliary_offset)
-        .expect("chain indexer metrics port overflow")
-}
-
-fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
-    args.relayer.then(|| {
-        let relayer_index = u16::from(args.indexer);
-        local.base_http_port + args.validators as u16 + relayer_index
-    })
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{build_secondaries, build_validators, local_run_commands};
+    use super::{LocalPortPlan, build_secondaries, build_validators, local_run_commands};
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
         default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
@@ -421,7 +528,10 @@ mod tests {
     };
     use commonware_codec::Encode as _;
     use commonware_formatting::hex;
-    use std::path::{Path, PathBuf};
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+    };
 
     const TEST_SIMPLEX_VERIFICATION_MATERIAL: &str = "abcdef";
 
@@ -469,6 +579,26 @@ mod tests {
         match &args.target {
             GenerateTarget::Local(local) => local,
             _ => panic!("test_args must construct a Local target"),
+        }
+    }
+
+    fn command_flag_port(command: &str, flag: &str) -> u16 {
+        let parts = command.split_whitespace().collect::<Vec<_>>();
+        let flag_index = parts
+            .iter()
+            .position(|part| *part == flag)
+            .unwrap_or_else(|| panic!("missing {flag} in command: {command}"));
+        parts
+            .get(flag_index + 1)
+            .unwrap_or_else(|| panic!("missing value after {flag} in command: {command}"))
+            .parse()
+            .unwrap_or_else(|error| panic!("invalid port after {flag} in command: {error}"))
+    }
+
+    fn assert_unique_port(seen: &mut BTreeMap<u16, String>, port: u16, owner: impl Into<String>) {
+        let owner = owner.into();
+        if let Some(existing) = seen.insert(port, owner.clone()) {
+            panic!("port {port} is assigned to both {existing} and {owner}");
         }
     }
 
@@ -534,7 +664,8 @@ mod tests {
         let mut args = test_args(false);
         args.relayer = true;
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
-        let config = super::local_relayer_config(local_args(&args), &material);
+        let ports = LocalPortPlan::new(&args, local_args(&args));
+        let config = super::local_relayer_config(&ports, &material);
         let expected = material
             .public_keys
             .iter()
@@ -726,6 +857,143 @@ mod tests {
     }
 
     #[test]
+    fn large_full_stack_ports_are_globally_unique() {
+        let mut args = test_args(true);
+        args.validators = 13;
+        args.indexer = true;
+        args.relayer = true;
+
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let validators = build_validators(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+        let secondaries = build_secondaries(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let nodes = validators.iter().chain(&secondaries).collect::<Vec<_>>();
+        let mut seen = BTreeMap::new();
+        for (index, node) in nodes.iter().enumerate() {
+            assert_unique_port(
+                &mut seen,
+                node.config.listen_port,
+                format!("node {index} p2p"),
+            );
+            assert_unique_port(
+                &mut seen,
+                node.config.http_port,
+                format!("node {index} HTTP"),
+            );
+            assert_unique_port(
+                &mut seen,
+                node.config.metrics_port,
+                format!("node {index} metrics"),
+            );
+        }
+
+        let chain_indexer = commands
+            .iter()
+            .find(|command| command.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+        let metadata_indexer = commands
+            .iter()
+            .find(|command| command.contains("--bin metadata-indexer"))
+            .expect("metadata-indexer command should be present");
+        let qmdb_indexer = commands
+            .iter()
+            .find(|command| command.contains("--bin qmdb-indexer"))
+            .expect("qmdb-indexer command should be present");
+        let explorer = commands
+            .iter()
+            .find(|command| command.contains("npm --prefix explorer"))
+            .expect("explorer command should be present");
+        let spammer = commands
+            .iter()
+            .find(|command| command.contains("constantinople-spammer"))
+            .expect("spammer command should be present");
+
+        let chain_indexer_port = command_flag_port(chain_indexer, "--port");
+        let chain_indexer_metrics_port = command_flag_port(chain_indexer, "--metrics-port");
+        let metadata_indexer_port = command_flag_port(metadata_indexer, "--port");
+        let qmdb_indexer_port = command_flag_port(qmdb_indexer, "--port");
+        let explorer_port = command_flag_port(explorer, "--port");
+        let spammer_metrics_port = command_flag_port(spammer, "--metrics-port");
+        for (port, owner) in [
+            (chain_indexer_port, "chain-indexer service"),
+            (chain_indexer_metrics_port, "chain-indexer metrics"),
+            (metadata_indexer_port, "metadata-indexer service"),
+            (qmdb_indexer_port, "qmdb-indexer service"),
+            (explorer_port, "explorer service"),
+            (spammer_metrics_port, "spammer metrics"),
+        ] {
+            assert_unique_port(&mut seen, port, owner);
+        }
+
+        assert_eq!(chain_indexer_port, 8095);
+        assert_eq!(metadata_indexer_port, 8096);
+        assert_eq!(qmdb_indexer_port, 8097);
+        assert_eq!(explorer_port, 5173);
+        assert_eq!(spammer_metrics_port, 9105);
+        assert_eq!(chain_indexer_metrics_port, 9106);
+        assert_eq!(seen.len(), nodes.len() * 3 + 6);
+
+        let indexer = secondaries[0]
+            .config
+            .indexer
+            .as_ref()
+            .expect("indexer secondary should have indexer config");
+        assert_eq!(
+            indexer.chain_indexer_url,
+            format!("http://127.0.0.1:{chain_indexer_port}")
+        );
+        let relayer = secondaries[1]
+            .config
+            .relayer
+            .as_ref()
+            .expect("relayer secondary should have relayer config");
+        let expected_relayer_urls = nodes
+            .iter()
+            .map(|node| format!("http://127.0.0.1:{}", node.config.http_port))
+            .collect::<Vec<_>>();
+        let actual_relayer_urls = relayer
+            .leaders
+            .iter()
+            .map(|leader| leader.url.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(actual_relayer_urls, expected_relayer_urls);
+        assert!(spammer.contains("--relayer-url http://127.0.0.1:8094"));
+        assert!(explorer.contains("VITE_SQL_URL=http://127.0.0.1:8096"));
+        assert!(explorer.contains("VITE_QMDB_URL=http://127.0.0.1:8097"));
+        assert!(explorer.contains("VITE_STORE_URL=http://127.0.0.1:8095"));
+        assert!(explorer.contains("VITE_MEMPOOL_URL=http://127.0.0.1:8094"));
+    }
+
+    #[test]
+    #[should_panic(expected = "assigned to both")]
+    fn local_port_plan_rejects_overlapping_node_ranges() {
+        let mut args = test_args(false);
+        let GenerateTarget::Local(ref mut local) = args.target else {
+            panic!("test_args must construct a Local target");
+        };
+        local.base_metrics_port = local.base_port;
+
+        let _ = LocalPortPlan::new(&args, local_args(&args));
+    }
+
+    #[test]
     fn local_run_commands_include_metadata_indexer_when_indexer_enabled() {
         let mut args = test_args(false);
         args.indexer = true;
@@ -793,7 +1061,7 @@ mod tests {
         assert!(explorer_cmd.contains("VITE_STORE_URL=http://127.0.0.1:18090"));
         assert!(explorer_cmd.contains("VITE_SIMPLEX_VERIFICATION_MATERIAL=abcdef"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
-        assert!(explorer_cmd.contains("run dev"));
+        assert!(explorer_cmd.contains("run dev -- --port 5173"));
     }
 
     #[test]

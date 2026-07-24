@@ -147,17 +147,23 @@ full upload path for raw KV, SQL metadata, simplex, and QMDB writes. When both
 `--indexer` and `--relayer` are set, the indexer is `secondary-0` and the
 relayer is `secondary-1`.
 
+The local generator reserves every node P2P, HTTP, and metrics endpoint before
+allocating auxiliary services. Node base ranges must not overlap. Indexer
+services, explorer, and auxiliary metrics retain the ports shown below for
+ordinary small clusters, then move upward deterministically when a larger node
+range occupies a preferred port.
+
 The printed `mprocs` command list grows by four entries:
 
 - `cargo run --release -p constantinople-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
-  — the simulator-backed shared store. `--chain-indexer-port` overrides the Store port;
+  — the simulator-backed shared store. `--chain-indexer-port` selects its preferred Store port;
   its local metrics port is placed after validator, secondary, and optional spammer metrics ports.
 - `cargo run --release -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
-  — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
+  — the metadata query/stream service. `--metadata-indexer-port` selects its preferred port.
 - `cargo run --release -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
   — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
-  overrides the port.
-- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev`
+  selects its preferred port.
+- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev -- --port 5173`
   — the [React explorer](../../explorer/README.md), which subscribes to the
   metadata service, streams new finalized blocks live, and verifies
   submitted-transaction proofs against `qmdb-indexer` and Simplex finalization

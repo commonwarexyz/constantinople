@@ -178,27 +178,30 @@ enum GenerateTarget {
 
 #[derive(Debug, Args)]
 pub(crate) struct LocalArgs {
-    /// Base p2p listen port; each validator is offset from this.
+    /// Base p2p listen port; each primary and secondary is offset from this.
     #[arg(long, default_value_t = 9000)]
     base_port: u16,
-    /// Base HTTP port; each validator is offset from this.
+    /// Base HTTP port; each primary and secondary is offset from this.
     #[arg(long, default_value_t = 8080)]
     base_http_port: u16,
-    /// Base metrics port; each validator is offset from this.
+    /// Base metrics port; each primary and secondary is offset from this.
     #[arg(long, default_value_t = 9090)]
     base_metrics_port: u16,
-    /// Local `chain-indexer` Store port.
+    /// Preferred local `chain-indexer` Store port. Moves upward when occupied
+    /// by a generated node or another enabled local service.
     #[arg(long = "chain-indexer-port", alias = "indexer-port", default_value_t = DEFAULT_CHAIN_INDEXER_PORT)]
     chain_indexer_port: u16,
     /// RocksDB parallelism for the local `chain-indexer` store. Omitted
     /// leaves RocksDB's stock parallelism.
     #[arg(long = "chain-indexer-db-parallelism")]
     chain_indexer_db_parallelism: Option<i32>,
-    /// Local `metadata-indexer` read-service port.
+    /// Preferred local `metadata-indexer` read-service port. Moves upward
+    /// when occupied by a generated node or another enabled local service.
     /// The explorer reads from this port via `VITE_SQL_URL`.
     #[arg(long = "metadata-indexer-port", alias = "sql-port", default_value_t = DEFAULT_METADATA_INDEXER_PORT)]
     metadata_indexer_port: u16,
-    /// Local `qmdb-indexer` read-service port.
+    /// Preferred local `qmdb-indexer` read-service port. Moves upward when
+    /// occupied by a generated node or another enabled local service.
     #[arg(long = "qmdb-indexer-port", default_value_t = DEFAULT_QMDB_INDEXER_PORT)]
     qmdb_indexer_port: u16,
 }
