@@ -372,7 +372,7 @@ mod tests {
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_eq!(
             rows.transaction_digests[0].to_string(),
-            "bfc66b7fd66a059d12a6805444f6120de1a4b927846ba6dc4395b8148ecb1a32"
+            "e21429fba53b81f8fb06af5c4815a351c75e4fdc8d3b47aacfaf3abc09deb9d4"
         );
         assert_tx_meta_body(&rows.sql, &signed);
     }
@@ -421,17 +421,16 @@ mod tests {
             0x7e, 0xbc, 0x9c, 0x98, 0x2c, 0xcf, 0x2e, 0xc4, 0x96, 0x8c, 0xc0, 0xcd, 0x55, 0xf1,
             0x2a, 0xf4, 0x66, 0x0c,
         ];
-        let mut body = Vec::with_capacity(85);
+        let mut body = Vec::with_capacity(83);
         body.push(0);
         body.extend_from_slice(&sender);
         body.push(0);
         body.extend_from_slice(&7u64.to_be_bytes());
         body.push(1);
-        body.extend_from_slice(&[0xac, 0x02]);
         body.extend_from_slice(&peer);
         body.push(1);
         body.extend_from_slice(&[4, 192, 0, 2, 1, 0x1f, 0x90]);
-        assert_eq!(body.len(), 85);
+        assert_eq!(body.len(), 83);
         body
     }
 

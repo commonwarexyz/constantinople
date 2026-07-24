@@ -57,13 +57,105 @@ export interface CommitteeChange {
 }
 
 export interface PlannedCommitteeTransaction extends CommitteeChange {
-    readonly targetEpoch: bigint;
     readonly nonce: bigint;
 }
 
 export interface CommitteeTransactionPlan {
     readonly transactions: readonly PlannedCommitteeTransaction[];
     readonly nextNonceState: NonceState;
+}
+
+export interface FinalizedCommitteeOverlay {
+    readonly finalizedHeight: bigint;
+    readonly targetEpoch: bigint;
+    readonly changes: readonly CommitteeChange[];
+}
+
+/** Return the mutable future committee selected by a finalized block. */
+export function committeeTargetEpochAtHeight(height: bigint): bigint {
+    if (height < 0n || height > MAX_U64) {
+        throw new Error('height must fit in u64');
+    }
+    return checkedAdd(
+        height / BLOCKS_PER_EPOCH,
+        2n,
+        'committee target epoch',
+    );
+}
+
+export function createFinalizedCommitteeOverlay(
+    changes: readonly CommitteeChange[],
+    finalizedHeight: bigint,
+): FinalizedCommitteeOverlay {
+    return {
+        finalizedHeight,
+        targetEpoch: committeeTargetEpochAtHeight(finalizedHeight),
+        changes: changes.map(({ peer, address }) => ({ peer, address })),
+    };
+}
+
+/** Apply finalized changes while their SQL rows are still catching up. */
+export function applyFinalizedCommitteeOverlay(
+    snapshot: CommitteeSnapshot,
+    overlay: FinalizedCommitteeOverlay,
+): CommitteeSnapshot {
+    const scheduled = new Set(snapshot.scheduled);
+    const available = [...snapshot.available];
+    const availablePeers = new Set(available.map(({ peer }) => peer));
+
+    for (const change of overlay.changes) {
+        if (change.address === null) {
+            scheduled.delete(change.peer);
+            continue;
+        }
+
+        scheduled.add(change.peer);
+        if (availablePeers.has(change.peer)) continue;
+        availablePeers.add(change.peer);
+        available.push({ peer: change.peer, address: change.address });
+    }
+
+    return {
+        ...snapshot,
+        targetEpoch: overlay.targetEpoch,
+        scheduled: [...scheduled],
+        available,
+    };
+}
+
+/** Whether SQL has indexed the finalized block and every committee mutation. */
+export function indexedCommitteeOverlayAdopted(
+    snapshot: CommitteeSnapshot,
+    overlay: FinalizedCommitteeOverlay,
+): boolean {
+    if (
+        snapshot.height < overlay.finalizedHeight ||
+        snapshot.targetEpoch < overlay.targetEpoch
+    ) {
+        return false;
+    }
+
+    const scheduled = new Set(snapshot.scheduled);
+    const available = new Map(
+        snapshot.available.map(({ peer, address }) => [peer, address]),
+    );
+    for (const change of overlay.changes) {
+        if (change.address === null) {
+            if (scheduled.has(change.peer)) return false;
+            continue;
+        }
+        if (!scheduled.has(change.peer)) return false;
+        if (available.get(change.peer) !== change.address) return false;
+    }
+    return true;
+}
+
+export function reconcileFinalizedCommitteeOverlay(
+    overlay: FinalizedCommitteeOverlay | null,
+    snapshot: CommitteeSnapshot,
+): FinalizedCommitteeOverlay | null {
+    if (overlay === null) return null;
+    return indexedCommitteeOverlayAdopted(snapshot, overlay) ? null : overlay;
 }
 
 /** Merge local, previously unknown peers into the indexed roster without duplicates. */
@@ -317,7 +409,6 @@ export function validateCommitteeSelection(selected: ReadonlySet<string>): strin
  */
 export function planCommitteeTransactions(
     changes: readonly CommitteeChange[],
-    targetEpoch: bigint,
     initialNonceState: NonceState,
     scheduledCommitteeSize: number,
 ): CommitteeTransactionPlan {
@@ -330,7 +421,7 @@ export function planCommitteeTransactions(
         if (consumed === null) {
             throw new Error('committee transaction nonce must fit in u64');
         }
-        transactions.push({ ...change, targetEpoch, nonce });
+        transactions.push({ ...change, nonce });
         nextNonceState = consumed;
     }
 

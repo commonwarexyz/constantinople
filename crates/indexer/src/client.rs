@@ -421,24 +421,24 @@ mod tests {
     #[test]
     fn verifies_variable_transaction_body_against_digest() {
         let mut bytes = committee_signed_transaction_golden();
-        let digest = Sha256::hash(&[&bytes[..85]]);
+        let digest = Sha256::hash(&[&bytes[..83]]);
 
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest).expect("digest matches");
 
-        bytes[77] = 0;
+        bytes[75] = 0;
         let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
             .expect_err("mutated body should be rejected");
         assert!(matches!(error, ReadError::SqlRow(message) if message.contains("does not match")));
 
-        bytes[77] = 1;
-        bytes[85] ^= 1;
+        bytes[75] = 1;
+        bytes[83] ^= 1;
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
             .expect("signature bytes are outside the transaction digest");
     }
 
     #[test]
     fn rejects_signed_transaction_bytes_without_full_variable_body() {
-        let bytes = committee_signed_transaction_golden()[..84].to_vec();
+        let bytes = committee_signed_transaction_golden()[..82].to_vec();
         let digest = Sha256::hash(&[&bytes]);
 
         let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
@@ -459,20 +459,19 @@ mod tests {
             0x7e, 0xbc, 0x9c, 0x98, 0x2c, 0xcf, 0x2e, 0xc4, 0x96, 0x8c, 0xc0, 0xcd, 0x55, 0xf1,
             0x2a, 0xf4, 0x66, 0x0c,
         ];
-        let mut signed = Vec::with_capacity(85 + 65);
+        let mut signed = Vec::with_capacity(83 + 65);
         signed.push(0);
         signed.extend_from_slice(&sender);
         signed.push(0);
         signed.extend_from_slice(&7u64.to_be_bytes());
         signed.push(1);
-        signed.extend_from_slice(&[0xac, 0x02]);
         signed.extend_from_slice(&peer);
         signed.push(1);
         signed.extend_from_slice(&[4, 192, 0, 2, 1, 0x1f, 0x90]);
-        assert_eq!(signed.len(), 85);
+        assert_eq!(signed.len(), 83);
         assert_eq!(
             Sha256::hash(&[&signed]).to_string(),
-            "bfc66b7fd66a059d12a6805444f6120de1a4b927846ba6dc4395b8148ecb1a32"
+            "e21429fba53b81f8fb06af5c4815a351c75e4fdc8d3b47aacfaf3abc09deb9d4"
         );
         signed.extend_from_slice(&[0; 65]);
         signed

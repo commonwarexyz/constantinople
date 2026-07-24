@@ -4,9 +4,7 @@ use crate::{AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSigna
 use bytes::{Buf, BufMut};
 use commonware_codec::{
     Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
-    varint::MAX_U64_VARINT_SIZE,
 };
-use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Digest, Hasher, Signer, ed25519};
 use core::num::NonZeroU64;
 use std::net::SocketAddr;
@@ -101,10 +99,8 @@ pub enum Action {
         /// The non-zero value to transfer.
         value: NonZeroU64,
     },
-    /// Adds or removes a future committee member.
+    /// Idempotently updates a member of the next mutable future committee.
     SetCommitteeMember {
-        /// The epoch whose committee should be updated.
-        target_epoch: Epoch,
         /// The Ed25519 peer to update.
         peer: ed25519::PublicKey,
         /// The peer's address when adding it, or `None` when removing it.
@@ -114,30 +110,22 @@ pub enum Action {
 
 impl Action {
     /// Minimum encoded action size.
-    pub const MIN_SIZE: usize = u8::SIZE + 1 + ed25519::PublicKey::SIZE + bool::SIZE;
+    pub const MIN_SIZE: usize = u8::SIZE + ed25519::PublicKey::SIZE + bool::SIZE;
     /// Maximum encoded action size.
-    pub const MAX_SIZE: usize = u8::SIZE
-        + MAX_U64_VARINT_SIZE
-        + ed25519::PublicKey::SIZE
-        + bool::SIZE
-        + MAX_SOCKET_ADDR_SIZE;
+    pub const MAX_SIZE: usize =
+        u8::SIZE + ed25519::PublicKey::SIZE + bool::SIZE + MAX_SOCKET_ADDR_SIZE;
 
     /// Creates a transfer action.
     pub const fn transfer(to: AccountKey, value: NonZeroU64) -> Self {
         Self::Transfer { to, value }
     }
 
-    /// Creates a committee-member action.
+    /// Creates an idempotent update to the next mutable future committee.
     pub const fn set_committee_member(
-        target_epoch: Epoch,
         peer: ed25519::PublicKey,
         address: Option<SocketAddr>,
     ) -> Self {
-        Self::SetCommitteeMember {
-            target_epoch,
-            peer,
-            address,
-        }
+        Self::SetCommitteeMember { peer, address }
     }
 }
 
@@ -149,13 +137,8 @@ impl Write for Action {
                 to.write(buf);
                 value.get().write(buf);
             }
-            Self::SetCommitteeMember {
-                target_epoch,
-                peer,
-                address,
-            } => {
+            Self::SetCommitteeMember { peer, address } => {
                 SET_COMMITTEE_MEMBER_TAG.write(buf);
-                target_epoch.write(buf);
                 peer.write(buf);
                 address.write(buf);
             }
@@ -167,15 +150,8 @@ impl EncodeSize for Action {
     fn encode_size(&self) -> usize {
         match self {
             Self::Transfer { .. } => u8::SIZE + AccountKey::SIZE + u64::SIZE,
-            Self::SetCommitteeMember {
-                target_epoch,
-                address,
-                ..
-            } => {
-                u8::SIZE
-                    + target_epoch.encode_size()
-                    + ed25519::PublicKey::SIZE
-                    + address.encode_size()
+            Self::SetCommitteeMember { address, .. } => {
+                u8::SIZE + ed25519::PublicKey::SIZE + address.encode_size()
             }
         }
     }
@@ -193,7 +169,6 @@ impl Read for Action {
                 Ok(Self::Transfer { to, value })
             }
             SET_COMMITTEE_MEMBER_TAG => Ok(Self::SetCommitteeMember {
-                target_epoch: Epoch::read(buf)?,
                 peer: ed25519::PublicKey::read(buf)?,
                 address: Option::<SocketAddr>::read(buf)?,
             }),
@@ -304,19 +279,14 @@ impl<D: Digest> Transaction<D> {
         )
     }
 
-    /// Creates a committee-member transaction.
+    /// Creates an idempotent update to the next mutable future committee.
     pub fn set_committee_member(
         sender: TransactionPublicKey,
-        target_epoch: Epoch,
         peer: ed25519::PublicKey,
         address: Option<SocketAddr>,
         nonce: u64,
     ) -> Self {
-        Self::with_action(
-            sender,
-            Action::set_committee_member(target_epoch, peer, address),
-            nonce,
-        )
+        Self::with_action(sender, Action::set_committee_member(peer, address), nonce)
     }
 
     /// Returns the decoded sender public key.
@@ -429,7 +399,6 @@ impl arbitrary::Arbitrary<'_> for Action {
                 Ok(Self::transfer(to, value))
             }
             SET_COMMITTEE_MEMBER_TAG => Ok(Self::set_committee_member(
-                Epoch::arbitrary(u)?,
                 ed25519::PublicKey::arbitrary(u)?,
                 Option::<SocketAddr>::arbitrary(u)?,
             )),
@@ -521,18 +490,12 @@ mod test {
         );
         let committee = Transaction::<sha256::Digest>::set_committee_member(
             test_sender(),
-            Epoch::new(u64::MAX),
             peer_key(),
             Some(peer_address()),
             u64::MAX,
         );
-        let removal = Transaction::<sha256::Digest>::set_committee_member(
-            test_sender(),
-            Epoch::zero(),
-            peer_key(),
-            None,
-            2,
-        );
+        let removal =
+            Transaction::<sha256::Digest>::set_committee_member(test_sender(), peer_key(), None, 2);
 
         for transaction in [transfer, committee, removal] {
             let encoded = transaction.encode();
@@ -565,13 +528,12 @@ mod test {
     fn transaction_add_committee_member_golden_vector() {
         let transaction = Transaction::<sha256::Digest>::set_committee_member(
             TransactionPublicKey::ed25519(sender_key()),
-            Epoch::new(300),
             peer_key(),
             Some(peer_address()),
             7,
         );
-        let expected: [u8; 85] = hex!(
-            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00000000000000000701ac023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c0104c00002011f90"
+        let expected: [u8; 83] = hex!(
+            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a000000000000000007013d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c0104c00002011f90"
         );
 
         assert_eq!(transaction.encode().as_ref(), expected.as_slice());
@@ -579,25 +541,18 @@ mod test {
             expected[TransactionPublicKey::SIZE + u64::SIZE],
             SET_COMMITTEE_MEMBER_TAG
         );
-        assert_eq!(
-            &expected[TransactionPublicKey::SIZE + u64::SIZE + u8::SIZE
-                ..TransactionPublicKey::SIZE + u64::SIZE + u8::SIZE + 2],
-            &[0xac, 0x02],
-            "target epoch must use canonical varint encoding"
-        );
     }
 
     #[test]
     fn transaction_remove_committee_member_golden_vector() {
         let transaction = Transaction::<sha256::Digest>::set_committee_member(
             TransactionPublicKey::ed25519(sender_key()),
-            Epoch::new(300),
             peer_key(),
             None,
             7,
         );
-        let expected: [u8; 78] = hex!(
-            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00000000000000000701ac023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00"
+        let expected: [u8; 76] = hex!(
+            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a000000000000000007013d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00"
         );
 
         assert_eq!(transaction.encode().as_ref(), expected.as_slice());
@@ -610,9 +565,8 @@ mod test {
             recipient,
             NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
         );
-        let committee_min = Action::set_committee_member(Epoch::zero(), peer_key(), None);
+        let committee_min = Action::set_committee_member(peer_key(), None);
         let committee_max = Action::set_committee_member(
-            Epoch::new(u64::MAX),
             peer_key(),
             Some(SocketAddr::from((Ipv6Addr::LOCALHOST, u16::MAX))),
         );
@@ -620,10 +574,10 @@ mod test {
         assert_eq!(transfer.encode_size(), 41);
         assert_eq!(committee_min.encode_size(), Action::MIN_SIZE);
         assert_eq!(committee_max.encode_size(), Action::MAX_SIZE);
-        assert_eq!(Action::MIN_SIZE, 35);
-        assert_eq!(Action::MAX_SIZE, 63);
-        assert_eq!(Transaction::<sha256::Digest>::MIN_SIZE, 77);
-        assert_eq!(Transaction::<sha256::Digest>::MAX_SIZE, 105);
+        assert_eq!(Action::MIN_SIZE, 34);
+        assert_eq!(Action::MAX_SIZE, 53);
+        assert_eq!(Transaction::<sha256::Digest>::MIN_SIZE, 76);
+        assert_eq!(Transaction::<sha256::Digest>::MAX_SIZE, 95);
     }
 
     #[test]
@@ -643,21 +597,14 @@ mod test {
     }
 
     #[test]
-    fn action_rejects_unknown_tag_and_non_canonical_fields() {
+    fn action_rejects_unknown_tag_and_invalid_address_fields() {
         assert!(matches!(
             Action::decode([2].as_slice()),
             Err(Error::InvalidEnum(2))
         ));
 
-        let non_canonical_epoch = [SET_COMMITTEE_MEMBER_TAG, 0x80, 0x00];
-        assert!(matches!(
-            Action::decode(non_canonical_epoch.as_slice()),
-            Err(Error::InvalidVarint(_))
-        ));
-
         let mut invalid_option = Vec::new();
         SET_COMMITTEE_MEMBER_TAG.write(&mut invalid_option);
-        Epoch::zero().write(&mut invalid_option);
         peer_key().write(&mut invalid_option);
         2u8.write(&mut invalid_option);
         assert!(matches!(
@@ -679,7 +626,6 @@ mod test {
     #[test]
     fn committee_member_action_rejects_every_truncation() {
         let action = Action::set_committee_member(
-            Epoch::new(300),
             peer_key(),
             Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 8080))),
         );

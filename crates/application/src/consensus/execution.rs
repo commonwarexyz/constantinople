@@ -158,7 +158,6 @@ where
 
 #[derive(Clone)]
 struct CommitteeMutation {
-    target_epoch: Epoch,
     peer: ed25519::PublicKey,
     address: Option<std::net::SocketAddr>,
 }
@@ -175,12 +174,7 @@ where
     let account = executor::prepare_account_action(transaction)?;
     let committee = match &transaction.value().action {
         Action::Transfer { .. } => None,
-        Action::SetCommitteeMember {
-            target_epoch,
-            peer,
-            address,
-        } => Some(CommitteeMutation {
-            target_epoch: *target_epoch,
+        Action::SetCommitteeMember { peer, address } => Some(CommitteeMutation {
             peer: peer.clone(),
             address: *address,
         }),
@@ -276,7 +270,7 @@ where
     }
 
     fn updated(&self, mutation: &CommitteeMutation) -> Option<Committee> {
-        if !self.mutations_allowed || mutation.target_epoch.get() != u64::from(&self.target) {
+        if !self.mutations_allowed {
             return None;
         }
         if let Some(address) = mutation.address

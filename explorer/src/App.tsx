@@ -8,10 +8,14 @@ import {
 } from 'react';
 import CommitteePage from './CommitteePage';
 import {
+    applyFinalizedCommitteeOverlay,
+    createFinalizedCommitteeOverlay,
     fetchCommittee,
     planCommitteeTransactions,
+    reconcileFinalizedCommitteeOverlay,
     type CommitteeChange,
     type CommitteeSnapshot,
+    type FinalizedCommitteeOverlay,
 } from './committee';
 import {
     accountKeyFromPublicKey,
@@ -219,6 +223,8 @@ export default function App() {
     const [committeeLoading, setCommitteeLoading] = useState(false);
     const [committeeError, setCommitteeError] = useState('');
     const [committeeSubmitMessage, setCommitteeSubmitMessage] = useState('');
+    const [finalizedCommitteeOverlays, setFinalizedCommitteeOverlays] =
+        useState<FinalizedCommitteeOverlay[]>([]);
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
@@ -243,6 +249,15 @@ export default function App() {
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
     const isCommitteePage = page === 'committee';
+    const displayedCommittee = useMemo(
+        () => committee === null
+            ? null
+            : finalizedCommitteeOverlays.reduce(
+                  (snapshot, overlay) => applyFinalizedCommitteeOverlay(snapshot, overlay),
+                  committee,
+              ),
+        [committee, finalizedCommitteeOverlays],
+    );
 
     const setLocalNonceState = (nextNonce: NonceState) => {
         nextNonceRef.current = nextNonce;
@@ -370,7 +385,17 @@ export default function App() {
         const refreshQueue = createRefreshQueue({
             load: (signal) => fetchCommittee(indexerUrl, signal),
             onResult: (snapshot) => {
-                setCommittee(snapshot);
+                setCommittee((current) =>
+                    current !== null && current.height > snapshot.height
+                        ? current
+                        : snapshot,
+                );
+                setFinalizedCommitteeOverlays((current) =>
+                    current.filter(
+                        (overlay) =>
+                            reconcileFinalizedCommitteeOverlay(overlay, snapshot) !== null,
+                    ),
+                );
                 setCommitteeError('');
             },
             onError: (error) => {
@@ -855,11 +880,11 @@ export default function App() {
             setIsWalletOpen(true);
             return;
         }
-        if (!committee) {
+        if (!displayedCommittee) {
             setCommitteeSubmitMessage('committee state unavailable');
             return;
         }
-        if (!committee.updatesOpen) {
+        if (!displayedCommittee.updatesOpen) {
             setCommitteeSubmitMessage('committee updates are locked at the final block');
             return;
         }
@@ -872,9 +897,8 @@ export default function App() {
             const previousNonce = nextNonceRef.current;
             const plan = planCommitteeTransactions(
                 changes,
-                committee.targetEpoch,
                 previousNonce,
-                committee.scheduled.length,
+                displayedCommittee.scheduled.length,
             );
             setLocalNonceState(plan.nextNonceState);
             reservation = { previous: previousNonce, next: plan.nextNonceState };
@@ -890,7 +914,6 @@ export default function App() {
                         {
                             senderPublicKey: wallet.publicKey,
                             nonce: transaction.nonce,
-                            targetEpoch: transaction.targetEpoch,
                             peer: transaction.peer,
                             address: transaction.address,
                         },
@@ -904,6 +927,22 @@ export default function App() {
                 mempoolUrl,
                 encodeTransactionBatch(encoded.map(({ bytes }) => bytes)),
             );
+            if (txStatus.status === 'finalized') {
+                setFinalizedCommitteeOverlays((current) => {
+                    const next = createFinalizedCommitteeOverlay(
+                        plan.transactions,
+                        BigInt(txStatus.height),
+                    );
+                    const superseded = new Set(next.changes.map(({ peer }) => peer));
+                    const retained = current.flatMap((overlay) => {
+                        const changes = overlay.changes.filter(
+                            ({ peer }) => !superseded.has(peer),
+                        );
+                        return changes.length === 0 ? [] : [{ ...overlay, changes }];
+                    });
+                    return [...retained, next];
+                });
+            }
             setCommitteeSubmitMessage(formatTxStatus(txStatus));
             await Promise.all([refreshAccount(), refreshCommittee()]);
         } catch (error) {
@@ -956,11 +995,12 @@ export default function App() {
                     <section className="explorer-stage" aria-label="live transaction throughput">
                         {isCommitteePage ? (
                             <CommitteePage
-                                snapshot={committee}
+                                snapshot={displayedCommittee}
                                 loading={committeeLoading}
                                 loadError={committeeError}
                                 walletAccountKey={walletAccountKey}
                                 submitMessage={committeeSubmitMessage}
+                                finalizedOverlays={finalizedCommitteeOverlays}
                                 isSubmitting={isSubmitting}
                                 onRefresh={() => void refreshCommittee()}
                                 onOpenWallet={() => setIsWalletOpen(true)}

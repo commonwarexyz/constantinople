@@ -53,14 +53,14 @@ mirrored by the shared encoder in [`src/codec.ts`](src/codec.ts):
 
 - Header: `sender[34] || nonce:u64be || action_tag:u8`.
 - Tag `0` (transfer): `recipient:AccountKey[32] || value:NonZeroU64:u64be`.
-- Tag `1` (committee): `target_epoch:Epoch:canonical-protobuf-u64-varint ||
-  peer:ed25519[32] || address:Option<SocketAddr>`. The option is byte `0` for a
-  removal, or byte `1` followed by IP version `4`/`6`, raw IP bytes, and a
-  big-endian `u16` port for an addition.
+- Tag `1` (committee): `peer:ed25519[32] || address:Option<SocketAddr>`. The
+  option is byte `0` for a removal, or byte `1` followed by IP version `4`/`6`,
+  raw IP bytes, and a big-endian `u16` port for an addition. The target epoch is
+  indexed lifecycle state for the committee UI, not part of the signed action.
 
 The signature encoding follows that variable-length body. QMDB transaction
-verification decodes the tag and committee epoch varint to locate the exact
-body bytes before hashing. Rust-compatible golden vectors live in
+verification decodes the tag and fixed peer-plus-address framing to locate the
+exact body bytes before hashing. Rust-compatible golden vectors live in
 `tests/codec.test.ts` and `tests/committeeCodec.test.ts`.
 
 ### Why SQL?

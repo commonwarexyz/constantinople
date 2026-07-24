@@ -319,30 +319,21 @@ fn transfer(
 
 fn committee_transaction(
     sender: &ed25519::PrivateKey,
-    target_epoch: Epoch,
     peer: ed25519::PublicKey,
     registered: bool,
     nonce: u64,
 ) -> SignedTransaction<sha256::Sha256> {
-    committee_address_transaction(
-        sender,
-        target_epoch,
-        peer,
-        registered.then_some(test_address()),
-        nonce,
-    )
+    committee_address_transaction(sender, peer, registered.then_some(test_address()), nonce)
 }
 
 fn committee_address_transaction(
     sender: &ed25519::PrivateKey,
-    target_epoch: Epoch,
     peer: ed25519::PublicKey,
     address: Option<SocketAddr>,
     nonce: u64,
 ) -> SignedTransaction<sha256::Sha256> {
     Transaction::set_committee_member(
         TransactionPublicKey::ed25519(sender.public_key()),
-        target_epoch,
         peer,
         address,
         nonce,
@@ -520,13 +511,12 @@ fn committee_reducer_adds_unknown_peers_and_preserves_addresses_across_blocks() 
         let initial = committee(Set::from_iter_dedup([sender.public_key()]));
         let harness = reducer_harness(&context, initial.clone(), initial.clone(), sender).await;
 
-        let target = Epoch::new(2);
         let first = vec![
-            committee_transaction(&harness.sender, target, b.clone(), true, 0),
-            committee_transaction(&harness.sender, target, b.clone(), true, 1),
-            committee_transaction(&harness.sender, target, c.clone(), true, 2),
-            committee_transaction(&harness.sender, target, b.clone(), false, 3),
-            committee_transaction(&harness.sender, target, b.clone(), false, 4),
+            committee_transaction(&harness.sender, b.clone(), true, 0),
+            committee_transaction(&harness.sender, b.clone(), true, 1),
+            committee_transaction(&harness.sender, c.clone(), true, 2),
+            committee_transaction(&harness.sender, b.clone(), false, 3),
+            committee_transaction(&harness.sender, b.clone(), false, 4),
         ];
         let (entering, selected) = execute_committee_block(&harness, 1, first)
             .await
@@ -539,9 +529,9 @@ fn committee_reducer_adds_unknown_peers_and_preserves_addresses_across_blocks() 
         assert_eq!(selected.addresses().get_value(&c), Some(&test_address()));
 
         let second = vec![
-            committee_transaction(&harness.sender, target, b.clone(), true, 5),
-            committee_transaction(&harness.sender, target, c.clone(), false, 6),
-            committee_transaction(&harness.sender, target, c, false, 7),
+            committee_transaction(&harness.sender, b.clone(), true, 5),
+            committee_transaction(&harness.sender, c.clone(), false, 6),
+            committee_transaction(&harness.sender, c, false, 7),
         ];
         let (entering, selected) = execute_committee_block(&harness, 2, second)
             .await
@@ -558,6 +548,34 @@ fn committee_reducer_adds_unknown_peers_and_preserves_addresses_across_blocks() 
 }
 
 #[test]
+fn committee_reducer_derives_target_after_epoch_boundary() {
+    deterministic::Runner::default().start(|context| async move {
+        let sender = ed25519::PrivateKey::from_seed(116);
+        let unknown_peer = ed25519::PrivateKey::from_seed(117).public_key();
+        let initial = committee(Set::from_iter_dedup([sender.public_key()]));
+        let harness = reducer_harness(&context, initial.clone(), initial.clone(), sender).await;
+
+        execute_committee_block(&harness, 1, Vec::new())
+            .await
+            .expect("genesis committee seed");
+        let transaction = committee_transaction(&harness.sender, unknown_peer.clone(), true, 0);
+        let (entering, selected) =
+            execute_committee_block(&harness, BLOCKS_PER_EPOCH, vec![transaction])
+                .await
+                .expect("first block after epoch boundary");
+
+        let expected = committee(Set::from_iter_dedup([
+            harness.sender.public_key(),
+            unknown_peer,
+        ]));
+        assert_eq!(entering, initial);
+        assert_eq!(selected, expected);
+        assert_eq!(exact_committee_row(&harness.dbs, 2).await, None);
+        assert_eq!(exact_committee_row(&harness.dbs, 3).await, Some(expected));
+    });
+}
+
+#[test]
 fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
     deterministic::Runner::default().start(|context| async move {
         let sender = ed25519::PrivateKey::from_seed(121);
@@ -566,40 +584,17 @@ fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
         let harness = reducer_harness(&context, initial.clone(), initial, sender).await;
 
         let invalid = [
-            (
-                1,
-                committee_transaction(
-                    &harness.sender,
-                    Epoch::new(3),
-                    eligible_peer.clone(),
-                    true,
-                    0,
-                ),
+            committee_address_transaction(
+                &harness.sender,
+                harness.sender.public_key(),
+                Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9_999))),
+                0,
             ),
-            (
-                1,
-                committee_address_transaction(
-                    &harness.sender,
-                    Epoch::new(2),
-                    harness.sender.public_key(),
-                    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9_999))),
-                    0,
-                ),
-            ),
-            (
-                1,
-                committee_transaction(
-                    &harness.sender,
-                    Epoch::new(2),
-                    harness.sender.public_key(),
-                    false,
-                    0,
-                ),
-            ),
+            committee_transaction(&harness.sender, harness.sender.public_key(), false, 0),
         ];
-        for (height, transaction) in invalid {
+        for transaction in invalid {
             assert!(
-                execute_committee_block(&harness, height, vec![transaction])
+                execute_committee_block(&harness, 1, vec![transaction])
                     .await
                     .is_err()
             );
@@ -607,13 +602,11 @@ fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
         assert_eq!(exact_committee_row(&harness.dbs, 2).await, None);
 
         let final_height = BLOCKS_PER_EPOCH - 1;
-        let target = Epoch::new(2);
         let (entering, selected) = execute_committee_block(
             &harness,
             final_height - 2,
             vec![committee_transaction(
                 &harness.sender,
-                target,
                 eligible_peer.clone(),
                 true,
                 0,
@@ -634,7 +627,7 @@ fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
 
         for height in [final_height - 1, final_height] {
             let transaction =
-                committee_transaction(&harness.sender, target, eligible_peer.clone(), false, 1);
+                committee_transaction(&harness.sender, eligible_peer.clone(), false, 1);
             assert!(
                 execute_committee_block(&harness, height, vec![transaction])
                     .await
@@ -659,7 +652,7 @@ fn committee_reducer_rejects_growth_past_maximum_size() {
         let initial = committee(members.clone());
         let extra = ed25519::PrivateKey::from_seed(2_000).public_key();
         let harness = reducer_harness(&context, initial.clone(), initial, sender).await;
-        let transaction = committee_transaction(&harness.sender, Epoch::new(2), extra, true, 0);
+        let transaction = committee_transaction(&harness.sender, extra, true, 0);
 
         assert!(
             execute_committee_block(&harness, 1, vec![transaction])

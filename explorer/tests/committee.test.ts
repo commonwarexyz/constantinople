@@ -2,14 +2,19 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    applyFinalizedCommitteeOverlay,
     blocksUntilCommitteeLock,
     committeeChanges,
     committeeLockDetail,
+    committeeTargetEpochAtHeight,
+    createFinalizedCommitteeOverlay,
     createCommitteeDraft,
     fetchCommittee,
+    indexedCommitteeOverlayAdopted,
     mergeCommitteeRoster,
     planCommitteeTransactions,
     reconcileCommitteeDrafts,
+    reconcileFinalizedCommitteeOverlay,
     reconcileCommitteeSelection,
     validateCommitteeSelection,
     type CommitteeSnapshot,
@@ -203,7 +208,7 @@ test('new peer planning uses its supplied canonical address', () => {
 
     assert.deepEqual(changes, [draft]);
     assert.equal(
-        planCommitteeTransactions(changes, snapshot.targetEpoch, { base: 3n, bitmap: 0n }, 2)
+        planCommitteeTransactions(changes, { base: 3n, bitmap: 0n }, 2)
             .transactions[0].address,
         draft.address,
     );
@@ -259,18 +264,95 @@ test('submissions reopen after height 64 starts the next epoch', async () => {
     assert.equal(blocksUntilCommitteeLock(snapshot), 61n);
 });
 
-test('per-peer E+2 actions reserve sequential nonces before signing', () => {
+test('per-peer actions reserve sequential nonces before signing', () => {
     const changes = [
         { peer: PEER_B, address: '192.0.2.2:9000' },
         { peer: PEER_C, address: null },
         { peer: PEER_A, address: null },
     ];
 
-    const plan = planCommitteeTransactions(changes, 19n, { base: 7n, bitmap: 0n }, 2);
+    const plan = planCommitteeTransactions(changes, { base: 7n, bitmap: 0n }, 2);
 
-    assert.deepEqual(plan.transactions.map(({ nonce }) => nonce), [7n, 8n, 9n]);
-    assert.ok(plan.transactions.every(({ targetEpoch }) => targetEpoch === 19n));
+    assert.deepEqual(plan.transactions, [
+        { ...changes[0], nonce: 7n },
+        { ...changes[1], nonce: 8n },
+        { ...changes[2], nonce: 9n },
+    ]);
     assert.deepEqual(plan.nextNonceState, { base: 10n, bitmap: 0n });
+});
+
+test('planning does not depend on the indexed target epoch', () => {
+    const first = committeeSnapshot([PEER_A], [PEER_A, PEER_B]);
+    const second = { ...first, targetEpoch: first.targetEpoch + 1n };
+    const selected = new Set([PEER_B]);
+    const plan = (snapshot: CommitteeSnapshot) =>
+        planCommitteeTransactions(
+            committeeChanges(snapshot, selected),
+            { base: 10n, bitmap: 0n },
+            snapshot.scheduled.length,
+        );
+
+    assert.deepEqual(plan(first), plan(second));
+});
+
+test('finalized height determines the actual mutable target epoch', () => {
+    assert.equal(committeeTargetEpochAtHeight(0n), 2n);
+    assert.equal(committeeTargetEpochAtHeight(63n), 2n);
+    assert.equal(committeeTargetEpochAtHeight(64n), 3n);
+    assert.equal(committeeTargetEpochAtHeight(127n), 3n);
+    assert.equal(committeeTargetEpochAtHeight(128n), 4n);
+    assert.throws(() => committeeTargetEpochAtHeight(-1n), /height must fit in u64/);
+});
+
+test('finalized overlay applies new peers and removals to stale indexed state', () => {
+    const snapshot = committeeSnapshot([PEER_A, PEER_C], [PEER_A, PEER_C]);
+    const overlay = createFinalizedCommitteeOverlay(
+        [
+            { peer: PEER_A, address: null },
+            { peer: PEER_B, address: '[2001:db8::2]:9000' },
+        ],
+        64n,
+    );
+
+    const applied = applyFinalizedCommitteeOverlay(snapshot, overlay);
+
+    assert.equal(applied.targetEpoch, 3n);
+    assert.deepEqual(applied.scheduled, [PEER_C, PEER_B]);
+    assert.deepEqual(applied.available, [
+        ...snapshot.available,
+        { peer: PEER_B, address: '[2001:db8::2]:9000' },
+    ]);
+});
+
+test('finalized overlay remains until height, schedule, and catalog are adopted', () => {
+    const overlay = createFinalizedCommitteeOverlay(
+        [
+            { peer: PEER_A, address: null },
+            { peer: PEER_B, address: '192.0.2.2:9000' },
+        ],
+        100n,
+    );
+    const beforeFinalizedHeight = {
+        ...committeeSnapshot([PEER_C, PEER_B], [PEER_A, PEER_B, PEER_C]),
+        height: 99n,
+    };
+    const missingCatalog = {
+        ...committeeSnapshot([PEER_C, PEER_B], [PEER_A, PEER_C]),
+        height: 100n,
+    };
+    const adopted = {
+        ...committeeSnapshot([PEER_C, PEER_B], [PEER_A, PEER_B, PEER_C]),
+        height: 100n,
+    };
+
+    assert.equal(indexedCommitteeOverlayAdopted(beforeFinalizedHeight, overlay), false);
+    assert.equal(indexedCommitteeOverlayAdopted(missingCatalog, overlay), false);
+    assert.equal(indexedCommitteeOverlayAdopted(adopted, overlay), true);
+    assert.strictEqual(
+        reconcileFinalizedCommitteeOverlay(overlay, beforeFinalizedHeight),
+        overlay,
+    );
+    assert.equal(reconcileFinalizedCommitteeOverlay(overlay, adopted), null);
 });
 
 test('sole-member replacement adds before removing the last member', () => {
@@ -284,7 +366,6 @@ test('sole-member replacement adds before removing the last member', () => {
 
     const plan = planCommitteeTransactions(
         [...expected].reverse(),
-        snapshot.targetEpoch,
         { base: 10n, bitmap: 0n },
         1,
     );
@@ -306,7 +387,6 @@ test('full 64-member replacement removes before adding the new member', () => {
 
     const plan = planCommitteeTransactions(
         [...expected].reverse(),
-        snapshot.targetEpoch,
         { base: 20n, bitmap: 0n },
         64,
     );

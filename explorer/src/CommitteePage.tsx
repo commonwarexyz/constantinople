@@ -11,6 +11,7 @@ import {
     type CommitteeChange,
     type CommitteeSnapshot,
     type EligibleCommitteePeer,
+    type FinalizedCommitteeOverlay,
 } from './committee';
 
 export default function CommitteePage({
@@ -19,6 +20,7 @@ export default function CommitteePage({
     loadError,
     walletAccountKey,
     submitMessage,
+    finalizedOverlays,
     isSubmitting,
     onRefresh,
     onOpenWallet,
@@ -29,6 +31,7 @@ export default function CommitteePage({
     loadError: string;
     walletAccountKey: string | null;
     submitMessage: string;
+    finalizedOverlays: readonly FinalizedCommitteeOverlay[];
     isSubmitting: boolean;
     onRefresh: () => void;
     onOpenWallet: () => void;
@@ -120,6 +123,14 @@ export default function CommitteePage({
     const current = new Set(snapshot.current);
     const next = new Set(snapshot.next);
     const scheduled = new Set(snapshot.scheduled);
+    const awaitingByPeer = new Map<string, CommitteeChange>();
+    for (const overlay of finalizedOverlays) {
+        for (const change of overlay.changes) awaitingByPeer.set(change.peer, change);
+    }
+    const latestOverlay = finalizedOverlays.at(-1) ?? null;
+    const indexedBlockLag = latestOverlay === null || snapshot.height >= latestOverlay.finalizedHeight
+        ? 0n
+        : latestOverlay.finalizedHeight - snapshot.height;
     const roster = effectiveSnapshot?.available ?? snapshot.available;
     const visibleSelection = snapshot.updatesOpen ? editor.selected : scheduled;
     const blockDistance = blocksUntilCommitteeLock(snapshot);
@@ -274,6 +285,7 @@ export default function CommitteePage({
                         const isNext = next.has(candidate.peer);
                         const isSelected = visibleSelection.has(candidate.peer);
                         const isScheduled = scheduled.has(candidate.peer);
+                        const awaiting = awaitingByPeer.get(candidate.peer) ?? null;
                         const pending = isScheduled === isSelected
                             ? null
                             : isSelected
@@ -281,7 +293,7 @@ export default function CommitteePage({
                                 : 'removal';
                         return (
                             <label
-                                className={`committee-row${pending ? ` committee-row--pending-${pending}` : ''}${!snapshot.updatesOpen || isSubmitting ? ' committee-row--disabled' : ''}`}
+                                className={`committee-row${pending ? ` committee-row--pending-${pending}` : ''}${awaiting ? ` committee-row--indexing-${awaiting.address === null ? 'removal' : 'addition'}` : ''}${!snapshot.updatesOpen || isSubmitting ? ' committee-row--disabled' : ''}`}
                                 role="row"
                                 key={candidate.peer}
                             >
@@ -331,10 +343,14 @@ export default function CommitteePage({
                                         ? '+ add'
                                         : pending === 'removal'
                                             ? '− remove'
+                                            : awaiting?.address === null
+                                                ? '✓ removal finalized'
+                                                : awaiting
+                                                    ? '✓ addition finalized'
                                             : isSelected
                                                 ? 'selected'
                                                 : 'excluded'}
-                                    tone={pending ?? (isSelected ? 'editing' : 'muted')}
+                                    tone={pending ?? (awaiting ? 'queued' : isSelected ? 'editing' : 'muted')}
                                 />
                             </label>
                         );
@@ -342,14 +358,27 @@ export default function CommitteePage({
                 </div>
             </section>
 
-            <div className={`committee-actions${changes.length > 0 ? ' committee-actions--pending' : ''}`}>
+            <div className={`committee-actions${changes.length > 0 ? ' committee-actions--pending' : ''}${latestOverlay ? ' committee-actions--indexing' : ''}`}>
                 <div className="committee-actions__summary" aria-live="polite">
                     <i aria-hidden="true">›</i>
                     <div>
-                        <strong>{changes.length} pending {changes.length === 1 ? 'change' : 'changes'}</strong>
+                        <strong>
+                            {changes.length > 0
+                                ? `${changes.length} pending ${changes.length === 1 ? 'change' : 'changes'}`
+                                : latestOverlay
+                                    ? `${awaitingByPeer.size} finalized ${awaitingByPeer.size === 1 ? 'change' : 'changes'} · awaiting indexer`
+                                    : '0 pending changes'}
+                        </strong>
                         {changes.length > 0 && (
                             <span>
                                 {changes.map((change) => `${change.address === null ? 'remove' : 'add'} ${shortPeer(change.peer)}`).join(' · ')}
+                            </span>
+                        )}
+                        {latestOverlay && (
+                            <span className="committee-actions__indexing">
+                                epoch {latestOverlay.targetEpoch.toString()} · finalized at {latestOverlay.finalizedHeight.toString()} · {indexedBlockLag > 0n
+                                    ? `indexer is ${indexedBlockLag.toString()} blocks behind this update`
+                                    : 'waiting for indexed committee rows'}
                             </span>
                         )}
                         {selectionError && <span className="committee-actions__error">{selectionError}</span>}

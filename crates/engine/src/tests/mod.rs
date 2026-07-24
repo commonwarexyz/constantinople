@@ -164,38 +164,24 @@ impl TestEngineDefinition {
         let first_update = vec![
             Transaction::set_committee_member(
                 sender_key.clone(),
-                Epoch::new(2),
                 signers[4].public_key(),
                 Some(socket_address(4)),
                 0,
             )
             .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
-            Transaction::set_committee_member(
-                sender_key.clone(),
-                Epoch::new(2),
-                signers[0].public_key(),
-                None,
-                1,
-            )
-            .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
+            Transaction::set_committee_member(sender_key.clone(), signers[0].public_key(), None, 1)
+                .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
         ];
         let second_update = vec![
             Transaction::set_committee_member(
                 sender_key.clone(),
-                Epoch::new(3),
                 signers[5].public_key(),
                 Some(socket_address(5)),
                 2,
             )
             .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
-            Transaction::set_committee_member(
-                sender_key,
-                Epoch::new(3),
-                signers[1].public_key(),
-                None,
-                3,
-            )
-            .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
+            Transaction::set_committee_member(sender_key, signers[1].public_key(), None, 3)
+                .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
         ];
         let proposals =
             BTreeMap::from([(1, first_update), (TEST_EPOCH_LENGTH.get(), second_update)]);
@@ -231,7 +217,6 @@ impl TestEngineDefinition {
             .map(|nonce| {
                 Transaction::set_committee_member(
                     sender_key.clone(),
-                    Epoch::new(2),
                     peer.clone(),
                     (nonce % 2 == 0).then_some(socket_address(4)),
                     nonce as u64,

@@ -18,7 +18,6 @@ export interface TransactionDraft {
 export interface CommitteeTransactionDraft {
     readonly senderPublicKey: Uint8Array;
     readonly nonce: bigint;
-    readonly targetEpoch: bigint;
     readonly peer: string;
     readonly address: string | null;
 }
@@ -102,7 +101,6 @@ export function encodeCommitteeTransactionBody(
             draft.nonce,
             SET_COMMITTEE_MEMBER_TAG,
         ),
-        encodeU64Varint(draft.targetEpoch, 'target epoch'),
         peer,
         address,
     );
@@ -111,8 +109,8 @@ export function encodeCommitteeTransactionBody(
 /**
  * Locate the consensus body within raw signed transaction bytes.
  *
- * Transfer bodies are fixed-width. Committee bodies contain a canonical u64
- * varint epoch, so their end must be decoded before hashing the body digest.
+ * Transfer bodies are fixed-width. Committee bodies use a fixed-width peer
+ * followed by an optional IPv4 or IPv6 socket address.
  */
 export function transactionBodyFromSignedTransaction(
     signedTransaction: Uint8Array,
@@ -130,11 +128,7 @@ export function transactionBodyFromSignedTransaction(
             throw new Error('SQL transfer transaction has zero value');
         }
     } else if (tag === SET_COMMITTEE_MEMBER_TAG) {
-        const epochEnd = readCanonicalU64VarintEnd(
-            signedTransaction,
-            TRANSACTION_HEADER_BYTES,
-        );
-        const optionOffset = epochEnd + ED25519_PUBLIC_KEY_BYTES;
+        const optionOffset = TRANSACTION_HEADER_BYTES + ED25519_PUBLIC_KEY_BYTES;
         assertAvailable(signedTransaction, optionOffset + 1);
         const addressOption = signedTransaction[optionOffset];
         if (addressOption === 0) {
@@ -226,21 +220,6 @@ function encodeU64Be(value: bigint, field: string): Uint8Array {
     return bytes;
 }
 
-function encodeU64Varint(value: bigint, field: string): Uint8Array {
-    if (value < 0n || value > MAX_U64) {
-        throw new Error(`${field} must fit in u64`);
-    }
-
-    const bytes: number[] = [];
-    let remaining = value;
-    while (remaining >= 0x80n) {
-        bytes.push(Number(remaining & 0x7fn) | 0x80);
-        remaining >>= 7n;
-    }
-    bytes.push(Number(remaining));
-    return new Uint8Array(bytes);
-}
-
 function encodeSocketAddress(value: string): Uint8Array {
     const endpoint = parseValidatorEndpoint(value);
     const port = new Uint8Array(2);
@@ -250,27 +229,6 @@ function encodeSocketAddress(value: string): Uint8Array {
         endpoint.addressBytes,
         port,
     );
-}
-
-function readCanonicalU64VarintEnd(bytes: Uint8Array, offset: number): number {
-    for (let index = 0; index < 10; index++) {
-        const position = offset + index;
-        if (position >= bytes.length) {
-            throw new Error('SQL committee transaction epoch is truncated');
-        }
-
-        const byte = bytes[position];
-        if (index > 0 && byte === 0) {
-            throw new Error('SQL committee transaction epoch is not canonical');
-        }
-        if (index === 9 && byte > 1) {
-            throw new Error('SQL committee transaction epoch does not fit in u64');
-        }
-        if ((byte & 0x80) === 0) {
-            return position + 1;
-        }
-    }
-    throw new Error('SQL committee transaction epoch does not fit in u64');
 }
 
 function readU64Be(bytes: Uint8Array, offset: number): bigint {
