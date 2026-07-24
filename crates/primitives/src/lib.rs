@@ -30,4 +30,4 @@ pub use transaction::{Action, SignedTransaction, Transaction, VerifiedTransactio
 pub const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-tx";
 
 /// Number of finalized blocks in each Constantinople epoch.
-pub const BLOCKS_PER_EPOCH: u64 = 128;
+pub const BLOCKS_PER_EPOCH: u64 = 64;

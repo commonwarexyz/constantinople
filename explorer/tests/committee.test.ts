@@ -23,7 +23,7 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
         async query(sql: string): Promise<DecodedQueryResult> {
             queries.push(sql);
             if (sql.includes('FROM block_meta')) {
-                return result({ height: 17_890n, epoch: 139n });
+                return result({ height: 8_930n, epoch: 139n });
             }
             if (sql.includes('FROM committee_meta') && sql.includes('<= 141')) {
                 // Epoch 141 has no explicit row yet, so the index query carries
@@ -47,10 +47,10 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
         },
     });
 
-    assert.equal(snapshot.height, 17_890n);
+    assert.equal(snapshot.height, 8_930n);
     assert.equal(snapshot.epoch, 139n);
     assert.equal(snapshot.targetEpoch, 141n);
-    assert.equal(snapshot.lockHeight, 17_918n);
+    assert.equal(snapshot.lockHeight, 8_958n);
     assert.equal(snapshot.updatesOpen, true);
     assert.deepEqual(snapshot.next, [PEER_A, PEER_B]);
     assert.deepEqual(snapshot.available.map(({ peer }) => peer), [PEER_A, PEER_B, PEER_C]);
@@ -123,48 +123,48 @@ test('lock model names both rejecting blocks and the last accepted block', () =>
     assert.equal(blocksUntilCommitteeLock(snapshot), 27n);
     assert.equal(
         committeeLockDetail(snapshot),
-        'final two blocks 17918 and 17919 reject updates; accepted through block 17917',
+        'final two blocks 8958 and 8959 reject updates; accepted through block 8957',
     );
 });
 
-test('submissions remain open after height 124 so updates can land in block 125', async () => {
-    const snapshot = await fetchCommitteeAtHeight(124n, 0n);
+test('submissions remain open after height 60 so updates can land in block 61', async () => {
+    const snapshot = await fetchCommitteeAtHeight(60n, 0n);
 
-    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.lockHeight, 62n);
     assert.equal(snapshot.updatesOpen, true);
     assert.equal(blocksUntilCommitteeLock(snapshot), 1n);
 });
 
-test('submissions close after final mutable block 125 is finalized', async () => {
-    const snapshot = await fetchCommitteeAtHeight(125n, 0n);
+test('submissions close after final mutable block 61 is finalized', async () => {
+    const snapshot = await fetchCommitteeAtHeight(61n, 0n);
 
-    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.lockHeight, 62n);
     assert.equal(snapshot.updatesOpen, false);
     assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
 });
 
-test('submissions remain closed after first rejecting block 126 is finalized', async () => {
-    const snapshot = await fetchCommitteeAtHeight(126n, 0n);
+test('submissions remain closed after first rejecting block 62 is finalized', async () => {
+    const snapshot = await fetchCommitteeAtHeight(62n, 0n);
 
-    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.lockHeight, 62n);
     assert.equal(snapshot.updatesOpen, false);
     assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
 });
 
-test('submissions remain closed after final rejecting block 127 is finalized', async () => {
-    const snapshot = await fetchCommitteeAtHeight(127n, 0n);
+test('submissions remain closed after final rejecting block 63 is finalized', async () => {
+    const snapshot = await fetchCommitteeAtHeight(63n, 0n);
 
-    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.lockHeight, 62n);
     assert.equal(snapshot.updatesOpen, false);
     assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
 });
 
-test('submissions reopen after height 128 starts the next epoch', async () => {
-    const snapshot = await fetchCommitteeAtHeight(128n, 1n);
+test('submissions reopen after height 64 starts the next epoch', async () => {
+    const snapshot = await fetchCommitteeAtHeight(64n, 1n);
 
-    assert.equal(snapshot.lockHeight, 254n);
+    assert.equal(snapshot.lockHeight, 126n);
     assert.equal(snapshot.updatesOpen, true);
-    assert.equal(blocksUntilCommitteeLock(snapshot), 125n);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 61n);
 });
 
 test('per-peer E+2 actions reserve sequential nonces before signing', () => {
@@ -243,11 +243,11 @@ test('multi-swap ordering adapts at capacity and remains deterministic', () => {
 
 function response(): CommitteeSnapshot {
     return {
-        height: 17_890n,
+        height: 8_930n,
         epoch: 139n,
         targetEpoch: 141n,
         updatesOpen: true,
-        lockHeight: 17_918n,
+        lockHeight: 8_958n,
         current: [PEER_A, PEER_C],
         next: [PEER_A, PEER_C],
         scheduled: [PEER_A, PEER_C],

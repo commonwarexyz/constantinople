@@ -6,7 +6,7 @@
 //! - `commonware-glue::stateful` owns QMDB lifecycle and startup sync
 //! - erasure-coded marshal owns finalized block availability
 //! - continuous DKG reshare prepares the next epoch's threshold scheme
-//! - the orchestrator starts one simplex actor per 128-block epoch
+//! - the orchestrator starts one simplex actor per 64-block epoch
 
 use crate::{
     CommitteeParticipants, DynamicProvider, Registrar, dkg::encode_finalized_application_height,

@@ -35,7 +35,7 @@ Constantinople is a high-throughput account-model blockchain example built on to
 | [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful)          | Speculative state management and sync                    |
 | [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p) (lookup)              | Authenticated peer-to-peer networking with lookup        |
 
-Consensus runs continuously in 128-block epochs. A small stateful QMDB stores
+Consensus runs continuously in 64-block epochs. A small stateful QMDB stores
 the committee selected for each epoch, and `glue::dkg` reshapes the threshold
 key as validators are added or removed. The explorer's committee page schedules
 changes two epochs ahead from the deployment's complete eligible-peer catalog.

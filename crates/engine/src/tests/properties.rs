@@ -439,9 +439,9 @@ impl Property<TestPublicKey, ValidatorState> for RestartedAcrossBoundary {
 }
 
 #[test]
-fn production_epoch_length_remains_128() {
+fn production_epoch_length_remains_64() {
     assert_eq!(super::TEST_EPOCH_LENGTH.get(), 64);
-    assert_eq!(constantinople_primitives::BLOCKS_PER_EPOCH, 128);
+    assert_eq!(constantinople_primitives::BLOCKS_PER_EPOCH, 64);
     assert_eq!(
         crate::EPOCH_LENGTH.get(),
         constantinople_primitives::BLOCKS_PER_EPOCH

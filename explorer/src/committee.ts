@@ -13,7 +13,7 @@ import {
 
 const MAX_U64 = (1n << 64n) - 1n;
 const MAX_COMMITTEE_SIZE = 64;
-const BLOCKS_PER_EPOCH = 128n;
+const BLOCKS_PER_EPOCH = 64n;
 const ED25519_PUBLIC_KEY_BYTES = 32;
 
 const BLOCK_META_TABLE = 'block_meta';
