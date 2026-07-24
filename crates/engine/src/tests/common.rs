@@ -1,15 +1,12 @@
-use crate::{
-    ThresholdScheme,
-    types::{EngineBlock, EngineMarshalMailbox},
-};
+use crate::types::{CommitteeSyncDb, EngineBlock, EngineCodedBlock, EngineMarshalMailbox};
 use commonware_actor::Feedback;
 use commonware_consensus::{
-    Heightable, Reporter,
+    Reporter,
     marshal::{self, Identifier},
-    types::{Height, View},
+    types::{Height, Round},
 };
 use commonware_cryptography::{
-    Digestible, Signer,
+    Signer,
     bls12381::{
         dkg::feldman_desmedt::{Output, deal},
         primitives::{group::Share, variant::MinSig},
@@ -17,203 +14,98 @@ use commonware_cryptography::{
     ed25519,
     sha256::Sha256,
 };
-use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
-use commonware_runtime::Quota;
-use commonware_utils::{
-    Acknowledgement, N3f1, TryCollect, acknowledgement::Exact, channel::mpsc, sync::Mutex, test_rng,
+use commonware_glue::{dkg::types::Payload, simulate::processed::ProcessedHeight};
+use commonware_p2p::{
+    Address, AddressableManager, AddressableTrackedPeers, Message, PeerSetSubscription, Provider,
+    Receiver, utils::mux,
 };
+use commonware_parallel::Sequential;
+use commonware_runtime::deterministic;
+use commonware_utils::{
+    Acknowledgement as _, N3f1, TryCollect as _, ordered::Map, sync::Mutex, test_rng,
+};
+use constantinople_mempool::TransactionSource;
+use constantinople_primitives::{Header, SealedBlock, VerifiedTransaction};
 use std::{
-    collections::BTreeMap,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-    },
+    collections::{BTreeMap, HashSet},
+    future::{Future, ready},
+    sync::{Arc, OnceLock},
 };
 
 pub(crate) type TestHasher = Sha256;
 pub(crate) type TestPrivateKey = ed25519::PrivateKey;
 pub(crate) type TestPublicKey = ed25519::PublicKey;
-pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
-pub(crate) type TestBlock = EngineBlock<TestHasher, TestPublicKey>;
-pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
+pub(crate) type TestBlock = EngineBlock<TestHasher, TestPrivateKey, MinSig>;
+pub(crate) type TestCodedBlock = EngineCodedBlock<TestHasher, TestPrivateKey, MinSig>;
+pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPrivateKey, MinSig>;
+pub(crate) type TestCommitteeDatabase =
+    CommitteeSyncDb<deterministic::Context, TestHasher, Sequential>;
+pub(crate) type TestEpochInfo = commonware_glue::dkg::types::EpochInfo<
+    MinSig,
+    TestPublicKey,
+    commonware_glue::dkg::network::Addresses<TestPublicKey>,
+>;
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
-pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);
 
-#[derive(Clone, Default)]
-pub(crate) struct RestartBarrier {
-    held: Arc<Mutex<Vec<Exact>>>,
-    released: Arc<AtomicBool>,
-    starts: Arc<AtomicUsize>,
-    latest_finalized: Arc<AtomicU64>,
-    recovered_finalized: Arc<AtomicU64>,
-    observed_processed: Arc<Mutex<Option<u64>>>,
+#[derive(Clone, Debug, Default)]
+pub(crate) struct HeightTransactionSource {
+    proposals: BTreeMap<u64, Vec<VerifiedTransaction<TestHasher>>>,
 }
 
-impl RestartBarrier {
-    pub(crate) fn begin_start(&self) -> bool {
-        let restarting = self.starts.fetch_add(1, Ordering::SeqCst) > 0;
-        if !restarting {
-            return false;
+impl HeightTransactionSource {
+    pub(crate) const fn new(
+        proposals: BTreeMap<u64, Vec<VerifiedTransaction<TestHasher>>>,
+    ) -> Self {
+        Self { proposals }
+    }
+}
+
+impl TransactionSource<commonware_consensus::types::coding::Commitment, TestPublicKey, TestHasher>
+    for HeightTransactionSource
+{
+    fn propose(
+        &mut self,
+        parent: &Header<
+            commonware_consensus::types::coding::Commitment,
+            <TestHasher as commonware_cryptography::Hasher>::Digest,
+            TestPublicKey,
+        >,
+        _round: Round,
+        filled: usize,
+    ) -> impl Future<Output = Vec<VerifiedTransaction<TestHasher>>> + Send {
+        if filled > 0 {
+            return ready(Vec::new());
         }
-
-        self.recovered_finalized.store(
-            self.latest_finalized.load(Ordering::SeqCst),
-            Ordering::SeqCst,
-        );
-        self.held.lock().clear();
-        true
-    }
-
-    fn observe_finalized(&self, height: u64) {
-        self.latest_finalized.fetch_max(height, Ordering::SeqCst);
-    }
-
-    fn acknowledge(&self, block_height: u64, acknowledgement: Exact) {
-        if block_height == 0 || self.released.load(Ordering::SeqCst) {
-            acknowledgement.acknowledge();
-            return;
-        }
-
-        self.held.lock().push(acknowledgement);
-    }
-
-    pub(crate) fn observe_processed(&self, height: u64) {
-        *self.observed_processed.lock() = Some(height);
-    }
-
-    pub(crate) fn release(&self) {
-        self.released.store(true, Ordering::SeqCst);
-        let acknowledgements = std::mem::take(&mut *self.held.lock());
-        for acknowledgement in acknowledgements {
-            acknowledgement.acknowledge();
-        }
-    }
-
-    pub(crate) fn recovered_finalized(&self) -> u64 {
-        self.recovered_finalized.load(Ordering::SeqCst)
-    }
-
-    pub(crate) fn observed_processed(&self) -> Option<u64> {
-        *self.observed_processed.lock()
+        ready(
+            self.proposals
+                .get(&(parent.height + 1))
+                .cloned()
+                .unwrap_or_default(),
+        )
     }
 }
 
-#[derive(Clone, Default)]
-pub(crate) struct TestReporter {
-    restart_barrier: Option<RestartBarrier>,
-}
-
-impl TestReporter {
-    pub(crate) const fn new(restart_barrier: Option<RestartBarrier>) -> Self {
-        Self { restart_barrier }
-    }
-}
-
-impl Reporter for TestReporter {
-    type Activity = marshal::Update<TestBlock>;
+impl Reporter for HeightTransactionSource {
+    type Activity = marshal::Update<
+        SealedBlock<commonware_consensus::types::coding::Commitment, TestPublicKey, TestHasher>,
+    >;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match activity {
-            marshal::Update::Tip(_, height, _) => {
-                if let Some(barrier) = &self.restart_barrier {
-                    barrier.observe_finalized(height.get());
-                }
-            }
-            marshal::Update::Block(block, response) => {
-                if let Some(barrier) = &self.restart_barrier {
-                    barrier.acknowledge(block.height().get(), response);
-                } else {
-                    response.acknowledge();
-                }
-            }
+        if let marshal::Update::Block(_, acknowledgement) = activity {
+            acknowledgement.acknowledge();
         }
         Feedback::Ok
     }
 }
 
-#[derive(Clone)]
-pub(crate) struct HeightMonitorReporter<R> {
-    inner: R,
-    monitor: mpsc::Sender<FinalizationUpdate<TestPublicKey>>,
-    public_key: TestPublicKey,
-}
-
-impl<R> HeightMonitorReporter<R> {
-    pub(crate) const fn new(
-        public_key: TestPublicKey,
-        monitor: mpsc::Sender<FinalizationUpdate<TestPublicKey>>,
-        inner: R,
-    ) -> Self {
-        Self {
-            inner,
-            monitor,
-            public_key,
-        }
-    }
-}
+pub(crate) type TrackLog =
+    Arc<Mutex<BTreeMap<TestPublicKey, Vec<(u64, AddressableTrackedPeers<TestPublicKey>)>>>>;
 
 type Fixture = (
     Vec<TestPrivateKey>,
     Output<MinSig, TestPublicKey>,
     BTreeMap<TestPublicKey, Option<Share>>,
 );
-
-impl<R> Reporter for HeightMonitorReporter<R>
-where
-    R: Reporter<Activity = marshal::Update<TestBlock>>,
-{
-    type Activity = marshal::Update<TestBlock>;
-
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        if let marshal::Update::Tip(_, height, digest) = &activity {
-            let monitor = self.monitor.clone();
-            let update = FinalizationUpdate {
-                pk: self.public_key.clone(),
-                view: View::new(height.get()),
-                block_digest: digest.as_ref().to_vec(),
-            };
-            let _ = monitor.try_send(update);
-        }
-
-        self.inner.report(activity)
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ValidatorState {
-    pub(crate) marshal: TestMarshalMailbox,
-    pub(crate) startup_sync_height: Option<u64>,
-}
-
-impl PartialEq for ValidatorState {
-    fn eq(&self, other: &Self) -> bool {
-        self.startup_sync_height == other.startup_sync_height
-    }
-}
-
-impl Eq for ValidatorState {}
-
-impl ValidatorState {
-    pub(crate) async fn digest_at_height(&self, height: u64) -> Option<Vec<u8>> {
-        self.marshal
-            .get_block(Identifier::Height(Height::new(height)))
-            .await
-            .map(|block| block.digest().as_ref().to_vec())
-    }
-
-    pub(crate) async fn processed_height(&self) -> u64 {
-        self.marshal
-            .get_processed_height()
-            .await
-            .map_or(0, |height| height.get())
-    }
-}
-
-impl ProcessedHeight for ValidatorState {
-    async fn processed_height(&self) -> u64 {
-        self.processed_height().await
-    }
-}
 
 pub(crate) fn validator_fixture(validators: u32) -> Fixture {
     let signers = (0..validators)
@@ -234,4 +126,174 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
         .collect();
 
     (signers, output, shares)
+}
+
+#[derive(Clone)]
+pub(crate) struct ValidatorState {
+    pub(crate) public_key: TestPublicKey,
+    pub(crate) marshal: TestMarshalMailbox,
+    pub(crate) committee: Arc<OnceLock<TestCommitteeDatabase>>,
+    pub(crate) processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
+    pub(crate) tracks: TrackLog,
+}
+
+impl PartialEq for ValidatorState {
+    fn eq(&self, other: &Self) -> bool {
+        self.public_key == other.public_key
+    }
+}
+
+impl Eq for ValidatorState {}
+
+impl ValidatorState {
+    pub(crate) async fn block_at_height(&self, height: u64) -> Option<TestCodedBlock> {
+        self.marshal
+            .get_block(Identifier::Height(Height::new(height)))
+            .await
+    }
+
+    pub(crate) async fn processed_height(&self) -> u64 {
+        self.processed
+            .lock()
+            .get(&self.public_key)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn committee(&self) -> Result<TestCommitteeDatabase, String> {
+        self.committee
+            .get()
+            .cloned()
+            .ok_or_else(|| format!("committee database for {} is not attached", self.public_key))
+    }
+
+    pub(crate) async fn epoch_info_at_height(&self, height: u64) -> Option<TestEpochInfo> {
+        use commonware_glue::dkg::ReshareBlock as _;
+
+        let block = self.block_at_height(height).await?;
+        match block.inner().payload()? {
+            Payload::EpochInfo(info) => Some(info),
+            Payload::DealerLog(_) => None,
+        }
+    }
+}
+
+impl ProcessedHeight for ValidatorState {
+    async fn processed_height(&self) -> u64 {
+        self.processed_height().await
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct TestReporter;
+
+impl commonware_consensus::Reporter for TestReporter {
+    type Activity = marshal::Update<TestBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> Feedback {
+        if let marshal::Update::Block(_, acknowledgement) = activity {
+            acknowledgement.acknowledge();
+        }
+        Feedback::Ok
+    }
+}
+
+/// Records the exact address-bearing peer sets handed to the production
+/// addressable manager while delegating them to simulated lookup networking.
+#[derive(Clone, Debug)]
+pub(crate) struct RecordingManager<M> {
+    inner: M,
+    public_key: TestPublicKey,
+    tracks: TrackLog,
+}
+
+impl<M> RecordingManager<M> {
+    pub(crate) const fn new(inner: M, public_key: TestPublicKey, tracks: TrackLog) -> Self {
+        Self {
+            inner,
+            public_key,
+            tracks,
+        }
+    }
+}
+
+impl<M> Provider for RecordingManager<M>
+where
+    M: Provider<PublicKey = TestPublicKey>,
+{
+    type PublicKey = TestPublicKey;
+
+    async fn peer_set(&mut self, id: u64) -> Option<commonware_p2p::TrackedPeers<Self::PublicKey>> {
+        self.inner.peer_set(id).await
+    }
+
+    async fn subscribe(&mut self) -> PeerSetSubscription<Self::PublicKey> {
+        self.inner.subscribe().await
+    }
+}
+
+impl<M> AddressableManager for RecordingManager<M>
+where
+    M: AddressableManager<PublicKey = TestPublicKey>,
+{
+    fn track<R>(&mut self, id: u64, peers: R) -> Feedback
+    where
+        R: Into<AddressableTrackedPeers<Self::PublicKey>> + Send,
+    {
+        let peers = peers.into();
+        self.tracks
+            .lock()
+            .entry(self.public_key.clone())
+            .or_default()
+            .push((id, peers.clone()));
+        self.inner.track(id, peers)
+    }
+
+    fn overwrite(&mut self, peers: Map<Self::PublicKey, Address>) -> Feedback {
+        self.inner.overwrite(peers)
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct EpochFilteredReceiver<R> {
+    inner: R,
+    failures: Option<Arc<HashSet<u64>>>,
+}
+
+impl<R> EpochFilteredReceiver<R> {
+    pub(crate) const fn pass(inner: R) -> Self {
+        Self {
+            inner,
+            failures: None,
+        }
+    }
+
+    pub(crate) const fn drop_epochs(inner: R, failures: Arc<HashSet<u64>>) -> Self {
+        Self {
+            inner,
+            failures: Some(failures),
+        }
+    }
+}
+
+impl<R> Receiver for EpochFilteredReceiver<R>
+where
+    R: Receiver<PublicKey = TestPublicKey>,
+{
+    type Error = R::Error;
+    type PublicKey = TestPublicKey;
+
+    async fn recv(&mut self) -> Result<Message<Self::PublicKey>, Self::Error> {
+        loop {
+            let message = self.inner.recv().await?;
+            let Some(failures) = &self.failures else {
+                return Ok(message);
+            };
+            let (_, bytes) = &message;
+            let (epoch, _) = mux::parse(bytes.clone()).expect("failed to parse DKG mux message");
+            if !failures.contains(&epoch) {
+                return Ok(message);
+            }
+        }
+    }
 }

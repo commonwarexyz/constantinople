@@ -147,10 +147,14 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 0,
             timestamp: 0,
+            eligible_peers_root: sha256::Digest::EMPTY,
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
+            committee_root: sha256::Digest::EMPTY,
+            committee_range: non_empty_range!(0, 1),
+            payload: None,
         };
 
         let round = Round::new(Epoch::zero(), View::zero());

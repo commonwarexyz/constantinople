@@ -53,11 +53,21 @@ test('selection diff includes disconnected eligible peers because connectivity i
 test('lock model names the exact rejecting final block and last accepted block', () => {
     const snapshot = parseCommitteeResponse(response());
 
-    assert.equal(blocksUntilCommitteeLock(snapshot), 541n);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 540n);
     assert.equal(
         committeeLockDetail(snapshot),
         'final block 18431 rejects updates; accepted through block 18430',
     );
+});
+
+test('lock distance reaches zero when the penultimate block is finalized', () => {
+    const snapshot = parseCommitteeResponse({
+        ...response(),
+        height: '18430',
+        updatesOpen: false,
+    });
+
+    assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
 });
 
 test('per-peer E+2 actions reserve sequential nonces before signing', () => {

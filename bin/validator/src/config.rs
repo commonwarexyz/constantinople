@@ -137,11 +137,11 @@ pub struct ValidatorConfig {
     pub traces: f64,
     /// Complete immutable catalog of peers eligible for committee membership.
     pub eligible_peers: Vec<EligiblePeerEntry>,
-    /// Optional indexer wiring. Honored only for secondary (non-voting)
-    /// validators when this section is present.
+    /// Optional indexer wiring. Honored only for validators that are
+    /// secondaries at genesis; the service remains available after promotion.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
-    /// Optional relayer wiring. Honored only for secondary validators.
+    /// Optional relayer wiring. Honored only for genesis-secondary validators.
     #[serde(default)]
     pub relayer: Option<RelayerConfig>,
 }
@@ -151,7 +151,10 @@ pub struct RelayerConfig {
     /// Views to retry a submission before giving up.
     #[serde(default = "default_relayer_retry_views")]
     pub max_retry_views: u64,
-    /// Per-leader relayer endpoints.
+    /// Validator HTTP endpoints keyed by public key.
+    ///
+    /// Configure every eligible validator; the relayer filters this catalog
+    /// to the active finalized committee before applying leader election.
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
@@ -335,6 +338,9 @@ fn decode_with_network(
     if config.indexer.is_some() && config.relayer.is_some() {
         panic!("relayer and indexer configs cannot be enabled on the same secondary");
     }
+    if let Some(relayer) = config.relayer.as_ref() {
+        validate_relayer_catalog(relayer, &eligible_peers);
+    }
     let genesis_leader = decode_public_key("genesis_leader", &config.genesis_leader);
     let listen_bind: SocketAddr = format!("0.0.0.0:{}", config.listen_port)
         .parse()
@@ -416,6 +422,20 @@ fn validate_eligible_catalog(
             panic!("participant '{public_key}' missing from eligible_peers");
         }
     }
+}
+
+fn validate_relayer_catalog(relayer: &RelayerConfig, eligible: &Map<ed25519::PublicKey, Address>) {
+    let leaders: Map<ed25519::PublicKey, ()> = relayer
+        .leaders
+        .iter()
+        .map(|leader| (decode_public_key("relayer leader", &leader.public_key), ()))
+        .try_collect()
+        .expect("relayer leaders contains duplicate public keys");
+    assert_eq!(
+        leaders.keys(),
+        eligible.keys(),
+        "relayer leader catalog must exactly match eligible_peers"
+    );
 }
 
 pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig {
@@ -551,10 +571,10 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 #[cfg(test)]
 mod tests {
     use super::{
-        EligiblePeerEntry, IndexerConfig, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        EligiblePeerEntry, IndexerConfig, RelayerConfig, RelayerLeaderConfig, StartupModeConfig,
+        ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, default_upload_buffer,
+        load_deployer_config, load_local_config, validate_relayer_catalog,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -566,7 +586,7 @@ mod tests {
         ed25519,
     };
     use commonware_formatting::hex;
-    use commonware_utils::{N3f1, TryCollect};
+    use commonware_utils::{N3f1, TryCollect, ordered::Map};
     use std::{
         collections::BTreeMap,
         fs,
@@ -1409,5 +1429,34 @@ secondaries:
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(peers_path);
+    }
+
+    #[test]
+    fn relayer_catalog_covers_every_eligible_validator() {
+        let first = ed25519::PrivateKey::from_seed(1).public_key();
+        let second = ed25519::PrivateKey::from_seed(2).public_key();
+        let eligible = Map::from_iter_dedup([
+            (
+                first.clone(),
+                commonware_p2p::Address::Symmetric("127.0.0.1:9001".parse().unwrap()),
+            ),
+            (
+                second.clone(),
+                commonware_p2p::Address::Symmetric("127.0.0.1:9002".parse().unwrap()),
+            ),
+        ]);
+        let relayer = RelayerConfig {
+            max_retry_views: 8,
+            leaders: [first, second]
+                .into_iter()
+                .enumerate()
+                .map(|(index, public_key)| RelayerLeaderConfig {
+                    public_key: hex(&public_key.encode()),
+                    url: format!("http://127.0.0.1:{}", 8081 + index),
+                })
+                .collect(),
+        };
+
+        validate_relayer_catalog(&relayer, &eligible);
     }
 }

@@ -255,11 +255,15 @@ fn remote_indexer_config(port: u16) -> IndexerConfig {
 
 fn remote_relayer_config(remote: &RemoteArgs, material: &ClusterMaterial) -> RelayerConfig {
     let leaders = material
-        .primary_hex()
-        .into_iter()
-        .map(|public_key| RelayerLeaderConfig {
-            url: format!("http://{public_key}:{}", remote.http_port),
-            public_key,
+        .public_keys
+        .iter()
+        .chain(&material.secondary_public_keys)
+        .map(|public_key| {
+            let public_key = hex(&public_key.encode());
+            RelayerLeaderConfig {
+                url: format!("http://{public_key}:{}", remote.http_port),
+                public_key,
+            }
         })
         .collect();
 
@@ -280,7 +284,9 @@ fn remote_spammer_config(
         relayer_url: relayer_url(args, remote, material),
         relayer_submitters: args.validators as usize,
         presigned_batches: args.spammer_presigned_batches,
-        primary_validators: material.primary_hex(),
+        // Leave submissions unpinned so the relayer follows committee
+        // rotations instead of targeting only genesis validators.
+        primary_validators: Vec::new(),
         accounts_jitter: args.spammer_accounts_jitter,
     }
 }
@@ -694,11 +700,37 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert!(relayed.primary_validators.is_empty());
         assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
         );
+    }
+
+    #[test]
+    fn remote_relayer_catalog_covers_every_eligible_validator() {
+        let mut args = generate_args();
+        args.relayer = true;
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let config = super::remote_relayer_config(&remote, &material);
+        let expected = material
+            .public_keys
+            .iter()
+            .chain(&material.secondary_public_keys)
+            .map(|public_key| {
+                let public_key = hex(&public_key.encode());
+                (public_key.clone(), format!("http://{public_key}:8080"))
+            })
+            .collect::<Vec<_>>();
+        let actual = config
+            .leaders
+            .into_iter()
+            .map(|leader| (leader.public_key, leader.url))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

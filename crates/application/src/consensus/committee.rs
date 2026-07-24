@@ -5,12 +5,10 @@ use bytes::{Buf, BufMut};
 use commonware_codec::{Error as CodecError, FixedSize, RangeCfg, Read, ReadExt as _, Write};
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Hasher, ed25519};
-use commonware_glue::dkg::{ParticipantsProvider, network::Directory};
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use commonware_storage::translator::Translator;
 use commonware_utils::{ordered::Set, sequence::U64};
-use std::marker::PhantomData;
 
 /// Number of blocks in each Constantinople epoch.
 pub const BLOCKS_PER_EPOCH: u64 = 1024;
@@ -114,6 +112,7 @@ pub const fn epoch_key(epoch: Epoch) -> U64 {
 pub fn seed_committees<E, H, T, S>(
     batch: CommitteeBatch<E, H, T, S>,
     genesis: Committee,
+    genesis_next: Committee,
 ) -> CommitteeBatch<E, H, T, S>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -122,8 +121,8 @@ where
     S: Strategy,
 {
     batch
-        .write(U64::new(0), Some(genesis.clone()))
-        .write(U64::new(1), Some(genesis))
+        .write(U64::new(0), Some(genesis))
+        .write(U64::new(1), Some(genesis_next))
 }
 
 /// Reads `epoch`, falling back to its predecessor when the requested row has
@@ -157,79 +156,6 @@ where
         return committee;
     }
     panic!("committee row and predecessor are both absent for epoch {epoch}");
-}
-
-/// State-backed DKG participant provider.
-///
-/// `F` resolves the exact peer union requested by DKG into its immutable
-/// transport directory. Keeping that resolver generic lets key-only and
-/// addressable deployments use the same committee state.
-pub struct CommitteeProvider<E, H, T, S, F, D>
-where
-    E: BufferPooler + Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-    S: Strategy,
-    D: Directory<ed25519::PublicKey>,
-{
-    database: CommitteeDatabase<E, H, T, S>,
-    directory: F,
-    _marker: PhantomData<fn() -> D>,
-}
-
-impl<E, H, T, S, F, D> CommitteeProvider<E, H, T, S, F, D>
-where
-    E: BufferPooler + Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-    S: Strategy,
-    D: Directory<ed25519::PublicKey>,
-{
-    /// Creates a provider over committed committee state.
-    pub const fn new(database: CommitteeDatabase<E, H, T, S>, directory: F) -> Self {
-        Self {
-            database,
-            directory,
-            _marker: PhantomData,
-        }
-    }
-}
-
-impl<E, H, T, S, F, D> Clone for CommitteeProvider<E, H, T, S, F, D>
-where
-    E: BufferPooler + Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-    S: Strategy,
-    F: Clone,
-    D: Directory<ed25519::PublicKey>,
-{
-    fn clone(&self) -> Self {
-        Self::new(self.database.clone(), self.directory.clone())
-    }
-}
-
-impl<E, H, T, S, F, D> ParticipantsProvider for CommitteeProvider<E, H, T, S, F, D>
-where
-    E: BufferPooler + Storage + Clock + Metrics,
-    H: Hasher,
-    T: Translator,
-    S: Strategy,
-    F: Fn(Epoch, Set<ed25519::PublicKey>) -> D + Clone + Send + Sync + 'static,
-    D: Directory<ed25519::PublicKey>,
-{
-    type PublicKey = ed25519::PublicKey;
-    type Directory = D;
-
-    async fn participants(&mut self, epoch: Epoch) -> Set<Self::PublicKey> {
-        committee_for_epoch(&self.database, epoch)
-            .await
-            .into_members()
-    }
-
-    async fn directory(&mut self, epoch: Epoch, peers: Set<Self::PublicKey>) -> Self::Directory {
-        (self.directory)(epoch, peers)
-    }
 }
 
 #[cfg(test)]

@@ -30,6 +30,8 @@ use futures::{
 };
 use std::{collections::HashMap, future::Future, num::NonZeroU64, sync::Arc, time::Duration};
 
+type SchemeRegistry<P, V> = Arc<Mutex<HashMap<Epoch, Arc<ThresholdScheme<P, V>>>>>;
+
 /// Epoch-scoped threshold schemes installed by the reshare actor.
 ///
 /// The provider starts with epoch zero and is extended by [`Registrar`] before
@@ -39,7 +41,7 @@ where
     P: PublicKey,
     V: Variant,
 {
-    schemes: Arc<Mutex<HashMap<Epoch, Arc<ThresholdScheme<P, V>>>>>,
+    schemes: SchemeRegistry<P, V>,
 }
 
 impl<P, V> Default for DynamicProvider<P, V>
@@ -142,94 +144,6 @@ where
                 .expect("registered DKG share must match its participant set"),
         };
         self.provider.register(epoch, scheme);
-    }
-}
-
-/// Waits for the committed parent of an epoch boundary before consulting a
-/// state-backed participant provider.
-///
-/// Reshare asks for epoch `E + 2` while constructing or verifying epoch `E`'s
-/// final block. Committee updates are forbidden in that final block, so the
-/// preceding block is the stable cutoff. Waiting for marshal to report that
-/// block as processed ensures the wrapped provider reads committed QMDB state
-/// rather than falling back before an in-flight committee update finalizes.
-pub struct FinalizedParticipants<E, P, S, MV>
-where
-    S: Scheme,
-    MV: MarshalVariant,
-{
-    context: E,
-    inner: P,
-    marshal: MarshalMailbox<S, MV>,
-    epocher: FixedEpocher,
-}
-
-impl<E, P, S, MV> FinalizedParticipants<E, P, S, MV>
-where
-    S: Scheme,
-    MV: MarshalVariant,
-{
-    /// Wraps a state-backed provider with the final-boundary commit fence.
-    pub const fn new(
-        context: E,
-        inner: P,
-        marshal: MarshalMailbox<S, MV>,
-        blocks_per_epoch: NonZeroU64,
-    ) -> Self {
-        Self {
-            context,
-            inner,
-            marshal,
-            epocher: FixedEpocher::new(blocks_per_epoch),
-        }
-    }
-
-    fn committed_cutoff(&self, requested: Epoch) -> Option<Height> {
-        let source = requested.previous()?.previous()?;
-        let boundary = self
-            .epocher
-            .last(source)
-            .expect("fixed epocher must cover the requested committee epoch");
-        Some(Height::new(boundary.get().saturating_sub(1)))
-    }
-}
-
-impl<E, P, S, MV> ParticipantsProvider for FinalizedParticipants<E, P, S, MV>
-where
-    E: Clock,
-    P: ParticipantsProvider,
-    S: Scheme<PublicKey = P::PublicKey>,
-    MV: MarshalVariant,
-{
-    type PublicKey = P::PublicKey;
-    type Directory = P::Directory;
-
-    async fn participants(
-        &mut self,
-        epoch: Epoch,
-    ) -> commonware_utils::ordered::Set<Self::PublicKey> {
-        if let Some(cutoff) = self.committed_cutoff(epoch) {
-            loop {
-                if self
-                    .marshal
-                    .get_processed_height()
-                    .await
-                    .is_some_and(|processed| processed >= cutoff)
-                {
-                    break;
-                }
-                self.context.sleep(Duration::from_millis(10)).await;
-            }
-        }
-        self.inner.participants(epoch).await
-    }
-
-    async fn directory(
-        &mut self,
-        epoch: Epoch,
-        peers: commonware_utils::ordered::Set<Self::PublicKey>,
-    ) -> Self::Directory {
-        self.inner.directory(epoch, peers).await
     }
 }
 

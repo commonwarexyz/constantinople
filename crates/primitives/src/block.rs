@@ -34,6 +34,8 @@ where
     pub height: u64,
     /// The timestamp of the block.
     pub timestamp: u64,
+    /// Commitment to the immutable catalog of committee-eligible peer keys and addresses.
+    pub eligible_peers_root: D,
     /// The canonical root of the chain state after applying this block.
     pub state_root: D,
     /// The retained range needed to sync the state database.
@@ -96,6 +98,7 @@ where
             + self.parent.encode_size()
             + self.height.encode_size()
             + self.timestamp.encode_size()
+            + self.eligible_peers_root.encode_size()
             + self.state_root.encode_size()
             + self.state_range.encode_size()
             + self.transactions_root.encode_size()
@@ -118,6 +121,7 @@ where
         self.parent.write(buf);
         self.height.write(buf);
         self.timestamp.write(buf);
+        self.eligible_peers_root.write(buf);
         self.state_root.write(buf);
         self.state_range.write(buf);
         self.transactions_root.write(buf);
@@ -143,6 +147,7 @@ where
             parent: D::read(buf)?,
             height: u64::read(buf)?,
             timestamp: u64::read(buf)?,
+            eligible_peers_root: D::read(buf)?,
             state_root: D::read(buf)?,
             state_range: NonEmptyRange::read(buf)?,
             transactions_root: D::read(buf)?,
@@ -168,6 +173,7 @@ where
             parent: u.arbitrary()?,
             height: u.arbitrary()?,
             timestamp: u.arbitrary()?,
+            eligible_peers_root: u.arbitrary()?,
             state_root: u.arbitrary()?,
             state_range: u.arbitrary()?,
             transactions_root: u.arbitrary()?,
@@ -454,6 +460,7 @@ mod tests {
         Signer, bls12381::primitives::variant::MinPk, ed25519, secp256r1::standard as secp256r1,
         sha256,
     };
+    use commonware_formatting::hex;
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use rand::{RngExt as _, SeedableRng, rngs::StdRng};
@@ -476,6 +483,7 @@ mod tests {
             parent: sha256::Digest::EMPTY,
             height: 42,
             timestamp: 1000,
+            eligible_peers_root: sha256::Sha256::hash(&[b"test eligible peers"]),
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
@@ -529,6 +537,31 @@ mod tests {
         let mut buf = Vec::new();
         header.write(&mut buf);
         assert_eq!(buf.len(), expected);
+    }
+
+    #[test]
+    fn header_hash_commits_eligible_peers_root() {
+        let header = test_header();
+        let mut changed = header.clone();
+        changed.eligible_peers_root = sha256::Sha256::hash(&[b"different eligible peers"]);
+
+        assert_ne!(
+            header.hash_slow(&mut sha256::Sha256::default()),
+            changed.hash_slow(&mut sha256::Sha256::default())
+        );
+    }
+
+    #[test]
+    fn header_hash_golden_vector() {
+        let expected: [u8; 32] =
+            hex!("a7ca2de8dd5b7d6f5e9a62f599a39062e9f9842a98152a4b64dd84a85701e07d");
+
+        assert_eq!(
+            test_header()
+                .hash_slow(&mut sha256::Sha256::default())
+                .as_ref(),
+            expected.as_slice()
+        );
     }
 
     #[test]

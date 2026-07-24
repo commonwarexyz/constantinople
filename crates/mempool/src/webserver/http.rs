@@ -436,11 +436,15 @@ impl From<CommitteeSnapshot> for CommitteeResponse {
         let epoch = snapshot.height / EPOCH_LENGTH;
         let target_epoch = epoch + 2;
         let lock_height = epoch * EPOCH_LENGTH + (EPOCH_LENGTH - 1);
+        // `height` is the finalized tip. Once the penultimate block is
+        // finalized, the only remaining proposal slot is the final block,
+        // where committee mutations are invalid by construction.
+        let last_admissible_height = lock_height.saturating_sub(1);
         Self {
             height: snapshot.height.to_string(),
             epoch: epoch.to_string(),
             target_epoch: target_epoch.to_string(),
-            updates_open: snapshot.height < lock_height,
+            updates_open: snapshot.height < last_admissible_height,
             lock_height: lock_height.to_string(),
             current: snapshot.current,
             scheduled: snapshot.scheduled,
@@ -466,8 +470,8 @@ impl From<EligiblePeer> for EligiblePeerResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CommitteeSnapshot, EligiblePeer, MAX_CONCURRENT_INGRESS, PublicKeyCache,
-        Semaphore, router,
+        AppState, CommitteeResponse, CommitteeSnapshot, EligiblePeer, MAX_CONCURRENT_INGRESS,
+        PublicKeyCache, Semaphore, router,
     };
     use crate::webserver::CommitteeReader;
     use axum::{
@@ -636,6 +640,22 @@ mod tests {
                 }),
             );
         });
+    }
+
+    #[test]
+    fn committee_updates_close_after_penultimate_block_finalizes() {
+        let response = |height| {
+            CommitteeResponse::from(CommitteeSnapshot {
+                height,
+                current: Vec::new(),
+                scheduled: Vec::new(),
+                available: Vec::new(),
+            })
+        };
+
+        assert!(response(1_021).updates_open);
+        assert!(!response(1_022).updates_open);
+        assert!(!response(1_023).updates_open);
     }
 
     #[test]

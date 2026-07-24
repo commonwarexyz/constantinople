@@ -8,11 +8,9 @@ use crate::{
     CommitteeParticipants, DynamicProvider, Registrar, ThresholdScheme,
     secret_store::FileSecretStore,
 };
-use commonware_actor::Feedback;
 use commonware_codec::Read;
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
-    Reporter,
     marshal::{
         coding::{
             Coding, Marshaled, shards,
@@ -20,10 +18,9 @@ use commonware_consensus::{
         },
         core::Mailbox as MarshalMailbox,
     },
-    simplex::{self, types::Finalization},
     types::{FixedEpocher, coding::Commitment},
 };
-use commonware_cryptography::{Hasher, PublicKey, Signer, bls12381::primitives::variant::Variant};
+use commonware_cryptography::{Hasher, Signer};
 use commonware_glue::{
     dkg::{network, orchestrator, reshare, types::Payload},
     stateful::{Stateful, db::Shared},
@@ -34,7 +31,6 @@ use constantinople_application::consensus::{
     TransactionHistoryOperation,
 };
 use constantinople_primitives::{Account, AccountKey, Block, BlockCfg, Header, Sealed};
-use std::marker::PhantomData;
 
 /// A finalized block with its seal (commitment-based).
 pub type EngineBlock<H, C, V> = Sealed<
@@ -78,50 +74,6 @@ pub type EngineProbeMailbox<H, C, V> = commonware_glue::stateful::probe::Mailbox
     ThresholdScheme<<C as Signer>::PublicKey, V>,
     EngineVariant<H, C, V>,
 >;
-
-/// A finalization certificate over the engine's threshold scheme.
-pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;
-
-/// Simplex activity stream observed by the engine, used by the optional
-/// `simplex_observer` reporter slot in [`crate::Config`].
-pub type EngineActivity<P, V> = simplex::types::Activity<ThresholdScheme<P, V>, Commitment>;
-
-/// A no-op [`Reporter`] over [`EngineActivity`].
-///
-/// Pass `None::<NoopActivityReporter<P, V>>` to [`crate::Config::simplex_observer`]
-/// when no external observer is wired in. The type parameter exists only to
-/// pin the activity type; the reporter never forwards anything.
-pub struct NoopActivityReporter<P, V>(PhantomData<fn() -> (P, V)>);
-
-impl<P, V> Default for NoopActivityReporter<P, V> {
-    fn default() -> Self {
-        Self(PhantomData)
-    }
-}
-
-impl<P, V> Clone for NoopActivityReporter<P, V> {
-    fn clone(&self) -> Self {
-        Self::default()
-    }
-}
-
-impl<P, V> std::fmt::Debug for NoopActivityReporter<P, V> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("NoopActivityReporter").finish()
-    }
-}
-
-impl<P, V> Reporter for NoopActivityReporter<P, V>
-where
-    P: PublicKey,
-    V: Variant,
-{
-    type Activity = EngineActivity<P, V>;
-
-    fn report(&mut self, _: Self::Activity) -> Feedback {
-        Feedback::Ok
-    }
-}
 
 pub(crate) type CodingBlock<H, C, V> = StoredCodedBlock<EngineBlock<H, C, V>, ReedSolomon<H>, H>;
 

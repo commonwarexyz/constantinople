@@ -10,6 +10,10 @@ use commonware_utils::non_empty_range;
 use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
 
 /// Creates the genesis block.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "genesis commits independent sync targets plus the DKG payload"
+)]
 pub fn genesis_block<C, P, H, R>(
     hasher: &mut H,
     leader: P,
@@ -17,6 +21,7 @@ pub fn genesis_block<C, P, H, R>(
     state_target: StateSyncTarget<H::Digest>,
     transactions_target: TransactionHistoryTarget<H::Digest>,
     committee_target: CommitteeSyncTarget<H::Digest>,
+    eligible_peers_root: H::Digest,
     payload: R,
 ) -> SealedBlock<C, P, H, R>
 where
@@ -33,11 +38,16 @@ where
         state_target,
         transactions_target,
         committee_target,
+        eligible_peers_root,
         payload,
     )
 }
 
 /// Creates the genesis block with an explicit consensus parent.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "genesis commits independent sync targets plus the DKG payload"
+)]
 pub fn genesis_block_with_parent<C, P, H, R>(
     hasher: &mut H,
     leader: P,
@@ -46,6 +56,7 @@ pub fn genesis_block_with_parent<C, P, H, R>(
     state_target: StateSyncTarget<H::Digest>,
     transactions_target: TransactionHistoryTarget<H::Digest>,
     committee_target: CommitteeSyncTarget<H::Digest>,
+    eligible_peers_root: H::Digest,
     payload: R,
 ) -> SealedBlock<C, P, H, R>
 where
@@ -63,6 +74,7 @@ where
         parent: H::Digest::EMPTY,
         height: 0,
         timestamp,
+        eligible_peers_root,
         state_root: state_target.root,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transactions_target.root,

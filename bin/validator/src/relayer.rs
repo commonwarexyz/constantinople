@@ -10,11 +10,17 @@ use axum::{
 };
 use commonware_actor::Feedback;
 use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
-use commonware_consensus::{Reporter, Viewable};
+use commonware_consensus::{
+    Reporter,
+    marshal::Update,
+    types::{Epoch, Round, View},
+};
 use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed25519, sha256};
-use commonware_formatting::from_hex;
+use commonware_formatting::{from_hex, hex};
+use commonware_glue::dkg::types::Payload;
 use commonware_parallel::Strategy;
-use constantinople_engine::types::EngineActivity;
+use commonware_utils::{Acknowledgement as _, ordered::Set};
+use constantinople_engine::types::EngineBlock;
 use constantinople_mempool::webserver::{AccountReader, TxStatus};
 use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
 use futures::future::join_all;
@@ -43,27 +49,75 @@ const PINNED_SUBMIT_RETRIES: usize = 3;
 /// release it while the job runs.
 const MAX_CONCURRENT_DECODES: usize = 1;
 
-type Activity = EngineActivity<ed25519::PublicKey, MinSig>;
+type Activity = Update<EngineBlock<sha256::Sha256, ed25519::PrivateKey, MinSig>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConsensusState {
+    round: Round,
+    committee_epoch: Epoch,
+    /// Canonically ordered hex-encoded committee public keys.
+    committee: Arc<[String]>,
+}
+
+impl ConsensusState {
+    fn genesis(committee: &Set<ed25519::PublicKey>) -> Self {
+        Self {
+            round: Round::zero(),
+            committee_epoch: Epoch::zero(),
+            committee: committee
+                .iter()
+                .map(|public_key| hex(&public_key.encode()))
+                .collect(),
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Observer {
-    current_view: watch::Sender<u64>,
+    consensus: watch::Sender<ConsensusState>,
 }
 
 #[derive(Clone)]
 pub struct ViewClock {
-    current_view: watch::Sender<u64>,
+    consensus: watch::Sender<ConsensusState>,
 }
 
 impl Observer {
-    pub fn new() -> (Self, ViewClock) {
-        let (current_view, _) = watch::channel(0);
+    pub fn new(genesis_committee: &Set<ed25519::PublicKey>) -> (Self, ViewClock) {
+        let (consensus, _) = watch::channel(ConsensusState::genesis(genesis_committee));
         (
             Self {
-                current_view: current_view.clone(),
+                consensus: consensus.clone(),
             },
-            ViewClock { current_view },
+            ViewClock { consensus },
         )
+    }
+
+    fn observe_round(&self, round: Round) {
+        self.consensus.send_if_modified(|current| {
+            if round <= current.round {
+                return false;
+            }
+            current.round = round;
+            true
+        });
+    }
+
+    fn observe_committee(&self, epoch: Epoch, committee: &Set<ed25519::PublicKey>) {
+        self.consensus.send_if_modified(|current| {
+            if epoch <= current.committee_epoch {
+                return false;
+            }
+            current.committee_epoch = epoch;
+            current.committee = committee
+                .iter()
+                .map(|public_key| hex(&public_key.encode()))
+                .collect();
+            if epoch > current.round.epoch() {
+                current.round = Round::new(epoch, View::zero());
+            }
+            true
+        });
     }
 }
 
@@ -71,31 +125,16 @@ impl Reporter for Observer {
     type Activity = Activity;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        let view = activity_view(&activity);
-        self.current_view.send_if_modified(|current| {
-            if view <= *current {
-                return false;
+        match activity {
+            Update::Tip(round, _, _) => self.observe_round(round),
+            Update::Block(block, acknowledgement) => {
+                if let Some(Payload::EpochInfo(info)) = block.header.payload.as_ref() {
+                    self.observe_committee(info.epoch, info.output.players());
+                }
+                acknowledgement.acknowledge();
             }
-            *current = view;
-            true
-        });
-        Feedback::Ok
-    }
-}
-
-fn activity_view(activity: &Activity) -> u64 {
-    match activity {
-        Activity::Notarize(activity) => activity.view().get(),
-        Activity::Notarization(activity) | Activity::Certification(activity) => {
-            activity.view().get()
         }
-        Activity::Nullify(activity) => activity.view().get(),
-        Activity::Nullification(activity) => activity.view().get(),
-        Activity::Finalize(activity) => activity.view().get(),
-        Activity::Finalization(activity) => activity.view().get(),
-        Activity::ConflictingNotarize(activity) => activity.view().get(),
-        Activity::ConflictingFinalize(activity) => activity.view().get(),
-        Activity::NullifyFinalize(activity) => activity.view().get(),
+        Feedback::Ok
     }
 }
 
@@ -263,6 +302,12 @@ async fn submit_to_pinned_leader<St: Strategy>(
     body: Bytes,
     target: &str,
 ) -> (StatusCode, String) {
+    let consensus = state.view_clock.consensus.borrow().clone();
+    if consensus.committee_epoch != consensus.round.epoch()
+        || !consensus.committee.iter().any(|member| member == target)
+    {
+        return (StatusCode::BAD_REQUEST, String::new());
+    }
     let Some(leader) = leader_by_id(&state.leaders, target).cloned() else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
@@ -297,8 +342,8 @@ async fn submit_with_retries<St: Strategy>(
     // leaders cache each batch id's status and acknowledge repeats without
     // re-admitting transactions.
     let mut accepted: HashSet<(String, String)> = HashSet::new();
-    let mut views = state.view_clock.current_view.subscribe();
-    let mut view = *views.borrow();
+    let mut consensus_updates = state.view_clock.consensus.subscribe();
+    let mut consensus = consensus_updates.borrow().clone();
 
     for retry in 0..=state.max_retry_views {
         // Until something resolves, resends reuse the original request bytes;
@@ -324,7 +369,7 @@ async fn submit_with_retries<St: Strategy>(
         // POST only to leaders that have not already accepted this batch id:
         // consecutive next-two-leaders windows overlap by one, and a resend
         // to an accepting leader only re-burns its ingress decode and verify.
-        let targets = next_two_leaders(&state.leaders, view)
+        let targets = next_two_leaders(&state.leaders, &consensus)
             .into_iter()
             .filter(|target| {
                 !accepted.contains(&(sent_batch_id.clone(), target.public_key.clone()))
@@ -372,7 +417,7 @@ async fn submit_with_retries<St: Strategy>(
             return json_response(best_effort_status(&included, &filtered, height));
         }
 
-        wait_for_view_advance(&mut views, &mut view).await;
+        wait_for_consensus_advance(&mut consensus_updates, &mut consensus).await;
     }
 
     json_response(best_effort_status(&included, &filtered, height))
@@ -416,7 +461,10 @@ async fn forward_to_targets(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "status reduction updates the batch's shared retry state"
+)]
 async fn merge_statuses<St: Strategy>(
     state: &AppState<St>,
     posted: &[(String, Leader)],
@@ -484,13 +532,16 @@ async fn merge_statuses<St: Strategy>(
     }
 }
 
-async fn wait_for_view_advance(views: &mut watch::Receiver<u64>, current: &mut u64) {
+async fn wait_for_consensus_advance(
+    updates: &mut watch::Receiver<ConsensusState>,
+    current: &mut ConsensusState,
+) {
     loop {
-        if views.changed().await.is_err() {
+        if updates.changed().await.is_err() {
             return;
         }
-        let next = *views.borrow();
-        if next > *current {
+        let next = updates.borrow().clone();
+        if next != *current {
             *current = next;
             return;
         }
@@ -757,16 +808,32 @@ fn normalize_leaders(leaders: Vec<RelayerLeaderConfig>) -> Vec<Leader> {
     leaders
 }
 
-fn next_two_leaders(leaders: &[Leader], observed_view: u64) -> Vec<Leader> {
-    if leaders.is_empty() {
+fn next_two_leaders(leaders: &[Leader], consensus: &ConsensusState) -> Vec<Leader> {
+    if consensus.committee.is_empty() || consensus.committee_epoch != consensus.round.epoch() {
         return Vec::new();
     }
-    let first = ((observed_view + 1) as usize) % leaders.len();
-    let second = ((observed_view + 2) as usize) % leaders.len();
-    if first == second {
-        return vec![leaders[first].clone()];
+
+    let n = u64::try_from(consensus.committee.len()).expect("committee length fits in u64");
+    let epoch = consensus.round.epoch().get();
+    let view = consensus.round.view().get();
+    let mut selected = Vec::with_capacity(2);
+    for offset in [1, 2] {
+        // RoundRobin uses the canonical committee ordering and
+        // `(epoch + next_view) % n` for rotating one-view terms.
+        let index = epoch.wrapping_add(view.wrapping_add(offset)) % n;
+        let public_key =
+            &consensus.committee[usize::try_from(index).expect("leader index fits in usize")];
+        let Some(leader) = leader_by_id(leaders, public_key) else {
+            continue;
+        };
+        if !selected
+            .iter()
+            .any(|selected: &Leader| selected.public_key == leader.public_key)
+        {
+            selected.push(leader.clone());
+        }
     }
-    vec![leaders[first].clone(), leaders[second].clone()]
+    selected
 }
 
 fn leader_by_id<'a>(leaders: &'a [Leader], public_key: &str) -> Option<&'a Leader> {
@@ -789,6 +856,26 @@ mod tests {
             sort_key: from_hex(key).expect("hex key"),
             url: format!("http://{key}"),
         }
+    }
+
+    fn consensus_state(epoch: u64, view: u64, committee: &[&str]) -> ConsensusState {
+        ConsensusState {
+            round: Round::new(Epoch::new(epoch), View::new(view)),
+            committee_epoch: Epoch::new(epoch),
+            committee: committee
+                .iter()
+                .map(|public_key| (*public_key).to_string())
+                .collect(),
+        }
+    }
+
+    fn test_view_clock(committee: impl IntoIterator<Item = String>) -> ViewClock {
+        let (consensus, _) = watch::channel(ConsensusState {
+            round: Round::zero(),
+            committee_epoch: Epoch::zero(),
+            committee: committee.into_iter().collect(),
+        });
+        ViewClock { consensus }
     }
 
     fn signed_transfer(seed: u64, nonce: u64) -> SignedTransaction<sha256::Sha256> {
@@ -838,7 +925,6 @@ mod tests {
     }
 
     fn pinned_state(leader_url: String) -> AppState<commonware_parallel::Sequential> {
-        let (_, view_clock) = Observer::new();
         AppState {
             leaders: Arc::new(vec![Leader {
                 public_key: "00".to_string(),
@@ -848,7 +934,7 @@ mod tests {
             max_retry_views: 1,
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             account_reader: Arc::new(OnceLock::new()),
-            view_clock,
+            view_clock: test_view_clock(["00".to_string()]),
             http: reqwest::Client::new(),
             strategy: commonware_parallel::Sequential,
             decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
@@ -865,8 +951,9 @@ mod tests {
     #[test]
     fn targets_next_two_views() {
         let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
+        let consensus = consensus_state(0, 0, &["00", "01", "02", "03"]);
 
-        let targets = next_two_leaders(&leaders, 0)
+        let targets = next_two_leaders(&leaders, &consensus)
             .into_iter()
             .map(|leader| leader.public_key)
             .collect::<Vec<_>>();
@@ -877,13 +964,52 @@ mod tests {
     #[test]
     fn targets_deduplicate_single_leader_network() {
         let leaders = vec![leader("00")];
+        let consensus = consensus_state(0, 12, &["00"]);
 
-        let targets = next_two_leaders(&leaders, 12)
+        let targets = next_two_leaders(&leaders, &consensus)
             .into_iter()
             .map(|leader| leader.public_key)
             .collect::<Vec<_>>();
 
         assert_eq!(targets, vec!["00"]);
+    }
+
+    #[test]
+    fn targets_active_committee_with_epoch_offset() {
+        let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
+        let consensus = consensus_state(2, 0, &["01", "03"]);
+
+        let targets = next_two_leaders(&leaders, &consensus)
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["03", "01"]);
+    }
+
+    #[test]
+    fn observer_tracks_full_round_and_rotates_committee() {
+        use commonware_consensus::types::Height;
+        use commonware_cryptography::{Digest as _, Signer as _};
+
+        let genesis_key = ed25519::PrivateKey::from_seed(10).public_key();
+        let next_key = ed25519::PrivateKey::from_seed(11).public_key();
+        let genesis = Set::from_iter_dedup([genesis_key]);
+        let next = Set::from_iter_dedup([next_key.clone()]);
+        let (mut observer, clock) = Observer::new(&genesis);
+
+        let round = Round::new(Epoch::new(3), View::new(7));
+        assert_eq!(
+            observer.report(Update::Tip(round, Height::new(9), sha256::Digest::EMPTY)),
+            Feedback::Ok,
+        );
+        assert_eq!(clock.consensus.borrow().round, round);
+
+        observer.observe_committee(Epoch::new(4), &next);
+        let state = clock.consensus.borrow();
+        assert_eq!(state.round, Round::new(Epoch::new(4), View::zero()));
+        assert_eq!(state.committee_epoch, Epoch::new(4));
+        assert_eq!(state.committee.as_ref(), &[hex(&next_key.encode())]);
     }
 
     #[test]
@@ -1055,7 +1181,12 @@ mod tests {
         leaders: Vec<Leader>,
         max_retry_views: u64,
     ) -> AppState<commonware_parallel::Sequential> {
-        let (_, view_clock) = Observer::new();
+        let view_clock = test_view_clock(
+            leaders
+                .iter()
+                .map(|leader| leader.public_key.clone())
+                .collect::<Vec<_>>(),
+        );
         AppState {
             leaders: Arc::new(leaders),
             max_retry_views,
@@ -1077,14 +1208,15 @@ mod tests {
     }
 
     /// Advances the relayer's observed view every few milliseconds so
-    /// `wait_for_view_advance` never stalls a retry round.
-    fn advance_views(sender: watch::Sender<u64>) -> tokio::task::JoinHandle<()> {
+    /// `wait_for_consensus_advance` never stalls a retry round.
+    fn advance_views(sender: watch::Sender<ConsensusState>) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut view = 0u64;
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                view += 1;
-                sender.send_replace(view);
+                sender.send_modify(|state| {
+                    state.round =
+                        Round::new(state.round.epoch(), View::new(state.round.view().get() + 1));
+                });
             }
         })
     }
@@ -1102,7 +1234,7 @@ mod tests {
         let leader_a = mock_leader("aa", spawn_mock_leader(router_a).await);
         let leader_b = mock_leader("bb", spawn_mock_leader(router_b).await);
         let state = retry_state(vec![leader_a, leader_b], 3);
-        let views = state.view_clock.current_view.clone();
+        let views = state.view_clock.consensus.clone();
         let body: Bytes = vec![signed_transfer(1, 0)].encode();
 
         let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
@@ -1130,7 +1262,7 @@ mod tests {
         );
         let leader = mock_leader("aa", spawn_mock_leader(router).await);
         let state = retry_state(vec![leader], 2);
-        let views = state.view_clock.current_view.clone();
+        let views = state.view_clock.consensus.clone();
         let body: Bytes = vec![signed_transfer(1, 0)].encode();
 
         let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
@@ -1162,7 +1294,7 @@ mod tests {
         let (router, bodies) = scripted_leader(Vec::new(), vec![Some(partial)]);
         let leader = mock_leader("aa", spawn_mock_leader(router).await);
         let state = retry_state(vec![leader], 1);
-        let views = state.view_clock.current_view.clone();
+        let views = state.view_clock.consensus.clone();
         let body: Bytes = vec![first, second.clone()].encode();
 
         let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
@@ -1202,7 +1334,7 @@ mod tests {
         let (router, _) = scripted_leader(Vec::new(), vec![Some(partial)]);
         let leader = mock_leader("aa", spawn_mock_leader(router).await);
         let state = retry_state(vec![leader], 1);
-        let views = state.view_clock.current_view.clone();
+        let views = state.view_clock.consensus.clone();
         let body: Bytes = vec![first, second].encode();
 
         let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
@@ -1245,7 +1377,7 @@ mod tests {
         );
         let leader = mock_leader("aa", spawn_mock_leader(router).await);
         let state = retry_state(vec![leader], 1);
-        let views = state.view_clock.current_view.clone();
+        let views = state.view_clock.consensus.clone();
         let body: Bytes = vec![first, second].encode();
 
         let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));

@@ -75,6 +75,7 @@ where
             self.genesis_state_target.clone(),
             self.genesis_transactions_target.clone(),
             self.genesis_committee_target.clone(),
+            self.eligible_peers_root,
             self.genesis_payload.clone(),
         )
     }

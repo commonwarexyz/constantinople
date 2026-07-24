@@ -320,7 +320,7 @@ mod tests {
         let mut rng = StdRng::from_seed([11; 32]);
         let consensus_key = ed25519::PrivateKey::random(&mut rng);
         let body = committee_body_golden();
-        let mut signed = body.clone();
+        let mut signed = body;
         signed.extend_from_slice(&[0; 65]);
         let lazy = deferred_transaction(&signed);
         let block = Sealed::new_unchecked(
@@ -432,6 +432,7 @@ mod tests {
             transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
             committee_root: sha256::Digest::EMPTY,
             committee_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
+            eligible_peers_root: sha256::Digest::EMPTY,
             payload: None,
         }
     }

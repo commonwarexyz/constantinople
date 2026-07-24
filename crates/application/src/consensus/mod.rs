@@ -36,13 +36,7 @@ use commonware_runtime::{
 };
 use commonware_utils::ordered::Set;
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
-use std::{
-    future::Future,
-    marker::PhantomData,
-    num::NonZeroU64,
-    pin::Pin,
-    sync::Arc,
-};
+use std::{future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc};
 
 mod body;
 mod committee;
@@ -57,8 +51,7 @@ mod tests;
 mod time;
 
 pub use committee::{
-    BLOCKS_PER_EPOCH, Committee, CommitteeProvider, MAX_COMMITTEE_SIZE, committee_for_epoch,
-    seed_committees,
+    BLOCKS_PER_EPOCH, Committee, MAX_COMMITTEE_SIZE, committee_for_epoch, seed_committees,
 };
 pub use db::{
     CommitteeBatch, CommitteeDatabase, CommitteeDb, CommitteeOperation, CommitteeSyncTarget,
@@ -102,8 +95,10 @@ where
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     genesis_committee_target: CommitteeSyncTarget<H::Digest>,
     genesis_payload: R,
+    eligible_peers_root: H::Digest,
     blocks_per_epoch: NonZeroU64,
     initial_committee: Committee,
+    initial_next_committee: Committee,
     eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, R, St>>,
     proposed_transactions: Counter,
@@ -131,8 +126,10 @@ where
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             genesis_committee_target: self.genesis_committee_target.clone(),
             genesis_payload: self.genesis_payload.clone(),
+            eligible_peers_root: self.eligible_peers_root,
             blocks_per_epoch: self.blocks_per_epoch,
             initial_committee: self.initial_committee.clone(),
+            initial_next_committee: self.initial_next_committee.clone(),
             eligible_committee_members: self.eligible_committee_members.clone(),
             finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
@@ -155,6 +152,7 @@ where
     /// Creates an application.
     #[expect(
         clippy::too_many_arguments,
+        clippy::type_complexity,
         reason = "the engine constructs the application from already grouped config"
     )]
     pub fn new(
@@ -168,8 +166,8 @@ where
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         genesis_committee_target: CommitteeSyncTarget<H::Digest>,
         genesis_info: commonware_glue::dkg::types::EpochInfo<V, ed25519::PublicKey, Dir>,
+        eligible_peers_root: H::Digest,
         blocks_per_epoch: NonZeroU64,
-        initial_committee: Committee,
         eligible_committee_members: Set<ed25519::PublicKey>,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, Payload<V, D, Dir>, St>>,
     ) -> Self {
@@ -177,6 +175,10 @@ where
             "proposed_transactions",
             "The number of transactions proposed into blocks",
         );
+        let initial_committee = Committee::new(genesis_info.players.clone())
+            .expect("genesis players must form a valid committee");
+        let initial_next_committee = Committee::new(genesis_info.next_players.clone())
+            .expect("genesis next players must form a valid committee");
 
         Self {
             strategy,
@@ -188,8 +190,10 @@ where
             genesis_transactions_target,
             genesis_committee_target,
             genesis_payload: Payload::EpochInfo(genesis_info),
+            eligible_peers_root,
             blocks_per_epoch,
             initial_committee,
+            initial_next_committee,
             eligible_committee_members: Arc::new(eligible_committee_members),
             finalized_hook,
             proposed_transactions,

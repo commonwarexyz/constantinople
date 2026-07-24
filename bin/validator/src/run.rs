@@ -9,12 +9,13 @@ use crate::{
 use commonware_actor::Feedback;
 use commonware_codec::{Encode, RangeCfg};
 use commonware_consensus::{
-    Heightable as _, Reporter,
+    Heightable as _, Reporter, Reporters,
     marshal::Update,
     simplex::elector::RoundRobin,
     types::{Epoch, coding::Commitment},
 };
 use commonware_cryptography::{
+    PublicKey as CryptographicPublicKey,
     bls12381::primitives::variant::MinSig,
     ed25519::{self, Batch, PublicKey},
     sha256::Sha256,
@@ -28,7 +29,10 @@ use commonware_glue::{
     stateful::{PruneConfig, db::SyncEngineConfig},
 };
 use commonware_macros::boxed;
-use commonware_p2p::{CheckedSender as _, LimitedSender as _, Recipients, authenticated::lookup};
+use commonware_p2p::{
+    Address, AddressableManager, AddressableTrackedPeers, CheckedSender as _, LimitedSender as _,
+    PeerSetSubscription, Provider, Recipients, TrackedPeers, authenticated::lookup,
+};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
@@ -45,7 +49,8 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZU16, NZU32, NZU64, NZUsize, TryCollect,
+    Acknowledgement as _, NZU16, NZU32, NZU64, NZUsize, TryCollect,
+    acknowledgement::Exact,
     ordered::{Map, Set},
     sequence::U64,
 };
@@ -56,7 +61,7 @@ use constantinople_engine::{
     MAX_PENDING_ACKS, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
     secret_store::FileSecretStore,
-    types::{EngineActivity, EngineBlock},
+    types::{EngineBlock, EngineMarshalMailbox},
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher,
@@ -70,6 +75,7 @@ use constantinople_primitives::{
     Block as ChainBlock, Header as ChainHeader, PublicKeyCache, Sealable as _, SealedBlock,
 };
 use std::{
+    fmt,
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
@@ -105,6 +111,87 @@ const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 const CURSOR_COMMITTEE_KEY: U64 = U64::new(2);
+
+/// Adds the immutable eligible-validator catalog as network-policy
+/// secondaries without changing the epoch IDs registered by DKG.
+#[derive(Clone)]
+struct PersistentSecondaries<M>
+where
+    M: AddressableManager,
+{
+    inner: M,
+    eligible: Map<M::PublicKey, Address>,
+}
+
+impl<M> PersistentSecondaries<M>
+where
+    M: AddressableManager,
+{
+    const fn new(inner: M, eligible: Map<M::PublicKey, Address>) -> Self {
+        Self { inner, eligible }
+    }
+}
+
+impl<M> fmt::Debug for PersistentSecondaries<M>
+where
+    M: AddressableManager,
+{
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PersistentSecondaries")
+            .field("eligible", &self.eligible.len())
+            .finish_non_exhaustive()
+    }
+}
+
+impl<M> Provider for PersistentSecondaries<M>
+where
+    M: AddressableManager,
+{
+    type PublicKey = M::PublicKey;
+
+    fn peer_set(
+        &mut self,
+        id: u64,
+    ) -> impl Future<Output = Option<TrackedPeers<Self::PublicKey>>> + Send {
+        self.inner.peer_set(id)
+    }
+
+    fn subscribe(&mut self) -> impl Future<Output = PeerSetSubscription<Self::PublicKey>> + Send {
+        self.inner.subscribe()
+    }
+}
+
+impl<M> AddressableManager for PersistentSecondaries<M>
+where
+    M: AddressableManager,
+{
+    fn track<R>(&mut self, id: u64, peers: R) -> Feedback
+    where
+        R: Into<AddressableTrackedPeers<Self::PublicKey>> + Send,
+    {
+        self.inner
+            .track(id, add_persistent_secondaries(peers.into(), &self.eligible))
+    }
+
+    fn overwrite(&mut self, peers: Map<Self::PublicKey, Address>) -> Feedback {
+        self.inner.overwrite(peers)
+    }
+}
+
+fn add_persistent_secondaries<P: CryptographicPublicKey>(
+    peers: AddressableTrackedPeers<P>,
+    eligible: &Map<P, Address>,
+) -> AddressableTrackedPeers<P> {
+    let secondary = Map::from_iter_dedup(
+        peers
+            .secondary
+            .iter_pairs()
+            .chain(eligible.iter_pairs())
+            .filter(|(peer, _)| peers.primary.get_value(peer).is_none())
+            .map(|(peer, address)| (peer.clone(), address.clone())),
+    );
+    AddressableTrackedPeers::new(peers.primary, secondary)
+}
 
 /// Returns the default finalized-block window before a proposed mempool batch
 /// is marked dropped.
@@ -148,17 +235,13 @@ fn buffer_pool_configs(
     (network_cfg, storage_cfg)
 }
 
-/// Concrete type the engine sees in the `simplex_observer` slot.
-///
-/// We always pin `O` to the indexer's certificate publisher so the engine type
-/// stays the same whether or not the indexer is enabled. Validators that opt
-/// out simply pass `simplex_observer: None`.
 type EngineCertReporter =
     CertificateReporter<Sha256, ed25519::PrivateKey, MinSig, ThresholdScheme<PublicKey, MinSig>>;
 type EnginePublisher = Publisher<Sha256, ed25519::PrivateKey, MinSig>;
 type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
 type ValidatorPayload = Payload<MinSig, ed25519::PrivateKey, Addresses<PublicKey>>;
 type ValidatorEngineBlock = EngineBlock<Sha256, ed25519::PrivateKey, MinSig>;
+type ValidatorMarshalMailbox = EngineMarshalMailbox<Sha256, ed25519::PrivateKey, MinSig>;
 type EngineFinalizedHook = FinalizedHookFn<
     commonware_runtime::tokio::Context,
     Commitment,
@@ -172,19 +255,48 @@ type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
 type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
 
+/// Adapts ordered marshal block updates to the certificate stream consumed by
+/// the indexer. The engine itself only sees this as a native marshal reporter.
 #[derive(Clone)]
-enum SimplexObserver {
-    Indexer(EngineCertReporter),
-    Relayer(crate::relayer::Observer),
+struct IndexerReporter {
+    sender: tokio::sync::mpsc::UnboundedSender<(Arc<ValidatorEngineBlock>, Exact)>,
 }
 
-impl Reporter for SimplexObserver {
-    type Activity = EngineActivity<PublicKey, MinSig>;
+impl IndexerReporter {
+    fn new(
+        marshal: ValidatorMarshalMailbox,
+        reporter: EngineCertReporter,
+    ) -> (Self, JoinHandle<()>) {
+        let (sender, mut receiver) =
+            tokio::sync::mpsc::unbounded_channel::<(Arc<ValidatorEngineBlock>, Exact)>();
+        let handle = tokio::spawn(async move {
+            while let Some((block, acknowledgement)) = receiver.recv().await {
+                let height = block.height();
+                let finalization = marshal
+                    .get_finalization(height)
+                    .await
+                    .unwrap_or_else(|| panic!("marshal finalization missing at height {height}"));
+                if !reporter.publish_finalization(finalization).await {
+                    break;
+                }
+                acknowledgement.acknowledge();
+            }
+        });
+        (Self { sender }, handle)
+    }
+}
+
+impl Reporter for IndexerReporter {
+    type Activity = Update<ValidatorEngineBlock>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match self {
-            Self::Indexer(reporter) => reporter.report(activity),
-            Self::Relayer(reporter) => reporter.report(activity),
+        let Update::Block(block, acknowledgement) = activity else {
+            return Feedback::Ok;
+        };
+        if self.sender.send((block, acknowledgement)).is_ok() {
+            Feedback::Ok
+        } else {
+            Feedback::Closed
         }
     }
 }
@@ -206,6 +318,7 @@ impl Reporter for MempoolReporter {
                     parent: block.header.parent,
                     height: block.header.height,
                     timestamp: block.header.timestamp,
+                    eligible_peers_root: block.header.eligible_peers_root,
                     state_root: block.header.state_root,
                     state_range: block.header.state_range.clone(),
                     transactions_root: block.header.transactions_root,
@@ -641,12 +754,12 @@ async fn start_queued_upload(
 /// Build the indexer wiring iff the secondary validator opted in.
 async fn maybe_build_indexer(
     context: RuntimeContext,
-    is_primary: bool,
+    is_genesis_primary: bool,
     indexer: Option<IndexerConfig>,
     partition_prefix: &str,
 ) -> Option<IndexerHandle> {
     let cfg = indexer?;
-    if is_primary {
+    if is_genesis_primary {
         return None;
     }
 
@@ -911,7 +1024,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
         let network_handle = network.start();
 
-        let relayer_view = relayer.as_ref().map(|_| crate::relayer::Observer::new());
+        let relayer_view = relayer
+            .as_ref()
+            .map(|_| crate::relayer::Observer::new(&primary));
         let relayer_view_clock = relayer_view
             .as_ref()
             .map(|(_, view_clock)| view_clock.clone());
@@ -935,33 +1050,51 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             account_reader.clone(),
             committee_reader.clone(),
         );
-        let is_primary = decoded.share.is_some();
-        let mempool_handle: Pin<Box<dyn Future<Output = ()> + Send>> = if is_primary {
-            let listener = tokio::net::TcpListener::bind(http_listen)
+        let is_genesis_primary = decoded.share.is_some();
+        let mempool_listener = if relayer.is_some() {
+            // The relayer owns the public port. Its own catalog entry is
+            // rewritten below to this private listener, avoiding a forwarding
+            // loop when this validator joins the active committee.
+            tokio::net::TcpListener::bind("127.0.0.1:0")
                 .await
-                .expect("failed to bind mempool HTTP listener");
-            info!(%http_listen, "mempool webserver listening");
-            let handle = mempool_actor.start(listener);
-            Box::pin(async move {
-                let _ = handle.await;
-            })
-        } else if let Some(relayer_config) = relayer.clone() {
-            let view_clock = relayer_view_clock.expect("relayer view clock exists");
-            drop(mempool_actor);
-            info!(%http_listen, "relayer webserver listening");
-            Box::pin(crate::relayer::serve(crate::relayer::ServerConfig {
-                listen: http_listen,
-                relayer: relayer_config,
-                account_reader: account_reader.clone(),
-                view_clock,
-                strategy: strategy.clone(),
-                max_batch_bytes: max_propose_bytes,
-            }))
+                .expect("failed to bind internal mempool listener")
         } else {
-            info!("secondary node: skipping mempool webserver");
-            drop(mempool_actor);
-            Box::pin(std::future::pending())
+            tokio::net::TcpListener::bind(http_listen)
+                .await
+                .expect("failed to bind mempool HTTP listener")
         };
+        let mempool_listen = mempool_listener
+            .local_addr()
+            .expect("mempool listener must have a local address");
+        if relayer.is_none() {
+            info!(%http_listen, "mempool webserver listening");
+        }
+        let mempool_actor_handle = mempool_actor.start(mempool_listener);
+        let mempool_handle = async move {
+            let _ = mempool_actor_handle.await;
+        };
+        let role_http_handle: Pin<Box<dyn Future<Output = ()> + Send>> =
+            if let Some(mut relayer_config) = relayer.clone() {
+                let view_clock = relayer_view_clock.expect("relayer view clock exists");
+                let local_key = hex(&decoded.public_key.encode());
+                let local = relayer_config
+                    .leaders
+                    .iter_mut()
+                    .find(|leader| leader.public_key == local_key)
+                    .expect("relayer leader catalog must include the local eligible validator");
+                local.url = format!("http://{mempool_listen}");
+                info!(%http_listen, "relayer webserver listening");
+                Box::pin(crate::relayer::serve(crate::relayer::ServerConfig {
+                    listen: http_listen,
+                    relayer: relayer_config,
+                    account_reader: account_reader.clone(),
+                    view_clock,
+                    strategy: strategy.clone(),
+                    max_batch_bytes: max_propose_bytes,
+                }))
+            } else {
+                Box::pin(std::future::pending())
+            };
 
         let startup = match startup {
             StartupModeConfig::MarshalSync => StartupMode::MarshalSync,
@@ -981,12 +1114,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .expect("failed to initialize validator-local DKG secret store");
 
         // Build the indexer wiring up-front. This consumes `indexer` from the
-        // loaded config and returns `None` for primaries or validators that
-        // did not declare an `indexer` block.
+        // loaded config and returns `None` for genesis primaries or validators
+        // that did not declare an `indexer` block.
         let indexer_partition_prefix = decoded.partition_prefix.clone();
-        let indexer_handle = maybe_build_indexer(
+        let mut indexer_handle = maybe_build_indexer(
             context.child("indexer"),
-            is_primary,
+            is_genesis_primary,
             indexer,
             &indexer_partition_prefix,
         )
@@ -996,65 +1129,52 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             finalized_height.clone(),
             indexer_finalized_hook(indexer_handle.as_ref()),
         );
+        let engine_manager =
+            PersistentSecondaries::new(oracle.clone(), decoded.eligible_peers.clone());
 
         info!("initializing engine");
-        let engine = Engine::<
-            _,
-            _,
-            _,
-            _,
-            Sha256,
-            MinSig,
-            RoundRobin<Sha256>,
-            Rayon,
-            _,
-            Batch,
-            SimplexObserver,
-        >::new(
-            context.child("engine"),
-            EngineConfig {
-                signer: decoded.signer,
-                manager: oracle.clone(),
-                blocker: oracle,
-                namespace: b"constantinople".to_vec(),
-                output: decoded.dkg_output,
-                share: decoded.share,
-                genesis,
-                eligible_peers: decoded.eligible_peers.clone(),
-                secret_store,
-                dkg_namespace: DKG_NAMESPACE,
-                input: mempool_mailbox.clone(),
-                partition_prefix: decoded.partition_prefix,
-                strategy,
-                public_key_cache,
-                startup,
-                blocks_per_epoch: EPOCH_LENGTH,
-                sync_config: production_sync_config(),
-                prune_config: Some(PRUNE_CONFIG),
-                genesis_leader: decoded.genesis_leader,
-                transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
-                block_codec: constantinople_primitives::BlockCfg {
-                    max_transactions: RangeCfg::new(0..=usize::MAX),
-                    payload: (
-                        NZU32!(64),
-                        commonware_cryptography::bls12381::primitives::sharing::ModeVersion::v0(),
-                        RangeCfg::new(0..=192),
-                    ),
+        let engine =
+            Engine::<_, _, _, _, Sha256, MinSig, RoundRobin<Sha256>, Rayon, _, Batch>::new(
+                context.child("engine"),
+                EngineConfig {
+                    signer: decoded.signer,
+                    manager: engine_manager,
+                    blocker: oracle,
+                    namespace: b"constantinople".to_vec(),
+                    output: decoded.dkg_output,
+                    share: decoded.share,
+                    genesis,
+                    eligible_peers: decoded.eligible_peers.clone(),
+                    secret_store,
+                    dkg_namespace: DKG_NAMESPACE,
+                    input: mempool_mailbox.clone(),
+                    partition_prefix: decoded.partition_prefix,
+                    strategy,
+                    public_key_cache,
+                    startup,
+                    blocks_per_epoch: EPOCH_LENGTH,
+                    simplex_timeouts: constantinople_engine::SimplexTimeouts::default(),
+                    sync_config: production_sync_config(),
+                    prune_config: Some(PRUNE_CONFIG),
+                    genesis_leader: decoded.genesis_leader,
+                    transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
+                    block_codec: constantinople_primitives::BlockCfg {
+                        max_transactions: RangeCfg::new(0..=usize::MAX),
+                        payload: (
+                            NZU32!(64),
+                            commonware_cryptography::bls12381::primitives::sharing::ModeVersion::v0(
+                            ),
+                            RangeCfg::new(0..=192),
+                        ),
+                    },
+                    prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
+                    state_page_cache_bytes,
+                    other_page_cache_bytes,
+                    finalized_hook: Some(finalized_hook),
                 },
-                prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
-                state_page_cache_bytes,
-                other_page_cache_bytes,
-                simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
-                    indexer_handle
-                        .as_ref()
-                        .map(|h| h.cert_reporter.clone())
-                        .map(SimplexObserver::Indexer)
-                }),
-                finalized_hook: Some(finalized_hook),
-            },
-            dkg_probe_network,
-        )
-        .await;
+                dkg_probe_network,
+            )
+            .await;
 
         // Install the account reader as soon as the stateful actor attaches
         // its databases. Runs concurrently with engine.start so the HTTP
@@ -1086,31 +1206,58 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
 
         info!("starting engine");
-        // Primaries report to the local mempool. Secondaries upload index data
-        // from the finalized hook and do not need marshal updates here.
-        let reporter: Option<MempoolReporter> = if is_primary {
-            Some(MempoolReporter(mempool_mailbox.clone()))
+        // Every eligible validator maintains the same finalized mempool view,
+        // so promotion never starts from stale transaction status.
+        let mempool_reporter = MempoolReporter(mempool_mailbox.clone());
+        let indexer_reporter = if relayer_observer.is_none() {
+            indexer_handle.as_mut().map(|handle| {
+                let (reporter, join) =
+                    IndexerReporter::new(engine.marshal_mailbox(), handle.cert_reporter.clone());
+                handle._uploaders.push(join);
+                reporter
+            })
         } else {
             None
         };
-        let engine_handle = engine.start(channels, reporter);
+        type ObserverReporters =
+            Reporters<Update<ValidatorEngineBlock>, crate::relayer::Observer, IndexerReporter>;
+        let observer_reporters: Option<ObserverReporters> =
+            if relayer_observer.is_some() || indexer_reporter.is_some() {
+                Some(Reporters::from((relayer_observer, indexer_reporter)))
+            } else {
+                None
+            };
+        type EngineReporters =
+            Reporters<Update<ValidatorEngineBlock>, MempoolReporter, ObserverReporters>;
+        let reporter: EngineReporters =
+            Reporters::from((Some(mempool_reporter), observer_reporters));
+        let engine_handle = engine.start(channels, Some(reporter));
 
-        wait_for_critical_task_exit(engine_handle, mempool_handle, network_handle).await;
+        wait_for_critical_task_exit(
+            engine_handle,
+            mempool_handle,
+            role_http_handle,
+            network_handle,
+        )
+        .await;
     });
 }
 
-async fn wait_for_critical_task_exit<E, M, N>(
+async fn wait_for_critical_task_exit<E, M, H, N>(
     engine_handle: E,
     mempool_handle: M,
+    role_http_handle: H,
     network_handle: N,
 ) where
     E: Future,
     M: Future,
+    H: Future,
     N: Future,
 {
     tokio::select! {
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
+        _ = role_http_handle => tracing::warn!("role HTTP server exited"),
         _ = network_handle => tracing::warn!("network exited"),
     }
 }
@@ -1130,7 +1277,7 @@ mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, ValidatorPayload,
+        FinalizedQueueWriter, FinalizedUploadCursor, ValidatorPayload, add_persistent_secondaries,
         default_mempool_drop_grace_blocks, maybe_build_indexer, recovered_finalized_upload_cursor,
         scan_finalized_queue_cursor, wait_for_critical_task_exit,
     };
@@ -1146,13 +1293,14 @@ mod tests {
         ed25519::{PrivateKey, PublicKey},
         sha256::{Digest as Sha256Digest, Sha256},
     };
+    use commonware_p2p::{Address, AddressableTrackedPeers};
     use commonware_runtime::{Runner as _, Supervisor as _};
     use commonware_storage::{
         merkle::mmr,
         qmdb::any::{unordered::Operation as UnorderedOperation, value::FixedEncoding},
         queue,
     };
-    use commonware_utils::{non_empty_range, sequence::FixedBytes};
+    use commonware_utils::{non_empty_range, ordered::Map, sequence::FixedBytes};
     use constantinople_primitives::{
         Account, AccountKey, Block, Header, Sealable, SignedTransaction,
     };
@@ -1169,6 +1317,41 @@ mod tests {
         assert_eq!(default_mempool_drop_grace_blocks(50), 100);
     }
 
+    #[test]
+    fn persistent_secondaries_include_all_eligible_non_primaries() {
+        let primary = PrivateKey::from_seed(1).public_key();
+        let scheduled = PrivateKey::from_seed(2).public_key();
+        let removed = PrivateKey::from_seed(3).public_key();
+        let primary_address: Address = "127.0.0.1:1001"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let scheduled_address: Address = "127.0.0.1:1002"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let removed_address: Address = "127.0.0.1:1003"
+            .parse::<std::net::SocketAddr>()
+            .unwrap()
+            .into();
+        let peers = AddressableTrackedPeers::new(
+            Map::from_iter_dedup([(primary.clone(), primary_address.clone())]),
+            Map::from_iter_dedup([(scheduled.clone(), scheduled_address.clone())]),
+        );
+        let eligible = Map::from_iter_dedup([
+            (primary.clone(), primary_address),
+            (scheduled.clone(), scheduled_address),
+            (removed.clone(), removed_address),
+        ]);
+
+        let peers = add_persistent_secondaries(peers, &eligible);
+
+        assert!(peers.primary.get_value(&primary).is_some());
+        assert!(peers.secondary.get_value(&primary).is_none());
+        assert!(peers.secondary.get_value(&scheduled).is_some());
+        assert!(peers.secondary.get_value(&removed).is_some());
+    }
+
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {
         let setup_task = tokio::spawn(async {});
@@ -1176,7 +1359,12 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_critical_task_exit(pending::<()>(), pending::<()>(), pending::<()>()),
+            wait_for_critical_task_exit(
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+            ),
         )
         .await;
 
@@ -1378,6 +1566,7 @@ mod tests {
             transactions_range: non_empty_range!(transaction_start, transaction_end),
             committee_root: Sha256Digest::EMPTY,
             committee_range: non_empty_range!(committee_start, committee_end),
+            eligible_peers_root: Sha256Digest::EMPTY,
             payload: None,
         };
         let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())

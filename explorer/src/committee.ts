@@ -199,8 +199,11 @@ function orderCommitteeChanges(
 
 /** Number of finalized block advances before the exact final-block lock. */
 export function blocksUntilCommitteeLock(snapshot: CommitteeSnapshot): bigint {
-    return snapshot.height < snapshot.lockHeight
-        ? snapshot.lockHeight - snapshot.height
+    const lastAdmissibleHeight = snapshot.lockHeight > 0n
+        ? snapshot.lockHeight - 1n
+        : 0n;
+    return snapshot.height < lastAdmissibleHeight
+        ? lastAdmissibleHeight - snapshot.height
         : 0n;
 }
 

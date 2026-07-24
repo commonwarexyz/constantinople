@@ -33,6 +33,8 @@ use rand::{CryptoRng, Rng};
 use std::{future::Future, sync::Arc};
 use tracing::{Instrument as _, info, info_span, warn};
 
+type LifecycleBlock<C, H, V, D, Dir> = SealedBlock<C, ed25519::PublicKey, H, Payload<V, D, Dir>>;
+
 fn mempool_header<C, D, P, R>(header: &Header<C, D, P, R>) -> Header<C, D, P>
 where
     C: Digest,
@@ -44,6 +46,7 @@ where
         parent: header.parent,
         height: header.height,
         timestamp: header.timestamp,
+        eligible_peers_root: header.eligible_peers_root,
         state_root: header.state_root,
         state_range: header.state_range.clone(),
         transactions_root: header.transactions_root,
@@ -111,7 +114,7 @@ where
     pub async fn propose_child(
         &mut self,
         (runtime, context): (E, Context<C, ed25519::PublicKey>),
-        parent: Arc<SealedBlock<C, ed25519::PublicKey, H, Payload<V, D, Dir>>>,
+        parent: Arc<LifecycleBlock<C, H, V, D, Dir>>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
         payload: Option<Payload<V, D, Dir>>,
         input: &mut I,
@@ -124,6 +127,14 @@ where
     {
         let parent_digest = parent.digest();
         let parent_height = parent.header.height;
+        if parent.header.eligible_peers_root != self.eligible_peers_root {
+            warn!(
+                height = parent_height,
+                reason = "eligible_peers_root_mismatch",
+                "application.propose.reject"
+            );
+            return None;
+        }
 
         // Select from the mempool, then execute the selection best effort
         // against the parent's state: anything inapplicable there fails its
@@ -148,6 +159,7 @@ where
             seed,
             input,
             &self.initial_committee,
+            &self.initial_next_committee,
             self.eligible_committee_members.clone(),
             self.blocks_per_epoch.get(),
         )
@@ -180,6 +192,7 @@ where
             parent: parent_digest,
             height: parent_height + 1,
             timestamp: time::timestamp_ms(&runtime),
+            eligible_peers_root: self.eligible_peers_root,
             state_root: execution.block.state.root(),
             state_range: execution.block.state_sync_range.clone(),
             transactions_root: execution.block.transactions.root(),
@@ -221,10 +234,8 @@ where
     pub async fn verify_child(
         &mut self,
         (runtime, _context): (E, Context<C, ed25519::PublicKey>),
-        block: Arc<SealedBlock<C, ed25519::PublicKey, H, Payload<V, D, Dir>>>,
-        parent: impl Future<
-            Output = Option<Arc<SealedBlock<C, ed25519::PublicKey, H, Payload<V, D, Dir>>>>,
-        > + Send,
+        block: Arc<LifecycleBlock<C, H, V, D, Dir>>,
+        parent: impl Future<Output = Option<Arc<LifecycleBlock<C, H, V, D, Dir>>>> + Send,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
@@ -268,6 +279,16 @@ where
             );
             return None;
         }
+        if header.eligible_peers_root != self.eligible_peers_root
+            || header.eligible_peers_root != parent.header.eligible_peers_root
+        {
+            warn!(
+                height = header.height,
+                reason = "eligible_peers_root_mismatch",
+                "application.verify.reject"
+            );
+            return None;
+        }
 
         // Signatures verify concurrently with execution on the shared pool:
         // the join measures ~2ms faster than sequencing the merkleize after
@@ -282,6 +303,7 @@ where
             header.height,
             body,
             &self.initial_committee,
+            &self.initial_next_committee,
             self.eligible_committee_members.clone(),
             self.blocks_per_epoch.get(),
         );
@@ -341,7 +363,7 @@ where
     pub async fn apply_certified(
         &mut self,
         (_, _): (E, Context<C, ed25519::PublicKey>),
-        block: &SealedBlock<C, ed25519::PublicKey, H, Payload<V, D, Dir>>,
+        block: &LifecycleBlock<C, H, V, D, Dir>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
     where
@@ -350,6 +372,10 @@ where
         I: TransactionSource<C, ed25519::PublicKey, H> + Sync,
         St: Strategy,
     {
+        assert!(
+            block.header.eligible_peers_root == self.eligible_peers_root,
+            "certified block committed an unexpected eligible peer catalog"
+        );
         let strategy = self.strategy.clone();
         let body = block.body.clone();
         let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
@@ -369,6 +395,7 @@ where
             digests,
             strategy,
             &self.initial_committee,
+            &self.initial_next_committee,
             &self.eligible_committee_members,
             self.blocks_per_epoch.get(),
         )

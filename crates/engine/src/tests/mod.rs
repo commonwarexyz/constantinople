@@ -1,158 +1,318 @@
-//! End-to-end engine tests driven by `commonware_glue::simulate`.
+//! Deterministic end-to-end tests for the complete validator engine.
 
 mod common;
+mod dkg_integration;
+mod plan;
 mod properties;
 
 use crate::{
-    CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    CERTIFICATE_CHANNEL, COMMITTEE_RESOLVER_CHANNEL, Channels, Config, DKG_CHANNEL,
+    DKG_PROBE_CHANNEL, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL, RESOLVER_CHANNEL,
+    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
-    HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
-    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, validator_fixture,
+    EpochFilteredReceiver, HeightTransactionSource, RecordingManager, TRANSACTION_NAMESPACE,
+    TestHasher, TestPrivateKey, TestPublicKey, TestReporter, TrackLog, ValidatorState,
+    validator_fixture,
 };
 use commonware_consensus::{
-    Heightable,
-    marshal::core::CommitmentFallback,
+    Heightable as _,
+    marshal::Identifier,
     simplex::elector::RoundRobin,
-    types::{Epoch, coding::Commitment},
+    types::{Epoch, Height, coding::Commitment},
 };
 use commonware_cryptography::{
-    Signer,
+    Committable as _, Signer as _,
     bls12381::{
         dkg::feldman_desmedt::Output,
         primitives::{group::Share, variant::MinSig},
     },
-    certificate::ConstantProvider,
     ed25519::Batch as Ed25519Batch,
 };
 use commonware_glue::{
+    dkg::{
+        network::Addresses,
+        types::{EpochInfo, EpochOutcome, Payload},
+    },
     simulate::{
-        action::{Action, Crash, Schedule},
         engine::{EngineDefinition, InitContext},
-        plan::PlanBuilder,
+        reporter::MonitorReporter,
     },
-    stateful::{
-        PruneConfig,
-        db::SyncEngineConfig,
-        probe::{Config as ProbeConfig, Probe},
-    },
+    stateful::db::SyncEngineConfig,
 };
-use commonware_macros::{test_group, test_traced};
-use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
+use commonware_p2p::{Address, simulated::Link};
 use commonware_parallel::Sequential;
-use commonware_runtime::{Handle, Quota, Spawner, Supervisor};
+use commonware_runtime::{Clock as _, Handle, Quota, Spawner as _, Supervisor as _};
 use commonware_utils::{
-    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
+    NZU32, NZU64, NZUsize,
+    channel::oneshot,
+    ordered::{Map, Set},
+    sync::Mutex,
 };
-use constantinople_mempool::mocks::StaticTransactionSource;
-use constantinople_primitives::PublicKeyCache;
-use properties::{
-    BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
-    RestartPreservesProcessedHeight, RestartRecoveryComplete, StateSyncReadyAtHeight,
+use constantinople_application::consensus::{Committee, FinalizedHookFn};
+use constantinople_primitives::{
+    PublicKeyCache, Transaction, TransactionPublicKey, VerifiedTransaction,
 };
-use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
-use tracing::{info, warn};
+use std::{
+    collections::{BTreeMap, HashSet, VecDeque},
+    net::SocketAddr,
+    num::NonZeroU64,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+use tracing::warn;
 
-const NUM_VALIDATORS: u32 = 4;
+pub(crate) const TEST_EPOCH_LENGTH: NonZeroU64 = NZU64!(64);
 const ENGINE_NAMESPACE: &[u8] = b"constantinople-engine-test";
-const MAX_PROBE_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
+const DKG_NAMESPACE: &[u8] = b"constantinople-engine-test-dkg";
+const MAX_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
+const TEST_QUOTA: Quota = Quota::per_second(NZU32!(1_000_000));
+static NEXT_SECRET_ROOT: AtomicU64 = AtomicU64::new(0);
 
-const fn default_link() -> Link {
+pub(crate) const fn final_height(epoch: u64) -> u64 {
+    TEST_EPOCH_LENGTH.get() * (epoch + 1) - 1
+}
+
+pub(crate) const fn default_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
-        jitter: Duration::from_millis(1),
+        jitter: Duration::from_millis(5),
         success_rate: 1.0,
     }
 }
 
-const fn lossy_link() -> Link {
-    Link {
-        latency: Duration::from_millis(200),
-        jitter: Duration::from_millis(150),
-        success_rate: 0.7,
-    }
+fn address(index: usize) -> Address {
+    Address::Symmetric(SocketAddr::from((
+        [127, 0, 0, 1],
+        20_000 + u16::try_from(index).expect("test peer index must fit in u16"),
+    )))
+}
+
+fn directory(
+    participants: &Set<TestPublicKey>,
+    eligible: &Map<TestPublicKey, Address>,
+) -> Addresses<TestPublicKey> {
+    participants
+        .iter()
+        .map(|peer| {
+            (
+                peer.clone(),
+                eligible
+                    .get_value(peer)
+                    .expect("eligible peer must have an address")
+                    .clone(),
+            )
+        })
+        .collect()
 }
 
 #[derive(Clone)]
-struct TestEngineDefinition {
+pub(crate) struct TestEngineDefinition {
     signers: Vec<TestPrivateKey>,
     output: Output<MinSig, TestPublicKey>,
     shares: BTreeMap<TestPublicKey, Option<Share>>,
-    enable_state_sync: bool,
-    /// When `true`, every node re-tracks peer set 0 during `init` as
-    /// `TrackedPeers::new(primary, secondary)` — primary = nodes with a DKG
-    /// share, secondary = nodes without. Exercises the p2p discovery secondary
-    /// mechanism. Default `false` leaves all nodes in the primary set as
-    /// configured by `PlanBuilder`.
-    use_discovery_split: bool,
-    sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
-    genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
-    restart_barrier: Option<RestartBarrier>,
-    prunable_items_per_section: NonZeroU64,
-    retained_marshal_blocks: usize,
+    genesis: EpochInfo<MinSig, TestPublicKey, Addresses<TestPublicKey>>,
+    eligible: Map<TestPublicKey, Address>,
+    proposals: BTreeMap<u64, Vec<VerifiedTransaction<TestHasher>>>,
+    failures: Arc<HashSet<u64>>,
+    processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
+    holds: Arc<Mutex<BTreeMap<TestPublicKey, VecDeque<u64>>>>,
+    starts: Arc<Mutex<BTreeMap<TestPublicKey, usize>>>,
+    tracks: TrackLog,
+    secret_root: Arc<PathBuf>,
 }
 
 impl TestEngineDefinition {
-    fn new(validators: u32) -> Self {
-        let (signers, output, shares) = validator_fixture(validators);
+    pub(crate) fn rotating() -> Self {
+        let (mut signers, output, mut shares) = validator_fixture(4);
+        let added = TestPrivateKey::from_seed(1_000_000);
+        shares.insert(added.public_key(), None);
+        signers.push(added);
+        let joining = TestPrivateKey::from_seed(1_000_001);
+        shares.insert(joining.public_key(), None);
+        signers.push(joining);
+
+        let initial = output.players().clone();
+        let eligible = Map::from_iter_dedup(
+            signers
+                .iter()
+                .enumerate()
+                .map(|(index, signer)| (signer.public_key(), address(index))),
+        );
+        let genesis = EpochInfo {
+            outcome: EpochOutcome::Success,
+            epoch: Epoch::zero(),
+            output: output.clone(),
+            players: initial.clone(),
+            next_players: initial.clone(),
+            directory: directory(&initial, &eligible),
+        };
+
+        let sender = &signers[1];
+        let sender_key = TransactionPublicKey::ed25519(sender.public_key());
+        let first_update = vec![
+            Transaction::set_committee_member(
+                sender_key.clone(),
+                Epoch::new(2),
+                signers[4].public_key(),
+                true,
+                0,
+            )
+            .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
+            Transaction::set_committee_member(
+                sender_key.clone(),
+                Epoch::new(2),
+                signers[0].public_key(),
+                false,
+                1,
+            )
+            .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
+        ];
+        let second_update = vec![
+            Transaction::set_committee_member(
+                sender_key.clone(),
+                Epoch::new(3),
+                signers[5].public_key(),
+                true,
+                2,
+            )
+            .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
+            Transaction::set_committee_member(
+                sender_key,
+                Epoch::new(3),
+                signers[1].public_key(),
+                false,
+                3,
+            )
+            .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
+        ];
+        let proposals =
+            BTreeMap::from([(1, first_update), (TEST_EPOCH_LENGTH.get(), second_update)]);
+
+        Self::from_parts(signers, output, shares, genesis, eligible, proposals)
+    }
+
+    pub(crate) fn stable() -> Self {
+        let (signers, output, shares) = validator_fixture(7);
+        let initial = output.players().clone();
+        let eligible = Map::from_iter_dedup(
+            signers
+                .iter()
+                .enumerate()
+                .map(|(index, signer)| (signer.public_key(), address(index))),
+        );
+        let genesis = EpochInfo {
+            outcome: EpochOutcome::Success,
+            epoch: Epoch::zero(),
+            output: output.clone(),
+            players: initial.clone(),
+            next_players: initial.clone(),
+            directory: directory(&initial, &eligible),
+        };
+        Self::from_parts(signers, output, shares, genesis, eligible, BTreeMap::new())
+    }
+
+    fn from_parts(
+        signers: Vec<TestPrivateKey>,
+        output: Output<MinSig, TestPublicKey>,
+        shares: BTreeMap<TestPublicKey, Option<Share>>,
+        genesis: EpochInfo<MinSig, TestPublicKey, Addresses<TestPublicKey>>,
+        eligible: Map<TestPublicKey, Address>,
+        proposals: BTreeMap<u64, Vec<VerifiedTransaction<TestHasher>>>,
+    ) -> Self {
+        let id = NEXT_SECRET_ROOT.fetch_add(1, Ordering::Relaxed);
+        let secret_root = std::env::temp_dir().join(format!(
+            "constantinople-engine-e2e-{}-{id}",
+            std::process::id(),
+        ));
+        if secret_root.exists() {
+            std::fs::remove_dir_all(&secret_root)
+                .expect("stale test secret root must be removable");
+        }
 
         Self {
             signers,
             output,
             shares,
-            enable_state_sync: false,
-            use_discovery_split: false,
-            sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
-            genesis_commitments: Arc::new(Mutex::new(BTreeMap::new())),
-            restart_barrier: None,
-            prunable_items_per_section: NZU64!(4_096),
-            retained_marshal_blocks: 16,
+            genesis,
+            eligible,
+            proposals,
+            failures: Arc::default(),
+            processed: Arc::default(),
+            holds: Arc::default(),
+            starts: Arc::default(),
+            tracks: Arc::default(),
+            secret_root: Arc::new(secret_root),
         }
     }
 
-    /// Extend the node set with `count` secondary (non-voting) participants.
-    ///
-    /// Secondaries receive an ed25519 identity but no DKG share, so the engine
-    /// constructs their threshold scheme in verifier mode (`me() == None`).
-    /// Simplex then runs as a silent observer: no votes, no certificates — the
-    /// node only processes inbound messages and drives its local state machine.
-    fn with_secondaries(mut self, count: u32) -> Self {
-        const SECONDARY_SEED_OFFSET: u64 = 1_000_000;
-        for i in 0..count {
-            let signer = TestPrivateKey::from_seed(SECONDARY_SEED_OFFSET + u64::from(i));
-            self.shares.insert(signer.public_key(), None);
-            self.signers.push(signer);
-        }
+    pub(crate) fn with_failures(mut self, epochs: impl IntoIterator<Item = u64>) -> Self {
+        self.failures = Arc::new(epochs.into_iter().collect());
         self
     }
 
-    /// Exercise the `p2p::discovery` secondary peer-set mechanism.
-    ///
-    /// With this enabled, each node re-tracks peer set 0 as
-    /// `TrackedPeers::new(primary, secondary)` during `init`. Primary = nodes
-    /// with a DKG share, secondary = the rest.
-    const fn with_discovery_split(mut self) -> Self {
-        self.use_discovery_split = true;
+    pub(crate) fn with_holds(
+        self,
+        participant: TestPublicKey,
+        heights: impl IntoIterator<Item = u64>,
+    ) -> Self {
+        self.holds
+            .lock()
+            .insert(participant, heights.into_iter().collect());
         self
     }
 
-    const fn with_state_sync(mut self) -> Self {
-        self.enable_state_sync = true;
-        self
+    pub(crate) fn initial_players(&self) -> Set<TestPublicKey> {
+        self.output.players().clone()
     }
 
-    fn with_restart_barrier(mut self, barrier: RestartBarrier) -> Self {
-        self.restart_barrier = Some(barrier);
-        self.prunable_items_per_section = NZU64!(1);
-        self
+    pub(crate) fn updated_players(&self) -> Set<TestPublicKey> {
+        let mut committee =
+            Committee::new(self.initial_players()).expect("initial committee must be valid");
+        committee
+            .assign(self.signers[4].public_key(), true)
+            .expect("joining peer must be assignable");
+        committee
+            .assign(self.signers[0].public_key(), false)
+            .expect("leaving peer must be removable");
+        committee.into_members()
     }
 
-    const fn with_aggressive_pruning(mut self) -> Self {
-        self.prunable_items_per_section = NZU64!(1);
-        self.retained_marshal_blocks = 0;
-        self
+    pub(crate) fn final_players(&self) -> Set<TestPublicKey> {
+        let mut committee =
+            Committee::new(self.updated_players()).expect("updated committee must be valid");
+        committee
+            .assign(self.signers[5].public_key(), true)
+            .expect("future joining peer must be assignable");
+        committee
+            .assign(self.signers[1].public_key(), false)
+            .expect("second leaving peer must be removable");
+        committee.into_members()
+    }
+
+    pub(crate) fn joining(&self) -> TestPublicKey {
+        self.signers[5].public_key()
+    }
+
+    pub(crate) fn leaving(&self) -> TestPublicKey {
+        self.signers[0].public_key()
+    }
+
+    pub(crate) fn starts(&self) -> Arc<Mutex<BTreeMap<TestPublicKey, usize>>> {
+        self.starts.clone()
+    }
+
+    pub(crate) fn secret_path(&self, participant: &TestPublicKey) -> Arc<PathBuf> {
+        let index = self
+            .signers
+            .iter()
+            .position(|signer| &signer.public_key() == participant)
+            .expect("test participant must have a signer identity");
+        Arc::new(self.secret_root.join(index.to_string()))
     }
 }
 
@@ -177,7 +337,9 @@ impl EngineDefinition for TestEngineDefinition {
             (MARSHAL_RESOLVER_CHANNEL, TEST_QUOTA),
             (STATE_RESOLVER_CHANNEL, TEST_QUOTA),
             (TRANSACTION_RESOLVER_CHANNEL, TEST_QUOTA),
-            (PROBE_CHANNEL, TEST_QUOTA),
+            (COMMITTEE_RESOLVER_CHANNEL, TEST_QUOTA),
+            (DKG_CHANNEL, TEST_QUOTA),
+            (DKG_PROBE_CHANNEL, TEST_QUOTA),
         ]
     }
 
@@ -185,97 +347,83 @@ impl EngineDefinition for TestEngineDefinition {
         let InitContext {
             context,
             index,
+            delayed,
             public_key,
             oracle,
             channels,
-            participants: _,
             monitor,
             ..
         } = ctx;
         let public_key = public_key.clone();
         let signer = self.signers[index].clone();
         let share = self.shares.get(&public_key).cloned().flatten();
-        let partition_prefix = format!("validator-{index}");
         let output = self.output.clone();
-        let sync_heights = self.sync_heights.clone();
-        let genesis_commitments = self.genesis_commitments.clone();
-        let prunable_items_per_section = self.prunable_items_per_section;
-        let retained_marshal_blocks = self.retained_marshal_blocks;
-        let enable_state_sync = self.enable_state_sync;
-        let uses_state_sync = enable_state_sync && index == 0;
-        let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
-        let is_restart = restart_barrier
-            .as_ref()
-            .is_some_and(RestartBarrier::begin_start);
+        let genesis = self.genesis.clone();
+        let eligible = self.eligible.clone();
+        let proposals = self.proposals.clone();
+        let failures = self.failures.clone();
+        let processed = self.processed.clone();
+        let holds = self.holds.clone();
+        let tracks = self.tracks.clone();
+        let starts = self.starts.clone();
+        let secret_root = self.secret_root.clone();
+        let partition_prefix = format!("validator-{index}");
         let genesis_leader = self.signers[0].public_key();
-        let mut manager = oracle.manager();
+        let manager =
+            RecordingManager::new(oracle.socket_manager(), public_key.clone(), tracks.clone());
         let blocker = oracle.control(public_key.clone());
         let (state_sender, state_receiver) = oneshot::channel();
 
-        // Override PlanBuilder's default single-primary-set tracking with the
-        // discovery primary/secondary split when requested.
-        if self.use_discovery_split && index == 0 {
-            let (primary, secondary): (Vec<_>, Vec<_>) = self
-                .signers
-                .iter()
-                .map(TestPrivateKey::public_key)
-                .partition(|pk| self.shares.get(pk).is_some_and(|share| share.is_some()));
-            let primary: Set<TestPublicKey> = primary.into_iter().try_collect().unwrap();
-            let secondary: Set<TestPublicKey> = secondary.into_iter().try_collect().unwrap();
-            manager.track(0, TrackedPeers::new(primary, secondary));
+        let restarting = {
+            let mut starts = starts.lock();
+            let count = starts.entry(public_key.clone()).or_default();
+            let restarting = *count > 0;
+            *count += 1;
+            restarting
+        };
+        if restarting {
+            let mut holds = holds.lock();
+            if let Some(heights) = holds.get_mut(&public_key) {
+                heights.pop_front();
+            }
         }
 
         let handle = context.child("validator").spawn(move |context| async move {
             let mut channels = channels.into_iter();
-            let votes = channels.next().expect("vote channel must exist");
-            let certificates = channels.next().expect("certificate channel must exist");
-            let resolver = channels.next().expect("resolver channel must exist");
-            let marshal = channels.next().expect("marshal channel must exist");
-            let marshal_resolver = channels
-                .next()
-                .expect("marshal resolver channel must exist");
-            let state_resolver = channels.next().expect("state resolver channel must exist");
-            let transaction_resolver = channels
-                .next()
-                .expect("transaction resolver channel must exist");
-            let probe_network = channels.next().expect("probe channel must exist");
+            let pass = |(sender, receiver)| (sender, EpochFilteredReceiver::pass(receiver));
+            let votes = pass(channels.next().expect("vote channel must exist"));
+            let certificates = pass(channels.next().expect("certificate channel must exist"));
+            let resolver = pass(channels.next().expect("resolver channel must exist"));
+            let marshal = pass(channels.next().expect("marshal channel must exist"));
+            let marshal_resolver = pass(
+                channels
+                    .next()
+                    .expect("marshal resolver channel must exist"),
+            );
+            let state_resolver = pass(channels.next().expect("state resolver channel must exist"));
+            let transaction_resolver = pass(
+                channels
+                    .next()
+                    .expect("transaction resolver channel must exist"),
+            );
+            let committee_resolver = pass(
+                channels
+                    .next()
+                    .expect("committee resolver channel must exist"),
+            );
+            let (dkg_sender, dkg_receiver) = channels.next().expect("DKG channel must exist");
+            let dkg = (
+                dkg_sender,
+                EpochFilteredReceiver::drop_epochs(dkg_receiver, failures),
+            );
+            let probe_network = pass(channels.next().expect("probe channel must exist"));
             assert!(channels.next().is_none(), "unexpected extra channel");
 
-            let (probe_handle, probe_mailbox) = if enable_state_sync {
-                let provider = ConstantProvider::new(TestScheme::verifier(
-                    &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
-                    output.players().clone(),
-                    output.public().clone(),
-                ));
-                let (probe, probe_mailbox) = Probe::new(ProbeConfig {
-                    context: context.child("probe"),
-                    provider,
-                    strategy: Sequential,
-                    capacity: NZUsize!(32),
-                    blocker: blocker.clone(),
-                    minimum_epoch: Epoch::zero(),
-                    retry_timeout: NZDuration!(Duration::from_millis(100)),
-                });
-                (Some(probe.start(probe_network)), Some(probe_mailbox))
-            } else {
-                (None, None)
-            };
-
-            let startup = if uses_state_sync {
+            let startup = if delayed {
                 StartupMode::StateSync
             } else {
                 StartupMode::MarshalSync
             };
-            let startup_mode = match &startup {
-                StartupMode::MarshalSync => "marshal_sync",
-                StartupMode::StateSync => "state_sync",
-            };
-            info!(
-                validator = %public_key,
-                %startup_mode,
-                "requested validator startup mode",
-            );
-
             let channels = Channels {
                 votes,
                 certificates,
@@ -284,15 +432,48 @@ impl EngineDefinition for TestEngineDefinition {
                 marshal_resolver,
                 state_resolver,
                 transaction_resolver,
+                committee_resolver,
+                dkg,
             };
-
-            let input =
-                StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
-            let reporter = HeightMonitorReporter::new(
-                public_key.clone(),
-                monitor,
-                TestReporter::new(restart_barrier.clone()),
-            );
+            let input = HeightTransactionSource::new(proposals);
+            let hook_context = context.child("finalized_hook");
+            let hook_key = public_key.clone();
+            let hook_processed = processed.clone();
+            let hook_holds = holds.clone();
+            let finalized_hook: FinalizedHookFn<
+                _,
+                Commitment,
+                TestHasher,
+                TestPublicKey,
+                Payload<MinSig, TestPrivateKey, Addresses<TestPublicKey>>,
+                Sequential,
+            > = Arc::new(move |block, _| {
+                let height = block.height().get();
+                let context = hook_context.child("block");
+                let public_key = hook_key.clone();
+                let processed = hook_processed.clone();
+                let holds = hook_holds.clone();
+                Box::pin(async move {
+                    processed.lock().insert(public_key.clone(), height);
+                    if height % TEST_EPOCH_LENGTH.get() == TEST_EPOCH_LENGTH.get() - 1 {
+                        warn!(validator = %public_key, height, "test engine finalized boundary");
+                    }
+                    loop {
+                        let held = holds
+                            .lock()
+                            .get(&public_key)
+                            .and_then(VecDeque::front)
+                            .is_some_and(|held| height >= *held);
+                        if !held {
+                            break;
+                        }
+                        context.sleep(Duration::from_millis(25)).await;
+                    }
+                })
+            });
+            let secret_path = secret_root.join(index.to_string());
+            let secret_store = crate::secret_store::FileSecretStore::load(&secret_path)
+                .expect("test secret store must initialize");
             let engine = Engine::<
                 _,
                 _,
@@ -304,7 +485,6 @@ impl EngineDefinition for TestEngineDefinition {
                 _,
                 _,
                 Ed25519Batch,
-                crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
             >::new(
                 context.child("engine"),
                 Config {
@@ -312,12 +492,12 @@ impl EngineDefinition for TestEngineDefinition {
                     manager,
                     blocker,
                     namespace: ENGINE_NAMESPACE.to_vec(),
-                    // Small: simulation state is tiny and large caches slow
-                    // deterministic runs.
-                    state_page_cache_bytes: 32 * 1024 * 1024,
-                    other_page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
+                    genesis,
+                    eligible_peers: eligible,
+                    secret_store,
+                    dkg_namespace: DKG_NAMESPACE,
                     input,
                     partition_prefix,
                     strategy: Sequential,
@@ -333,80 +513,74 @@ impl EngineDefinition for TestEngineDefinition {
                         update_channel_size: NZUsize!(256),
                         max_retained_roots: 32,
                     },
-                    prune_config: Some(PruneConfig {
-                        max_pending_acks: MAX_PENDING_ACKS,
-                        maintenance_interval: NZUsize!(16),
-                        retained_marshal_blocks,
-                        retained_qmdb_blocks: 0,
-                    }),
+                    prune_config: None,
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
-                    block_codec: Default::default(),
-                    prunable_items_per_section,
-                    probe: probe_mailbox.clone(),
-                    simplex_observer: None,
-                    finalized_hook: None,
+                    block_codec: constantinople_primitives::BlockCfg {
+                        max_transactions: commonware_codec::RangeCfg::new(0..=usize::MAX),
+                        payload: (
+                            NZU32!(64),
+                            commonware_cryptography::bls12381::primitives::sharing::ModeVersion::v0(
+                            ),
+                            commonware_codec::RangeCfg::new(0..=192),
+                        ),
+                    },
+                    prunable_items_per_section: NZU64!(4096),
+                    state_page_cache_bytes: 32 * 1024 * 1024,
+                    other_page_cache_bytes: 32 * 1024 * 1024,
+                    blocks_per_epoch: TEST_EPOCH_LENGTH,
+                    simplex_timeouts: crate::SimplexTimeouts {
+                        leader: Duration::from_secs(1),
+                        certification: Duration::from_secs(2),
+                        retry: Duration::from_millis(500),
+                        fetch: Duration::from_secs(2),
+                        skip: Duration::from_secs(5),
+                    },
+                    finalized_hook: Some(finalized_hook),
                 },
+                probe_network,
             )
             .await;
 
             let genesis_commitment = engine.genesis_commitment();
-            if let Some(expected) = genesis_commitments
-                .lock()
-                .insert(public_key.clone(), genesis_commitment)
-            {
-                assert_eq!(genesis_commitment, expected, "genesis changed on restart");
+            let marshal = engine.marshal_mailbox();
+            let committee = engine.subscribe_committee_detached();
+            let committee_cell = Arc::new(std::sync::OnceLock::new());
+            let reporter = MonitorReporter::new(public_key.clone(), monitor, TestReporter);
+            let engine_handle = engine.start(channels, Some(reporter));
+            if !delayed {
+                let stored_genesis = marshal
+                    .get_block(Identifier::Height(Height::zero()))
+                    .await
+                    .expect("marshal-sync engine must retain genesis");
+                assert_eq!(
+                    stored_genesis.commitment(),
+                    genesis_commitment,
+                    "engine genesis commitment must identify marshal genesis",
+                );
             }
 
-            let selected_sync_floor = engine.startup_sync_floor();
-            let marshal = engine.marshal_mailbox();
-            let restart_marshal = marshal.clone();
-            let engine_handle = engine.start(channels, Some(reporter));
-            let startup_sync_height = if let Some(finalization) = selected_sync_floor {
-                let block = marshal
-                    .subscribe_by_commitment(
-                        finalization.proposal.payload,
-                        CommitmentFallback::Wait,
-                    )
-                    .await
-                    .expect("state-sync floor block must be available");
-                let height = block.height().get();
-                sync_heights.lock().insert(public_key.clone(), height);
-                info!(validator = %public_key, height, "resolved state-sync floor block");
-                Some(height)
-            } else {
-                sync_heights.lock().get(&public_key).copied()
-            };
             if state_sender
                 .send(ValidatorState {
+                    public_key: public_key.clone(),
                     marshal,
-                    startup_sync_height,
+                    committee: committee_cell.clone(),
+                    processed,
+                    tracks,
                 })
                 .is_err()
             {
                 warn!(validator = %public_key, "validator state receiver dropped");
                 return;
             }
+            context
+                .child("committee_attacher")
+                .spawn(move |_| async move {
+                    let database = committee.await;
+                    let _ = committee_cell.set(database);
+                });
 
-            if is_restart {
-                let processed = restart_marshal
-                    .get_processed_height()
-                    .await
-                    .map_or(0, |height| height.get());
-                let barrier = restart_barrier.expect("restart barrier must exist");
-                barrier.observe_processed(processed);
-                barrier.release();
-            }
-            let engine_result = if let Some(probe_handle) = probe_handle {
-                let (probe_result, engine_result) = futures::join!(probe_handle, engine_handle);
-                if let Err(error) = probe_result {
-                    warn!(validator = %public_key, ?error, "probe exited");
-                }
-                engine_result
-            } else {
-                engine_handle.await
-            };
-            if let Err(error) = engine_result {
+            if let Err(error) = engine_handle.await {
                 warn!(validator = %public_key, ?error, "engine exited");
             }
         });
@@ -422,448 +596,6 @@ impl EngineDefinition for TestEngineDefinition {
     }
 }
 
-fn run_finalize(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .exit_condition(FinalizedHeightAtLeast::new(100))
-        .property(BlockAgreementAtHeight::new(100))
-        .run()
-        .unwrap();
-}
-
-fn run_determinism(engine: TestEngineDefinition) {
-    let seeds = 0..2;
-    let first = PlanBuilder::new(engine.clone())
-        .link(default_link())
-        .seeds(seeds.clone())
-        .exit_condition(FinalizedHeightAtLeast::new(20))
-        .property(BlockAgreementAtHeight::new(20))
-        .run()
-        .unwrap();
-    let second = PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(seeds.clone())
-        .exit_condition(FinalizedHeightAtLeast::new(20))
-        .property(BlockAgreementAtHeight::new(20))
-        .run()
-        .unwrap();
-
-    for (seed, (left, right)) in seeds.zip(first.iter().zip(second.iter())) {
-        assert_eq!(
-            left.state, right.state,
-            "seed {seed} produced different state"
-        );
-    }
-}
-
-fn run_crash_restart(engine: TestEngineDefinition) {
-    let validator = engine.participants()[0].clone();
-
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Schedule(
-            Schedule::new()
-                .at(Duration::from_millis(500), Action::Crash(validator.clone()))
-                .at(Duration::from_millis(1_000), Action::Restart(validator)),
-        ))
-        .exit_condition(FinalizedHeightAtLeast::new(50))
-        .property(BlockAgreementAtHeight::new(50))
-        .run()
-        .unwrap();
-}
-
-fn run_restart_with_archived_finalizations() {
-    let barrier = RestartBarrier::default();
-    let engine = TestEngineDefinition::new(NUM_VALIDATORS).with_restart_barrier(barrier.clone());
-    let validator = engine.participants()[0].clone();
-
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seed(0)
-        .crash(Crash::Schedule(
-            Schedule::new()
-                .at(
-                    Duration::from_millis(2_500),
-                    Action::Crash(validator.clone()),
-                )
-                .at(Duration::from_millis(5_000), Action::Restart(validator)),
-        ))
-        .timeout(Duration::from_secs(30))
-        .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
-        .property(RestartPreservesProcessedHeight::new(barrier))
-        .run()
-        .unwrap();
-}
-
-fn run_delayed_start(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Delay { count: 1, after: 5 })
-        .exit_condition(FinalizedHeightAtLeast::new(20))
-        .property(BlockAgreementAtHeight::new(20))
-        .run()
-        .unwrap();
-}
-
-fn run_state_sync(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .exit_condition(StateSyncReadyAtHeight::new(150))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::new(150))
-        .run()
-        .unwrap();
-}
-
-fn run_state_sync_deterministic(engine: TestEngineDefinition) {
-    let seeds = 0..2;
-    let first = PlanBuilder::new(engine.clone())
-        .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .exit_condition(StateSyncReadyAtHeight::new(150))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::new(150))
-        .run()
-        .unwrap();
-    let second = PlanBuilder::new(engine)
-        .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .exit_condition(StateSyncReadyAtHeight::new(150))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::new(150))
-        .run()
-        .unwrap();
-
-    for (seed, (left, right)) in seeds.zip(first.iter().zip(second.iter())) {
-        assert_eq!(
-            left.state, right.state,
-            "seed {seed} produced different state"
-        );
-    }
-}
-
-fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .crash(Crash::Random {
-            frequency: Duration::from_secs(3),
-            downtime: Duration::from_millis(500),
-            count: 1,
-        })
-        .exit_condition(StateSyncReadyAtHeight::new(200))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::at_least(200, 3))
-        .run()
-        .unwrap();
-}
-
-fn run_state_sync_lossy(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(lossy_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .exit_condition(StateSyncReadyAtHeight::new(150))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::at_least(150, 3))
-        .run()
-        .unwrap();
-}
-
-fn run_lossy(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(lossy_link())
-        .seeds(0..2)
-        .exit_condition(FinalizedHeightAtLeast::new(20))
-        .property(BlockAgreementAtHeight::new(20))
-        .run()
-        .unwrap();
-}
-
-fn run_random_crashes(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Random {
-            frequency: Duration::from_secs(2),
-            downtime: Duration::from_secs(1),
-            count: 1,
-        })
-        .exit_condition(FinalizedHeightAtLeast::new(50))
-        .property(BlockAgreementAtHeight::new(50))
-        .run()
-        .unwrap();
-}
-
-fn run_many_crashes(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Random {
-            frequency: Duration::from_secs(2),
-            downtime: Duration::from_millis(500),
-            count: 3,
-        })
-        .exit_condition(FinalizedHeightAtLeast::new(50))
-        .property(BlockAgreementAtHeight::new(50))
-        .run()
-        .unwrap();
-}
-
-fn run_total_shutdown(engine: TestEngineDefinition) {
-    // One deterministic full blackout: every validator crashes at once and
-    // restarts together. A fixed schedule guarantees the outage actually
-    // happens; `Crash::Random` cycles can miss the run entirely when the
-    // exit height finalizes before their first tick.
-    let mut schedule = Schedule::new();
-    let participants = engine.participants();
-    for participant in participants.iter().cloned() {
-        schedule = schedule.at(Duration::from_secs(3), Action::Crash(participant));
-    }
-    for participant in participants.iter().cloned() {
-        schedule = schedule.at(Duration::from_millis(3_300), Action::Restart(participant));
-    }
-
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..3)
-        .crash(Crash::Schedule(schedule))
-        .timeout(Duration::from_secs(90))
-        .exit_condition(FinalizedHeightAtLeast::new(100))
-        .property(BlockAgreementAtHeight::new(100))
-        .run()
-        .unwrap();
-}
-
-fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
-    let delayed = engine.participants().first().cloned().unwrap();
-
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .crash(Crash::Schedule(
-            Schedule::new()
-                .at(Duration::from_millis(9_000), Action::Crash(delayed.clone()))
-                .at(Duration::from_millis(11_000), Action::Restart(delayed)),
-        ))
-        .exit_condition(StateSyncReadyAtHeight::new(180))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::at_least(180, 3))
-        .run()
-        .unwrap();
-}
-
-fn run_rapid_crashes(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Random {
-            frequency: Duration::from_millis(750),
-            downtime: Duration::from_millis(250),
-            count: 1,
-        })
-        .exit_condition(FinalizedHeightAtLeast::new(40))
-        .property(BlockAgreementAtHeight::new(40))
-        .run()
-        .unwrap();
-}
-
-fn run_network_partition(engine: TestEngineDefinition) {
-    let participants = engine.participants();
-    let isolated = participants[0].clone();
-    let good_link = default_link();
-    let dead_link = Link {
-        latency: Duration::from_secs(1),
-        jitter: Duration::ZERO,
-        success_rate: 0.0,
-    };
-    let mut schedule = Schedule::new();
-    for peer in &participants[1..] {
-        schedule = schedule
-            .at(
-                Duration::from_millis(500),
-                Action::UpdateLink {
-                    from: isolated.clone(),
-                    to: peer.clone(),
-                    link: dead_link.clone(),
-                },
-            )
-            .at(
-                Duration::from_millis(500),
-                Action::UpdateLink {
-                    from: peer.clone(),
-                    to: isolated.clone(),
-                    link: dead_link.clone(),
-                },
-            );
-    }
-    schedule = schedule.at(Duration::from_secs(2), Action::Heal(good_link));
-
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Schedule(schedule))
-        .exit_condition(FinalizedHeightAtLeast::new(40))
-        .property(BlockAgreementAtHeight::at_least(40, 3))
-        .run()
-        .unwrap();
-}
-
-fn run_secondaries_sync(engine: TestEngineDefinition) {
-    // Every node (primary and secondary) must reach height 40 and agree on the
-    // block at that height. `FinalizedHeightAtLeast` polls per-node state and
-    // requires `target_count == participants.len()` to have the block, so
-    // secondaries falling behind will cause the exit condition never to fire.
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .exit_condition(FinalizedHeightAtLeast::new(40))
-        .property(BlockAgreementAtHeight::new(40))
-        .run()
-        .unwrap();
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn all_validators_finalize_and_commit() {
-    run_finalize(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn deterministic_across_seeds() {
-    run_determinism(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn restart_preserves_genesis_after_pruning() {
-    run_crash_restart(TestEngineDefinition::new(NUM_VALIDATORS).with_aggressive_pruning());
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn restart_replays_finalizations_archived_before_acknowledgement() {
-    run_restart_with_archived_finalizations();
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn delayed_start_one_validator() {
-    run_delayed_start(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn state_sync_hands_off_to_marshal() {
-    run_state_sync(TestEngineDefinition::new(NUM_VALIDATORS).with_state_sync());
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn state_sync_deterministic() {
-    run_state_sync_deterministic(TestEngineDefinition::new(NUM_VALIDATORS).with_state_sync());
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn state_sync_random_crashes() {
-    run_state_sync_random_crashes(TestEngineDefinition::new(NUM_VALIDATORS).with_state_sync());
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn state_sync_lossy_network() {
-    run_state_sync_lossy(TestEngineDefinition::new(NUM_VALIDATORS).with_state_sync());
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn lossy_network() {
-    run_lossy(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn random_crashes() {
-    run_random_crashes(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn many_concurrent_crashes() {
-    run_many_crashes(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn full_cluster_outage_and_recovery() {
-    run_total_shutdown(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn state_sync_crash_during_sync() {
-    run_state_sync_crash_during_sync(TestEngineDefinition::new(NUM_VALIDATORS).with_state_sync());
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn rapid_crashes() {
-    run_rapid_crashes(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn network_partition_and_rejoin() {
-    run_network_partition(TestEngineDefinition::new(NUM_VALIDATORS));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn secondaries_sync_with_primaries() {
-    run_secondaries_sync(TestEngineDefinition::new(NUM_VALIDATORS).with_secondaries(2));
-}
-
-#[test_group("slow")]
-#[test_traced("DEBUG")]
-fn secondaries_sync_with_discovery_split() {
-    run_secondaries_sync(
-        TestEngineDefinition::new(NUM_VALIDATORS)
-            .with_secondaries(2)
-            .with_discovery_split(),
-    );
+pub(crate) fn plan(engine: TestEngineDefinition) -> plan::Plan {
+    plan::Plan::new(engine)
 }

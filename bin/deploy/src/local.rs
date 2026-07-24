@@ -56,7 +56,7 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
         &output_dir,
         args,
         local,
-        &material.primary_hex(),
+        &[],
         &material.simplex_verification_material_hex(),
     );
 }
@@ -215,11 +215,12 @@ fn build_secondaries(
 
 fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> RelayerConfig {
     let leaders = material
-        .primary_hex()
-        .into_iter()
+        .public_keys
+        .iter()
+        .chain(&material.secondary_public_keys)
         .enumerate()
         .map(|(index, public_key)| RelayerLeaderConfig {
-            public_key,
+            public_key: hex(&public_key.encode()),
             url: format!(
                 "http://127.0.0.1:{}",
                 local
@@ -350,13 +351,15 @@ fn local_run_commands(
     }
 
     if args.spammer {
-        let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
-        let network_source = format!(
-            "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
-            relayer_port, args.validators, targets,
+        let mut network_source = format!(
+            "--relayer-url http://127.0.0.1:{} --relayer-submitters {}",
+            relayer_port, args.validators,
         );
+        if !relayer_targets.is_empty() {
+            network_source.push_str(&format!(" --relayer-targets {}", relayer_targets.join(",")));
+        }
 
         // Place the spammer's metrics port past the primary and secondary ranges
         // so it does not collide with any validator on the loopback host.
@@ -401,6 +404,8 @@ mod tests {
         default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
         generate_local_cluster_material, total_secondaries,
     };
+    use commonware_codec::Encode as _;
+    use commonware_formatting::hex;
     use std::path::{Path, PathBuf};
 
     const TEST_SIMPLEX_VERIFICATION_MATERIAL: &str = "abcdef";
@@ -484,6 +489,7 @@ mod tests {
         assert!(commands[3].contains("constantinople-spammer"));
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
         assert!(commands[3].contains("--relayer-submitters 2"));
+        assert!(!commands[3].contains("--relayer-targets"));
         assert!(commands[3].contains("--accounts 10"));
         assert!(commands[3].contains("--value 1"));
         assert!(commands[3].contains("--seed-offset 1000"));
@@ -506,6 +512,33 @@ mod tests {
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople"));
         assert!(commands[2].contains("secondary-0.yaml"));
+    }
+
+    #[test]
+    fn local_relayer_catalog_covers_every_eligible_validator() {
+        let mut args = test_args(false);
+        args.relayer = true;
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let config = super::local_relayer_config(local_args(&args), &material);
+        let expected = material
+            .public_keys
+            .iter()
+            .chain(&material.secondary_public_keys)
+            .enumerate()
+            .map(|(index, public_key)| {
+                (
+                    hex(&public_key.encode()),
+                    format!("http://127.0.0.1:{}", 8080 + index),
+                )
+            })
+            .collect::<Vec<_>>();
+        let actual = config
+            .leaders
+            .into_iter()
+            .map(|leader| (leader.public_key, leader.url))
+            .collect::<Vec<_>>();
+
+        assert_eq!(actual, expected);
     }
 
     #[test]

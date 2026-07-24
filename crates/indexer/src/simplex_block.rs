@@ -4,9 +4,12 @@ use commonware_consensus::types::coding::Commitment;
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_primitives::{Block, BlockCfg, Header, LazySignedTransaction, Sealed};
 
+type SimplexBlock<H, P, R> = Sealed<Block<Commitment, P, H, R>, H>;
+type SimplexHeader<H, P, R> = Sealed<Header<Commitment, <H as Hasher>::Digest, P, R>, H>;
+
 pub(crate) fn encode_simplex_block_parts<H, P, R>(
-    block: &Sealed<Block<Commitment, P, H, R>, H>,
-) -> (Sealed<Header<Commitment, H::Digest, P, R>, H>, Bytes)
+    block: &SimplexBlock<H, P, R>,
+) -> (SimplexHeader<H, P, R>, Bytes)
 where
     H: Hasher,
     P: PublicKey,
@@ -18,10 +21,10 @@ where
 }
 
 pub(crate) fn decode_simplex_block_parts<H, P, R, RCfg>(
-    header: Sealed<Header<Commitment, H::Digest, P, R>, H>,
+    header: SimplexHeader<H, P, R>,
     body: Bytes,
     cfg: &BlockCfg<RCfg>,
-) -> Result<Sealed<Block<Commitment, P, H, R>, H>, commonware_codec::Error>
+) -> Result<SimplexBlock<H, P, R>, commonware_codec::Error>
 where
     H: Hasher,
     P: PublicKey,

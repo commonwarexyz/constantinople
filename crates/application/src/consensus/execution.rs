@@ -212,6 +212,7 @@ where
         mut batch: CommitteeBatch<E, H, EightCap, S>,
         height: u64,
         initial: &Committee,
+        initial_next: &Committee,
         blocks_per_epoch: u64,
     ) -> Self {
         let epoch = Epoch::new(height / blocks_per_epoch);
@@ -222,7 +223,7 @@ where
                 .expect("genesis committee state read must succeed")
                 .is_none()
         {
-            batch = super::committee::seed_committees(batch, initial.clone());
+            batch = super::committee::seed_committees(batch, initial.clone(), initial_next.clone());
         }
         let entering_epoch = epoch.next();
         let entering = match batch
@@ -248,10 +249,7 @@ where
             .get(&target)
             .await
             .expect("committee target read must succeed");
-        let committee = match direct.clone() {
-            Some(committee) => committee,
-            None => entering.clone(),
-        };
+        let committee = direct.clone().unwrap_or_else(|| entering.clone());
         let final_block = height % blocks_per_epoch == blocks_per_epoch - 1;
         Self {
             batch,
@@ -541,7 +539,10 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// concurrently with the state merkleize inside `finalize_child` (chunked
 /// appends fold to exactly the accepted digests in block order). An empty
 /// selection proposes an empty block so an idle chain keeps making progress.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "proposal execution coordinates all stateful databases and mempool refill state"
+)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S, I, R>(
     strategy: S,
@@ -556,6 +557,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I, R>(
     candidates: Vec<SignedTransaction<H>>,
     input: &mut I,
     initial_committee: &Committee,
+    initial_next_committee: &Committee,
     eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     blocks_per_epoch: u64,
 ) -> ProposalExecution<E, H, S>
@@ -577,6 +579,7 @@ where
         committee_batch,
         parent_header.height + 1,
         initial_committee,
+        initial_next_committee,
         blocks_per_epoch,
     )
     .await;
@@ -684,12 +687,12 @@ where
                                 let Some((action, digest)) = prepared else {
                                     continue;
                                 };
-                                let committee_update = match action.committee.as_ref() {
-                                    Some(mutation) => committee_execution
-                                        .updated(mutation, &eligible_committee_members)
-                                        .map(Some),
-                                    None => Some(None),
-                                };
+                                let committee_update =
+                                    action.committee.as_ref().map_or(Some(None), |mutation| {
+                                        committee_execution
+                                            .updated(mutation, &eligible_committee_members)
+                                            .map(Some)
+                                    });
                                 let applied = committee_update.is_some()
                                     && selector.apply_one(&action.account);
                                 if applied {
@@ -799,6 +802,10 @@ where
 }
 
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "execution coordinates the three stateful databases and committee policy"
+)]
 pub(super) async fn execute_body<E, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
@@ -808,6 +815,7 @@ pub(super) async fn execute_body<E, H, S>(
     height: u64,
     body: PreparedBody<H>,
     initial_committee: &Committee,
+    initial_next_committee: &Committee,
     eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
@@ -826,6 +834,7 @@ where
         committee_batch,
         height,
         initial_committee,
+        initial_next_committee,
         blocks_per_epoch,
     )
     .await;
@@ -873,6 +882,10 @@ where
 }
 
 #[tracing::instrument(name = "application.apply.body", level = "info", skip_all)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "certified replay coordinates the three stateful databases and committee policy"
+)]
 pub(super) async fn apply_prepared_body<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
@@ -883,6 +896,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     digests: Vec<H::Digest>,
     strategy: S,
     initial_committee: &Committee,
+    initial_next_committee: &Committee,
     eligible_committee_members: &Set<ed25519::PublicKey>,
     blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
@@ -895,6 +909,7 @@ where
         committee_batch,
         height,
         initial_committee,
+        initial_next_committee,
         blocks_per_epoch,
     )
     .await;
@@ -982,6 +997,10 @@ where
 /// append can overlap the state merkleize; callers holding a finished batch
 /// pass it via [`ready`].
 #[tracing::instrument(name = "application.execute.finalize", level = "info", skip_all)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "finalization carries the staged state for all committed databases"
+)]
 async fn finalize_child<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,

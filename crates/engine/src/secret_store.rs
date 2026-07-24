@@ -126,7 +126,12 @@ impl SecretStore for FileSecretStore {
 
     async fn get_share(&mut self, epoch: Epoch) -> Option<Share> {
         let bytes = read_optional(&self.share_path(epoch)).expect("failed to read DKG share")?;
-        Share::decode(bytes.as_slice()).ok()
+        Some(Share::decode(bytes.as_slice()).unwrap_or_else(|error| {
+            panic!(
+                "corrupt persisted DKG share for epoch {}: {error}",
+                epoch.get()
+            )
+        }))
     }
 
     async fn put_seed(&mut self, epoch: Epoch, seed: Summary) {
@@ -137,7 +142,12 @@ impl SecretStore for FileSecretStore {
     async fn get_seed(&mut self, epoch: Epoch) -> Option<Summary> {
         let bytes =
             read_optional(&self.seed_path(epoch)).expect("failed to read DKG dealer seed")?;
-        Summary::decode(bytes.as_slice()).ok()
+        Some(Summary::decode(bytes.as_slice()).unwrap_or_else(|error| {
+            panic!(
+                "corrupt persisted DKG dealer seed for epoch {}: {error}",
+                epoch.get()
+            )
+        }))
     }
 
     async fn put_dealing<P: PublicKey>(&mut self, epoch: Epoch, dealer: P, private: DealerPrivMsg) {
@@ -156,7 +166,14 @@ impl SecretStore for FileSecretStore {
     ) -> Option<DealerPrivMsg> {
         let bytes = read_optional(&self.dealing_path(epoch, dealer))
             .expect("failed to read private DKG dealing")?;
-        DealerPrivMsg::decode(bytes.as_slice()).ok()
+        Some(
+            DealerPrivMsg::decode(bytes.as_slice()).unwrap_or_else(|error| {
+                panic!(
+                    "corrupt persisted private DKG dealing for epoch {}: {error}",
+                    epoch.get()
+                )
+            }),
+        )
     }
 
     async fn prune(&mut self, min: Epoch) {
@@ -366,6 +383,19 @@ mod tests {
         (share, dealer_seed, dealer, dealing)
     }
 
+    fn assert_corruption_panic(result: std::thread::Result<()>, expected_message: &str) {
+        let panic = result.expect_err("malformed persisted secret must panic");
+        let message = panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("corruption panic should contain a string message");
+        assert!(
+            message.contains(expected_message),
+            "unexpected corruption panic: {message}"
+        );
+    }
+
     #[test]
     fn round_trips_share_seed_and_dealing() {
         let directory = TestDirectory::new();
@@ -410,6 +440,44 @@ mod tests {
             assert_eq!(restarted.get_seed(epoch).await, Some(seed));
             assert_eq!(restarted.get_dealing(epoch, &dealer).await, Some(dealing));
         });
+    }
+
+    #[test]
+    fn malformed_persisted_material_panics_instead_of_appearing_absent() {
+        let directory = TestDirectory::new();
+        let mut store = FileSecretStore::load(directory.store_path()).unwrap();
+        let epoch = Epoch::new(10);
+        let (share, seed, dealer, dealing) = materials(8);
+
+        block_on(async {
+            store.put_share(epoch, share).await;
+            store.put_seed(epoch, seed).await;
+            store.put_dealing(epoch, dealer.clone(), dealing).await;
+        });
+
+        fs::write(store.share_path(epoch), [0xff]).unwrap();
+        assert_corruption_panic(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = block_on(store.get_share(epoch));
+            })),
+            "corrupt persisted DKG share for epoch 10",
+        );
+
+        fs::write(store.seed_path(epoch), [0xff]).unwrap();
+        assert_corruption_panic(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = block_on(store.get_seed(epoch));
+            })),
+            "corrupt persisted DKG dealer seed for epoch 10",
+        );
+
+        fs::write(store.dealing_path(epoch, &dealer), [0xff]).unwrap();
+        assert_corruption_panic(
+            catch_unwind(AssertUnwindSafe(|| {
+                let _ = block_on(store.get_dealing(epoch, &dealer));
+            })),
+            "corrupt persisted private DKG dealing for epoch 10",
+        );
     }
 
     #[test]

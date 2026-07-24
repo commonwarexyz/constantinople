@@ -18,10 +18,7 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::full::Config as MmrConfig,
-    qmdb::{
-        any::{FixedConfig, VariableConfig},
-        keyless::fixed as keyless_fixed,
-    },
+    qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, ordered::Set};
@@ -88,11 +85,8 @@ fn transaction_config(strategy: Rayon, cache: &CacheRef) -> keyless_fixed::Compa
     }
 }
 
-fn committee_config(
-    strategy: Rayon,
-    cache: &CacheRef,
-) -> VariableConfig<EightCap, ((), ()), Rayon> {
-    VariableConfig {
+fn committee_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayon> {
+    FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: "finalize-committee-journal".into(),
             metadata_partition: "finalize-committee-metadata".into(),
@@ -101,11 +95,9 @@ fn committee_config(
             strategy,
             page_cache: cache.clone(),
         },
-        journal_config: VariableJournalConfig {
+        journal_config: FixedJournalConfig {
             partition: "finalize-committee-log".into(),
-            items_per_section: NZU64!(1 << 16),
-            compression: None,
-            codec_config: ((), ()),
+            items_per_blob: NZU64!(1 << 16),
             page_cache: cache.clone(),
             write_buffer: NZUsize!(1 << 20),
         },
@@ -166,11 +158,11 @@ fn main() {
                 ed25519::PrivateKey::from_seed(1).public_key()
             ]))
             .expect("genesis committee");
-            let committee = seed_committees(committee_batch, genesis)
+            let committee = seed_committees(committee_batch, genesis.clone(), genesis)
                 .merkleize()
                 .await
                 .expect("seed committee");
-            dbs.finalize((state, transactions, committee)).await;
+            Box::pin(dbs.finalize((state, transactions, committee))).await;
 
             let transfers = Arc::new(transfers());
             let digests: Vec<_> = (0..TXS as u64)

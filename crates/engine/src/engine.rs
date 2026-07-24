@@ -9,7 +9,7 @@
 //! - the orchestrator starts one simplex actor per 1024-block epoch
 
 use crate::{CommitteeParticipants, DynamicProvider, Registrar, types::*};
-use commonware_codec::{RangeCfg, Read};
+use commonware_codec::{Encode as _, RangeCfg, Read};
 use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporter, Reporters,
@@ -67,8 +67,7 @@ use commonware_utils::{
     NZDuration, NZU16, NZU32, NZU64, NZUsize, non_empty_range, ordered::Map, union,
 };
 use constantinople_application::consensus::{
-    Application, Committee, CommitteeSyncTarget, FinalizedHookFn, StateSyncTarget,
-    TransactionHistoryTarget,
+    Application, CommitteeSyncTarget, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::PublicKeyCache;
@@ -104,6 +103,42 @@ const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
+const ELIGIBLE_PEERS_DOMAIN: &[u8] = b"constantinople/eligible-peers/v1";
+
+/// Local Simplex timing policy used by each epoch actor.
+#[derive(Clone, Copy, Debug)]
+pub struct SimplexTimeouts {
+    /// Time to wait for the current leader to propose a block.
+    pub leader: Duration,
+    /// Time to wait for a proposal to become certified.
+    pub certification: Duration,
+    /// Delay before retrying a failed consensus action.
+    pub retry: Duration,
+    /// Time to wait while fetching missing consensus data.
+    pub fetch: Duration,
+    /// Time to wait before advancing past an inactive view.
+    pub skip: Duration,
+}
+
+impl Default for SimplexTimeouts {
+    fn default() -> Self {
+        Self {
+            leader: Duration::from_secs(4),
+            certification: Duration::from_secs(8),
+            retry: Duration::from_secs(10),
+            fetch: Duration::from_secs(4),
+            skip: Duration::from_secs(11),
+        }
+    }
+}
+
+fn eligible_peers_root<H, P>(eligible_peers: &Map<P, Address>) -> H::Digest
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    H::hash(&[ELIGIBLE_PEERS_DOMAIN, &eligible_peers.encode()])
+}
 
 /// Vote channel id.
 pub const VOTE_CHANNEL: u64 = 0;
@@ -172,7 +207,7 @@ pub enum StartupMode {
     StateSync,
 }
 
-pub struct Config<E, C, M, B, V, St, I, H, O>
+pub struct Config<E, C, M, B, V, St, I, H>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     C: Signer<PublicKey = ed25519::PublicKey>,
@@ -181,7 +216,6 @@ where
     V: Variant,
     St: Strategy,
     H: Hasher,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
 {
     pub signer: C,
     pub manager: M,
@@ -211,6 +245,8 @@ where
     /// deterministic actor-level tests exercise several resharing boundaries
     /// without finalizing thousands of blocks.
     pub blocks_per_epoch: NonZero<u64>,
+    /// Local liveness timings for each epoch's Simplex actor.
+    pub simplex_timeouts: SimplexTimeouts,
     pub sync_config: SyncEngineConfig,
     pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
@@ -228,12 +264,6 @@ where
     /// from the state cache so backfill and replay scans cannot evict its
     /// working set.
     pub other_page_cache_bytes: usize,
-    /// Optional external observer for finalized simplex certificates.
-    ///
-    /// The DKG orchestrator installs marshal as each epoch's simplex reporter.
-    /// The engine recreates finalization activity for this observer from
-    /// marshal's ordered finalized-block stream.
-    pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
     #[expect(
@@ -253,7 +283,7 @@ where
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
+pub struct Engine<E, C, M, B, H, V, L, St, I, BV>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer<PublicKey = ed25519::PublicKey>,
@@ -265,7 +295,6 @@ where
     St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
     EngineBlock<H, C, V>: ReshareBlock<Variant = V, Signer = C, Directory = network::Addresses<C::PublicKey>>
         + Digestible<Digest = H::Digest>
         + Read<Cfg = EngineBlockCfg<C, V>>,
@@ -301,32 +330,16 @@ where
         FixedEpocher,
         St,
     >,
-    #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C, V>,
-    #[cfg(all(test, feature = "test-utils"))]
-    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V>>,
     #[cfg(all(test, feature = "test-utils"))]
     genesis_commitment: Commitment,
     reshare: DkgReshareActor<E, M, B, H, V, C, St, BV>,
     reshare_mailbox: reshare::Mailbox<EngineBlock<H, C, V>, V, C>,
     orchestrator: DkgOrchestratorActor<E, M, B, H, V, C, L, St, I>,
     orchestrator_mailbox: orchestrator::Mailbox<EngineBlock<H, C, V>>,
-    #[expect(
-        clippy::type_complexity,
-        reason = "the compatibility actor carries the engine's marshal variant"
-    )]
-    simplex_observer: Option<
-        crate::simplex_observer::Actor<
-            E,
-            ThresholdScheme<C::PublicKey, V>,
-            EngineVariant<H, C, V>,
-            O,
-        >,
-    >,
-    simplex_observer_mailbox: Option<crate::simplex_observer::Mailbox<EngineBlock<H, C, V>>>,
 }
 
-impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
+impl<E, C, M, B, H, V, L, St, I, BV> Engine<E, C, M, B, H, V, L, St, I, BV>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer<PublicKey = ed25519::PublicKey>,
@@ -338,20 +351,17 @@ where
     St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
     EngineBlock<H, C, V>: ReshareBlock<Variant = V, Signer = C, Directory = network::Addresses<C::PublicKey>>
         + Digestible<Digest = H::Digest>
         + Read<Cfg = EngineBlockCfg<C, V>>,
     CodingBlock<H, C, V>: Digestible<Digest = H::Digest>,
 {
-    #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C, V> {
+    /// Returns a clone of the marshal mailbox.
+    ///
+    /// Callers may use this before [`start`](Self::start) to wire reporters
+    /// that need access to finalized blocks or certificates.
+    pub fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C, V> {
         self.marshal_mailbox.clone()
-    }
-
-    #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V>> {
-        self.startup_sync_floor.clone()
     }
 
     #[cfg(all(test, feature = "test-utils"))]
@@ -397,7 +407,7 @@ where
     #[boxed]
     pub async fn new<Sx, Rx>(
         context: E,
-        config: Config<E, C, M, B, V, St, I, H, O>,
+        config: Config<E, C, M, B, V, St, I, H>,
         dkg_probe_network: (Sx, Rx),
     ) -> Self
     where
@@ -417,6 +427,7 @@ where
                 .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
+        let eligible_peers_root = eligible_peers_root::<H, C::PublicKey>(&config.eligible_peers);
         let epocher = FixedEpocher::new(config.blocks_per_epoch);
         let mut secret_store = config.secret_store.clone();
         if let Some(share) = config.share.clone() {
@@ -574,7 +585,8 @@ where
         };
 
         // The canonical genesis is a pure function of configuration: the leader, the
-        // participant-derived coding config, and the canonical empty-database roots.
+        // participant-derived coding config, immutable eligible peer catalog, and the
+        // canonical empty-database roots.
         let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
             &mut H::default(),
             config.genesis_leader.clone(),
@@ -585,6 +597,7 @@ where
             <constantinople_application::consensus::CommitteeDb<E, H, EightCap, St> as ManagedDb<
                 E,
             >>::initial_sync_target(),
+            eligible_peers_root,
             Payload::EpochInfo(config.genesis.clone()),
         );
         let coded_genesis =
@@ -597,8 +610,6 @@ where
             application_committee_target,
         ) = block_targets(&application_genesis);
 
-        #[cfg(all(test, feature = "test-utils"))]
-        let startup_sync_floor = startup_plan.floor().cloned();
         #[cfg(all(test, feature = "test-utils"))]
         let genesis_commitment = coded_genesis.commitment();
         let marshal_start = startup_plan.marshal_start(coded_genesis);
@@ -655,9 +666,8 @@ where
             application_transactions_target,
             application_committee_target,
             config.genesis.clone(),
+            eligible_peers_root,
             config.blocks_per_epoch,
-            Committee::new(config.genesis.players.clone())
-                .expect("genesis participants must form a valid committee"),
             config.eligible_peers.keys().clone(),
             config.finalized_hook,
         );
@@ -783,13 +793,13 @@ where
                         config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()),
                     )
                     .expect("simplex page cache must hold at least one page"),
-                    leader_timeout: Duration::from_secs(4),
-                    certification_timeout: Duration::from_secs(8),
-                    timeout_retry: Duration::from_secs(10),
-                    fetch_timeout: Duration::from_secs(4),
+                    leader_timeout: config.simplex_timeouts.leader,
+                    certification_timeout: config.simplex_timeouts.certification,
+                    timeout_retry: config.simplex_timeouts.retry,
+                    fetch_timeout: config.simplex_timeouts.fetch,
                     fetch_concurrent: NZUsize!(32),
                     view_retention: ACTIVITY_TIMEOUT,
-                    skip_timeout: Duration::from_secs(11),
+                    skip_timeout: config.simplex_timeouts.skip,
                     forwarding: simplex::ForwardingPolicy::Disabled,
                 },
                 gate,
@@ -800,19 +810,6 @@ where
                 partition_prefix: format!("{}_orchestrator", config.partition_prefix),
             },
         );
-        let (simplex_observer, simplex_observer_mailbox) = config.simplex_observer.map_or_else(
-            || (None, None),
-            |observer| {
-                let (actor, mailbox) = crate::simplex_observer::Actor::new(
-                    context.child("simplex_observer"),
-                    marshal_mailbox.clone(),
-                    observer,
-                    MAILBOX_SIZE,
-                );
-                (Some(actor), Some(mailbox))
-            },
-        );
-
         Self {
             context: ContextCell::new(context),
             signer: config.signer,
@@ -827,18 +824,13 @@ where
             shards,
             shard_mailbox,
             marshal,
-            #[cfg(all(test, feature = "test-utils"))]
             marshal_mailbox,
-            #[cfg(all(test, feature = "test-utils"))]
-            startup_sync_floor,
             #[cfg(all(test, feature = "test-utils"))]
             genesis_commitment,
             reshare: reshare_actor,
             reshare_mailbox,
             orchestrator: orchestrator_actor,
             orchestrator_mailbox,
-            simplex_observer,
-            simplex_observer_mailbox,
         }
     }
 
@@ -891,28 +883,6 @@ where
         let orchestrator_handle =
             self.orchestrator
                 .start(channels.votes, channels.certificates, channels.resolver);
-        let simplex_observer_handle = self
-            .simplex_observer
-            .map(crate::simplex_observer::Actor::start);
-
-        // Avoid constructing an always-present empty `Reporters`: cloning an
-        // `Update::Block` for such a branch would clone and then cancel its
-        // acknowledgement when the empty branch drops it.
-        #[expect(
-            clippy::type_complexity,
-            reason = "the annotation selects the Option/Option Reporters constructor"
-        )]
-        let supplemental_reporters: Option<
-            Reporters<
-                Update<EngineBlock<H, C, V>>,
-                crate::simplex_observer::Mailbox<EngineBlock<H, C, V>>,
-                Rep,
-            >,
-        > = if self.simplex_observer_mailbox.is_some() || reporter.is_some() {
-            Some(Reporters::from((self.simplex_observer_mailbox, reporter)))
-        } else {
-            None
-        };
         #[expect(
             clippy::type_complexity,
             reason = "the annotation selects the reporter/Option Reporters constructor"
@@ -920,12 +890,8 @@ where
         let reshare_reporters: Reporters<
             Update<EngineBlock<H, C, V>>,
             reshare::Mailbox<EngineBlock<H, C, V>, V, C>,
-            Reporters<
-                Update<EngineBlock<H, C, V>>,
-                crate::simplex_observer::Mailbox<EngineBlock<H, C, V>>,
-                Rep,
-            >,
-        > = Reporters::from((self.reshare_mailbox, supplemental_reporters));
+            Rep,
+        > = Reporters::from((self.reshare_mailbox, reporter));
         let reporters = Reporters::from((
             self.stateful_mailbox,
             Reporters::from((self.orchestrator_mailbox, reshare_reporters)),
@@ -934,7 +900,7 @@ where
             .marshal
             .start(reporters, self.shard_mailbox, marshal_resolver);
 
-        let mut handles = vec![
+        let handles = vec![
             probe_handle,
             state_resolver_handle,
             transaction_resolver_handle,
@@ -945,10 +911,6 @@ where
             orchestrator_handle,
             marshal_handle,
         ];
-        if let Some(handle) = simplex_observer_handle {
-            handles.push(handle);
-        }
-
         if let Err(error) = try_join_all(handles).await {
             error!(?error, "engine task failed");
         } else {
@@ -976,13 +938,13 @@ where
     }
 }
 
-fn block_targets<H, C, V>(
-    block: &EngineBlock<H, C, V>,
-) -> (
-    StateSyncTarget<H::Digest>,
-    TransactionHistoryTarget<H::Digest>,
-    CommitteeSyncTarget<H::Digest>,
-)
+type BlockTargets<D> = (
+    StateSyncTarget<D>,
+    TransactionHistoryTarget<D>,
+    CommitteeSyncTarget<D>,
+);
+
+fn block_targets<H, C, V>(block: &EngineBlock<H, C, V>) -> BlockTargets<H::Digest>
 where
     H: Hasher,
     C: Signer,
@@ -1158,5 +1120,42 @@ where
         init_cache_size: Some(STATE_INIT_CACHE_SIZE),
         init_buffer: NZUsize!(1 << 21),
         init_concurrency: (),
+    }
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use super::eligible_peers_root;
+    use commonware_cryptography::{Signer as _, ed25519, sha256};
+    use commonware_p2p::Address;
+    use commonware_utils::ordered::Map;
+    use std::net::SocketAddr;
+
+    fn address(port: u16) -> Address {
+        format!("127.0.0.1:{port}")
+            .parse::<SocketAddr>()
+            .unwrap()
+            .into()
+    }
+
+    #[test]
+    fn eligible_peers_root_is_canonical_and_commits_keys_and_addresses() {
+        let a = ed25519::PrivateKey::from_seed(1).public_key();
+        let b = ed25519::PrivateKey::from_seed(2).public_key();
+        let canonical =
+            Map::try_from([(a.clone(), address(1001)), (b.clone(), address(1002))]).unwrap();
+        let reordered =
+            Map::try_from([(b.clone(), address(1002)), (a.clone(), address(1001))]).unwrap();
+        let changed_address =
+            Map::try_from([(b.clone(), address(1003)), (a, address(1001))]).unwrap();
+        let changed_key = Map::try_from([(b, address(1002))]).unwrap();
+
+        let root = eligible_peers_root::<sha256::Sha256, _>(&canonical);
+        assert_eq!(root, eligible_peers_root::<sha256::Sha256, _>(&reordered));
+        assert_ne!(
+            root,
+            eligible_peers_root::<sha256::Sha256, _>(&changed_address)
+        );
+        assert_ne!(root, eligible_peers_root::<sha256::Sha256, _>(&changed_key));
     }
 }

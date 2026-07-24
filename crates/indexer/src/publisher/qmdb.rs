@@ -2413,7 +2413,7 @@ mod tests {
             let databases =
                 test_application_databases(context.child("application"), "root-match").await;
 
-            let first = build_and_commit_application_block(
+            let first = Box::pin(build_and_commit_application_block(
                 &databases,
                 None,
                 1,
@@ -2434,7 +2434,7 @@ mod tests {
                     ),
                 ],
                 vec![signed_transaction(1, 0), signed_transaction(2, 0)],
-            )
+            ))
             .await;
             publish_block_and_assert_roots(
                 context.child("first"),
@@ -2446,7 +2446,7 @@ mod tests {
             .await;
             assert_transaction_append_locations_match_block(&client, &first).await;
 
-            let second = build_and_commit_application_block(
+            let second = Box::pin(build_and_commit_application_block(
                 &databases,
                 Some(&first),
                 2,
@@ -2467,7 +2467,7 @@ mod tests {
                     ),
                 ],
                 vec![signed_transaction(3, 1)],
-            )
+            ))
             .await;
             publish_block_and_assert_roots(
                 context.child("second"),
@@ -2701,6 +2701,7 @@ mod tests {
             transactions_range,
             committee_root,
             committee_range,
+            eligible_peers_root: Sha256Digest::EMPTY,
             payload: None,
         };
         Block::new(header, transactions).seal(&mut Sha256::default())
@@ -2977,6 +2978,7 @@ mod tests {
             transactions_range: non_empty_range!(0, 2),
             committee_root: Sha256Digest::EMPTY,
             committee_range: non_empty_range!(0, 2),
+            eligible_peers_root: Sha256Digest::EMPTY,
             payload: None,
         };
         let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())

@@ -8,11 +8,10 @@
 
 use ahash::AHashMap;
 use bytes::Buf;
-use commonware_actor::Feedback;
 use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::{
-    Block, Heightable, Reporter,
-    simplex::{self, types::Activity},
+    Block, Heightable,
+    simplex::types::Finalization,
     types::{Height, coding::Commitment},
 };
 use commonware_cryptography::{
@@ -20,12 +19,12 @@ use commonware_cryptography::{
 };
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use exoware_sdk::{StoreClient, StoreWriteBatch};
-use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
+use exoware_simplex::{Finalized, PreparedUpload, SimplexClient};
 use std::{fmt, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
-use tracing::{debug, warn};
+use tracing::debug;
 
-/// Cloneable reporter over Simplex activity.
+/// Cloneable sink for finalized blocks and their Simplex finalizations.
 pub struct CertificateReporter<H, C, V, S>
 where
     H: Hasher + Send + Sync + 'static,
@@ -76,6 +75,20 @@ where
     {
         let _ = self.tx.send(SimplexInput::Block(block)).await;
     }
+
+    /// Queue the finalization corresponding to an ordered marshal block.
+    ///
+    /// Returns `false` if the uploader has stopped. The native marshal
+    /// reporter uses that result to decide whether to acknowledge delivery.
+    pub async fn publish_finalization(&self, finalization: Finalization<S, Commitment>) -> bool
+    where
+        S::Certificate: Send,
+    {
+        self.tx
+            .send(SimplexInput::Finalization(finalization))
+            .await
+            .is_ok()
+    }
 }
 
 impl<H, C, V, S> Clone for CertificateReporter<H, C, V, S>
@@ -92,50 +105,6 @@ where
     }
 }
 
-impl<H, C, V, S> Reporter for CertificateReporter<H, C, V, S>
-where
-    H: Hasher + Send + Sync + 'static,
-    C: Signer + Send + Sync + 'static,
-    V: Variant,
-    S: Scheme + Send + Sync + 'static,
-    S::Certificate: Send,
-    simplex::types::Notarization<S, Commitment>: Send,
-    simplex::types::Finalization<S, Commitment>: Send,
-{
-    type Activity = Activity<S, Commitment>;
-
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match activity {
-            Activity::Notarization(notarization) => {
-                dispatch_input(&self.tx, SimplexInput::Notarization(notarization));
-            }
-            Activity::Finalization(finalization) => {
-                dispatch_input(&self.tx, SimplexInput::Finalization(finalization));
-            }
-            _ => {}
-        }
-        Feedback::Ok
-    }
-}
-
-fn dispatch_input<H, C, V, S>(
-    tx: &mpsc::Sender<SimplexInput<H, C, V, S>>,
-    input: SimplexInput<H, C, V, S>,
-) where
-    H: Hasher + Send + Sync + 'static,
-    C: Signer + Send + Sync + 'static,
-    V: Variant,
-    S: Scheme + Send + Sync + 'static,
-    S::Certificate: Send,
-{
-    let tx = tx.clone();
-    tokio::spawn(async move {
-        if let Err(error) = tx.send(input).await {
-            warn!("simplex certificate uploader stopped; dropping activity: {error}");
-        }
-    });
-}
-
 enum SimplexInput<H, C, V, S>
 where
     H: Hasher,
@@ -144,8 +113,7 @@ where
     S: Scheme,
 {
     Block(Arc<EngineBlock<H, C, V>>),
-    Notarization(simplex::types::Notarization<S, Commitment>),
-    Finalization(simplex::types::Finalization<S, Commitment>),
+    Finalization(Finalization<S, Commitment>),
 }
 
 struct PendingBlockCertificates<H, C, V, S>
@@ -156,8 +124,7 @@ where
     S: Scheme,
 {
     block: Option<Arc<EngineBlock<H, C, V>>>,
-    notarization: Option<simplex::types::Notarization<S, Commitment>>,
-    finalization: Option<simplex::types::Finalization<S, Commitment>>,
+    finalization: Option<Finalization<S, Commitment>>,
 }
 
 impl<H, C, V, S> Default for PendingBlockCertificates<H, C, V, S>
@@ -170,7 +137,6 @@ where
     fn default() -> Self {
         Self {
             block: None,
-            notarization: None,
             finalization: None,
         }
     }
@@ -216,7 +182,6 @@ async fn run_uploader<H, C, V, S>(
                     prepared.extend(client.prepare_block(&header, body));
                     entry.block = Some(block);
                 }
-                SimplexInput::Notarization(notarization) => entry.notarization = Some(notarization),
                 SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
             }
             touched.push(key);
@@ -267,9 +232,6 @@ where
     fn block_digest_key(&self) -> Vec<u8> {
         match self {
             Self::Block(block) => block.seal().as_ref().to_vec(),
-            Self::Notarization(notarization) => {
-                block_digest_key::<H>(&notarization.proposal.payload)
-            }
             Self::Finalization(finalization) => {
                 block_digest_key::<H>(&finalization.proposal.payload)
             }
@@ -280,7 +242,7 @@ where
     fn body_bytes(&self) -> usize {
         match self {
             Self::Block(block) => block.body.encode_size(),
-            Self::Notarization(_) | Self::Finalization(_) => 0,
+            Self::Finalization(_) => 0,
         }
     }
 }
@@ -309,17 +271,6 @@ where
     let Some(block) = entry.block.as_deref() else {
         return false;
     };
-
-    if let Some(notarization) = entry.notarization.take() {
-        let certified = CertifiedHeader::new(notarization.proposal.payload, block);
-        let notarized =
-            Notarized::new(notarization, certified).expect("notarization matches certified header");
-        prepared.extend(
-            client
-                .prepare_notarized(&notarized)
-                .expect("notarization upload must prepare"),
-        );
-    }
 
     let mut staged_finalization = false;
     if let Some(finalization) = entry.finalization.take() {

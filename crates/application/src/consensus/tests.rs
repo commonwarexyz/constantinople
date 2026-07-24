@@ -1,3 +1,8 @@
+#![expect(
+    clippy::large_futures,
+    reason = "the deterministic integration harness intentionally owns full three-database futures"
+)]
+
 use super::{
     Application, BLOCKS_PER_EPOCH, Committee, CommitteeSyncTarget, Databases, MAX_COMMITTEE_SIZE,
     StateSyncTarget, TransactionHistoryTarget, execution::execute_body, genesis_block,
@@ -213,10 +218,14 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     let genesis_committee = Committee::new(Set::from_iter_dedup([leader.public_key()]))
         .expect("test genesis committee");
     let genesis_info = test_genesis_info(genesis_committee.members().clone());
-    let committee = seed_committees(committee_batch, genesis_committee.clone())
-        .merkleize()
-        .await
-        .expect("genesis committee");
+    let committee = seed_committees(
+        committee_batch,
+        genesis_committee.clone(),
+        genesis_committee.clone(),
+    )
+    .merkleize()
+    .await
+    .expect("genesis committee");
     let state_target = StateSyncTarget::new(state.root(), sync_range_from_bounds(state.bounds()));
     let transaction_target = TransactionHistoryTarget::new(
         transactions.root(),
@@ -233,6 +242,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         state_target.clone(),
         transaction_target.clone(),
         committee_target.clone(),
+        sha256::Digest::EMPTY,
         TestPayload::EpochInfo(genesis_info.clone()),
     );
     let eligible_committee_members = Set::from_iter_dedup([
@@ -253,8 +263,8 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             transaction_target.clone(),
             committee_target.clone(),
             genesis_info,
+            sha256::Digest::EMPTY,
             NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
-            genesis_committee,
             eligible_committee_members.clone(),
             None,
         ),
@@ -309,6 +319,7 @@ fn committee_transaction(
 struct ReducerHarness {
     dbs: TestDbs,
     initial: Committee,
+    initial_next: Committee,
     eligible: Set<ed25519::PublicKey>,
     sender: ed25519::PrivateKey,
 }
@@ -316,6 +327,7 @@ struct ReducerHarness {
 async fn reducer_harness(
     context: &deterministic::Context,
     initial: Committee,
+    initial_next: Committee,
     eligible: Set<ed25519::PublicKey>,
     sender: ed25519::PrivateKey,
 ) -> ReducerHarness {
@@ -355,6 +367,7 @@ async fn reducer_harness(
     ReducerHarness {
         dbs,
         initial,
+        initial_next,
         eligible,
         sender,
     }
@@ -381,6 +394,7 @@ async fn execute_committee_block(
         height,
         body,
         &harness.initial,
+        &harness.initial_next,
         Arc::new(harness.eligible.clone()),
         BLOCKS_PER_EPOCH,
     )
@@ -412,6 +426,7 @@ fn unexecuted_child_header(
         parent: *parent.seal(),
         height: 1,
         timestamp: 1,
+        eligible_peers_root: parent.header.eligible_peers_root,
         state_root: parent.header.state_root,
         state_range: parent.header.state_range.clone(),
         transactions_root: parent.header.transactions_root,
@@ -428,21 +443,39 @@ fn committee_reducer_seeds_genesis_rows_and_materializes_final_carry_forward() {
         assert_eq!(BLOCKS_PER_EPOCH, 1024);
         let sender = ed25519::PrivateKey::from_seed(101);
         let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
-        let harness =
-            reducer_harness(&context, initial.clone(), initial.members().clone(), sender).await;
+        let initial_next =
+            Committee::new(Set::from_iter_dedup([
+                ed25519::PrivateKey::from_seed(102).public_key()
+            ]))
+            .unwrap();
+        let eligible = Set::from_iter_dedup(
+            initial
+                .members()
+                .iter()
+                .chain(initial_next.members())
+                .cloned(),
+        );
+        let harness = reducer_harness(
+            &context,
+            initial.clone(),
+            initial_next.clone(),
+            eligible,
+            sender,
+        )
+        .await;
 
         let (entering, selected) = execute_committee_block(&harness, 1, Vec::new())
             .await
             .expect("first reducer block");
-        assert_eq!(entering, initial);
-        assert_eq!(selected, initial);
+        assert_eq!(entering, initial_next);
+        assert_eq!(selected, initial_next);
         assert_eq!(
             exact_committee_row(&harness.dbs, 0).await,
             Some(initial.clone())
         );
         assert_eq!(
             exact_committee_row(&harness.dbs, 1).await,
-            Some(initial.clone())
+            Some(initial_next.clone())
         );
         assert_eq!(exact_committee_row(&harness.dbs, 2).await, None);
 
@@ -452,9 +485,12 @@ fn committee_reducer_seeds_genesis_rows_and_materializes_final_carry_forward() {
             execute_committee_block(&harness, BLOCKS_PER_EPOCH - 1, Vec::new())
                 .await
                 .expect("final reducer block");
-        assert_eq!(entering, initial);
-        assert_eq!(selected, initial);
-        assert_eq!(exact_committee_row(&harness.dbs, 2).await, Some(initial));
+        assert_eq!(entering, initial_next);
+        assert_eq!(selected, initial_next);
+        assert_eq!(
+            exact_committee_row(&harness.dbs, 2).await,
+            Some(initial_next)
+        );
     });
 }
 
@@ -466,7 +502,8 @@ fn committee_reducer_composes_ordered_idempotent_mutations_across_blocks() {
         let c = ed25519::PrivateKey::from_seed(113).public_key();
         let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
         let eligible = Set::from_iter_dedup([sender.public_key(), b.clone(), c.clone()]);
-        let harness = reducer_harness(&context, initial.clone(), eligible, sender).await;
+        let harness =
+            reducer_harness(&context, initial.clone(), initial.clone(), eligible, sender).await;
 
         let target = Epoch::new(2);
         let first = vec![
@@ -510,6 +547,7 @@ fn committee_reducer_rejects_ineligible_wrong_epoch_empty_and_final_mutations() 
         let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
         let harness = reducer_harness(
             &context,
+            initial.clone(),
             initial,
             Set::from_iter_dedup([sender.public_key(), eligible_peer.clone()]),
             sender,
@@ -568,7 +606,7 @@ fn committee_reducer_rejects_growth_past_maximum_size() {
         let initial = Committee::new(members.clone()).expect("maximum-size committee");
         let extra = ed25519::PrivateKey::from_seed(2_000).public_key();
         let eligible = Set::from_iter_dedup(members.iter().cloned().chain([extra.clone()]));
-        let harness = reducer_harness(&context, initial, eligible, sender).await;
+        let harness = reducer_harness(&context, initial.clone(), initial, eligible, sender).await;
         let transaction = committee_transaction(&harness.sender, Epoch::new(2), extra, true, 0);
 
         assert!(
@@ -607,6 +645,40 @@ fn verify_rejects_invalid_body() {
             ],
         )
         .seal(&mut sha256::Sha256::default());
+
+        let result = app
+            .verify_child(
+                (context.child("verify"), consensus_context),
+                Arc::new(block),
+                std::future::ready(Some(Arc::new(parent))),
+                dbs.new_batches().await,
+            )
+            .await;
+
+        assert!(result.is_none());
+    });
+}
+
+#[test]
+fn verify_rejects_changed_eligible_peer_catalog_root() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = verify_harness(&context).await;
+
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let mut header = unexecuted_child_header(&parent, &consensus_context);
+        header.eligible_peers_root = sha256::Sha256::hash(&[b"different catalog"]);
+        let block = Block::<sha256::Digest, _, sha256::Sha256, _>::new(header, Vec::new())
+            .seal(&mut sha256::Sha256::default());
 
         let result = app
             .verify_child(
@@ -702,6 +774,10 @@ fn propose_drops_inapplicable_and_refills() {
             )
             .await
             .expect("best-effort proposal must succeed");
+        assert_eq!(
+            proposed.block.header.eligible_peers_root,
+            parent.header.eligible_peers_root
+        );
         assert_eq!(
             body_digests(&proposed.block),
             vec![*keep.message_digest(), *refill.message_digest()]
@@ -924,6 +1000,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
         empty_state_target(),
         genesis_target,
         empty_committee_target(),
+        sha256::Digest::EMPTY,
         TestPayload::EpochInfo(test_genesis_info(Set::from_iter_dedup([
             leader.public_key()
         ]))),
@@ -966,6 +1043,7 @@ fn genesis_block_uses_the_initialized_transaction_target() {
         root: sha256::Sha256::hash(&[b"genesis"]),
         leaf_count: commonware_storage::mmr::Location::new(1),
     };
+    let eligible_peers_root = sha256::Sha256::hash(&[b"eligible peers"]);
 
     let block = genesis_block::<sha256::Digest, _, sha256::Sha256, _>(
         &mut sha256::Sha256::default(),
@@ -974,11 +1052,13 @@ fn genesis_block_uses_the_initialized_transaction_target() {
         empty_state_target(),
         target.clone(),
         empty_committee_target(),
-        TestPayload::EpochInfo(test_genesis_info(Set::from_iter_dedup([leader.clone()]))),
+        eligible_peers_root,
+        TestPayload::EpochInfo(test_genesis_info(Set::from_iter_dedup([leader]))),
     );
 
     assert_eq!(block.header.transactions_root, target.root);
     assert_eq!(block.header.transactions_range, non_empty_range!(0, 1));
+    assert_eq!(block.header.eligible_peers_root, eligible_peers_root);
 }
 
 /// Digests of a sealed block's body transactions.
@@ -1074,9 +1154,8 @@ fn build_timeout_bounds_refill_rounds() {
             harness.transaction_target.clone(),
             harness.committee_target.clone(),
             test_genesis_info(Set::from_iter_dedup([harness.leader.public_key()])),
+            sha256::Digest::EMPTY,
             NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
-            Committee::new(Set::from_iter_dedup([harness.leader.public_key()]))
-                .expect("deadline genesis committee"),
             harness.eligible_committee_members.clone(),
             None,
         );
