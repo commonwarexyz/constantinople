@@ -127,6 +127,7 @@ pub(crate) struct TestEngineDefinition {
     proposals: BTreeMap<u64, Vec<VerifiedTransaction<TestHasher>>>,
     failures: Arc<HashSet<u64>>,
     processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
+    first_processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
     holds: Arc<Mutex<BTreeMap<TestPublicKey, VecDeque<u64>>>>,
     hold_releases: Arc<Mutex<BTreeMap<TestPublicKey, TestPublicKey>>>,
     attached: Arc<Mutex<HashSet<TestPublicKey>>>,
@@ -270,6 +271,7 @@ impl TestEngineDefinition {
             proposals,
             failures: Arc::default(),
             processed: Arc::default(),
+            first_processed: Arc::default(),
             holds: Arc::default(),
             hold_releases: Arc::default(),
             attached: Arc::default(),
@@ -415,6 +417,7 @@ impl EngineDefinition for TestEngineDefinition {
         let proposals = self.proposals.clone();
         let failures = self.failures.clone();
         let processed = self.processed.clone();
+        let first_processed = self.first_processed.clone();
         let holds = self.holds.clone();
         let hold_releases = self.hold_releases.clone();
         let attached = self.attached.clone();
@@ -493,6 +496,7 @@ impl EngineDefinition for TestEngineDefinition {
             let hook_context = context.child("finalized_hook");
             let hook_key = public_key.clone();
             let hook_processed = processed.clone();
+            let hook_first_processed = first_processed.clone();
             let hook_holds = holds.clone();
             let hook_hold_releases = hold_releases.clone();
             let hook_attached = attached.clone();
@@ -508,10 +512,15 @@ impl EngineDefinition for TestEngineDefinition {
                 let context = hook_context.child("block");
                 let public_key = hook_key.clone();
                 let processed = hook_processed.clone();
+                let first_processed = hook_first_processed.clone();
                 let holds = hook_holds.clone();
                 let hold_releases = hook_hold_releases.clone();
                 let attached = hook_attached.clone();
                 Box::pin(async move {
+                    first_processed
+                        .lock()
+                        .entry(public_key.clone())
+                        .or_insert(height);
                     processed.lock().insert(public_key.clone(), height);
                     if height % TEST_EPOCH_LENGTH.get() == TEST_EPOCH_LENGTH.get() - 1 {
                         warn!(validator = %public_key, height, "test engine finalized boundary");
@@ -629,6 +638,7 @@ impl EngineDefinition for TestEngineDefinition {
                     marshal,
                     committee: committee_cell.clone(),
                     processed,
+                    first_processed,
                     tracks,
                 })
                 .is_err()

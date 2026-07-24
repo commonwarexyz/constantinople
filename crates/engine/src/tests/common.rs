@@ -134,6 +134,7 @@ pub(crate) struct ValidatorState {
     pub(crate) marshal: TestMarshalMailbox,
     pub(crate) committee: Arc<OnceLock<TestCommitteeDatabase>>,
     pub(crate) processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
+    pub(crate) first_processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
     pub(crate) tracks: TrackLog,
 }
 
@@ -158,6 +159,10 @@ impl ValidatorState {
             .get(&self.public_key)
             .copied()
             .unwrap_or_default()
+    }
+
+    pub(crate) fn first_processed_height(&self) -> Option<u64> {
+        self.first_processed.lock().get(&self.public_key).copied()
     }
 
     pub(crate) fn committee(&self) -> Result<TestCommitteeDatabase, String> {

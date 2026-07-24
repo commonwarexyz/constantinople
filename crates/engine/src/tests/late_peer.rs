@@ -1,8 +1,9 @@
 //! A committee member introduced by finalized application state after genesis.
 
 use super::{
-    TRANSACTION_NAMESPACE, TestEngineDefinition, TestHasher, TestPrivateKey, TestPublicKey,
-    ValidatorState, directory, final_height, plan, socket_address, validator_fixture,
+    TEST_EPOCH_LENGTH, TRANSACTION_NAMESPACE, TestEngineDefinition, TestHasher, TestPrivateKey,
+    TestPublicKey, ValidatorState, directory, final_height, plan, socket_address,
+    validator_fixture,
 };
 use crate::tests::common::TestEpochInfo;
 use commonware_consensus::types::{Epoch, Round, View};
@@ -115,6 +116,14 @@ impl Property<TestPublicKey, ValidatorState> for LatePeerLifecycle {
             }
             if late_state.processed_height().await < final_height(ACTIVE_EPOCH - 1) + 1 {
                 return Err("late peer did not participate after committee activation".into());
+            }
+            let first_processed = late_state
+                .first_processed_height()
+                .ok_or_else(|| "late peer never applied a finalized block".to_string())?;
+            if first_processed <= REGISTRATION_HEIGHT {
+                return Err(format!(
+                    "late peer replay began at or before registration: first applied height {first_processed}"
+                ));
             }
 
             let registration_block = original_state
@@ -236,11 +245,15 @@ fn engine_adds_post_genesis_peer_via_committee_transaction() {
     let (mut engine, late_peer, expected) = late_peer_engine();
     let initial = engine.initial_players();
     for participant in initial.iter() {
-        engine = engine.with_hold_until_attached(participant.clone(), 8, late_peer.clone());
+        engine = engine.with_hold_until_attached(
+            participant.clone(),
+            TEST_EPOCH_LENGTH.get() + 8,
+            late_peer.clone(),
+        );
     }
     let secret_path = engine.secret_path(&late_peer);
     let late_address = socket_address(LATE_PEER_INDEX);
-    let start_round = Round::new(Epoch::zero(), View::new(4));
+    let start_round = Round::new(Epoch::new(1), View::zero());
 
     let result = plan(engine)
         .crash(Crash::DelayRound {
