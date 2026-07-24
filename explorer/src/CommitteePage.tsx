@@ -90,7 +90,7 @@ export default function CommitteePage({
                 <CommitteeDatum label="current epoch" value={snapshot.epoch.toString()} />
                 <CommitteeDatum label="effective epoch" value={snapshot.targetEpoch.toString()} />
                 <CommitteeDatum label="selected / eligible" value={`${selected.size} / ${snapshot.available.length}`} />
-                <CommitteeDatum label="blocks to final-block lock" value={blockDistance.toString()} />
+                <CommitteeDatum label="blocks until submissions close" value={blockDistance.toString()} />
             </div>
 
             <div className="committee-page__notice">

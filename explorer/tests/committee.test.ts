@@ -46,7 +46,7 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
     assert.equal(snapshot.height, 17_890n);
     assert.equal(snapshot.epoch, 139n);
     assert.equal(snapshot.targetEpoch, 141n);
-    assert.equal(snapshot.lockHeight, 17_919n);
+    assert.equal(snapshot.lockHeight, 17_918n);
     assert.equal(snapshot.updatesOpen, true);
     assert.deepEqual(snapshot.available.map(({ peer }) => peer), [PEER_A, PEER_B, PEER_C]);
     assert.equal(queries.length, 4);
@@ -69,24 +69,54 @@ test('selection diff includes every indexed eligible peer', () => {
     );
 });
 
-test('lock model names the exact rejecting final block and last accepted block', () => {
+test('lock model names both rejecting blocks and the last accepted block', () => {
     const snapshot = response();
 
-    assert.equal(blocksUntilCommitteeLock(snapshot), 28n);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 27n);
     assert.equal(
         committeeLockDetail(snapshot),
-        'final block 17919 rejects updates; accepted through block 17918',
+        'final two blocks 17918 and 17919 reject updates; accepted through block 17917',
     );
 });
 
-test('lock distance reaches zero when the penultimate block is finalized', () => {
-    const snapshot = {
-        ...response(),
-        height: 17_918n,
-        updatesOpen: false,
-    };
+test('submissions remain open after height 124 so updates can land in block 125', async () => {
+    const snapshot = await fetchCommitteeAtHeight(124n, 0n);
 
+    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.updatesOpen, true);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 1n);
+});
+
+test('submissions close after final mutable block 125 is finalized', async () => {
+    const snapshot = await fetchCommitteeAtHeight(125n, 0n);
+
+    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.updatesOpen, false);
     assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
+});
+
+test('submissions remain closed after first rejecting block 126 is finalized', async () => {
+    const snapshot = await fetchCommitteeAtHeight(126n, 0n);
+
+    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.updatesOpen, false);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
+});
+
+test('submissions remain closed after final rejecting block 127 is finalized', async () => {
+    const snapshot = await fetchCommitteeAtHeight(127n, 0n);
+
+    assert.equal(snapshot.lockHeight, 126n);
+    assert.equal(snapshot.updatesOpen, false);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
+});
+
+test('submissions reopen after height 128 starts the next epoch', async () => {
+    const snapshot = await fetchCommitteeAtHeight(128n, 1n);
+
+    assert.equal(snapshot.lockHeight, 254n);
+    assert.equal(snapshot.updatesOpen, true);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 125n);
 });
 
 test('per-peer E+2 actions reserve sequential nonces before signing', () => {
@@ -169,7 +199,7 @@ function response(): CommitteeSnapshot {
         epoch: 139n,
         targetEpoch: 141n,
         updatesOpen: true,
-        lockHeight: 17_919n,
+        lockHeight: 17_918n,
         current: [PEER_A, PEER_C],
         scheduled: [PEER_A, PEER_C],
         available: [
@@ -178,6 +208,23 @@ function response(): CommitteeSnapshot {
             { peer: PEER_C, address: 'validator-c:9000' },
         ],
     };
+}
+
+async function fetchCommitteeAtHeight(height: bigint, epoch: bigint): Promise<CommitteeSnapshot> {
+    return fetchCommittee('http://indexer.invalid', undefined, {
+        async query(sql: string): Promise<DecodedQueryResult> {
+            if (sql.includes('FROM block_meta')) {
+                return result({ height, epoch });
+            }
+            if (sql.includes('FROM committee_meta')) {
+                return result({ epoch: 0n, members: peerBytes(PEER_A) });
+            }
+            if (sql.includes('FROM eligible_peer')) {
+                return result({ peer: peerBytes(PEER_A), address: 'validator-a:9000' });
+            }
+            throw new Error(`unexpected SQL: ${sql}`);
+        },
+    });
 }
 
 function committeeSnapshot(scheduled: readonly string[], available: readonly string[]) {

@@ -36,7 +36,7 @@ export interface CommitteeSnapshot {
     readonly epoch: bigint;
     readonly targetEpoch: bigint;
     readonly updatesOpen: boolean;
-    /** The exact final block, which rejects committee mutations. */
+    /** The first of the epoch's final two blocks, which reject committee mutations. */
     readonly lockHeight: bigint;
     readonly current: readonly string[];
     readonly scheduled: readonly string[];
@@ -117,14 +117,14 @@ export async function fetchCommittee(
         BLOCKS_PER_EPOCH,
         'epoch end',
     );
-    const lockHeight = epochEnd - 1n;
-    const lastAdmissibleHeight = lockHeight > 0n ? lockHeight - 1n : 0n;
+    const lockHeight = epochEnd - 2n;
+    const submissionLockHeight = lockHeight - 1n;
 
     return {
         height,
         epoch,
         targetEpoch,
-        updatesOpen: height < lastAdmissibleHeight,
+        updatesOpen: height < submissionLockHeight,
         lockHeight,
         current,
         scheduled,
@@ -288,22 +288,23 @@ function orderCommitteeChanges(
     return ordered;
 }
 
-/** Number of finalized block advances before the exact final-block lock. */
+/** Number of finalized block advances before new submissions must close. */
 export function blocksUntilCommitteeLock(snapshot: CommitteeSnapshot): bigint {
-    const lastAdmissibleHeight = snapshot.lockHeight > 0n
+    const submissionLockHeight = snapshot.lockHeight > 0n
         ? snapshot.lockHeight - 1n
         : 0n;
-    return snapshot.height < lastAdmissibleHeight
-        ? lastAdmissibleHeight - snapshot.height
+    return snapshot.height < submissionLockHeight
+        ? submissionLockHeight - snapshot.height
         : 0n;
 }
 
 export function committeeLockDetail(snapshot: CommitteeSnapshot): string {
-    const finalBlock = snapshot.lockHeight.toString();
+    const firstFrozenBlock = snapshot.lockHeight.toString();
+    const finalBlock = (snapshot.lockHeight + 1n).toString();
     if (snapshot.lockHeight === 0n) {
-        return `final block ${finalBlock} rejects committee updates`;
+        return `final two blocks ${firstFrozenBlock} and ${finalBlock} reject committee updates`;
     }
-    return `final block ${finalBlock} rejects updates; accepted through block ${(
+    return `final two blocks ${firstFrozenBlock} and ${finalBlock} reject updates; accepted through block ${(
         snapshot.lockHeight - 1n
     ).toString()}`;
 }
