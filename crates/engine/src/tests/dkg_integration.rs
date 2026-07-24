@@ -15,7 +15,7 @@ fn engine_stable_control_crosses_three_boundaries() {
     let participants = engine.initial_players();
     plan(engine)
         .exit_condition(ParticipantQuorumFinalizedHeightAtLeast::new(
-            final_height(2),
+            final_height(2) + 1,
             participants,
         ))
         .run()
@@ -45,20 +45,21 @@ fn engine_finalizes_shards_larger_than_one_mibibyte() {
 #[test_traced("WARN")]
 fn engine_dkg_applies_two_committee_rotations() {
     let engine = TestEngineDefinition::rotating();
+    let joining = engine.joining();
     let property = TwoCommitteeRotations::new(
         engine.initial_players(),
         engine.updated_players(),
         engine.final_players(),
         engine.leaving(),
-        engine.joining(),
+        joining.clone(),
     );
     let final_players = engine.final_players();
 
     plan(engine)
-        .exit_condition(ParticipantQuorumFinalizedHeightAtLeast::new(
-            final_height(3),
-            final_players,
-        ))
+        .exit_condition(
+            ParticipantQuorumFinalizedHeightAtLeast::new(final_height(3) + 1, final_players)
+                .requiring(joining),
+        )
         .property(property)
         .run()
         .unwrap();
