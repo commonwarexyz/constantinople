@@ -149,8 +149,9 @@ relayer is `secondary-1`.
 
 The printed `mprocs` command list grows by four entries:
 
-- `cargo run --release -p constantinople-indexer --bin chain-indexer -- --port 8090 --data-dir ./local/chain-indexer`
-  — the simulator-backed shared store. `--chain-indexer-port` overrides the port.
+- `cargo run --release -p constantinople-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
+  — the simulator-backed shared store. `--chain-indexer-port` overrides the Store port;
+  its local metrics port is placed after validator, secondary, and optional spammer metrics ports.
 - `cargo run --release -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
   — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
 - `cargo run --release -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`

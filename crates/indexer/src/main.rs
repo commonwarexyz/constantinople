@@ -57,6 +57,10 @@ struct Cli {
     #[arg(long, default_value_t = 8090)]
     port: u16,
 
+    /// Metrics port to bind on `0.0.0.0`.
+    #[arg(long, default_value_t = DEFAULT_METRICS_PORT)]
+    metrics_port: u16,
+
     /// Directory used by the simulator's RocksDB engine.
     #[arg(long, conflicts_with_all = ["hosts", "config"])]
     data_dir: Option<PathBuf>,
@@ -100,12 +104,14 @@ fn resolve_data_dir(config_path: &Path, data_dir: PathBuf) -> PathBuf {
         .join(data_dir)
 }
 
-fn load_settings(cli: Cli) -> (PathBuf, u16, Option<i32>) {
+fn load_settings(cli: Cli) -> (PathBuf, u16, u16, Option<i32>) {
+    let metrics_port = cli.metrics_port;
     if let Some(config_path) = cli.config {
         let config = load_deployer_config(&config_path);
         return (
             resolve_data_dir(&config_path, config.data_dir),
             config.port,
+            metrics_port,
             config.db_parallelism,
         );
     }
@@ -114,6 +120,7 @@ fn load_settings(cli: Cli) -> (PathBuf, u16, Option<i32>) {
         cli.data_dir
             .expect("clap should require --data-dir or --hosts"),
         cli.port,
+        metrics_port,
         cli.db_parallelism,
     )
 }
@@ -123,7 +130,7 @@ async fn health() -> &'static str {
 }
 
 /// Port the deployer scrapes for binary metrics.
-const METRICS_PORT: u16 = 9090;
+const DEFAULT_METRICS_PORT: u16 = 9090;
 /// Ingest latency buckets: 1ms to 60s.
 const INGEST_DURATION_BUCKETS: [f64; 12] = [
     0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 15.0, 60.0,
@@ -229,6 +236,7 @@ fn chain_indexer_rocks_config(db_parallelism: Option<i32>) -> RocksConfig {
 async fn run(
     data_dir: &Path,
     port: u16,
+    metrics_port: u16,
     db_parallelism: Option<i32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let engine = Arc::new(RocksStore::open(
@@ -243,11 +251,18 @@ async fn run(
         .layer(middleware::from_fn_with_state(metrics, track_ingest))
         .layer(CorsLayer::very_permissive());
 
-    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], METRICS_PORT));
+    let metrics_addr = std::net::SocketAddr::from(([0, 0, 0, 0], metrics_port));
     let metrics_app = Router::new()
         .route("/metrics", get(serve_metrics))
         .with_state(registry);
-    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr).await?;
+    let metrics_listener = tokio::net::TcpListener::bind(metrics_addr)
+        .await
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to bind metrics listener {metrics_addr}: {error}"),
+            )
+        })?;
     tokio::spawn(async move {
         if let Err(error) = axum::serve(metrics_listener, metrics_app).await {
             tracing::warn!(?error, "metrics server exited");
@@ -256,14 +271,19 @@ async fn run(
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     info!(%addr, directory = %data_dir.display(), "chain indexer listening");
-    let listener = tokio::net::TcpListener::bind(addr).await?;
+    let listener = tokio::net::TcpListener::bind(addr).await.map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to bind Store listener {addr}: {error}"),
+        )
+    })?;
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 fn main() {
     let cli = Cli::parse();
-    let (data_dir, port, db_parallelism) = load_settings(cli);
+    let (data_dir, port, metrics_port, db_parallelism) = load_settings(cli);
     fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -276,7 +296,7 @@ fn main() {
         .expect("failed to build tokio runtime");
 
     runtime.block_on(async move {
-        if let Err(error) = run(&data_dir, port, db_parallelism).await {
+        if let Err(error) = run(&data_dir, port, metrics_port, db_parallelism).await {
             eprintln!("chain-indexer exited with error: {error}");
             std::process::exit(1);
         }
@@ -285,7 +305,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, load_settings};
+    use super::{Cli, DEFAULT_METRICS_PORT, load_settings};
     use clap::Parser;
     use std::{
         fs,
@@ -307,12 +327,15 @@ mod tests {
             "chain-indexer",
             "--port",
             "8090",
+            "--metrics-port",
+            "19090",
             "--data-dir",
             "./chain-indexer",
         ])
         .expect("local invocation should parse");
 
         assert_eq!(cli.port, 8090);
+        assert_eq!(cli.metrics_port, 19_090);
         assert_eq!(cli.data_dir, Some(PathBuf::from("./chain-indexer")));
         assert!(cli.hosts.is_none());
         assert!(cli.config.is_none());
@@ -349,9 +372,10 @@ mod tests {
         ])
         .expect("deployer invocation should parse");
 
-        let (data_dir, port, db_parallelism) = load_settings(cli);
+        let (data_dir, port, metrics_port, db_parallelism) = load_settings(cli);
 
         assert_eq!(port, 18_090);
+        assert_eq!(metrics_port, DEFAULT_METRICS_PORT);
         assert_eq!(db_parallelism, None);
         assert_eq!(
             data_dir,

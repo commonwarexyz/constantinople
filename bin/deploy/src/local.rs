@@ -307,14 +307,16 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
+        let metrics_port = chain_indexer_metrics_port(args, local);
         let db_parallelism = local
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
+            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
+            metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
@@ -363,10 +365,7 @@ fn local_run_commands(
 
         // Place the spammer's metrics port past the primary and secondary ranges
         // so it does not collide with any validator on the loopback host.
-        let metrics_port = local
-            .base_metrics_port
-            .checked_add(args.validators as u16 + total_secondaries as u16)
-            .expect("spammer metrics port overflow");
+        let metrics_port = spammer_metrics_port(args, local);
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -387,6 +386,22 @@ fn local_run_commands(
     }
 
     commands
+}
+
+fn spammer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
+    local
+        .base_metrics_port
+        .checked_add(args.validators as u16 + total_secondaries(args) as u16)
+        .expect("spammer metrics port overflow")
+}
+
+fn chain_indexer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
+    let auxiliary_offset =
+        args.validators as u16 + total_secondaries(args) as u16 + u16::from(args.spammer);
+    local
+        .base_metrics_port
+        .checked_add(auxiliary_offset)
+        .expect("chain indexer metrics port overflow")
 }
 
 fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
@@ -680,7 +695,34 @@ mod tests {
             .find(|c| c.contains("--bin chain-indexer"))
             .expect("chain-indexer command should be present");
         assert!(indexer_cmd.contains("--port 8090"));
+        assert!(indexer_cmd.contains("--metrics-port 9094"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
+    }
+
+    #[test]
+    fn local_indexer_and_spammer_metrics_ports_do_not_overlap() {
+        let mut args = test_args(true);
+        args.validators = 4;
+        args.indexer = true;
+        args.relayer = true;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let indexer = commands
+            .iter()
+            .find(|command| command.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+        let spammer = commands
+            .iter()
+            .find(|command| command.contains("constantinople-spammer"))
+            .expect("spammer command should be present");
+        assert!(indexer.contains("--metrics-port 9097"));
+        assert!(spammer.contains("--metrics-port 9096"));
     }
 
     #[test]
