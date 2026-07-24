@@ -470,8 +470,8 @@ impl From<EligiblePeer> for EligiblePeerResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, CommitteeResponse, CommitteeSnapshot, EligiblePeer, MAX_CONCURRENT_INGRESS,
-        PublicKeyCache, Semaphore, router,
+        AppState, CommitteeResponse, CommitteeSnapshot, EPOCH_LENGTH, EligiblePeer,
+        MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router,
     };
     use crate::webserver::CommitteeReader;
     use axum::{
@@ -622,14 +622,16 @@ mod tests {
                 .expect("response body should collect");
             let response: serde_json::Value =
                 serde_json::from_slice(&body).expect("response should be JSON");
+            let epoch = 17_890 / EPOCH_LENGTH;
+            let lock_height = (epoch + 1) * EPOCH_LENGTH - 1;
             assert_eq!(
                 response,
                 serde_json::json!({
                     "height": "17890",
-                    "epoch": "17",
-                    "targetEpoch": "19",
+                    "epoch": epoch.to_string(),
+                    "targetEpoch": (epoch + 2).to_string(),
                     "updatesOpen": true,
-                    "lockHeight": "18431",
+                    "lockHeight": lock_height.to_string(),
                     "current": ["peer-a", "peer-c"],
                     "scheduled": ["peer-a", "peer-c"],
                     "available": [

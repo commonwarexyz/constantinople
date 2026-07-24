@@ -478,7 +478,7 @@ mod tests {
 
     #[test]
     fn final_payload_binds_epoch_and_both_committee_snapshots() {
-        assert_eq!(BLOCKS_PER_EPOCH, 1024);
+        assert_eq!(BLOCKS_PER_EPOCH, 128);
         let a = key(211).public_key();
         let b = key(212).public_key();
         let c = key(213).public_key();

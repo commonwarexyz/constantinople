@@ -440,7 +440,7 @@ fn unexecuted_child_header(
 #[test]
 fn committee_reducer_seeds_genesis_rows_and_materializes_final_carry_forward() {
     deterministic::Runner::default().start(|context| async move {
-        assert_eq!(BLOCKS_PER_EPOCH, 1024);
+        assert_eq!(BLOCKS_PER_EPOCH, 128);
         let sender = ed25519::PrivateKey::from_seed(101);
         let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
         let initial_next =

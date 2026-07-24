@@ -6,7 +6,7 @@
 //! - `commonware-glue::stateful` owns QMDB lifecycle and startup sync
 //! - erasure-coded marshal owns finalized block availability
 //! - continuous DKG reshare prepares the next epoch's threshold scheme
-//! - the orchestrator starts one simplex actor per 1024-block epoch
+//! - the orchestrator starts one simplex actor per 128-block epoch
 
 use crate::{CommitteeParticipants, DynamicProvider, Registrar, types::*};
 use commonware_codec::{Encode as _, RangeCfg, Read};
@@ -70,7 +70,7 @@ use constantinople_application::consensus::{
     Application, CommitteeSyncTarget, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::PublicKeyCache;
+use constantinople_primitives::{BLOCKS_PER_EPOCH, PublicKeyCache};
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
@@ -83,7 +83,7 @@ use tracing::{error, info, warn};
 pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::Scheme<P, V>;
 
 /// Number of finalized blocks in each production epoch.
-pub const EPOCH_LENGTH: NonZero<u64> = NZU64!(1024);
+pub const EPOCH_LENGTH: NonZero<u64> = NonZero::new(BLOCKS_PER_EPOCH).unwrap();
 const MAX_DKG_PARTICIPANTS: NonZero<u32> = NZU32!(64);
 const DKG_MUXER_SIZE: usize = 128;
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);

@@ -9,9 +9,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use commonware_storage::translator::Translator;
 use commonware_utils::{ordered::Set, sequence::U64};
-
-/// Number of blocks in each Constantinople epoch.
-pub const BLOCKS_PER_EPOCH: u64 = 1024;
+pub use constantinople_primitives::BLOCKS_PER_EPOCH;
 
 /// Maximum number of members in a committee.
 pub const MAX_COMMITTEE_SIZE: usize = 64;

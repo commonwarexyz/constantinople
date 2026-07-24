@@ -28,3 +28,6 @@ pub use transaction::{Action, SignedTransaction, Transaction, VerifiedTransactio
 
 /// Signing namespace for transaction signatures.
 pub const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-tx";
+
+/// Number of finalized blocks in each Constantinople epoch.
+pub const BLOCKS_PER_EPOCH: u64 = 128;

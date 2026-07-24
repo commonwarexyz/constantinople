@@ -522,7 +522,7 @@
           <div class="body">
             <h3>Install the continuous reshare actor graph</h3>
             <p>Preserve Constantinople’s erasure-coded marshal, but replace the one-off epoch-zero Simplex actor with Commonware’s dynamic registrar, reshare wrapper, and orchestrator.</p>
-            <ul class="deliverables"><li><code>FixedEpocher(1024)</code>, dynamic scheme provider/registrar, genesis <code>EpochInfo(0)</code>, DKG probe, and shared DKG/stateful sync plan.</li><li>Validator-local durable <code>SecretStore</code> plus Commonware’s reshare public recovery journal; seed only epoch zero from current deployment material.</li><li>Actor stack: stateful mailbox → <code>reshare::Application</code> → existing <code>Marshaled</code> → DKG orchestrator.</li><li>Reporter fan-out to stateful, reshare, orchestrator, indexer, and relayer; start/join all actors and new channels.</li></ul>
+            <ul class="deliverables"><li><code>FixedEpocher(128)</code>, dynamic scheme provider/registrar, genesis <code>EpochInfo(0)</code>, DKG probe, and shared DKG/stateful sync plan.</li><li>Validator-local durable <code>SecretStore</code> plus Commonware’s reshare public recovery journal; seed only epoch zero from current deployment material.</li><li>Actor stack: stateful mailbox → <code>reshare::Application</code> → existing <code>Marshaled</code> → DKG orchestrator.</li><li>Reporter fan-out to stateful, reshare, orchestrator, indexer, and relayer; start/join all actors and new channels.</li></ul>
             <div class="tags"><span class="tag highlight">engine.rs</span><span class="tag">engine/types.rs</span><span class="tag">validator/run.rs</span><span class="tag">dkg secret partition</span></div>
           </div>
         </article>
@@ -542,7 +542,7 @@
           <div class="body">
             <h3>Prove multi-epoch safety and cut over with a new genesis</h3>
             <p>The block, transaction, and state formats all change. Treat this as a coordinated network restart, then exercise normal operation, committee changes, fallback, restart, and state sync across at least three epochs.</p>
-            <ul class="deliverables"><li>Golden Rust/TypeScript codecs; provider ordering/exact-directory tests; proposal and verifier boundary tests.</li><li>Add/remove/fallback/failed-reshare scenarios; signer-to-verifier transitions; restart at heights 1023/1024; future-player state sync.</li><li>Assert <code>max_pending_acks + 1 + retained_marshal_blocks ≥ 1024</code>.</li><li>Run <code>just fmt-fix</code>, <code>just lint</code>, <code>just test</code>, <code>just build</code>, plus explorer test/build.</li></ul>
+            <ul class="deliverables"><li>Golden Rust/TypeScript codecs; provider ordering/exact-directory tests; proposal and verifier boundary tests.</li><li>Add/remove/fallback/failed-reshare scenarios; signer-to-verifier transitions; restart at heights 127/128; future-player state sync.</li><li>Assert <code>max_pending_acks + 1 + retained_marshal_blocks ≥ 128</code>.</li><li>Run <code>just fmt-fix</code>, <code>just lint</code>, <code>just test</code>, <code>just build</code>, plus explorer test/build.</li></ul>
             <div class="tags"><span class="tag highlight">integration harness</span><span class="tag">fault tests</span><span class="tag">frontend goldens</span><span class="tag">deployment smoke test</span></div>
           </div>
         </article>
@@ -597,7 +597,7 @@
             <pre><code><span class="kw">let</span> app = reshare::<span class="ty">Application</span>::new(
   stateful_mailbox,
   reshare_mailbox,
-  <span class="ty">NZU64</span>!(<span class="num">1024</span>),
+  <span class="ty">NZU64</span>!(<span class="num">128</span>),
 );
 
 <span class="kw">let</span> automaton = marshal::coding::<span class="ty">Marshaled</span>::new(
@@ -688,7 +688,7 @@
       </div>
       <div class="callout">
         <h3>Resolved: the upstream final-block call is the lock boundary</h3>
-        <p>For epoch E, <code>reshare::Application</code> calls <code>epoch_info</code> before invoking the inner application’s propose or verify at height <code>E×1024+1023</code>. Therefore E+2 membership is exactly the parent state through height <code>E×1024+1022</code>: committee actions are accepted in non-final blocks and consensus-rejected in the final block. There is no configurable earlier cutoff.</p>
+        <p>For epoch E, <code>reshare::Application</code> calls <code>epoch_info</code> before invoking the inner application’s propose or verify at height <code>E×128+127</code>. Therefore E+2 membership is exactly the parent state through height <code>E×128+126</code>: committee actions are accepted in non-final blocks and consensus-rejected in the final block. There is no configurable earlier cutoff.</p>
         <span class="decide-with">Decision: lock immediately before the final block</span>
       </div>
       <div class="callout">
@@ -702,7 +702,7 @@
       <div class="section-header"><span class="section-number">07</span><h2>Definition of done</h2></div>
       <div class="acceptance">
         <div class="acceptance-item"><span class="check">✓</span><span>All Commonware packages resolve to the branch commit from one source, with Rust 1.95 and a passing workspace build.</span></div>
-        <div class="acceptance-item"><span class="check">✓</span><span>Blocks 1023→1024 and 2047→2048 rotate through DKG-orchestrated Simplex epochs without restarting the application.</span></div>
+        <div class="acceptance-item"><span class="check">✓</span><span>Blocks 127→128 and 255→256 rotate through DKG-orchestrated Simplex epochs without restarting the application.</span></div>
         <div class="acceptance-item"><span class="check">✓</span><span>Register/remove transactions deterministically produce the E+2 set; absent updates carry E+1 forward and materialize it.</span></div>
         <div class="acceptance-item"><span class="check">✓</span><span>Final blocks reject committee mutations, while transfers remain valid and the DKG payload matches the stable parent state.</span></div>
         <div class="acceptance-item"><span class="check">✓</span><span>Lookup activates the exact dealers/players/next-players union from certified addresses; missing or extra directory entries fail.</span></div>

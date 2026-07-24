@@ -1,9 +1,7 @@
 //! Read-only committee state for the mempool HTTP server.
 
+pub use constantinople_primitives::BLOCKS_PER_EPOCH as EPOCH_LENGTH;
 use futures::future::BoxFuture;
-
-/// Number of blocks in a committee epoch.
-pub const EPOCH_LENGTH: u64 = 1024;
 
 /// An immutable peer eligible for committee membership.
 #[derive(Clone, Debug, PartialEq, Eq)]
