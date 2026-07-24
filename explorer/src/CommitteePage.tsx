@@ -39,11 +39,11 @@ export default function CommitteePage({
         setSelected(new Set(snapshot?.scheduled ?? []));
     }, [selectionBaseline]);
 
-    const changes = useMemo(
-        () => (snapshot ? committeeChanges(snapshot, selected) : []),
-        [snapshot, selected],
-    );
     const selectionError = validateCommitteeSelection(selected);
+    const changes = useMemo(
+        () => (snapshot && selectionError === null ? committeeChanges(snapshot, selected) : []),
+        [snapshot, selected, selectionError],
+    );
 
     if (snapshot === null) {
         return (

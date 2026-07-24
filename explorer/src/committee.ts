@@ -5,6 +5,7 @@ import {
 } from './nonce.ts';
 
 const MAX_U64 = (1n << 64n) - 1n;
+const MAX_COMMITTEE_SIZE = 64;
 
 export interface EligibleCommitteePeer {
     readonly peer: string;
@@ -74,6 +75,8 @@ export function parseCommitteeResponse(value: unknown): CommitteeSnapshot {
     if (targetEpoch !== epoch + 2n) {
         throw new Error('targetEpoch must equal epoch + 2');
     }
+    assertCommitteeSize(current.length, 'current committee');
+    assertCommitteeSize(scheduled.length, 'scheduled committee');
 
     const eligible = new Set(available.map(({ peer }) => peer));
     for (const peer of [...current, ...scheduled]) {
@@ -107,14 +110,19 @@ export function committeeChanges(
     }
 
     const scheduled = new Set(snapshot.scheduled);
-    return snapshot.available.flatMap(({ peer }) => {
+    const changes = snapshot.available.flatMap(({ peer }) => {
         const registered = selected.has(peer);
         return registered === scheduled.has(peer) ? [] : [{ peer, registered }];
     });
+    return orderCommitteeChanges(changes, scheduled.size);
 }
 
 export function validateCommitteeSelection(selected: ReadonlySet<string>): string | null {
-    return selected.size === 0 ? 'committee must contain at least one peer' : null;
+    if (selected.size === 0) return 'committee must contain at least one peer';
+    if (selected.size > MAX_COMMITTEE_SIZE) {
+        return `committee must contain at most ${MAX_COMMITTEE_SIZE} peers`;
+    }
+    return null;
 }
 
 /**
@@ -125,11 +133,12 @@ export function planCommitteeTransactions(
     changes: readonly CommitteeChange[],
     targetEpoch: bigint,
     initialNonceState: NonceState,
+    scheduledCommitteeSize: number,
 ): CommitteeTransactionPlan {
     let nextNonceState = initialNonceState;
     const transactions: PlannedCommitteeTransaction[] = [];
 
-    for (const change of changes) {
+    for (const change of orderCommitteeChanges(changes, scheduledCommitteeSize)) {
         const nonce = nextAvailableNonce(nextNonceState);
         const consumed = consumeNonce(nextNonceState, nonce);
         if (consumed === null) {
@@ -140,6 +149,52 @@ export function planCommitteeTransactions(
     }
 
     return { transactions, nextNonceState };
+}
+
+/**
+ * Deterministically order idempotent per-peer updates without crossing the
+ * consensus committee bounds after any individual transaction.
+ */
+function orderCommitteeChanges(
+    changes: readonly CommitteeChange[],
+    initialSize: number,
+): CommitteeChange[] {
+    assertCommitteeSize(initialSize, 'scheduled committee');
+
+    const seen = new Set<string>();
+    const additions: CommitteeChange[] = [];
+    const removals: CommitteeChange[] = [];
+    for (const change of changes) {
+        if (seen.has(change.peer)) {
+            throw new Error(`committee changes contain duplicate peer ${change.peer}`);
+        }
+        seen.add(change.peer);
+        (change.registered ? additions : removals).push(change);
+    }
+
+    const finalSize = initialSize + additions.length - removals.length;
+    assertCommitteeSize(finalSize, 'resulting committee');
+
+    const ordered: CommitteeChange[] = [];
+    let size = initialSize;
+    let additionIndex = 0;
+    let removalIndex = 0;
+    while (additionIndex < additions.length || removalIndex < removals.length) {
+        if (additionIndex < additions.length && size < MAX_COMMITTEE_SIZE) {
+            ordered.push(additions[additionIndex]);
+            additionIndex += 1;
+            size += 1;
+            continue;
+        }
+        if (removalIndex < removals.length && size > 1) {
+            ordered.push(removals[removalIndex]);
+            removalIndex += 1;
+            size -= 1;
+            continue;
+        }
+        throw new Error('committee changes cannot stay within size bounds');
+    }
+    return ordered;
 }
 
 /** Number of finalized block advances before the exact final-block lock. */
@@ -203,6 +258,12 @@ function decimalU64(value: unknown, field: string): bigint {
         throw new Error(`${field} must fit in u64`);
     }
     return parsed;
+}
+
+function assertCommitteeSize(size: number, field: string) {
+    if (!Number.isSafeInteger(size) || size < 1 || size > MAX_COMMITTEE_SIZE) {
+        throw new Error(`${field} must contain 1..=${MAX_COMMITTEE_SIZE} peers`);
+    }
 }
 
 function record(value: unknown, field: string): Record<string, unknown> {

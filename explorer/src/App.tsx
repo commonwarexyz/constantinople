@@ -886,6 +886,7 @@ export default function App() {
                 changes,
                 committee.targetEpoch,
                 previousNonce,
+                committee.scheduled.length,
             );
             setLocalNonceState(plan.nextNonceState);
             reservation = { previous: previousNonce, next: plan.nextNonceState };
