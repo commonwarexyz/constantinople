@@ -8,7 +8,10 @@
 //! - continuous DKG reshare prepares the next epoch's threshold scheme
 //! - the orchestrator starts one simplex actor per 128-block epoch
 
-use crate::{CommitteeParticipants, DynamicProvider, Registrar, types::*};
+use crate::{
+    CommitteeParticipants, DynamicProvider, Registrar, dkg::encode_finalized_application_height,
+    types::*,
+};
 use commonware_codec::{Encode as _, RangeCfg, Read};
 use commonware_coding::CodecConfig;
 use commonware_consensus::{
@@ -20,7 +23,7 @@ use commonware_consensus::{
         resolver::p2p as marshal_resolver,
     },
     simplex::{self, elector::Config as Elector, types::Finalization},
-    types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, Height, ViewDelta, coding::Commitment},
 };
 #[cfg(all(test, feature = "test-utils"))]
 use commonware_cryptography::Committable;
@@ -75,6 +78,10 @@ use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -620,7 +627,7 @@ where
         let genesis_commitment = coded_genesis.commitment();
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
-        let (marshal, marshal_mailbox, _) = MarshalActor::init(
+        let (marshal, marshal_mailbox, recovered_processed_height) = MarshalActor::init(
             context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
@@ -643,6 +650,9 @@ where
             },
         )
         .await;
+        let finalized_application_height = Arc::new(AtomicU64::new(
+            encode_finalized_application_height(recovered_processed_height),
+        ));
         probe_mailbox.attach(marshal_mailbox.clone());
 
         let (shards, shard_mailbox) = shards::Engine::new(
@@ -661,6 +671,34 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
+        let external_finalized_hook = config.finalized_hook;
+        let finalized_application_height_for_hook = finalized_application_height.clone();
+        #[expect(
+            clippy::type_complexity,
+            reason = "the hook is parameterized by the engine's full block payload"
+        )]
+        let finalized_hook: FinalizedHookFn<
+            E,
+            Commitment,
+            H,
+            C::PublicKey,
+            Payload<V, C, network::Addresses<C::PublicKey>>,
+            St,
+        > = Arc::new(move |block, databases| {
+            // Stateful invokes this hook only after committing the finalized
+            // batch to every managed database. Publish before invoking the
+            // optional external hook so its latency cannot delay DKG readers.
+            finalized_application_height_for_hook.fetch_max(
+                encode_finalized_application_height(Some(Height::new(block.header.height))),
+                Ordering::Release,
+            );
+            let external_finalized_hook = external_finalized_hook.clone();
+            Box::pin(async move {
+                if let Some(hook) = external_finalized_hook {
+                    hook(block, databases).await;
+                }
+            })
+        });
         let application = Application::new(
             context.child("application"),
             config.strategy.clone(),
@@ -675,7 +713,7 @@ where
             eligible_peers_root,
             config.blocks_per_epoch,
             config.eligible_peers.keys().clone(),
-            config.finalized_hook,
+            Some(finalized_hook),
         );
         let state_sync = probe_artifact.map(|artifact| StateSync {
             info: artifact.info,
@@ -736,7 +774,7 @@ where
             config.genesis.players.clone(),
             config.genesis.next_players.clone(),
             config.eligible_peers,
-            marshal_mailbox.clone(),
+            finalized_application_height,
             config.blocks_per_epoch,
         );
         let registrar = Registrar::new(consensus_namespace, provider.clone());

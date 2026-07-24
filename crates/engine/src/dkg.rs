@@ -1,14 +1,11 @@
 //! DKG scheme registration and committee integration.
 
 use crate::ThresholdScheme;
-use commonware_consensus::{
-    marshal::core::{Mailbox as MarshalMailbox, Variant as MarshalVariant},
-    types::{Epoch, Epocher as _, FixedEpocher, Height},
-};
+use commonware_consensus::types::{Epoch, Epocher as _, FixedEpocher, Height};
 use commonware_cryptography::{
     PublicKey,
     bls12381::primitives::variant::Variant,
-    certificate::{Provider, Scheme, Scoped},
+    certificate::{Provider, Scoped},
     ed25519,
 };
 use commonware_glue::dkg::{
@@ -28,9 +25,30 @@ use futures::{
     FutureExt as _,
     future::{BoxFuture, Shared},
 };
-use std::{collections::HashMap, future::Future, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    future::Future,
+    num::NonZeroU64,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
+};
 
 type SchemeRegistry<P, V> = Arc<Mutex<HashMap<Epoch, Arc<ThresholdScheme<P, V>>>>>;
+
+/// Encodes an optional applied height for storage in an atomic watermark.
+///
+/// Zero means no block has been applied; applied heights are shifted by one so
+/// genesis (height zero) remains distinguishable from that state.
+pub(crate) fn encode_finalized_application_height(height: Option<Height>) -> u64 {
+    height.map_or(0, |height| height.next().get())
+}
+
+fn application_finalized_through(watermark: &AtomicU64, cutoff: Height) -> bool {
+    watermark.load(Ordering::Acquire) > cutoff.get()
+}
 
 fn committed_committee_cutoff(epocher: &FixedEpocher, requested: Epoch) -> Option<Height> {
     let source = requested.previous()?.previous()?;
@@ -160,30 +178,26 @@ where
 
 /// Reads committees from finalized application state and resolves their exact
 /// lookup address directories.
-pub struct CommitteeParticipants<E, H, St, S, MV>
+pub struct CommitteeParticipants<E, H, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: commonware_cryptography::Hasher,
     St: Strategy,
-    S: Scheme,
-    MV: MarshalVariant,
 {
     context: E,
     database: Shared<BoxFuture<'static, CommitteeDatabase<E, H, EightCap, St>>>,
     genesis_players: Set<ed25519::PublicKey>,
     genesis_next_players: Set<ed25519::PublicKey>,
     addresses: Arc<Map<ed25519::PublicKey, Address>>,
-    marshal: MarshalMailbox<S, MV>,
+    finalized_application_height: Arc<AtomicU64>,
     epocher: FixedEpocher,
 }
 
-impl<E, H, St, S, MV> CommitteeParticipants<E, H, St, S, MV>
+impl<E, H, St> CommitteeParticipants<E, H, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: commonware_cryptography::Hasher,
     St: Strategy,
-    S: Scheme,
-    MV: MarshalVariant,
 {
     /// Creates a committed-state participant provider.
     pub fn new<F>(
@@ -192,7 +206,7 @@ where
         genesis_players: Set<ed25519::PublicKey>,
         genesis_next_players: Set<ed25519::PublicKey>,
         addresses: Map<ed25519::PublicKey, Address>,
-        marshal: MarshalMailbox<S, MV>,
+        finalized_application_height: Arc<AtomicU64>,
         blocks_per_epoch: NonZeroU64,
     ) -> Self
     where
@@ -204,7 +218,7 @@ where
             genesis_players,
             genesis_next_players,
             addresses: Arc::new(addresses),
-            marshal,
+            finalized_application_height,
             epocher: FixedEpocher::new(blocks_per_epoch),
         }
     }
@@ -214,13 +228,11 @@ where
     }
 }
 
-impl<E, H, St, S, MV> ParticipantsProvider for CommitteeParticipants<E, H, St, S, MV>
+impl<E, H, St> ParticipantsProvider for CommitteeParticipants<E, H, St>
 where
     E: BufferPooler + Storage + Metrics + Clock,
     H: commonware_cryptography::Hasher,
     St: Strategy,
-    S: Scheme<PublicKey = ed25519::PublicKey>,
-    MV: MarshalVariant,
 {
     type PublicKey = ed25519::PublicKey;
     type Directory = Addresses<ed25519::PublicKey>;
@@ -228,12 +240,7 @@ where
     async fn participants(&mut self, epoch: Epoch) -> Set<Self::PublicKey> {
         if let Some(cutoff) = self.committed_cutoff(epoch) {
             loop {
-                if self
-                    .marshal
-                    .get_processed_height()
-                    .await
-                    .is_some_and(|processed| processed >= cutoff)
-                {
+                if application_finalized_through(&self.finalized_application_height, cutoff) {
                     break;
                 }
                 self.context.sleep(Duration::from_millis(10)).await;
@@ -273,9 +280,15 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::committed_committee_cutoff;
+    use super::{
+        application_finalized_through, committed_committee_cutoff,
+        encode_finalized_application_height,
+    };
     use commonware_consensus::types::{Epoch, FixedEpocher, Height};
-    use std::num::NonZeroU64;
+    use std::{
+        num::NonZeroU64,
+        sync::atomic::{AtomicU64, Ordering},
+    };
 
     #[test]
     fn committed_committee_cutoff_precedes_final_two_blocks() {
@@ -291,5 +304,24 @@ mod tests {
             committed_committee_cutoff(&epocher, Epoch::new(3)),
             Some(Height::new(13))
         );
+    }
+
+    #[test]
+    fn finalized_application_watermark_distinguishes_none_and_genesis() {
+        let watermark = AtomicU64::new(encode_finalized_application_height(None));
+        assert!(!application_finalized_through(&watermark, Height::zero()));
+
+        watermark.store(
+            encode_finalized_application_height(Some(Height::zero())),
+            Ordering::Release,
+        );
+        assert!(application_finalized_through(&watermark, Height::zero()));
+        assert!(!application_finalized_through(&watermark, Height::new(1)));
+
+        watermark.store(
+            encode_finalized_application_height(Some(Height::new(1))),
+            Ordering::Release,
+        );
+        assert!(application_finalized_through(&watermark, Height::new(1)));
     }
 }
