@@ -317,6 +317,12 @@ impl Reporter for IndexerReporter {
         let Update::Block(block, acknowledgement) = activity else {
             return Feedback::Ok;
         };
+        // Marshal reports the trusted genesis block to applications, but
+        // genesis has no Simplex finalization certificate to publish.
+        if block.height().get() == 0 {
+            acknowledgement.acknowledge();
+            return Feedback::Ok;
+        }
         if self.sender.send((block, acknowledgement)).is_ok() {
             Feedback::Ok
         } else {
@@ -1305,9 +1311,9 @@ mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedBlockLogger,
-        FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor, ValidatorPayload,
-        add_persistent_secondaries, default_mempool_drop_grace_blocks, maybe_build_indexer,
-        recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor, IndexerReporter,
+        ValidatorPayload, add_persistent_secondaries, default_mempool_drop_grace_blocks,
+        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
         wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
@@ -1398,6 +1404,24 @@ mod tests {
             Feedback::Ok
         );
         assert!(waiter.now_or_never().unwrap().is_ok());
+    }
+
+    #[test]
+    fn indexer_reporter_acknowledges_genesis_without_requesting_a_finalization() {
+        let block = queued_upload(0, 0, 1, 0, 1, 0, 1).block();
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut reporter = IndexerReporter { sender };
+        let (acknowledgement, waiter) = Exact::handle();
+
+        assert_eq!(
+            reporter.report(Update::Block(block, acknowledgement)),
+            Feedback::Ok
+        );
+        assert!(waiter.now_or_never().unwrap().is_ok());
+        assert!(
+            receiver.try_recv().is_err(),
+            "genesis must not enter the finalization lookup queue"
+        );
     }
 
     #[tokio::test]
