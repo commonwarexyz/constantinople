@@ -36,7 +36,13 @@ use commonware_runtime::{
 };
 use commonware_utils::ordered::Set;
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
-use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{
+    future::Future,
+    marker::PhantomData,
+    num::NonZeroU64,
+    pin::Pin,
+    sync::Arc,
+};
 
 mod body;
 mod committee;
@@ -96,6 +102,7 @@ where
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     genesis_committee_target: CommitteeSyncTarget<H::Digest>,
     genesis_payload: R,
+    blocks_per_epoch: NonZeroU64,
     initial_committee: Committee,
     eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, R, St>>,
@@ -124,6 +131,7 @@ where
             genesis_transactions_target: self.genesis_transactions_target.clone(),
             genesis_committee_target: self.genesis_committee_target.clone(),
             genesis_payload: self.genesis_payload.clone(),
+            blocks_per_epoch: self.blocks_per_epoch,
             initial_committee: self.initial_committee.clone(),
             eligible_committee_members: self.eligible_committee_members.clone(),
             finalized_hook: self.finalized_hook.clone(),
@@ -160,6 +168,7 @@ where
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
         genesis_committee_target: CommitteeSyncTarget<H::Digest>,
         genesis_info: commonware_glue::dkg::types::EpochInfo<V, ed25519::PublicKey, Dir>,
+        blocks_per_epoch: NonZeroU64,
         initial_committee: Committee,
         eligible_committee_members: Set<ed25519::PublicKey>,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, Payload<V, D, Dir>, St>>,
@@ -179,6 +188,7 @@ where
             genesis_transactions_target,
             genesis_committee_target,
             genesis_payload: Payload::EpochInfo(genesis_info),
+            blocks_per_epoch,
             initial_committee,
             eligible_committee_members: Arc::new(eligible_committee_members),
             finalized_hook,

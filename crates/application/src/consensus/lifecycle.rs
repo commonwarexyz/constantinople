@@ -1,7 +1,7 @@
 //! Propose, verify, and apply entry points.
 
 use super::{
-    Application, BLOCKS_PER_EPOCH,
+    Application,
     body::{verify_signatures, wait_for_timestamp},
     execution::{
         apply_prepared_body, commitments_match, execute_body, execute_proposal, prepare_lazy,
@@ -56,6 +56,7 @@ where
 
 fn valid_payload<V, D, Dir>(
     height: u64,
+    blocks_per_epoch: u64,
     payload: Option<&Payload<V, D, Dir>>,
     entering: &super::Committee,
     selected: &super::Committee,
@@ -65,12 +66,12 @@ where
     D: Signer<PublicKey = ed25519::PublicKey>,
     Dir: Directory<ed25519::PublicKey>,
 {
-    let relative = height % BLOCKS_PER_EPOCH;
-    if relative == BLOCKS_PER_EPOCH - 1 {
+    let relative = height % blocks_per_epoch;
+    if relative == blocks_per_epoch - 1 {
         let Some(Payload::EpochInfo(info)) = payload else {
             return false;
         };
-        let epoch = Epoch::new(height / BLOCKS_PER_EPOCH);
+        let epoch = Epoch::new(height / blocks_per_epoch);
         return info.epoch == epoch.next()
             && &info.players == entering.members()
             && &info.next_players == selected.members();
@@ -78,7 +79,7 @@ where
 
     match payload {
         None => true,
-        Some(Payload::DealerLog(_)) => relative >= BLOCKS_PER_EPOCH / 2,
+        Some(Payload::DealerLog(_)) => relative >= blocks_per_epoch / 2,
         Some(Payload::EpochInfo(_)) => false,
     }
 }
@@ -148,6 +149,7 @@ where
             input,
             &self.initial_committee,
             self.eligible_committee_members.clone(),
+            self.blocks_per_epoch.get(),
         )
         .await;
 
@@ -165,6 +167,7 @@ where
 
         if !valid_payload(
             parent_height + 1,
+            self.blocks_per_epoch.get(),
             payload.as_ref(),
             &execution.block.entering_committee,
             &execution.block.selected_committee,
@@ -280,6 +283,7 @@ where
             body,
             &self.initial_committee,
             self.eligible_committee_members.clone(),
+            self.blocks_per_epoch.get(),
         );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
 
@@ -305,6 +309,7 @@ where
         if !commitments_match(&header, &execution)
             || !valid_payload(
                 header.height,
+                self.blocks_per_epoch.get(),
                 header.payload.as_ref(),
                 &execution.entering_committee,
                 &execution.selected_committee,
@@ -365,12 +370,14 @@ where
             strategy,
             &self.initial_committee,
             &self.eligible_committee_members,
+            self.blocks_per_epoch.get(),
         )
         .await
         .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
         assert!(
             valid_payload(
                 block.header.height,
+                self.blocks_per_epoch.get(),
                 block.header.payload.as_ref(),
                 &execution.entering_committee,
                 &execution.selected_committee,
@@ -383,8 +390,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{BLOCKS_PER_EPOCH, valid_payload};
-    use crate::consensus::Committee;
+    use super::valid_payload;
+    use crate::consensus::{BLOCKS_PER_EPOCH, Committee};
     use commonware_consensus::types::Epoch;
     use commonware_cryptography::{
         Signer as _,
@@ -460,6 +467,7 @@ mod tests {
 
         assert!(valid_payload(
             height,
+            BLOCKS_PER_EPOCH,
             Some(&TestPayload::EpochInfo(valid.clone())),
             &entering,
             &selected,
@@ -474,16 +482,22 @@ mod tests {
         for invalid in [wrong_epoch, wrong_players, wrong_next_players] {
             assert!(!valid_payload(
                 height,
+                BLOCKS_PER_EPOCH,
                 Some(&TestPayload::EpochInfo(invalid)),
                 &entering,
                 &selected,
             ));
         }
         assert!(!valid_payload::<MinSig, ed25519::PrivateKey, ()>(
-            height, None, &entering, &selected,
+            height,
+            BLOCKS_PER_EPOCH,
+            None,
+            &entering,
+            &selected,
         ));
         assert!(!valid_payload(
             height,
+            BLOCKS_PER_EPOCH,
             Some(&dealer_log()),
             &entering,
             &selected,
@@ -499,13 +513,21 @@ mod tests {
 
         assert!(!valid_payload(
             midpoint - 1,
+            BLOCKS_PER_EPOCH,
             Some(&log),
             &committee,
             &committee,
         ));
-        assert!(valid_payload(midpoint, Some(&log), &committee, &committee,));
+        assert!(valid_payload(
+            midpoint,
+            BLOCKS_PER_EPOCH,
+            Some(&log),
+            &committee,
+            &committee,
+        ));
         assert!(valid_payload(
             BLOCKS_PER_EPOCH - 2,
+            BLOCKS_PER_EPOCH,
             Some(&log),
             &committee,
             &committee,
@@ -518,6 +540,7 @@ mod tests {
         );
         assert!(!valid_payload(
             midpoint,
+            BLOCKS_PER_EPOCH,
             Some(&TestPayload::EpochInfo(early_info)),
             &committee,
             &committee,

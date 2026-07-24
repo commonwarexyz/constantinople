@@ -253,6 +253,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             transaction_target.clone(),
             committee_target.clone(),
             genesis_info,
+            NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
             genesis_committee,
             eligible_committee_members.clone(),
             None,
@@ -381,6 +382,7 @@ async fn execute_committee_block(
         body,
         &harness.initial,
         Arc::new(harness.eligible.clone()),
+        BLOCKS_PER_EPOCH,
     )
     .await?;
     let committees = (
@@ -1072,6 +1074,7 @@ fn build_timeout_bounds_refill_rounds() {
             harness.transaction_target.clone(),
             harness.committee_target.clone(),
             test_genesis_info(Set::from_iter_dedup([harness.leader.public_key()])),
+            NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
             Committee::new(Set::from_iter_dedup([harness.leader.public_key()]))
                 .expect("deadline genesis committee"),
             harness.eligible_committee_members.clone(),

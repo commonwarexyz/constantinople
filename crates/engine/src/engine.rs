@@ -655,6 +655,7 @@ where
             application_transactions_target,
             application_committee_target,
             config.genesis.clone(),
+            config.blocks_per_epoch,
             Committee::new(config.genesis.players.clone())
                 .expect("genesis participants must form a valid committee"),
             config.eligible_peers.keys().clone(),

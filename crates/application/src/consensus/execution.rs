@@ -88,7 +88,7 @@
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
-    committee::{BLOCKS_PER_EPOCH, Committee, epoch_key},
+    committee::{Committee, epoch_key},
     db::{
         self, CommitteeBatch, StateBatch, StateStaged, StateUpdates, TransactionBatch,
         apply_transaction_digests,
@@ -212,8 +212,9 @@ where
         mut batch: CommitteeBatch<E, H, EightCap, S>,
         height: u64,
         initial: &Committee,
+        blocks_per_epoch: u64,
     ) -> Self {
-        let epoch = Epoch::new(height / BLOCKS_PER_EPOCH);
+        let epoch = Epoch::new(height / blocks_per_epoch);
         if height == 1
             && batch
                 .get(&epoch_key(Epoch::zero()))
@@ -251,7 +252,7 @@ where
             Some(committee) => committee,
             None => entering.clone(),
         };
-        let final_block = height % BLOCKS_PER_EPOCH == BLOCKS_PER_EPOCH - 1;
+        let final_block = height % blocks_per_epoch == blocks_per_epoch - 1;
         Self {
             batch,
             target,
@@ -556,6 +557,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I, R>(
     input: &mut I,
     initial_committee: &Committee,
     eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
+    blocks_per_epoch: u64,
 ) -> ProposalExecution<E, H, S>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -571,9 +573,13 @@ where
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
-    let mut committee_execution =
-        CommitteeExecution::load(committee_batch, parent_header.height + 1, initial_committee)
-            .await;
+    let mut committee_execution = CommitteeExecution::load(
+        committee_batch,
+        parent_header.height + 1,
+        initial_committee,
+        blocks_per_epoch,
+    )
+    .await;
 
     // The history append for a round's accepted digests runs on the pool
     // while later rounds refill, prepare, stage, and select; rounds chain on
@@ -803,6 +809,7 @@ pub(super) async fn execute_body<E, H, S>(
     body: PreparedBody<H>,
     initial_committee: &Committee,
     eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
+    blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -815,7 +822,13 @@ where
         .await?;
 
     let transaction_count = actions.len();
-    let mut committee = CommitteeExecution::load(committee_batch, height, initial_committee).await;
+    let mut committee = CommitteeExecution::load(
+        committee_batch,
+        height,
+        initial_committee,
+        blocks_per_epoch,
+    )
+    .await;
     for mutation in actions
         .iter()
         .filter_map(|action| action.committee.as_ref())
@@ -871,13 +884,20 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     strategy: S,
     initial_committee: &Committee,
     eligible_committee_members: &Set<ed25519::PublicKey>,
+    blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let mut committee = CommitteeExecution::load(committee_batch, height, initial_committee).await;
+    let mut committee = CommitteeExecution::load(
+        committee_batch,
+        height,
+        initial_committee,
+        blocks_per_epoch,
+    )
+    .await;
     for mutation in actions
         .iter()
         .filter_map(|action| action.committee.as_ref())
