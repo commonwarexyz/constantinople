@@ -10,6 +10,71 @@ use commonware_utils::{ordered::Set, sequence::U64, sync::Mutex};
 use std::{collections::BTreeMap, future::Future, path::PathBuf, pin::Pin, sync::Arc};
 
 #[derive(Clone)]
+pub(crate) struct FinalizedBlockHasTransactions {
+    height: u64,
+    transactions: usize,
+    participants: Set<TestPublicKey>,
+}
+
+impl FinalizedBlockHasTransactions {
+    pub(crate) const fn new(
+        height: u64,
+        transactions: usize,
+        participants: Set<TestPublicKey>,
+    ) -> Self {
+        Self {
+            height,
+            transactions,
+            participants,
+        }
+    }
+}
+
+impl Property<TestPublicKey, ValidatorState> for FinalizedBlockHasTransactions {
+    fn name(&self) -> &str {
+        "finalized_block_has_transactions"
+    }
+
+    fn check<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<TestPublicKey>,
+        states: &'a [&'a ValidatorState],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let mut found = 0usize;
+            for participant in self.participants.iter() {
+                let Some(state) = states
+                    .iter()
+                    .copied()
+                    .find(|state| &state.public_key == participant)
+                else {
+                    continue;
+                };
+                let Some(block) = state.block_at_height(self.height).await else {
+                    continue;
+                };
+                let actual = block.inner().body.len();
+                if actual != self.transactions {
+                    return Err(format!(
+                        "block at height {} has {actual} transactions, expected {}",
+                        self.height, self.transactions,
+                    ));
+                }
+                found += 1;
+            }
+            let quorum = self.participants.len() * 2 / 3 + 1;
+            if found < quorum {
+                return Err(format!(
+                    "only {found} participants retained block at height {}, expected quorum {quorum}",
+                    self.height,
+                ));
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone)]
 pub(crate) struct ParticipantQuorumFinalizedHeightAtLeast {
     height: u64,
     participants: Set<TestPublicKey>,

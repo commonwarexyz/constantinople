@@ -252,6 +252,12 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: EngineBlockCfg<C, V>,
+    /// Maximum non-fixed-size bytes accepted in an erasure-coded block shard.
+    ///
+    /// This must accommodate shards produced by the application's maximum
+    /// proposal size. It remains explicit because the block codec constrains
+    /// transaction count, not total encoded bytes.
+    pub maximum_shard_size: usize,
     pub prunable_items_per_section: NonZero<u64>,
     /// Capacity in bytes of the state QMDB page cache.
     ///
@@ -645,7 +651,7 @@ where
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
                 shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
+                    maximum_shard_size: config.maximum_shard_size,
                 },
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),

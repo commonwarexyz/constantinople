@@ -15,6 +15,7 @@ use common::{
     TestHasher, TestPrivateKey, TestPublicKey, TestReporter, TrackLog, ValidatorState,
     validator_fixture,
 };
+use commonware_codec::EncodeSize as _;
 use commonware_consensus::{
     Heightable as _,
     marshal::Identifier,
@@ -67,6 +68,7 @@ use std::{
 use tracing::warn;
 
 pub(crate) const TEST_EPOCH_LENGTH: NonZeroU64 = NZU64!(64);
+pub(crate) const LARGE_PROPOSAL_TRANSACTIONS: usize = 16_384;
 const ENGINE_NAMESPACE: &[u8] = b"constantinople-engine-test";
 const DKG_NAMESPACE: &[u8] = b"constantinople-engine-test-dkg";
 const MAX_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
@@ -214,6 +216,38 @@ impl TestEngineDefinition {
             directory: directory(&initial, &eligible),
         };
         Self::from_parts(signers, output, shares, genesis, eligible, BTreeMap::new())
+    }
+
+    pub(crate) fn with_large_proposal(mut self) -> Self {
+        let sender = &self.signers[1];
+        let sender_key = TransactionPublicKey::ed25519(sender.public_key());
+        let peer = self.signers[4].public_key();
+        let transactions = (0..LARGE_PROPOSAL_TRANSACTIONS)
+            .map(|nonce| {
+                Transaction::set_committee_member(
+                    sender_key.clone(),
+                    Epoch::new(2),
+                    peer.clone(),
+                    nonce % 2 == 0,
+                    nonce as u64,
+                )
+                .seal_and_sign(
+                    sender,
+                    TRANSACTION_NAMESPACE,
+                    &mut TestHasher::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let encoded_bytes = transactions
+            .iter()
+            .map(|transaction| transaction.encode_size())
+            .sum::<usize>();
+        assert!(
+            encoded_bytes > 2 * 1024 * 1024,
+            "large proposal must produce a Reed-Solomon shard larger than 1 MiB",
+        );
+        self.proposals.insert(1, transactions);
+        self
     }
 
     fn from_parts(
@@ -525,6 +559,7 @@ impl EngineDefinition for TestEngineDefinition {
                             commonware_codec::RangeCfg::new(0..=192),
                         ),
                     },
+                    maximum_shard_size: 8 * 1024 * 1024,
                     prunable_items_per_section: NZU64!(4096),
                     state_page_cache_bytes: 32 * 1024 * 1024,
                     other_page_cache_bytes: 32 * 1024 * 1024,

@@ -1,9 +1,9 @@
 //! Real multi-node Engine coverage for epoch-scoped DKG integration.
 
-use super::{TestEngineDefinition, final_height, plan};
+use super::{LARGE_PROPOSAL_TRANSACTIONS, TestEngineDefinition, final_height, plan};
 use crate::tests::properties::{
-    FailedCeremonyCarriesCommittee, ParticipantQuorumFinalizedHeightAtLeast,
-    RestartedAcrossBoundary, TwoCommitteeRotations,
+    FailedCeremonyCarriesCommittee, FinalizedBlockHasTransactions,
+    ParticipantQuorumFinalizedHeightAtLeast, RestartedAcrossBoundary, TwoCommitteeRotations,
 };
 use commonware_glue::simulate::{action::Crash, engine::EngineDefinition as _};
 use commonware_macros::{test_group, test_traced};
@@ -16,6 +16,25 @@ fn engine_stable_control_crosses_three_boundaries() {
     plan(engine)
         .exit_condition(ParticipantQuorumFinalizedHeightAtLeast::new(
             final_height(2),
+            participants,
+        ))
+        .run()
+        .unwrap();
+}
+
+#[test_group("slow")]
+#[test_traced("WARN")]
+fn engine_finalizes_shards_larger_than_one_mibibyte() {
+    let engine = TestEngineDefinition::rotating().with_large_proposal();
+    let participants = engine.initial_players();
+    plan(engine)
+        .exit_condition(ParticipantQuorumFinalizedHeightAtLeast::new(
+            1,
+            participants.clone(),
+        ))
+        .property(FinalizedBlockHasTransactions::new(
+            1,
+            LARGE_PROPOSAL_TRANSACTIONS,
             participants,
         ))
         .run()

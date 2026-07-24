@@ -91,6 +91,8 @@ use tracing::{info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 const DKG_NAMESPACE: &[u8] = b"_CONSTANTINOPLE_DKG";
+// Leave room for block headers and DKG payloads when the transaction budget is tiny.
+const SHARD_SIZE_FLOOR: usize = 1024 * 1024;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
@@ -1197,6 +1199,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                             RangeCfg::new(0..=192),
                         ),
                     },
+                    maximum_shard_size: max_propose_bytes.max(SHARD_SIZE_FLOOR),
                     prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                     state_page_cache_bytes,
                     other_page_cache_bytes,
