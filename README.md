@@ -29,11 +29,21 @@ Constantinople is a high-throughput account-model blockchain example built on to
 
 | Primitive                                                                                                    | Role                                                     |
 |--------------------------------------------------------------------------------------------------------------|----------------------------------------------------------|
-| [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (simplex) | Single-epoch BFT consensus with BLS threshold signatures |
+| [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (simplex) | Epoch-scoped BFT consensus with reshared BLS threshold signatures |
 | [`commonware-consensus`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-consensus) (marshal) | Erasure-coded broadcast and backfill of finalized blocks |
 | [`commonware-storage`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-storage) (QMDB)        | Merkleized key-value database for state and transactions |
 | [`commonware-glue`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-glue) (stateful)          | Speculative state management and sync                    |
 | [`commonware-p2p`](https://github.com/commonwarexyz/monorepo/tree/main/commonware-p2p) (lookup)              | Authenticated peer-to-peer networking with lookup        |
+
+Consensus runs continuously in 1024-block epochs. A small stateful QMDB stores
+the committee selected for each epoch, and `glue::dkg` reshapes the threshold
+key as validators are added or removed. The explorer's committee page schedules
+changes two epochs ahead from the deployment's complete eligible-peer catalog.
+
+The included DKG secret store is deliberately naive, plaintext, and local to
+each validator. It uses restrictive filesystem permissions and durable atomic
+writes, but it is not production-grade secret management; production operators
+should replace it with encrypted or hardware-backed storage.
 
 ## Packages
 
