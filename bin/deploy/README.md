@@ -36,6 +36,38 @@ cargo run --bin constantinople -- \
   --peers ./local/peers.yaml
 ```
 
+### Add a validator to a running local network
+
+Extend an existing local bundle with a fresh Ed25519 identity and a
+state-syncing, non-genesis validator:
+
+```sh
+cargo run --bin constantinople-deploy -- generate-validator \
+  --output-dir ./local
+```
+
+The command writes the first available `joining-validator-N.yaml`, appends its
+loopback endpoint to `peers.yaml` under `secondaries`, updates `local-ports.yaml`
+and any generated local relayer's HTTP leader catalog, and prints the exact
+command to start the new validator. It deliberately leaves the genesis DKG, primary/secondary
+participant lists, and immutable `eligible_peers` bootstrap directory
+unchanged. Run the command again to create another joining validator.
+
+Ports are selected from the first unused loopback ports and are unique across
+all node P2P, HTTP, and metrics endpoints. Override them when needed:
+
+```sh
+cargo run --bin constantinople-deploy -- generate-validator \
+  --output-dir ./local \
+  --p2p-port 10000 \
+  --http-port 10001 \
+  --metrics-port 10002
+```
+
+Overrides must be nonzero and unused. The command rejects non-loopback peer
+topologies because joining existing remote deployments requires deployer and
+host provisioning that this local-only operation does not perform.
+
 Run the whole local cluster with the printed `mprocs` command, or start each validator in a
 separate terminal:
 

@@ -1,23 +1,33 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
-    PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
-    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, eligible_peer_entries,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    GenerateValidatorArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
+    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
+    absolute_path, eligible_peer_entries, ensure_output_dir_missing,
+    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
+use commonware_cryptography::{Signer, ed25519};
 use commonware_formatting::hex;
+use commonware_math::algebra::Random;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use std::{
-    collections::BTreeMap,
-    fs,
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
+    io::Write as _,
+    net::SocketAddr,
     path::{Path, PathBuf},
 };
 use tracing::info;
 
 const MAX_LOCAL_VALIDATORS: u32 = 64;
 const DEFAULT_EXPLORER_PORT: u16 = 5173;
+const DEFAULT_JOINING_P2P_PORT: u16 = 9000;
+const DEFAULT_JOINING_HTTP_PORT: u16 = 8080;
+const DEFAULT_JOINING_METRICS_PORT: u16 = 9090;
+const LOCAL_PORTS_FILE: &str = "local-ports.yaml";
+const PENDING_VALIDATOR_FILE: &str = ".joining-validator.pending.yaml";
 
 struct GeneratedValidator {
     config_file: PathBuf,
@@ -48,6 +58,26 @@ struct LocalPortPlan {
     explorer: Option<u16>,
     spammer_metrics: Option<u16>,
     relayer_http: Option<u16>,
+    reserved: BTreeMap<u16, String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LocalPortManifest {
+    ports: BTreeMap<u16, String>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PendingValidatorGeneration {
+    public_key: String,
+    p2p: String,
+    config_file: String,
+    files: Vec<PendingBundleFile>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct PendingBundleFile {
+    name: String,
+    contents: String,
 }
 
 impl LocalPortPlan {
@@ -113,6 +143,7 @@ impl LocalPortPlan {
             explorer,
             spammer_metrics,
             relayer_http,
+            reserved: allocator.reserved,
         }
     }
 
@@ -162,7 +193,7 @@ fn offset_port(base: u16, offset: usize, owner: &str) -> u16 {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     validate_generate_args(args);
-    let _port_plan = LocalPortPlan::new(args, local);
+    let port_plan = LocalPortPlan::new(args, local);
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -189,6 +220,12 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
         write_yaml_config(&secondary.config_file, &secondary.config);
     }
     write_yaml_config(&output_dir.join(PEERS_CONFIG_FILE), &peers);
+    write_yaml_config(
+        &output_dir.join(LOCAL_PORTS_FILE),
+        &LocalPortManifest {
+            ports: port_plan.reserved,
+        },
+    );
     write_simplex_verification_material(&output_dir, &material);
 
     print_local_run_commands(
@@ -198,6 +235,406 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
         &[],
         &material.simplex_verification_material_hex(),
     );
+}
+
+/// Extend an existing local bundle with a non-genesis validator identity.
+pub(super) fn generate_validator(args: &GenerateValidatorArgs) {
+    let output_dir = absolute_path(&args.output_dir);
+    assert!(
+        output_dir.is_dir(),
+        "output directory does not exist: {}",
+        output_dir.display()
+    );
+    if recover_pending_validator(&output_dir) {
+        return;
+    }
+
+    let template_path = output_dir.join("validator-0.yaml");
+    let mut config: ValidatorConfig = read_yaml_config(&template_path, "validator template");
+    let peers_path = output_dir.join(PEERS_CONFIG_FILE);
+    let mut peers: PeersConfig = read_yaml_config(&peers_path, "peers config");
+    let mut used_ports = validate_local_peers_and_collect_ports(&peers);
+    let mut relayer_configs = Vec::new();
+    let mut genesis_node_metrics = Vec::new();
+    let mut has_indexer = false;
+
+    for path in validator_config_paths(&output_dir) {
+        let raw = fs::read_to_string(&path).unwrap_or_else(|error| {
+            panic!(
+                "failed to read validator config '{}': {error}",
+                path.display()
+            )
+        });
+        let yaml: serde_yaml::Value = serde_yaml::from_str(&raw).unwrap_or_else(|error| {
+            panic!(
+                "failed to parse validator config '{}': {error}",
+                path.display()
+            )
+        });
+        let existing: ValidatorConfig =
+            serde_yaml::from_value(yaml.clone()).unwrap_or_else(|error| {
+                panic!(
+                    "failed to decode validator config '{}': {error}",
+                    path.display()
+                )
+            });
+        reserve_existing_port(&mut used_ports, existing.metrics_port, &path, "metrics");
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("joining-validator-"))
+        {
+            genesis_node_metrics.push(existing.metrics_port);
+        }
+        if existing.relayer.is_some() {
+            relayer_configs.push((path, yaml));
+        }
+        if let Some(indexer) = existing.indexer.as_ref() {
+            has_indexer = true;
+            if let Some(port) = local_url_port(&indexer.chain_indexer_url) {
+                used_ports
+                    .entry(port)
+                    .or_insert_with(|| "legacy chain-indexer service".to_string());
+            }
+        }
+    }
+    let manifest_path = output_dir.join(LOCAL_PORTS_FILE);
+    if manifest_path.exists() {
+        let manifest: LocalPortManifest = read_yaml_config(&manifest_path, "local port manifest");
+        for (port, owner) in manifest.ports {
+            used_ports.entry(port).or_insert(owner);
+        }
+    } else {
+        reserve_legacy_service_ports(&mut used_ports, &genesis_node_metrics, has_indexer);
+    }
+
+    let p2p = allocate_joining_port(
+        &mut used_ports,
+        args.p2p_port,
+        DEFAULT_JOINING_P2P_PORT,
+        "p2p",
+    );
+    let http = allocate_joining_port(
+        &mut used_ports,
+        args.http_port,
+        DEFAULT_JOINING_HTTP_PORT,
+        "HTTP",
+    );
+    let metrics = allocate_joining_port(
+        &mut used_ports,
+        args.metrics_port,
+        DEFAULT_JOINING_METRICS_PORT,
+        "metrics",
+    );
+
+    let signer = ed25519::PrivateKey::random(UnwrapErr(SysRng));
+    let public_key = hex(&signer.public_key().encode());
+    let (index, config_path) = first_joining_config_path(&output_dir);
+
+    config.private_key = hex(&signer.encode());
+    config.dkg_share.clear();
+    config.startup = crate::StartupModeConfig::StateSync;
+    config.listen_port = p2p;
+    config.partition_prefix = format!("joining-validator-{index}");
+    config.http_port = http;
+    config.metrics_port = metrics;
+    config.indexer = None;
+    config.relayer = None;
+
+    peers.secondaries.push(PeerEntry {
+        name: public_key.clone(),
+        p2p: format!("127.0.0.1:{p2p}"),
+        http: format!("127.0.0.1:{http}"),
+    });
+    for (_, relayer) in &mut relayer_configs {
+        append_relayer_leader(
+            relayer,
+            RelayerLeaderConfig {
+                public_key: public_key.clone(),
+                url: format!("http://127.0.0.1:{http}"),
+            },
+        );
+    }
+
+    let mut files = vec![pending_yaml_file(&config_path, &config)];
+    files.push(pending_yaml_file(&peers_path, &peers));
+    files.extend(
+        relayer_configs
+            .iter()
+            .map(|(path, relayer)| pending_yaml_file(path, relayer)),
+    );
+    files.push(pending_yaml_file(
+        &manifest_path,
+        &LocalPortManifest { ports: used_ports },
+    ));
+    let pending = PendingValidatorGeneration {
+        public_key,
+        p2p: format!("127.0.0.1:{p2p}"),
+        config_file: config_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("joining config has a UTF-8 filename")
+            .to_string(),
+        files,
+    };
+    persist_pending_validator(&output_dir, &pending);
+    apply_pending_validator(&output_dir, pending);
+}
+
+fn pending_yaml_file(path: &Path, value: &impl serde::Serialize) -> PendingBundleFile {
+    PendingBundleFile {
+        name: path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("bundle file has a UTF-8 filename")
+            .to_string(),
+        contents: serde_yaml::to_string(value).expect("failed to serialize bundle update"),
+    }
+}
+
+fn persist_pending_validator(output_dir: &Path, pending: &PendingValidatorGeneration) {
+    let path = output_dir.join(PENDING_VALIDATOR_FILE);
+    let temporary = output_dir.join(format!("{PENDING_VALIDATOR_FILE}.tmp"));
+    let contents = serde_yaml::to_string(pending).expect("failed to serialize pending update");
+    write_synced(&temporary, contents.as_bytes(), "pending validator update");
+    fs::rename(&temporary, &path).expect("failed to publish pending validator update");
+    sync_directory(output_dir);
+}
+
+fn recover_pending_validator(output_dir: &Path) -> bool {
+    let path = output_dir.join(PENDING_VALIDATOR_FILE);
+    if !path.exists() {
+        return false;
+    }
+    let pending: PendingValidatorGeneration = read_yaml_config(&path, "pending validator update");
+    apply_pending_validator(output_dir, pending);
+    true
+}
+
+fn apply_pending_validator(output_dir: &Path, pending: PendingValidatorGeneration) {
+    for file in &pending.files {
+        assert_eq!(
+            Path::new(&file.name)
+                .file_name()
+                .and_then(|name| name.to_str()),
+            Some(file.name.as_str()),
+            "pending bundle update contains a non-local filename"
+        );
+        write_synced(
+            &output_dir.join(&file.name),
+            file.contents.as_bytes(),
+            &format!("bundle file '{}'", file.name),
+        );
+    }
+    sync_directory(output_dir);
+    fs::remove_file(output_dir.join(PENDING_VALIDATOR_FILE))
+        .expect("failed to clear pending validator update");
+    sync_directory(output_dir);
+    print_generated_validator(output_dir, &pending);
+}
+
+fn write_synced(path: &Path, contents: &[u8], kind: &str) {
+    let mut file = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)
+        .unwrap_or_else(|error| panic!("failed to open {kind} '{}': {error}", path.display()));
+    file.write_all(contents)
+        .unwrap_or_else(|error| panic!("failed to write {kind} '{}': {error}", path.display()));
+    file.sync_all()
+        .unwrap_or_else(|error| panic!("failed to sync {kind} '{}': {error}", path.display()));
+}
+
+fn sync_directory(path: &Path) {
+    fs::File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .unwrap_or_else(|error| panic!("failed to sync directory '{}': {error}", path.display()));
+}
+
+fn print_generated_validator(output_dir: &Path, pending: &PendingValidatorGeneration) {
+    let config_path = output_dir.join(&pending.config_file);
+    let peers_path = output_dir.join(PEERS_CONFIG_FILE);
+    println!("public key: {}", pending.public_key);
+    println!("p2p address: {}", pending.p2p);
+    println!("config path: {}", config_path.display());
+    println!(
+        "run: cargo run --release --bin constantinople -- --config {} --peers {}",
+        config_path.display(),
+        peers_path.display()
+    );
+}
+
+fn local_url_port(url: &str) -> Option<u16> {
+    url.strip_prefix("http://127.0.0.1:")?.parse().ok()
+}
+
+fn append_relayer_leader(config: &mut serde_yaml::Value, leader: RelayerLeaderConfig) {
+    let config = config
+        .as_mapping_mut()
+        .expect("validator config must be a YAML mapping");
+    let relayer = config
+        .get_mut("relayer")
+        .and_then(serde_yaml::Value::as_mapping_mut)
+        .expect("relayer config must be a YAML mapping");
+    let leaders = relayer
+        .get_mut("leaders")
+        .and_then(serde_yaml::Value::as_sequence_mut)
+        .expect("relayer leaders must be a YAML sequence");
+    leaders.push(serde_yaml::to_value(leader).expect("failed to serialize relayer leader"));
+}
+
+fn read_yaml_config<T: serde::de::DeserializeOwned>(path: &Path, kind: &str) -> T {
+    let raw = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("failed to read {kind} '{}': {error}", path.display()));
+    serde_yaml::from_str(&raw)
+        .unwrap_or_else(|error| panic!("failed to parse {kind} '{}': {error}", path.display()))
+}
+
+fn validate_local_peers_and_collect_ports(peers: &PeersConfig) -> BTreeMap<u16, String> {
+    let mut used = BTreeMap::new();
+    let mut names = BTreeSet::new();
+    for peer in peers.validators.iter().chain(&peers.secondaries) {
+        assert!(
+            names.insert(peer.name.clone()),
+            "duplicate peer name '{}'",
+            peer.name
+        );
+        for (kind, raw) in [("p2p", &peer.p2p), ("HTTP", &peer.http)] {
+            let address: SocketAddr = raw.parse().unwrap_or_else(|error| {
+                panic!(
+                    "peer '{}' has invalid {kind} address '{raw}': {error}",
+                    peer.name
+                )
+            });
+            assert!(
+                address.ip().is_loopback(),
+                "peer '{}' has non-loopback {kind} address '{raw}'; generate-validator is local-only",
+                peer.name
+            );
+            reserve_port(
+                &mut used,
+                address.port(),
+                format!("peer {} {kind}", peer.name),
+            );
+        }
+    }
+    used
+}
+
+fn validator_config_paths(output_dir: &Path) -> Vec<PathBuf> {
+    let mut paths = fs::read_dir(output_dir)
+        .expect("failed to read output directory")
+        .map(|entry| entry.expect("failed to read output directory entry").path())
+        .filter(|path| {
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                return false;
+            };
+            name.ends_with(".yaml")
+                && (name.starts_with("validator-")
+                    || name.starts_with("secondary-")
+                    || name.starts_with("joining-validator-"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn reserve_existing_port(used: &mut BTreeMap<u16, String>, port: u16, path: &Path, kind: &str) {
+    reserve_port(used, port, format!("{} {kind}", path.display()));
+}
+
+fn reserve_legacy_service_ports(
+    used: &mut BTreeMap<u16, String>,
+    genesis_node_metrics: &[u16],
+    has_indexer: bool,
+) {
+    // Older bundles did not persist the spammer and chain-indexer metrics
+    // ports. The local generator allocates at most those two immediately after
+    // the original nodes, so conservatively reserve both positions.
+    if let Some(last_node_metric) = genesis_node_metrics.iter().copied().max() {
+        let mut candidate = last_node_metric
+            .checked_add(1)
+            .expect("local metrics range is exhausted");
+        for owner in ["possible spammer metrics", "possible chain-indexer metrics"] {
+            while used.contains_key(&candidate) {
+                candidate = candidate
+                    .checked_add(1)
+                    .expect("local metrics range is exhausted");
+            }
+            reserve_port(used, candidate, owner.to_string());
+            candidate = candidate.saturating_add(1);
+        }
+    }
+
+    if has_indexer {
+        for (preferred, owner) in [
+            (8090, "legacy chain-indexer service"),
+            (8091, "legacy metadata-indexer service"),
+            (8092, "legacy qmdb-indexer service"),
+            (DEFAULT_EXPLORER_PORT, "legacy explorer service"),
+        ] {
+            reserve_preferred_port(used, preferred, owner);
+        }
+    }
+}
+
+fn reserve_preferred_port(used: &mut BTreeMap<u16, String>, preferred: u16, owner: &str) -> u16 {
+    for port in preferred..=u16::MAX {
+        if !used.contains_key(&port) {
+            reserve_port(used, port, owner.to_string());
+            return port;
+        }
+    }
+    panic!("no local port is available for {owner} at or above {preferred}");
+}
+
+fn reserve_port(used: &mut BTreeMap<u16, String>, port: u16, owner: String) {
+    assert_ne!(port, 0, "local port for {owner} must be non-zero");
+    if let Some(existing) = used.insert(port, owner.clone()) {
+        panic!("local port {port} is assigned to both {existing} and {owner}");
+    }
+}
+
+fn allocate_joining_port(
+    used: &mut BTreeMap<u16, String>,
+    requested: Option<u16>,
+    preferred: u16,
+    kind: &str,
+) -> u16 {
+    if let Some(port) = requested {
+        assert!(
+            local_port_available(port),
+            "local port {port} is already bound"
+        );
+        reserve_port(used, port, format!("joining validator {kind}"));
+        return port;
+    }
+    for port in preferred..=u16::MAX {
+        if local_port_available(port)
+            && let std::collections::btree_map::Entry::Vacant(entry) = used.entry(port)
+        {
+            entry.insert(format!("joining validator {kind}"));
+            return port;
+        }
+    }
+    panic!("no local port is available for joining validator {kind} at or above {preferred}");
+}
+
+fn local_port_available(port: u16) -> bool {
+    let tcp = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port));
+    let udp = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, port));
+    tcp.is_ok() && udp.is_ok()
+}
+
+fn first_joining_config_path(output_dir: &Path) -> (u32, PathBuf) {
+    for index in 0..=u32::MAX {
+        let path = output_dir.join(format!("joining-validator-{index}.yaml"));
+        if !path.exists() {
+            return (index, path);
+        }
+    }
+    unreachable!("all joining validator config names are occupied")
 }
 
 fn build_validators(
@@ -520,17 +957,23 @@ fn local_run_commands(
 
 #[cfg(test)]
 mod tests {
-    use super::{LocalPortPlan, build_secondaries, build_validators, local_run_commands};
+    use super::{
+        LocalPortPlan, allocate_joining_port, build_secondaries, build_validators,
+        generate_validator, local_run_commands, validate_local_peers_and_collect_ports,
+    };
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
-        default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries,
+        GenerateArgs, GenerateTarget, GenerateValidatorArgs, LocalArgs, PeerEntry, PeersConfig,
+        StartupModeConfig, ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, generate_local_cluster_material,
+        total_secondaries,
     };
     use commonware_codec::Encode as _;
     use commonware_formatting::hex;
     use std::{
         collections::BTreeMap,
+        fs,
         path::{Path, PathBuf},
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     const TEST_SIMPLEX_VERIFICATION_MATERIAL: &str = "abcdef";
@@ -600,6 +1043,228 @@ mod tests {
         if let Some(existing) = seen.insert(port, owner.clone()) {
             panic!("port {port} is assigned to both {existing} and {owner}");
         }
+    }
+
+    fn unique_temp_dir(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should follow unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "constantinople-deploy-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    #[test]
+    fn generate_validator_extends_bundle_repeatedly_without_changing_genesis() {
+        let output_dir = unique_temp_dir("joining-validator");
+        let mut args = test_args(false);
+        args.output_dir = output_dir.clone();
+        args.relayer = true;
+        super::generate(&args, local_args(&args));
+
+        let template: ValidatorConfig =
+            super::read_yaml_config(&output_dir.join("validator-0.yaml"), "template");
+        let original_eligible =
+            serde_yaml::to_value(&template.eligible_peers).expect("eligible peers serialize");
+        let joining_args = GenerateValidatorArgs {
+            output_dir: output_dir.clone(),
+            p2p_port: None,
+            http_port: None,
+            metrics_port: None,
+        };
+
+        generate_validator(&joining_args);
+        generate_validator(&joining_args);
+
+        let first: ValidatorConfig = super::read_yaml_config(
+            &output_dir.join("joining-validator-0.yaml"),
+            "joining config",
+        );
+        let second: ValidatorConfig = super::read_yaml_config(
+            &output_dir.join("joining-validator-1.yaml"),
+            "joining config",
+        );
+        assert_eq!(first.startup, StartupModeConfig::StateSync);
+        assert!(first.dkg_share.is_empty());
+        assert!(first.indexer.is_none());
+        assert!(first.relayer.is_none());
+        assert_eq!(first.partition_prefix, "joining-validator-0");
+        assert_eq!(second.partition_prefix, "joining-validator-1");
+        assert_ne!(first.private_key, second.private_key);
+        assert_eq!(first.dkg_output, template.dkg_output);
+        assert_eq!(first.genesis_leader, template.genesis_leader);
+        assert_eq!(first.primary_validators, template.primary_validators);
+        assert_eq!(first.secondary_validators, template.secondary_validators);
+        assert_eq!(
+            serde_yaml::to_value(&first.eligible_peers).expect("eligible peers serialize"),
+            original_eligible
+        );
+        assert_eq!(first.num_validators, template.num_validators);
+        assert_eq!(first.log_level, template.log_level);
+        assert_eq!(first.worker_threads, template.worker_threads);
+        assert_eq!(first.rayon_threads, template.rayon_threads);
+        assert_eq!(first.max_propose_bytes, template.max_propose_bytes);
+        assert_eq!(first.max_pool_bytes, template.max_pool_bytes);
+        assert_eq!(
+            first.state_page_cache_bytes,
+            template.state_page_cache_bytes
+        );
+        assert_eq!(
+            first.other_page_cache_bytes,
+            template.other_page_cache_bytes
+        );
+        assert_eq!(first.public_key_cache_size, template.public_key_cache_size);
+        assert_eq!(first.traces, template.traces);
+
+        let peers: PeersConfig = super::read_yaml_config(&output_dir.join("peers.yaml"), "peers");
+        assert_eq!(peers.secondaries.len(), 3);
+        let first_peer = &peers.secondaries[1];
+        let second_peer = &peers.secondaries[2];
+        assert_eq!(first_peer.p2p, format!("127.0.0.1:{}", first.listen_port));
+        assert_eq!(first_peer.http, format!("127.0.0.1:{}", first.http_port));
+        assert_ne!(first_peer.name, second_peer.name);
+
+        let relayer: ValidatorConfig =
+            super::read_yaml_config(&output_dir.join("secondary-0.yaml"), "relayer");
+        let leaders = &relayer
+            .relayer
+            .expect("relayer should remain configured")
+            .leaders;
+        assert_eq!(leaders.len(), 5);
+        assert_eq!(leaders[3].public_key, first_peer.name);
+        assert_eq!(leaders[3].url, format!("http://{}", first_peer.http));
+        assert_eq!(leaders[4].public_key, second_peer.name);
+        assert_eq!(leaders[4].url, format!("http://{}", second_peer.http));
+
+        let used = validate_local_peers_and_collect_ports(&peers);
+        assert!(!used.contains_key(&first.metrics_port));
+        assert_ne!(first.metrics_port, second.metrics_port);
+        assert!(!used.contains_key(&second.metrics_port));
+
+        fs::remove_dir_all(&output_dir).expect("failed to remove test bundle");
+    }
+
+    #[test]
+    fn generate_validator_avoids_full_stack_service_ports() {
+        let output_dir = unique_temp_dir("joining-validator-full-stack");
+        let mut args = test_args(true);
+        args.output_dir = output_dir.clone();
+        args.indexer = true;
+        args.relayer = true;
+        super::generate(&args, local_args(&args));
+
+        let manifest: super::LocalPortManifest =
+            super::read_yaml_config(&output_dir.join("local-ports.yaml"), "port manifest");
+        let chain_port = manifest
+            .ports
+            .iter()
+            .find_map(|(port, owner)| (owner == "chain-indexer service").then_some(*port))
+            .expect("chain indexer port must exist");
+        let collision = std::panic::catch_unwind(|| {
+            generate_validator(&GenerateValidatorArgs {
+                output_dir: output_dir.clone(),
+                p2p_port: Some(chain_port),
+                http_port: None,
+                metrics_port: None,
+            });
+        });
+        assert!(collision.is_err());
+        assert!(!output_dir.join("joining-validator-0.yaml").exists());
+
+        generate_validator(&GenerateValidatorArgs {
+            output_dir: output_dir.clone(),
+            p2p_port: None,
+            http_port: None,
+            metrics_port: None,
+        });
+        let joining: ValidatorConfig = super::read_yaml_config(
+            &output_dir.join("joining-validator-0.yaml"),
+            "joining validator",
+        );
+        let original_metrics = super::validator_config_paths(&output_dir)
+            .into_iter()
+            .filter(|path| {
+                !path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.starts_with("joining-validator-"))
+            })
+            .map(|path| super::read_yaml_config::<ValidatorConfig>(&path, "validator").metrics_port)
+            .collect::<Vec<_>>();
+        assert!(
+            joining.metrics_port
+                > original_metrics
+                    .into_iter()
+                    .max()
+                    .expect("original nodes have metrics")
+                    + 2
+        );
+        assert_ne!(joining.listen_port, chain_port);
+
+        fs::remove_dir_all(&output_dir).expect("failed to remove test bundle");
+    }
+
+    #[test]
+    fn joining_port_override_must_be_nonzero_and_globally_unused() {
+        let mut used = BTreeMap::from([(10_000, "existing".to_string())]);
+        let collision = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            allocate_joining_port(&mut used, Some(10_000), 9000, "p2p")
+        }));
+        assert!(collision.is_err());
+        let zero = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            allocate_joining_port(&mut used, Some(0), 9000, "p2p")
+        }));
+        assert!(zero.is_err());
+        let available = (10_001..=u16::MAX)
+            .find(|port| super::local_port_available(*port))
+            .expect("test needs an available local port");
+        assert_eq!(
+            allocate_joining_port(&mut used, Some(available), 9000, "p2p"),
+            available
+        );
+    }
+
+    #[test]
+    fn generate_validator_rejects_non_loopback_topology() {
+        let peers = PeersConfig {
+            validators: vec![PeerEntry {
+                name: "remote".to_string(),
+                p2p: "192.0.2.1:9000".to_string(),
+                http: "127.0.0.1:8080".to_string(),
+            }],
+            secondaries: Vec::new(),
+        };
+        let result = std::panic::catch_unwind(|| validate_local_peers_and_collect_ports(&peers));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pending_validator_update_recovers_the_same_generation() {
+        let output_dir = unique_temp_dir("joining-validator-recovery");
+        fs::create_dir_all(&output_dir).expect("test bundle should be created");
+        let pending = super::PendingValidatorGeneration {
+            public_key: "11".repeat(32),
+            p2p: "127.0.0.1:9000".to_string(),
+            config_file: "joining-validator-0.yaml".to_string(),
+            files: vec![super::PendingBundleFile {
+                name: "joining-validator-0.yaml".to_string(),
+                contents: "startup: state_sync\n".to_string(),
+            }],
+        };
+        super::persist_pending_validator(&output_dir, &pending);
+
+        assert!(super::recover_pending_validator(&output_dir));
+        assert_eq!(
+            fs::read_to_string(output_dir.join("joining-validator-0.yaml"))
+                .expect("recovered config should exist"),
+            "startup: state_sync\n"
+        );
+        assert!(!output_dir.join(super::PENDING_VALIDATOR_FILE).exists());
+        assert!(!super::recover_pending_validator(&output_dir));
+
+        fs::remove_dir_all(&output_dir).expect("failed to remove test bundle");
     }
 
     #[test]

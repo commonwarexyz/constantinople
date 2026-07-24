@@ -80,7 +80,25 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     Generate(Box<GenerateArgs>),
+    /// Add a state-syncing validator to an existing local deployment bundle.
+    GenerateValidator(GenerateValidatorArgs),
     SimplexVerificationMaterial(SimplexVerificationMaterialArgs),
+}
+
+#[derive(Debug, Args)]
+struct GenerateValidatorArgs {
+    /// Existing local deployment bundle to extend.
+    #[arg(long)]
+    output_dir: PathBuf,
+    /// P2P listen port (defaults to the first globally unused local port).
+    #[arg(long)]
+    p2p_port: Option<u16>,
+    /// HTTP service port (defaults to the first globally unused local port).
+    #[arg(long)]
+    http_port: Option<u16>,
+    /// Prometheus metrics port (defaults to the first globally unused local port).
+    #[arg(long)]
+    metrics_port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
@@ -550,6 +568,7 @@ fn main() {
             GenerateTarget::Local(local_args) => local::generate(args, local_args),
             GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
         },
+        Command::GenerateValidator(args) => local::generate_validator(args),
         Command::SimplexVerificationMaterial(args) => {
             println!(
                 "{}",
@@ -943,6 +962,31 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
+    }
+
+    #[test]
+    fn parses_generate_validator_port_overrides() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate-validator",
+            "--output-dir",
+            "local",
+            "--p2p-port",
+            "10000",
+            "--http-port",
+            "10001",
+            "--metrics-port",
+            "10002",
+        ])
+        .expect("generate-validator invocation should parse");
+
+        let Command::GenerateValidator(args) = cli.command else {
+            panic!("expected generate-validator command");
+        };
+        assert_eq!(args.output_dir, PathBuf::from("local"));
+        assert_eq!(args.p2p_port, Some(10_000));
+        assert_eq!(args.http_port, Some(10_001));
+        assert_eq!(args.metrics_port, Some(10_002));
     }
 
     #[test]
