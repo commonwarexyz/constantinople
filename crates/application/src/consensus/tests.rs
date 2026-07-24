@@ -539,7 +539,7 @@ fn committee_reducer_composes_ordered_idempotent_mutations_across_blocks() {
 }
 
 #[test]
-fn committee_reducer_rejects_ineligible_wrong_epoch_empty_and_final_mutations() {
+fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
     deterministic::Runner::default().start(|context| async move {
         let sender = ed25519::PrivateKey::from_seed(121);
         let eligible_peer = ed25519::PrivateKey::from_seed(122).public_key();
@@ -579,10 +579,6 @@ fn committee_reducer_rejects_ineligible_wrong_epoch_empty_and_final_mutations() 
                     0,
                 ),
             ),
-            (
-                BLOCKS_PER_EPOCH - 1,
-                committee_transaction(&harness.sender, Epoch::new(2), eligible_peer, true, 0),
-            ),
         ];
         for (height, transaction) in invalid {
             assert!(
@@ -592,6 +588,47 @@ fn committee_reducer_rejects_ineligible_wrong_epoch_empty_and_final_mutations() 
             );
         }
         assert_eq!(exact_committee_row(&harness.dbs, 2).await, None);
+
+        let final_height = BLOCKS_PER_EPOCH - 1;
+        let target = Epoch::new(2);
+        let (entering, selected) = execute_committee_block(
+            &harness,
+            final_height - 2,
+            vec![committee_transaction(
+                &harness.sender,
+                target,
+                eligible_peer.clone(),
+                true,
+                0,
+            )],
+        )
+        .await
+        .expect("last mutable block");
+        let expected = Committee::new(Set::from_iter_dedup([
+            harness.sender.public_key(),
+            eligible_peer.clone(),
+        ]))
+        .unwrap();
+        assert_eq!(entering, harness.initial);
+        assert_eq!(selected, expected);
+        assert_eq!(
+            exact_committee_row(&harness.dbs, 2).await,
+            Some(expected.clone())
+        );
+
+        for height in [final_height - 1, final_height] {
+            let transaction =
+                committee_transaction(&harness.sender, target, eligible_peer.clone(), false, 1);
+            assert!(
+                execute_committee_block(&harness, height, vec![transaction])
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                exact_committee_row(&harness.dbs, 2).await,
+                Some(expected.clone())
+            );
+        }
     });
 }
 

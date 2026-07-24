@@ -32,6 +32,17 @@ use std::{collections::HashMap, future::Future, num::NonZeroU64, sync::Arc, time
 
 type SchemeRegistry<P, V> = Arc<Mutex<HashMap<Epoch, Arc<ThresholdScheme<P, V>>>>>;
 
+fn committed_committee_cutoff(epocher: &FixedEpocher, requested: Epoch) -> Option<Height> {
+    let source = requested.previous()?.previous()?;
+    let boundary = epocher
+        .last(source)
+        .expect("fixed epocher must cover the requested committee epoch");
+    // Committee mutations are frozen for the source epoch's final two blocks.
+    // Waiting only through the last mutable block also avoids depending on a
+    // finalized notification that the calling reshare actor must acknowledge.
+    Some(Height::new(boundary.get().saturating_sub(2)))
+}
+
 /// Epoch-scoped threshold schemes installed by the reshare actor.
 ///
 /// The provider starts with epoch zero and is extended by [`Registrar`] before
@@ -199,12 +210,7 @@ where
     }
 
     fn committed_cutoff(&self, requested: Epoch) -> Option<Height> {
-        let source = requested.previous()?.previous()?;
-        let boundary = self
-            .epocher
-            .last(source)
-            .expect("fixed epocher must cover the requested committee epoch");
-        Some(Height::new(boundary.get().saturating_sub(1)))
+        committed_committee_cutoff(&self.epocher, requested)
     }
 }
 
@@ -262,5 +268,28 @@ where
                 (peer.clone(), address.clone())
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::committed_committee_cutoff;
+    use commonware_consensus::types::{Epoch, FixedEpocher, Height};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn committed_committee_cutoff_precedes_final_two_blocks() {
+        let epocher = FixedEpocher::new(NonZeroU64::new(8).expect("epoch length is non-zero"));
+
+        assert_eq!(committed_committee_cutoff(&epocher, Epoch::zero()), None);
+        assert_eq!(committed_committee_cutoff(&epocher, Epoch::new(1)), None);
+        assert_eq!(
+            committed_committee_cutoff(&epocher, Epoch::new(2)),
+            Some(Height::new(5))
+        );
+        assert_eq!(
+            committed_committee_cutoff(&epocher, Epoch::new(3)),
+            Some(Height::new(13))
+        );
     }
 }

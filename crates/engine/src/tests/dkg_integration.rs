@@ -74,7 +74,7 @@ fn engine_failed_ceremony_carries_threshold_state() {
 
     plan(engine)
         .exit_condition(ParticipantQuorumFinalizedHeightAtLeast::new(
-            final_height(0),
+            final_height(0) + 1,
             initial,
         ))
         .property(property)
@@ -96,11 +96,7 @@ fn run_boundary_restart(height: u64) {
     let secret_path = engine.secret_path(&participant);
     let participants = engine.initial_players();
     let engine = engine.with_holds(participant.clone(), [height]);
-    let target = if height < final_height(0) {
-        final_height(0)
-    } else {
-        final_height(0) + 1
-    };
+    let target = final_height(0) + 1;
 
     let result = plan(engine)
         .crash(Crash::ProcessedHeight {

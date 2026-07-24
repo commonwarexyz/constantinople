@@ -199,7 +199,12 @@ where
     entering: Committee,
     committee: Committee,
     dirty: bool,
-    final_block: bool,
+    mutations_allowed: bool,
+}
+
+const fn committee_mutations_allowed(height: u64, blocks_per_epoch: u64) -> bool {
+    // The participant provider snapshots the committee at the last mutable block.
+    height % blocks_per_epoch < blocks_per_epoch.saturating_sub(2)
 }
 
 impl<E, H, S> CommitteeExecution<E, H, S>
@@ -259,7 +264,7 @@ where
             // The final block materializes an absent carry-forward row after
             // reshare has read the same value through its fallback.
             dirty: final_block && direct.is_none(),
-            final_block,
+            mutations_allowed: committee_mutations_allowed(height, blocks_per_epoch),
         }
     }
 
@@ -268,7 +273,7 @@ where
         mutation: &CommitteeMutation,
         eligible: &Set<ed25519::PublicKey>,
     ) -> Option<Committee> {
-        if self.final_block
+        if !self.mutations_allowed
             || mutation.target_epoch.get() != u64::from(&self.target)
             || eligible.position(&mutation.peer).is_none()
         {
@@ -1053,7 +1058,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::range_from_bounds;
+    use super::{committee_mutations_allowed, range_from_bounds};
     use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
     use commonware_utils::non_empty_range;
 
@@ -1068,5 +1073,18 @@ mod tests {
         };
 
         assert_eq!(range_from_bounds(&bounds), non_empty_range!(11, 15));
+    }
+
+    #[test]
+    fn committee_mutations_are_rejected_in_final_two_blocks() {
+        const BLOCKS_PER_EPOCH: u64 = 8;
+
+        assert!(committee_mutations_allowed(5, BLOCKS_PER_EPOCH));
+        assert!(!committee_mutations_allowed(6, BLOCKS_PER_EPOCH));
+        assert!(!committee_mutations_allowed(7, BLOCKS_PER_EPOCH));
+        assert!(committee_mutations_allowed(8, BLOCKS_PER_EPOCH));
+        assert!(committee_mutations_allowed(13, BLOCKS_PER_EPOCH));
+        assert!(!committee_mutations_allowed(14, BLOCKS_PER_EPOCH));
+        assert!(!committee_mutations_allowed(15, BLOCKS_PER_EPOCH));
     }
 }
