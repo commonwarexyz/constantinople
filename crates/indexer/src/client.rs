@@ -12,15 +12,17 @@ use crate::{
     publisher::certificate::CertifiedHeader,
     sql_schema::build_meta_schema,
 };
-use bytes::Bytes;
-use commonware_codec::{FixedSize as _, Read};
+use bytes::{Buf as _, Bytes};
+use commonware_codec::{Read, ReadExt as _};
 use commonware_consensus::{
     Heightable,
     types::{Height, View, coding::Commitment},
 };
-use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
-use constantinople_engine::types::{EngineBlock, EngineHeader};
-use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
+use commonware_cryptography::{
+    Digest, Hasher, Signer, bls12381::primitives::variant::Variant, certificate::Scheme,
+};
+use constantinople_engine::types::{EngineBlock, EngineBlockCfg, EngineHeader};
+use constantinople_primitives::{SignedTransaction, Transaction};
 use datafusion::{
     arrow::array::{Array, BinaryArray},
     prelude::SessionContext,
@@ -112,33 +114,36 @@ impl IndexerClient {
     }
 
     /// Fetch and decode the certified block header for `digest`.
-    pub async fn header_by_digest<H, P>(
+    pub async fn header_by_digest<H, C, V>(
         &self,
         digest: &H::Digest,
-    ) -> Result<Option<EngineHeader<H, P>>, ReadError>
+        cfg: &<EngineHeader<H, C, V> as Read>::Cfg,
+    ) -> Result<Option<EngineHeader<H, C, V>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
     {
-        Ok(self.blocks.get_header(digest, &()).await?)
+        Ok(self.blocks.get_header(digest, cfg).await?)
     }
 
     /// Decode and return the full block for `digest`.
     ///
     /// This is the body-fetching path. Header-only callers should use
     /// [`Self::header_by_digest`] or the certified height/latest helpers.
-    pub async fn block_by_digest<H, P>(
+    pub async fn block_by_digest<H, C, V>(
         &self,
         digest: &H::Digest,
-        cfg: &BlockCfg,
-    ) -> Result<Option<EngineBlock<H, P>>, ReadError>
+        cfg: &EngineBlockCfg<C, V>,
+    ) -> Result<Option<EngineBlock<H, C, V>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
     {
         let Some(data) = self
             .blocks
-            .get_block::<EngineHeader<H, P>, H::Digest>(digest, &())
+            .get_block::<EngineHeader<H, C, V>, H::Digest>(digest, &cfg.payload)
             .await?
         else {
             return Ok(None);
@@ -151,20 +156,21 @@ impl IndexerClient {
     }
 
     /// Decode the certified header at `height`.
-    pub async fn certified_header_by_height<H, P, S>(
+    pub async fn certified_header_by_height<H, C, V, S>(
         &self,
         height: u64,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<CertifiedHeader<H, P>>, ReadError>
+        cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<CertifiedHeader<H, C, V>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
         Ok(self
             .blocks
-            .get_finalized_by_height::<CertifiedHeader<H, P>, S, Commitment>(
+            .get_finalized_by_height::<CertifiedHeader<H, C, V>, S, Commitment>(
                 Height::new(height),
                 cfg,
             )
@@ -173,95 +179,103 @@ impl IndexerClient {
     }
 
     /// Fetch the certified block-header digest at `height`.
-    pub async fn digest_by_height<H, P, S>(
+    pub async fn digest_by_height<H, C, V, S>(
         &self,
         height: u64,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
     ) -> Result<Option<H::Digest>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
         Ok(self
-            .certified_header_by_height::<H, P, S>(height, cfg)
+            .certified_header_by_height::<H, C, V, S>(height, cfg)
             .await?
             .map(|header| header.block_digest()))
     }
 
     /// Decode and return the certified full block at `height`.
-    pub async fn block_by_height<H, P, S>(
+    pub async fn block_by_height<H, C, V, S>(
         &self,
         height: u64,
-        block_cfg: &BlockCfg,
-        cert_cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<EngineBlock<H, P>>, ReadError>
+        block_cfg: &EngineBlockCfg<C, V>,
+        cert_cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<EngineBlock<H, C, V>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
-        let Some(digest) = self.digest_by_height::<H, P, S>(height, cert_cfg).await? else {
+        let Some(digest) = self
+            .digest_by_height::<H, C, V, S>(height, cert_cfg)
+            .await?
+        else {
             return Ok(None);
         };
-        self.block_by_digest::<H, P>(&digest, block_cfg).await
+        self.block_by_digest::<H, C, V>(&digest, block_cfg).await
     }
 
     /// Latest finalized block header, decoded from the Simplex finalization
     /// height index without fetching the block body.
-    pub async fn latest_certified_header<H, P, S>(
+    pub async fn latest_certified_header<H, C, V, S>(
         &self,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<CertifiedHeader<H, P>>, ReadError>
+        cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<CertifiedHeader<H, C, V>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
         Ok(self
             .blocks
-            .latest_finalized::<CertifiedHeader<H, P>, S, Commitment>(cfg)
+            .latest_finalized::<CertifiedHeader<H, C, V>, S, Commitment>(cfg)
             .await?
             .map(|finalized| finalized.header))
     }
 
     /// Latest finalized height from the certified Simplex finalization index.
-    pub async fn latest_height<H, P, S>(
+    pub async fn latest_height<H, C, V, S>(
         &self,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
     ) -> Result<Option<u64>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
         Ok(self
-            .latest_certified_header::<H, P, S>(cfg)
+            .latest_certified_header::<H, C, V, S>(cfg)
             .await?
             .map(|header| header.height().get()))
     }
 
     /// Latest finalized full block. This fetches the body by digest after
     /// decoding the latest certified header.
-    pub async fn latest_block<H, P, S>(
+    pub async fn latest_block<H, C, V, S>(
         &self,
-        block_cfg: &BlockCfg,
-        cert_cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<EngineBlock<H, P>>, ReadError>
+        block_cfg: &EngineBlockCfg<C, V>,
+        cert_cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<EngineBlock<H, C, V>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
-        let Some(header) = self.latest_certified_header::<H, P, S>(cert_cfg).await? else {
+        let Some(header) = self.latest_certified_header::<H, C, V, S>(cert_cfg).await? else {
             return Ok(None);
         };
-        self.block_by_digest::<H, P>(&header.block_digest(), block_cfg)
+        self.block_by_digest::<H, C, V>(&header.block_digest(), block_cfg)
             .await
     }
 
@@ -325,20 +339,21 @@ impl IndexerClient {
     }
 
     /// Decode the Simplex finalization artifact for `view`.
-    pub async fn finalization_by_view<H, P, S>(
+    pub async fn finalization_by_view<H, C, V, S>(
         &self,
         view: u64,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<Finalized<CertifiedHeader<H, P>, S, Commitment>>, ReadError>
+        cfg: &<Finalized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<Finalized<CertifiedHeader<H, C, V>, S, Commitment>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
         Ok(self
             .blocks
-            .get_finalized_by_view::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
+            .get_finalized_by_view::<CertifiedHeader<H, C, V>, S, Commitment>(View::new(view), cfg)
             .await?)
     }
 
@@ -348,20 +363,21 @@ impl IndexerClient {
     }
 
     /// Decode the Simplex notarization artifact for `view`.
-    pub async fn notarization_by_view<H, P, S>(
+    pub async fn notarization_by_view<H, C, V, S>(
         &self,
         view: u64,
-        cfg: &<Notarized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<Notarized<CertifiedHeader<H, P>, S, Commitment>>, ReadError>
+        cfg: &<Notarized<CertifiedHeader<H, C, V>, S, Commitment> as Read>::Cfg,
+    ) -> Result<Option<Notarized<CertifiedHeader<H, C, V>, S, Commitment>>, ReadError>
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
         S: Scheme,
         <S::Certificate as Read>::Cfg: Clone,
     {
         Ok(self
             .blocks
-            .get_notarized::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
+            .get_notarized::<CertifiedHeader<H, C, V>, S, Commitment>(View::new(view), cfg)
             .await?)
     }
 }
@@ -380,17 +396,15 @@ fn verify_signed_transaction_digest<H>(bytes: &[u8], digest: &H::Digest) -> Resu
 where
     H: Hasher,
 {
-    let body_len = Transaction::<H::Digest>::SIZE;
-    if bytes.len() < body_len {
-        return Err(ReadError::SqlRow(format!(
-            "tx_meta.body_hex signed transaction is {} bytes, shorter than {body_len}-byte transaction body",
-            bytes.len()
-        )));
-    }
+    let mut remaining = Bytes::copy_from_slice(bytes);
+    Transaction::<H::Digest>::read(&mut remaining).map_err(|error| {
+        ReadError::SqlRow(format!(
+            "tx_meta.body signed transaction does not contain a valid transaction body: {error}"
+        ))
+    })?;
+    let body_len = bytes.len() - remaining.remaining();
 
-    let mut hasher = H::new();
-    hasher.update(&bytes[..body_len]);
-    let actual = hasher.finalize();
+    let actual = H::hash(&[&bytes[..body_len]]);
     if actual.as_ref() != digest.as_ref() {
         return Err(ReadError::SqlRow(
             "tx_meta.body_hex transaction body does not match tx_digest".to_string(),
@@ -402,35 +416,64 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_cryptography::{sha256, sha256::Sha256};
+    use commonware_cryptography::sha256::Sha256;
 
     #[test]
-    fn verifies_signed_transaction_bytes_against_digest() {
-        let mut bytes = vec![7u8; Transaction::<sha256::Digest>::SIZE + 1];
-        let digest = digest_transaction_body(&bytes);
+    fn verifies_variable_transaction_body_against_digest() {
+        let mut bytes = committee_signed_transaction_golden();
+        let digest = Sha256::hash(&[&bytes[..78]]);
 
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest).expect("digest matches");
 
-        bytes[0] ^= 1;
+        bytes[77] = 0;
         let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
             .expect_err("mutated body should be rejected");
         assert!(matches!(error, ReadError::SqlRow(message) if message.contains("does not match")));
+
+        bytes[77] = 1;
+        bytes[78] ^= 1;
+        verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
+            .expect("signature bytes are outside the transaction digest");
     }
 
     #[test]
-    fn rejects_signed_transaction_bytes_without_full_body() {
-        let bytes = vec![0u8; Transaction::<sha256::Digest>::SIZE - 1];
-        let digest = digest_transaction_body(&bytes);
+    fn rejects_signed_transaction_bytes_without_full_variable_body() {
+        let bytes = committee_signed_transaction_golden()[..77].to_vec();
+        let digest = Sha256::hash(&[&bytes]);
 
         let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
             .expect_err("truncated body should be rejected");
-        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("shorter")));
+        assert!(
+            matches!(error, ReadError::SqlRow(message) if message.contains("valid transaction body"))
+        );
     }
 
-    fn digest_transaction_body(bytes: &[u8]) -> sha256::Digest {
-        let body_len = Transaction::<sha256::Digest>::SIZE.min(bytes.len());
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes[..body_len]);
-        hasher.finalize()
+    fn committee_signed_transaction_golden() -> Vec<u8> {
+        let sender = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let peer = [
+            0x3d, 0x40, 0x17, 0xc3, 0xe8, 0x43, 0x89, 0x5a, 0x92, 0xb7, 0x0a, 0xa7, 0x4d, 0x1b,
+            0x7e, 0xbc, 0x9c, 0x98, 0x2c, 0xcf, 0x2e, 0xc4, 0x96, 0x8c, 0xc0, 0xcd, 0x55, 0xf1,
+            0x2a, 0xf4, 0x66, 0x0c,
+        ];
+        let mut signed = Vec::with_capacity(78 + 65);
+        signed.push(0);
+        signed.extend_from_slice(&sender);
+        signed.push(0);
+        signed.extend_from_slice(&7u64.to_be_bytes());
+        signed.push(1);
+        signed.extend_from_slice(&[0xac, 0x02]);
+        signed.extend_from_slice(&peer);
+        signed.push(1);
+        assert_eq!(signed.len(), 78);
+        assert_eq!(
+            Sha256::hash(&[&signed]).to_string(),
+            "cc9c11a8f6f5011dd0b705e3316b3af679a8de1602f8fec3bfcaa7a392921fa1"
+        );
+        signed.extend_from_slice(&[0; 65]);
+        signed
     }
 }

@@ -18,15 +18,16 @@ that fits.
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
-| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or latest account proof locations without paying full-block decode cost. |
-| **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
+| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, transfer account activity, or latest account proof locations without paying full-block decode cost. |
+| **QMDB operation logs** | Account-state, transaction-hash, and epoch-indexed committee operations in distinct Store namespaces | `qmdb-indexer` read APIs. `/state`, `/transactions`, and `/committee` serve the matching operation ranges and proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 
 All paths share the same exoware [`StoreClient`] under the hood. The owning
-secondary stages SQL rows and both QMDB row families into one Store batch from
+secondary stages SQL rows and all three QMDB row families into one Store batch from
 the finalized hook; simplex block and certificate artifacts are published from
-the same finalized path after data upload. QMDB uses Store prefixes `0x8` and
-`0x9`; SQL table/index prefixes are owned by [`exoware-sql`'s `KvSchema`][kvschema].
+the same finalized path after data upload. Account state, transaction history,
+and committee state use namespace bytes `0x00`, `0x01`, and `0x04` respectively;
+SQL table/index prefixes are owned by [`exoware-sql`'s `KvSchema`][kvschema].
 The current SQL table-prefix allocation is:
 
 | SQL table | Table prefix | Secondary indexes |
@@ -59,8 +60,8 @@ the full body only when requested.
   with finalized headers, and uploads `exoware-simplex` proof artifacts to the
   shared Store.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
-  on the single owning secondary and commits SQL, account-state QMDB, and
-  transaction-hash QMDB rows in one Store batch.
+  on the single owning secondary and commits SQL, account-state QMDB,
+  transaction-hash QMDB, and committee-state QMDB rows in one Store batch.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
   storage and SQL transaction lookup rows. Latest-finalized-height is derived
   from the Simplex finalization height index.
@@ -71,16 +72,17 @@ the full body only when requested.
   [`exoware_sql::SqlServer`](https://docs.rs/exoware-sql/latest/exoware_sql/struct.SqlServer.html)
   so the explorer can reach the `store.sql.v1.Service` `Subscribe` RPC.
 - `[[bin]] qmdb-indexer` — QMDB Connect facade over the same Store. It mounts
-  account-state operation logs at `/state` and transaction-hash operation logs
-  at `/transactions`.
+  account-state operation logs at `/state`, transaction-hash operation logs at
+  `/transactions`, and committee-state operation logs at `/committee`.
 
 ## Back-pressure model
 
 The finalized hook runs after finalized database application and before prune.
 It writes a durable finalized upload queue entry before returning to consensus.
 That entry is deliberately the pre-prune boundary: it contains the finalized
-block, finalized timestamp, QMDB writer start cursors, and the account-state delta
-that must be read while the local QMDB can still prove the finalized range.
+block, finalized timestamp, QMDB writer start cursors, and the account-state and
+committee-state deltas that must be read while the local QMDB can still prove
+the finalized ranges.
 The writer end cursors are derived from the block header and start cursors.
 
 The background uploader derives the rest from that durable entry: SQL rows,

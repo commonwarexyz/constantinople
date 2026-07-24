@@ -1,26 +1,27 @@
 use bytes::Bytes;
 use commonware_codec::{Decode, Encode};
+use commonware_consensus::types::coding::Commitment;
 use commonware_cryptography::{Hasher, PublicKey};
-use constantinople_engine::types::{EngineBlock, EngineHeader};
-use constantinople_primitives::{Block, BlockCfg, LazySignedTransaction, Sealed};
+use constantinople_primitives::{Block, BlockCfg, Header, LazySignedTransaction, Sealed};
 
-pub(crate) fn encode_simplex_block_parts<H, P>(
-    block: &EngineBlock<H, P>,
-) -> (EngineHeader<H, P>, Bytes)
+pub(crate) fn encode_simplex_block_parts<H, P, R>(
+    block: &Sealed<Block<Commitment, P, H, R>, H>,
+) -> (Sealed<Header<Commitment, H::Digest, P, R>, H>, Bytes)
 where
     H: Hasher,
     P: PublicKey,
+    R: Clone,
 {
     let header = Sealed::new_unchecked(block.header.clone(), *block.seal());
     let body = block.body.encode();
     (header, body)
 }
 
-pub(crate) fn decode_simplex_block_parts<H, P>(
-    header: EngineHeader<H, P>,
+pub(crate) fn decode_simplex_block_parts<H, P, R, RCfg>(
+    header: Sealed<Header<Commitment, H::Digest, P, R>, H>,
     body: Bytes,
-    cfg: &BlockCfg,
-) -> Result<EngineBlock<H, P>, commonware_codec::Error>
+    cfg: &BlockCfg<RCfg>,
+) -> Result<Sealed<Block<Commitment, P, H, R>, H>, commonware_codec::Error>
 where
     H: Hasher,
     P: PublicKey,

@@ -15,29 +15,33 @@ use commonware_consensus::{
     simplex::{self, types::Activity},
     types::{Height, coding::Commitment},
 };
-use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
+use commonware_cryptography::{
+    Digestible, Hasher, Signer, bls12381::primitives::variant::Variant, certificate::Scheme,
+};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
-use std::sync::Arc;
+use std::{fmt, sync::Arc};
 use tokio::{sync::mpsc, task::JoinHandle};
 use tracing::{debug, warn};
 
 /// Cloneable reporter over Simplex activity.
-pub struct CertificateReporter<H, P, S>
+pub struct CertificateReporter<H, C, V, S>
 where
     H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
+    C: Signer + Send + Sync + 'static,
+    V: Variant,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
 {
-    tx: mpsc::Sender<SimplexInput<H, P, S>>,
+    tx: mpsc::Sender<SimplexInput<H, C, V, S>>,
 }
 
-impl<H, P, S> CertificateReporter<H, P, S>
+impl<H, C, V, S> CertificateReporter<H, C, V, S>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
     S: Scheme,
 {
     /// Build a reporter and background uploader.
@@ -48,7 +52,8 @@ where
     ) -> (Self, JoinHandle<()>)
     where
         H: Hasher + Send + Sync + 'static,
-        P: PublicKey + Send + Sync + 'static,
+        C: Signer + Send + Sync + 'static,
+        V: Variant,
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
@@ -57,25 +62,27 @@ where
                 .expect("simplex namespace prefix must be valid"),
         );
         let (tx, rx) = mpsc::channel(buffer);
-        let join = tokio::spawn(run_uploader::<H, P, S>(client, rx, commit_metrics));
+        let join = tokio::spawn(run_uploader::<H, C, V, S>(client, rx, commit_metrics));
         (Self { tx }, join)
     }
 
     /// Queue a finalized block for digest-addressed block upload and later
     /// certificate pairing.
-    pub async fn publish_block(&self, block: Arc<EngineBlock<H, P>>)
+    pub async fn publish_block(&self, block: Arc<EngineBlock<H, C, V>>)
     where
         H: Hasher,
-        P: PublicKey,
+        C: Signer,
+        V: Variant,
     {
         let _ = self.tx.send(SimplexInput::Block(block)).await;
     }
 }
 
-impl<H, P, S> Clone for CertificateReporter<H, P, S>
+impl<H, C, V, S> Clone for CertificateReporter<H, C, V, S>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
     S: Scheme,
 {
     fn clone(&self) -> Self {
@@ -85,10 +92,11 @@ where
     }
 }
 
-impl<H, P, S> Reporter for CertificateReporter<H, P, S>
+impl<H, C, V, S> Reporter for CertificateReporter<H, C, V, S>
 where
     H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
+    C: Signer + Send + Sync + 'static,
+    V: Variant,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
     simplex::types::Notarization<S, Commitment>: Send,
@@ -110,10 +118,13 @@ where
     }
 }
 
-fn dispatch_input<H, P, S>(tx: &mpsc::Sender<SimplexInput<H, P, S>>, input: SimplexInput<H, P, S>)
-where
+fn dispatch_input<H, C, V, S>(
+    tx: &mpsc::Sender<SimplexInput<H, C, V, S>>,
+    input: SimplexInput<H, C, V, S>,
+) where
     H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
+    C: Signer + Send + Sync + 'static,
+    V: Variant,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
 {
@@ -125,32 +136,35 @@ where
     });
 }
 
-enum SimplexInput<H, P, S>
+enum SimplexInput<H, C, V, S>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
     S: Scheme,
 {
-    Block(Arc<EngineBlock<H, P>>),
+    Block(Arc<EngineBlock<H, C, V>>),
     Notarization(simplex::types::Notarization<S, Commitment>),
     Finalization(simplex::types::Finalization<S, Commitment>),
 }
 
-struct PendingBlockCertificates<H, P, S>
+struct PendingBlockCertificates<H, C, V, S>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
     S: Scheme,
 {
-    block: Option<Arc<EngineBlock<H, P>>>,
+    block: Option<Arc<EngineBlock<H, C, V>>>,
     notarization: Option<simplex::types::Notarization<S, Commitment>>,
     finalization: Option<simplex::types::Finalization<S, Commitment>>,
 }
 
-impl<H, P, S> Default for PendingBlockCertificates<H, P, S>
+impl<H, C, V, S> Default for PendingBlockCertificates<H, C, V, S>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
     S: Scheme,
 {
     fn default() -> Self {
@@ -167,17 +181,18 @@ const MAX_BLOCK_BYTES_PER_COMMIT: usize = 64 * 1024 * 1024;
 /// Maximum inputs drained into one store commit.
 const MAX_INPUTS_PER_COMMIT: usize = 256;
 
-async fn run_uploader<H, P, S>(
+async fn run_uploader<H, C, V, S>(
     client: SimplexClient,
-    mut rx: mpsc::Receiver<SimplexInput<H, P, S>>,
+    mut rx: mpsc::Receiver<SimplexInput<H, C, V, S>>,
     commit_metrics: super::StoreCommitMetrics,
 ) where
     H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
+    C: Signer + Send + Sync + 'static,
+    V: Variant,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send + Sync,
 {
-    let mut pending: AHashMap<Vec<u8>, PendingBlockCertificates<H, P, S>> = AHashMap::new();
+    let mut pending: AHashMap<Vec<u8>, PendingBlockCertificates<H, C, V, S>> = AHashMap::new();
     while let Some(first) = rx.recv().await {
         // Drain the queued backlog (bounded by body bytes and input count) so
         // a burst of blocks and certificates pays one store round-trip
@@ -242,10 +257,11 @@ async fn run_uploader<H, P, S>(
     debug!("simplex certificate uploader task exiting: channel closed");
 }
 
-impl<H, P, S> SimplexInput<H, P, S>
+impl<H, C, V, S> SimplexInput<H, C, V, S>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
     S: Scheme,
 {
     fn block_digest_key(&self) -> Vec<u8> {
@@ -278,14 +294,15 @@ where
 
 /// Stages the entry's ready certificates into `prepared`, returning whether a
 /// finalization was staged (the entry is complete and can be dropped).
-fn stage_ready_certificates<H, P, S>(
+fn stage_ready_certificates<H, C, V, S>(
     client: &SimplexClient,
-    entry: &mut PendingBlockCertificates<H, P, S>,
+    entry: &mut PendingBlockCertificates<H, C, V, S>,
     prepared: &mut PreparedUpload,
 ) -> bool
 where
     H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
+    C: Signer + Send + Sync + 'static,
+    V: Variant,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send + Sync,
 {
@@ -320,29 +337,60 @@ where
 }
 
 /// A finalized header tagged with the marshal commitment certified by Simplex.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CertifiedHeader<H, P>
+#[derive(PartialEq, Eq)]
+pub struct CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     commitment: Commitment,
-    header: EngineHeader<H, P>,
+    header: EngineHeader<H, C, V>,
 }
 
-impl<H, P> CertifiedHeader<H, P>
+impl<H, C, V> fmt::Debug for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
-    fn new(commitment: Commitment, block: &EngineBlock<H, P>) -> Self {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CertifiedHeader")
+            .field("commitment", &self.commitment)
+            .field("header_digest", self.header.seal())
+            .field("height", &self.header.height)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<H, C, V> Clone for CertifiedHeader<H, C, V>
+where
+    H: Hasher,
+    C: Signer,
+    V: Variant,
+{
+    fn clone(&self) -> Self {
+        Self {
+            commitment: self.commitment,
+            header: self.header.clone(),
+        }
+    }
+}
+
+impl<H, C, V> CertifiedHeader<H, C, V>
+where
+    H: Hasher,
+    C: Signer,
+    V: Variant,
+{
+    fn new(commitment: Commitment, block: &EngineBlock<H, C, V>) -> Self {
         debug_assert_eq!(commitment.block::<H::Digest>(), *block.seal());
-        let header = EngineHeader::<H, P>::new_unchecked(block.header.clone(), *block.seal());
+        let header = EngineHeader::<H, C, V>::new_unchecked(block.header.clone(), *block.seal());
         Self { commitment, header }
     }
 
     /// Return the certified Constantinople block header.
-    pub const fn header(&self) -> &EngineHeader<H, P> {
+    pub const fn header(&self) -> &EngineHeader<H, C, V> {
         &self.header
     }
 
@@ -352,20 +400,22 @@ where
     }
 }
 
-impl<H, P> Heightable for CertifiedHeader<H, P>
+impl<H, C, V> Heightable for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     fn height(&self) -> Height {
         self.header.height()
     }
 }
 
-impl<H, P> Digestible for CertifiedHeader<H, P>
+impl<H, C, V> Digestible for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     type Digest = Commitment;
 
@@ -374,30 +424,33 @@ where
     }
 }
 
-impl<H, P> Block for CertifiedHeader<H, P>
+impl<H, C, V> Block for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     fn parent(&self) -> Self::Digest {
         self.header.context.parent.1
     }
 }
 
-impl<H, P> EncodeSize for CertifiedHeader<H, P>
+impl<H, C, V> EncodeSize for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     fn encode_size(&self) -> usize {
         self.commitment.encode_size() + self.header.encode_size()
     }
 }
 
-impl<H, P> Write for CertifiedHeader<H, P>
+impl<H, C, V> Write for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.commitment.write(buf);
@@ -405,16 +458,17 @@ where
     }
 }
 
-impl<H, P> Read for CertifiedHeader<H, P>
+impl<H, C, V> Read for CertifiedHeader<H, C, V>
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
-    type Cfg = ();
+    type Cfg = <EngineHeader<H, C, V> as Read>::Cfg;
 
-    fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let commitment = Commitment::read(buf)?;
-        let header = EngineHeader::<H, P>::read(buf)?;
+        let header = EngineHeader::<H, C, V>::read_cfg(buf, cfg)?;
         if commitment.block::<H::Digest>() != *header.seal() {
             return Err(CodecError::Invalid(
                 "CertifiedHeader",

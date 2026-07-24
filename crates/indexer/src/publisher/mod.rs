@@ -9,6 +9,7 @@
 //! | `sql` (metadata) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`       |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
+//! | `qmdb` (committee)| Epoch-indexed committee-state operation log                   |
 //!
 //! Simplex block and certificate artifacts are uploaded separately through
 //! [`CertificateReporter`] using `exoware-simplex` indexes in the same Store.

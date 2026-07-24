@@ -2,7 +2,8 @@
 //!
 //! `qmdb-indexer` exposes the Store-backed QMDB indexes written by
 //! validators. It serves the account-state operation log under `/state` and
-//! transaction-hash history under `/transactions`.
+//! transaction-hash history under `/transactions`, and epoch-indexed committee
+//! state under `/committee`.
 
 use ahash::AHashMap;
 use axum::{Router, routing::get};
@@ -11,8 +12,11 @@ use commonware_codec::FixedSize;
 use commonware_cryptography::sha256::Sha256;
 use commonware_deployer::aws::Hosts;
 use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
-use commonware_utils::sequence::FixedBytes;
-use constantinople_indexer::namespaces::{state_qmdb_client, transactions_qmdb_client};
+use commonware_utils::sequence::{FixedBytes, U64};
+use constantinople_application::consensus::Committee;
+use constantinople_indexer::namespaces::{
+    committee_qmdb_client, state_qmdb_client, transactions_qmdb_client,
+};
 use constantinople_primitives::{Account, AccountKey};
 use exoware_qmdb::{
     KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
@@ -40,12 +44,15 @@ type TransactionClient = KeylessClient<
     commonware_cryptography::sha256::Digest,
     FixedEncoding<commonware_cryptography::sha256::Digest>,
 >;
+type CommitteeValue = FixedBytes<{ Committee::SIZE }>;
+type CommitteeClient =
+    UnorderedClient<mmr::Family, Sha256, U64, CommitteeValue, FixedEncoding<CommitteeValue>>;
 
 #[derive(Parser, Debug)]
 #[command(
     name = "qmdb-indexer",
     version,
-    about = "QMDB service over Constantinople state and transaction indexes"
+    about = "QMDB service over Constantinople state, transaction, and committee indexes"
 )]
 #[command(group(
     ArgGroup::new("mode")
@@ -132,6 +139,7 @@ fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send
     let base = StoreClient::new(store_url);
     let state = Arc::new(StateClient::new(state_qmdb_client(&base)?, ()));
     let transactions = Arc::new(TransactionClient::new(transactions_qmdb_client(&base)?, ()));
+    let committee = Arc::new(CommitteeClient::new(committee_qmdb_client(&base)?, ()));
 
     Ok(Router::new()
         .route("/health", get(health))
@@ -139,6 +147,10 @@ fn build_app(store_url: &str) -> Result<Router, Box<dyn std::error::Error + Send
         .nest_service(
             "/transactions",
             keyless_operation_log_connect_stack(transactions),
+        )
+        .nest_service(
+            "/committee",
+            unordered_operation_log_connect_stack(committee),
         )
         .layer(tower_http::cors::CorsLayer::very_permissive()))
 }
@@ -291,6 +303,7 @@ mod tests {
         for path in [
             "/state/qmdb.v1.OperationLogService/GetOperationRange",
             "/transactions/qmdb.v1.OperationLogService/GetOperationRange",
+            "/committee/qmdb.v1.OperationLogService/GetOperationRange",
         ] {
             let response = app
                 .clone()

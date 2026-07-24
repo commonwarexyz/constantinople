@@ -13,8 +13,9 @@
 //!   the explorer subscribes to over the `store.sql.v1.Service` `Subscribe`
 //!   RPC. `tx_meta` stores one row per finalized transaction with proof and
 //!   body data. `tx_activity` stores one account-ordered row for each sender
-//!   and receiver side of a transaction. `account_meta` stores the latest
-//!   indexed account state plus its QMDB operation location.
+//!   and receiver side of a transfer action; non-transfer actions have no
+//!   account activity rows. `account_meta` stores the latest indexed account
+//!   state plus its QMDB operation location.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the

@@ -15,6 +15,8 @@ pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u8 = 0x01;
 pub const SIMPLEX_PREFIX_VALUE: u8 = 0x02;
 /// Store namespace byte for SQL metadata rows.
 pub const SQL_META_PREFIX_VALUE: u8 = 0x03;
+/// Store namespace byte for QMDB committee-state rows.
+pub const COMMITTEE_QMDB_PREFIX_VALUE: u8 = 0x04;
 
 /// Store namespace prefix for account-state QMDB rows.
 pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
@@ -24,6 +26,11 @@ pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
 /// Store namespace prefix for transaction-history QMDB rows.
 pub fn transactions_qmdb_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
     StoreKeyPrefix::new(vec![TRANSACTIONS_QMDB_PREFIX_VALUE])
+}
+
+/// Store namespace prefix for committee-state QMDB rows.
+pub fn committee_qmdb_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
+    StoreKeyPrefix::new(vec![COMMITTEE_QMDB_PREFIX_VALUE])
 }
 
 /// Store namespace prefix for Simplex block and certificate rows.
@@ -54,6 +61,16 @@ pub fn transactions_qmdb_client(
     ))
 }
 
+/// Clone `client` into the committee-state QMDB namespace.
+pub fn committee_qmdb_client(
+    client: &StoreClient,
+) -> Result<PrefixedStoreClient, StoreKeyPrefixError> {
+    Ok(PrefixedStoreClient::new(
+        client.clone(),
+        committee_qmdb_prefix()?,
+    ))
+}
+
 /// Clone `client` into the Simplex block and certificate namespace.
 pub fn simplex_client(client: &StoreClient) -> Result<PrefixedStoreClient, StoreKeyPrefixError> {
     Ok(PrefixedStoreClient::new(client.clone(), simplex_prefix()?))
@@ -74,6 +91,7 @@ mod tests {
         let prefixes = [
             state_qmdb_prefix().expect("state prefix"),
             transactions_qmdb_prefix().expect("transaction prefix"),
+            committee_qmdb_prefix().expect("committee prefix"),
             simplex_prefix().expect("simplex prefix"),
             sql_meta_prefix().expect("sql metadata prefix"),
         ];

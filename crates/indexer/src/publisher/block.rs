@@ -7,14 +7,13 @@ use crate::publisher::{
         encode_tx_activity_row, encode_tx_meta_row,
     },
 };
-use bytes::Bytes;
-use commonware_codec::FixedSize;
+use bytes::{Buf as _, Bytes};
+use commonware_codec::{FixedSize as _, ReadExt as _};
+use commonware_consensus::types::coding::Commitment;
 use commonware_cryptography::{Digest, Hasher, PublicKey};
-use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{
-    AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
+    AccountKey, Action, Block, LazySignedTransaction, Sealed, Transaction, TransactionPublicKey,
 };
-use std::array::TryFromSliceError;
 use tracing::warn;
 
 /// Encoded block rows split by index surface.
@@ -29,6 +28,10 @@ struct IndexedTransaction<D: Digest> {
     block_index: usize,
     digest: D,
     bytes: Bytes,
+    transfer: Option<IndexedTransfer>,
+}
+
+struct IndexedTransfer {
     sender: AccountKey,
     to: [u8; AccountKey::SIZE],
     value: u64,
@@ -37,8 +40,8 @@ struct IndexedTransaction<D: Digest> {
 
 /// Build every row for a finalized block, partitioned by destination store.
 #[cfg(test)]
-pub(crate) fn encode_indexed_block_rows<H, P>(
-    block: &EngineBlock<H, P>,
+pub(crate) fn encode_indexed_block_rows<H, P, R>(
+    block: &Sealed<Block<Commitment, P, H, R>, H>,
 ) -> IndexedBlockRows<H::Digest>
 where
     H: Hasher,
@@ -51,8 +54,8 @@ where
     encode_indexed_block_rows_at(block, finalized_ts_micros)
 }
 
-pub(crate) fn encode_indexed_block_rows_at<H, P>(
-    block: &EngineBlock<H, P>,
+pub(crate) fn encode_indexed_block_rows_at<H, P, R>(
+    block: &Sealed<Block<Commitment, P, H, R>, H>,
     finalized_ts_micros: i64,
 ) -> IndexedBlockRows<H::Digest>
 where
@@ -84,7 +87,8 @@ where
 
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
 
-    // One tx_meta row plus sender/receiver tx_activity rows per transaction.
+    // Every transaction gets a tx_meta row. Transfer actions additionally get
+    // sender/receiver tx_activity rows.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
     for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
         transaction_digests.push(tx.digest);
@@ -92,14 +96,17 @@ where
         let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
         let mut digest = [0u8; 32];
         digest.copy_from_slice(tx.digest.as_ref());
-        let mut sender = [0u8; AccountKey::SIZE];
-        sender.copy_from_slice(tx.sender.as_ref());
-        let receiver = tx.to;
         sql.push(encode_tx_meta_row(TxMetaRow {
             digest,
             qmdb_location,
             body: tx.bytes,
         }));
+        let Some(transfer) = tx.transfer else {
+            continue;
+        };
+        let mut sender = [0u8; AccountKey::SIZE];
+        sender.copy_from_slice(transfer.sender.as_ref());
+        let receiver = transfer.to;
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
             role: TxActivityRole::Sender,
@@ -107,8 +114,8 @@ where
             index: idx_u32,
             digest,
             counterparty: receiver,
-            value: tx.value,
-            nonce: tx.nonce,
+            value: transfer.value,
+            nonce: transfer.nonce,
         }));
         if receiver != sender {
             sql.push(encode_tx_activity_row(TxActivityRow {
@@ -118,8 +125,8 @@ where
                 index: idx_u32,
                 digest,
                 counterparty: sender,
-                value: tx.value,
-                nonce: tx.nonce,
+                value: transfer.value,
+                nonce: transfer.nonce,
             }));
         }
     }
@@ -154,72 +161,64 @@ where
     H: Hasher,
 {
     let signed_bytes = transaction.encoded_signed_transaction();
-    let transaction_size = Transaction::<H::Digest>::SIZE;
-    if signed_bytes.len() < transaction_size {
-        warn!(
-            height,
-            block_index,
-            signed_len = signed_bytes.len(),
-            transaction_size,
-            "indexer: skipping transaction with truncated signed payload"
-        );
-        return None;
-    }
+    let mut remaining = signed_bytes.clone();
+    let decoded = match Transaction::<H::Digest>::read(&mut remaining) {
+        Ok(decoded) => decoded,
+        Err(error) => {
+            warn!(
+                height,
+                block_index,
+                signed_len = signed_bytes.len(),
+                %error,
+                "indexer: skipping signed payload with invalid transaction body"
+            );
+            return None;
+        }
+    };
+    let body_len = signed_bytes.len() - remaining.remaining();
+    let transaction_bytes = &signed_bytes[..body_len];
 
-    let transaction_bytes = &signed_bytes[..transaction_size];
-    let Some(sender) =
-        AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
-    else {
-        warn!(
-            height,
-            block_index, "indexer: sender public key bytes cannot derive an account key"
-        );
-        return None;
+    let transfer = match decoded.action {
+        Action::Transfer { to, value } => {
+            match AccountKey::from_public_key_bytes(
+                &transaction_bytes[..TransactionPublicKey::SIZE],
+            ) {
+                Some(sender) => {
+                    let mut to_bytes = [0; AccountKey::SIZE];
+                    to_bytes.copy_from_slice(to.as_ref());
+                    Some(IndexedTransfer {
+                        sender,
+                        to: to_bytes,
+                        value: value.get(),
+                        nonce: decoded.nonce,
+                    })
+                }
+                None => {
+                    warn!(
+                        height,
+                        block_index,
+                        "indexer: sender public key bytes cannot derive an account key; indexing metadata without account activity"
+                    );
+                    None
+                }
+            }
+        }
+        Action::SetCommitteeMember { .. } => None,
     };
 
-    let to_start = TransactionPublicKey::SIZE;
-    let to_end = to_start + AccountKey::SIZE;
-    let value_start = to_end;
-    let value_end = value_start + u64::SIZE;
-    let nonce_start = value_end;
-    let nonce_end = nonce_start + u64::SIZE;
-    let value = read_u64(&transaction_bytes[value_start..value_end])
-        .expect("transaction value slice has fixed width");
-    if value == 0 {
-        warn!(
-            height,
-            block_index, "indexer: skipping transaction with zero value"
-        );
-        return None;
-    }
-
-    let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
-        .expect("transaction nonce slice has fixed width");
-    let mut to = [0u8; AccountKey::SIZE];
-    to.copy_from_slice(&transaction_bytes[to_start..to_end]);
-
-    let mut hasher = H::new();
-    hasher.update(transaction_bytes);
     Some(IndexedTransaction {
         block_index,
-        digest: hasher.finalize(),
+        digest: H::hash(&[transaction_bytes]),
         bytes: signed_bytes,
-        sender,
-        to,
-        value,
-        nonce,
+        transfer,
     })
-}
-
-fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
-    Ok(u64::from_be_bytes(bytes.try_into()?))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
-    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
+    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View, coding::Commitment},
@@ -265,6 +264,13 @@ mod tests {
 
         let rows = encode_indexed_block_rows(&block);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
+        assert_eq!(
+            rows.sql
+                .iter()
+                .filter(|row| row.table == TX_ACTIVITY_TABLE)
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -309,6 +315,46 @@ mod tests {
         assert_tx_meta_body(&rows.sql, &transaction);
     }
 
+    #[test]
+    fn committee_action_indexes_metadata_without_transfer_activity() {
+        let mut rng = StdRng::from_seed([11; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let body = committee_body_golden();
+        let mut signed = body.clone();
+        signed.extend_from_slice(&[0; 65]);
+        let lazy = deferred_transaction(&signed);
+        let block = Sealed::new_unchecked(
+            Block {
+                header: test_header(consensus_key.public_key(), 1),
+                body: vec![lazy],
+            },
+            sha256::Digest::EMPTY,
+        );
+
+        let rows = encode_indexed_block_rows(&block);
+
+        assert_eq!(
+            rows.sql
+                .iter()
+                .filter(|row| row.table == TX_META_TABLE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            rows.sql
+                .iter()
+                .filter(|row| row.table == TX_ACTIVITY_TABLE)
+                .count(),
+            0
+        );
+        assert_eq!(rows.transaction_digests.len(), 1);
+        assert_eq!(
+            rows.transaction_digests[0].to_string(),
+            "cc9c11a8f6f5011dd0b705e3316b3af679a8de1602f8fec3bfcaa7a392921fa1"
+        );
+        assert_tx_meta_body(&rows.sql, &signed);
+    }
+
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {
         let sender = rows
             .iter()
@@ -334,6 +380,38 @@ mod tests {
         assert_eq!(body.as_slice(), expected_body);
     }
 
+    fn deferred_transaction(signed: &[u8]) -> LazySignedTransaction<Sha256> {
+        let mut encoded = Vec::with_capacity(signed.len().encode_size() + signed.len());
+        signed.len().write(&mut encoded);
+        encoded.extend_from_slice(signed);
+        LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+            .expect("outer lazy transaction should decode")
+    }
+
+    fn committee_body_golden() -> Vec<u8> {
+        let sender = [
+            0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64,
+            0x07, 0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68,
+            0xf7, 0x07, 0x51, 0x1a,
+        ];
+        let peer = [
+            0x3d, 0x40, 0x17, 0xc3, 0xe8, 0x43, 0x89, 0x5a, 0x92, 0xb7, 0x0a, 0xa7, 0x4d, 0x1b,
+            0x7e, 0xbc, 0x9c, 0x98, 0x2c, 0xcf, 0x2e, 0xc4, 0x96, 0x8c, 0xc0, 0xcd, 0x55, 0xf1,
+            0x2a, 0xf4, 0x66, 0x0c,
+        ];
+        let mut body = Vec::with_capacity(78);
+        body.push(0);
+        body.extend_from_slice(&sender);
+        body.push(0);
+        body.extend_from_slice(&7u64.to_be_bytes());
+        body.push(1);
+        body.extend_from_slice(&[0xac, 0x02]);
+        body.extend_from_slice(&peer);
+        body.push(1);
+        assert_eq!(body.len(), 78);
+        body
+    }
+
     fn test_header(
         leader: PublicKey,
         tx_count: usize,
@@ -352,6 +430,9 @@ mod tests {
             state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
+            committee_root: sha256::Digest::EMPTY,
+            committee_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
+            payload: None,
         }
     }
 
