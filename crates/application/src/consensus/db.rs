@@ -1,8 +1,9 @@
 //! Database aliases and batch helpers for consensus execution.
 
+use super::committee::Committee;
 use commonware_cryptography::Hasher;
 use commonware_glue::stateful::db::{
-    DatabaseSet, Unmerkleized,
+    DatabaseSet, Shared, Unmerkleized,
     any::{AnyStaged, AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
@@ -22,13 +23,13 @@ use commonware_storage::{
     },
     translator::EightCap,
 };
-use commonware_utils::sync::TracedAsyncRwLock;
+use commonware_utils::sequence::U64;
 use constantinople_primitives::{Account, AccountKey};
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
-    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
+    Shared<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -40,10 +41,26 @@ pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
-pub type TransactionDatabase<E, H, S> = Arc<TracedAsyncRwLock<TransactionHistoryDb<E, H, S>>>;
+pub type TransactionDatabase<E, H, S> = Shared<TransactionHistoryDb<E, H, S>>;
+
+/// Epoch-indexed canonical committee state.
+pub type CommitteeDb<E, H, T, S> = fixed::Db<mmr::Family, E, U64, Committee, H, T, S>;
+
+/// Shared QMDB handle for committee state.
+pub type CommitteeDatabase<E, H, T, S> = Shared<CommitteeDb<E, H, T, S>>;
+
+/// Operation type served by the committee state-sync resolver.
+pub type CommitteeOperation = fixed::Operation<mmr::Family, U64, Committee>;
+
+/// State-sync target for committee state.
+pub type CommitteeSyncTarget<D> = AnyTarget<mmr::Family, D>;
 
 /// The backing databases owned by the application.
-pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
+pub type Databases<E, H, T, S> = (
+    StateDatabase<E, H, T, S>,
+    TransactionDatabase<E, H, S>,
+    CommitteeDatabase<E, H, T, S>,
+);
 
 /// Unmerkleized application state batch, staged by the executor before writes.
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
@@ -77,14 +94,29 @@ pub type StateUpdates = Vec<(usize, Option<Account>)>;
 pub(super) type TransactionBatch<E, H, S> =
     <TransactionDatabase<E, H, S> as DatabaseSet<E>>::Unmerkleized;
 
+/// Unmerkleized committee-state batch.
+pub type CommitteeBatch<E, H, T, S> = AnyUnmerkleized<
+    mmr::Family,
+    E,
+    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<U64, FixedEncoding<Committee>>>>,
+    UnorderedIndex<T, mmr::Location>,
+    H,
+    UnorderedUpdate<U64, FixedEncoding<Committee>>,
+    S,
+>;
+
 pub(super) type StateMerkleized<E, H, T, S> = <StateBatch<E, H, T, S> as Unmerkleized>::Merkleized;
 
 pub(super) type TransactionMerkleized<E, H, S> =
     <TransactionBatch<E, H, S> as Unmerkleized>::Merkleized;
 
+pub(super) type CommitteeMerkleized<E, H, T, S> =
+    <CommitteeBatch<E, H, T, S> as Unmerkleized>::Merkleized;
+
 pub(super) type MerkleizedDatabases<E, H, S> = (
     StateMerkleized<E, H, EightCap, S>,
     TransactionMerkleized<E, H, S>,
+    CommitteeMerkleized<E, H, EightCap, S>,
 );
 
 pub(super) fn apply_transaction_digests<E, H, S>(
@@ -110,21 +142,27 @@ pub(super) async fn finalize_execution<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
     transaction_batch: impl Future<Output = TransactionBatch<E, H, S>>,
+    committee_batch: CommitteeBatch<E, H, EightCap, S>,
 ) -> Result<MerkleizedDatabases<E, H, S>, commonware_storage::qmdb::Error<mmr::Family>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    // The two batches own separate databases and locks, and each merkleize
+    // The three batches own separate databases and locks, and each merkleize
     // dispatches its CPU to the strategy's pool internally, so joining the
     // futures runs the state and transaction-history merkleizes
     // concurrently.
-    let (state_merkleized, transaction_merkleized) = futures::join!(
+    let (state_merkleized, transaction_merkleized, committee_merkleized) = futures::join!(
         state_staged.merkleize(state_updates, Vec::new()),
         async move { transaction_batch.await.merkleize().await },
+        committee_batch.merkleize(),
     );
-    Ok((state_merkleized?, transaction_merkleized?))
+    Ok((
+        state_merkleized?,
+        transaction_merkleized?,
+        committee_merkleized?,
+    ))
 }
 
 #[cfg(test)]
@@ -162,6 +200,8 @@ mod tests {
             },
             translator: EightCap,
             init_cache_size: Some(NZUsize!(1024)),
+            init_buffer: NZUsize!(1 << 20),
+            init_concurrency: (),
         }
     }
 

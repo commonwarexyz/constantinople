@@ -7,7 +7,7 @@
 //! and the gain is too small to carry that hazard. Asserts all three
 //! schedules produce identical roots.
 
-use commonware_cryptography::{Hasher as _, Sha256};
+use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
@@ -18,12 +18,15 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::full::Config as MmrConfig,
-    qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
+    qmdb::{
+        any::{FixedConfig, VariableConfig},
+        keyless::fixed as keyless_fixed,
+    },
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize};
+use commonware_utils::{NZU16, NZU64, NZUsize, ordered::Set};
 use constantinople_application::{
-    consensus::{self, Databases},
+    consensus::{self, Committee, Databases, seed_committees},
     executor::PreparedTransfer,
 };
 use constantinople_primitives::{Account, AccountKey, Nonce};
@@ -44,7 +47,7 @@ const WARMUP: usize = 3;
 const ITERS: usize = 10;
 
 fn key(index: u64) -> AccountKey {
-    AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
 fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayon> {
@@ -65,6 +68,8 @@ fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayo
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -80,6 +85,34 @@ fn transaction_config(strategy: Rayon, cache: &CacheRef) -> keyless_fixed::Compa
             write_buffer: NZUsize!(1 << 20),
         },
         commit_codec_config: (),
+    }
+}
+
+fn committee_config(
+    strategy: Rayon,
+    cache: &CacheRef,
+) -> VariableConfig<EightCap, ((), ()), Rayon> {
+    VariableConfig {
+        merkle_config: MmrConfig {
+            journal_partition: "finalize-committee-journal".into(),
+            metadata_partition: "finalize-committee-metadata".into(),
+            items_per_blob: NZU64!(1 << 16),
+            write_buffer: NZUsize!(1 << 20),
+            strategy,
+            page_cache: cache.clone(),
+        },
+        journal_config: VariableJournalConfig {
+            partition: "finalize-committee-log".into(),
+            items_per_section: NZU64!(1 << 16),
+            compression: None,
+            codec_config: ((), ()),
+            page_cache: cache.clone(),
+            write_buffer: NZUsize!(1 << 20),
+        },
+        translator: EightCap,
+        init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -110,12 +143,14 @@ fn main() {
                 (
                     state_config(strategy.clone(), &cache),
                     transaction_config(strategy.clone(), &cache),
+                    committee_config(strategy.clone(), &cache),
                 ),
             )
             .await;
 
-            // Seed 1M accounts and finalize both databases once.
-            let (mut state_batch, transaction_batch) = dbs.new_batches().await;
+            // Seed 1M accounts and the two genesis committee rows, then
+            // finalize all databases once.
+            let (mut state_batch, transaction_batch, committee_batch) = dbs.new_batches().await;
             for index in 0..ACCOUNTS {
                 state_batch = state_batch.write(
                     key(index),
@@ -127,18 +162,27 @@ fn main() {
             }
             let state = state_batch.merkleize().await.expect("seed state");
             let transactions = transaction_batch.merkleize().await.expect("seed txs");
-            dbs.finalize((state, transactions)).await;
+            let genesis = Committee::new(Set::from_iter_dedup([
+                ed25519::PrivateKey::from_seed(1).public_key()
+            ]))
+            .expect("genesis committee");
+            let committee = seed_committees(committee_batch, genesis)
+                .merkleize()
+                .await
+                .expect("seed committee");
+            dbs.finalize((state, transactions, committee)).await;
 
             let transfers = Arc::new(transfers());
             let digests: Vec<_> = (0..TXS as u64)
-                .map(|i| Sha256::hash(&(u64::MAX - i).to_le_bytes()))
+                .map(|i| Sha256::hash(&[&(u64::MAX - i).to_le_bytes()]))
                 .collect();
 
             let mut totals = [Duration::ZERO; 3];
-            let mut roots: [Option<(String, String)>; 3] = [None, None, None];
+            let mut roots: [Option<(String, String, String)>; 3] = [None, None, None];
             for iter in 0..(WARMUP + ITERS) {
                 for variant in 0..3 {
-                    let (state_batch, mut transaction_batch) = dbs.new_batches().await;
+                    let (state_batch, mut transaction_batch, committee_batch) =
+                        dbs.new_batches().await;
                     let (staged, updates) =
                         consensus::compute(state_batch, Arc::clone(&transfers), &strategy).await;
                     let updates = updates.expect("compute");
@@ -147,20 +191,26 @@ fn main() {
                     }
 
                     let start = Instant::now();
-                    let (state, transactions) = match variant {
+                    let (state, transactions, committee) = match variant {
                         // Strictly sequential.
                         0 => {
                             let state = staged.merkleize(updates, Vec::new()).await.expect("state");
                             let transactions = transaction_batch.merkleize().await.expect("txs");
-                            (state, transactions)
+                            let committee = committee_batch.merkleize().await.expect("committee");
+                            (state, transactions, committee)
                         }
                         // futures::join! on one task (production's finalize_execution).
                         1 => {
-                            let (state, transactions) = futures::join!(
+                            let (state, transactions, committee) = futures::join!(
                                 staged.merkleize(updates, Vec::new()),
-                                transaction_batch.merkleize()
+                                transaction_batch.merkleize(),
+                                committee_batch.merkleize(),
                             );
-                            (state.expect("state"), transactions.expect("txs"))
+                            (
+                                state.expect("state"),
+                                transactions.expect("txs"),
+                                committee.expect("committee"),
+                            )
                         }
                         // Spawned concurrent (the rejected alternative; see module docs).
                         _ => {
@@ -170,7 +220,8 @@ fn main() {
                                 .spawn(move |_| async move { transaction_batch.merkleize().await });
                             let state = staged.merkleize(updates, Vec::new()).await.expect("state");
                             let transactions = handle.await.expect("task").expect("txs");
-                            (state, transactions)
+                            let committee = committee_batch.merkleize().await.expect("committee");
+                            (state, transactions, committee)
                         }
                     };
                     let elapsed = start.elapsed();
@@ -178,6 +229,7 @@ fn main() {
                     let pair = (
                         format!("{}", state.root()),
                         format!("{}", transactions.root()),
+                        format!("{}", committee.root()),
                     );
                     match &roots[variant] {
                         None => roots[variant] = Some(pair),

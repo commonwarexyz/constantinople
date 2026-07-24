@@ -18,8 +18,8 @@ where
     }
 }
 
-pub(super) fn parent_transactions_inactivity_floor<C, P, H>(
-    parent: &SealedBlock<C, P, H>,
+pub(super) fn parent_transactions_inactivity_floor<C, P, H, R>(
+    parent: &SealedBlock<C, P, H, R>,
 ) -> mmr::Location
 where
     C: Digest,

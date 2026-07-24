@@ -55,7 +55,7 @@ impl Fixture {
 }
 
 fn key(index: u64) -> AccountKey {
-    AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
 fn signed_key(index: u64) -> AccountKey {
@@ -121,6 +121,8 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 

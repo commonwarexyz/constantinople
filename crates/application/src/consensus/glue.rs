@@ -3,34 +3,42 @@
 use super::{
     Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
 };
-use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
-use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
+use commonware_consensus::marshal::ancestry::Ancestry;
+use commonware_cryptography::{
+    Digest, Hasher, Signer, bls12381::primitives::variant::Variant, certificate::Scheme, ed25519,
+};
+use commonware_glue::{
+    dkg::{network::Directory, reshare::Input as ReshareInput, types::Payload},
+    stateful::{Application as CApplication, Input, Proposed, db::DatabaseSet},
+};
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, qmdb::sync::Target as AnyTarget, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use rand::{CryptoRng, Rng};
-use std::sync::Arc;
 
-impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
+impl<E, H, C, S, I, V, D, Dir, St> CApplication<E>
+    for Application<E, H, C, S, ed25519::PublicKey, I, Payload<V, D, Dir>, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
     C: Digest,
-    S: Scheme<PublicKey = P>,
-    P: PublicKey,
-    I: TransactionSource<C, P, H> + Sync,
-    B: Send + Sync + 'static,
+    S: Scheme<PublicKey = ed25519::PublicKey>,
+    I: TransactionSource<C, ed25519::PublicKey, H> + Sync,
+    V: Variant,
+    D: Signer<PublicKey = ed25519::PublicKey>,
+    Dir: Directory<ed25519::PublicKey>,
     St: Strategy,
 {
     type SigningScheme = S;
-    type Context = commonware_consensus::simplex::types::Context<C, P>;
-    type Block = SealedBlock<C, P, H>;
+    type Context = commonware_consensus::simplex::types::Context<C, ed25519::PublicKey>;
+    type Block = SealedBlock<C, ed25519::PublicKey, H, Payload<V, D, Dir>>;
     type Databases = Databases<E, H, EightCap, St>;
-    type InputProvider = I;
+    type Provider = I;
+    type Input = ReshareInput<(), V, D, Dir>;
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
@@ -44,6 +52,13 @@ where
             header_range_to_target(
                 block.header.transactions_root,
                 block.header.transactions_range.clone(),
+            ),
+            AnyTarget::new(
+                block.header.committee_root,
+                non_empty_range!(
+                    mmr::Location::new(block.header.committee_range.start()),
+                    mmr::Location::new(block.header.committee_range.end())
+                ),
             ),
         )
     }
@@ -59,19 +74,29 @@ where
             0,
             self.genesis_state_target.clone(),
             self.genesis_transactions_target.clone(),
+            self.genesis_committee_target.clone(),
+            self.genesis_payload.clone(),
         )
     }
 
     async fn propose(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
+        ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
-        input: &mut Self::InputProvider,
+        mut input: Input<Self::Input, Self::Provider>,
     ) -> Option<Proposed<Self, E>> {
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        let result = self.propose_child(context, parent, batches, input).await;
+        let result = self
+            .propose_child(
+                context,
+                parent,
+                batches,
+                input.upstream.payload,
+                &mut input.provider,
+            )
+            .await;
 
         // propose_child releases the parent on the strategy's pool, so only
         // the drained ancestry stream remains; the span keeps its drop cost
@@ -86,7 +111,7 @@ where
     async fn verify(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
+        ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let mut ancestry = Box::pin(ancestry);

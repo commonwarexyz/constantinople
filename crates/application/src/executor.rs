@@ -29,7 +29,7 @@
 
 use ahash::AHashMap;
 use commonware_cryptography::Hasher;
-use constantinople_primitives::{Account, AccountKey, Nonce, SignedTransaction};
+use constantinople_primitives::{Account, AccountKey, Action, Nonce, SignedTransaction};
 
 /// Fully loaded base account state for one in-memory execution batch.
 pub type State = AHashMap<AccountKey, Account>;
@@ -97,16 +97,48 @@ pub fn prepare_transfer<H>(transaction: &SignedTransaction<H>) -> Option<Prepare
 where
     H: Hasher,
 {
-    let transfer = transaction.value();
-    let sender = AccountKey::from_public_key(transfer.sender_lazy().get()?);
-    let recipient = transfer.to;
+    let transaction = transaction.value();
+    let Action::Transfer { to, value } = &transaction.action else {
+        return None;
+    };
+    let sender = AccountKey::from_public_key(transaction.sender_lazy().get()?);
+    let recipient = *to;
     Some(PreparedTransfer {
         sender,
         recipient,
         sender_prefix: sender.prefix(),
         recipient_prefix: recipient.prefix(),
-        value: transfer.value.get(),
-        nonce: transfer.nonce,
+        value: value.get(),
+        nonce: transaction.nonce,
+    })
+}
+
+/// Prepares the account-side effect of any transaction action.
+///
+/// Committee actions are represented as zero-value self-transfers: they touch
+/// only the sender and consume its nonce without changing its balance.
+pub(crate) fn prepare_account_action<H>(
+    transaction: &SignedTransaction<H>,
+) -> Option<PreparedTransfer>
+where
+    H: Hasher,
+{
+    if let Some(transfer) = prepare_transfer(transaction) {
+        return Some(transfer);
+    }
+
+    let transaction = transaction.value();
+    let Action::SetCommitteeMember { .. } = &transaction.action else {
+        return None;
+    };
+    let sender = AccountKey::from_public_key(transaction.sender_lazy().get()?);
+    Some(PreparedTransfer {
+        sender,
+        recipient: sender,
+        sender_prefix: sender.prefix(),
+        recipient_prefix: sender.prefix(),
+        value: 0,
+        nonce: transaction.nonce,
     })
 }
 
@@ -508,7 +540,7 @@ impl SelectiveExecutor {
         applied
     }
 
-    fn apply_one(&mut self, transfer: &PreparedTransfer) -> bool {
+    pub(crate) fn apply_one(&mut self, transfer: &PreparedTransfer) -> bool {
         let sender = self
             .indices
             .get(transfer.sender_prefix, &transfer.sender)

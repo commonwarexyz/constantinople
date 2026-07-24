@@ -88,24 +88,28 @@
 use super::{
     MALFORMED_TRANSACTION, Result, STATIC_INVALID_TRANSACTION,
     body::PreparedBody,
+    committee::{BLOCKS_PER_EPOCH, Committee, epoch_key},
     db::{
-        self, StateBatch, StateStaged, StateUpdates, TransactionBatch, apply_transaction_digests,
+        self, CommitteeBatch, StateBatch, StateStaged, StateUpdates, TransactionBatch,
+        apply_transaction_digests,
     },
     reject_verify,
 };
 use crate::executor::{self, PreparedTransfer};
 use commonware_codec::EncodeSize as _;
-use commonware_consensus::types::Round;
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_consensus::types::{Epoch, Round};
+use commonware_cryptography::{Digest, Hasher, PublicKey, ed25519};
 use commonware_glue::stateful::db::Merkleized as _;
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
 };
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
-use commonware_utils::non_empty_range;
+use commonware_utils::{non_empty_range, ordered::Set, sequence::U64};
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
+use constantinople_primitives::{
+    Account, Action, Header, LazySignedTransaction, SignedTransaction,
+};
 use std::{
     future::{Future, ready},
     pin::Pin,
@@ -132,8 +136,12 @@ where
 {
     pub(super) state: db::StateMerkleized<E, H, EightCap, S>,
     pub(super) transactions: db::TransactionMerkleized<E, H, S>,
+    pub(super) committee: db::CommitteeMerkleized<E, H, EightCap, S>,
     pub(super) state_sync_range: commonware_utils::range::NonEmptyRange<u64>,
     pub(super) transactions_range: commonware_utils::range::NonEmptyRange<u64>,
+    pub(super) committee_range: commonware_utils::range::NonEmptyRange<u64>,
+    pub(super) entering_committee: Committee,
+    pub(super) selected_committee: Committee,
     pub(super) transaction_count: usize,
 }
 
@@ -144,7 +152,150 @@ where
     S: Strategy,
 {
     pub(super) fn into_merkleized(self) -> db::MerkleizedDatabases<E, H, S> {
-        (self.state, self.transactions)
+        (self.state, self.transactions, self.committee)
+    }
+}
+
+#[derive(Clone)]
+struct CommitteeMutation {
+    target_epoch: Epoch,
+    peer: ed25519::PublicKey,
+    registered: bool,
+}
+
+pub(super) struct PreparedAction {
+    account: PreparedTransfer,
+    committee: Option<CommitteeMutation>,
+}
+
+fn prepare_action<H>(transaction: &SignedTransaction<H>) -> Option<PreparedAction>
+where
+    H: Hasher,
+{
+    let account = executor::prepare_account_action(transaction)?;
+    let committee = match &transaction.value().action {
+        Action::Transfer { .. } => None,
+        Action::SetCommitteeMember {
+            target_epoch,
+            peer,
+            registered,
+        } => Some(CommitteeMutation {
+            target_epoch: *target_epoch,
+            peer: peer.clone(),
+            registered: *registered,
+        }),
+    };
+    Some(PreparedAction { account, committee })
+}
+
+struct CommitteeExecution<E, H, S>
+where
+    E: BufferPooler + Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    batch: CommitteeBatch<E, H, EightCap, S>,
+    target: U64,
+    entering: Committee,
+    committee: Committee,
+    dirty: bool,
+    final_block: bool,
+}
+
+impl<E, H, S> CommitteeExecution<E, H, S>
+where
+    E: BufferPooler + Storage + Clock + Metrics,
+    H: Hasher,
+    S: Strategy,
+{
+    async fn load(
+        mut batch: CommitteeBatch<E, H, EightCap, S>,
+        height: u64,
+        initial: &Committee,
+    ) -> Self {
+        let epoch = Epoch::new(height / BLOCKS_PER_EPOCH);
+        if height == 1
+            && batch
+                .get(&epoch_key(Epoch::zero()))
+                .await
+                .expect("genesis committee state read must succeed")
+                .is_none()
+        {
+            batch = super::committee::seed_committees(batch, initial.clone());
+        }
+        let entering_epoch = epoch.next();
+        let entering = match batch
+            .get(&epoch_key(entering_epoch))
+            .await
+            .expect("entering committee read must succeed")
+        {
+            Some(committee) => committee,
+            None => batch
+                .get(&epoch_key(epoch))
+                .await
+                .expect("entering committee fallback read must succeed")
+                .unwrap_or_else(|| initial.clone()),
+        };
+        let target_epoch = Epoch::new(
+            epoch
+                .get()
+                .checked_add(2)
+                .expect("committee target epoch must not overflow"),
+        );
+        let target = epoch_key(target_epoch);
+        let direct = batch
+            .get(&target)
+            .await
+            .expect("committee target read must succeed");
+        let committee = match direct.clone() {
+            Some(committee) => committee,
+            None => entering.clone(),
+        };
+        let final_block = height % BLOCKS_PER_EPOCH == BLOCKS_PER_EPOCH - 1;
+        Self {
+            batch,
+            target,
+            entering,
+            committee,
+            // The final block materializes an absent carry-forward row after
+            // reshare has read the same value through its fallback.
+            dirty: final_block && direct.is_none(),
+            final_block,
+        }
+    }
+
+    fn updated(
+        &self,
+        mutation: &CommitteeMutation,
+        eligible: &Set<ed25519::PublicKey>,
+    ) -> Option<Committee> {
+        if self.final_block
+            || mutation.target_epoch.get() != u64::from(&self.target)
+            || eligible.position(&mutation.peer).is_none()
+        {
+            return None;
+        }
+        let mut next = self.committee.clone();
+        next.assign(mutation.peer.clone(), mutation.registered)
+            .ok()?;
+        Some(next)
+    }
+
+    fn commit(&mut self, committee: Committee) {
+        self.committee = committee;
+        self.dirty = true;
+    }
+
+    fn finish(self) -> CommitteeBatch<E, H, EightCap, S> {
+        if self.dirty {
+            self.batch.write(self.target, Some(self.committee))
+        } else {
+            self.batch
+        }
+    }
+
+    fn committees(&self) -> (Committee, Committee) {
+        (self.entering.clone(), self.committee.clone())
     }
 }
 
@@ -342,7 +493,7 @@ where
 pub(super) fn prepare_lazy<H, S>(
     strategy: &S,
     body: &[LazySignedTransaction<H>],
-) -> Result<(Vec<PreparedTransfer>, Vec<H::Digest>)>
+) -> Result<(Vec<PreparedAction>, Vec<H::Digest>)>
 where
     H: Hasher,
     S: Strategy,
@@ -350,8 +501,8 @@ where
     strategy
         .try_map_collect_vec(body, |lazy| {
             let tx = lazy.get().ok_or(MALFORMED_TRANSACTION)?;
-            let transfer = executor::prepare_transfer(tx).ok_or(MALFORMED_TRANSACTION)?;
-            Ok((transfer, *tx.message_digest()))
+            let action = prepare_action(tx).ok_or(MALFORMED_TRANSACTION)?;
+            Ok((action, *tx.message_digest()))
         })
         .map(|prepared| prepared.into_iter().unzip())
 }
@@ -391,16 +542,20 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// selection proposes an empty block so an idle chain keeps making progress.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
-pub(super) async fn execute_proposal<E, C, P, H, S, I>(
+pub(super) async fn execute_proposal<E, C, P, H, S, I, R>(
     strategy: S,
     clock: &impl Clock,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
+    committee_batch: CommitteeBatch<E, H, EightCap, S>,
     parent_floor: mmr::Location,
-    parent_header: &Header<C, H::Digest, P>,
+    parent_header: &Header<C, H::Digest, P, R>,
+    mempool_parent: &Header<C, H::Digest, P>,
     round: Round,
     candidates: Vec<SignedTransaction<H>>,
     input: &mut I,
+    initial_committee: &Committee,
+    eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
 ) -> ProposalExecution<E, H, S>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -416,6 +571,9 @@ where
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
+    let mut committee_execution =
+        CommitteeExecution::load(committee_batch, parent_header.height + 1, initial_committee)
+            .await;
 
     // The history append for a round's accepted digests runs on the pool
     // while later rounds refill, prepare, stage, and select; rounds chain on
@@ -446,15 +604,14 @@ where
                 let mut selector = selector;
                 move |s: S| {
                     let (prepared, transfers) = prepare_span.in_scope(|| {
-                        let prepared: Vec<Option<(PreparedTransfer, H::Digest)>> = s
+                        let prepared: Vec<Option<(PreparedAction, H::Digest)>> = s
                             .map_collect_vec(&candidates, |tx| {
-                                executor::prepare_transfer(tx)
-                                    .map(|transfer| (transfer, *tx.message_digest()))
+                                prepare_action(tx).map(|action| (action, *tx.message_digest()))
                             });
                         let transfers: Vec<PreparedTransfer> = prepared
                             .iter()
                             .flatten()
-                            .map(|(transfer, _)| *transfer)
+                            .map(|(action, _)| action.account)
                             .collect();
                         (prepared, transfers)
                     });
@@ -504,36 +661,56 @@ where
             txs = transfers.len().traced(),
             dropped = tracing::field::Empty,
         );
-        let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
-            .spawn({
-                let span = select_span.clone();
-                let mut selector = selector;
-                let mut body = body;
-                move |_: S| {
-                    span.in_scope(|| {
-                        let applied = selector.apply(&transfers);
-                        let mut flags = applied.into_iter();
-                        let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
-                        let mut included = 0usize;
-                        let mut dropped = 0usize;
-                        for (transaction, prepared) in candidates.into_iter().zip(prepared) {
-                            let Some((_, digest)) = prepared else {
-                                continue;
-                            };
-                            if flags.next().expect("one flag per prepared transfer") {
-                                included += transaction.encode_size();
-                                chunk.push(digest);
-                                body.push(transaction);
-                            } else {
-                                dropped += transaction.encode_size();
+        let (selector_back, committee_back, body_back, chunk, included_delta, dropped_bytes) =
+            strategy
+                .spawn({
+                    let span = select_span.clone();
+                    let mut selector = selector;
+                    let mut committee_execution = committee_execution;
+                    let eligible_committee_members = eligible_committee_members.clone();
+                    let mut body = body;
+                    move |_: S| {
+                        span.in_scope(|| {
+                            let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
+                            let mut included = 0usize;
+                            let mut dropped = 0usize;
+                            for (transaction, prepared) in candidates.into_iter().zip(prepared) {
+                                let Some((action, digest)) = prepared else {
+                                    continue;
+                                };
+                                let committee_update = match action.committee.as_ref() {
+                                    Some(mutation) => committee_execution
+                                        .updated(mutation, &eligible_committee_members)
+                                        .map(Some),
+                                    None => Some(None),
+                                };
+                                let applied = committee_update.is_some()
+                                    && selector.apply_one(&action.account);
+                                if applied {
+                                    if let Some(next) = committee_update.flatten() {
+                                        committee_execution.commit(next);
+                                    }
+                                    included += transaction.encode_size();
+                                    chunk.push(digest);
+                                    body.push(transaction);
+                                } else {
+                                    dropped += transaction.encode_size();
+                                }
                             }
-                        }
-                        (selector, body, chunk, included, dropped)
-                    })
-                }
-            })
-            .await;
+                            (
+                                selector,
+                                committee_execution,
+                                body,
+                                chunk,
+                                included,
+                                dropped,
+                            )
+                        })
+                    }
+                })
+                .await;
         selector = selector_back;
+        committee_execution = committee_back;
         body = body_back;
         included_bytes += included_delta;
         select_span.record("dropped", dropped_bytes.traced());
@@ -565,7 +742,7 @@ where
         // response means nothing fits in the remaining headroom (or the pool
         // is dry) and ends the loop.
         candidates = input
-            .propose(parent_header, round, included_bytes)
+            .propose(mempool_parent, round, included_bytes)
             .instrument(info_span!("application.execute.refill"))
             .await;
     }
@@ -597,11 +774,15 @@ where
     }
     .instrument(info_span!("application.execute.apply_wait"));
 
+    let (entering_committee, selected_committee) = committee_execution.committees();
     ProposalExecution {
         block: finalize_child(
             staged,
             updates,
             transaction_batch,
+            committee_execution.finish(),
+            entering_committee,
+            selected_committee,
             parent_floor,
             body.len(),
             "database merkleization must succeed",
@@ -616,8 +797,12 @@ pub(super) async fn execute_body<E, H, S>(
     strategy: S,
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
+    committee_batch: CommitteeBatch<E, H, EightCap, S>,
     parent_floor: mmr::Location,
+    height: u64,
     body: PreparedBody<H>,
+    initial_committee: &Committee,
+    eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
 ) -> Result<BlockExecution<E, H, S>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
@@ -625,11 +810,25 @@ where
     S: Strategy,
 {
     let prepare_span = info_span!("application.execute.prepare", txs = body.len().traced());
-    let (transfers, digests) = strategy
+    let (actions, digests) = strategy
         .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice())))
         .await?;
 
-    let transaction_count = transfers.len();
+    let transaction_count = actions.len();
+    let mut committee = CommitteeExecution::load(committee_batch, height, initial_committee).await;
+    for mutation in actions
+        .iter()
+        .filter_map(|action| action.committee.as_ref())
+    {
+        let next = committee
+            .updated(mutation, &eligible_committee_members)
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
+        committee.commit(next);
+    }
+    let transfers = actions
+        .into_iter()
+        .map(|action| action.account)
+        .collect::<Vec<_>>();
     let transfers = Arc::new(transfers);
 
     // The transaction-history append has no dependency on state execution, so
@@ -645,10 +844,14 @@ where
     let transaction_batch = apply.await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
+    let (entering_committee, selected_committee) = committee.committees();
     Ok(finalize_child(
         staged,
         state_updates,
         ready(transaction_batch),
+        committee.finish(),
+        entering_committee,
+        selected_committee,
         parent_floor,
         transaction_count,
         "database merkleization during verification must succeed",
@@ -660,26 +863,38 @@ where
 pub(super) async fn apply_prepared_body<E, H, S>(
     state_batch: StateBatch<E, H, EightCap, S>,
     transaction_batch: TransactionBatch<E, H, S>,
+    committee_batch: CommitteeBatch<E, H, EightCap, S>,
     transaction_floor: mmr::Location,
-    transfers: Vec<PreparedTransfer>,
+    height: u64,
+    actions: Vec<PreparedAction>,
     digests: Vec<H::Digest>,
     strategy: S,
-) -> Result<db::MerkleizedDatabases<E, H, S>>
+    initial_committee: &Committee,
+    eligible_committee_members: &Set<ed25519::PublicKey>,
+) -> Result<BlockExecution<E, H, S>>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
     S: Strategy,
 {
-    let transfers = Arc::new(transfers);
+    let mut committee = CommitteeExecution::load(committee_batch, height, initial_committee).await;
+    for mutation in actions
+        .iter()
+        .filter_map(|action| action.committee.as_ref())
+    {
+        let next = committee
+            .updated(mutation, eligible_committee_members)
+            .ok_or(STATIC_INVALID_TRANSACTION)?;
+        committee.commit(next);
+    }
+    let transfers = Arc::new(actions.into_iter().map(|action| action.account).collect());
+    let transaction_count = digests.len();
 
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
     let apply = strategy.spawn(move |_: S| {
-        apply_span.in_scope(|| {
-            apply_transaction_digests(transaction_batch, &digests)
-                .with_inactivity_floor(transaction_floor)
-        })
+        apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
 
@@ -688,13 +903,23 @@ where
     let transaction_batch = apply.await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    db::finalize_execution(staged, state_updates, ready(transaction_batch))
-        .await
-        .map_err(|_| STATIC_INVALID_TRANSACTION)
+    let (entering_committee, selected_committee) = committee.committees();
+    Ok(finalize_child(
+        staged,
+        state_updates,
+        ready(transaction_batch),
+        committee.finish(),
+        entering_committee,
+        selected_committee,
+        transaction_floor,
+        transaction_count,
+        "database merkleization during apply must succeed",
+    )
+    .await)
 }
 
-pub(super) fn commitments_match<E, C, P, H, S>(
-    header: &Header<C, H::Digest, P>,
+pub(super) fn commitments_match<E, C, P, H, S, R>(
+    header: &Header<C, H::Digest, P, R>,
     execution: &BlockExecution<E, H, S>,
 ) -> bool
 where
@@ -720,6 +945,14 @@ where
         reject_verify(header.height, "transaction_range_mismatch");
         return false;
     }
+    if execution.committee.root() != header.committee_root {
+        reject_verify(header.height, "committee_root_mismatch");
+        return false;
+    }
+    if execution.committee_range != header.committee_range {
+        reject_verify(header.height, "committee_range_mismatch");
+        return false;
+    }
 
     true
 }
@@ -733,6 +966,9 @@ async fn finalize_child<E, H, S>(
     state_staged: StateStaged<E, H, EightCap, S>,
     state_updates: StateUpdates,
     transaction_batch: impl Future<Output = TransactionBatch<E, H, S>>,
+    committee_batch: CommitteeBatch<E, H, EightCap, S>,
+    entering_committee: Committee,
+    selected_committee: Committee,
     parent_floor: mmr::Location,
     transaction_count: usize,
     expect_message: &'static str,
@@ -744,18 +980,27 @@ where
 {
     let transaction_batch =
         async move { transaction_batch.await.with_inactivity_floor(parent_floor) };
-    let (state, transactions) =
-        db::finalize_execution(state_staged, state_updates, transaction_batch)
-            .await
-            .expect(expect_message);
+    let (state, transactions, committee) = db::finalize_execution(
+        state_staged,
+        state_updates,
+        transaction_batch,
+        committee_batch,
+    )
+    .await
+    .expect(expect_message);
     let state_sync_range = range_from_bounds(state.bounds());
     let transactions_range = range_from_bounds(transactions.bounds());
+    let committee_range = range_from_bounds(committee.bounds());
 
     BlockExecution {
         state,
         transactions,
+        committee,
         state_sync_range,
         transactions_range,
+        committee_range,
+        entering_committee,
+        selected_committee,
         transaction_count,
     }
 }
