@@ -7,14 +7,10 @@
 //! - [`Signable`] — A convenience trait for types that are [`Sealable`],
 //!   providing a one-step `seal_and_sign` method.
 
-use crate::{
-    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
-    TransactionSignature,
-};
+use crate::{PublicKeyCache, Sealable, Sealed, SignedTransaction, TransactionBatchVerifier};
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{
-    DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write,
-    types::lazy::Lazy,
+    DecodeExt, Encode, EncodeSize, Error, RangeCfg, Read, ReadExt, Write, types::lazy::Lazy,
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
@@ -22,7 +18,7 @@ use rand::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Signed<T, H, Sig>
 where
     H: Hasher,
@@ -30,6 +26,20 @@ where
 {
     inner: Sealed<T, H>,
     signature: Lazy<Sig>,
+}
+
+impl<T, H, Sig> Clone for Signed<T, H, Sig>
+where
+    T: Clone,
+    H: Hasher,
+    Sig: Signature,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            signature: self.signature.clone(),
+        }
+    }
 }
 
 impl<T, H, Sig> PartialEq for Signed<T, H, Sig>
@@ -134,13 +144,15 @@ where
     }
 }
 
-impl<T, H, Sig> FixedSize for Signed<T, H, Sig>
+impl<T, H, Sig> EncodeSize for Signed<T, H, Sig>
 where
-    T: FixedSize,
+    T: EncodeSize,
     H: Hasher,
     Sig: Signature,
 {
-    const SIZE: usize = T::SIZE + Sig::SIZE;
+    fn encode_size(&self) -> usize {
+        self.inner.encode_size() + self.signature.encode_size()
+    }
 }
 
 impl<T, H, Sig> Read for Signed<T, H, Sig>
@@ -167,7 +179,7 @@ where
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self {
-            inner: u.arbitrary::<T>()?.seal(&mut H::new()),
+            inner: u.arbitrary::<T>()?.seal(&mut H::default()),
             signature: Lazy::new(u.arbitrary()?),
         })
     }
@@ -195,7 +207,6 @@ pub trait Signable: Sealable {
 impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
-#[derive(Clone)]
 pub struct LazySignedTransaction<H>
 where
     H: Hasher,
@@ -204,12 +215,19 @@ where
     value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
 }
 
+impl<H: Hasher> Clone for LazySignedTransaction<H> {
+    fn clone(&self) -> Self {
+        Self {
+            pending: self.pending.clone(),
+            value: self.value.clone(),
+        }
+    }
+}
+
 impl<H> LazySignedTransaction<H>
 where
     H: Hasher,
 {
-    const MAX_ENCODED_SIZE: usize = Transaction::<H::Digest>::SIZE + TransactionSignature::MAX_SIZE;
-
     /// Creates a lazy transaction from an already decoded value.
     pub fn new(value: SignedTransaction<H>) -> Self {
         Self {
@@ -273,8 +291,8 @@ where
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
-        let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
-        if len < Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE {
+        let len = usize::read_cfg(buf, &RangeCfg::new(0..=SignedTransaction::<H>::MAX_SIZE))?;
+        if len < SignedTransaction::<H>::MIN_SIZE {
             return Err(Error::EndOfBuffer);
         }
         if buf.remaining() < len {
@@ -533,7 +551,9 @@ mod test {
             hasher: &mut H,
         ) -> crate::Sealed<Self, H> {
             hasher.update(&self.0);
-            Sealed::new_unchecked(self, hasher.finalize())
+            let (next, digest) = core::mem::take(hasher).finalize();
+            *hasher = next;
+            Sealed::new_unchecked(self, digest)
         }
     }
 
