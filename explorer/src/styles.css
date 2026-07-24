@@ -443,7 +443,7 @@ body {
     margin: 0;
     justify-self: center;
     display: grid;
-    grid-template-columns: repeat(5, minmax(0, 1fr));
+    grid-template-columns: repeat(6, minmax(0, 1fr));
     align-items: start;
     gap: 1px;
     padding: 0;

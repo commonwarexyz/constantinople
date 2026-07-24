@@ -132,7 +132,6 @@ where
     }
 
     // SQL: one block_meta row per finalized block.
-    // `view` is currently 0; see `encode_block_meta_row` docs for why.
     sql.insert(
         0,
         encode_block_meta_row(BlockMetaRow {
@@ -141,7 +140,7 @@ where
             tx_count,
             transactions_root,
             transactions_tip: block.header.transactions_range.end() - 1,
-            view: 0,
+            round: block.header.context.round,
             finalized_ts_micros,
         }),
     );
@@ -217,7 +216,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
+    use crate::sql_schema::{BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
@@ -238,6 +237,29 @@ mod tests {
     use core::num::NonZeroU64;
     use exoware_sql::CellValue;
     use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn block_metadata_indexes_consensus_round() {
+        let mut rng = StdRng::from_seed([1; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let mut header = test_header(consensus_key.public_key(), 0);
+        header.context.round = Round::new(Epoch::new(3), View::new(11));
+        let block = Block::<Commitment, PublicKey, Sha256>::new(header, Vec::new())
+            .seal(&mut Sha256::default());
+
+        let rows = encode_indexed_block_rows(&block);
+        let metadata = rows
+            .sql
+            .iter()
+            .find(|row| row.table == BLOCK_META_TABLE)
+            .expect("block metadata row should be indexed");
+
+        assert!(matches!(metadata.values.get(5), Some(CellValue::UInt64(3))));
+        assert!(matches!(
+            metadata.values.get(6),
+            Some(CellValue::UInt64(11))
+        ));
+    }
 
     #[test]
     fn r1_sender_history_uses_account_key() {

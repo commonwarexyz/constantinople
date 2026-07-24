@@ -2,6 +2,7 @@
 
 use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
 use bytes::Bytes;
+use commonware_consensus::types::Round;
 use exoware_sql::CellValue;
 
 /// One row destined for a SQL metadata table.
@@ -21,7 +22,7 @@ pub(crate) struct BlockMetaRow {
     pub tx_count: u64,
     pub transactions_root: [u8; 32],
     pub transactions_tip: u64,
-    pub view: u64,
+    pub round: Round,
     pub finalized_ts_micros: i64,
 }
 
@@ -75,10 +76,6 @@ pub(crate) struct AccountMetaRow {
 /// The `finalized_ts_micros` is captured at the moment the
 /// block is delivered (wall-clock on this validator).
 ///
-/// The `view` column is currently always `0` because the finalized hook does
-/// not see consensus rounds. A future enrichment can pipe round/view metadata
-/// through either by joining tables or by extending [`SqlRow`] with an update
-/// path.
 pub(crate) fn encode_block_meta_row(block: BlockMetaRow) -> SqlRow {
     SqlRow {
         table: BLOCK_META_TABLE,
@@ -88,7 +85,8 @@ pub(crate) fn encode_block_meta_row(block: BlockMetaRow) -> SqlRow {
             CellValue::UInt64(block.tx_count),
             CellValue::FixedBinary(block.transactions_root.to_vec()),
             CellValue::UInt64(block.transactions_tip),
-            CellValue::UInt64(block.view),
+            CellValue::UInt64(block.round.epoch().get()),
+            CellValue::UInt64(block.round.view().get()),
             CellValue::Timestamp(block.finalized_ts_micros),
         ],
     }

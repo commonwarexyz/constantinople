@@ -17,6 +17,7 @@
     },
     "include": [
         "tests/**/*.ts",
+        "src/blockMetadata.ts",
         "src/blockSequence.ts",
         "src/codec.ts",
         "src/committee.ts",

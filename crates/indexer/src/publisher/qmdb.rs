@@ -1942,6 +1942,7 @@ mod tests {
                     CellValue::FixedBinary(vec![2u8; 32]),
                     CellValue::UInt64(2),
                     CellValue::UInt64(0),
+                    CellValue::UInt64(0),
                     CellValue::Timestamp(1_000),
                 ],
             },

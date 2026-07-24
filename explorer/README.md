@@ -11,7 +11,7 @@ The explorer opens a single `Subscribe` stream against
 delivered `SubscribeResponse` frame carries the rows from one atomic
 ingest batch, and the indexer flushes once per finalized block, so most
 frames decode to exactly one new block summary —
-`(height, txCount, arrival time, sequence)`.
+`(height, epoch, txCount, arrival time, sequence)`.
 
 The schema column names (`height`, `tx_count`, …) come from
 [`crates/indexer/src/sql_schema.rs`](../crates/indexer/src/sql_schema.rs),

@@ -2191,6 +2191,7 @@ const ExplorerStats = memo(function ExplorerStats({
     return (
         <dl className="observed-stats" aria-label="explorer statistics">
             <ExplorerStat label="latest height" value={stats.latestHeight} />
+            <ExplorerStat label="active epoch" value={stats.activeEpoch} />
             <ExplorerStat
                 label="observed tx/sec"
                 value={formatObservedTxPerSecond(totalTxObserved, observedRateWindow)}
@@ -2217,15 +2218,18 @@ function buildExplorerStats(
     totalTxObserved: number,
 ): {
     latestHeight: string;
+    activeEpoch: string;
     totalTxObserved: string;
     peakTxPerBlock: string;
     avgTxPerBlock: string;
 } {
     let latest: bigint | null = null;
+    let activeEpoch: bigint | null = null;
     let peak = 0;
     for (const block of blocks) {
         if (latest === null || block.height > latest) {
             latest = block.height;
+            activeEpoch = block.epoch;
         }
         if (block.txCount > peak) {
             peak = block.txCount;
@@ -2235,6 +2239,7 @@ function buildExplorerStats(
     const avg = totalBlocksObserved === 0 ? 0 : totalTxObserved / totalBlocksObserved;
     return {
         latestHeight: latest?.toString() ?? '—',
+        activeEpoch: activeEpoch?.toString() ?? '—',
         totalTxObserved: totalTxObserved === 0 ? '—' : totalTxObserved.toLocaleString(),
         peakTxPerBlock: peak === 0 ? '—' : peak.toLocaleString(),
         avgTxPerBlock: totalBlocksObserved === 0 ? '—' : Math.round(avg).toLocaleString(),

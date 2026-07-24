@@ -47,6 +47,8 @@ pub const BLOCK_META_TX_COUNT: &str = "tx_count";
 pub const BLOCK_META_TRANSACTIONS_ROOT: &str = "transactions_root";
 /// `block_meta`: latest transaction-hash QMDB operation location at this block.
 pub const BLOCK_META_TRANSACTIONS_TIP: &str = "transactions_tip";
+/// `block_meta`: simplex consensus epoch that finalized the block.
+pub const BLOCK_META_EPOCH: &str = "epoch";
 /// `block_meta`: simplex consensus view that finalized the block.
 pub const BLOCK_META_VIEW: &str = "view";
 /// `block_meta`: finalization timestamp in microseconds since the Unix epoch.
@@ -121,6 +123,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                     false,
                 ),
                 TableColumnConfig::new(BLOCK_META_TRANSACTIONS_TIP, DataType::UInt64, false),
+                TableColumnConfig::new(BLOCK_META_EPOCH, DataType::UInt64, false),
                 TableColumnConfig::new(BLOCK_META_VIEW, DataType::UInt64, false),
                 TableColumnConfig::new(
                     BLOCK_META_FINALIZED_TS,
@@ -250,6 +253,7 @@ mod tests {
         assert_eq!(BLOCK_META_TX_COUNT, "tx_count");
         assert_eq!(BLOCK_META_TRANSACTIONS_ROOT, "transactions_root");
         assert_eq!(BLOCK_META_TRANSACTIONS_TIP, "transactions_tip");
+        assert_eq!(BLOCK_META_EPOCH, "epoch");
         assert_eq!(BLOCK_META_VIEW, "view");
         assert_eq!(BLOCK_META_FINALIZED_TS, "finalized_ts");
         assert_eq!(TX_META_DIGEST, "tx_digest");
