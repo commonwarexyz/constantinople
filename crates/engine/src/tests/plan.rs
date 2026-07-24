@@ -4,9 +4,10 @@
 //! simulated network to one retained peer set. DKG integration needs several
 //! epoch-indexed sets so removed validators remain reachable while
 //! lookup transitions are exercised. This small plan keeps only the
-//! processed-height crash control used by these tests.
+//! processed-height crash and delayed-start controls used by these tests.
 
 use super::{TestEngineDefinition, ValidatorState};
+use commonware_consensus::types::Round;
 use commonware_glue::simulate::{
     action::Crash,
     engine::EngineDefinition as _,
@@ -28,8 +29,14 @@ struct ProcessedCrash {
     triggered: bool,
 }
 
+struct DelayedStart {
+    participants: HashSet<super::TestPublicKey>,
+    round: Round,
+}
+
 pub(crate) struct RunResult {
     pub(crate) crashes: u64,
+    pub(crate) delayed_started: bool,
 }
 
 pub(crate) struct Plan {
@@ -37,6 +44,7 @@ pub(crate) struct Plan {
     link: Link,
     max_message_size: u32,
     timeout: Duration,
+    delayed_start: Option<DelayedStart>,
     processed_crashes: Vec<ProcessedCrash>,
     exit: Option<Box<dyn ExitCondition<super::TestPublicKey, ValidatorState>>>,
     properties: Vec<Box<dyn Property<super::TestPublicKey, ValidatorState>>>,
@@ -49,6 +57,7 @@ impl Plan {
             link: super::default_link(),
             max_message_size: super::MAX_MESSAGE_SIZE,
             timeout: Duration::from_secs(600),
+            delayed_start: None,
             processed_crashes: Vec::new(),
             exit: None,
             properties: Vec::new(),
@@ -57,6 +66,19 @@ impl Plan {
 
     pub(crate) fn crash(mut self, crash: Crash<super::TestPublicKey>) -> Self {
         match crash {
+            Crash::DelayRound {
+                participants,
+                round,
+            } => {
+                assert!(
+                    self.delayed_start.is_none(),
+                    "the engine integration plan supports one delayed-start group"
+                );
+                self.delayed_start = Some(DelayedStart {
+                    participants: participants.into_iter().collect(),
+                    round,
+                });
+            }
             Crash::ProcessedHeight {
                 participant,
                 heights,
@@ -67,7 +89,7 @@ impl Plan {
                 downtime,
                 triggered: false,
             }),
-            Crash::DelayRound { .. } | Crash::Random { .. } | Crash::Schedule(_) => {
+            Crash::Random { .. } | Crash::Schedule(_) => {
                 panic!("the engine integration plan only supports deterministic crash controls")
             }
         }
@@ -122,7 +144,11 @@ impl Plan {
         .await;
         network.start();
 
-        let delayed = HashSet::new();
+        let delayed = self
+            .delayed_start
+            .as_ref()
+            .map(|start| start.participants.clone())
+            .unwrap_or_default();
         let mut team = Team::new(self.engine.clone(), participants);
         let (monitor_tx, mut monitor_rx) =
             mpsc::channel::<FinalizationUpdate<super::TestPublicKey>>(1024);
@@ -138,6 +164,7 @@ impl Plan {
 
         let mut tracker = ProgressTracker::default();
         let mut crashes = 0;
+        let mut delayed_started = delayed.is_empty();
         let exit = self
             .exit
             .take()
@@ -169,6 +196,26 @@ impl Plan {
                 _ = context.sleep(Duration::from_millis(25)) => {},
             }
 
+            if !delayed_started
+                && self.delayed_start.as_ref().is_some_and(|start| {
+                    tracker
+                        .max_round()
+                        .is_some_and(|round| round >= start.round)
+                })
+            {
+                for participant in &delayed {
+                    team.start_one(
+                        &context,
+                        &oracle,
+                        participant.clone(),
+                        monitor_tx.clone(),
+                        true,
+                    )
+                    .await;
+                }
+                delayed_started = true;
+            }
+
             crashes += self
                 .trigger_processed_crashes(&context, &mut team, &restart_tx)
                 .await?;
@@ -191,7 +238,10 @@ impl Plan {
                     .await
                     .map_err(|error| format!("property {} failed: {error}", property.name()))?;
             }
-            return Ok(RunResult { crashes });
+            return Ok(RunResult {
+                crashes,
+                delayed_started,
+            });
         }
     }
 

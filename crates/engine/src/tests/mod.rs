@@ -2,6 +2,7 @@
 
 mod common;
 mod dkg_integration;
+mod late_peer;
 mod plan;
 mod properties;
 
@@ -127,6 +128,8 @@ pub(crate) struct TestEngineDefinition {
     failures: Arc<HashSet<u64>>,
     processed: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
     holds: Arc<Mutex<BTreeMap<TestPublicKey, VecDeque<u64>>>>,
+    hold_releases: Arc<Mutex<BTreeMap<TestPublicKey, TestPublicKey>>>,
+    attached: Arc<Mutex<HashSet<TestPublicKey>>>,
     starts: Arc<Mutex<BTreeMap<TestPublicKey, usize>>>,
     tracks: TrackLog,
     secret_root: Arc<PathBuf>,
@@ -268,6 +271,8 @@ impl TestEngineDefinition {
             failures: Arc::default(),
             processed: Arc::default(),
             holds: Arc::default(),
+            hold_releases: Arc::default(),
+            attached: Arc::default(),
             starts: Arc::default(),
             tracks: Arc::default(),
             secret_root: Arc::new(secret_root),
@@ -287,6 +292,19 @@ impl TestEngineDefinition {
         self.holds
             .lock()
             .insert(participant, heights.into_iter().collect());
+        self
+    }
+
+    pub(crate) fn with_hold_until_attached(
+        self,
+        participant: TestPublicKey,
+        height: u64,
+        release: TestPublicKey,
+    ) -> Self {
+        self.holds
+            .lock()
+            .insert(participant.clone(), [height].into());
+        self.hold_releases.lock().insert(participant, release);
         self
     }
 
@@ -398,6 +416,8 @@ impl EngineDefinition for TestEngineDefinition {
         let failures = self.failures.clone();
         let processed = self.processed.clone();
         let holds = self.holds.clone();
+        let hold_releases = self.hold_releases.clone();
+        let attached = self.attached.clone();
         let tracks = self.tracks.clone();
         let starts = self.starts.clone();
         let secret_root = self.secret_root.clone();
@@ -474,6 +494,8 @@ impl EngineDefinition for TestEngineDefinition {
             let hook_key = public_key.clone();
             let hook_processed = processed.clone();
             let hook_holds = holds.clone();
+            let hook_hold_releases = hold_releases.clone();
+            let hook_attached = attached.clone();
             let finalized_hook: FinalizedHookFn<
                 _,
                 Commitment,
@@ -487,6 +509,8 @@ impl EngineDefinition for TestEngineDefinition {
                 let public_key = hook_key.clone();
                 let processed = hook_processed.clone();
                 let holds = hook_holds.clone();
+                let hold_releases = hook_hold_releases.clone();
+                let attached = hook_attached.clone();
                 Box::pin(async move {
                     processed.lock().insert(public_key.clone(), height);
                     if height % TEST_EPOCH_LENGTH.get() == TEST_EPOCH_LENGTH.get() - 1 {
@@ -498,7 +522,11 @@ impl EngineDefinition for TestEngineDefinition {
                             .get(&public_key)
                             .and_then(VecDeque::front)
                             .is_some_and(|held| height >= *held);
-                        if !held {
+                        let release = hold_releases.lock().get(&public_key).cloned();
+                        let released = release
+                            .as_ref()
+                            .is_some_and(|release| attached.lock().contains(release));
+                        if !held || released {
                             break;
                         }
                         context.sleep(Duration::from_millis(25)).await;
@@ -608,11 +636,13 @@ impl EngineDefinition for TestEngineDefinition {
                 warn!(validator = %public_key, "validator state receiver dropped");
                 return;
             }
+            let committee_key = public_key.clone();
             context
                 .child("committee_attacher")
                 .spawn(move |_| async move {
                     let database = committee.await;
                     let _ = committee_cell.set(database);
+                    attached.lock().insert(committee_key);
                 });
 
             if let Err(error) = engine_handle.await {
