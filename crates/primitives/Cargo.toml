@@ -20,6 +20,7 @@ commonware-utils.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
+commonware-glue.workspace = true
 commonware-runtime.workspace = true
 
 # Other
@@ -38,6 +39,7 @@ commonware-codec = { workspace = true, features = ["arbitrary"] }
 commonware-utils = { workspace = true, features = ["arbitrary"] }
 commonware-consensus = { workspace = true, features = ["arbitrary"] }
 commonware-cryptography = { workspace = true, features = ["arbitrary"] }
+commonware-glue = { workspace = true, features = ["arbitrary"] }
 
 # Other
 rand = { workspace = true, features = ["std_rng"] }
@@ -48,6 +50,7 @@ arbitrary = [
 	"commonware-codec/arbitrary",
 	"commonware-consensus/arbitrary",
 	"commonware-cryptography/arbitrary",
+	"commonware-glue/arbitrary",
 	"commonware-math/arbitrary",
 	"commonware-utils/arbitrary",
 	"dep:arbitrary",

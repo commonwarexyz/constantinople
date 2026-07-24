@@ -6,16 +6,21 @@
 //! - [`Block`] - Execution payload and required consensus metadata.
 
 use crate::{LazySignedTransaction, Sealable, Sealed, SignedTransaction};
-use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
+use commonware_codec::{
+    Codec, Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write,
+};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
-use commonware_cryptography::{Digest, Hasher, PublicKey};
+use commonware_cryptography::{
+    Digest, Hasher, PublicKey, Signer, bls12381::primitives::variant::Variant,
+};
+use commonware_glue::dkg::{ReshareBlock, network::Directory, types::Payload};
 use commonware_utils::range::NonEmptyRange;
 
 /// A block header containing metadata, consensus context, and state commitment roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Header<C, D, P>
+pub struct Header<C, D, P, R = ()>
 where
     C: Digest,
     D: Digest,
@@ -37,26 +42,36 @@ where
     pub transactions_root: D,
     /// The active range of the transactions database.
     pub transactions_range: NonEmptyRange<u64>,
+    /// The canonical root of the committee database after applying this block.
+    pub committee_root: D,
+    /// The retained range needed to sync the committee database.
+    pub committee_range: NonEmptyRange<u64>,
+    /// Optional consensus metadata committed by this header.
+    pub payload: Option<R>,
 }
 
-impl<C, D, P> Header<C, D, P>
+impl<C, D, P, R> Header<C, D, P, R>
 where
     C: Digest,
     D: Digest,
     P: PublicKey,
+    R: Write + EncodeSize,
 {
     /// Hashes the encoded header to produce a digest.
     pub fn hash_slow<H: Hasher<Digest = D>>(&self, hasher: &mut H) -> D {
         hasher.update(self.encode().as_ref());
-        hasher.finalize()
+        let (next, digest) = core::mem::take(hasher).finalize();
+        *hasher = next;
+        digest
     }
 }
 
-impl<C, D, P> Sealable for Header<C, D, P>
+impl<C, D, P, R> Sealable for Header<C, D, P, R>
 where
     C: Digest,
     D: Digest,
     P: PublicKey,
+    R: Write + EncodeSize,
 {
     type SealDigest = D;
 
@@ -69,11 +84,12 @@ where
     }
 }
 
-impl<C, D, P> EncodeSize for Header<C, D, P>
+impl<C, D, P, R> EncodeSize for Header<C, D, P, R>
 where
     C: Digest,
     D: Digest,
     P: PublicKey,
+    R: EncodeSize,
 {
     fn encode_size(&self) -> usize {
         self.context.encode_size()
@@ -84,14 +100,18 @@ where
             + self.state_range.encode_size()
             + self.transactions_root.encode_size()
             + self.transactions_range.encode_size()
+            + self.committee_root.encode_size()
+            + self.committee_range.encode_size()
+            + self.payload.encode_size()
     }
 }
 
-impl<C, D, P> Write for Header<C, D, P>
+impl<C, D, P, R> Write for Header<C, D, P, R>
 where
     C: Digest,
     D: Digest,
     P: PublicKey,
+    R: Write,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.context.write(buf);
@@ -102,18 +122,22 @@ where
         self.state_range.write(buf);
         self.transactions_root.write(buf);
         self.transactions_range.write(buf);
+        self.committee_root.write(buf);
+        self.committee_range.write(buf);
+        self.payload.write(buf);
     }
 }
 
-impl<C, D, P> Read for Header<C, D, P>
+impl<C, D, P, R> Read for Header<C, D, P, R>
 where
     C: Digest,
     D: Digest,
     P: PublicKey,
+    R: Read,
 {
-    type Cfg = ();
+    type Cfg = R::Cfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             context: Context::read(buf)?,
             parent: D::read(buf)?,
@@ -123,16 +147,20 @@ where
             state_range: NonEmptyRange::read(buf)?,
             transactions_root: D::read(buf)?,
             transactions_range: NonEmptyRange::read(buf)?,
+            committee_root: D::read(buf)?,
+            committee_range: NonEmptyRange::read(buf)?,
+            payload: Option::<R>::read_cfg(buf, cfg)?,
         })
     }
 }
 
 #[cfg(any(feature = "arbitrary", test))]
-impl<C, D, P> arbitrary::Arbitrary<'_> for Header<C, D, P>
+impl<C, D, P, R> arbitrary::Arbitrary<'_> for Header<C, D, P, R>
 where
     C: Digest + for<'a> arbitrary::Arbitrary<'a>,
     D: Digest + for<'a> arbitrary::Arbitrary<'a>,
     P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
+    R: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
         Ok(Self {
@@ -144,35 +172,41 @@ where
             state_range: u.arbitrary()?,
             transactions_root: u.arbitrary()?,
             transactions_range: u.arbitrary()?,
+            committee_root: u.arbitrary()?,
+            committee_range: u.arbitrary()?,
+            payload: u.arbitrary()?,
         })
     }
 }
 
 /// Codec configuration for decoding a [`Block`].
 #[derive(Clone, Debug)]
-pub struct BlockCfg {
+pub struct BlockCfg<RCfg = ()> {
     /// Maximum number of transactions in the block body.
     pub max_transactions: RangeCfg<usize>,
+    /// Configuration for decoding the optional header payload.
+    pub payload: RCfg,
 }
 
-impl Default for BlockCfg {
+impl<RCfg: Default> Default for BlockCfg<RCfg> {
     fn default() -> Self {
         Self {
             max_transactions: RangeCfg::new(0..=usize::MAX),
+            payload: RCfg::default(),
         }
     }
 }
 
 /// A block containing signed transactions and required epoch-consensus metadata.
-#[derive(Debug, Clone)]
-pub struct Block<C, P, H>
+#[derive(Debug)]
+pub struct Block<C, P, H, R = ()>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
 {
     /// The execution header.
-    pub header: Header<C, H::Digest, P>,
+    pub header: Header<C, H::Digest, P, R>,
     /// Ordered transactions included in this execution payload.
     ///
     /// Each transaction is held in a [`LazySignedTransaction`] so block
@@ -182,55 +216,71 @@ where
     pub body: Vec<LazySignedTransaction<H>>,
 }
 
+impl<C, P, H, R> Clone for Block<C, P, H, R>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    R: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            body: self.body.clone(),
+        }
+    }
+}
+
 /// A sealed canonical block.
-pub type SealedBlock<C, P, H> = Sealed<Block<C, P, H>, H>;
+pub type SealedBlock<C, P, H, R = ()> = Sealed<Block<C, P, H, R>, H>;
 
 #[cfg(any(feature = "arbitrary", test))]
-impl<C, P, H> arbitrary::Arbitrary<'_> for Block<C, P, H>
+impl<C, P, H, R> arbitrary::Arbitrary<'_> for Block<C, P, H, R>
 where
     C: Digest + for<'a> arbitrary::Arbitrary<'a>,
     P: PublicKey + for<'a> arbitrary::Arbitrary<'a>,
     H: Hasher,
     H::Digest: for<'a> arbitrary::Arbitrary<'a>,
-    SignedTransaction<H>: for<'a> arbitrary::Arbitrary<'a>,
+    R: for<'a> arbitrary::Arbitrary<'a>,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'_>) -> arbitrary::Result<Self> {
-        let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
-            body: body.into_iter().map(LazySignedTransaction::new).collect(),
+            body: Vec::new(),
         })
     }
 }
 
-impl<C, P, H> PartialEq for Block<C, P, H>
+impl<C, P, H, R> PartialEq for Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: PartialEq,
 {
     fn eq(&self, other: &Self) -> bool {
         self.header == other.header && self.body == other.body
     }
 }
 
-impl<C, P, H> Eq for Block<C, P, H>
+impl<C, P, H, R> Eq for Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey + Eq,
     H: Hasher,
     H::Digest: Eq,
+    R: Eq,
 {
 }
 
-impl<C, P, H> Block<C, P, H>
+impl<C, P, H, R> Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
 {
     /// Creates a new block from already-decoded transactions.
-    pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
+    pub fn new(header: Header<C, H::Digest, P, R>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
             header,
             body: body.into_iter().map(LazySignedTransaction::new).collect(),
@@ -238,22 +288,24 @@ where
     }
 }
 
-impl<C, P, H> EncodeSize for Block<C, P, H>
+impl<C, P, H, R> EncodeSize for Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: EncodeSize,
 {
     fn encode_size(&self) -> usize {
         self.header.encode_size() + self.body.encode_size()
     }
 }
 
-impl<C, P, H> Write for Block<C, P, H>
+impl<C, P, H, R> Write for Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Write,
 {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.header.write(buf);
@@ -261,28 +313,30 @@ where
     }
 }
 
-impl<C, P, H> Read for Block<C, P, H>
+impl<C, P, H, R> Read for Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Read,
 {
-    type Cfg = BlockCfg;
+    type Cfg = BlockCfg<R::Cfg>;
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
-            header: Header::read_cfg(buf, &())?,
+            header: Header::read_cfg(buf, &cfg.payload)?,
             body: Vec::read_cfg(buf, &tx_vec_cfg)?,
         })
     }
 }
 
-impl<C, P, H> Sealable for Block<C, P, H>
+impl<C, P, H, R> Sealable for Block<C, P, H, R>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Write + EncodeSize,
 {
     type SealDigest = H::Digest;
 
@@ -296,7 +350,7 @@ where
     }
 }
 
-impl<C, P, H> Heightable for Sealed<Block<C, P, H>, H>
+impl<C, P, H, R> Heightable for Sealed<Block<C, P, H, R>, H>
 where
     C: Digest,
     P: PublicKey,
@@ -307,7 +361,7 @@ where
     }
 }
 
-impl<C, P, H> Heightable for Sealed<Header<C, H::Digest, P>, H>
+impl<C, P, H, R> Heightable for Sealed<Header<C, H::Digest, P, R>, H>
 where
     C: Digest,
     P: PublicKey,
@@ -318,33 +372,36 @@ where
     }
 }
 
-impl<C, P, H> ConsensusBlock for Sealed<Block<C, P, H>, H>
+impl<C, P, H, R> ConsensusBlock for Sealed<Block<C, P, H, R>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Codec + Clone + Send + Sync + 'static,
 {
     fn parent(&self) -> Self::Digest {
         self.header.parent
     }
 }
 
-impl<C, P, H> ConsensusBlock for Sealed<Header<C, H::Digest, P>, H>
+impl<C, P, H, R> ConsensusBlock for Sealed<Header<C, H::Digest, P, R>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Codec + Clone + Send + Sync + 'static,
 {
     fn parent(&self) -> Self::Digest {
         self.parent
     }
 }
 
-impl<C, P, H> CertifiableBlock for Sealed<Block<C, P, H>, H>
+impl<C, P, H, R> CertifiableBlock for Sealed<Block<C, P, H, R>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Codec + Clone + Send + Sync + 'static,
 {
     type Context = Context<C, P>;
 
@@ -353,16 +410,35 @@ where
     }
 }
 
-impl<C, P, H> CertifiableBlock for Sealed<Header<C, H::Digest, P>, H>
+impl<C, P, H, R> CertifiableBlock for Sealed<Header<C, H::Digest, P, R>, H>
 where
     C: Digest,
     P: PublicKey,
     H: Hasher,
+    R: Codec + Clone + Send + Sync + 'static,
 {
     type Context = Context<C, P>;
 
     fn context(&self) -> Self::Context {
         self.context.clone()
+    }
+}
+
+impl<C, P, H, V, S, Dir> ReshareBlock for Sealed<Block<C, P, H, Payload<V, S, Dir>>, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    V: Variant,
+    S: Signer,
+    Dir: Directory<S::PublicKey>,
+{
+    type Variant = V;
+    type Signer = S;
+    type Directory = Dir;
+
+    fn payload(&self) -> Option<Payload<V, S, Dir>> {
+        self.header.payload.clone()
     }
 }
 
@@ -374,10 +450,13 @@ mod tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Signer, ed25519, secp256r1::standard as secp256r1, sha256};
+    use commonware_cryptography::{
+        Signer, bls12381::primitives::variant::MinPk, ed25519, secp256r1::standard as secp256r1,
+        sha256,
+    };
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
-    use rand::{SeedableRng, rngs::StdRng};
+    use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 
     fn test_context() -> Context<sha256::Digest, ed25519::PublicKey> {
         let mut rng = StdRng::from_seed([7u8; 32]);
@@ -389,7 +468,9 @@ mod tests {
         }
     }
 
-    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey> {
+    fn test_header_with_payload<R>(
+        payload: Option<R>,
+    ) -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey, R> {
         Header {
             context: test_context(),
             parent: sha256::Digest::EMPTY,
@@ -399,7 +480,30 @@ mod tests {
             state_range: non_empty_range!(0, 1),
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(0, 1),
+            committee_root: sha256::Digest::EMPTY,
+            committee_range: non_empty_range!(0, 1),
+            payload,
         }
+    }
+
+    fn test_header() -> Header<sha256::Digest, sha256::Digest, ed25519::PublicKey> {
+        test_header_with_payload(None)
+    }
+
+    fn arbitrary_value<T>() -> T
+    where
+        T: for<'a> arbitrary::Arbitrary<'a>,
+    {
+        let mut rng = StdRng::from_seed([11u8; 32]);
+        for _ in 0..256 {
+            let mut bytes = [0u8; 4096];
+            rng.fill(&mut bytes);
+            let mut unstructured = arbitrary::Unstructured::new(&bytes);
+            if let Ok(value) = T::arbitrary(&mut unstructured) {
+                return value;
+            }
+        }
+        panic!("failed to generate arbitrary test value");
     }
 
     #[test]
@@ -441,6 +545,74 @@ mod tests {
         )
         .expect("decoding should succeed");
         assert_eq!(decoded, block);
+    }
+
+    #[test]
+    fn block_codec_roundtrip_with_bounded_payload() {
+        let block = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Vec<u8>>::new(
+            test_header_with_payload(Some(vec![1, 2, 3, 4])),
+            vec![],
+        );
+        let encoded = block.encode();
+        let cfg = BlockCfg {
+            max_transactions: RangeCfg::new(0..=0),
+            payload: (RangeCfg::new(0..=4), ()),
+        };
+
+        let decoded =
+            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Vec<u8>>::decode_cfg(
+                encoded.clone(),
+                &cfg,
+            )
+            .expect("payload within the configured bound should decode");
+        assert_eq!(decoded, block);
+
+        let too_small = BlockCfg {
+            max_transactions: RangeCfg::new(0..=0),
+            payload: (RangeCfg::new(0..=3), ()),
+        };
+        assert!(
+            Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Vec<u8>>::decode_cfg(
+                encoded, &too_small,
+            )
+            .is_err(),
+            "payload exceeding the configured bound should be rejected"
+        );
+    }
+
+    #[test]
+    fn block_seal_commits_to_payload() {
+        let without_payload = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, u8>::new(
+            test_header_with_payload(None),
+            vec![],
+        )
+        .seal(&mut sha256::Sha256::default());
+        let with_payload = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, u8>::new(
+            test_header_with_payload(Some(7)),
+            vec![],
+        )
+        .seal(&mut sha256::Sha256::default());
+
+        assert_ne!(without_payload.seal(), with_payload.seal());
+    }
+
+    #[test]
+    fn arbitrary_block_supports_payload() {
+        let _: Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256, u8> = arbitrary_value();
+    }
+
+    #[test]
+    fn sealed_dkg_block_exposes_reshare_payload() {
+        type DkgPayload = Payload<MinPk, ed25519::PrivateKey>;
+
+        let payload = arbitrary_value::<DkgPayload>();
+        let block = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, DkgPayload>::new(
+            test_header_with_payload(Some(payload.clone())),
+            vec![],
+        )
+        .seal(&mut sha256::Sha256::default());
+
+        assert!(ReshareBlock::payload(&block) == Some(payload));
     }
 
     #[test]

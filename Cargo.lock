@@ -1154,6 +1154,7 @@ name = "commonware-glue"
 version = "2026.7.0"
 source = "git+https://github.com/commonwarexyz/monorepo?branch=cl%2Fdkg-peer-manager#ce9746e8d4b7cf4ab10f9d09c31002a8761ff5b0"
 dependencies = [
+ "arbitrary",
  "bytes",
  "commonware-actor",
  "commonware-broadcast",
@@ -1704,6 +1705,7 @@ dependencies = [
  "commonware-consensus",
  "commonware-cryptography",
  "commonware-formatting",
+ "commonware-glue",
  "commonware-math",
  "commonware-parallel",
  "commonware-runtime",
