@@ -19,6 +19,7 @@
         "tests/**/*.ts",
         "src/blockSequence.ts",
         "src/codec.ts",
+        "src/committee.ts",
         "src/historyKey.ts",
         "src/nonce.ts",
         "src/proofMath.ts",

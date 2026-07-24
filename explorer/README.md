@@ -31,6 +31,27 @@ transaction bytes, verifies the SQL bytes hash to that digest, fetches a
 transaction operation-log proof from `qmdb-indexer` under `/transactions`, and
 shows a checkmark after browser-side QMDB and Simplex verification succeeds.
 
+### Committee controls
+
+The manually routed `/committee` page reads `GET /committee` from
+`VITE_MEMPOOL_URL`. Height and epoch fields are required to be canonical
+decimal strings so the client can retain exact `u64` values. The page starts
+from the scheduled E+2 set, renders every peer in the immutable eligible
+catalog, and treats runtime connectivity as advisory display data only.
+
+Transfers and committee updates use the finalized tagged Rust wire contract,
+mirrored by the shared encoder in [`src/codec.ts`](src/codec.ts):
+
+- Header: `sender[34] || nonce:u64be || action_tag:u8`.
+- Tag `0` (transfer): `recipient:AccountKey[32] || value:NonZeroU64:u64be`.
+- Tag `1` (committee): `target_epoch:Epoch:canonical-protobuf-u64-varint ||
+  peer:ed25519[32] || registered:bool:u8`.
+
+The signature encoding follows that variable-length body. QMDB transaction
+verification decodes the tag and committee epoch varint to locate the exact
+body bytes before hashing. Rust-compatible golden vectors live in
+`tests/codec.test.ts` and `tests/committeeCodec.test.ts`.
+
 ### Why SQL?
 
 The indexer publishes every finalized block to complementary surfaces

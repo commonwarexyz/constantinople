@@ -6,8 +6,16 @@ import {
     useState,
     type CSSProperties,
 } from 'react';
+import CommitteePage from './CommitteePage';
+import {
+    fetchCommittee,
+    planCommitteeTransactions,
+    type CommitteeChange,
+    type CommitteeSnapshot,
+} from './committee';
 import {
     accountKeyFromPublicKey,
+    encodeSignedCommitteeTransaction,
     encodeSignedTransaction,
     encodeTransactionBatch,
     parseAccountKeyHex,
@@ -73,6 +81,8 @@ type Status =
     | { kind: 'connecting' }
     | { kind: 'live' }
     | { kind: 'error'; message: string };
+
+type ExplorerPage = 'home' | 'committee';
 
 // The explorer subscribes to `metadata-indexer` for block rows and queries
 // `qmdb-indexer` for submitted-transaction proofs. Defaults match
@@ -203,6 +213,11 @@ export default function App() {
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
+    const [page, setPage] = useState<ExplorerPage>(() => pageFromLocation());
+    const [committee, setCommittee] = useState<CommitteeSnapshot | null>(null);
+    const [committeeLoading, setCommitteeLoading] = useState(false);
+    const [committeeError, setCommitteeError] = useState('');
+    const [committeeSubmitMessage, setCommitteeSubmitMessage] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
@@ -225,6 +240,7 @@ export default function App() {
         signedInAccountKey,
     );
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
+    const isCommitteePage = page === 'committee';
 
     const setLocalNonceState = (nextNonce: NonceState) => {
         nextNonceRef.current = nextNonce;
@@ -334,7 +350,9 @@ export default function App() {
 
     useEffect(() => {
         const onPopState = () => {
+            const nextPage = pageFromLocation();
             const next = accountFromLocation();
+            setPage(nextPage);
             setLookupAccount(next);
             setAccountInput(next);
             setAccountCursorStack([null]);
@@ -342,6 +360,37 @@ export default function App() {
         window.addEventListener('popstate', onPopState);
         return () => window.removeEventListener('popstate', onPopState);
     }, []);
+
+    useEffect(() => {
+        if (!isCommitteePage) return;
+
+        const controller = new AbortController();
+        let loading = false;
+        const load = async () => {
+            if (loading) return;
+            loading = true;
+            setCommitteeLoading(true);
+            try {
+                const snapshot = await fetchCommittee(mempoolUrl, controller.signal);
+                if (controller.signal.aborted) return;
+                setCommittee(snapshot);
+                setCommitteeError('');
+            } catch (error) {
+                if (controller.signal.aborted) return;
+                setCommitteeError(error instanceof Error ? error.message : String(error));
+            } finally {
+                if (!controller.signal.aborted) setCommitteeLoading(false);
+                loading = false;
+            }
+        };
+
+        void load();
+        const interval = window.setInterval(() => void load(), 5_000);
+        return () => {
+            controller.abort();
+            window.clearInterval(interval);
+        };
+    }, [isCommitteePage]);
 
     useEffect(() => {
         if (!lookupAccount) {
@@ -627,6 +676,19 @@ export default function App() {
         setWalletMessage('signed out');
     };
 
+    const refreshCommittee = async () => {
+        setCommitteeLoading(true);
+        try {
+            const snapshot = await fetchCommittee(mempoolUrl);
+            setCommittee(snapshot);
+            setCommitteeError('');
+        } catch (error) {
+            setCommitteeError(error instanceof Error ? error.message : String(error));
+        } finally {
+            setCommitteeLoading(false);
+        }
+    };
+
     const copyValue = async (value: string) => {
         try {
             await navigator.clipboard.writeText(value);
@@ -657,9 +719,11 @@ export default function App() {
 
         setSearchMessage('');
         setLookupAccount(normalized);
+        setPage('home');
         setAccountInput(normalized);
         setAccountCursorStack([null]);
         const url = new URL(window.location.href);
+        url.pathname = '/';
         url.searchParams.set('account', normalized);
         const nextLocation = `${url.pathname}${url.search}${url.hash}`;
         if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
@@ -676,16 +740,34 @@ export default function App() {
     };
 
     const clearAccountLookup = () => {
+        setPage('home');
         setLookupAccount('');
         setAccountInput('');
         setAccountCursorStack([null]);
         setSearchMessage('');
         const url = new URL(window.location.href);
+        url.pathname = '/';
         url.searchParams.delete('account');
         const nextLocation = `${url.pathname}${url.search}${url.hash}`;
         if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
             window.history.pushState(null, '', nextLocation);
         }
+    };
+
+    const openCommitteePage = () => {
+        setPage('committee');
+        setLookupAccount('');
+        setAccountInput('');
+        setAccountCursorStack([null]);
+        setSearchMessage('');
+        const url = new URL(window.location.href);
+        url.pathname = '/committee';
+        url.searchParams.delete('account');
+        const nextLocation = `${url.pathname}${url.search}${url.hash}`;
+        if (nextLocation !== `${window.location.pathname}${window.location.search}${window.location.hash}`) {
+            window.history.pushState(null, '', nextLocation);
+        }
+        setIsSearchOpen(false);
     };
 
     const nextAccountPage = () => {
@@ -780,6 +862,71 @@ export default function App() {
         }
     };
 
+    const submitCommitteeChanges = async (changes: readonly CommitteeChange[]) => {
+        if (!wallet || !walletAccountKey) {
+            setIsWalletOpen(true);
+            return;
+        }
+        if (!committee) {
+            setCommitteeSubmitMessage('committee state unavailable');
+            return;
+        }
+        if (!committee.updatesOpen) {
+            setCommitteeSubmitMessage('committee updates are locked at the final block');
+            return;
+        }
+        if (changes.length === 0) return;
+
+        setPendingSubmissionCount((count) => count + 1);
+        setCommitteeSubmitMessage(`reserving ${changes.length} sequential nonces`);
+        let reservation: { previous: NonceState; next: NonceState } | null = null;
+        try {
+            const previousNonce = nextNonceRef.current;
+            const plan = planCommitteeTransactions(
+                changes,
+                committee.targetEpoch,
+                previousNonce,
+            );
+            setLocalNonceState(plan.nextNonceState);
+            reservation = { previous: previousNonce, next: plan.nextNonceState };
+
+            const encoded = [];
+            for (let index = 0; index < plan.transactions.length; index++) {
+                const transaction = plan.transactions[index];
+                setCommitteeSubmitMessage(
+                    `signing update ${index + 1} / ${plan.transactions.length}`,
+                );
+                encoded.push(
+                    await encodeSignedCommitteeTransaction(
+                        {
+                            senderPublicKey: wallet.publicKey,
+                            nonce: transaction.nonce,
+                            targetEpoch: transaction.targetEpoch,
+                            peer: transaction.peer,
+                            registered: transaction.registered,
+                        },
+                        wallet.sign,
+                    ),
+                );
+            }
+
+            setCommitteeSubmitMessage(`submitting ${encoded.length} per-peer updates`);
+            const txStatus = await submitTransactions(
+                mempoolUrl,
+                encodeTransactionBatch(encoded.map(({ bytes }) => bytes)),
+            );
+            setCommitteeSubmitMessage(formatTxStatus(txStatus));
+            await Promise.all([refreshAccount(), refreshCommittee()]);
+        } catch (error) {
+            if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
+                setLocalNonceState(reservation.previous);
+            }
+            setCommitteeSubmitMessage(error instanceof Error ? error.message : String(error));
+        } finally {
+            setPendingSubmissionCount((count) => Math.max(0, count - 1));
+        }
+    };
+
     return (
         <div className="app">
             <div className="app__container">
@@ -805,6 +952,12 @@ export default function App() {
                         <span className="app__header-separator" aria-hidden="true">
                             ⬝
                         </span>
+                        <button className="wallet-trigger" onClick={openCommitteePage}>
+                            committee
+                        </button>
+                        <span className="app__header-separator" aria-hidden="true">
+                            ⬝
+                        </span>
                         <button className="wallet-trigger" onClick={() => setIsWalletOpen(true)}>
                             wallet{walletAccountKey && <span className="wallet-trigger__key"> {shortHex(walletAccountKey)}</span>}
                         </button>
@@ -812,7 +965,19 @@ export default function App() {
                 </header>
                 <main className="app__main app__main--minimal">
                     <section className="explorer-stage" aria-label="live transaction throughput">
-                        {lookupAccount ? (
+                        {isCommitteePage ? (
+                            <CommitteePage
+                                snapshot={committee}
+                                loading={committeeLoading}
+                                loadError={committeeError}
+                                walletAccountKey={walletAccountKey}
+                                submitMessage={committeeSubmitMessage}
+                                isSubmitting={isSubmitting}
+                                onRefresh={() => void refreshCommittee()}
+                                onOpenWallet={() => setIsWalletOpen(true)}
+                                onSubmit={(changes) => void submitCommitteeChanges(changes)}
+                            />
+                        ) : lookupAccount ? (
                             <AccountPage
                                 account={lookupAccount}
                                 onCopy={copyValue}
@@ -1815,12 +1980,17 @@ function accountNonceState(account: AccountView | null): NonceState {
 
 function accountFromLocation(): string {
     const url = new URL(window.location.href);
+    if (url.pathname === '/committee') return '';
     const queryAccount = url.searchParams.get('account');
     const fromQuery = queryAccount?.trim().replace(/^0x/i, '').toLowerCase();
     if (fromQuery && isAccountKeyHex(fromQuery)) return fromQuery;
 
     const pathMatch = /^\/account\/([0-9a-fA-F]{64})$/.exec(url.pathname);
     return pathMatch ? pathMatch[1].toLowerCase() : '';
+}
+
+function pageFromLocation(): ExplorerPage {
+    return window.location.pathname === '/committee' ? 'committee' : 'home';
 }
 
 function readHistory(key: string): SubmittedTransaction[] {
