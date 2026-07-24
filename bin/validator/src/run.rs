@@ -114,7 +114,7 @@ const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 const CURSOR_COMMITTEE_KEY: U64 = U64::new(2);
 
-/// Keeps the immutable genesis/bootstrap directory available as network-policy
+/// Keeps explicitly configured service nodes available as network-policy
 /// secondaries without changing the epoch IDs registered by DKG.
 #[derive(Clone)]
 struct BootstrapSecondaries<M>
@@ -122,15 +122,15 @@ where
     M: AddressableManager,
 {
     inner: M,
-    eligible: Map<M::PublicKey, Address>,
+    persistent: Map<M::PublicKey, Address>,
 }
 
 impl<M> BootstrapSecondaries<M>
 where
     M: AddressableManager,
 {
-    const fn new(inner: M, eligible: Map<M::PublicKey, Address>) -> Self {
-        Self { inner, eligible }
+    const fn new(inner: M, persistent: Map<M::PublicKey, Address>) -> Self {
+        Self { inner, persistent }
     }
 }
 
@@ -140,7 +140,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("BootstrapSecondaries")
-            .field("bootstrap", &self.eligible.len())
+            .field("persistent", &self.persistent.len())
             .finish_non_exhaustive()
     }
 }
@@ -171,8 +171,10 @@ where
     where
         R: Into<AddressableTrackedPeers<Self::PublicKey>> + Send,
     {
-        self.inner
-            .track(id, add_persistent_secondaries(peers.into(), &self.eligible))
+        self.inner.track(
+            id,
+            add_persistent_secondaries(peers.into(), &self.persistent),
+        )
     }
 
     fn overwrite(&mut self, peers: Map<Self::PublicKey, Address>) -> Feedback {
@@ -182,13 +184,13 @@ where
 
 fn add_persistent_secondaries<P: CryptographicPublicKey>(
     peers: AddressableTrackedPeers<P>,
-    eligible: &Map<P, Address>,
+    persistent: &Map<P, Address>,
 ) -> AddressableTrackedPeers<P> {
     let secondary = Map::from_iter_dedup(
         peers
             .secondary
             .iter_pairs()
-            .chain(eligible.iter_pairs())
+            .chain(persistent.iter_pairs())
             .filter(|(peer, _)| peers.primary.get_value(peer).is_none())
             .map(|(peer, address)| (peer.clone(), address.clone())),
     );
@@ -791,21 +793,17 @@ async fn start_queued_upload(
     });
 }
 
-/// Build the indexer wiring iff a genesis-secondary validator opted in.
+/// Build the indexer wiring when this genesis-secondary opted in.
 ///
 /// The peer metadata seeded here is the genesis/bootstrap directory. Future
 /// committee membership and p2p addresses come from finalized snapshots.
 async fn maybe_build_indexer(
     context: RuntimeContext,
-    is_genesis_primary: bool,
     indexer: Option<IndexerConfig>,
     partition_prefix: &str,
     eligible_peers: &Map<ed25519::PublicKey, Address>,
 ) -> Option<IndexerHandle> {
     let cfg = indexer?;
-    if is_genesis_primary {
-        return None;
-    }
 
     info!(
         chain_indexer_url = %cfg.chain_indexer_url,
@@ -1084,7 +1082,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             mempool_receiver,
             account_reader.clone(),
         );
-        let is_genesis_primary = decoded.share.is_some();
         let mempool_listener = if relayer.is_some() {
             // The relayer owns the public port. Its own catalog entry is
             // rewritten below to this private listener, avoiding a forwarding
@@ -1148,20 +1145,27 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .expect("failed to initialize validator-local DKG secret store");
 
         // Build indexer wiring from the genesis/bootstrap metadata up-front.
-        // This consumes `indexer` from the loaded config and returns `None` for
-        // genesis primaries or validators without an `indexer` block.
+        // Config loading rejects indexer wiring on genesis primaries, so the
+        // uploader can never start as part of the epoch-zero committee.
         let indexer_partition_prefix = decoded.partition_prefix.clone();
         let mut indexer_handle = maybe_build_indexer(
             context.child("indexer"),
-            is_genesis_primary,
             indexer,
             &indexer_partition_prefix,
             &decoded.eligible_peers,
         )
         .await;
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
-        let engine_manager =
-            BootstrapSecondaries::new(oracle.clone(), decoded.eligible_peers.clone());
+        let persistent_secondaries =
+            Map::from_iter_dedup(decoded.secondary_participants.iter().map(|peer| {
+                let address = decoded
+                    .eligible_peers
+                    .get_value(peer)
+                    .expect("bootstrap secondary missing eligible address")
+                    .clone();
+                (peer.clone(), address)
+            }));
+        let engine_manager = BootstrapSecondaries::new(oracle.clone(), persistent_secondaries);
 
         info!("initializing engine");
         let engine =
@@ -1344,10 +1348,10 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_secondaries_include_all_genesis_non_primaries() {
+    fn bootstrap_secondaries_remain_tracked_across_committee_rotations() {
         let primary = PrivateKey::from_seed(1).public_key();
         let scheduled = PrivateKey::from_seed(2).public_key();
-        let removed = PrivateKey::from_seed(3).public_key();
+        let indexer = PrivateKey::from_seed(3).public_key();
         let primary_address: Address = "127.0.0.1:1001"
             .parse::<std::net::SocketAddr>()
             .unwrap()
@@ -1356,26 +1360,43 @@ mod tests {
             .parse::<std::net::SocketAddr>()
             .unwrap()
             .into();
-        let removed_address: Address = "127.0.0.1:1003"
+        let indexer_address: Address = "127.0.0.1:1003"
             .parse::<std::net::SocketAddr>()
             .unwrap()
             .into();
-        let peers = AddressableTrackedPeers::new(
-            Map::from_iter_dedup([(primary.clone(), primary_address.clone())]),
+        let initial = AddressableTrackedPeers::new(
+            Map::from_iter_dedup([(primary.clone(), primary_address)]),
             Map::from_iter_dedup([(scheduled.clone(), scheduled_address.clone())]),
         );
-        let eligible = Map::from_iter_dedup([
-            (primary.clone(), primary_address),
-            (scheduled.clone(), scheduled_address),
-            (removed.clone(), removed_address),
-        ]);
+        let persistent = Map::from_iter_dedup([(indexer.clone(), indexer_address.clone())]);
 
-        let peers = add_persistent_secondaries(peers, &eligible);
+        let initial = add_persistent_secondaries(initial, &persistent);
 
-        assert!(peers.primary.get_value(&primary).is_some());
-        assert!(peers.secondary.get_value(&primary).is_none());
-        assert!(peers.secondary.get_value(&scheduled).is_some());
-        assert!(peers.secondary.get_value(&removed).is_some());
+        assert!(initial.primary.get_value(&primary).is_some());
+        assert!(initial.secondary.get_value(&primary).is_none());
+        assert!(initial.secondary.get_value(&scheduled).is_some());
+        assert_eq!(
+            initial.secondary.get_value(&indexer),
+            Some(&indexer_address)
+        );
+
+        let promoted = AddressableTrackedPeers::new(
+            Map::from_iter_dedup([(indexer.clone(), indexer_address.clone())]),
+            Map::default(),
+        );
+        let promoted = add_persistent_secondaries(promoted, &persistent);
+        assert!(promoted.primary.get_value(&indexer).is_some());
+        assert!(promoted.secondary.get_value(&indexer).is_none());
+
+        let rotated = AddressableTrackedPeers::new(
+            Map::from_iter_dedup([(scheduled, scheduled_address)]),
+            Map::default(),
+        );
+        let rotated = add_persistent_secondaries(rotated, &persistent);
+        assert_eq!(
+            rotated.secondary.get_value(&indexer),
+            Some(&indexer_address)
+        );
     }
 
     #[test]
@@ -1443,7 +1464,7 @@ mod tests {
 
             let handle = tokio::time::timeout(
                 Duration::from_secs(2),
-                maybe_build_indexer(context, false, Some(indexer), "test", &Map::default()),
+                maybe_build_indexer(context, Some(indexer), "test", &Map::default()),
             )
             .await
             .expect("publisher connection should not block startup")

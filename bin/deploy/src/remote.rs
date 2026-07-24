@@ -793,7 +793,10 @@ mod tests {
         let remote = remote_args();
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
 
+        let validators = build_validators(&args, &remote, Path::new("/tmp/configs"), &material);
         let secondaries = build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
+        let indexer_public_key = &material.secondary_public_keys[0];
+        let indexer_public_key_hex = hex(&indexer_public_key.encode());
 
         let indexer = secondaries[0]
             .config
@@ -802,6 +805,30 @@ mod tests {
             .expect("secondary should have indexer wiring");
         assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
         assert_eq!(indexer.upload_buffer, 64);
+        assert!(
+            material
+                .dkg_output
+                .players()
+                .position(indexer_public_key)
+                .is_none()
+        );
+        assert!(secondaries[0].config.dkg_share.is_empty());
+        assert_eq!(secondaries[0].public_key_hex, indexer_public_key_hex);
+        assert!(validators.iter().chain(&secondaries).all(|validator| {
+            !validator
+                .config
+                .primary_validators
+                .contains(&indexer_public_key_hex)
+                && validator
+                    .config
+                    .secondary_validators
+                    .contains(&indexer_public_key_hex)
+                && validator
+                    .config
+                    .eligible_peers
+                    .iter()
+                    .any(|peer| peer.public_key == indexer_public_key_hex)
+        }));
         assert!(
             secondaries[1].config.indexer.is_none(),
             "relayer secondary should not have indexer wiring"

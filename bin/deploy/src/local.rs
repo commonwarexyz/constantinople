@@ -1769,9 +1769,36 @@ mod tests {
             Path::new("/tmp/configs"),
             &material,
         );
+        let indexer_public_key = &material.secondary_public_keys[0];
+        let indexer_public_key_hex = hex(&indexer_public_key.encode());
 
-        // Primaries never get indexer wiring.
+        // The uploader is a bootstrap secondary, never an epoch-zero DKG
+        // participant, and every node keeps it in its bootstrap peer set.
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+        assert!(
+            material
+                .dkg_output
+                .players()
+                .position(indexer_public_key)
+                .is_none()
+        );
+        assert!(secondaries[0].config.dkg_share.is_empty());
+        assert_eq!(secondaries[0].peer.name, indexer_public_key_hex);
+        assert!(validators.iter().chain(&secondaries).all(|validator| {
+            !validator
+                .config
+                .primary_validators
+                .contains(&indexer_public_key_hex)
+                && validator
+                    .config
+                    .secondary_validators
+                    .contains(&indexer_public_key_hex)
+                && validator
+                    .config
+                    .eligible_peers
+                    .iter()
+                    .any(|peer| peer.public_key == indexer_public_key_hex)
+        }));
         assert!(
             validators
                 .iter()

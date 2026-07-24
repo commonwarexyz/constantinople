@@ -334,6 +334,15 @@ fn decode_with_network(
     let public_key = signer.public_key();
     let dkg_output = decode_dkg_output(&config.dkg_output, config.num_validators);
     let share = decode_share_opt(&config.dkg_share);
+    if config.indexer.is_some() && primary_participants.contains(&public_key) {
+        panic!("indexer validator cannot be a genesis primary");
+    }
+    if share.is_some() && config.indexer.is_some() {
+        panic!("indexer config is only valid on secondary validators");
+    }
+    if config.indexer.is_some() && !secondary_participants.contains(&public_key) {
+        panic!("indexer validator must be listed in secondary_validators");
+    }
     if share.is_some() && config.relayer.is_some() {
         panic!("relayer config is only valid on secondary validators");
     }
@@ -571,7 +580,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         EligiblePeerEntry, IndexerConfig, RelayerConfig, RelayerLeaderConfig, StartupModeConfig,
-        ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        ValidatorConfig, decode_with_network, default_max_pool_bytes, default_max_propose_bytes,
         default_page_cache_bytes, default_public_key_cache_size, default_upload_buffer,
         load_deployer_config, load_local_config, validate_relayer_catalog,
     };
@@ -585,6 +594,7 @@ mod tests {
         ed25519,
     };
     use commonware_formatting::hex;
+    use commonware_p2p::Address;
     use commonware_utils::{N3f1, TryCollect, ordered::Map};
     use std::{
         collections::BTreeMap,
@@ -673,6 +683,22 @@ mod tests {
                 .collect()
         }
 
+        fn eligible_address_map(&self) -> Map<ed25519::PublicKey, Address> {
+            self.primary_keys
+                .iter()
+                .chain(&self.secondary_keys)
+                .enumerate()
+                .map(|(index, public_key)| {
+                    let port = 9_000 + u16::try_from(index).unwrap();
+                    (
+                        public_key.clone(),
+                        Address::Symmetric(format!("127.0.0.1:{port}").parse().unwrap()),
+                    )
+                })
+                .try_collect()
+                .unwrap()
+        }
+
         /// Build a [`ValidatorConfig`] for primary slot `index`.
         fn primary_config(
             &self,
@@ -753,6 +779,87 @@ mod tests {
             public_key: name.clone(),
             name,
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "indexer config is only valid on secondary validators")]
+    fn share_bearing_validator_cannot_own_indexer_uploader() {
+        let cluster = Cluster::new(2, 1);
+        let mut config = cluster.primary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            cluster.eligible_entries(),
+        );
+        config.indexer = Some(IndexerConfig {
+            chain_indexer_url: "http://127.0.0.1:8090".to_string(),
+            upload_buffer: default_upload_buffer(),
+        });
+        let uploader = cluster.primary_keys[0].clone();
+        let mut secondaries = cluster.secondary_keys.clone();
+        secondaries.push(uploader);
+
+        let _ = decode_with_network(
+            config,
+            cluster.primary_keys[1..].to_vec(),
+            secondaries,
+            cluster.eligible_address_map(),
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "indexer validator cannot be a genesis primary")]
+    fn shareless_primary_cannot_masquerade_as_indexer_secondary() {
+        let cluster = Cluster::new(2, 1);
+        let mut config = cluster.primary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            cluster.eligible_entries(),
+        );
+        config.dkg_share.clear();
+        let uploader = cluster.primary_keys[0].clone();
+        config.secondary_validators.push(hex(&uploader.encode()));
+        config.indexer = Some(IndexerConfig {
+            chain_indexer_url: "http://127.0.0.1:8090".to_string(),
+            upload_buffer: default_upload_buffer(),
+        });
+        let mut secondaries = cluster.secondary_keys.clone();
+        secondaries.push(uploader);
+
+        let _ = decode_with_network(
+            config,
+            cluster.primary_keys.clone(),
+            secondaries,
+            cluster.eligible_address_map(),
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "indexer validator must be listed in secondary_validators")]
+    fn indexer_uploader_must_be_a_persistent_bootstrap_secondary() {
+        let cluster = Cluster::new(2, 1);
+        let mut config = cluster.secondary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            cluster.eligible_entries(),
+        );
+        config.secondary_validators.clear();
+        config.indexer = Some(IndexerConfig {
+            chain_indexer_url: "http://127.0.0.1:8090".to_string(),
+            upload_buffer: default_upload_buffer(),
+        });
+
+        let _ = decode_with_network(
+            config,
+            cluster.primary_keys.clone(),
+            Vec::new(),
+            cluster.eligible_address_map(),
+            None,
+            false,
+        );
     }
 
     #[test]
