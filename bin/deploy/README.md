@@ -490,8 +490,9 @@ npm --prefix explorer run dev
 
 Secondary validators join the P2P network and observe consensus, but do **not** participate in
 consensus. They receive an ed25519 identity during setup but **no DKG share**, so they cannot sign
-consensus messages. Every generated node carries the same immutable `eligible_peers` catalog,
-which maps each primary and secondary identity to the host used to resolve its lookup address.
+consensus messages. Every generated node carries the same immutable `eligible_peers` bootstrap
+directory, which maps each genesis primary and generated secondary identity to its initial lookup
+address. Finalized committee snapshots carry addresses for validators registered later.
 
 Secondaries do **not** run the mempool HTTP webserver — since they cannot propose blocks, they
 have no need to ingest transactions. Submit transactions to a primary validator instead.
@@ -530,10 +531,15 @@ flags.
 
 Notes:
 
-- Every node in the deployment (primary and secondary) must agree on the full `eligible_peers`
-  catalog. The deploy tool emits the complete catalog into every YAML. Changing an identity or
-  address requires a coordinated new genesis/restart; editing one config in isolation will break
-  lookup connectivity and committee eligibility.
+- Every node must agree on the genesis `eligible_peers` bootstrap directory emitted by the deploy
+  tool. It remains part of the checkpoint and must not be edited independently. A post-genesis
+  validator does not belong in this directory: give it the same genesis primary/secondary lists
+  and DKG output, no DKG share, its own identity and listen ports, and a self entry in
+  `peers.yaml` or the deployer hosts file. Its finalized committee transaction supplies the p2p
+  address used by lookup and DKG.
+- Registering a validator does not provision or launch its process and does not derive a relayer
+  HTTP endpoint from its p2p socket. Operators must start the node before activation and add an
+  explicit relayer leader URL when relayed submission to that validator is required.
 - The DKG polynomial is sized to the primary count only — adding secondaries does not change
   consensus quorum thresholds.
 

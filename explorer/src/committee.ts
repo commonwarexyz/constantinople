@@ -5,6 +5,10 @@ import {
 } from './nonce.ts';
 import { toHex } from './codec.ts';
 import {
+    normalizeEd25519PublicKey,
+    normalizeValidatorEndpoint,
+} from './validator.ts';
+import {
     SqlClient,
     type CellValue,
     type DecodedQueryResult,
@@ -42,13 +46,14 @@ export interface CommitteeSnapshot {
     /** The immutable committee for the epoch immediately after `epoch`. */
     readonly next: readonly string[];
     readonly scheduled: readonly string[];
-    /** The complete immutable eligible catalog. */
+    /** Peers and addresses learned from finalized committee snapshots. */
     readonly available: readonly EligibleCommitteePeer[];
 }
 
 export interface CommitteeChange {
     readonly peer: string;
-    readonly registered: boolean;
+    /** The peer's existing canonical endpoint for additions; null for removals. */
+    readonly address: string | null;
 }
 
 export interface PlannedCommitteeTransaction extends CommitteeChange {
@@ -59,6 +64,57 @@ export interface PlannedCommitteeTransaction extends CommitteeChange {
 export interface CommitteeTransactionPlan {
     readonly transactions: readonly PlannedCommitteeTransaction[];
     readonly nextNonceState: NonceState;
+}
+
+/** Merge local, previously unknown peers into the indexed roster without duplicates. */
+export function mergeCommitteeRoster(
+    available: readonly EligibleCommitteePeer[],
+    drafts: readonly EligibleCommitteePeer[],
+): EligibleCommitteePeer[] {
+    const merged = [...available];
+    const peers = new Set(available.map(({ peer }) => peer));
+    for (const draft of drafts) {
+        if (peers.has(draft.peer)) continue;
+        peers.add(draft.peer);
+        merged.push(draft);
+    }
+    return merged;
+}
+
+/** Build a canonical draft, rejecting both indexed and already-local peers. */
+export function createCommitteeDraft(
+    roster: readonly EligibleCommitteePeer[],
+    publicKey: string,
+    endpoint: string,
+): EligibleCommitteePeer {
+    const peer = normalizeEd25519PublicKey(publicKey);
+    if (roster.some((candidate) => candidate.peer === peer)) {
+        throw new Error('validator public key already exists in the roster');
+    }
+    return { peer, address: normalizeValidatorEndpoint(endpoint) };
+}
+
+/**
+ * Keep local peers through height-only refreshes. Epoch/lock transitions reset
+ * the edit session, while peers adopted by the finalized index are deduplicated.
+ */
+export function reconcileCommitteeDrafts(
+    previous: CommitteeSnapshot | null,
+    next: CommitteeSnapshot | null,
+    drafts: readonly EligibleCommitteePeer[],
+): EligibleCommitteePeer[] {
+    if (
+        previous === null ||
+        next === null ||
+        !next.updatesOpen ||
+        previous.targetEpoch !== next.targetEpoch ||
+        previous.lockHeight !== next.lockHeight ||
+        previous.updatesOpen !== next.updatesOpen
+    ) {
+        return [];
+    }
+    const indexed = new Set(next.available.map(({ peer }) => peer));
+    return drafts.filter(({ peer }) => !indexed.has(peer));
 }
 
 /** Rebase explicit peer choices onto a newly indexed committee snapshot. */
@@ -89,7 +145,7 @@ export function reconcileCommitteeSelection(
     return reconciled;
 }
 
-/** Read the finalized committee view and immutable peer catalog from SQL. */
+/** Read the finalized committee view and known-peer catalog from SQL. */
 export async function fetchCommittee(
     sqlUrl: string,
     signal?: AbortSignal,
@@ -219,7 +275,9 @@ function decodeEligiblePeer(row: DecodedRow): EligibleCommitteePeer {
     }
     return {
         peer: toHex(peer),
-        address: expectString(row.values[ELIGIBLE_PEER_ADDRESS], ELIGIBLE_PEER_ADDRESS),
+        address: normalizeValidatorEndpoint(
+            expectString(row.values[ELIGIBLE_PEER_ADDRESS], ELIGIBLE_PEER_ADDRESS),
+        ),
     };
 }
 
@@ -236,9 +294,11 @@ export function committeeChanges(
     }
 
     const scheduled = new Set(snapshot.scheduled);
-    const changes = snapshot.available.flatMap(({ peer }) => {
-        const registered = selected.has(peer);
-        return registered === scheduled.has(peer) ? [] : [{ peer, registered }];
+    const changes = snapshot.available.flatMap(({ peer, address }) => {
+        const isSelected = selected.has(peer);
+        return isSelected === scheduled.has(peer)
+            ? []
+            : [{ peer, address: isSelected ? address : null }];
     });
     return orderCommitteeChanges(changes, scheduled.size);
 }
@@ -295,7 +355,7 @@ function orderCommitteeChanges(
             throw new Error(`committee changes contain duplicate peer ${change.peer}`);
         }
         seen.add(change.peer);
-        (change.registered ? additions : removals).push(change);
+        (change.address !== null ? additions : removals).push(change);
     }
 
     const finalSize = initialSize + additions.length - removals.length;

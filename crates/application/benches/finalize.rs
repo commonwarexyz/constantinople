@@ -21,7 +21,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, ordered::Set};
+use commonware_utils::{NZU16, NZU64, NZUsize, ordered::Map};
 use constantinople_application::{
     consensus::{self, Committee, Databases, seed_committees},
     executor::PreparedTransfer,
@@ -29,6 +29,7 @@ use constantinople_application::{
 use constantinople_primitives::{Account, AccountKey, Nonce};
 use core::num::NonZeroUsize;
 use std::{
+    net::{Ipv4Addr, SocketAddr},
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -154,9 +155,10 @@ fn main() {
             }
             let state = state_batch.merkleize().await.expect("seed state");
             let transactions = transaction_batch.merkleize().await.expect("seed txs");
-            let genesis = Committee::new(Set::from_iter_dedup([
-                ed25519::PrivateKey::from_seed(1).public_key()
-            ]))
+            let genesis = Committee::new(Map::from_iter_dedup([(
+                ed25519::PrivateKey::from_seed(1).public_key(),
+                SocketAddr::from((Ipv4Addr::LOCALHOST, 8_000)),
+            )]))
             .expect("genesis committee");
             let committee = seed_committees(committee_batch, genesis.clone(), genesis)
                 .merkleize()

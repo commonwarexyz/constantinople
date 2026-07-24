@@ -38,9 +38,10 @@ Constantinople is a high-throughput account-model blockchain example built on to
 Consensus runs continuously in 64-block epochs. A small stateful QMDB stores
 the committee selected for each epoch, and `glue::dkg` reshapes the threshold
 key as validators are added or removed. The explorer's committee page schedules
-changes two epochs ahead from the deployment's complete eligible-peer catalog.
-It reads finalized committee data from the SQL indexer and submits mutations as
-ordinary signed transactions through the relayer.
+changes two epochs ahead and can register a previously unknown validator with
+its public key and p2p socket. It reads finalized committee and peer-directory
+data from the SQL indexer and submits mutations as ordinary signed transactions
+through the relayer.
 
 The included DKG secret store is deliberately naive, plaintext, and local to
 each validator. It uses restrictive filesystem permissions and durable atomic

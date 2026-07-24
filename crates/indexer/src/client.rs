@@ -421,7 +421,7 @@ mod tests {
     #[test]
     fn verifies_variable_transaction_body_against_digest() {
         let mut bytes = committee_signed_transaction_golden();
-        let digest = Sha256::hash(&[&bytes[..78]]);
+        let digest = Sha256::hash(&[&bytes[..85]]);
 
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest).expect("digest matches");
 
@@ -431,14 +431,14 @@ mod tests {
         assert!(matches!(error, ReadError::SqlRow(message) if message.contains("does not match")));
 
         bytes[77] = 1;
-        bytes[78] ^= 1;
+        bytes[85] ^= 1;
         verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
             .expect("signature bytes are outside the transaction digest");
     }
 
     #[test]
     fn rejects_signed_transaction_bytes_without_full_variable_body() {
-        let bytes = committee_signed_transaction_golden()[..77].to_vec();
+        let bytes = committee_signed_transaction_golden()[..84].to_vec();
         let digest = Sha256::hash(&[&bytes]);
 
         let error = verify_signed_transaction_digest::<Sha256>(&bytes, &digest)
@@ -459,7 +459,7 @@ mod tests {
             0x7e, 0xbc, 0x9c, 0x98, 0x2c, 0xcf, 0x2e, 0xc4, 0x96, 0x8c, 0xc0, 0xcd, 0x55, 0xf1,
             0x2a, 0xf4, 0x66, 0x0c,
         ];
-        let mut signed = Vec::with_capacity(78 + 65);
+        let mut signed = Vec::with_capacity(85 + 65);
         signed.push(0);
         signed.extend_from_slice(&sender);
         signed.push(0);
@@ -468,10 +468,11 @@ mod tests {
         signed.extend_from_slice(&[0xac, 0x02]);
         signed.extend_from_slice(&peer);
         signed.push(1);
-        assert_eq!(signed.len(), 78);
+        signed.extend_from_slice(&[4, 192, 0, 2, 1, 0x1f, 0x90]);
+        assert_eq!(signed.len(), 85);
         assert_eq!(
             Sha256::hash(&[&signed]).to_string(),
-            "cc9c11a8f6f5011dd0b705e3316b3af679a8de1602f8fec3bfcaa7a392921fa1"
+            "bfc66b7fd66a059d12a6805444f6120de1a4b927846ba6dc4395b8148ecb1a32"
         );
         signed.extend_from_slice(&[0; 65]);
         signed

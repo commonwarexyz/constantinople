@@ -411,7 +411,7 @@ pub(crate) struct ValidatorConfig {
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
     #[serde(default)]
     traces: f64,
-    /// Complete immutable catalog of peers eligible for committee membership.
+    /// Genesis/bootstrap peer directory; later committees may register new peers.
     eligible_peers: Vec<EligiblePeerEntry>,
     /// Optional indexer wiring. Set on secondary validators only when the
     /// local or remote deploy job enables the shared `chain-indexer` stack.

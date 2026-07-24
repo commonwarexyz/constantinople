@@ -73,12 +73,13 @@ pub(crate) struct AccountMetaRow {
     pub qmdb_location: u64,
 }
 
-/// Immutable eligible-peer catalog entry supplied by validator configuration.
+/// Known-peer catalog entry, sourced from finalized committee state or the
+/// validator's bootstrap configuration.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EligiblePeer {
     /// Raw 32-byte Ed25519 public key.
     pub public_key: [u8; 32],
-    /// Configured network ingress address.
+    /// Network ingress address.
     pub address: String,
 }
 
@@ -164,7 +165,7 @@ pub(crate) fn encode_committee_meta_row(committee: CommitteeMetaRow) -> SqlRow {
     }
 }
 
-/// Encode one immutable eligible-peer catalog row.
+/// Encode one finalized known-peer catalog row.
 pub(crate) fn encode_eligible_peer_row(peer: &EligiblePeer) -> SqlRow {
     SqlRow {
         table: ELIGIBLE_PEER_TABLE,

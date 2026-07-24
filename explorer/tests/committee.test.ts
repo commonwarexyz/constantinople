@@ -5,8 +5,11 @@ import {
     blocksUntilCommitteeLock,
     committeeChanges,
     committeeLockDetail,
+    createCommitteeDraft,
     fetchCommittee,
+    mergeCommitteeRoster,
     planCommitteeTransactions,
+    reconcileCommitteeDrafts,
     reconcileCommitteeSelection,
     validateCommitteeSelection,
     type CommitteeSnapshot,
@@ -38,9 +41,9 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
             }
             if (sql.includes('FROM eligible_peer')) {
                 return result(
-                    { peer: peerBytes(PEER_A), address: 'validator-a:9000' },
-                    { peer: peerBytes(PEER_B), address: 'validator-b:9000' },
-                    { peer: peerBytes(PEER_C), address: 'validator-c:9000' },
+                    { peer: peerBytes(PEER_A), address: '192.0.2.1:9000' },
+                    { peer: peerBytes(PEER_B), address: '192.0.2.2:9000' },
+                    { peer: peerBytes(PEER_C), address: '[2001:db8::3]:9000' },
                 );
             }
             throw new Error(`unexpected SQL: ${sql}`);
@@ -59,13 +62,52 @@ test('committee reads finalized snapshots and eligible peers from SQL', async ()
     assert.ok(queries.some((query) => query.includes('FROM eligible_peer')));
 });
 
+test('committee rejects duplicate indexed peers', async () => {
+    await assert.rejects(
+        fetchCommittee('http://indexer.invalid', undefined, {
+            async query(sql: string): Promise<DecodedQueryResult> {
+                if (sql.includes('FROM block_meta')) return result({ height: 1n, epoch: 0n });
+                if (sql.includes('FROM committee_meta')) {
+                    return result({ epoch: 0n, members: peerBytes(PEER_A) });
+                }
+                if (sql.includes('FROM eligible_peer')) {
+                    return result(
+                        { peer: peerBytes(PEER_A), address: '192.0.2.1:9000' },
+                        { peer: peerBytes(PEER_A), address: '192.0.2.2:9000' },
+                    );
+                }
+                throw new Error(`unexpected SQL: ${sql}`);
+            },
+        }),
+        /duplicate peers/,
+    );
+});
+
+test('draft creation rejects indexed and already-local peers', () => {
+    const roster = response().available;
+    const draft = createCommitteeDraft(roster, `ED25519:${'44'.repeat(32)}`, '192.0.2.44:09000');
+
+    assert.deepEqual(draft, {
+        peer: '44'.repeat(32),
+        address: '192.0.2.44:9000',
+    });
+    assert.throws(
+        () => createCommitteeDraft(roster, PEER_A.toUpperCase(), '192.0.2.99:9000'),
+        /already exists/,
+    );
+    assert.throws(
+        () => createCommitteeDraft([...roster, draft], draft.peer, '[::1]:9000'),
+        /already exists/,
+    );
+});
+
 test('selection diff includes every indexed eligible peer', () => {
     const snapshot = response();
     const selected = new Set([PEER_A, PEER_B]);
 
     assert.deepEqual(committeeChanges(snapshot, selected), [
-        { peer: PEER_B, registered: true },
-        { peer: PEER_C, registered: false },
+        { peer: PEER_B, address: '192.0.2.2:9000' },
+        { peer: PEER_C, address: null },
     ]);
     assert.equal(validateCommitteeSelection(new Set()), 'committee must contain at least one peer');
     assert.equal(
@@ -114,6 +156,56 @@ test('selection reconciliation discards unsendable edits when submissions close'
     assert.deepEqual(
         reconcileCommitteeSelection(previous, next, new Set([PEER_A, PEER_B])),
         new Set([PEER_A]),
+    );
+});
+
+test('draft peers persist across heights and reconcile when the index adopts them', () => {
+    const previous = response();
+    const draft = { peer: '44'.repeat(32), address: '192.0.2.44:9000' };
+    const heightRefresh = { ...previous, height: previous.height + 1n };
+
+    assert.deepEqual(reconcileCommitteeDrafts(previous, heightRefresh, [draft]), [draft]);
+    assert.deepEqual(
+        mergeCommitteeRoster(heightRefresh.available, [draft]).at(-1),
+        draft,
+    );
+
+    const adopted = {
+        ...heightRefresh,
+        available: [...heightRefresh.available, draft],
+    };
+    assert.deepEqual(reconcileCommitteeDrafts(heightRefresh, adopted, [draft]), []);
+    assert.equal(mergeCommitteeRoster(adopted.available, [draft]).length, adopted.available.length);
+});
+
+test('draft peers reset on target epoch and lock transitions', () => {
+    const previous = response();
+    const draft = { peer: '44'.repeat(32), address: '192.0.2.44:9000' };
+
+    assert.deepEqual(
+        reconcileCommitteeDrafts(previous, { ...previous, targetEpoch: 142n }, [draft]),
+        [],
+    );
+    assert.deepEqual(
+        reconcileCommitteeDrafts(previous, { ...previous, updatesOpen: false }, [draft]),
+        [],
+    );
+});
+
+test('new peer planning uses its supplied canonical address', () => {
+    const snapshot = response();
+    const draft = { peer: '44'.repeat(32), address: '[2001:db8::44]:9000' };
+    const effective = {
+        ...snapshot,
+        available: mergeCommitteeRoster(snapshot.available, [draft]),
+    };
+    const changes = committeeChanges(effective, new Set([...snapshot.scheduled, draft.peer]));
+
+    assert.deepEqual(changes, [draft]);
+    assert.equal(
+        planCommitteeTransactions(changes, snapshot.targetEpoch, { base: 3n, bitmap: 0n }, 2)
+            .transactions[0].address,
+        draft.address,
     );
 });
 
@@ -169,9 +261,9 @@ test('submissions reopen after height 64 starts the next epoch', async () => {
 
 test('per-peer E+2 actions reserve sequential nonces before signing', () => {
     const changes = [
-        { peer: PEER_B, registered: true },
-        { peer: PEER_C, registered: false },
-        { peer: PEER_A, registered: false },
+        { peer: PEER_B, address: '192.0.2.2:9000' },
+        { peer: PEER_C, address: null },
+        { peer: PEER_A, address: null },
     ];
 
     const plan = planCommitteeTransactions(changes, 19n, { base: 7n, bitmap: 0n }, 2);
@@ -184,8 +276,8 @@ test('per-peer E+2 actions reserve sequential nonces before signing', () => {
 test('sole-member replacement adds before removing the last member', () => {
     const snapshot = committeeSnapshot([PEER_A], [PEER_A, PEER_B]);
     const expected = [
-        { peer: PEER_B, registered: true },
-        { peer: PEER_A, registered: false },
+        { peer: PEER_B, address: '192.0.2.2:9000' },
+        { peer: PEER_A, address: null },
     ];
 
     assert.deepEqual(committeeChanges(snapshot, new Set([PEER_B])), expected);
@@ -206,8 +298,8 @@ test('full 64-member replacement removes before adding the new member', () => {
     const selected = new Set([...scheduled.slice(1), peers[64]]);
     const snapshot = committeeSnapshot(scheduled, peers);
     const expected = [
-        { peer: peers[0], registered: false },
-        { peer: peers[64], registered: true },
+        { peer: peers[0], address: null },
+        { peer: peers[64], address: '192.0.2.65:9000' },
     ];
 
     assert.deepEqual(committeeChanges(snapshot, selected), expected);
@@ -228,10 +320,10 @@ test('multi-swap ordering adapts at capacity and remains deterministic', () => {
     const selected = new Set([...scheduled.slice(2), peers[63], peers[64]]);
     const snapshot = committeeSnapshot(scheduled, peers);
     const expected = [
-        { peer: peers[63], registered: true },
-        { peer: peers[0], registered: false },
-        { peer: peers[64], registered: true },
-        { peer: peers[1], registered: false },
+        { peer: peers[63], address: '192.0.2.64:9000' },
+        { peer: peers[0], address: null },
+        { peer: peers[64], address: '192.0.2.65:9000' },
+        { peer: peers[1], address: null },
     ];
 
     const first = committeeChanges(snapshot, selected);
@@ -252,9 +344,9 @@ function response(): CommitteeSnapshot {
         next: [PEER_A, PEER_C],
         scheduled: [PEER_A, PEER_C],
         available: [
-            { peer: PEER_A, address: 'validator-a:9000' },
-            { peer: PEER_B, address: 'validator-b:9000' },
-            { peer: PEER_C, address: 'validator-c:9000' },
+            { peer: PEER_A, address: '192.0.2.1:9000' },
+            { peer: PEER_B, address: '192.0.2.2:9000' },
+            { peer: PEER_C, address: '[2001:db8::3]:9000' },
         ],
     };
 }
@@ -269,7 +361,7 @@ async function fetchCommitteeAtHeight(height: bigint, epoch: bigint): Promise<Co
                 return result({ epoch: 0n, members: peerBytes(PEER_A) });
             }
             if (sql.includes('FROM eligible_peer')) {
-                return result({ peer: peerBytes(PEER_A), address: 'validator-a:9000' });
+                return result({ peer: peerBytes(PEER_A), address: '192.0.2.1:9000' });
             }
             throw new Error(`unexpected SQL: ${sql}`);
         },
@@ -284,7 +376,7 @@ function committeeSnapshot(scheduled: readonly string[], available: readonly str
         scheduled,
         available: available.map((candidate, index) => ({
             peer: candidate,
-            address: `validator-${index}:9000`,
+            address: `192.0.2.${index + 1}:9000`,
         })),
     };
 }
@@ -308,21 +400,21 @@ function peer(index: number): string {
 
 function changeWithoutPlanFields({
     peer: changedPeer,
-    registered,
+    address,
 }: {
     readonly peer: string;
-    readonly registered: boolean;
+    readonly address: string | null;
 }) {
-    return { peer: changedPeer, registered };
+    return { peer: changedPeer, address };
 }
 
 function intermediateCommitteeSizes(
-    changes: readonly { readonly registered: boolean }[],
+    changes: readonly { readonly address: string | null }[],
     initialSize: number,
 ): number[] {
     let size = initialSize;
-    return changes.map(({ registered }) => {
-        size += registered ? 1 : -1;
+    return changes.map(({ address }) => {
+        size += address === null ? -1 : 1;
         assert.ok(size >= 1 && size <= 64);
         return size;
     });

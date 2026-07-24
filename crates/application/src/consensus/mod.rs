@@ -34,9 +34,11 @@ use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
-use commonware_utils::ordered::Set;
+use commonware_utils::ordered::Map;
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
-use std::{future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc};
+use std::{
+    future::Future, marker::PhantomData, net::SocketAddr, num::NonZeroU64, pin::Pin, sync::Arc,
+};
 
 mod body;
 mod committee;
@@ -99,7 +101,6 @@ where
     blocks_per_epoch: NonZeroU64,
     initial_committee: Committee,
     initial_next_committee: Committee,
-    eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, R, St>>,
     proposed_transactions: Counter,
     _marker: PhantomData<(E, C, S, I)>,
@@ -130,7 +131,6 @@ where
             blocks_per_epoch: self.blocks_per_epoch,
             initial_committee: self.initial_committee.clone(),
             initial_next_committee: self.initial_next_committee.clone(),
-            eligible_committee_members: self.eligible_committee_members.clone(),
             finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
@@ -168,17 +168,35 @@ where
         genesis_info: commonware_glue::dkg::types::EpochInfo<V, ed25519::PublicKey, Dir>,
         eligible_peers_root: H::Digest,
         blocks_per_epoch: NonZeroU64,
-        eligible_committee_members: Set<ed25519::PublicKey>,
+        initial_peer_addresses: Map<ed25519::PublicKey, SocketAddr>,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, Payload<V, D, Dir>, St>>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",
             "The number of transactions proposed into blocks",
         );
-        let initial_committee = Committee::new(genesis_info.players.clone())
-            .expect("genesis players must form a valid committee");
-        let initial_next_committee = Committee::new(genesis_info.next_players.clone())
-            .expect("genesis next players must form a valid committee");
+        let initial_committee = Committee::new(Map::from_iter_dedup(
+            genesis_info.players.iter().map(|peer| {
+                (
+                    peer.clone(),
+                    *initial_peer_addresses
+                        .get_value(peer)
+                        .expect("genesis player must have an initial address"),
+                )
+            }),
+        ))
+        .expect("genesis players must form a valid committee");
+        let initial_next_committee = Committee::new(Map::from_iter_dedup(
+            genesis_info.next_players.iter().map(|peer| {
+                (
+                    peer.clone(),
+                    *initial_peer_addresses
+                        .get_value(peer)
+                        .expect("genesis next player must have an initial address"),
+                )
+            }),
+        ))
+        .expect("genesis next players must form a valid committee");
 
         Self {
             strategy,
@@ -194,7 +212,6 @@ where
             blocks_per_epoch,
             initial_committee,
             initial_next_committee,
-            eligible_committee_members: Arc::new(eligible_committee_members),
             finalized_hook,
             proposed_transactions,
             _marker: PhantomData,

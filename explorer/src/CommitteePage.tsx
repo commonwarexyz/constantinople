@@ -1,12 +1,16 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type FormEvent } from 'react';
 import {
     blocksUntilCommitteeLock,
     committeeChanges,
     committeeLockDetail,
+    createCommitteeDraft,
+    mergeCommitteeRoster,
+    reconcileCommitteeDrafts,
     reconcileCommitteeSelection,
     validateCommitteeSelection,
     type CommitteeChange,
     type CommitteeSnapshot,
+    type EligibleCommitteePeer,
 } from './committee';
 
 export default function CommitteePage({
@@ -30,32 +34,76 @@ export default function CommitteePage({
     onOpenWallet: () => void;
     onSubmit: (changes: readonly CommitteeChange[]) => void;
 }) {
-    const [selected, setSelected] = useState<Set<string>>(new Set());
+    const [editor, setEditor] = useState<{
+        drafts: EligibleCommitteePeer[];
+        selected: Set<string>;
+    }>({ drafts: [], selected: new Set() });
+    const [draftPeer, setDraftPeer] = useState('');
+    const [draftAddress, setDraftAddress] = useState('');
+    const [draftError, setDraftError] = useState('');
     const previousSnapshotRef = useRef<CommitteeSnapshot | null>(null);
     const selectionBaseline = snapshot
         ? [
               snapshot.targetEpoch.toString(),
               snapshot.updatesOpen ? 'open' : 'closed',
+              snapshot.lockHeight.toString(),
               snapshot.scheduled.join(','),
-              snapshot.available.map(({ peer }) => peer).join(','),
+              snapshot.available.map(({ peer, address }) => `${peer}@${address}`).join(','),
           ].join(':')
         : '';
 
     useEffect(() => {
         const previousSnapshot = previousSnapshotRef.current;
-        setSelected((current) =>
-            reconcileCommitteeSelection(previousSnapshot, snapshot, current),
-        );
+        setEditor((current) => {
+            const drafts = reconcileCommitteeDrafts(
+                previousSnapshot,
+                snapshot,
+                current.drafts,
+            );
+            const previousEffective = previousSnapshot === null
+                ? null
+                : {
+                      ...previousSnapshot,
+                      available: mergeCommitteeRoster(
+                          previousSnapshot.available,
+                          current.drafts,
+                      ),
+                  };
+            const nextEffective = snapshot === null
+                ? null
+                : {
+                      ...snapshot,
+                      available: mergeCommitteeRoster(snapshot.available, drafts),
+                  };
+            return {
+                drafts,
+                selected: reconcileCommitteeSelection(
+                    previousEffective,
+                    nextEffective,
+                    current.selected,
+                ),
+            };
+        });
+        setDraftError('');
         previousSnapshotRef.current = snapshot;
     }, [selectionBaseline]);
 
-    const selectionError = validateCommitteeSelection(selected);
+    const effectiveSnapshot = useMemo(
+        () => snapshot === null
+            ? null
+            : {
+                  ...snapshot,
+                  available: mergeCommitteeRoster(snapshot.available, editor.drafts),
+              },
+        [snapshot, editor.drafts],
+    );
+    const selectionError = validateCommitteeSelection(editor.selected);
     const changes = useMemo(
         () =>
-            snapshot?.updatesOpen && selectionError === null
-                ? committeeChanges(snapshot, selected)
+            effectiveSnapshot?.updatesOpen && selectionError === null
+                ? committeeChanges(effectiveSnapshot, editor.selected)
                 : [],
-        [snapshot, selected, selectionError],
+        [effectiveSnapshot, editor.selected, selectionError],
     );
 
     if (snapshot === null) {
@@ -72,7 +120,8 @@ export default function CommitteePage({
     const current = new Set(snapshot.current);
     const next = new Set(snapshot.next);
     const scheduled = new Set(snapshot.scheduled);
-    const visibleSelection = snapshot.updatesOpen ? selected : scheduled;
+    const roster = effectiveSnapshot?.available ?? snapshot.available;
+    const visibleSelection = snapshot.updatesOpen ? editor.selected : scheduled;
     const blockDistance = blocksUntilCommitteeLock(snapshot);
     const canSubmit =
         snapshot.updatesOpen &&
@@ -81,11 +130,38 @@ export default function CommitteePage({
         !isSubmitting;
 
     const togglePeer = (peer: string) => {
-        setSelected((previous) => {
-            const next = new Set(previous);
+        setEditor((previous) => {
+            const next = new Set(previous.selected);
             if (next.has(peer)) next.delete(peer);
             else next.add(peer);
-            return next;
+            return { ...previous, selected: next };
+        });
+    };
+
+    const addDraft = (event: FormEvent) => {
+        event.preventDefault();
+        try {
+            const draft = createCommitteeDraft(roster, draftPeer, draftAddress);
+            setEditor((previous) => ({
+                drafts: [...previous.drafts, draft],
+                selected: new Set([...previous.selected, draft.peer]),
+            }));
+            setDraftPeer('');
+            setDraftAddress('');
+            setDraftError('');
+        } catch (error) {
+            setDraftError(error instanceof Error ? error.message : String(error));
+        }
+    };
+
+    const discardDraft = (peer: string) => {
+        setEditor((previous) => {
+            const selected = new Set(previous.selected);
+            selected.delete(peer);
+            return {
+                drafts: previous.drafts.filter((draft) => draft.peer !== peer),
+                selected,
+            };
         });
     };
 
@@ -114,7 +190,7 @@ export default function CommitteePage({
             <div className="committee-summary">
                 <CommitteeDatum label="finalized height" value={snapshot.height.toString()} />
                 <CommitteeDatum label="current epoch" value={snapshot.epoch.toString()} />
-                <CommitteeDatum label="selected / eligible" value={`${visibleSelection.size}/${snapshot.available.length}`} />
+                <CommitteeDatum label="selected / eligible" value={`${visibleSelection.size}/${roster.length}`} />
                 <CommitteeDatum label="blocks to lock" value={blockDistance.toString()} />
             </div>
 
@@ -150,8 +226,40 @@ export default function CommitteePage({
             <section className="committee-roster" aria-labelledby="committee-roster-heading">
                 <div className="committee-section-heading committee-roster__heading">
                     <h3 id="committee-roster-heading">validator roster</h3>
-                    <span>{snapshot.available.length} eligible</span>
+                    <span>{roster.length} eligible{editor.drafts.length > 0 ? ` · ${editor.drafts.length} local` : ''}</span>
                 </div>
+                <form className="committee-add" onSubmit={addDraft}>
+                    <div className="committee-add__prompt" aria-hidden="true">$</div>
+                    <label>
+                        <span>public key</span>
+                        <input
+                            value={draftPeer}
+                            onChange={(event) => setDraftPeer(event.target.value)}
+                            placeholder="32-byte Ed25519 hex"
+                            spellCheck={false}
+                            autoComplete="off"
+                            disabled={!snapshot.updatesOpen || isSubmitting}
+                        />
+                    </label>
+                    <label>
+                        <span>network address</span>
+                        <input
+                            value={draftAddress}
+                            onChange={(event) => setDraftAddress(event.target.value)}
+                            placeholder="203.0.113.7:9000 or [2001:db8::7]:9000"
+                            spellCheck={false}
+                            autoComplete="off"
+                            disabled={!snapshot.updatesOpen || isSubmitting}
+                        />
+                    </label>
+                    <button
+                        type="submit"
+                        disabled={!snapshot.updatesOpen || isSubmitting || !draftPeer.trim() || !draftAddress.trim()}
+                    >
+                        + add validator
+                    </button>
+                    {draftError && <span className="committee-add__error" role="alert">{draftError}</span>}
+                </form>
                 <div className="committee-table" role="table" aria-label="committee peers">
                     <div className="committee-row committee-row--head" role="row">
                         <span role="columnheader" aria-label="selection" />
@@ -160,7 +268,8 @@ export default function CommitteePage({
                         <span role="columnheader">next</span>
                         <span role="columnheader">{snapshot.updatesOpen ? 'editing' : 'scheduled'}</span>
                     </div>
-                    {snapshot.available.map((candidate) => {
+                    {roster.map((candidate) => {
+                        const isDraft = editor.drafts.some(({ peer }) => peer === candidate.peer);
                         const isCurrent = current.has(candidate.peer);
                         const isNext = next.has(candidate.peer);
                         const isSelected = visibleSelection.has(candidate.peer);
@@ -187,7 +296,24 @@ export default function CommitteePage({
                                 </span>
                                 <span className="committee-row__identity" role="cell">
                                     <strong title={candidate.peer}>{candidate.peer}</strong>
-                                    <small title={candidate.address}>{candidate.address}</small>
+                                    <span className="committee-row__endpoint">
+                                        <small title={candidate.address}>{candidate.address}</small>
+                                        {isDraft && (
+                                            <button
+                                                type="button"
+                                                className="committee-row__discard"
+                                                disabled={isSubmitting}
+                                                onClick={(event) => {
+                                                    event.preventDefault();
+                                                    event.stopPropagation();
+                                                    discardDraft(candidate.peer);
+                                                }}
+                                                aria-label={`discard local validator ${candidate.peer}`}
+                                            >
+                                                × discard
+                                            </button>
+                                        )}
+                                    </span>
                                 </span>
                                 <MembershipBadge
                                     phase="now"
@@ -223,7 +349,7 @@ export default function CommitteePage({
                         <strong>{changes.length} pending {changes.length === 1 ? 'change' : 'changes'}</strong>
                         {changes.length > 0 && (
                             <span>
-                                {changes.map((change) => `${change.registered ? 'register' : 'remove'} ${shortPeer(change.peer)}`).join(' · ')}
+                                {changes.map((change) => `${change.address === null ? 'remove' : 'add'} ${shortPeer(change.peer)}`).join(' · ')}
                             </span>
                         )}
                         {selectionError && <span className="committee-actions__error">{selectionError}</span>}

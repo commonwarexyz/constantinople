@@ -38,14 +38,23 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, batch_chain::Bounds, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{N3f1, NZU16, NZU64, NZUsize, non_empty_range, ordered::Set};
+use commonware_utils::{
+    N3f1, NZU16, NZU64, NZUsize, non_empty_range,
+    ordered::{Map, Set},
+};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
     Account, AccountKey, Block, Header, LazySignedTransaction, Nonce, PublicKeyCache, Sealable,
     SealedBlock, SignedTransaction, Transaction, TransactionPublicKey,
 };
 use futures::FutureExt as _;
-use std::{num::NonZeroU64, panic::AssertUnwindSafe, sync::Arc, time::Duration};
+use std::{
+    net::{Ipv4Addr, SocketAddr},
+    num::NonZeroU64,
+    panic::AssertUnwindSafe,
+    sync::Arc,
+    time::Duration,
+};
 
 type TestPayload = Payload<MinSig, ed25519::PrivateKey>;
 type TestApp = Application<
@@ -61,6 +70,18 @@ type TestApp = Application<
 type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;
 
 const TEST_TX_NS: &[u8] = b"constantinople-application-test-transactions";
+
+fn test_address() -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, 8_000))
+}
+
+fn peer_addresses(members: &Set<ed25519::PublicKey>) -> Map<ed25519::PublicKey, SocketAddr> {
+    Map::from_iter_dedup(members.iter().cloned().map(|peer| (peer, test_address())))
+}
+
+fn committee(members: Set<ed25519::PublicKey>) -> Committee {
+    Committee::new(peer_addresses(&members)).unwrap()
+}
 
 fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     StateSyncTarget::new(
@@ -215,8 +236,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         .merkleize()
         .await
         .expect("genesis transactions");
-    let genesis_committee = Committee::new(Set::from_iter_dedup([leader.public_key()]))
-        .expect("test genesis committee");
+    let genesis_committee = committee(Set::from_iter_dedup([leader.public_key()]));
     let genesis_info = test_genesis_info(genesis_committee.members().clone());
     let committee = seed_committees(
         committee_batch,
@@ -265,7 +285,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             genesis_info,
             sha256::Digest::EMPTY,
             NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
-            eligible_committee_members.clone(),
+            peer_addresses(&eligible_committee_members),
             None,
         ),
         dbs,
@@ -304,11 +324,27 @@ fn committee_transaction(
     registered: bool,
     nonce: u64,
 ) -> SignedTransaction<sha256::Sha256> {
+    committee_address_transaction(
+        sender,
+        target_epoch,
+        peer,
+        registered.then_some(test_address()),
+        nonce,
+    )
+}
+
+fn committee_address_transaction(
+    sender: &ed25519::PrivateKey,
+    target_epoch: Epoch,
+    peer: ed25519::PublicKey,
+    address: Option<SocketAddr>,
+    nonce: u64,
+) -> SignedTransaction<sha256::Sha256> {
     Transaction::set_committee_member(
         TransactionPublicKey::ed25519(sender.public_key()),
         target_epoch,
         peer,
-        registered,
+        address,
         nonce,
     )
     .seal_and_sign(sender, TEST_TX_NS, &mut sha256::Sha256::default())
@@ -320,7 +356,6 @@ struct ReducerHarness {
     dbs: TestDbs,
     initial: Committee,
     initial_next: Committee,
-    eligible: Set<ed25519::PublicKey>,
     sender: ed25519::PrivateKey,
 }
 
@@ -328,7 +363,6 @@ async fn reducer_harness(
     context: &deterministic::Context,
     initial: Committee,
     initial_next: Committee,
-    eligible: Set<ed25519::PublicKey>,
     sender: ed25519::PrivateKey,
 ) -> ReducerHarness {
     let cache = CacheRef::from_pooler(context, NZU16!(16), NZUsize!(4096));
@@ -368,7 +402,6 @@ async fn reducer_harness(
         dbs,
         initial,
         initial_next,
-        eligible,
         sender,
     }
 }
@@ -395,7 +428,6 @@ async fn execute_committee_block(
         body,
         &harness.initial,
         &harness.initial_next,
-        Arc::new(harness.eligible.clone()),
         BLOCKS_PER_EPOCH,
     )
     .await?;
@@ -442,27 +474,12 @@ fn committee_reducer_seeds_genesis_rows_and_materializes_final_carry_forward() {
     deterministic::Runner::default().start(|context| async move {
         assert_eq!(BLOCKS_PER_EPOCH, 64);
         let sender = ed25519::PrivateKey::from_seed(101);
-        let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
-        let initial_next =
-            Committee::new(Set::from_iter_dedup([
-                ed25519::PrivateKey::from_seed(102).public_key()
-            ]))
-            .unwrap();
-        let eligible = Set::from_iter_dedup(
-            initial
-                .members()
-                .iter()
-                .chain(initial_next.members())
-                .cloned(),
-        );
-        let harness = reducer_harness(
-            &context,
-            initial.clone(),
-            initial_next.clone(),
-            eligible,
-            sender,
-        )
-        .await;
+        let initial = committee(Set::from_iter_dedup([sender.public_key()]));
+        let initial_next = committee(Set::from_iter_dedup([
+            ed25519::PrivateKey::from_seed(102).public_key()
+        ]));
+        let harness =
+            reducer_harness(&context, initial.clone(), initial_next.clone(), sender).await;
 
         let (entering, selected) = execute_committee_block(&harness, 1, Vec::new())
             .await
@@ -495,15 +512,13 @@ fn committee_reducer_seeds_genesis_rows_and_materializes_final_carry_forward() {
 }
 
 #[test]
-fn committee_reducer_composes_ordered_idempotent_mutations_across_blocks() {
+fn committee_reducer_adds_unknown_peers_and_preserves_addresses_across_blocks() {
     deterministic::Runner::default().start(|context| async move {
         let sender = ed25519::PrivateKey::from_seed(111);
         let b = ed25519::PrivateKey::from_seed(112).public_key();
         let c = ed25519::PrivateKey::from_seed(113).public_key();
-        let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
-        let eligible = Set::from_iter_dedup([sender.public_key(), b.clone(), c.clone()]);
-        let harness =
-            reducer_harness(&context, initial.clone(), initial.clone(), eligible, sender).await;
+        let initial = committee(Set::from_iter_dedup([sender.public_key()]));
+        let harness = reducer_harness(&context, initial.clone(), initial.clone(), sender).await;
 
         let target = Epoch::new(2);
         let first = vec![
@@ -521,6 +536,7 @@ fn committee_reducer_composes_ordered_idempotent_mutations_across_blocks() {
             selected.members(),
             &Set::from_iter_dedup([harness.sender.public_key(), c.clone()])
         );
+        assert_eq!(selected.addresses().get_value(&c), Some(&test_address()));
 
         let second = vec![
             committee_transaction(&harness.sender, target, b.clone(), true, 5),
@@ -530,10 +546,13 @@ fn committee_reducer_composes_ordered_idempotent_mutations_across_blocks() {
         let (entering, selected) = execute_committee_block(&harness, 2, second)
             .await
             .expect("second committee mutation block");
-        let expected =
-            Committee::new(Set::from_iter_dedup([harness.sender.public_key(), b])).unwrap();
+        let expected = committee(Set::from_iter_dedup([
+            harness.sender.public_key(),
+            b.clone(),
+        ]));
         assert_eq!(entering, initial);
         assert_eq!(selected, expected);
+        assert_eq!(selected.addresses().get_value(&b), Some(&test_address()));
         assert_eq!(exact_committee_row(&harness.dbs, 2).await, Some(expected));
     });
 }
@@ -543,22 +562,10 @@ fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
     deterministic::Runner::default().start(|context| async move {
         let sender = ed25519::PrivateKey::from_seed(121);
         let eligible_peer = ed25519::PrivateKey::from_seed(122).public_key();
-        let ineligible_peer = ed25519::PrivateKey::from_seed(123).public_key();
-        let initial = Committee::new(Set::from_iter_dedup([sender.public_key()])).unwrap();
-        let harness = reducer_harness(
-            &context,
-            initial.clone(),
-            initial,
-            Set::from_iter_dedup([sender.public_key(), eligible_peer.clone()]),
-            sender,
-        )
-        .await;
+        let initial = committee(Set::from_iter_dedup([sender.public_key()]));
+        let harness = reducer_harness(&context, initial.clone(), initial, sender).await;
 
         let invalid = [
-            (
-                1,
-                committee_transaction(&harness.sender, Epoch::new(2), ineligible_peer, true, 0),
-            ),
             (
                 1,
                 committee_transaction(
@@ -566,6 +573,16 @@ fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
                     Epoch::new(3),
                     eligible_peer.clone(),
                     true,
+                    0,
+                ),
+            ),
+            (
+                1,
+                committee_address_transaction(
+                    &harness.sender,
+                    Epoch::new(2),
+                    harness.sender.public_key(),
+                    Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 9_999))),
                     0,
                 ),
             ),
@@ -604,11 +621,10 @@ fn committee_reducer_rejects_invalid_mutations_and_freezes_final_two_blocks() {
         )
         .await
         .expect("last mutable block");
-        let expected = Committee::new(Set::from_iter_dedup([
+        let expected = committee(Set::from_iter_dedup([
             harness.sender.public_key(),
             eligible_peer.clone(),
-        ]))
-        .unwrap();
+        ]));
         assert_eq!(entering, harness.initial);
         assert_eq!(selected, expected);
         assert_eq!(
@@ -640,10 +656,9 @@ fn committee_reducer_rejects_growth_past_maximum_size() {
             (0..MAX_COMMITTEE_SIZE)
                 .map(|index| ed25519::PrivateKey::from_seed(1_000 + index as u64).public_key()),
         );
-        let initial = Committee::new(members.clone()).expect("maximum-size committee");
+        let initial = committee(members.clone());
         let extra = ed25519::PrivateKey::from_seed(2_000).public_key();
-        let eligible = Set::from_iter_dedup(members.iter().cloned().chain([extra.clone()]));
-        let harness = reducer_harness(&context, initial.clone(), initial, eligible, sender).await;
+        let harness = reducer_harness(&context, initial.clone(), initial, sender).await;
         let transaction = committee_transaction(&harness.sender, Epoch::new(2), extra, true, 0);
 
         assert!(
@@ -1193,7 +1208,7 @@ fn build_timeout_bounds_refill_rounds() {
             test_genesis_info(Set::from_iter_dedup([harness.leader.public_key()])),
             sha256::Digest::EMPTY,
             NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
-            harness.eligible_committee_members.clone(),
+            peer_addresses(&harness.eligible_committee_members),
             None,
         );
 

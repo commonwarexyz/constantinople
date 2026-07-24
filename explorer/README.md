@@ -39,7 +39,12 @@ live `block_meta` stream refreshes this view after every finalized block, while
 route entry, manual refreshes, and submissions use the same coalesced loader.
 It presents the committee as a three-stage lifecycle: the active epoch, the
 already-locked next epoch, and the later epoch currently open for edits. The
-table renders every peer in the immutable eligible catalog across all three stages.
+table renders every indexed peer across all three stages. While submissions are
+open, the add-validator form accepts a previously unknown lowercase 32-byte
+Ed25519 key and an `IPv4:port` or `[IPv6]:port` endpoint. Local peers are
+selected immediately, survive height-only refreshes, and leave draft state when
+finalized index data adopts them. Existing peers retain their indexed canonical
+address; address updates are not a committee operation.
 Committee mutations remain ordinary signed transactions submitted through
 `VITE_MEMPOOL_URL`; validators expose no separate committee read API.
 
@@ -49,7 +54,9 @@ mirrored by the shared encoder in [`src/codec.ts`](src/codec.ts):
 - Header: `sender[34] || nonce:u64be || action_tag:u8`.
 - Tag `0` (transfer): `recipient:AccountKey[32] || value:NonZeroU64:u64be`.
 - Tag `1` (committee): `target_epoch:Epoch:canonical-protobuf-u64-varint ||
-  peer:ed25519[32] || registered:bool:u8`.
+  peer:ed25519[32] || address:Option<SocketAddr>`. The option is byte `0` for a
+  removal, or byte `1` followed by IP version `4`/`6`, raw IP bytes, and a
+  big-endian `u16` port for an addition.
 
 The signature encoding follows that variable-length body. QMDB transaction
 verification decodes the tag and committee epoch varint to locate the exact

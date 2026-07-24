@@ -34,7 +34,7 @@ where
     pub height: u64,
     /// The timestamp of the block.
     pub timestamp: u64,
-    /// Commitment to the immutable catalog of committee-eligible peer keys and addresses.
+    /// Commitment to the genesis/bootstrap directory of peer keys and addresses.
     pub eligible_peers_root: D,
     /// The canonical root of the chain state after applying this block.
     pub state_root: D,

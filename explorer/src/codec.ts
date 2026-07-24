@@ -20,7 +20,7 @@ export interface CommitteeTransactionDraft {
     readonly nonce: bigint;
     readonly targetEpoch: bigint;
     readonly peer: string;
-    readonly registered: boolean;
+    readonly address: string | null;
 }
 
 export interface EncodedTransaction {
@@ -37,11 +37,11 @@ export function parseAccountKeyHex(value: string): Uint8Array {
 }
 
 export function parseEd25519Peer(value: string): Uint8Array {
-    const normalized = value.trim().replace(/^ed25519:/i, '').replace(/^0x/i, '');
-    if (!/^[0-9a-fA-F]{64}$/.test(normalized)) {
+    try {
+        return fromHex(normalizeEd25519PublicKey(value));
+    } catch {
         throw new Error('eligible peer must be a 32-byte Ed25519 public key');
     }
-    return fromHex(normalized);
 }
 
 export function parseU64(value: string, field: string): bigint {
@@ -93,6 +93,9 @@ export function encodeCommitteeTransactionBody(
     draft: CommitteeTransactionDraft,
 ): Uint8Array {
     const peer = parseEd25519Peer(draft.peer);
+    const address = draft.address === null
+        ? Uint8Array.of(0)
+        : encodeSocketAddress(draft.address);
     return bytesConcat(
         encodeTransactionHeader(
             draft.senderPublicKey,
@@ -101,7 +104,7 @@ export function encodeCommitteeTransactionBody(
         ),
         encodeU64Varint(draft.targetEpoch, 'target epoch'),
         peer,
-        Uint8Array.of(draft.registered ? 1 : 0),
+        address,
     );
 }
 
@@ -131,11 +134,21 @@ export function transactionBodyFromSignedTransaction(
             signedTransaction,
             TRANSACTION_HEADER_BYTES,
         );
-        bodyEnd = epochEnd + ED25519_PUBLIC_KEY_BYTES + 1;
-        assertAvailable(signedTransaction, bodyEnd);
-        const registered = signedTransaction[bodyEnd - 1];
-        if (registered !== 0 && registered !== 1) {
-            throw new Error('SQL committee transaction has invalid registered flag');
+        const optionOffset = epochEnd + ED25519_PUBLIC_KEY_BYTES;
+        assertAvailable(signedTransaction, optionOffset + 1);
+        const addressOption = signedTransaction[optionOffset];
+        if (addressOption === 0) {
+            bodyEnd = optionOffset + 1;
+        } else if (addressOption === 1) {
+            assertAvailable(signedTransaction, optionOffset + 2);
+            const ipVersion = signedTransaction[optionOffset + 1];
+            if (ipVersion !== 4 && ipVersion !== 6) {
+                throw new Error('SQL committee transaction has invalid IP version');
+            }
+            bodyEnd = optionOffset + 2 + (ipVersion === 4 ? 4 : 16) + 2;
+            assertAvailable(signedTransaction, bodyEnd);
+        } else {
+            throw new Error('SQL committee transaction has invalid address option');
         }
     } else {
         throw new Error(`SQL transaction body has unknown action tag ${tag}`);
@@ -228,6 +241,17 @@ function encodeU64Varint(value: bigint, field: string): Uint8Array {
     return new Uint8Array(bytes);
 }
 
+function encodeSocketAddress(value: string): Uint8Array {
+    const endpoint = parseValidatorEndpoint(value);
+    const port = new Uint8Array(2);
+    new DataView(port.buffer).setUint16(0, endpoint.port, false);
+    return bytesConcat(
+        Uint8Array.of(1, endpoint.ipVersion),
+        endpoint.addressBytes,
+        port,
+    );
+}
+
 function readCanonicalU64VarintEnd(bytes: Uint8Array, offset: number): number {
     for (let index = 0; index < 10; index++) {
         const position = offset + index;
@@ -294,3 +318,7 @@ function assertByteLength(bytes: Uint8Array, expected: number, label: string) {
         throw new Error(`${label} must be ${expected} bytes`);
     }
 }
+import {
+    normalizeEd25519PublicKey,
+    parseValidatorEndpoint,
+} from './validator.ts';

@@ -17,7 +17,7 @@
 //!   account activity rows. `account_meta` stores the latest indexed account
 //!   state plus its QMDB operation location. `committee_meta` materializes the
 //!   epoch-indexed committee snapshots, while `eligible_peer` stores the
-//!   immutable validator catalog exposed to committee-management clients.
+//!   finalized known-peer catalog exposed to committee-management clients.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the
@@ -38,7 +38,7 @@ pub const TX_ACTIVITY_TABLE: &str = "tx_activity";
 pub const ACCOUNT_META_TABLE: &str = "account_meta";
 /// Name of the SQL table that records materialized committees by epoch.
 pub const COMMITTEE_META_TABLE: &str = "committee_meta";
-/// Name of the SQL table that records the immutable eligible-peer catalog.
+/// Name of the SQL table that records the finalized known-peer catalog.
 pub const ELIGIBLE_PEER_TABLE: &str = "eligible_peer";
 
 // ---------- block_meta columns ----------
@@ -112,7 +112,7 @@ pub const COMMITTEE_META_MEMBERS: &str = "members";
 
 /// `eligible_peer`: 32-byte Ed25519 public key (primary key).
 pub const ELIGIBLE_PEER_PEER: &str = "peer";
-/// `eligible_peer`: configured network ingress address.
+/// `eligible_peer`: finalized network ingress address.
 pub const ELIGIBLE_PEER_ADDRESS: &str = "address";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.

@@ -87,11 +87,15 @@ pub(crate) const fn default_link() -> Link {
     }
 }
 
-fn address(index: usize) -> Address {
-    Address::Symmetric(SocketAddr::from((
+fn socket_address(index: usize) -> SocketAddr {
+    SocketAddr::from((
         [127, 0, 0, 1],
         20_000 + u16::try_from(index).expect("test peer index must fit in u16"),
-    )))
+    ))
+}
+
+fn address(index: usize) -> Address {
+    Address::Symmetric(socket_address(index))
 }
 
 fn directory(
@@ -142,6 +146,7 @@ impl TestEngineDefinition {
         let eligible = Map::from_iter_dedup(
             signers
                 .iter()
+                .take(initial.len())
                 .enumerate()
                 .map(|(index, signer)| (signer.public_key(), address(index))),
         );
@@ -161,7 +166,7 @@ impl TestEngineDefinition {
                 sender_key.clone(),
                 Epoch::new(2),
                 signers[4].public_key(),
-                true,
+                Some(socket_address(4)),
                 0,
             )
             .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
@@ -169,7 +174,7 @@ impl TestEngineDefinition {
                 sender_key.clone(),
                 Epoch::new(2),
                 signers[0].public_key(),
-                false,
+                None,
                 1,
             )
             .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
@@ -179,7 +184,7 @@ impl TestEngineDefinition {
                 sender_key.clone(),
                 Epoch::new(3),
                 signers[5].public_key(),
-                true,
+                Some(socket_address(5)),
                 2,
             )
             .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
@@ -187,7 +192,7 @@ impl TestEngineDefinition {
                 sender_key,
                 Epoch::new(3),
                 signers[1].public_key(),
-                false,
+                None,
                 3,
             )
             .seal_and_sign(sender, TRANSACTION_NAMESPACE, &mut TestHasher::default()),
@@ -228,7 +233,7 @@ impl TestEngineDefinition {
                     sender_key.clone(),
                     Epoch::new(2),
                     peer.clone(),
-                    nonce % 2 == 0,
+                    (nonce % 2 == 0).then_some(socket_address(4)),
                     nonce as u64,
                 )
                 .seal_and_sign(
@@ -304,28 +309,38 @@ impl TestEngineDefinition {
         self.output.players().clone()
     }
 
+    fn committee_with_addresses(&self, players: Set<TestPublicKey>) -> Committee {
+        Committee::new(Map::from_iter_dedup(players.iter().map(|peer| {
+            let index = self
+                .signers
+                .iter()
+                .position(|signer| signer.public_key() == *peer)
+                .expect("test committee peer must have a signer");
+            (peer.clone(), socket_address(index))
+        })))
+        .expect("test committee must be valid")
+    }
+
     pub(crate) fn updated_players(&self) -> Set<TestPublicKey> {
-        let mut committee =
-            Committee::new(self.initial_players()).expect("initial committee must be valid");
+        let mut committee = self.committee_with_addresses(self.initial_players());
         committee
-            .assign(self.signers[4].public_key(), true)
+            .assign(self.signers[4].public_key(), Some(socket_address(4)))
             .expect("joining peer must be assignable");
         committee
-            .assign(self.signers[0].public_key(), false)
+            .assign(self.signers[0].public_key(), None)
             .expect("leaving peer must be removable");
-        committee.into_members()
+        committee.members().clone()
     }
 
     pub(crate) fn final_players(&self) -> Set<TestPublicKey> {
-        let mut committee =
-            Committee::new(self.updated_players()).expect("updated committee must be valid");
+        let mut committee = self.committee_with_addresses(self.updated_players());
         committee
-            .assign(self.signers[5].public_key(), true)
+            .assign(self.signers[5].public_key(), Some(socket_address(5)))
             .expect("future joining peer must be assignable");
         committee
-            .assign(self.signers[1].public_key(), false)
+            .assign(self.signers[1].public_key(), None)
             .expect("second leaving peer must be removable");
-        committee.into_members()
+        committee.members().clone()
     }
 
     pub(crate) fn joining(&self) -> TestPublicKey {

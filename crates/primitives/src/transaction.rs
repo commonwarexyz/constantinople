@@ -9,9 +9,11 @@ use commonware_codec::{
 use commonware_consensus::types::Epoch;
 use commonware_cryptography::{Digest, Hasher, Signer, ed25519};
 use core::num::NonZeroU64;
+use std::net::SocketAddr;
 
 const TRANSFER_TAG: u8 = 0;
 const SET_COMMITTEE_MEMBER_TAG: u8 = 1;
+const MAX_SOCKET_ADDR_SIZE: usize = u8::SIZE + u128::SIZE + u16::SIZE;
 
 /// A signed transaction accepted by the canonical block format.
 #[derive(Debug)]
@@ -99,14 +101,14 @@ pub enum Action {
         /// The non-zero value to transfer.
         value: NonZeroU64,
     },
-    /// Changes the desired registration state of a future committee member.
+    /// Adds or removes a future committee member.
     SetCommitteeMember {
         /// The epoch whose committee should be updated.
         target_epoch: Epoch,
         /// The Ed25519 peer to update.
         peer: ed25519::PublicKey,
-        /// Whether the peer should be registered.
-        registered: bool,
+        /// The peer's address when adding it, or `None` when removing it.
+        address: Option<SocketAddr>,
     },
 }
 
@@ -114,8 +116,11 @@ impl Action {
     /// Minimum encoded action size.
     pub const MIN_SIZE: usize = u8::SIZE + 1 + ed25519::PublicKey::SIZE + bool::SIZE;
     /// Maximum encoded action size.
-    pub const MAX_SIZE: usize =
-        u8::SIZE + MAX_U64_VARINT_SIZE + ed25519::PublicKey::SIZE + bool::SIZE;
+    pub const MAX_SIZE: usize = u8::SIZE
+        + MAX_U64_VARINT_SIZE
+        + ed25519::PublicKey::SIZE
+        + bool::SIZE
+        + MAX_SOCKET_ADDR_SIZE;
 
     /// Creates a transfer action.
     pub const fn transfer(to: AccountKey, value: NonZeroU64) -> Self {
@@ -126,12 +131,12 @@ impl Action {
     pub const fn set_committee_member(
         target_epoch: Epoch,
         peer: ed25519::PublicKey,
-        registered: bool,
+        address: Option<SocketAddr>,
     ) -> Self {
         Self::SetCommitteeMember {
             target_epoch,
             peer,
-            registered,
+            address,
         }
     }
 }
@@ -147,12 +152,12 @@ impl Write for Action {
             Self::SetCommitteeMember {
                 target_epoch,
                 peer,
-                registered,
+                address,
             } => {
                 SET_COMMITTEE_MEMBER_TAG.write(buf);
                 target_epoch.write(buf);
                 peer.write(buf);
-                registered.write(buf);
+                address.write(buf);
             }
         }
     }
@@ -162,8 +167,15 @@ impl EncodeSize for Action {
     fn encode_size(&self) -> usize {
         match self {
             Self::Transfer { .. } => u8::SIZE + AccountKey::SIZE + u64::SIZE,
-            Self::SetCommitteeMember { target_epoch, .. } => {
-                u8::SIZE + target_epoch.encode_size() + ed25519::PublicKey::SIZE + bool::SIZE
+            Self::SetCommitteeMember {
+                target_epoch,
+                address,
+                ..
+            } => {
+                u8::SIZE
+                    + target_epoch.encode_size()
+                    + ed25519::PublicKey::SIZE
+                    + address.encode_size()
             }
         }
     }
@@ -183,7 +195,7 @@ impl Read for Action {
             SET_COMMITTEE_MEMBER_TAG => Ok(Self::SetCommitteeMember {
                 target_epoch: Epoch::read(buf)?,
                 peer: ed25519::PublicKey::read(buf)?,
-                registered: bool::read(buf)?,
+                address: Option::<SocketAddr>::read(buf)?,
             }),
             tag => Err(Error::InvalidEnum(tag)),
         }
@@ -297,12 +309,12 @@ impl<D: Digest> Transaction<D> {
         sender: TransactionPublicKey,
         target_epoch: Epoch,
         peer: ed25519::PublicKey,
-        registered: bool,
+        address: Option<SocketAddr>,
         nonce: u64,
     ) -> Self {
         Self::with_action(
             sender,
-            Action::set_committee_member(target_epoch, peer, registered),
+            Action::set_committee_member(target_epoch, peer, address),
             nonce,
         )
     }
@@ -419,7 +431,7 @@ impl arbitrary::Arbitrary<'_> for Action {
             SET_COMMITTEE_MEMBER_TAG => Ok(Self::set_committee_member(
                 Epoch::arbitrary(u)?,
                 ed25519::PublicKey::arbitrary(u)?,
-                bool::arbitrary(u)?,
+                Option::<SocketAddr>::arbitrary(u)?,
             )),
             _ => unreachable!("arbitrary action tag is range constrained"),
         }
@@ -436,6 +448,7 @@ mod test {
     use commonware_formatting::hex;
     use commonware_math::algebra::Random;
     use rand::{SeedableRng, rngs::StdRng};
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     const SENDER_BYTES: [u8; ed25519::PublicKey::SIZE] =
         hex!("d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a");
@@ -448,6 +461,10 @@ mod test {
 
     fn peer_key() -> ed25519::PublicKey {
         ed25519::PublicKey::decode(&PEER_BYTES[..]).expect("fixture peer should decode")
+    }
+
+    fn peer_address() -> SocketAddr {
+        SocketAddr::from((Ipv4Addr::new(192, 0, 2, 1), 8080))
     }
 
     fn test_sender() -> TransactionPublicKey {
@@ -506,11 +523,18 @@ mod test {
             test_sender(),
             Epoch::new(u64::MAX),
             peer_key(),
-            false,
+            Some(peer_address()),
             u64::MAX,
         );
+        let removal = Transaction::<sha256::Digest>::set_committee_member(
+            test_sender(),
+            Epoch::zero(),
+            peer_key(),
+            None,
+            2,
+        );
 
-        for transaction in [transfer, committee] {
+        for transaction in [transfer, committee, removal] {
             let encoded = transaction.encode();
             let decoded =
                 Transaction::<sha256::Digest>::decode(encoded).expect("decoding should succeed");
@@ -538,16 +562,16 @@ mod test {
     }
 
     #[test]
-    fn transaction_set_committee_member_golden_vector() {
+    fn transaction_add_committee_member_golden_vector() {
         let transaction = Transaction::<sha256::Digest>::set_committee_member(
             TransactionPublicKey::ed25519(sender_key()),
             Epoch::new(300),
             peer_key(),
-            true,
+            Some(peer_address()),
             7,
         );
-        let expected: [u8; 78] = hex!(
-            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00000000000000000701ac023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c01"
+        let expected: [u8; 85] = hex!(
+            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00000000000000000701ac023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c0104c00002011f90"
         );
 
         assert_eq!(transaction.encode().as_ref(), expected.as_slice());
@@ -564,22 +588,42 @@ mod test {
     }
 
     #[test]
+    fn transaction_remove_committee_member_golden_vector() {
+        let transaction = Transaction::<sha256::Digest>::set_committee_member(
+            TransactionPublicKey::ed25519(sender_key()),
+            Epoch::new(300),
+            peer_key(),
+            None,
+            7,
+        );
+        let expected: [u8; 78] = hex!(
+            "00d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a00000000000000000701ac023d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c00"
+        );
+
+        assert_eq!(transaction.encode().as_ref(), expected.as_slice());
+    }
+
+    #[test]
     fn transaction_size_bounds_cover_both_actions() {
         let recipient = AccountKey::from_public_key(&TransactionPublicKey::ed25519(peer_key()));
         let transfer = Action::transfer(
             recipient,
             NonZeroU64::new(u64::MAX).expect("max value should be non-zero"),
         );
-        let committee_min = Action::set_committee_member(Epoch::zero(), peer_key(), false);
-        let committee_max = Action::set_committee_member(Epoch::new(u64::MAX), peer_key(), true);
+        let committee_min = Action::set_committee_member(Epoch::zero(), peer_key(), None);
+        let committee_max = Action::set_committee_member(
+            Epoch::new(u64::MAX),
+            peer_key(),
+            Some(SocketAddr::from((Ipv6Addr::LOCALHOST, u16::MAX))),
+        );
 
         assert_eq!(transfer.encode_size(), 41);
         assert_eq!(committee_min.encode_size(), Action::MIN_SIZE);
         assert_eq!(committee_max.encode_size(), Action::MAX_SIZE);
         assert_eq!(Action::MIN_SIZE, 35);
-        assert_eq!(Action::MAX_SIZE, 44);
+        assert_eq!(Action::MAX_SIZE, 63);
         assert_eq!(Transaction::<sha256::Digest>::MIN_SIZE, 77);
-        assert_eq!(Transaction::<sha256::Digest>::MAX_SIZE, 86);
+        assert_eq!(Transaction::<sha256::Digest>::MAX_SIZE, 105);
     }
 
     #[test]
@@ -611,15 +655,42 @@ mod test {
             Err(Error::InvalidVarint(_))
         ));
 
-        let mut invalid_bool = Vec::new();
-        SET_COMMITTEE_MEMBER_TAG.write(&mut invalid_bool);
-        Epoch::zero().write(&mut invalid_bool);
-        peer_key().write(&mut invalid_bool);
-        2u8.write(&mut invalid_bool);
+        let mut invalid_option = Vec::new();
+        SET_COMMITTEE_MEMBER_TAG.write(&mut invalid_option);
+        Epoch::zero().write(&mut invalid_option);
+        peer_key().write(&mut invalid_option);
+        2u8.write(&mut invalid_option);
         assert!(matches!(
-            Action::decode(invalid_bool.as_slice()),
+            Action::decode(invalid_option.as_slice()),
             Err(Error::InvalidBool)
         ));
+
+        let mut invalid_address = invalid_option;
+        *invalid_address
+            .last_mut()
+            .expect("option prefix should exist") = 1;
+        5u8.write(&mut invalid_address);
+        assert!(matches!(
+            Action::decode(invalid_address.as_slice()),
+            Err(Error::Invalid("IpAddr", "Invalid version"))
+        ));
+    }
+
+    #[test]
+    fn committee_member_action_rejects_every_truncation() {
+        let action = Action::set_committee_member(
+            Epoch::new(300),
+            peer_key(),
+            Some(SocketAddr::from((Ipv6Addr::LOCALHOST, 8080))),
+        );
+        let encoded = action.encode();
+
+        for end in 0..encoded.len() {
+            assert!(
+                Action::decode(&encoded[..end]).is_err(),
+                "truncation at byte {end} must be rejected"
+            );
+        }
     }
 
     #[test]

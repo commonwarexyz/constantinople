@@ -11,15 +11,15 @@ use crate::{
     namespaces::{
         committee_qmdb_client, sql_meta_client, state_qmdb_client, transactions_qmdb_client,
     },
-    sql_schema::build_meta_schema,
+    sql_schema::{ELIGIBLE_PEER_TABLE, build_meta_schema},
 };
 use commonware_codec::{
-    Codec, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
+    Codec, DecodeExt, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt,
+    Write,
 };
 use commonware_cryptography::{
     Hasher, Signer,
     bls12381::primitives::{sharing::ModeVersion, variant::Variant},
-    ed25519,
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
@@ -444,6 +444,11 @@ struct CommitteeCommitOrder {
     completions: Vec<oneshot::Sender<()>>,
 }
 
+// Committee epochs occupy every ordinary key. The maximum epoch cannot be a
+// writable committee target because E+2 must fit in u64, so reserve it to
+// serialize updates to the shared latest-address catalog.
+const ELIGIBLE_PEER_COMMIT_ORDER_KEY: u64 = u64::MAX;
+
 struct PendingUploadCompletion {
     state_latest: Location<QmdbFamily>,
     transaction_latest: Location<QmdbFamily>,
@@ -490,6 +495,9 @@ where
             next_writer_location(transaction_writer.latest_published_watermark().await);
         let committee_next_location =
             next_writer_location(committee_writer.latest_published_watermark().await);
+        let seed_bootstrap_peers = state_next_location == 0
+            && transaction_next_location == 0
+            && committee_next_location == 0;
         let buffer = buffer.clamp(1, MAX_BUFFERED_QMDB_UPLOADS);
         let (commit_tx, commit_rx) = mpsc::channel(buffer);
         let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
@@ -512,7 +520,7 @@ where
             state_writer.clone(),
             transaction_writer.clone(),
             committee_writer,
-            eligible_peers,
+            seed_bootstrap_peers.then_some(eligible_peers),
             prepare_rx,
             commit_tx,
         ));
@@ -743,7 +751,7 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     committee_writer: Arc<CommitteeWriter<H>>,
-    eligible_peers: Arc<[EligiblePeer]>,
+    eligible_peers: Option<Arc<[EligiblePeer]>>,
     mut rx: mpsc::Receiver<PendingQueuedFinalizedUpload<H, C, V>>,
     commit_tx: mpsc::Sender<PreparedQmdbUpload>,
 ) where
@@ -753,7 +761,7 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
     C: Signer + Send + Sync + 'static,
     V: Variant,
 {
-    let mut publish_eligible_peers = true;
+    let mut publish_eligible_peers = eligible_peers.is_some();
     while let Some(upload) = rx.recv().await {
         let height = upload.height;
         let prepared = prepare_qmdb_upload(
@@ -763,7 +771,11 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
             state_writer.clone(),
             transaction_writer.clone(),
             committee_writer.clone(),
-            publish_eligible_peers.then_some(eligible_peers.as_ref()),
+            publish_eligible_peers.then(|| {
+                eligible_peers
+                    .as_deref()
+                    .expect("bootstrap peers are present")
+            }),
             upload,
         )
         .await
@@ -841,10 +853,17 @@ where
     )?
     .ops;
     let account_rows = account_rows(&state_delta, state_start);
-    let committee_rows = committee_rows(&committee_delta)?;
-    let eligible_peer_rows = eligible_peers
-        .into_iter()
-        .flatten()
+    let (committee_rows, mut finalized_peers) = committee_rows(&committee_delta)?;
+    for peer in eligible_peers.into_iter().flatten() {
+        let already_materialized = finalized_peers
+            .iter()
+            .any(|finalized| finalized.public_key == peer.public_key);
+        if !already_materialized {
+            finalized_peers.push(peer.clone());
+        }
+    }
+    let eligible_peer_rows = finalized_peers
+        .iter()
         .map(encode_eligible_peer_row)
         .collect();
     Ok(PendingPreparedQmdbUpload {
@@ -1080,7 +1099,14 @@ where
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
 {
-    let committee_epochs = upload.committee_epochs.clone();
+    let mut committee_epochs = upload.committee_epochs.clone();
+    if upload
+        .sql_rows
+        .iter()
+        .any(|row| row.table == ELIGIBLE_PEER_TABLE)
+    {
+        committee_epochs.push(ELIGIBLE_PEER_COMMIT_ORDER_KEY);
+    }
     let prepared = prepare_commit_batch_blocking(
         context.child("stage_commit_batch"),
         sql_writer,
@@ -1748,25 +1774,43 @@ fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::Sql
     rows
 }
 
-fn committee_rows(delta: &[CommitteeOperation]) -> Result<Vec<super::SqlRow>, PublishError> {
-    let mut rows = Vec::new();
+fn committee_rows(
+    delta: &[CommitteeOperation],
+) -> Result<(Vec<super::SqlRow>, Vec<EligiblePeer>), PublishError> {
+    let mut committee_rows = Vec::new();
+    let mut eligible_peer_rows: Vec<EligiblePeer> = Vec::new();
     for operation in delta {
         match operation {
             AnyOperation::Update(UnorderedUpdate(epoch, committee)) => {
                 let epoch = u64::from(epoch);
-                let encoded = committee.as_ref();
-                let count = usize::from(encoded[0]);
-                let members_end = 1usize
-                    .checked_add(count.saturating_mul(ed25519::PublicKey::SIZE))
-                    .filter(|end| count > 0 && *end <= encoded.len())
-                    .ok_or(PublishError::CommitteeEncoding { epoch })?;
-                if encoded[members_end..].iter().any(|byte| *byte != 0) {
-                    return Err(PublishError::CommitteeEncoding { epoch });
-                }
-                rows.push(encode_committee_meta_row(CommitteeMetaRow {
+                let snapshot = Committee::decode(committee.as_ref())
+                    .map_err(|_| PublishError::CommitteeEncoding { epoch })?;
+                let members = snapshot
+                    .members()
+                    .iter()
+                    .flat_map(|member| member.as_ref().iter().copied())
+                    .collect();
+                committee_rows.push(encode_committee_meta_row(CommitteeMetaRow {
                     epoch,
-                    members: encoded[1..members_end].to_vec(),
+                    members,
                 }));
+                for (member, address) in snapshot.addresses().iter_pairs() {
+                    let peer = EligiblePeer {
+                        public_key: member
+                            .as_ref()
+                            .try_into()
+                            .expect("Ed25519 public keys have fixed width"),
+                        address: address.to_string(),
+                    };
+                    if let Some(existing) = eligible_peer_rows
+                        .iter_mut()
+                        .find(|existing| existing.public_key == peer.public_key)
+                    {
+                        *existing = peer;
+                    } else {
+                        eligible_peer_rows.push(peer);
+                    }
+                }
             }
             AnyOperation::Delete(epoch) => {
                 return Err(PublishError::CommitteeDelete {
@@ -1776,7 +1820,7 @@ fn committee_rows(delta: &[CommitteeOperation]) -> Result<Vec<super::SqlRow>, Pu
             AnyOperation::CommitFloor(_, _) => {}
         }
     }
-    Ok(rows)
+    Ok((committee_rows, eligible_peer_rows))
 }
 
 fn account_key_array(key: &AccountKey) -> [u8; AccountKey::SIZE] {
@@ -2039,7 +2083,7 @@ mod tests {
         qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
         translator::EightCap,
     };
-    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, ordered::Set};
+    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, ordered::Map};
     use constantinople_primitives::{
         Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
@@ -2050,7 +2094,7 @@ mod tests {
     };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
-    use std::num::NonZeroU64 as StdNonZeroU64;
+    use std::{net::SocketAddr, num::NonZeroU64 as StdNonZeroU64};
 
     const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
     const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
@@ -2694,15 +2738,30 @@ mod tests {
 
     #[test]
     fn queued_upload_materializes_committee_and_eligible_peer_rows() {
+        let upload = test_queued_upload();
+        let encoded = upload.encode();
+        let mut encoded_ref = encoded.as_ref();
+        let upload = QueuedFinalizedUpload::<Sha256, ed25519::PrivateKey, MinSig>::read_cfg(
+            &mut encoded_ref,
+            &QueuedFinalizedUploadCfg::default(),
+        )
+        .expect("durable queued upload replays");
         let (completion, _rx) = oneshot::channel();
-        let catalog = [EligiblePeer {
-            public_key: [9u8; 32],
-            address: "validator-9:9000".to_string(),
-        }];
+        let expected_member = ed25519::PrivateKey::from_seed(1).public_key().encode();
+        let catalog = [
+            EligiblePeer {
+                public_key: expected_member.as_ref().try_into().unwrap(),
+                address: "stale-bootstrap-address:9000".to_string(),
+            },
+            EligiblePeer {
+                public_key: [9u8; 32],
+                address: "validator-9:9000".to_string(),
+            },
+        ];
         let prepared = expand_queued_finalized_upload(
             PendingQueuedFinalizedUpload {
                 height: 1,
-                upload: test_queued_upload(),
+                upload,
                 completion,
             },
             Some(&catalog),
@@ -2715,20 +2774,42 @@ mod tests {
             &prepared.committee_rows[0].values[0],
             CellValue::UInt64(1)
         ));
-        let expected_member = ed25519::PrivateKey::from_seed(1).public_key().encode();
         assert!(matches!(
             &prepared.committee_rows[0].values[1],
             CellValue::Binary(members) if members.as_slice() == expected_member.as_ref()
         ));
-        assert_eq!(prepared.eligible_peer_rows.len(), 1);
+        assert_eq!(prepared.eligible_peer_rows.len(), 2);
         assert_eq!(prepared.eligible_peer_rows[0].table, ELIGIBLE_PEER_TABLE);
         assert!(matches!(
             &prepared.eligible_peer_rows[0].values[0],
-            CellValue::FixedBinary(peer) if peer == &[9u8; 32]
+            CellValue::FixedBinary(peer) if peer.as_slice() == expected_member.as_ref()
         ));
         assert!(matches!(
             &prepared.eligible_peer_rows[0].values[1],
+            CellValue::Utf8(address) if address == "127.0.0.1:10001"
+        ));
+        assert!(matches!(
+            &prepared.eligible_peer_rows[1].values[0],
+            CellValue::FixedBinary(peer) if peer == &[9u8; 32]
+        ));
+        assert!(matches!(
+            &prepared.eligible_peer_rows[1].values[1],
             CellValue::Utf8(address) if address == "validator-9:9000"
+        ));
+    }
+
+    #[test]
+    fn committee_rows_reject_malformed_snapshot() {
+        let malformed = CommitteeValue::new([0u8; Committee::SIZE]);
+        let Err(error) = committee_rows(&[CommitteeOperation::Update(UnorderedUpdate(
+            U64::new(7),
+            malformed,
+        ))]) else {
+            panic!("empty committee snapshot must be rejected");
+        };
+        assert!(matches!(
+            error,
+            PublishError::CommitteeEncoding { epoch: 7 }
         ));
     }
 
@@ -3297,9 +3378,11 @@ mod tests {
     }
 
     fn test_committee(seed: u64) -> Committee {
-        Committee::new(Set::from_iter_dedup([
-            ed25519::PrivateKey::from_seed(seed).public_key()
-        ]))
+        let port = u16::try_from(10_000 + seed).expect("test port fits u16");
+        Committee::new(Map::from_iter_dedup([(
+            ed25519::PrivateKey::from_seed(seed).public_key(),
+            SocketAddr::from(([127, 0, 0, 1], port)),
+        )]))
         .expect("test committee")
     }
 

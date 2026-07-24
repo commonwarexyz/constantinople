@@ -114,10 +114,10 @@ const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 const CURSOR_COMMITTEE_KEY: U64 = U64::new(2);
 
-/// Adds the immutable eligible-validator catalog as network-policy
+/// Keeps the immutable genesis/bootstrap directory available as network-policy
 /// secondaries without changing the epoch IDs registered by DKG.
 #[derive(Clone)]
-struct PersistentSecondaries<M>
+struct BootstrapSecondaries<M>
 where
     M: AddressableManager,
 {
@@ -125,7 +125,7 @@ where
     eligible: Map<M::PublicKey, Address>,
 }
 
-impl<M> PersistentSecondaries<M>
+impl<M> BootstrapSecondaries<M>
 where
     M: AddressableManager,
 {
@@ -134,18 +134,18 @@ where
     }
 }
 
-impl<M> fmt::Debug for PersistentSecondaries<M>
+impl<M> fmt::Debug for BootstrapSecondaries<M>
 where
     M: AddressableManager,
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("PersistentSecondaries")
-            .field("eligible", &self.eligible.len())
+        f.debug_struct("BootstrapSecondaries")
+            .field("bootstrap", &self.eligible.len())
             .finish_non_exhaustive()
     }
 }
 
-impl<M> Provider for PersistentSecondaries<M>
+impl<M> Provider for BootstrapSecondaries<M>
 where
     M: AddressableManager,
 {
@@ -163,7 +163,7 @@ where
     }
 }
 
-impl<M> AddressableManager for PersistentSecondaries<M>
+impl<M> AddressableManager for BootstrapSecondaries<M>
 where
     M: AddressableManager,
 {
@@ -791,7 +791,10 @@ async fn start_queued_upload(
     });
 }
 
-/// Build the indexer wiring iff the secondary validator opted in.
+/// Build the indexer wiring iff a genesis-secondary validator opted in.
+///
+/// The peer metadata seeded here is the genesis/bootstrap directory. Future
+/// committee membership and p2p addresses come from finalized snapshots.
 async fn maybe_build_indexer(
     context: RuntimeContext,
     is_genesis_primary: bool,
@@ -1112,7 +1115,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     .leaders
                     .iter_mut()
                     .find(|leader| leader.public_key == local_key)
-                    .expect("relayer leader catalog must include the local eligible validator");
+                    .expect("relayer leader catalog must include the local validator");
                 local.url = format!("http://{mempool_listen}");
                 info!(%http_listen, "relayer webserver listening");
                 Box::pin(crate::relayer::serve(crate::relayer::ServerConfig {
@@ -1144,9 +1147,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let secret_store = FileSecretStore::load(secret_store_dir)
             .expect("failed to initialize validator-local DKG secret store");
 
-        // Build the indexer wiring up-front. This consumes `indexer` from the
-        // loaded config and returns `None` for genesis primaries or validators
-        // that did not declare an `indexer` block.
+        // Build indexer wiring from the genesis/bootstrap metadata up-front.
+        // This consumes `indexer` from the loaded config and returns `None` for
+        // genesis primaries or validators without an `indexer` block.
         let indexer_partition_prefix = decoded.partition_prefix.clone();
         let mut indexer_handle = maybe_build_indexer(
             context.child("indexer"),
@@ -1158,7 +1161,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         .await;
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
         let engine_manager =
-            PersistentSecondaries::new(oracle.clone(), decoded.eligible_peers.clone());
+            BootstrapSecondaries::new(oracle.clone(), decoded.eligible_peers.clone());
 
         info!("initializing engine");
         let engine =
@@ -1218,8 +1221,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         });
 
         info!("starting engine");
-        // Every eligible validator maintains the same finalized mempool view,
-        // so promotion never starts from stale transaction status.
+        // Every running validator maintains the same finalized mempool view,
+        // so a later promotion never starts from stale transaction status.
         let mempool_reporter = MempoolReporter(mempool_mailbox.clone());
         let indexer_reporter = if relayer_observer.is_none() {
             indexer_handle.as_mut().map(|handle| {
@@ -1341,7 +1344,7 @@ mod tests {
     }
 
     #[test]
-    fn persistent_secondaries_include_all_eligible_non_primaries() {
+    fn bootstrap_secondaries_include_all_genesis_non_primaries() {
         let primary = PrivateKey::from_seed(1).public_key();
         let scheduled = PrivateKey::from_seed(2).public_key();
         let removed = PrivateKey::from_seed(3).public_key();

@@ -349,7 +349,7 @@ impl Property<TestPublicKey, ValidatorState> for TwoCommitteeRotations {
                 .await
                 .map_err(|error| format!("committee row read failed: {error}"))?
                 .ok_or_else(|| "E+2 row absent; fallback would be required".to_string())?;
-            if row.into_members() != self.updated {
+            if row.members() != &self.updated {
                 return Err("materialized E+2 row differs from requested committee".into());
             }
 

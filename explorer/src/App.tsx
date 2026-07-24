@@ -892,7 +892,7 @@ export default function App() {
                             nonce: transaction.nonce,
                             targetEpoch: transaction.targetEpoch,
                             peer: transaction.peer,
-                            registered: transaction.registered,
+                            address: transaction.address,
                         },
                         wallet.sign,
                     ),

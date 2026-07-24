@@ -105,7 +105,7 @@ use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
 };
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
-use commonware_utils::{non_empty_range, ordered::Set, sequence::U64};
+use commonware_utils::{non_empty_range, sequence::U64};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
     Account, Action, Header, LazySignedTransaction, SignedTransaction,
@@ -160,7 +160,7 @@ where
 struct CommitteeMutation {
     target_epoch: Epoch,
     peer: ed25519::PublicKey,
-    registered: bool,
+    address: Option<std::net::SocketAddr>,
 }
 
 pub(super) struct PreparedAction {
@@ -178,11 +178,11 @@ where
         Action::SetCommitteeMember {
             target_epoch,
             peer,
-            registered,
+            address,
         } => Some(CommitteeMutation {
             target_epoch: *target_epoch,
             peer: peer.clone(),
-            registered: *registered,
+            address: *address,
         }),
     };
     Some(PreparedAction { account, committee })
@@ -196,6 +196,7 @@ where
 {
     batch: CommitteeBatch<E, H, EightCap, S>,
     target: U64,
+    current: Committee,
     entering: Committee,
     committee: Committee,
     dirty: bool,
@@ -230,6 +231,11 @@ where
         {
             batch = super::committee::seed_committees(batch, initial.clone(), initial_next.clone());
         }
+        let current = batch
+            .get(&epoch_key(epoch))
+            .await
+            .expect("current committee read must succeed")
+            .unwrap_or_else(|| initial.clone());
         let entering_epoch = epoch.next();
         let entering = match batch
             .get(&epoch_key(entering_epoch))
@@ -241,7 +247,7 @@ where
                 .get(&epoch_key(epoch))
                 .await
                 .expect("entering committee fallback read must succeed")
-                .unwrap_or_else(|| initial.clone()),
+                .unwrap_or_else(|| current.clone()),
         };
         let target_epoch = Epoch::new(
             epoch
@@ -259,6 +265,7 @@ where
         Self {
             batch,
             target,
+            current,
             entering,
             committee,
             // The final block materializes an absent carry-forward row after
@@ -268,20 +275,23 @@ where
         }
     }
 
-    fn updated(
-        &self,
-        mutation: &CommitteeMutation,
-        eligible: &Set<ed25519::PublicKey>,
-    ) -> Option<Committee> {
-        if !self.mutations_allowed
-            || mutation.target_epoch.get() != u64::from(&self.target)
-            || eligible.position(&mutation.peer).is_none()
+    fn updated(&self, mutation: &CommitteeMutation) -> Option<Committee> {
+        if !self.mutations_allowed || mutation.target_epoch.get() != u64::from(&self.target) {
+            return None;
+        }
+        if let Some(address) = mutation.address
+            && self
+                .current
+                .addresses()
+                .get_value(&mutation.peer)
+                .into_iter()
+                .chain(self.entering.addresses().get_value(&mutation.peer))
+                .any(|existing| *existing != address)
         {
             return None;
         }
         let mut next = self.committee.clone();
-        next.assign(mutation.peer.clone(), mutation.registered)
-            .ok()?;
+        next.assign(mutation.peer.clone(), mutation.address).ok()?;
         Some(next)
     }
 
@@ -563,7 +573,6 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I, R>(
     input: &mut I,
     initial_committee: &Committee,
     initial_next_committee: &Committee,
-    eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     blocks_per_epoch: u64,
 ) -> ProposalExecution<E, H, S>
 where
@@ -681,7 +690,6 @@ where
                     let span = select_span.clone();
                     let mut selector = selector;
                     let mut committee_execution = committee_execution;
-                    let eligible_committee_members = eligible_committee_members.clone();
                     let mut body = body;
                     move |_: S| {
                         span.in_scope(|| {
@@ -694,9 +702,7 @@ where
                                 };
                                 let committee_update =
                                     action.committee.as_ref().map_or(Some(None), |mutation| {
-                                        committee_execution
-                                            .updated(mutation, &eligible_committee_members)
-                                            .map(Some)
+                                        committee_execution.updated(mutation).map(Some)
                                     });
                                 let applied = committee_update.is_some()
                                     && selector.apply_one(&action.account);
@@ -821,7 +827,6 @@ pub(super) async fn execute_body<E, H, S>(
     body: PreparedBody<H>,
     initial_committee: &Committee,
     initial_next_committee: &Committee,
-    eligible_committee_members: Arc<Set<ed25519::PublicKey>>,
     blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
 where
@@ -848,7 +853,7 @@ where
         .filter_map(|action| action.committee.as_ref())
     {
         let next = committee
-            .updated(mutation, &eligible_committee_members)
+            .updated(mutation)
             .ok_or(STATIC_INVALID_TRANSACTION)?;
         committee.commit(next);
     }
@@ -902,7 +907,6 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     strategy: S,
     initial_committee: &Committee,
     initial_next_committee: &Committee,
-    eligible_committee_members: &Set<ed25519::PublicKey>,
     blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
 where
@@ -923,7 +927,7 @@ where
         .filter_map(|action| action.committee.as_ref())
     {
         let next = committee
-            .updated(mutation, eligible_committee_members)
+            .updated(mutation)
             .ok_or(STATIC_INVALID_TRANSACTION)?;
         committee.commit(next);
     }

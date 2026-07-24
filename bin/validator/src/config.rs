@@ -135,7 +135,8 @@ pub struct ValidatorConfig {
     /// deployer mode, where the hosts file names a monitoring instance.
     #[serde(default)]
     pub traces: f64,
-    /// Complete immutable catalog of peers eligible for committee membership.
+    /// Immutable genesis/bootstrap peer directory committed by the checkpoint.
+    /// Later committee snapshots carry their own peer addresses.
     pub eligible_peers: Vec<EligiblePeerEntry>,
     /// Optional indexer wiring. Honored only for validators that are
     /// secondaries at genesis; the service remains available after promotion.
@@ -153,8 +154,9 @@ pub struct RelayerConfig {
     pub max_retry_views: u64,
     /// Validator HTTP endpoints keyed by public key.
     ///
-    /// Configure every eligible validator; the relayer filters this catalog
-    /// to the active finalized committee before applying leader election.
+    /// This is an explicit HTTP catalog; p2p addresses are not HTTP endpoints.
+    /// The relayer filters it to the active finalized committee before applying
+    /// leader election.
     pub leaders: Vec<RelayerLeaderConfig>,
 }
 
@@ -168,9 +170,9 @@ pub struct RelayerLeaderConfig {
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct EligiblePeerEntry {
-    /// Hex-encoded ed25519 public key of the eligible peer.
+    /// Hex-encoded ed25519 public key of the bootstrap peer.
     pub public_key: String,
-    /// Host name used to resolve the peer's immutable p2p address.
+    /// Host name used to resolve the peer's bootstrap p2p address.
     pub name: String,
 }
 
@@ -211,7 +213,7 @@ pub struct DecodedConfig {
     pub primary_participants: Vec<ed25519::PublicKey>,
     /// Secondary (non-voting) validators.
     pub secondary_participants: Vec<ed25519::PublicKey>,
-    /// Immutable address catalog for every peer eligible to join a committee.
+    /// Immutable genesis/bootstrap p2p directory.
     pub eligible_peers: Map<ed25519::PublicKey, Address>,
     /// Storage partition prefix for this validator.
     pub partition_prefix: String,
@@ -339,7 +341,7 @@ fn decode_with_network(
         panic!("relayer and indexer configs cannot be enabled on the same secondary");
     }
     if let Some(relayer) = config.relayer.as_ref() {
-        validate_relayer_catalog(relayer, &eligible_peers);
+        validate_relayer_catalog(relayer, &eligible_peers, &public_key);
     }
     let genesis_leader = decode_public_key("genesis_leader", &config.genesis_leader);
     let listen_bind: SocketAddr = format!("0.0.0.0:{}", config.listen_port)
@@ -384,12 +386,13 @@ fn decode_with_network(
     }
 }
 
-/// Decode the primary/secondary hex lists from the YAML. Panics if `self_key`
-/// is absent from both lists — every node must be explicitly declared.
+/// Decode the genesis primary/secondary lists from the YAML.
+///
+/// The local key need not appear: a validator joining after genesis must be
+/// able to start from the same checkpoint as the genesis validators.
 fn decode_participants(
     primary_hex: &[String],
     secondary_hex: &[String],
-    self_key: &ed25519::PublicKey,
 ) -> (Vec<ed25519::PublicKey>, Vec<ed25519::PublicKey>) {
     let primary = primary_hex
         .iter()
@@ -399,18 +402,10 @@ fn decode_participants(
         .iter()
         .map(|hex_str| decode_public_key("secondary_validators", hex_str))
         .collect::<Vec<_>>();
-    if !primary.contains(self_key) && !secondary.contains(self_key) {
-        let self_hex = hex(&self_key.encode());
-        panic!(
-            "self public key '{self_hex}' not listed in primary_validators or secondary_validators"
-        );
-    }
     (primary, secondary)
 }
 
-/// Ensure every peer active at genesis has an immutable address. The eligible
-/// catalog may be a superset so future committee members can be registered
-/// without changing genesis configuration.
+/// Ensure every peer named by the genesis checkpoint has a bootstrap address.
 fn validate_eligible_catalog(
     primary: &[ed25519::PublicKey],
     secondary: &[ed25519::PublicKey],
@@ -424,17 +419,27 @@ fn validate_eligible_catalog(
     }
 }
 
-fn validate_relayer_catalog(relayer: &RelayerConfig, eligible: &Map<ed25519::PublicKey, Address>) {
+fn validate_relayer_catalog(
+    relayer: &RelayerConfig,
+    bootstrap: &Map<ed25519::PublicKey, Address>,
+    local: &ed25519::PublicKey,
+) {
     let leaders: Map<ed25519::PublicKey, ()> = relayer
         .leaders
         .iter()
         .map(|leader| (decode_public_key("relayer leader", &leader.public_key), ()))
         .try_collect()
         .expect("relayer leaders contains duplicate public keys");
-    assert_eq!(
-        leaders.keys(),
-        eligible.keys(),
-        "relayer leader catalog must exactly match eligible_peers"
+    assert!(
+        bootstrap
+            .keys()
+            .iter()
+            .all(|peer| leaders.get_value(peer).is_some()),
+        "relayer leader catalog must cover the genesis/bootstrap directory"
+    );
+    assert!(
+        leaders.get_value(local).is_some(),
+        "relayer leader catalog must include the local validator"
     );
 }
 
@@ -446,11 +451,8 @@ pub fn load_local_config(peers_path: &Path, config_path: &Path) -> LoadedConfig 
     let raw_peers = std::fs::read_to_string(peers_path).expect("failed to read peers file");
     let peers: PeersFile = serde_yaml::from_str(&raw_peers).expect("failed to parse peers file");
 
-    let (primary_participants, secondary_participants) = decode_participants(
-        &config.primary_validators,
-        &config.secondary_validators,
-        &self_public_key,
-    );
+    let (primary_participants, secondary_participants) =
+        decode_participants(&config.primary_validators, &config.secondary_validators);
 
     // Self lookup must succeed against either the primary or secondary sections.
     let peers_by_name = peers
@@ -506,11 +508,8 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
     let raw_hosts = std::fs::read_to_string(hosts_path).expect("failed to read hosts file");
     let hosts: Hosts = serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
 
-    let (primary_participants, secondary_participants) = decode_participants(
-        &config.primary_validators,
-        &config.secondary_validators,
-        &self_public_key,
-    );
+    let (primary_participants, secondary_participants) =
+        decode_participants(&config.primary_validators, &config.secondary_validators);
 
     let hosts_by_name = hosts
         .hosts
@@ -766,7 +765,71 @@ mod tests {
     }
 
     #[test]
-    fn local_config_resolves_complete_eligible_catalog() {
+    fn new_node_can_load_genesis_config_without_bootstrap_membership() {
+        let cluster = Cluster::new(2, 0);
+        let newcomer = ed25519::PrivateKey::from_seed(9_000_000);
+        let newcomer_key = newcomer.public_key();
+        let newcomer_name = hex(&newcomer_key.encode());
+        let first_name = hex(&cluster.primary_keys[0].encode());
+        let second_name = hex(&cluster.primary_keys[1].encode());
+        let config_path = temp_path("validator-config", ".yaml");
+        let peers_path = temp_path("validator-peers", ".yaml");
+        let mut config =
+            cluster.primary_config(0, StartupModeConfig::StateSync, cluster.eligible_entries());
+        config.private_key = hex(&newcomer.encode());
+        config.dkg_share.clear();
+        config.listen_port = 9100;
+        config.http_port = 8180;
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+        fs::write(
+            &peers_path,
+            format!(
+                r#"validators:
+  - name: "{first_name}"
+    p2p: "127.0.0.1:9000"
+    http: "127.0.0.1:8080"
+  - name: "{second_name}"
+    p2p: "127.0.0.1:9001"
+    http: "127.0.0.1:8081"
+secondaries:
+  - name: "{newcomer_name}"
+    p2p: "127.0.0.1:9100"
+    http: "127.0.0.1:8180"
+"#,
+            ),
+        )
+        .expect("peers should write");
+
+        let loaded = load_local_config(&peers_path, &config_path);
+
+        assert_eq!(loaded.decoded.public_key, newcomer_key);
+        assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9100".parse().unwrap());
+        assert!(!loaded.decoded.primary_participants.contains(&newcomer_key));
+        assert!(
+            !loaded
+                .decoded
+                .secondary_participants
+                .contains(&newcomer_key)
+        );
+        assert!(
+            loaded
+                .decoded
+                .eligible_peers
+                .get_value(&newcomer_key)
+                .is_none()
+        );
+        assert_eq!(loaded.decoded.eligible_peers.len(), 2);
+
+        let _ = fs::remove_file(config_path);
+        let _ = fs::remove_file(peers_path);
+    }
+
+    #[test]
+    fn local_config_resolves_genesis_bootstrap_directory() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
         let peer_key = &cluster.primary_keys[1];
@@ -830,7 +893,7 @@ mod tests {
     }
 
     #[test]
-    fn deployer_config_resolves_complete_eligible_catalog() {
+    fn deployer_config_resolves_genesis_bootstrap_directory() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
         let peer_key = &cluster.primary_keys[1];
@@ -1432,9 +1495,10 @@ secondaries:
     }
 
     #[test]
-    fn relayer_catalog_covers_every_eligible_validator() {
+    fn relayer_catalog_can_explicitly_cover_future_validators() {
         let first = ed25519::PrivateKey::from_seed(1).public_key();
         let second = ed25519::PrivateKey::from_seed(2).public_key();
+        let future = ed25519::PrivateKey::from_seed(3).public_key();
         let eligible = Map::from_iter_dedup([
             (
                 first.clone(),
@@ -1447,7 +1511,7 @@ secondaries:
         ]);
         let relayer = RelayerConfig {
             max_retry_views: 8,
-            leaders: [first, second]
+            leaders: [first, second, future.clone()]
                 .into_iter()
                 .enumerate()
                 .map(|(index, public_key)| RelayerLeaderConfig {
@@ -1457,6 +1521,6 @@ secondaries:
                 .collect(),
         };
 
-        validate_relayer_catalog(&relayer, &eligible);
+        validate_relayer_catalog(&relayer, &eligible, &future);
     }
 }

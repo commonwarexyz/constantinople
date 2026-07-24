@@ -77,6 +77,7 @@ use constantinople_primitives::{BLOCKS_PER_EPOCH, PublicKeyCache};
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
+    net::SocketAddr,
     num::{NonZero, NonZeroU16},
     sync::{
         Arc,
@@ -139,12 +140,24 @@ impl Default for SimplexTimeouts {
     }
 }
 
-fn eligible_peers_root<H, P>(eligible_peers: &Map<P, Address>) -> H::Digest
+fn genesis_directory_root<H, P>(bootstrap_peers: &Map<P, Address>) -> H::Digest
 where
     H: Hasher,
     P: PublicKey,
 {
-    H::hash(&[ELIGIBLE_PEERS_DOMAIN, &eligible_peers.encode()])
+    H::hash(&[ELIGIBLE_PEERS_DOMAIN, &bootstrap_peers.encode()])
+}
+
+fn bootstrap_socket_addresses<P>(bootstrap_peers: &Map<P, Address>) -> Map<P, SocketAddr>
+where
+    P: PublicKey,
+{
+    Map::from_iter_dedup(bootstrap_peers.iter_pairs().map(|(peer, address)| {
+        let Address::Symmetric(socket) = address else {
+            panic!("genesis/bootstrap peer {peer:?} must have a symmetric socket address");
+        };
+        (peer.clone(), *socket)
+    }))
 }
 
 /// Vote channel id.
@@ -232,7 +245,8 @@ where
     pub share: Option<group::Share>,
     /// Canonical epoch-zero DKG artifact embedded in genesis.
     pub genesis: EpochInfo<V, C::PublicKey, network::Addresses<C::PublicKey>>,
-    /// Immutable lookup addresses for every committee-eligible validator.
+    /// Immutable genesis/bootstrap peer directory committed by genesis.
+    /// Finalized committee snapshots provide addresses for later committees.
     pub eligible_peers: Map<C::PublicKey, Address>,
     /// Plaintext validator-local storage for DKG private material.
     ///
@@ -440,7 +454,8 @@ where
                 .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
-        let eligible_peers_root = eligible_peers_root::<H, C::PublicKey>(&config.eligible_peers);
+        let eligible_peers_root = genesis_directory_root::<H, C::PublicKey>(&config.eligible_peers);
+        let bootstrap_addresses = bootstrap_socket_addresses(&config.eligible_peers);
         let epocher = FixedEpocher::new(config.blocks_per_epoch);
         let mut secret_store = config.secret_store.clone();
         if let Some(share) = config.share.clone() {
@@ -598,7 +613,7 @@ where
         };
 
         // The canonical genesis is a pure function of configuration: the leader, the
-        // participant-derived coding config, immutable eligible peer catalog, and the
+        // participant-derived coding config, immutable genesis/bootstrap directory, and the
         // canonical empty-database roots.
         let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
             &mut H::default(),
@@ -712,7 +727,7 @@ where
             config.genesis.clone(),
             eligible_peers_root,
             config.blocks_per_epoch,
-            config.eligible_peers.keys().clone(),
+            bootstrap_addresses.clone(),
             Some(finalized_hook),
         );
         let state_sync = probe_artifact.map(|artifact| StateSync {
@@ -773,7 +788,7 @@ where
             committee_subscription,
             config.genesis.players.clone(),
             config.genesis.next_players.clone(),
-            config.eligible_peers,
+            bootstrap_addresses,
             finalized_application_height,
             config.blocks_per_epoch,
         );
@@ -1169,7 +1184,7 @@ where
 
 #[cfg(test)]
 mod catalog_tests {
-    use super::eligible_peers_root;
+    use super::{bootstrap_socket_addresses, genesis_directory_root};
     use commonware_cryptography::{Signer as _, ed25519, sha256};
     use commonware_p2p::Address;
     use commonware_utils::ordered::Map;
@@ -1183,7 +1198,7 @@ mod catalog_tests {
     }
 
     #[test]
-    fn eligible_peers_root_is_canonical_and_commits_keys_and_addresses() {
+    fn genesis_directory_root_is_canonical_and_commits_keys_and_addresses() {
         let a = ed25519::PrivateKey::from_seed(1).public_key();
         let b = ed25519::PrivateKey::from_seed(2).public_key();
         let canonical =
@@ -1194,12 +1209,43 @@ mod catalog_tests {
             Map::try_from([(b.clone(), address(1003)), (a, address(1001))]).unwrap();
         let changed_key = Map::try_from([(b, address(1002))]).unwrap();
 
-        let root = eligible_peers_root::<sha256::Sha256, _>(&canonical);
-        assert_eq!(root, eligible_peers_root::<sha256::Sha256, _>(&reordered));
+        let root = genesis_directory_root::<sha256::Sha256, _>(&canonical);
+        assert_eq!(
+            root,
+            genesis_directory_root::<sha256::Sha256, _>(&reordered)
+        );
         assert_ne!(
             root,
-            eligible_peers_root::<sha256::Sha256, _>(&changed_address)
+            genesis_directory_root::<sha256::Sha256, _>(&changed_address)
         );
-        assert_ne!(root, eligible_peers_root::<sha256::Sha256, _>(&changed_key));
+        assert_ne!(
+            root,
+            genesis_directory_root::<sha256::Sha256, _>(&changed_key)
+        );
+    }
+
+    #[test]
+    fn bootstrap_addresses_convert_symmetric_sockets() {
+        let peer = ed25519::PrivateKey::from_seed(1).public_key();
+        let socket: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let addresses = bootstrap_socket_addresses(&Map::from_iter_dedup([(
+            peer.clone(),
+            Address::Symmetric(socket),
+        )]));
+
+        assert_eq!(addresses.get_value(&peer), Some(&socket));
+    }
+
+    #[test]
+    #[should_panic(expected = "must have a symmetric socket address")]
+    fn bootstrap_addresses_reject_asymmetric_addresses() {
+        let peer = ed25519::PrivateKey::from_seed(1).public_key();
+        let socket: SocketAddr = "127.0.0.1:1001".parse().unwrap();
+        let asymmetric = Address::Asymmetric {
+            ingress: socket.into(),
+            egress: socket,
+        };
+
+        let _ = bootstrap_socket_addresses(&Map::from_iter_dedup([(peer, asymmetric)]));
     }
 }

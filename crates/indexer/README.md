@@ -89,10 +89,12 @@ The writer end cursors are derived from the block header and start cursors.
 
 The background uploader derives the rest from that durable entry: SQL rows,
 transaction-hash QMDB operations, account and committee metadata rows,
-watermarks, and the final Store batch. The immutable eligible-peer catalog is
-upserted with the first prepared upload after the publisher connects. This
-keeps SQL-row encoding off the durable queue write path while still making
-recovery independent from local database pruning.
+watermarks, and the final Store batch. Each decoded finalized committee
+snapshot materializes both its epoch membership and its known peers in the
+same SQL upload. Configured eligible peers may also seed the catalog with the
+first prepared upload after the publisher connects. This keeps SQL-row
+encoding off the durable queue write path while still making recovery
+independent from local database pruning.
 
 Remote Store commits retry indefinitely with a capped exponential backoff using
 the fully staged `StoreWriteBatch`, so a transient store outage stalls queued

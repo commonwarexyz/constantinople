@@ -160,7 +160,6 @@ where
             input,
             &self.initial_committee,
             &self.initial_next_committee,
-            self.eligible_committee_members.clone(),
             self.blocks_per_epoch.get(),
         )
         .await;
@@ -304,7 +303,6 @@ where
             body,
             &self.initial_committee,
             &self.initial_next_committee,
-            self.eligible_committee_members.clone(),
             self.blocks_per_epoch.get(),
         );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
@@ -396,7 +394,6 @@ where
             strategy,
             &self.initial_committee,
             &self.initial_next_committee,
-            &self.eligible_committee_members,
             self.blocks_per_epoch.get(),
         )
         .await
@@ -429,12 +426,25 @@ mod tests {
         ed25519,
     };
     use commonware_glue::dkg::types::{EpochInfo, EpochOutcome, Payload};
-    use commonware_utils::{N3f1, ordered::Set};
+    use commonware_utils::{
+        N3f1,
+        ordered::{Map, Set},
+    };
+    use std::net::{Ipv4Addr, SocketAddr};
 
     type TestPayload = Payload<MinSig, ed25519::PrivateKey>;
 
     fn key(seed: u64) -> ed25519::PrivateKey {
         ed25519::PrivateKey::from_seed(seed)
+    }
+
+    fn committee(members: Set<ed25519::PublicKey>) -> Committee {
+        Committee::new(Map::from_iter_dedup(
+            members
+                .into_iter()
+                .map(|peer| (peer, SocketAddr::from((Ipv4Addr::LOCALHOST, 8_000)))),
+        ))
+        .unwrap()
     }
 
     fn epoch_info(
@@ -482,8 +492,8 @@ mod tests {
         let a = key(211).public_key();
         let b = key(212).public_key();
         let c = key(213).public_key();
-        let entering = Committee::new(Set::from_iter_dedup([a, b.clone()])).unwrap();
-        let selected = Committee::new(Set::from_iter_dedup([b, c])).unwrap();
+        let entering = committee(Set::from_iter_dedup([a, b.clone()]));
+        let selected = committee(Set::from_iter_dedup([b, c]));
         let epoch = Epoch::new(7);
         let height = epoch.get() * BLOCKS_PER_EPOCH + BLOCKS_PER_EPOCH - 1;
         let valid = epoch_info(
@@ -534,7 +544,7 @@ mod tests {
     #[test]
     fn dealer_logs_are_allowed_from_midpoint_until_before_final_block() {
         let member = key(221).public_key();
-        let committee = Committee::new(Set::from_iter_dedup([member])).unwrap();
+        let committee = committee(Set::from_iter_dedup([member]));
         let log = dealer_log();
         let midpoint = BLOCKS_PER_EPOCH / 2;
 

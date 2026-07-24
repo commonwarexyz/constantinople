@@ -1213,6 +1213,77 @@ body {
     background: rgba(88, 166, 255, 0.045);
 }
 
+.committee-add {
+    min-width: 0;
+    display: grid;
+    grid-template-columns: auto minmax(12rem, 1.35fr) minmax(14rem, 1fr) auto;
+    align-items: end;
+    gap: 0.55rem;
+    padding: 0.65rem 0.8rem;
+    border-bottom: 1px solid var(--theme-border);
+    background: #0e0f10;
+}
+
+.committee-add__prompt {
+    align-self: center;
+    color: var(--theme-accent);
+    font-size: 1rem;
+}
+
+.committee-add label {
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+}
+
+.committee-add label > span {
+    color: var(--theme-text-dim);
+    font-size: 0.58rem;
+    text-transform: uppercase;
+    letter-spacing: 0.07em;
+}
+
+.committee-add input {
+    width: 100%;
+    min-width: 0;
+    height: 2rem;
+    padding: 0 0.55rem;
+    border: 1px solid #43464b;
+    border-radius: 0;
+    outline: 0;
+    background: #090a0b;
+    color: var(--theme-text);
+    font: inherit;
+    font-size: 0.7rem;
+}
+
+.committee-add input:focus {
+    border-color: var(--theme-accent);
+    box-shadow: inset 2px 0 0 var(--theme-accent);
+}
+
+.committee-add input::placeholder {
+    color: #666a70;
+}
+
+.committee-add button {
+    min-height: 2rem;
+    padding-inline: 0.8rem;
+    border-color: rgba(63, 185, 80, 0.55);
+    background: rgba(63, 185, 80, 0.08);
+    color: var(--theme-success);
+    font-size: 0.68rem;
+    white-space: nowrap;
+}
+
+.committee-add__error {
+    grid-column: 2 / -1;
+    color: var(--committee-red);
+    font-size: 0.65rem;
+    overflow-wrap: anywhere;
+}
+
 .committee-table {
     width: 100%;
     min-width: 0;
@@ -1343,6 +1414,51 @@ body {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+}
+
+.committee-row__endpoint {
+    min-width: 0;
+    display: flex;
+    align-items: center;
+    gap: 0.55rem;
+}
+
+.committee-row__endpoint small {
+    min-width: 0;
+    flex: 1 1 auto;
+}
+
+.committee-row__discard {
+    flex: 0 0 auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--committee-red);
+    font: inherit;
+    font-size: 0.68em;
+    white-space: nowrap;
+}
+
+.committee-row__discard:hover:not(:disabled) {
+    color: #ff8a8a;
+    text-decoration: underline;
+}
+
+@media (max-width: 1000px) {
+    .committee-add {
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: stretch;
+    }
+
+    .committee-add label,
+    .committee-add button,
+    .committee-add__error {
+        grid-column: 2;
+    }
+
+    .committee-add__prompt {
+        grid-row: 1;
+    }
 }
 
 .committee-row__identity strong {
@@ -1726,6 +1842,21 @@ body {
 
     .committee-table {
         font-size: clamp(0.58rem, 1.8vw, 0.72rem);
+    }
+
+    .committee-add {
+        grid-template-columns: auto minmax(0, 1fr);
+        align-items: stretch;
+    }
+
+    .committee-add label,
+    .committee-add button,
+    .committee-add__error {
+        grid-column: 2;
+    }
+
+    .committee-add__prompt {
+        grid-row: 1;
     }
 
     .committee-row--head {
