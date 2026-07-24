@@ -1,6 +1,9 @@
 //! SQL row encoding shared by the combined publisher.
 
-use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
+use crate::sql_schema::{
+    ACCOUNT_META_TABLE, BLOCK_META_TABLE, COMMITTEE_META_TABLE, ELIGIBLE_PEER_TABLE,
+    TX_ACTIVITY_TABLE, TX_META_TABLE,
+};
 use bytes::Bytes;
 use commonware_consensus::types::Round;
 use exoware_sql::CellValue;
@@ -70,6 +73,21 @@ pub(crate) struct AccountMetaRow {
     pub qmdb_location: u64,
 }
 
+/// Immutable eligible-peer catalog entry supplied by validator configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EligiblePeer {
+    /// Raw 32-byte Ed25519 public key.
+    pub public_key: [u8; 32],
+    /// Configured network ingress address.
+    pub address: String,
+}
+
+/// Materialized committee membership for one epoch.
+pub(crate) struct CommitteeMetaRow {
+    pub epoch: u64,
+    pub members: Vec<u8>,
+}
+
 /// Encode the SQL rows for a finalized block.
 ///
 /// Returns one `block_meta` row.
@@ -131,6 +149,28 @@ pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
             CellValue::UInt64(account.nonce_base),
             CellValue::UInt64(account.nonce_bitmap),
             CellValue::UInt64(account.qmdb_location),
+        ],
+    }
+}
+
+/// Encode one materialized epoch committee row.
+pub(crate) fn encode_committee_meta_row(committee: CommitteeMetaRow) -> SqlRow {
+    SqlRow {
+        table: COMMITTEE_META_TABLE,
+        values: vec![
+            CellValue::UInt64(committee.epoch),
+            CellValue::Binary(committee.members),
+        ],
+    }
+}
+
+/// Encode one immutable eligible-peer catalog row.
+pub(crate) fn encode_eligible_peer_row(peer: &EligiblePeer) -> SqlRow {
+    SqlRow {
+        table: ELIGIBLE_PEER_TABLE,
+        values: vec![
+            CellValue::FixedBinary(peer.public_key.to_vec()),
+            CellValue::Utf8(peer.address.clone()),
         ],
     }
 }

@@ -3,7 +3,6 @@ import {
     blocksUntilCommitteeLock,
     committeeChanges,
     committeeLockDetail,
-    connectivityAdvisory,
     validateCommitteeSelection,
     type CommitteeChange,
     type CommitteeSnapshot,
@@ -96,7 +95,7 @@ export default function CommitteePage({
 
             <div className="committee-page__notice">
                 <span>permissionless demo: any signed account may submit an eligible E+2 change</span>
-                <span>connectivity is advisory only and never affects transaction validity</span>
+                <span>committee state and the eligible catalog are read from finalized index data</span>
             </div>
 
             <div className="committee-table" role="table" aria-label="eligible committee peers">
@@ -105,7 +104,6 @@ export default function CommitteePage({
                     <span role="columnheader">eligible peer</span>
                     <span role="columnheader">address</span>
                     <span role="columnheader">current / E+2</span>
-                    <span role="columnheader">network</span>
                 </div>
                 {snapshot.available.map((candidate) => {
                     const isSelected = selected.has(candidate.peer);
@@ -128,12 +126,6 @@ export default function CommitteePage({
                                 {current.has(candidate.peer) ? 'member' : 'standby'} /{' '}
                                 {isSelected ? 'selected' : 'not selected'}
                                 {scheduled.has(candidate.peer) !== isSelected && <em> changed</em>}
-                            </span>
-                            <span
-                                className={candidate.connected ? 'committee-row__connected' : 'committee-row__disconnected'}
-                                role="cell"
-                            >
-                                {connectivityAdvisory(candidate.connected)}
                             </span>
                         </label>
                     );

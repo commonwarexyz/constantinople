@@ -1008,9 +1008,9 @@ body {
 }
 
 .committee-row {
-    min-width: 102ch;
+    min-width: 80ch;
     display: grid;
-    grid-template-columns: 7ch minmax(24ch, 1.5fr) minmax(18ch, 1fr) minmax(22ch, 1fr) minmax(21ch, 1fr);
+    grid-template-columns: 7ch minmax(24ch, 1.5fr) minmax(18ch, 1fr) minmax(22ch, 1fr);
     gap: 1ch;
     align-items: center;
     padding: 0.7ch 1ch;
@@ -1051,14 +1051,6 @@ body {
 .committee-row em {
     color: var(--theme-accent);
     font-style: normal;
-}
-
-.committee-row__connected {
-    color: var(--theme-success);
-}
-
-.committee-row__disconnected {
-    color: var(--theme-text-dim);
 }
 
 .committee-actions {

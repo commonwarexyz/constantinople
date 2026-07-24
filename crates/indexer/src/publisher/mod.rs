@@ -6,7 +6,7 @@
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `simplex`        | certified headers, full blocks by digest, certificates       |
-//! | `sql` (metadata) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`       |
+//! | `sql` (metadata) | Block, transaction, account, committee, and peer catalog rows|
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //! | `qmdb` (committee)| Epoch-indexed committee-state operation log                   |
@@ -28,7 +28,7 @@ use commonware_runtime::{
 };
 use exoware_sdk::{StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
-pub use sql::SqlRow;
+pub use sql::{EligiblePeer, SqlRow};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use tracing::warn;

@@ -450,8 +450,4 @@ fn production_epoch_length_remains_128() {
         constantinople_application::consensus::BLOCKS_PER_EPOCH,
         constantinople_primitives::BLOCKS_PER_EPOCH
     );
-    assert_eq!(
-        constantinople_mempool::webserver::EPOCH_LENGTH,
-        constantinople_primitives::BLOCKS_PER_EPOCH
-    );
 }

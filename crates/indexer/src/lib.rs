@@ -9,4 +9,4 @@ mod simplex_block;
 pub mod sql_schema;
 
 pub use client::{IndexerClient, ReadError};
-pub use publisher::{CertificateReporter, Publisher};
+pub use publisher::{CertificateReporter, EligiblePeer, Publisher};

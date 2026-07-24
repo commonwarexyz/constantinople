@@ -18,7 +18,7 @@ that fits.
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
-| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, transfer account activity, or latest account proof locations without paying full-block decode cost. |
+| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`, `committee_meta`, `eligible_peer` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and consumers of finalized block, account, transaction, and committee views. |
 | **QMDB operation logs** | Account-state, transaction-hash, and epoch-indexed committee operations in distinct Store namespaces | `qmdb-indexer` read APIs. `/state`, `/transactions`, and `/committee` serve the matching operation ranges and proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 
@@ -36,6 +36,8 @@ The current SQL table-prefix allocation is:
 | `tx_meta` | `0x1` | none |
 | `tx_activity` | `0x2` | none |
 | `account_meta` | `0x3` | none |
+| `committee_meta` | `0x4` | none |
+| `eligible_peer` | `0x5` | none |
 
 `exoware-sql` expands those table prefixes into its Store key layout. There are
 currently no secondary SQL index rows, so finalized-block SQL writes only add
@@ -52,8 +54,8 @@ the full body only when requested.
 ## Crate contents
 
 - [`sql_schema::build_meta_schema`](src/sql_schema.rs) — the canonical
-  source of truth for the live `block_meta`, `tx_meta`, `tx_activity`, and
-  `account_meta` table layouts. The explorer's column-name strings live here
+  source of truth for the live block, transaction, account, committee, and
+  eligible-peer table layouts. The explorer's column-name strings live here
   too, so a schema change is a one-place edit.
 - A [`CertificateReporter`](src/publisher/certificate.rs) that taps
   simplex `Activity` events, uploads full blocks by digest, pairs certificates
@@ -86,9 +88,11 @@ the finalized ranges.
 The writer end cursors are derived from the block header and start cursors.
 
 The background uploader derives the rest from that durable entry: SQL rows,
-transaction-hash QMDB operations, account metadata rows, watermarks, and the
-final Store batch. This keeps SQL-row encoding off the durable queue write path
-while still making recovery independent from local database pruning.
+transaction-hash QMDB operations, account and committee metadata rows,
+watermarks, and the final Store batch. The immutable eligible-peer catalog is
+upserted with the first prepared upload after the publisher connects. This
+keeps SQL-row encoding off the durable queue write path while still making
+recovery independent from local database pruning.
 
 Remote Store commits retry indefinitely with a capped exponential backoff using
 the fully staged `StoreWriteBatch`, so a transient store outage stalls queued

@@ -2,7 +2,10 @@
 
 use super::{
     block::{IndexedBlockRows, encode_indexed_block_rows_at},
-    sql::{AccountMetaRow, encode_account_meta_row},
+    sql::{
+        AccountMetaRow, CommitteeMetaRow, EligiblePeer, encode_account_meta_row,
+        encode_committee_meta_row, encode_eligible_peer_row,
+    },
 };
 use crate::{
     namespaces::{
@@ -16,6 +19,7 @@ use commonware_codec::{
 use commonware_cryptography::{
     Hasher, Signer,
     bls12381::primitives::{sharing::ModeVersion, variant::Variant},
+    ed25519,
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
@@ -291,6 +295,10 @@ pub enum PublishError {
     Sql(#[from] datafusion::error::DataFusionError),
     #[error("failed to encode SQL metadata row: {0}")]
     SqlRow(String),
+    #[error("committee epoch {epoch} was deleted from append-only committee state")]
+    CommitteeDelete { epoch: u64 },
+    #[error("malformed encoded committee at epoch {epoch}")]
+    CommitteeEncoding { epoch: u64 },
     #[error("cannot initialize QMDB writer from {locations} operation locations")]
     CheckpointTooLarge { locations: u64 },
     #[error("QMDB Store is empty but finalized block height {height} needs historical backfill")]
@@ -329,6 +337,8 @@ where
     state_delta: Arc<Vec<StateOperation>>,
     committee_delta: Arc<Vec<CommitteeOperation>>,
     account_rows: Vec<super::SqlRow>,
+    committee_rows: Vec<super::SqlRow>,
+    eligible_peer_rows: Vec<super::SqlRow>,
     transaction_ops: Vec<TransactionOperation<H>>,
     completion: oneshot::Sender<()>,
 }
@@ -443,6 +453,7 @@ where
         store_url: &str,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
+        eligible_peers: Arc<[EligiblePeer]>,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
@@ -489,6 +500,7 @@ where
             state_writer.clone(),
             transaction_writer.clone(),
             committee_writer,
+            eligible_peers,
             prepare_rx,
             commit_tx,
         ));
@@ -719,6 +731,7 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     committee_writer: Arc<CommitteeWriter<H>>,
+    eligible_peers: Arc<[EligiblePeer]>,
     mut rx: mpsc::Receiver<PendingQueuedFinalizedUpload<H, C, V>>,
     commit_tx: mpsc::Sender<PreparedQmdbUpload>,
 ) where
@@ -728,6 +741,7 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
     C: Signer + Send + Sync + 'static,
     V: Variant,
 {
+    let mut publish_eligible_peers = true;
     while let Some(upload) = rx.recv().await {
         let height = upload.height;
         let prepared = prepare_qmdb_upload(
@@ -737,6 +751,7 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
             state_writer.clone(),
             transaction_writer.clone(),
             committee_writer.clone(),
+            publish_eligible_peers.then_some(eligible_peers.as_ref()),
             upload,
         )
         .await
@@ -748,6 +763,7 @@ async fn run_qmdb_preparer<Cx, H, C, V>(
                 height: upload.0.height,
             })
             .expect("QMDB committer stopped");
+        publish_eligible_peers = false;
     }
     debug!("indexer QMDB preparer task exiting: channel closed");
 }
@@ -757,6 +773,7 @@ async fn prepare_qmdb_upload<Cx, H, C, V>(
     state_writer: Arc<StateWriter<H>>,
     transaction_writer: Arc<TransactionWriter<H>>,
     committee_writer: Arc<CommitteeWriter<H>>,
+    eligible_peers: Option<&[EligiblePeer]>,
     upload: PendingQueuedFinalizedUpload<H, C, V>,
 ) -> Result<PreparedQmdbUpload, PublishError>
 where
@@ -766,7 +783,7 @@ where
     C: Signer,
     V: Variant,
 {
-    let prepared = expand_queued_finalized_upload(upload)?;
+    let prepared = expand_queued_finalized_upload(upload, eligible_peers)?;
     prepare_prepared_qmdb_upload(
         context,
         state_writer,
@@ -779,6 +796,7 @@ where
 
 fn expand_queued_finalized_upload<H, C, V>(
     upload: PendingQueuedFinalizedUpload<H, C, V>,
+    eligible_peers: Option<&[EligiblePeer]>,
 ) -> Result<PendingPreparedQmdbUpload<H>, PublishError>
 where
     H: Hasher,
@@ -811,12 +829,20 @@ where
     )?
     .ops;
     let account_rows = account_rows(&state_delta, state_start);
+    let committee_rows = committee_rows(&committee_delta)?;
+    let eligible_peer_rows = eligible_peers
+        .into_iter()
+        .flatten()
+        .map(encode_eligible_peer_row)
+        .collect();
     Ok(PendingPreparedQmdbUpload {
         height,
         block_rows,
         state_delta,
         committee_delta,
         account_rows,
+        committee_rows,
+        eligible_peer_rows,
         transaction_ops,
         completion,
     })
@@ -840,6 +866,8 @@ where
         state_delta,
         committee_delta,
         account_rows,
+        committee_rows,
+        eligible_peer_rows,
         transaction_ops,
         completion,
     } = upload;
@@ -849,6 +877,8 @@ where
     } = block_rows;
     let mut sql = sql;
     sql.extend(account_rows);
+    sql.extend(committee_rows);
+    sql.extend(eligible_peer_rows);
 
     let state_prepare = context
         .child("state")
@@ -1652,6 +1682,37 @@ fn account_rows(delta: &[StateOperation], start_location: u64) -> Vec<super::Sql
     rows
 }
 
+fn committee_rows(delta: &[CommitteeOperation]) -> Result<Vec<super::SqlRow>, PublishError> {
+    let mut rows = Vec::new();
+    for operation in delta {
+        match operation {
+            AnyOperation::Update(UnorderedUpdate(epoch, committee)) => {
+                let epoch = u64::from(epoch);
+                let encoded = committee.as_ref();
+                let count = usize::from(encoded[0]);
+                let members_end = 1usize
+                    .checked_add(count.saturating_mul(ed25519::PublicKey::SIZE))
+                    .filter(|end| count > 0 && *end <= encoded.len())
+                    .ok_or(PublishError::CommitteeEncoding { epoch })?;
+                if encoded[members_end..].iter().any(|byte| *byte != 0) {
+                    return Err(PublishError::CommitteeEncoding { epoch });
+                }
+                rows.push(encode_committee_meta_row(CommitteeMetaRow {
+                    epoch,
+                    members: encoded[1..members_end].to_vec(),
+                }));
+            }
+            AnyOperation::Delete(epoch) => {
+                return Err(PublishError::CommitteeDelete {
+                    epoch: u64::from(epoch),
+                });
+            }
+            AnyOperation::CommitFloor(_, _) => {}
+        }
+    }
+    Ok(rows)
+}
+
 fn account_key_array(key: &AccountKey) -> [u8; AccountKey::SIZE] {
     key.as_ref()
         .try_into()
@@ -1887,7 +1948,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
+    use crate::sql_schema::{
+        BLOCK_META_TABLE, COMMITTEE_META_TABLE, ELIGIBLE_PEER_TABLE, TX_META_TABLE,
+    };
     use commonware_consensus::{
         marshal::coding::types::coding_config_for_participants,
         simplex::types::Context as SimplexContext,
@@ -2363,6 +2426,7 @@ mod tests {
                 &url,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
+                Arc::default(),
             )
             .await
             .expect("publisher connects");
@@ -2397,6 +2461,54 @@ mod tests {
     }
 
     #[test]
+    fn queued_upload_materializes_committee_and_eligible_peer_rows() {
+        let (completion, _rx) = oneshot::channel();
+        let catalog = [EligiblePeer {
+            public_key: [9u8; 32],
+            address: "validator-9:9000".to_string(),
+        }];
+        let prepared = expand_queued_finalized_upload(
+            PendingQueuedFinalizedUpload {
+                height: 1,
+                upload: test_queued_upload(),
+                completion,
+            },
+            Some(&catalog),
+        )
+        .expect("queued upload expands");
+
+        assert_eq!(prepared.committee_rows.len(), 1);
+        assert_eq!(prepared.committee_rows[0].table, COMMITTEE_META_TABLE);
+        assert!(matches!(
+            &prepared.committee_rows[0].values[0],
+            CellValue::UInt64(1)
+        ));
+        let expected_member = ed25519::PrivateKey::from_seed(1).public_key().encode();
+        assert!(matches!(
+            &prepared.committee_rows[0].values[1],
+            CellValue::Binary(members) if members.as_slice() == expected_member.as_ref()
+        ));
+        assert_eq!(prepared.eligible_peer_rows.len(), 1);
+        assert_eq!(prepared.eligible_peer_rows[0].table, ELIGIBLE_PEER_TABLE);
+        assert!(matches!(
+            &prepared.eligible_peer_rows[0].values[0],
+            CellValue::FixedBinary(peer) if peer == &[9u8; 32]
+        ));
+        assert!(matches!(
+            &prepared.eligible_peer_rows[0].values[1],
+            CellValue::Utf8(address) if address == "validator-9:9000"
+        ));
+    }
+
+    #[test]
+    fn committee_rows_reject_deletions() {
+        let Err(error) = committee_rows(&[CommitteeOperation::Delete(U64::new(7))]) else {
+            panic!("committee snapshots are append-only");
+        };
+        assert!(matches!(error, PublishError::CommitteeDelete { epoch: 7 }));
+    }
+
+    #[test]
     fn queued_upload_roots_match_application_roots() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (handle, url) = exoware_simulator::open_temp()
@@ -2408,6 +2520,7 @@ mod tests {
                 &url,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
+                Arc::default(),
             )
             .await
             .expect("publisher connects");
@@ -2486,6 +2599,7 @@ mod tests {
                 &url,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
+                Arc::default(),
             )
             .await
             .expect("publisher recovers");
@@ -2517,6 +2631,7 @@ mod tests {
                 &url,
                 1,
                 crate::publisher::StoreCommitMetrics::new(&context),
+                Arc::default(),
             )
             .await
             .expect("publisher connects");

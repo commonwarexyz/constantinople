@@ -4,7 +4,7 @@ use crate::{
     config::{
         IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
     },
-    state_reader::{ConnectedPeersReader, FinalizedHeight, StateDbReader},
+    state_reader::StateDbReader,
 };
 use commonware_actor::Feedback;
 use commonware_codec::{Encode, RangeCfg};
@@ -30,8 +30,8 @@ use commonware_glue::{
 };
 use commonware_macros::boxed;
 use commonware_p2p::{
-    Address, AddressableManager, AddressableTrackedPeers, CheckedSender as _, LimitedSender as _,
-    PeerSetSubscription, Provider, Recipients, TrackedPeers, authenticated::lookup,
+    Address, AddressableManager, AddressableTrackedPeers, Ingress, PeerSetSubscription, Provider,
+    TrackedPeers, authenticated::lookup,
 };
 use commonware_parallel::Rayon;
 use commonware_runtime::{
@@ -64,13 +64,13 @@ use constantinople_engine::{
     types::{EngineBlock, EngineMarshalMailbox},
 };
 use constantinople_indexer::{
-    CertificateReporter, Publisher,
+    CertificateReporter, EligiblePeer as IndexedEligiblePeer, Publisher,
     publisher::{
         StoreCommitMetrics,
         qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
     },
 };
-use constantinople_mempool::webserver::{self, AccountReader, CommitteeReader, Mailbox};
+use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::{
     Block as ChainBlock, Header as ChainHeader, PublicKeyCache, Sealable as _, SealedBlock,
 };
@@ -80,7 +80,7 @@ use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 use tokio::{
@@ -386,11 +386,17 @@ struct LazyPublisher {
     store_url: String,
     buffer: usize,
     commit_metrics: StoreCommitMetrics,
+    eligible_peers: Arc<[IndexedEligiblePeer]>,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
-    fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
+    fn new(
+        context: RuntimeContext,
+        store_url: String,
+        buffer: usize,
+        eligible_peers: Arc<[IndexedEligiblePeer]>,
+    ) -> Self {
         // Registered once here: `connect` is retried on failure and must not
         // re-register.
         let commit_metrics = StoreCommitMetrics::new(&context);
@@ -399,6 +405,7 @@ impl LazyPublisher {
             store_url,
             buffer,
             commit_metrics,
+            eligible_peers,
             publisher: Mutex::new(None),
         }
     }
@@ -414,6 +421,7 @@ impl LazyPublisher {
                 &self.store_url,
                 self.buffer,
                 self.commit_metrics.clone(),
+                self.eligible_peers.clone(),
             )
             .await
             {
@@ -789,6 +797,7 @@ async fn maybe_build_indexer(
     is_genesis_primary: bool,
     indexer: Option<IndexerConfig>,
     partition_prefix: &str,
+    eligible_peers: &Map<ed25519::PublicKey, Address>,
 ) -> Option<IndexerHandle> {
     let cfg = indexer?;
     if is_genesis_primary {
@@ -808,6 +817,7 @@ async fn maybe_build_indexer(
         context.child("publisher"),
         cfg.chain_indexer_url,
         cfg.upload_buffer,
+        indexed_eligible_peers(eligible_peers),
     ));
     let page_cache = CacheRef::from_pooler(
         &context,
@@ -871,6 +881,28 @@ async fn maybe_build_indexer(
     })
 }
 
+fn indexed_eligible_peers(
+    eligible_peers: &Map<ed25519::PublicKey, Address>,
+) -> Arc<[IndexedEligiblePeer]> {
+    eligible_peers
+        .iter_pairs()
+        .map(|(public_key, address)| {
+            let encoded = public_key.encode();
+            IndexedEligiblePeer {
+                public_key: encoded
+                    .as_ref()
+                    .try_into()
+                    .expect("Ed25519 public key has fixed width"),
+                address: match address.ingress() {
+                    Ingress::Socket(address) => address.to_string(),
+                    Ingress::Dns { host, port } => format!("{host}:{port}"),
+                },
+            }
+        })
+        .collect::<Vec<_>>()
+        .into()
+}
+
 fn indexer_finalized_hook(indexer: Option<&IndexerHandle>) -> Option<EngineFinalizedHook> {
     let indexer = indexer?;
     let publisher = indexer.publisher.clone();
@@ -882,21 +914,6 @@ fn indexer_finalized_hook(indexer: Option<&IndexerHandle>) -> Option<EngineFinal
             databases,
         ))
     }))
-}
-
-fn track_finalized_height(
-    finalized_height: FinalizedHeight,
-    inner: Option<EngineFinalizedHook>,
-) -> EngineFinalizedHook {
-    Arc::new(move |block, databases| {
-        finalized_height.observe(block.height().get());
-        let inner = inner.clone();
-        Box::pin(async move {
-            if let Some(inner) = inner {
-                inner(block, databases).await;
-            }
-        })
-    })
 }
 
 pub fn run_local(peers_path: PathBuf, config_path: PathBuf) {
@@ -1038,22 +1055,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             dkg: network.register(DKG_CHANNEL, quota, backlog),
         };
         let dkg_probe_network = network.register(DKG_PROBE_CHANNEL, quota, backlog);
-        let connected_state = Arc::new(StdMutex::new((dkg_probe_network.0.clone(), Vec::new())));
-        let local_public_key = decoded.public_key.clone();
-        let connected_peers: ConnectedPeersReader = Arc::new(move || {
-            let mut state = connected_state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let (sender, last_connected) = &mut *state;
-            if let Ok(checked) = sender.check(Recipients::All) {
-                *last_connected = checked.recipients();
-            }
-            let mut connected = last_connected.clone();
-            if !connected.contains(&local_public_key) {
-                connected.push(local_public_key.clone());
-            }
-            connected
-        });
         let network_handle = network.start();
 
         let relayer_view = relayer
@@ -1066,7 +1067,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
         let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
-        let committee_reader: Arc<OnceLock<Arc<dyn CommitteeReader>>> = Arc::new(OnceLock::new());
         let mempool_actor = webserver::Actor::new(
             context.child("mempool"),
             webserver::Config {
@@ -1080,7 +1080,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             mempool_mailbox.clone(),
             mempool_receiver,
             account_reader.clone(),
-            committee_reader.clone(),
         );
         let is_genesis_primary = decoded.share.is_some();
         let mempool_listener = if relayer.is_some() {
@@ -1154,13 +1153,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             is_genesis_primary,
             indexer,
             &indexer_partition_prefix,
+            &decoded.eligible_peers,
         )
         .await;
-        let finalized_height = FinalizedHeight::default();
-        let finalized_hook = track_finalized_height(
-            finalized_height.clone(),
-            indexer_finalized_hook(indexer_handle.as_ref()),
-        );
+        let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
         let engine_manager =
             PersistentSecondaries::new(oracle.clone(), decoded.eligible_peers.clone());
 
@@ -1203,7 +1199,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                     state_page_cache_bytes,
                     other_page_cache_bytes,
-                    finalized_hook: Some(finalized_hook),
+                    finalized_hook,
                 },
                 dkg_probe_network,
             )
@@ -1214,28 +1210,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // listener can come up immediately; account lookups return 503 until
         // the cell is populated.
         let subscribe_fut = engine.subscribe_databases_detached();
-        let subscribe_committee_fut = engine.subscribe_committee_detached();
         let account_reader_setter = account_reader.clone();
-        let committee_reader_setter = committee_reader.clone();
-        let committee_eligible = decoded.eligible_peers.clone();
-        let genesis_current = primary.clone();
-        let genesis_scheduled = primary;
         let _account_reader_setup = tokio::spawn(async move {
-            let (db, committee) = tokio::join!(subscribe_fut, subscribe_committee_fut);
-            let reader = Arc::new(StateDbReader::new(
-                db,
-                committee,
-                finalized_height,
-                committee_eligible,
-                genesis_current,
-                genesis_scheduled,
-                connected_peers,
-            ));
-            let account: Arc<dyn AccountReader> = reader.clone();
-            let committee: Arc<dyn CommitteeReader> = reader;
-            let _ = account_reader_setter.set(account);
-            let _ = committee_reader_setter.set(committee);
-            info!("state readers attached");
+            let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(subscribe_fut.await));
+            let _ = account_reader_setter.set(reader);
+            info!("account state reader attached");
         });
 
         info!("starting engine");
@@ -1461,7 +1440,7 @@ mod tests {
 
             let handle = tokio::time::timeout(
                 Duration::from_secs(2),
-                maybe_build_indexer(context, false, Some(indexer), "test"),
+                maybe_build_indexer(context, false, Some(indexer), "test", &Map::default()),
             )
             .await
             .expect("publisher connection should not block startup")

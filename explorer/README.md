@@ -33,11 +33,11 @@ shows a checkmark after browser-side QMDB and Simplex verification succeeds.
 
 ### Committee controls
 
-The manually routed `/committee` page reads `GET /committee` from
-`VITE_MEMPOOL_URL`. Height and epoch fields are required to be canonical
-decimal strings so the client can retain exact `u64` values. The page starts
-from the scheduled E+2 set, renders every peer in the immutable eligible
-catalog, and treats runtime connectivity as advisory display data only.
+The manually routed `/committee` page reads finalized `block_meta`,
+`committee_meta`, and `eligible_peer` rows from `VITE_SQL_URL`. It starts from
+the scheduled E+2 set and renders every peer in the immutable eligible catalog.
+Committee mutations remain ordinary signed transactions submitted through
+`VITE_MEMPOOL_URL`; validators expose no separate committee read API.
 
 Transfers and committee updates use the finalized tagged Rust wire contract,
 mirrored by the shared encoder in [`src/codec.ts`](src/codec.ts):

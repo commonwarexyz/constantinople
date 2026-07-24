@@ -371,7 +371,7 @@ export default function App() {
             loading = true;
             setCommitteeLoading(true);
             try {
-                const snapshot = await fetchCommittee(mempoolUrl, controller.signal);
+                const snapshot = await fetchCommittee(indexerUrl, controller.signal);
                 if (controller.signal.aborted) return;
                 setCommittee(snapshot);
                 setCommitteeError('');
@@ -679,7 +679,7 @@ export default function App() {
     const refreshCommittee = async () => {
         setCommitteeLoading(true);
         try {
-            const snapshot = await fetchCommittee(mempoolUrl);
+            const snapshot = await fetchCommittee(indexerUrl);
             setCommittee(snapshot);
             setCommitteeError('');
         } catch (error) {

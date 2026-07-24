@@ -3,15 +3,32 @@ import {
     nextAvailableNonce,
     type NonceState,
 } from './nonce.ts';
+import { toHex } from './codec.ts';
+import {
+    SqlClient,
+    type CellValue,
+    type DecodedQueryResult,
+    type DecodedRow,
+} from '@exowarexyz/sql';
 
 const MAX_U64 = (1n << 64n) - 1n;
 const MAX_COMMITTEE_SIZE = 64;
+const BLOCKS_PER_EPOCH = 128n;
+const ED25519_PUBLIC_KEY_BYTES = 32;
+
+const BLOCK_META_TABLE = 'block_meta';
+const BLOCK_META_HEIGHT = 'height';
+const BLOCK_META_EPOCH = 'epoch';
+const COMMITTEE_META_TABLE = 'committee_meta';
+const COMMITTEE_META_EPOCH = 'epoch';
+const COMMITTEE_META_MEMBERS = 'members';
+const ELIGIBLE_PEER_TABLE = 'eligible_peer';
+const ELIGIBLE_PEER_PEER = 'peer';
+const ELIGIBLE_PEER_ADDRESS = 'address';
 
 export interface EligibleCommitteePeer {
     readonly peer: string;
     readonly address: string;
-    /** Runtime observation only; it is never an eligibility or validity check. */
-    readonly connected: boolean;
 }
 
 export interface CommitteeSnapshot {
@@ -23,7 +40,7 @@ export interface CommitteeSnapshot {
     readonly lockHeight: bigint;
     readonly current: readonly string[];
     readonly scheduled: readonly string[];
-    /** The complete immutable eligible catalog, including disconnected peers. */
+    /** The complete immutable eligible catalog. */
     readonly available: readonly EligibleCommitteePeer[];
 }
 
@@ -42,38 +59,48 @@ export interface CommitteeTransactionPlan {
     readonly nextNonceState: NonceState;
 }
 
-/**
- * Fetch and validate the mempool's `GET /committee` response.
- *
- * Consensus-sized integers must cross JSON as decimal strings. Converting
- * them to bigint here keeps rendering and E+2/lock arithmetic exact.
- */
+/** Read the finalized committee view and immutable peer catalog from SQL. */
 export async function fetchCommittee(
-    baseUrl: string,
+    sqlUrl: string,
     signal?: AbortSignal,
+    client: Pick<SqlClient, 'query'> = new SqlClient(trimTrailingSlash(sqlUrl)),
 ): Promise<CommitteeSnapshot> {
-    const response = await fetch(`${trimTrailingSlash(baseUrl)}/committee`, { signal });
-    if (!response.ok) {
-        const detail = await response.text();
-        const suffix = detail ? `: ${detail}` : '';
-        throw new Error(`committee lookup failed with HTTP ${response.status}${suffix}`);
+    const tipResult = await sqlQuery(
+        client,
+        `
+            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_EPOCH}
+            FROM ${BLOCK_META_TABLE}
+            ORDER BY ${BLOCK_META_HEIGHT} DESC
+            LIMIT 1
+        `,
+        signal,
+    );
+    const tip = tipResult.rows[0];
+    if (!tip) {
+        throw new Error('committee state is unavailable before the first indexed block');
     }
-    return parseCommitteeResponse(await response.json());
-}
+    const height = expectBigint(tip.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT);
+    const epoch = expectBigint(tip.values[BLOCK_META_EPOCH], BLOCK_META_EPOCH);
+    const targetEpoch = checkedAdd(epoch, 2n, 'committee target epoch');
 
-export function parseCommitteeResponse(value: unknown): CommitteeSnapshot {
-    const response = record(value, 'committee response');
-    const height = decimalU64(response.height, 'height');
-    const epoch = decimalU64(response.epoch, 'epoch');
-    const targetEpoch = decimalU64(response.targetEpoch, 'targetEpoch');
-    const lockHeight = decimalU64(response.lockHeight, 'lockHeight');
-    const updatesOpen = boolean(response.updatesOpen, 'updatesOpen');
-    const current = uniqueStringArray(response.current, 'current');
-    const scheduled = uniqueStringArray(response.scheduled, 'scheduled');
-    const available = eligiblePeers(response.available);
-
-    if (targetEpoch !== epoch + 2n) {
-        throw new Error('targetEpoch must equal epoch + 2');
+    const [currentResult, scheduledResult, availableResult] = await Promise.all([
+        fetchCommitteeAt(client, epoch, signal),
+        fetchCommitteeAt(client, targetEpoch, signal),
+        sqlQuery(
+            client,
+            `
+                SELECT ${ELIGIBLE_PEER_PEER}, ${ELIGIBLE_PEER_ADDRESS}
+                FROM ${ELIGIBLE_PEER_TABLE}
+                ORDER BY ${ELIGIBLE_PEER_PEER} ASC
+            `,
+            signal,
+        ),
+    ]);
+    const current = decodeCommittee(currentResult, epoch);
+    const scheduled = decodeCommittee(scheduledResult, targetEpoch);
+    const available = availableResult.rows.map(decodeEligiblePeer);
+    if (new Set(available.map(({ peer }) => peer)).size !== available.length) {
+        throw new Error('eligible peer index contains duplicate peers');
     }
     assertCommitteeSize(current.length, 'current committee');
     assertCommitteeSize(scheduled.length, 'scheduled committee');
@@ -85,15 +112,79 @@ export function parseCommitteeResponse(value: unknown): CommitteeSnapshot {
         }
     }
 
+    const epochEnd = checkedMultiply(
+        checkedAdd(epoch, 1n, 'next epoch'),
+        BLOCKS_PER_EPOCH,
+        'epoch end',
+    );
+    const lockHeight = epochEnd - 1n;
+    const lastAdmissibleHeight = lockHeight > 0n ? lockHeight - 1n : 0n;
+
     return {
         height,
         epoch,
         targetEpoch,
-        updatesOpen,
+        updatesOpen: height < lastAdmissibleHeight,
         lockHeight,
         current,
         scheduled,
         available,
+    };
+}
+
+async function fetchCommitteeAt(
+    client: Pick<SqlClient, 'query'>,
+    requestedEpoch: bigint,
+    signal?: AbortSignal,
+): Promise<DecodedQueryResult> {
+    return sqlQuery(
+        client,
+        `
+            SELECT ${COMMITTEE_META_EPOCH}, ${COMMITTEE_META_MEMBERS}
+            FROM ${COMMITTEE_META_TABLE}
+            WHERE ${COMMITTEE_META_EPOCH} <= ${requestedEpoch.toString()}
+            ORDER BY ${COMMITTEE_META_EPOCH} DESC
+            LIMIT 1
+        `,
+        signal,
+    );
+}
+
+function decodeCommittee(result: DecodedQueryResult, requestedEpoch: bigint): string[] {
+    const row = result.rows[0];
+    if (!row) {
+        throw new Error(`committee for epoch ${requestedEpoch.toString()} is not indexed`);
+    }
+    const indexedEpoch = expectBigint(row.values[COMMITTEE_META_EPOCH], COMMITTEE_META_EPOCH);
+    if (indexedEpoch > requestedEpoch) {
+        throw new Error('committee index returned a snapshot after the requested epoch');
+    }
+    const members = expectBytes(row.values[COMMITTEE_META_MEMBERS], COMMITTEE_META_MEMBERS);
+    if (
+        members.length === 0 ||
+        members.length % ED25519_PUBLIC_KEY_BYTES !== 0 ||
+        members.length / ED25519_PUBLIC_KEY_BYTES > MAX_COMMITTEE_SIZE
+    ) {
+        throw new Error('SQL committee members must contain 1..=64 Ed25519 public keys');
+    }
+    const decoded: string[] = [];
+    for (let offset = 0; offset < members.length; offset += ED25519_PUBLIC_KEY_BYTES) {
+        decoded.push(toHex(members.slice(offset, offset + ED25519_PUBLIC_KEY_BYTES)));
+    }
+    if (new Set(decoded).size !== decoded.length) {
+        throw new Error('SQL committee members contain duplicate peers');
+    }
+    return decoded;
+}
+
+function decodeEligiblePeer(row: DecodedRow): EligibleCommitteePeer {
+    const peer = expectBytes(row.values[ELIGIBLE_PEER_PEER], ELIGIBLE_PEER_PEER);
+    if (peer.length !== ED25519_PUBLIC_KEY_BYTES) {
+        throw new Error('SQL eligible peer must be a 32-byte Ed25519 public key');
+    }
+    return {
+        peer: toHex(peer),
+        address: expectString(row.values[ELIGIBLE_PEER_ADDRESS], ELIGIBLE_PEER_ADDRESS),
     };
 }
 
@@ -217,77 +308,55 @@ export function committeeLockDetail(snapshot: CommitteeSnapshot): string {
     ).toString()}`;
 }
 
-export function connectivityAdvisory(connected: boolean): string {
-    return connected ? 'connected · advisory' : 'not connected · advisory';
-}
-
-function eligiblePeers(value: unknown): EligibleCommitteePeer[] {
-    if (!Array.isArray(value)) {
-        throw new Error('available must be an array');
-    }
-
-    const peers = value.map((entry, index) => {
-        const candidate = record(entry, `available[${index}]`);
-        return {
-            peer: string(candidate.peer, `available[${index}].peer`),
-            address: string(candidate.address, `available[${index}].address`),
-            connected: boolean(candidate.connected, `available[${index}].connected`),
-        };
-    });
-    const unique = new Set(peers.map(({ peer }) => peer));
-    if (unique.size !== peers.length) {
-        throw new Error('available contains duplicate peers');
-    }
-    return peers;
-}
-
-function uniqueStringArray(value: unknown, field: string): string[] {
-    if (!Array.isArray(value)) {
-        throw new Error(`${field} must be an array`);
-    }
-    const values = value.map((entry, index) => string(entry, `${field}[${index}]`));
-    if (new Set(values).size !== values.length) {
-        throw new Error(`${field} contains duplicate peers`);
-    }
-    return values;
-}
-
-function decimalU64(value: unknown, field: string): bigint {
-    if (typeof value !== 'string' || !/^(0|[1-9]\d*)$/.test(value)) {
-        throw new Error(`${field} must be a canonical decimal string`);
-    }
-    const parsed = BigInt(value);
-    if (parsed > MAX_U64) {
-        throw new Error(`${field} must fit in u64`);
-    }
-    return parsed;
-}
-
 function assertCommitteeSize(size: number, field: string) {
     if (!Number.isSafeInteger(size) || size < 1 || size > MAX_COMMITTEE_SIZE) {
         throw new Error(`${field} must contain 1..=${MAX_COMMITTEE_SIZE} peers`);
     }
 }
 
-function record(value: unknown, field: string): Record<string, unknown> {
-    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
-        throw new Error(`${field} must be an object`);
-    }
-    return value as Record<string, unknown>;
+async function sqlQuery(
+    client: Pick<SqlClient, 'query'>,
+    query: string,
+    signal?: AbortSignal,
+): Promise<DecodedQueryResult> {
+    return client.query(query.replace(/\s+/g, ' ').trim(), { signal });
 }
 
-function string(value: unknown, field: string): string {
+function expectBigint(value: CellValue, column: string): bigint {
+    if (typeof value !== 'bigint' || value < 0n || value > MAX_U64) {
+        throw new Error(`SQL column ${column} must be UInt64`);
+    }
+    return value;
+}
+
+function expectBytes(value: CellValue, column: string): Uint8Array {
+    if (!(value instanceof Uint8Array)) {
+        throw new Error(`SQL column ${column} must be binary`);
+    }
+    return value;
+}
+
+function expectString(value: CellValue, column: string): string {
     if (typeof value !== 'string' || value.length === 0) {
-        throw new Error(`${field} must be a non-empty string`);
+        throw new Error(`SQL column ${column} must be non-empty Utf8`);
     }
     return value;
 }
 
-function boolean(value: unknown, field: string): boolean {
-    if (typeof value !== 'boolean') {
-        throw new Error(`${field} must be a boolean`);
+function checkedAdd(left: bigint, right: bigint, field: string): bigint {
+    const result = left + right;
+    if (result < 0n || result > MAX_U64) {
+        throw new Error(`${field} must fit in u64`);
     }
-    return value;
+    return result;
+}
+
+function checkedMultiply(left: bigint, right: bigint, field: string): bigint {
+    const result = left * right;
+    if (result < 0n || result > MAX_U64) {
+        throw new Error(`${field} must fit in u64`);
+    }
+    return result;
 }
 
 function trimTrailingSlash(value: string): string {

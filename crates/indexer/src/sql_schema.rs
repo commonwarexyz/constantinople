@@ -15,7 +15,9 @@
 //!   body data. `tx_activity` stores one account-ordered row for each sender
 //!   and receiver side of a transfer action; non-transfer actions have no
 //!   account activity rows. `account_meta` stores the latest indexed account
-//!   state plus its QMDB operation location.
+//!   state plus its QMDB operation location. `committee_meta` materializes the
+//!   epoch-indexed committee snapshots, while `eligible_peer` stores the
+//!   immutable validator catalog exposed to committee-management clients.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the
@@ -34,6 +36,10 @@ pub const TX_META_TABLE: &str = "tx_meta";
 pub const TX_ACTIVITY_TABLE: &str = "tx_activity";
 /// Name of the SQL table that records the latest indexed account state.
 pub const ACCOUNT_META_TABLE: &str = "account_meta";
+/// Name of the SQL table that records materialized committees by epoch.
+pub const COMMITTEE_META_TABLE: &str = "committee_meta";
+/// Name of the SQL table that records the immutable eligible-peer catalog.
+pub const ELIGIBLE_PEER_TABLE: &str = "eligible_peer";
 
 // ---------- block_meta columns ----------
 
@@ -94,6 +100,20 @@ pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
 /// `account_meta`: account-state QMDB operation location.
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
+
+// ---------- committee_meta columns ----------
+
+/// `committee_meta`: epoch whose effective committee is stored (primary key).
+pub const COMMITTEE_META_EPOCH: &str = "epoch";
+/// `committee_meta`: canonical concatenation of 32-byte Ed25519 public keys.
+pub const COMMITTEE_META_MEMBERS: &str = "members";
+
+// ---------- eligible_peer columns ----------
+
+/// `eligible_peer`: 32-byte Ed25519 public key (primary key).
+pub const ELIGIBLE_PEER_PEER: &str = "peer";
+/// `eligible_peer`: configured network ingress address.
+pub const ELIGIBLE_PEER_ADDRESS: &str = "address";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
@@ -196,6 +216,32 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 vec![],
             )
         })
+        .and_then(|schema| {
+            schema.table(
+                COMMITTEE_META_TABLE,
+                vec![
+                    TableColumnConfig::new(COMMITTEE_META_EPOCH, DataType::UInt64, false),
+                    TableColumnConfig::new(COMMITTEE_META_MEMBERS, DataType::Binary, false),
+                ],
+                vec![COMMITTEE_META_EPOCH.to_string()],
+                vec![],
+            )
+        })
+        .and_then(|schema| {
+            schema.table(
+                ELIGIBLE_PEER_TABLE,
+                vec![
+                    TableColumnConfig::new(
+                        ELIGIBLE_PEER_PEER,
+                        DataType::FixedSizeBinary(32),
+                        false,
+                    ),
+                    TableColumnConfig::new(ELIGIBLE_PEER_ADDRESS, DataType::Utf8, false),
+                ],
+                vec![ELIGIBLE_PEER_PEER.to_string()],
+                vec![],
+            )
+        })
 }
 
 #[cfg(test)]
@@ -238,6 +284,14 @@ mod tests {
             tables.iter().any(|t| t == ACCOUNT_META_TABLE),
             "account_meta missing: {tables:?}"
         );
+        assert!(
+            tables.iter().any(|t| t == COMMITTEE_META_TABLE),
+            "committee_meta missing: {tables:?}"
+        );
+        assert!(
+            tables.iter().any(|t| t == ELIGIBLE_PEER_TABLE),
+            "eligible_peer missing: {tables:?}"
+        );
     }
 
     /// The string constants must remain stable so the explorer can rely on
@@ -248,6 +302,8 @@ mod tests {
         assert_eq!(TX_META_TABLE, "tx_meta");
         assert_eq!(TX_ACTIVITY_TABLE, "tx_activity");
         assert_eq!(ACCOUNT_META_TABLE, "account_meta");
+        assert_eq!(COMMITTEE_META_TABLE, "committee_meta");
+        assert_eq!(ELIGIBLE_PEER_TABLE, "eligible_peer");
         assert_eq!(BLOCK_META_HEIGHT, "height");
         assert_eq!(BLOCK_META_DIGEST, "digest");
         assert_eq!(BLOCK_META_TX_COUNT, "tx_count");
@@ -272,5 +328,9 @@ mod tests {
         assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");
         assert_eq!(ACCOUNT_META_NONCE_BITMAP, "nonce_bitmap");
         assert_eq!(ACCOUNT_META_QMDB_LOCATION, "qmdb_location");
+        assert_eq!(COMMITTEE_META_EPOCH, "epoch");
+        assert_eq!(COMMITTEE_META_MEMBERS, "members");
+        assert_eq!(ELIGIBLE_PEER_PEER, "peer");
+        assert_eq!(ELIGIBLE_PEER_ADDRESS, "address");
     }
 }

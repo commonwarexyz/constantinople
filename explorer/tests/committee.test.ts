@@ -5,44 +5,63 @@ import {
     blocksUntilCommitteeLock,
     committeeChanges,
     committeeLockDetail,
-    connectivityAdvisory,
-    parseCommitteeResponse,
+    fetchCommittee,
     planCommitteeTransactions,
     validateCommitteeSelection,
+    type CommitteeSnapshot,
 } from '../src/committee.ts';
+import type { DecodedQueryResult } from '@exowarexyz/sql';
 
-const PEER_A = `ed25519:${'11'.repeat(32)}`;
-const PEER_B = `ed25519:${'22'.repeat(32)}`;
-const PEER_C = `ed25519:${'33'.repeat(32)}`;
+const PEER_A = '11'.repeat(32);
+const PEER_B = '22'.repeat(32);
+const PEER_C = '33'.repeat(32);
 
-test('committee response requires exact decimal strings and retains all eligible peers', () => {
-    const snapshot = parseCommitteeResponse(response());
+test('committee reads finalized snapshots and eligible peers from SQL', async () => {
+    const queries: string[] = [];
+    const snapshot = await fetchCommittee('http://indexer.invalid', undefined, {
+        async query(sql: string): Promise<DecodedQueryResult> {
+            queries.push(sql);
+            if (sql.includes('FROM block_meta')) {
+                return result({ height: 17_890n, epoch: 139n });
+            }
+            if (sql.includes('FROM committee_meta') && sql.includes('<= 141')) {
+                // Epoch 141 has no explicit row yet, so the index query carries
+                // forward the most recent materialized committee.
+                return result({ epoch: 140n, members: peerBytes(PEER_A, PEER_C) });
+            }
+            if (sql.includes('FROM committee_meta')) {
+                return result({ epoch: 139n, members: peerBytes(PEER_A, PEER_C) });
+            }
+            if (sql.includes('FROM eligible_peer')) {
+                return result(
+                    { peer: peerBytes(PEER_A), address: 'validator-a:9000' },
+                    { peer: peerBytes(PEER_B), address: 'validator-b:9000' },
+                    { peer: peerBytes(PEER_C), address: 'validator-c:9000' },
+                );
+            }
+            throw new Error(`unexpected SQL: ${sql}`);
+        },
+    });
 
     assert.equal(snapshot.height, 17_890n);
-    assert.equal(snapshot.epoch, 17n);
-    assert.equal(snapshot.targetEpoch, 19n);
+    assert.equal(snapshot.epoch, 139n);
+    assert.equal(snapshot.targetEpoch, 141n);
+    assert.equal(snapshot.lockHeight, 17_919n);
+    assert.equal(snapshot.updatesOpen, true);
     assert.deepEqual(snapshot.available.map(({ peer }) => peer), [PEER_A, PEER_B, PEER_C]);
-    assert.equal(snapshot.available[1]?.connected, false);
-
-    assert.throws(
-        () => parseCommitteeResponse({ ...response(), height: 17890 }),
-        /height must be a canonical decimal string/,
-    );
-    assert.throws(
-        () => parseCommitteeResponse({ ...response(), targetEpoch: '20' }),
-        /targetEpoch must equal epoch \+ 2/,
-    );
+    assert.equal(queries.length, 4);
+    assert.ok(queries.some((query) => query.includes('FROM committee_meta')));
+    assert.ok(queries.some((query) => query.includes('FROM eligible_peer')));
 });
 
-test('selection diff includes disconnected eligible peers because connectivity is advisory', () => {
-    const snapshot = parseCommitteeResponse(response());
+test('selection diff includes every indexed eligible peer', () => {
+    const snapshot = response();
     const selected = new Set([PEER_A, PEER_B]);
 
     assert.deepEqual(committeeChanges(snapshot, selected), [
         { peer: PEER_B, registered: true },
         { peer: PEER_C, registered: false },
     ]);
-    assert.equal(connectivityAdvisory(false), 'not connected · advisory');
     assert.equal(validateCommitteeSelection(new Set()), 'committee must contain at least one peer');
     assert.equal(
         validateCommitteeSelection(new Set(Array.from({ length: 65 }, (_, index) => peer(index)))),
@@ -51,21 +70,21 @@ test('selection diff includes disconnected eligible peers because connectivity i
 });
 
 test('lock model names the exact rejecting final block and last accepted block', () => {
-    const snapshot = parseCommitteeResponse(response());
+    const snapshot = response();
 
-    assert.equal(blocksUntilCommitteeLock(snapshot), 540n);
+    assert.equal(blocksUntilCommitteeLock(snapshot), 28n);
     assert.equal(
         committeeLockDetail(snapshot),
-        'final block 18431 rejects updates; accepted through block 18430',
+        'final block 17919 rejects updates; accepted through block 17918',
     );
 });
 
 test('lock distance reaches zero when the penultimate block is finalized', () => {
-    const snapshot = parseCommitteeResponse({
+    const snapshot = {
         ...response(),
-        height: '18430',
+        height: 17_918n,
         updatesOpen: false,
-    });
+    };
 
     assert.equal(blocksUntilCommitteeLock(snapshot), 0n);
 });
@@ -144,34 +163,46 @@ test('multi-swap ordering adapts at capacity and remains deterministic', () => {
     assert.deepEqual(intermediateCommitteeSizes(first, 63), [64, 63, 64, 63]);
 });
 
-function response(): Record<string, unknown> {
+function response(): CommitteeSnapshot {
     return {
-        height: '17890',
-        epoch: '17',
-        targetEpoch: '19',
+        height: 17_890n,
+        epoch: 139n,
+        targetEpoch: 141n,
         updatesOpen: true,
-        lockHeight: '18431',
+        lockHeight: 17_919n,
         current: [PEER_A, PEER_C],
         scheduled: [PEER_A, PEER_C],
         available: [
-            { peer: PEER_A, address: 'validator-a:9000', connected: true },
-            { peer: PEER_B, address: 'validator-b:9000', connected: false },
-            { peer: PEER_C, address: 'validator-c:9000', connected: true },
+            { peer: PEER_A, address: 'validator-a:9000' },
+            { peer: PEER_B, address: 'validator-b:9000' },
+            { peer: PEER_C, address: 'validator-c:9000' },
         ],
     };
 }
 
 function committeeSnapshot(scheduled: readonly string[], available: readonly string[]) {
-    return parseCommitteeResponse({
+    return {
         ...response(),
         current: scheduled,
         scheduled,
         available: available.map((candidate, index) => ({
             peer: candidate,
             address: `validator-${index}:9000`,
-            connected: true,
         })),
-    });
+    };
+}
+
+function result(...values: Record<string, bigint | string | Uint8Array>[]): DecodedQueryResult {
+    return {
+        columns: values.length === 0 ? [] : Object.keys(values[0]),
+        rows: values.map((row) => ({ values: row, cells: Object.values(row) })),
+    };
+}
+
+function peerBytes(...peers: string[]): Uint8Array {
+    return Uint8Array.from(
+        peers.flatMap((peer) => peer.match(/../g)?.map((byte) => Number.parseInt(byte, 16)) ?? []),
+    );
 }
 
 function peer(index: number): string {
