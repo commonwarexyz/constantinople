@@ -46,7 +46,11 @@ selected immediately, survive height-only refreshes, and leave draft state when
 finalized index data adopts them. Existing peers retain their indexed canonical
 address; address updates are not a committee operation.
 Committee mutations remain ordinary signed transactions submitted through
-`VITE_MEMPOOL_URL`; validators expose no separate committee read API.
+`VITE_MEMPOOL_URL`; validators expose no separate committee read API. The UI
+submits multi-peer edits as ordered single-transaction requests so each change
+has its own finalized height and effective epoch. Finalized changes remain
+visible while SQL catches up, and retire only once their `tx_meta` digest is
+indexed.
 
 Transfers and committee updates use the finalized tagged Rust wire contract,
 mirrored by the shared encoder in [`src/codec.ts`](src/codec.ts):
@@ -123,8 +127,12 @@ npm run build
 ```
 
 Outputs a static bundle to `dist/`. The explorer lives outside the cargo
-workspace and is **not** exercised by `just test`; ship-time verification
-is just `npm run build`.
+workspace and is **not** exercised by `just test`; ship-time verification is:
+
+```sh
+npm test
+npm run build
+```
 
 ## Styling: why we don't depend on www-sacred directly
 

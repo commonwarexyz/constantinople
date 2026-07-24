@@ -1,6 +1,6 @@
 # Commonware DKG Late-Join State-Sync Stall
 
-Status: unresolved investigation note  
+Status: baseline late join resolved; failed-ceremony combination unresolved  
 Observed against Commonware `cl/dkg-peer-manager` at `ce9746e8d4b7cf4ab10f9d09c31002a8761ff5b0`  
 Recorded: 2026-07-23
 
@@ -8,23 +8,21 @@ Recorded: 2026-07-23
 
 Constantinople's continuously running validator scenarios are green: stable
 resharing, committee additions and removals, failed-ceremony carry-over, and
-restart immediately before or after an epoch boundary. An attempted scenario
-in which an eligible future validator starts late in `StateSync` mode did not
-reliably cross the later activation boundary and was removed from the green
-suite.
+restart immediately before or after an epoch boundary. A focused cold late-join
+scenario is also green: an unknown validator is registered by transaction,
+starts in `StateSync` only after it is announced as a next player, restores the
+committee database, receives a reshared threshold share, and finalizes after
+activation.
 
-This has not been reduced to a confirmed production bug. The strongest known
-confounder is Commonware's simulated network, whose peer-set manager is global
-to the simulation rather than local to each validator. A delayed validator
-therefore tries to bootstrap peer-set ID 0 after the shared manager has already
-advanced to later IDs. There is also evidence that an already-running validator
-can wait indefinitely at the DKG/orchestrator fence, so a core reshare or
-state-sync liveness issue has not been ruled out.
+The remaining unresolved case combines that late join with a prior failed DKG
+ceremony. It has not been reduced to a confirmed production bug. There is still
+evidence that an already-running validator can wait indefinitely at the
+DKG/orchestrator fence, so a core reshare or state-sync liveness issue has not
+been ruled out.
 
-The unresolved case is specifically a cold late join. Constantinople's normal
-deployment starts every eligible validator from genesis and retains all
-non-primary eligible validators as lookup secondaries, so ordinary promotion
-does not depend on this path.
+Generated indexer and relayer service nodes start as persistent bootstrap
+secondaries. Separately, `generate-validator` creates a genuinely post-genesis
+identity for the now-covered cold state-sync path.
 
 ## Intended scenario
 
@@ -89,9 +87,9 @@ before the remaining scenario was set aside:
   after cases run independently.
 - Eligible validators are kept as persistent lookup secondaries in production.
 
-These fixes made all non-delayed resharing scenarios deterministic and green,
-but the cold late-join scenario was not restored because the shared simulated
-manager still prevents a faithful test.
+These fixes made the baseline delayed resharing scenario deterministic and
+green. The failed-ceremony-plus-late-join combination remains set aside pending
+the upstream simulator and fence work below.
 
 ## Current green coverage
 
@@ -107,9 +105,15 @@ currently covers:
 - restart immediately before and immediately after an epoch boundary, including
   recovery of the persisted DKG share.
 
+[`crates/engine/src/tests/late_peer.rs`](../crates/engine/src/tests/late_peer.rs)
+covers a validator absent from the genesis DKG and bootstrap directory. It
+starts after the registration is finalized and the epoch-1 artifact announces
+it, state-syncs all application databases, becomes an active dealer in epoch 3,
+and persists its new share.
+
 These tests use the real Constantinople engine actor graph, stateful QMDBs,
 marshal, reshare, orchestrator, and deterministic P2P transport. They do not
-cover a process with no local history starting after the network has advanced.
+yet cover a no-history process joining after a failed ceremony.
 
 ## Leading hypotheses
 

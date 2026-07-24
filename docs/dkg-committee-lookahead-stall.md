@@ -25,9 +25,11 @@ marshal's aggregate reporter acknowledgement.
 
 ## Failure mechanism
 
-Constantinople uses 128-block epochs. At the end of epoch `E`, the final block
-contains the public artifact for `E+1`, including the committee lookahead for
-`E+2`. Reshare obtains that lookahead through `ParticipantsProvider`.
+At the time of this incident, Constantinople used 128-block epochs. It now uses
+64-block epochs, but the same end-of-epoch invariant applies. The final block of
+epoch `E` contains the public artifact for `E+1`, including the committee
+lookahead for `E+2`. Reshare obtains that lookahead through
+`ParticipantsProvider`.
 
 Before the fix, the provider waited until marshal's durable processed height
 reached `final - 1`. The sequence was:
@@ -53,13 +55,16 @@ could not finalize height 255 and start height 256.
 
 Committee mutations are now accepted only through `final - 2`. The penultimate
 and final blocks reject committee transactions, so the committee is immutable
-before reshare requests its lookahead. For 128-block epochs, the last mutable
-heights are therefore:
+before reshare requests its lookahead. The incident's 128-block epochs had last
+mutable heights:
 
 - 125 for the epoch ending at 127;
 - 253 for the epoch ending at 255;
 - 381 for the epoch ending at 383;
 - and the corresponding `128n + 125` height thereafter.
+
+With the current 64-block epochs, the corresponding heights are 61, 125, 189,
+and `64n + 61` thereafter.
 
 This is an externally visible transaction rule: a committee transaction that
 would otherwise be valid is rejected in an epoch's penultimate or final block.
