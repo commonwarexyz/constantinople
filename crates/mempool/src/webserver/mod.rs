@@ -18,6 +18,9 @@ use derive_more::Display;
 mod account_reader;
 pub use account_reader::AccountReader;
 
+mod committee_reader;
+pub use committee_reader::{CommitteeReader, CommitteeSnapshot, EPOCH_LENGTH, EligiblePeer};
+
 mod actor;
 pub use actor::{Actor, Config, TxStatus};
 

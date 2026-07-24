@@ -13,7 +13,7 @@ use core::{
 use std::collections::VecDeque;
 
 /// A queue-backed transaction source for deterministic tests.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct StaticTransactionSource<C, P, H>
 where
     P: PublicKey,
@@ -21,6 +21,20 @@ where
 {
     proposals: VecDeque<Vec<VerifiedTransaction<H>>>,
     _marker: PhantomData<(C, P)>,
+}
+
+impl<C, P, H> Clone for StaticTransactionSource<C, P, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fn clone(&self) -> Self {
+        Self {
+            proposals: self.proposals.clone(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<C, P, H> StaticTransactionSource<C, P, H>
@@ -99,7 +113,7 @@ mod tests {
     fn sign_tx(key: &ed25519::PrivateKey, nonce: u64) -> VerifiedTransaction<sha256::Sha256> {
         let hasher = &mut sha256::Sha256::default();
         let public_key = TransactionPublicKey::ed25519(key.public_key());
-        Transaction::new(
+        Transaction::transfer(
             public_key.clone(),
             public_key,
             NonZeroU64::new(1).expect("test value should be non-zero"),

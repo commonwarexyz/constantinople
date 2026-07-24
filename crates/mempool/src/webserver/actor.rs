@@ -4,7 +4,7 @@
 //! batch submissions from HTTP handlers and serves proposals to the
 //! consensus layer via the [`Mailbox`].
 
-use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
+use super::{AccountReader, ActorReceiver, CommitteeReader, Mailbox, http, mailbox::Message};
 use ahash::{AHashMap, AHashSet};
 use commonware_codec::EncodeSize;
 use commonware_consensus::marshal::Update;
@@ -29,6 +29,10 @@ const MAX_STATUS_ENTRIES: usize = 1_000_000;
 /// validator's state database is attached. The cell is populated after engine
 /// startup; HTTP handlers return 503 until then.
 pub type AccountReaderCell = Arc<OnceLock<Arc<dyn AccountReader>>>;
+
+/// Shared cell that lets the mempool answer committee lookups once the
+/// validator's state reader is attached.
+pub type CommitteeReaderCell = Arc<OnceLock<Arc<dyn CommitteeReader>>>;
 
 /// Outcome of a submitted batch, delivered when the result is known.
 ///
@@ -571,6 +575,7 @@ where
     strategy: St,
     public_key_cache: PublicKeyCache,
     account_reader: AccountReaderCell,
+    committee_reader: CommitteeReaderCell,
 }
 
 impl<E, C, P, H, St> Actor<E, C, P, H, St>
@@ -585,16 +590,16 @@ where
     /// Creates a new mempool actor.
     ///
     /// `mailbox` is the handle previously paired with `receiver` by
-    /// [`Mailbox::channel`](super::Mailbox::channel). `account_reader` is a
-    /// shared cell populated once the validator's state database is attached;
-    /// HTTP account lookups return `503 Service Unavailable` while it is
-    /// empty.
+    /// [`Mailbox::channel`](super::Mailbox::channel). The reader cells are
+    /// populated once the validator's state database is attached; dependent
+    /// HTTP lookups return `503 Service Unavailable` while they are empty.
     pub fn new(
         context: E,
         config: Config<St>,
         mailbox: Mailbox<C, P, H>,
         receiver: ActorReceiver<C, P, H>,
         account_reader: AccountReaderCell,
+        committee_reader: CommitteeReaderCell,
     ) -> Self {
         Self {
             context: ContextCell::new(context),
@@ -609,6 +614,7 @@ where
             strategy: config.strategy,
             public_key_cache: config.public_key_cache,
             account_reader,
+            committee_reader,
         }
     }
 
@@ -632,6 +638,7 @@ where
             strategy,
             public_key_cache,
             account_reader,
+            committee_reader,
         } = self;
 
         let app_state = Arc::new(http::AppState {
@@ -641,6 +648,7 @@ where
             strategy: strategy.clone(),
             public_key_cache,
             account_reader,
+            committee_reader,
             ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
         });
         let app = http::router::<C, P, H, St>(app_state);
@@ -856,7 +864,7 @@ mod tests {
     fn new_transactions_filters_duplicate_digests() {
         let signer = ed25519::PrivateKey::from_seed(1);
         let recipient = ed25519::PrivateKey::from_seed(2).public_key();
-        let transaction = Transaction::new(
+        let transaction = Transaction::transfer(
             TransactionPublicKey::ed25519(signer.public_key()),
             TransactionPublicKey::ed25519(recipient),
             NonZeroU64::new(1).expect("non-zero"),
@@ -1090,7 +1098,7 @@ mod tests {
         let recipient = ed25519::PrivateKey::from_seed(seed + 100).public_key();
         let transactions = (0..txs as u64)
             .map(|nonce| {
-                Transaction::new(
+                Transaction::transfer(
                     TransactionPublicKey::ed25519(signer.public_key()),
                     TransactionPublicKey::ed25519(recipient.clone()),
                     NonZeroU64::new(1).expect("non-zero"),

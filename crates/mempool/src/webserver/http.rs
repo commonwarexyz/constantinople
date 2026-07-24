@@ -1,8 +1,8 @@
 //! HTTP handlers for the mempool webserver.
 
 use super::{
-    Mailbox,
-    actor::{AccountReaderCell, IngestStatus},
+    CommitteeSnapshot, EPOCH_LENGTH, EligiblePeer, Mailbox,
+    actor::{AccountReaderCell, CommitteeReaderCell, IngestStatus},
 };
 use axum::{
     Router,
@@ -19,7 +19,7 @@ use commonware_runtime::telemetry::traces::TracedExt as _;
 use commonware_utils::sys_rng;
 use constantinople_primitives::{
     Account, LazySignedTransaction, Nonce, PublicKeyCache, SignedTransaction, TransactionPublicKey,
-    TransactionSignature, VerifiedTransaction, verify_transaction_chunks,
+    VerifiedTransaction, verify_transaction_chunks,
 };
 use std::{fmt::Display, sync::Arc};
 use tokio::sync::Semaphore;
@@ -34,9 +34,6 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 
 /// Minimum bytes needed to encode the batch-length prefix.
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
-
-/// Minimum bytes needed to encode a `u64` varint.
-const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Maximum ingress batches admitted to CPU verification concurrently, shared
 /// across both POST endpoints.
@@ -66,6 +63,7 @@ where
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub account_reader: AccountReaderCell,
+    pub committee_reader: CommitteeReaderCell,
     pub ingress_permits: Arc<Semaphore>,
 }
 
@@ -91,6 +89,7 @@ where
         .route("/transactions/ingest", post(ingest_batch::<C, P, H, St>))
         .route("/transactions/{batch_id}", get(fetch_status::<C, P, H, St>))
         .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
+        .route("/committee", get(fetch_committee::<C, P, H, St>))
         .layer(DefaultBodyLimit::max(max_request_bytes))
         .layer(cors)
         .with_state(state)
@@ -100,17 +99,9 @@ const fn max_request_bytes(max_batch_bytes: usize) -> usize {
     max_batch_bytes.saturating_add(MAX_BATCH_LENGTH_PREFIX_BYTES)
 }
 
-const fn min_signed_transaction_bytes() -> usize {
-    TransactionPublicKey::SIZE
-        + TransactionPublicKey::SIZE
-        + MIN_U64_VARINT_BYTES
-        + MIN_U64_VARINT_BYTES
-        + TransactionSignature::MIN_SIZE
-}
-
-fn max_transaction_count(body_len: usize) -> Option<usize> {
+fn max_transaction_count<H: Hasher>(body_len: usize) -> Option<usize> {
     let payload_len = body_len.saturating_sub(MIN_BATCH_LENGTH_PREFIX_BYTES);
-    let max_transactions = payload_len / min_signed_transaction_bytes();
+    let max_transactions = payload_len / SignedTransaction::<H>::MIN_SIZE;
     (max_transactions > 0).then_some(max_transactions)
 }
 
@@ -226,7 +217,7 @@ where
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    let Some(max_transactions) = max_transaction_count(body.len()) else {
+    let Some(max_transactions) = max_transaction_count::<H>(body.len()) else {
         return Err(StatusCode::BAD_REQUEST);
     };
 
@@ -249,7 +240,7 @@ where
     let public_key_cache = state.public_key_cache.clone();
     let verified = state.strategy.spawn(move |strategy| {
         let _permit = permit;
-        let batch_id = H::hash(&body).to_string();
+        let batch_id = H::hash(&[body.as_ref()]).to_string();
 
         let decode = info_span!(
             parent: &parent,
@@ -400,9 +391,85 @@ impl From<Nonce> for NonceResponse {
     }
 }
 
+/// Returns committed committee state and advisory peer connectivity.
+///
+/// Consensus-sized integers are encoded as canonical decimal strings so
+/// JavaScript clients do not lose precision.
+async fn fetch_committee<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let Some(reader) = state.committee_reader.get() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    };
+
+    ok_json(&CommitteeResponse::from(reader.get().await))
+}
+
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct CommitteeResponse {
+    height: String,
+    epoch: String,
+    target_epoch: String,
+    updates_open: bool,
+    lock_height: String,
+    current: Vec<String>,
+    scheduled: Vec<String>,
+    available: Vec<EligiblePeerResponse>,
+}
+
+#[derive(serde::Serialize)]
+struct EligiblePeerResponse {
+    peer: String,
+    address: String,
+    connected: bool,
+}
+
+impl From<CommitteeSnapshot> for CommitteeResponse {
+    fn from(snapshot: CommitteeSnapshot) -> Self {
+        let epoch = snapshot.height / EPOCH_LENGTH;
+        let target_epoch = epoch + 2;
+        let lock_height = epoch * EPOCH_LENGTH + (EPOCH_LENGTH - 1);
+        Self {
+            height: snapshot.height.to_string(),
+            epoch: epoch.to_string(),
+            target_epoch: target_epoch.to_string(),
+            updates_open: snapshot.height < lock_height,
+            lock_height: lock_height.to_string(),
+            current: snapshot.current,
+            scheduled: snapshot.scheduled,
+            available: snapshot
+                .available
+                .into_iter()
+                .map(EligiblePeerResponse::from)
+                .collect(),
+        }
+    }
+}
+
+impl From<EligiblePeer> for EligiblePeerResponse {
+    fn from(peer: EligiblePeer) -> Self {
+        Self {
+            peer: peer.peer,
+            address: peer.address,
+            connected: peer.connected,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router};
+    use super::{
+        AppState, CommitteeSnapshot, EligiblePeer, MAX_CONCURRENT_INGRESS, PublicKeyCache,
+        Semaphore, router,
+    };
+    use crate::webserver::CommitteeReader;
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
@@ -412,19 +479,63 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
-    use std::sync::Arc;
+    use futures::future::{BoxFuture, FutureExt};
+    use std::sync::{Arc, OnceLock};
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
+    struct StubCommitteeReader;
+
+    impl CommitteeReader for StubCommitteeReader {
+        fn get<'a>(&'a self) -> BoxFuture<'a, CommitteeSnapshot> {
+            async {
+                CommitteeSnapshot {
+                    height: 17_890,
+                    current: vec!["peer-a".into(), "peer-c".into()],
+                    scheduled: vec!["peer-a".into(), "peer-c".into()],
+                    available: vec![
+                        EligiblePeer {
+                            peer: "peer-a".into(),
+                            address: "validator-a:9000".into(),
+                            connected: true,
+                        },
+                        EligiblePeer {
+                            peer: "peer-b".into(),
+                            address: "validator-b:9000".into(),
+                            connected: false,
+                        },
+                        EligiblePeer {
+                            peer: "peer-c".into(),
+                            address: "validator-c:9000".into(),
+                            connected: true,
+                        },
+                    ],
+                }
+            }
+            .boxed()
+        }
+    }
+
+    fn test_router(
+        context: impl Metrics,
+        max_batch_bytes: usize,
+        committee_reader: Option<Arc<dyn CommitteeReader>>,
+    ) -> axum::Router {
         let (sender, _receiver) = mpsc::channel(1);
+        let committee_reader_cell = Arc::new(OnceLock::new());
+        if let Some(reader) = committee_reader {
+            committee_reader_cell
+                .set(reader)
+                .unwrap_or_else(|_| panic!("committee reader must only be installed once"));
+        }
         let state = Arc::new(AppState {
             mailbox: super::super::mailbox::Mailbox::new(sender),
             namespace: b"mempool-http-test",
             max_batch_bytes,
             strategy: Sequential,
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
-            account_reader: std::sync::Arc::new(std::sync::OnceLock::new()),
+            account_reader: Arc::new(OnceLock::new()),
+            committee_reader: committee_reader_cell,
             ingress_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS)),
         });
 
@@ -434,7 +545,7 @@ mod tests {
     #[test]
     fn router_accepts_requests_above_axum_default_limit() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let app = test_router(context, 4 * 1024 * 1024);
+            let app = test_router(context, 4 * 1024 * 1024, None);
             let request = Request::builder()
                 .method("POST")
                 .uri("/transactions")
@@ -450,7 +561,7 @@ mod tests {
     #[test]
     fn router_rejects_malformed_length_prefix_without_panicking() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let app = test_router(context, 4 * 1024 * 1024);
+            let app = test_router(context, 4 * 1024 * 1024, None);
             let request = Request::builder()
                 .method("POST")
                 .uri("/transactions")
@@ -467,7 +578,7 @@ mod tests {
     #[test]
     fn router_allows_explorer_account_preflight() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let app = test_router(context, 4 * 1024 * 1024);
+            let app = test_router(context, 4 * 1024 * 1024, None);
             let request = Request::builder()
                 .method(Method::OPTIONS)
                 .uri("/account/00")
@@ -483,6 +594,62 @@ mod tests {
                 response.headers().get(header::ACCESS_CONTROL_ALLOW_ORIGIN),
                 Some(&header::HeaderValue::from_static("*")),
             );
+        });
+    }
+
+    #[test]
+    fn committee_response_uses_decimal_strings_and_exact_lock_block() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let app = test_router(
+                context,
+                4 * 1024 * 1024,
+                Some(Arc::new(StubCommitteeReader)),
+            );
+            let request = Request::builder()
+                .uri("/committee")
+                .body(Body::empty())
+                .expect("request should build");
+
+            let response = app.oneshot(request).await.expect("router should respond");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("response body should collect");
+            let response: serde_json::Value =
+                serde_json::from_slice(&body).expect("response should be JSON");
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "height": "17890",
+                    "epoch": "17",
+                    "targetEpoch": "19",
+                    "updatesOpen": true,
+                    "lockHeight": "18431",
+                    "current": ["peer-a", "peer-c"],
+                    "scheduled": ["peer-a", "peer-c"],
+                    "available": [
+                        {"peer": "peer-a", "address": "validator-a:9000", "connected": true},
+                        {"peer": "peer-b", "address": "validator-b:9000", "connected": false},
+                        {"peer": "peer-c", "address": "validator-c:9000", "connected": true},
+                    ],
+                }),
+            );
+        });
+    }
+
+    #[test]
+    fn committee_returns_unavailable_until_reader_is_attached() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let app = test_router(context, 4 * 1024 * 1024, None);
+            let request = Request::builder()
+                .uri("/committee")
+                .body(Body::empty())
+                .expect("request should build");
+
+            let response = app.oneshot(request).await.expect("router should respond");
+
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         });
     }
 }

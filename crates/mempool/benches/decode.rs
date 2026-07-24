@@ -29,7 +29,7 @@ fn encoded_batch(n: usize) -> bytes::Bytes {
         .map(|i| {
             let sender = &signers[i % SIGNERS];
             let recipient = signers[(i + 1) % SIGNERS].public_key();
-            Transaction::new(
+            Transaction::transfer(
                 TransactionPublicKey::ed25519(sender.public_key()),
                 TransactionPublicKey::ed25519(recipient),
                 NonZeroU64::new(1).expect("bench value must be non-zero"),
