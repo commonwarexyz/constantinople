@@ -18,7 +18,7 @@ fn sign_one(
     value: NonZeroU64,
     nonce: u64,
 ) -> Tx {
-    let tx = Transaction::new(
+    let tx = Transaction::transfer(
         TransactionPublicKey::ed25519(sender.public_key.clone()),
         TransactionPublicKey::ed25519(recipient.clone()),
         value,
@@ -126,7 +126,7 @@ mod tests {
             let body = txs.as_slice().encode();
 
             // Decode as the server would.
-            let max_transactions = body.len() / 118; // conservative min tx size
+            let max_transactions = body.len() / Tx::MIN_SIZE;
             let cfg = (RangeCfg::new(1..=max_transactions), ());
             let decoded =
                 Vec::<Tx>::decode_cfg(&mut &body[..], &cfg).expect("decode should succeed");
