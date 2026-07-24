@@ -11,8 +11,11 @@ import {
     applyFinalizedCommitteeOverlay,
     createFinalizedCommitteeOverlay,
     fetchCommittee,
+    fetchIndexedCommitteeTransactions,
+    mergeFinalizedCommitteeOverlay,
     planCommitteeTransactions,
     reconcileFinalizedCommitteeOverlay,
+    reserveAttemptedCommitteeNonce,
     type CommitteeChange,
     type CommitteeSnapshot,
     type FinalizedCommitteeOverlay,
@@ -30,6 +33,7 @@ import { submittedTransactionHistoryKey } from './historyKey';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
+    singleTransactionFinalized,
     submitTransactions,
     type AccountView,
     type TxStatus,
@@ -225,6 +229,7 @@ export default function App() {
     const [committeeSubmitMessage, setCommitteeSubmitMessage] = useState('');
     const [finalizedCommitteeOverlays, setFinalizedCommitteeOverlays] =
         useState<FinalizedCommitteeOverlay[]>([]);
+    const finalizedCommitteeOverlaysRef = useRef<FinalizedCommitteeOverlay[]>([]);
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const pendingBlocksRef = useRef<ObservedBlock[]>([]);
     const blockFlushTimeoutRef = useRef<number | null>(null);
@@ -266,6 +271,14 @@ export default function App() {
 
     const mergeLocalNonceState = (nextNonce: NonceState) => {
         setLocalNonceState(mergeNonceStates(nextNonceRef.current, nextNonce));
+    };
+
+    const updateFinalizedCommitteeOverlays = (
+        update: (current: readonly FinalizedCommitteeOverlay[]) => FinalizedCommitteeOverlay[],
+    ) => {
+        const next = update(finalizedCommitteeOverlaysRef.current);
+        finalizedCommitteeOverlaysRef.current = next;
+        setFinalizedCommitteeOverlays(next);
     };
 
     const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
@@ -383,17 +396,30 @@ export default function App() {
         if (!isCommitteePage) return;
 
         const refreshQueue = createRefreshQueue({
-            load: (signal) => fetchCommittee(indexerUrl, signal),
-            onResult: (snapshot) => {
+            load: async (signal) => {
+                const indexedTransactionDigests = await fetchIndexedCommitteeTransactions(
+                    indexerUrl,
+                    finalizedCommitteeOverlaysRef.current.map(
+                        ({ transactionDigest }) => transactionDigest,
+                    ),
+                    signal,
+                );
+                const snapshot = await fetchCommittee(indexerUrl, signal);
+                return { indexedTransactionDigests, snapshot };
+            },
+            onResult: ({ indexedTransactionDigests, snapshot }) => {
                 setCommittee((current) =>
                     current !== null && current.height > snapshot.height
                         ? current
                         : snapshot,
                 );
-                setFinalizedCommitteeOverlays((current) =>
+                updateFinalizedCommitteeOverlays((current) =>
                     current.filter(
                         (overlay) =>
-                            reconcileFinalizedCommitteeOverlay(overlay, snapshot) !== null,
+                            reconcileFinalizedCommitteeOverlay(
+                                overlay,
+                                indexedTransactionDigests,
+                            ) !== null,
                     ),
                 );
                 setCommitteeError('');
@@ -892,7 +918,8 @@ export default function App() {
 
         setPendingSubmissionCount((count) => count + 1);
         setCommitteeSubmitMessage(`reserving ${changes.length} sequential nonces`);
-        let reservation: { previous: NonceState; next: NonceState } | null = null;
+        let reservedNonceState: NonceState | null = null;
+        let retainedNonceState: NonceState | null = null;
         try {
             const previousNonce = nextNonceRef.current;
             const plan = planCommitteeTransactions(
@@ -901,7 +928,8 @@ export default function App() {
                 displayedCommittee.scheduled.length,
             );
             setLocalNonceState(plan.nextNonceState);
-            reservation = { previous: previousNonce, next: plan.nextNonceState };
+            reservedNonceState = plan.nextNonceState;
+            retainedNonceState = previousNonce;
 
             const encoded = [];
             for (let index = 0; index < plan.transactions.length; index++) {
@@ -922,32 +950,53 @@ export default function App() {
                 );
             }
 
-            setCommitteeSubmitMessage(`submitting ${encoded.length} per-peer updates`);
-            const txStatus = await submitTransactions(
-                mempoolUrl,
-                encodeTransactionBatch(encoded.map(({ bytes }) => bytes)),
-            );
-            if (txStatus.status === 'finalized') {
-                setFinalizedCommitteeOverlays((current) => {
-                    const next = createFinalizedCommitteeOverlay(
-                        plan.transactions,
-                        BigInt(txStatus.height),
+            let finalized = 0;
+            for (let index = 0; index < encoded.length; index++) {
+                retainedNonceState = reserveAttemptedCommitteeNonce(
+                    retainedNonceState,
+                    plan.transactions[index].nonce,
+                );
+                setCommitteeSubmitMessage(
+                    `submitting update ${index + 1} / ${encoded.length}`,
+                );
+                const txStatus = await submitTransactions(
+                    mempoolUrl,
+                    encodeTransactionBatch([encoded[index].bytes]),
+                );
+                if (!singleTransactionFinalized(txStatus)) {
+                    setCommitteeSubmitMessage(
+                        `${finalized} / ${encoded.length} finalized · ${formatTxStatus(txStatus)}`,
                     );
-                    const superseded = new Set(next.changes.map(({ peer }) => peer));
-                    const retained = current.flatMap((overlay) => {
-                        const changes = overlay.changes.filter(
-                            ({ peer }) => !superseded.has(peer),
-                        );
-                        return changes.length === 0 ? [] : [{ ...overlay, changes }];
-                    });
-                    return [...retained, next];
-                });
+                    break;
+                }
+                finalized += 1;
+                const overlay = createFinalizedCommitteeOverlay(
+                    [plan.transactions[index]],
+                    BigInt(txStatus.height),
+                    encoded[index].digestHex,
+                );
+                updateFinalizedCommitteeOverlays((current) =>
+                    mergeFinalizedCommitteeOverlay(current, overlay),
+                );
+                setCommitteeSubmitMessage(
+                    `${finalized} / ${encoded.length} finalized at block ${txStatus.height}`,
+                );
             }
-            setCommitteeSubmitMessage(formatTxStatus(txStatus));
+            if (
+                reservedNonceState !== null &&
+                retainedNonceState !== null &&
+                nonceStatesEqual(nextNonceRef.current, reservedNonceState)
+            ) {
+                setLocalNonceState(retainedNonceState);
+            }
             await Promise.all([refreshAccount(), refreshCommittee()]);
         } catch (error) {
-            if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
-                setLocalNonceState(reservation.previous);
+            if (
+                reservedNonceState !== null &&
+                retainedNonceState !== null &&
+                nonceStatesEqual(nextNonceRef.current, reservedNonceState)
+            ) {
+                setLocalNonceState(retainedNonceState);
             }
             setCommitteeSubmitMessage(error instanceof Error ? error.message : String(error));
         } finally {

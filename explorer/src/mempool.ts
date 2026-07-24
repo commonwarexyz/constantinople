@@ -1,4 +1,4 @@
-import { toArrayBuffer } from './codec';
+import { toArrayBuffer } from './codec.ts';
 
 export interface AccountView {
     readonly balance: number;
@@ -19,6 +19,15 @@ export type TxStatus =
           readonly filtered: number;
       }
     | { readonly status: 'dropped' };
+
+/** Whether a one-transaction submission finalized that transaction. */
+export function singleTransactionFinalized(
+    status: TxStatus,
+): status is Extract<TxStatus, { readonly height: number }> {
+    return status.status === 'finalized' || (
+        status.status === 'partially_finalized' && status.included > 0
+    );
+}
 
 export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);

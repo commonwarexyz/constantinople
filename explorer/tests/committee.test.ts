@@ -10,12 +10,15 @@ import {
     createFinalizedCommitteeOverlay,
     createCommitteeDraft,
     fetchCommittee,
+    fetchIndexedCommitteeTransactions,
     indexedCommitteeOverlayAdopted,
     mergeCommitteeRoster,
+    mergeFinalizedCommitteeOverlay,
     planCommitteeTransactions,
     reconcileCommitteeDrafts,
     reconcileFinalizedCommitteeOverlay,
     reconcileCommitteeSelection,
+    reserveAttemptedCommitteeNonce,
     validateCommitteeSelection,
     type CommitteeSnapshot,
 } from '../src/committee.ts';
@@ -24,6 +27,8 @@ import type { DecodedQueryResult } from '@exowarexyz/sql';
 const PEER_A = '11'.repeat(32);
 const PEER_B = '22'.repeat(32);
 const PEER_C = '33'.repeat(32);
+const DIGEST_A = 'aa'.repeat(32);
+const DIGEST_B = 'bb'.repeat(32);
 
 test('committee reads finalized snapshots and eligible peers from SQL', async () => {
     const queries: string[] = [];
@@ -281,6 +286,26 @@ test('per-peer actions reserve sequential nonces before signing', () => {
     assert.deepEqual(plan.nextNonceState, { base: 10n, bitmap: 0n });
 });
 
+test('attempted committee nonces remain reserved while unsent suffixes are released', () => {
+    const initial = { base: 0n, bitmap: 0n };
+    const plan = planCommitteeTransactions(
+        [
+            { peer: PEER_A, address: null },
+            { peer: PEER_B, address: '192.0.2.2:9000' },
+            { peer: PEER_C, address: null },
+        ],
+        initial,
+        2,
+    );
+    const retained = plan.transactions.slice(0, 2).reduce(
+        (state, transaction) => reserveAttemptedCommitteeNonce(state, transaction.nonce),
+        initial,
+    );
+
+    assert.deepEqual(retained, { base: 2n, bitmap: 0n });
+    assert.deepEqual(plan.nextNonceState, { base: 3n, bitmap: 0n });
+});
+
 test('planning does not depend on the indexed target epoch', () => {
     const first = committeeSnapshot([PEER_A], [PEER_A, PEER_B]);
     const second = { ...first, targetEpoch: first.targetEpoch + 1n };
@@ -312,6 +337,7 @@ test('finalized overlay applies new peers and removals to stale indexed state', 
             { peer: PEER_B, address: '[2001:db8::2]:9000' },
         ],
         64n,
+        DIGEST_A,
     );
 
     const applied = applyFinalizedCommitteeOverlay(snapshot, overlay);
@@ -324,35 +350,82 @@ test('finalized overlay applies new peers and removals to stale indexed state', 
     ]);
 });
 
-test('finalized overlay remains until height, schedule, and catalog are adopted', () => {
+test('finalized overlay remains until its transaction row is indexed', () => {
     const overlay = createFinalizedCommitteeOverlay(
         [
             { peer: PEER_A, address: null },
             { peer: PEER_B, address: '192.0.2.2:9000' },
         ],
         100n,
+        DIGEST_A,
     );
-    const beforeFinalizedHeight = {
-        ...committeeSnapshot([PEER_C, PEER_B], [PEER_A, PEER_B, PEER_C]),
-        height: 99n,
-    };
-    const missingCatalog = {
-        ...committeeSnapshot([PEER_C, PEER_B], [PEER_A, PEER_C]),
-        height: 100n,
-    };
-    const adopted = {
-        ...committeeSnapshot([PEER_C, PEER_B], [PEER_A, PEER_B, PEER_C]),
-        height: 100n,
-    };
+    const pending = new Set<string>();
+    const indexed = new Set([DIGEST_A]);
 
-    assert.equal(indexedCommitteeOverlayAdopted(beforeFinalizedHeight, overlay), false);
-    assert.equal(indexedCommitteeOverlayAdopted(missingCatalog, overlay), false);
-    assert.equal(indexedCommitteeOverlayAdopted(adopted, overlay), true);
+    assert.equal(indexedCommitteeOverlayAdopted(overlay, pending), false);
+    assert.equal(indexedCommitteeOverlayAdopted(overlay, indexed), true);
     assert.strictEqual(
-        reconcileFinalizedCommitteeOverlay(overlay, beforeFinalizedHeight),
+        reconcileFinalizedCommitteeOverlay(overlay, pending),
         overlay,
     );
-    assert.equal(reconcileFinalizedCommitteeOverlay(overlay, adopted), null);
+    assert.equal(reconcileFinalizedCommitteeOverlay(overlay, indexed), null);
+});
+
+test('newer finalized feedback supersedes an older change for the same peer', () => {
+    const first = createFinalizedCommitteeOverlay(
+        [{ peer: PEER_B, address: '192.0.2.2:9000' }],
+        61n,
+        DIGEST_A,
+    );
+    const second = createFinalizedCommitteeOverlay(
+        [{ peer: PEER_B, address: null }],
+        64n,
+        DIGEST_B,
+    );
+
+    assert.deepEqual(mergeFinalizedCommitteeOverlay([first], second), [second]);
+});
+
+test('per-transaction overlays preserve epochs across a submission boundary', () => {
+    const beforeBoundary = createFinalizedCommitteeOverlay(
+        [{ peer: PEER_B, address: '192.0.2.2:9000' }],
+        61n,
+        DIGEST_A,
+    );
+    const afterBoundary = createFinalizedCommitteeOverlay(
+        [{ peer: PEER_A, address: null }],
+        64n,
+        DIGEST_B,
+    );
+
+    assert.equal(beforeBoundary.targetEpoch, 2n);
+    assert.equal(afterBoundary.targetEpoch, 3n);
+    const initial: CommitteeSnapshot = committeeSnapshot([PEER_A], [PEER_A]);
+    assert.deepEqual(
+        [beforeBoundary, afterBoundary].reduce<CommitteeSnapshot>(
+            (snapshot, overlay) => applyFinalizedCommitteeOverlay(snapshot, overlay),
+            initial,
+        ).scheduled,
+        [PEER_B],
+    );
+});
+
+test('indexed committee transaction lookup returns only visible digests', async () => {
+    const indexed = await fetchIndexedCommitteeTransactions(
+        'http://indexer.invalid',
+        [DIGEST_A, DIGEST_B],
+        undefined,
+        {
+            async query(sql: string): Promise<DecodedQueryResult> {
+                assert.match(sql, /FROM tx_meta/);
+                assert.match(sql, new RegExp(`X'${DIGEST_A}'`));
+                assert.match(sql, new RegExp(`X'${DIGEST_B}'`));
+                return result({ tx_digest: peerBytes(DIGEST_B) });
+            },
+        },
+    );
+
+    assert.deepEqual(indexed, new Set([DIGEST_B]));
 });
 
 test('sole-member replacement adds before removing the last member', () => {

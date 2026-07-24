@@ -3,7 +3,7 @@ import {
     nextAvailableNonce,
     type NonceState,
 } from './nonce.ts';
-import { toHex } from './codec.ts';
+import { fromHex, toHex } from './codec.ts';
 import {
     normalizeEd25519PublicKey,
     normalizeValidatorEndpoint,
@@ -29,6 +29,8 @@ const COMMITTEE_META_MEMBERS = 'members';
 const ELIGIBLE_PEER_TABLE = 'eligible_peer';
 const ELIGIBLE_PEER_PEER = 'peer';
 const ELIGIBLE_PEER_ADDRESS = 'address';
+const TX_META_TABLE = 'tx_meta';
+const TX_META_DIGEST = 'tx_digest';
 
 export interface EligibleCommitteePeer {
     readonly peer: string;
@@ -65,7 +67,20 @@ export interface CommitteeTransactionPlan {
     readonly nextNonceState: NonceState;
 }
 
+/** Keep an attempted nonce reserved even when the relayer outcome is unresolved. */
+export function reserveAttemptedCommitteeNonce(
+    state: NonceState,
+    nonce: bigint,
+): NonceState {
+    const next = consumeNonce(state, nonce);
+    if (next === null) {
+        throw new Error('attempted committee nonce must fit in u64');
+    }
+    return next;
+}
+
 export interface FinalizedCommitteeOverlay {
+    readonly transactionDigest: string;
     readonly finalizedHeight: bigint;
     readonly targetEpoch: bigint;
     readonly changes: readonly CommitteeChange[];
@@ -86,12 +101,31 @@ export function committeeTargetEpochAtHeight(height: bigint): bigint {
 export function createFinalizedCommitteeOverlay(
     changes: readonly CommitteeChange[],
     finalizedHeight: bigint,
+    transactionDigest: string,
 ): FinalizedCommitteeOverlay {
+    const digest = fromHex(transactionDigest);
+    if (digest.length !== 32) {
+        throw new Error('committee transaction digest must contain 32 bytes');
+    }
     return {
+        transactionDigest: toHex(digest),
         finalizedHeight,
         targetEpoch: committeeTargetEpochAtHeight(finalizedHeight),
         changes: changes.map(({ peer, address }) => ({ peer, address })),
     };
+}
+
+/** Add an overlay, discarding older local feedback for the same peers. */
+export function mergeFinalizedCommitteeOverlay(
+    current: readonly FinalizedCommitteeOverlay[],
+    next: FinalizedCommitteeOverlay,
+): FinalizedCommitteeOverlay[] {
+    const superseded = new Set(next.changes.map(({ peer }) => peer));
+    const retained = current.flatMap((overlay) => {
+        const changes = overlay.changes.filter(({ peer }) => !superseded.has(peer));
+        return changes.length === 0 ? [] : [{ ...overlay, changes }];
+    });
+    return [...retained, next];
 }
 
 /** Apply finalized changes while their SQL rows are still catching up. */
@@ -125,37 +159,53 @@ export function applyFinalizedCommitteeOverlay(
 
 /** Whether SQL has indexed the finalized block and every committee mutation. */
 export function indexedCommitteeOverlayAdopted(
-    snapshot: CommitteeSnapshot,
     overlay: FinalizedCommitteeOverlay,
+    indexedTransactionDigests: ReadonlySet<string>,
 ): boolean {
-    if (
-        snapshot.height < overlay.finalizedHeight ||
-        snapshot.targetEpoch < overlay.targetEpoch
-    ) {
-        return false;
-    }
-
-    const scheduled = new Set(snapshot.scheduled);
-    const available = new Map(
-        snapshot.available.map(({ peer, address }) => [peer, address]),
-    );
-    for (const change of overlay.changes) {
-        if (change.address === null) {
-            if (scheduled.has(change.peer)) return false;
-            continue;
-        }
-        if (!scheduled.has(change.peer)) return false;
-        if (available.get(change.peer) !== change.address) return false;
-    }
-    return true;
+    return indexedTransactionDigests.has(overlay.transactionDigest);
 }
 
 export function reconcileFinalizedCommitteeOverlay(
     overlay: FinalizedCommitteeOverlay | null,
-    snapshot: CommitteeSnapshot,
+    indexedTransactionDigests: ReadonlySet<string>,
 ): FinalizedCommitteeOverlay | null {
     if (overlay === null) return null;
-    return indexedCommitteeOverlayAdopted(snapshot, overlay) ? null : overlay;
+    return indexedCommitteeOverlayAdopted(overlay, indexedTransactionDigests) ? null : overlay;
+}
+
+/** Return pending committee transaction digests already present in finalized SQL rows. */
+export async function fetchIndexedCommitteeTransactions(
+    sqlUrl: string,
+    transactionDigests: readonly string[],
+    signal?: AbortSignal,
+    client: Pick<SqlClient, 'query'> = new SqlClient(trimTrailingSlash(sqlUrl)),
+): Promise<Set<string>> {
+    const digests = [...new Set(transactionDigests.map((digest) => {
+        const bytes = fromHex(digest);
+        if (bytes.length !== 32) {
+            throw new Error('committee transaction digest must contain 32 bytes');
+        }
+        return toHex(bytes);
+    }))];
+    if (digests.length === 0) return new Set();
+
+    const literals = digests.map((digest) => `X'${digest}'`).join(', ');
+    const result = await sqlQuery(
+        client,
+        `
+            SELECT ${TX_META_DIGEST}
+            FROM ${TX_META_TABLE}
+            WHERE ${TX_META_DIGEST} IN (${literals})
+        `,
+        signal,
+    );
+    return new Set(result.rows.map((row) => {
+        const digest = expectBytes(row.values[TX_META_DIGEST], TX_META_DIGEST);
+        if (digest.length !== 32) {
+            throw new Error('SQL transaction digest must contain 32 bytes');
+        }
+        return toHex(digest);
+    }));
 }
 
 /** Merge local, previously unknown peers into the indexed roster without duplicates. */
