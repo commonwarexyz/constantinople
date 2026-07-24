@@ -1,17 +1,15 @@
-//! Fixed-epoch engine assembly.
+//! Epoch-orchestrated engine assembly.
 //!
 //! The engine keeps the consensus stack deliberately small:
 //!
 //! - `constantinople-application` owns execution
 //! - `commonware-glue::stateful` owns QMDB lifecycle and startup sync
 //! - erasure-coded marshal owns finalized block availability
-//! - one simplex engine runs forever in epoch zero
-//!
-//! There is no DKG actor and no epoch orchestrator. The validator set and
-//! threshold scheme are fixed at startup from the supplied threshold output and
-//! optional local share.
+//! - continuous DKG reshare prepares the next epoch's threshold scheme
+//! - the orchestrator starts one simplex actor per 1024-block epoch
 
-use crate::types::*;
+use crate::{CommitteeParticipants, DynamicProvider, Registrar, types::*};
+use commonware_codec::{RangeCfg, Read};
 use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporter, Reporters,
@@ -21,25 +19,35 @@ use commonware_consensus::{
         core::{Actor as MarshalActor, Variant as MarshalVariant},
         resolver::p2p as marshal_resolver,
     },
-    simplex::{
-        self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
-    },
+    simplex::{self, elector::Config as Elector, types::Finalization},
     types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
 };
+#[cfg(all(test, feature = "test-utils"))]
+use commonware_cryptography::Committable;
 use commonware_cryptography::{
-    BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
+    BatchVerifier, Digest, Digestible, Hasher, PublicKey, Signer,
     bls12381::{
         dkg::feldman_desmedt::Output,
-        primitives::{group, variant::Variant},
+        primitives::{group, sharing::Mode, variant::Variant},
     },
-    certificate::{ConstantProvider, Verifier},
+    certificate::Verifier,
+    ed25519,
 };
-use commonware_glue::stateful::{
-    Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
-    db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
+use commonware_glue::{
+    dkg::{
+        ReshareBlock, SecretStore as _,
+        fence::Fence,
+        network, orchestrator, probe, reshare,
+        state_sync::{Config as DkgStateSyncConfig, Plan as DkgStateSyncPlan, StateSync},
+        types::{EpochInfo, Payload},
+    },
+    stateful::{
+        Config as StatefulConfig, PruneConfig, Stateful, SyncPlan,
+        db::{ManagedDb, SyncEngineConfig, p2p as qmdb_resolver},
+    },
 };
 use commonware_macros::boxed;
-use commonware_p2p::{Blocker, Manager, Receiver, Sender};
+use commonware_p2p::{Address, AddressableManager, Blocker, Receiver, Sender};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
@@ -55,12 +63,15 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
+use commonware_utils::{
+    NZDuration, NZU16, NZU32, NZU64, NZUsize, non_empty_range, ordered::Map, union,
+};
 use constantinople_application::consensus::{
-    Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, Committee, CommitteeSyncTarget, FinalizedHookFn, StateSyncTarget,
+    TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{BlockCfg, PublicKeyCache};
+use constantinople_primitives::PublicKeyCache;
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
@@ -72,7 +83,10 @@ use tracing::{error, info, warn};
 /// The fixed threshold scheme used by simplex and marshal.
 pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::Scheme<P, V>;
 
-const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
+/// Number of finalized blocks in each production epoch.
+pub const EPOCH_LENGTH: NonZero<u64> = NZU64!(1024);
+const MAX_DKG_PARTICIPANTS: NonZero<u32> = NZU32!(64);
+const DKG_MUXER_SIZE: usize = 128;
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
@@ -105,11 +119,17 @@ pub const MARSHAL_RESOLVER_CHANNEL: u64 = 4;
 pub const STATE_RESOLVER_CHANNEL: u64 = 5;
 /// Transaction history database sync resolver channel id.
 pub const TRANSACTION_RESOLVER_CHANNEL: u64 = 6;
-/// State-sync probe channel id.
-pub const PROBE_CHANNEL: u64 = 7;
+/// Committee database sync resolver channel id.
+pub const COMMITTEE_RESOLVER_CHANNEL: u64 = 7;
+/// Private DKG reshare traffic channel id.
+pub const DKG_CHANNEL: u64 = 8;
+/// DKG state-sync probe channel id.
+pub const DKG_PROBE_CHANNEL: u64 = 9;
+/// Backwards-compatible name for the DKG state-sync probe channel.
+pub const PROBE_CHANNEL: u64 = DKG_PROBE_CHANNEL;
 
 /// All channel ids used by the engine, including the state-sync probe.
-pub const CHANNELS: [u64; 8] = [
+pub const CHANNELS: [u64; 10] = [
     VOTE_CHANNEL,
     CERTIFICATE_CHANNEL,
     RESOLVER_CHANNEL,
@@ -117,7 +137,9 @@ pub const CHANNELS: [u64; 8] = [
     MARSHAL_RESOLVER_CHANNEL,
     STATE_RESOLVER_CHANNEL,
     TRANSACTION_RESOLVER_CHANNEL,
-    PROBE_CHANNEL,
+    COMMITTEE_RESOLVER_CHANNEL,
+    DKG_CHANNEL,
+    DKG_PROBE_CHANNEL,
 ];
 
 /// Registered physical channels required by the engine.
@@ -135,6 +157,8 @@ where
     pub marshal_resolver: (S, R),
     pub state_resolver: (S, R),
     pub transaction_resolver: (S, R),
+    pub committee_resolver: (S, R),
+    pub dkg: (S, R),
 }
 
 /// Requested engine startup behavior.
@@ -151,8 +175,8 @@ pub enum StartupMode {
 pub struct Config<E, C, M, B, V, St, I, H, O>
 where
     E: BufferPooler + Storage + Clock + Metrics,
-    C: Signer,
-    M: Manager<PublicKey = C::PublicKey>,
+    C: Signer<PublicKey = ed25519::PublicKey>,
+    M: AddressableManager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     V: Variant,
     St: Strategy,
@@ -165,16 +189,33 @@ where
     pub namespace: Vec<u8>,
     pub output: Output<V, C::PublicKey>,
     pub share: Option<group::Share>,
+    /// Canonical epoch-zero DKG artifact embedded in genesis.
+    pub genesis: EpochInfo<V, C::PublicKey, network::Addresses<C::PublicKey>>,
+    /// Immutable lookup addresses for every committee-eligible validator.
+    pub eligible_peers: Map<C::PublicKey, Address>,
+    /// Plaintext validator-local storage for DKG private material.
+    ///
+    /// [`crate::secret_store::FileSecretStore`] is explicitly not a
+    /// production-grade secret manager.
+    pub secret_store: crate::secret_store::FileSecretStore,
+    /// Static namespace used for DKG transcripts.
+    pub dkg_namespace: &'static [u8],
     pub input: I,
     pub partition_prefix: String,
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub startup: StartupMode,
+    /// Finalized blocks per epoch.
+    ///
+    /// Production validators use [`EPOCH_LENGTH`]. Keeping this explicit lets
+    /// deterministic actor-level tests exercise several resharing boundaries
+    /// without finalizing thousands of blocks.
+    pub blocks_per_epoch: NonZero<u64>,
     pub sync_config: SyncEngineConfig,
     pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
-    pub block_codec: BlockCfg,
+    pub block_codec: EngineBlockCfg<C, V>,
     pub prunable_items_per_section: NonZero<u64>,
     /// Capacity in bytes of the state QMDB page cache.
     ///
@@ -187,23 +228,36 @@ where
     /// from the state cache so backfill and replay scans cannot evict its
     /// working set.
     pub other_page_cache_bytes: usize,
-    pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
-    /// Optional external observer of the simplex activity stream. The marshal
-    /// reporter is always wired up; this slot is fanned out via
-    /// [`commonware_consensus::Reporters`] so primaries that pass `None`
-    /// behave exactly as before.
+    /// Optional external observer for finalized simplex certificates.
+    ///
+    /// The DKG orchestrator installs marshal as each epoch's simplex reporter.
+    /// The engine recreates finalization activity for this observer from
+    /// marshal's ordered finalized-block stream.
     pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
-    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, St>>,
+    #[expect(
+        clippy::type_complexity,
+        reason = "the hook is parameterized by the engine's full block payload"
+    )]
+    pub finalized_hook: Option<
+        FinalizedHookFn<
+            E,
+            Commitment,
+            H,
+            C::PublicKey,
+            Payload<V, C, network::Addresses<C::PublicKey>>,
+            St,
+        >,
+    >,
 }
 
 /// Fully assembled validator engine.
 pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
-    C: Signer,
-    M: Manager<PublicKey = C::PublicKey>,
+    C: Signer<PublicKey = ed25519::PublicKey>,
+    M: AddressableManager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
@@ -212,6 +266,10 @@ where
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    EngineBlock<H, C, V>: ReshareBlock<Variant = V, Signer = C, Directory = network::Addresses<C::PublicKey>>
+        + Digestible<Digest = H::Digest>
+        + Read<Cfg = EngineBlockCfg<C, V>>,
+    CodingBlock<H, C, V>: Digestible<Digest = H::Digest>,
 {
     context: ContextCell<E>,
     signer: C,
@@ -219,17 +277,19 @@ where
     blocker: B,
     state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, St>,
     transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, St>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, St>,
-    shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
-    shard_mailbox: ShardsMailbox<H, C::PublicKey>,
+    committee_resolver: CommitteeResolverActor<E, C::PublicKey, M, B, H, St>,
+    probe: Handle<()>,
+    stateful: StatefulApp<E, H, C, V, I, St>,
+    stateful_mailbox: AppMailbox<E, H, C, V, I, St>,
+    shards: ShardsEngine<E, B, M, H, C, V, St>,
+    shard_mailbox: ShardsMailbox<H, C, V>,
     #[expect(
         clippy::type_complexity,
         reason = "marshal actor type is inherently complex"
     )]
     marshal: MarshalActor<
         E,
-        EngineVariant<H, C::PublicKey>,
+        EngineVariant<H, C, V>,
         SchemeProvider<C::PublicKey, V>,
         PrunableArchive<
             EightCap,
@@ -237,24 +297,40 @@ where
             H::Digest,
             Finalization<ThresholdScheme<C::PublicKey, V>, Commitment>,
         >,
-        PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
+        PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C, V>>,
         FixedEpocher,
         St,
     >,
     #[cfg(all(test, feature = "test-utils"))]
-    marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
+    marshal_mailbox: EngineMarshalMailbox<H, C, V>,
     #[cfg(all(test, feature = "test-utils"))]
     startup_sync_floor: Option<EngineFinalization<C::PublicKey, V>>,
     #[cfg(all(test, feature = "test-utils"))]
     genesis_commitment: Commitment,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
+    reshare: DkgReshareActor<E, M, B, H, V, C, St, BV>,
+    reshare_mailbox: reshare::Mailbox<EngineBlock<H, C, V>, V, C>,
+    orchestrator: DkgOrchestratorActor<E, M, B, H, V, C, L, St, I>,
+    orchestrator_mailbox: orchestrator::Mailbox<EngineBlock<H, C, V>>,
+    #[expect(
+        clippy::type_complexity,
+        reason = "the compatibility actor carries the engine's marshal variant"
+    )]
+    simplex_observer: Option<
+        crate::simplex_observer::Actor<
+            E,
+            ThresholdScheme<C::PublicKey, V>,
+            EngineVariant<H, C, V>,
+            O,
+        >,
+    >,
+    simplex_observer_mailbox: Option<crate::simplex_observer::Mailbox<EngineBlock<H, C, V>>>,
 }
 
 impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
-    C: Signer,
-    M: Manager<PublicKey = C::PublicKey>,
+    C: Signer<PublicKey = ed25519::PublicKey>,
+    M: AddressableManager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
@@ -263,9 +339,13 @@ where
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    EngineBlock<H, C, V>: ReshareBlock<Variant = V, Signer = C, Directory = network::Addresses<C::PublicKey>>
+        + Digestible<Digest = H::Digest>
+        + Read<Cfg = EngineBlockCfg<C, V>>,
+    CodingBlock<H, C, V>: Digestible<Digest = H::Digest>,
 {
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
+    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C, V> {
         self.marshal_mailbox.clone()
     }
 
@@ -285,6 +365,12 @@ where
         self.stateful_mailbox.subscribe_databases().await.0
     }
 
+    /// Returns the committed committee database once stateful initialization
+    /// completes.
+    pub async fn subscribe_committee(&self) -> CommitteeSyncDb<E, H, St> {
+        self.stateful_mailbox.subscribe_databases().await.2
+    }
+
     /// Returns a standalone future that resolves to the state database once
     /// the stateful actor has initialized it.
     ///
@@ -298,9 +384,26 @@ where
         async move { mailbox.subscribe_databases().await.0 }
     }
 
-    /// Initializes the full engine stack.
+    /// Returns a standalone future for the committed committee database.
+    pub fn subscribe_committee_detached(
+        &self,
+    ) -> impl std::future::Future<Output = CommitteeSyncDb<E, H, St>> + Send + 'static {
+        let mailbox = self.stateful_mailbox.clone();
+        async move { mailbox.subscribe_databases().await.2 }
+    }
+
+    /// Initializes the full engine stack and starts the DKG probe on its
+    /// dedicated physical channel.
     #[boxed]
-    pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
+    pub async fn new<Sx, Rx>(
+        context: E,
+        config: Config<E, C, M, B, V, St, I, H, O>,
+        dkg_probe_network: (Sx, Rx),
+    ) -> Self
+    where
+        Sx: Sender<PublicKey = C::PublicKey>,
+        Rx: Receiver<PublicKey = C::PublicKey>,
+    {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
@@ -314,11 +417,47 @@ where
                 .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
-        let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
+        let epocher = FixedEpocher::new(config.blocks_per_epoch);
+        let mut secret_store = config.secret_store.clone();
+        if let Some(share) = config.share.clone() {
+            secret_store
+                .put_initial_share(Epoch::zero(), share)
+                .expect("failed to durably seed the initial DKG share");
+        }
+        let epoch_zero_share = secret_store.get_share(Epoch::zero()).await;
         let scheme =
-            threshold_scheme::<C, V>(&consensus_namespace, &config.output, config.share.clone());
-        let provider =
-            ConstantProvider::<ThresholdScheme<C::PublicKey, V>, Epoch>::new(scheme.clone());
+            threshold_scheme::<C, V>(&consensus_namespace, &config.output, epoch_zero_share);
+        let provider = DynamicProvider::default();
+        provider.register(Epoch::zero(), scheme);
+
+        assert_eq!(
+            config.genesis.epoch,
+            Epoch::zero(),
+            "genesis must describe epoch zero"
+        );
+        assert_eq!(
+            config.genesis.output, config.output,
+            "genesis DKG output must match engine configuration",
+        );
+        let dkg_manager = network::AddressableManager::new(config.manager.clone());
+        let (probe_actor, probe_mailbox) = probe::Actor::new(probe::Config {
+            context: context.child("dkg_probe"),
+            manager: dkg_manager.clone(),
+            bootstrap: probe::Bootstrap {
+                epoch: Epoch::zero(),
+                participants: config.genesis.participants(),
+                directory: config.genesis.directory.clone(),
+            },
+            verifier: threshold_scheme::<C, V>(&consensus_namespace, &config.output, None),
+            genesis: config.genesis.clone(),
+            strategy: config.strategy.clone(),
+            blocker: config.blocker.clone(),
+            blocks_per_epoch: config.blocks_per_epoch,
+            retry_timeout: NZDuration!(Duration::from_millis(500)),
+            mailbox_size: MAILBOX_SIZE,
+            block_codec_config: config.block_codec.clone(),
+        });
+        let probe_handle = probe_actor.start(dkg_probe_network);
 
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
@@ -353,6 +492,23 @@ where
                     priority_responses: false,
                 },
             );
+        let (committee_resolver, committee_sync_resolver) =
+            CommitteeResolverActor::<_, C::PublicKey, _, _, H, St>::new(
+                context.child("committee_resolver"),
+                qmdb_resolver::standard::Config {
+                    peer_provider: config.manager.clone(),
+                    blocker: config.blocker.clone(),
+                    database: None,
+                    mailbox_size: MAILBOX_SIZE,
+                    me: Some(config.signer.public_key()),
+                    initial: STATE_SYNC_INITIAL,
+                    timeout: STATE_SYNC_TIMEOUT,
+                    fetch_retry_timeout: STATE_SYNC_RETRY,
+                    priority_requests: false,
+                    priority_responses: false,
+                    max_serve_ops: NZU64!(4096),
+                },
+            );
         let n_participants = u16::try_from(config.output.players().len())
             .expect("participant count must fit in u16");
         let coding_config = coding_config_for_participants(n_participants);
@@ -371,7 +527,7 @@ where
                 &config.partition_prefix,
                 prunable_items_per_section,
             ),
-            init_finalized_blocks_archive::<E, H, C::PublicKey>(
+            init_finalized_blocks_archive::<E, H, C, V>(
                 &context,
                 &page_cache,
                 &config.partition_prefix,
@@ -384,10 +540,15 @@ where
             &page_cache,
             config.strategy.clone(),
         );
+        let committee_db_config = committee_db_config(
+            &config.partition_prefix,
+            &storage_page_cache,
+            config.strategy.clone(),
+        );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
         let stateful_startup_context = context.child("stateful_startup");
         let mut startup_plan =
-            SyncPlan::<E, ThresholdScheme<C::PublicKey, V>, EngineVariant<H, C::PublicKey>>::init(
+            SyncPlan::<E, ThresholdScheme<C::PublicKey, V>, EngineVariant<H, C, V>>::init(
                 &stateful_startup_context,
                 stateful_partition_prefix.clone(),
             )
@@ -397,16 +558,20 @@ where
         // stays floorless so marshal restores its acknowledged progress; only a requested or
         // interrupted state sync discovers a new floor.
         let state_sync_requested = matches!(&config.startup, StartupMode::StateSync);
-        if startup_plan.should_state_sync(state_sync_requested) {
-            let finalization = config
-                .probe
-                .as_ref()
-                .expect("state sync requires a probe mailbox")
+        let probe_artifact = if startup_plan.should_state_sync(state_sync_requested) {
+            let artifact = probe_mailbox
                 .subscribe()
                 .await
                 .expect("probe actor exited before selecting a state-sync floor");
-            startup_plan = startup_plan.with_floor(finalization);
-        }
+            provider.register(
+                artifact.info.epoch,
+                threshold_scheme::<C, V>(&consensus_namespace, &artifact.info.output, None),
+            );
+            startup_plan = startup_plan.with_floor(artifact.floor.clone());
+            Some(artifact)
+        } else {
+            None
+        };
 
         // The canonical genesis is a pure function of configuration: the leader, the
         // participant-derived coding config, and the canonical empty-database roots.
@@ -417,22 +582,25 @@ where
             0,
             <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
             <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+            <constantinople_application::consensus::CommitteeDb<E, H, EightCap, St> as ManagedDb<
+                E,
+            >>::initial_sync_target(),
+            Payload::EpochInfo(config.genesis.clone()),
         );
-        let coded_genesis = EngineCodedBlock::new(genesis_block, coding_config, &config.strategy);
+        let coded_genesis =
+            EngineCodedBlock::<H, C, V>::new(genesis_block, coding_config, &config.strategy);
         let application_genesis =
-            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(coded_genesis.clone());
-        let (application_state_target, application_transactions_target) =
-            block_targets(&application_genesis);
+            <EngineVariant<H, C, V> as MarshalVariant>::into_inner(coded_genesis.clone());
+        let (
+            application_state_target,
+            application_transactions_target,
+            application_committee_target,
+        ) = block_targets(&application_genesis);
 
         #[cfg(all(test, feature = "test-utils"))]
         let startup_sync_floor = startup_plan.floor().cloned();
-        // Simplex adopts the peer floor only for state sync. Otherwise it independently replays
-        // its journal from canonical genesis while marshal restores application progress.
+        #[cfg(all(test, feature = "test-utils"))]
         let genesis_commitment = coded_genesis.commitment();
-        let simplex_floor = startup_plan.floor().map_or_else(
-            || SimplexFloor::Genesis(genesis_commitment),
-            |finalization| SimplexFloor::Finalized(finalization.clone()),
-        );
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
         let (marshal, marshal_mailbox, _) = MarshalActor::init(
@@ -445,7 +613,7 @@ where
                 start: marshal_start,
                 partition_prefix: format!("{}_marshal", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
-                view_retention_timeout: ACTIVITY_TIMEOUT,
+                view_retention: ACTIVITY_TIMEOUT,
                 prunable_items_per_section,
                 page_cache: page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
@@ -458,9 +626,7 @@ where
             },
         )
         .await;
-        if let Some(probe) = &config.probe {
-            probe.attach(marshal_mailbox.clone());
-        }
+        probe_mailbox.attach(marshal_mailbox.clone());
 
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
@@ -487,9 +653,37 @@ where
             config.public_key_cache,
             application_state_target,
             application_transactions_target,
+            application_committee_target,
+            config.genesis.clone(),
+            Committee::new(config.genesis.players.clone())
+                .expect("genesis participants must form a valid committee"),
+            config.eligible_peers.keys().clone(),
             config.finalized_hook,
         );
-        let (stateful, stateful_mailbox) = Stateful::init(
+        let state_sync = probe_artifact.map(|artifact| StateSync {
+            info: artifact.info,
+            floor: startup_plan
+                .floor()
+                .cloned()
+                .expect("DKG state sync requires a stateful floor"),
+        });
+        let fence_epoch = state_sync
+            .as_ref()
+            .map_or_else(Epoch::zero, |state_sync| state_sync.info.epoch);
+        let dkg_state_sync = DkgStateSyncPlan::init(
+            context.child("dkg_state_sync_plan"),
+            DkgStateSyncConfig {
+                partition_prefix: config.partition_prefix.clone(),
+                max_participants: MAX_DKG_PARTICIPANTS,
+                max_supported_mode:
+                    commonware_cryptography::bls12381::primitives::sharing::ModeVersion::v0(),
+                directory_codec_config: RangeCfg::new(0..=MAX_DKG_PARTICIPANTS.get() as usize * 3),
+            },
+            state_sync,
+        )
+        .await;
+
+        let (stateful_actor, stateful_mailbox) = Stateful::init(
             context.child("stateful"),
             StatefulConfig {
                 application,
@@ -500,65 +694,121 @@ where
                         config.strategy.clone(),
                     ),
                     transaction_db_config,
+                    committee_db_config,
                 ),
-                input_provider: config.input,
+                provider: config.input,
                 marshal: marshal_mailbox.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
-                resolvers: (state_sync_resolver, transaction_sync_resolver),
+                resolvers: (
+                    state_sync_resolver,
+                    transaction_sync_resolver,
+                    committee_sync_resolver,
+                ),
                 sync_config: config.sync_config,
                 prune_config: config.prune_config,
             },
         );
+        let committee_subscription = {
+            let stateful_mailbox = stateful_mailbox.clone();
+            async move { stateful_mailbox.subscribe_databases().await.2 }
+        };
+        let participants_provider = CommitteeParticipants::new(
+            context.child("committee_participants"),
+            committee_subscription,
+            config.genesis.players.clone(),
+            config.genesis.next_players.clone(),
+            config.eligible_peers,
+            marshal_mailbox.clone(),
+            config.blocks_per_epoch,
+        );
+        let registrar = Registrar::new(consensus_namespace, provider.clone());
+        let (fence, gate) = Fence::new(fence_epoch);
+        let (reshare_actor, reshare_mailbox) = reshare::Actor::new(
+            context.child("reshare"),
+            reshare::Config {
+                signer: config.signer.clone(),
+                manager: dkg_manager.clone(),
+                blocker: config.blocker.clone(),
+                participants_provider,
+                secret_store,
+                strategy: config.strategy.clone(),
+                registrar,
+                marshal: marshal_mailbox.clone(),
+                state_sync: dkg_state_sync.clone(),
+                fence,
+                namespace: config.dkg_namespace,
+                sharing_mode: Mode::NonZeroCounter,
+                mailbox_size: MAILBOX_SIZE,
+                partition_prefix: format!("{}_reshare", config.partition_prefix),
+                max_participants: MAX_DKG_PARTICIPANTS,
+                blocks_per_epoch: config.blocks_per_epoch,
+                batch_verifier: std::marker::PhantomData::<BV>,
+            },
+        );
 
+        let reshare_application = reshare::Application::new(
+            stateful_mailbox.clone(),
+            reshare_mailbox.clone(),
+            config.blocks_per_epoch,
+        );
         let application = Marshaled::new(
             context.child("application"),
             MarshaledConfig {
-                application: stateful_mailbox.clone(),
+                application: reshare_application,
                 marshal: marshal_mailbox.clone(),
                 shards: shard_mailbox.clone(),
-                scheme_provider: provider,
+                scheme_provider: provider.clone(),
                 strategy: config.strategy.clone(),
-                epocher,
+                epocher: epocher.clone(),
             },
         );
-        // Fan simplex activity to the marshal mailbox and any external
-        // observer (e.g. the indexer's certificate publisher). When
-        // `simplex_observer` is `None`, this combinator is equivalent to
-        // forwarding activity to the marshal mailbox alone — primaries that
-        // pass `None` see exactly the previous behavior.
-        #[cfg(all(test, feature = "test-utils"))]
-        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
-            Reporters::from((marshal_mailbox.clone(), config.simplex_observer));
-        #[cfg(not(all(test, feature = "test-utils")))]
-        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
-            Reporters::from((marshal_mailbox, config.simplex_observer));
-
-        let simplex = simplex::Engine::new(
-            context.child("simplex"),
-            simplex::Config {
-                scheme,
-                elector: L::default(),
-                blocker: config.blocker.clone(),
-                automaton: application.clone(),
-                relay: application,
-                reporter: simplex_reporter,
+        let (orchestrator_actor, orchestrator_mailbox) = orchestrator::Actor::new(
+            context.child("orchestrator"),
+            orchestrator::Config {
+                oracle: config.blocker.clone(),
+                manager: dkg_manager,
+                provider,
+                marshal: marshal_mailbox.clone(),
+                application,
                 strategy: config.strategy.clone(),
-                partition: format!("{}_simplex", config.partition_prefix),
+                simplex: orchestrator::SimplexConfig {
+                    elector: L::default(),
+                    mailbox_size: MAILBOX_SIZE,
+                    replay_buffer: REPLAY_BUFFER,
+                    write_buffer: WRITE_BUFFER,
+                    page_cache_page_size: PAGE_CACHE_PAGE_SIZE,
+                    page_cache_pages: NonZero::new(
+                        config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()),
+                    )
+                    .expect("simplex page cache must hold at least one page"),
+                    leader_timeout: Duration::from_secs(4),
+                    certification_timeout: Duration::from_secs(8),
+                    timeout_retry: Duration::from_secs(10),
+                    fetch_timeout: Duration::from_secs(4),
+                    fetch_concurrent: NZUsize!(32),
+                    view_retention: ACTIVITY_TIMEOUT,
+                    skip_timeout: Duration::from_secs(11),
+                    forwarding: simplex::ForwardingPolicy::Disabled,
+                },
+                gate,
+                state_sync: dkg_state_sync,
+                blocks_per_epoch: config.blocks_per_epoch,
+                muxer_size: DKG_MUXER_SIZE,
                 mailbox_size: MAILBOX_SIZE,
-                epoch: Epoch::zero(),
-                floor: simplex_floor,
-                replay_buffer: NZUsize!(1024 * 1024),
-                write_buffer: NZUsize!(1024 * 1024),
-                page_cache,
-                leader_timeout: Duration::from_secs(4),
-                certification_timeout: Duration::from_secs(8),
-                timeout_retry: Duration::from_secs(10),
-                fetch_timeout: Duration::from_secs(4),
-                activity_timeout: ACTIVITY_TIMEOUT,
-                skip_timeout: ViewDelta::new(10),
-                fetch_concurrent: NZUsize!(32),
-                forwarding: simplex::ForwardingPolicy::Disabled,
+                partition_prefix: format!("{}_orchestrator", config.partition_prefix),
+            },
+        );
+        let (simplex_observer, simplex_observer_mailbox) = config.simplex_observer.map_or_else(
+            || (None, None),
+            |observer| {
+                let (actor, mailbox) = crate::simplex_observer::Actor::new(
+                    context.child("simplex_observer"),
+                    marshal_mailbox.clone(),
+                    observer,
+                    MAILBOX_SIZE,
+                );
+                (Some(actor), Some(mailbox))
             },
         );
 
@@ -569,7 +819,9 @@ where
             blocker: config.blocker,
             state_resolver,
             transaction_resolver,
-            stateful,
+            committee_resolver,
+            probe: probe_handle,
+            stateful: stateful_actor,
             stateful_mailbox,
             shards,
             shard_mailbox,
@@ -580,7 +832,12 @@ where
             startup_sync_floor,
             #[cfg(all(test, feature = "test-utils"))]
             genesis_commitment,
-            simplex,
+            reshare: reshare_actor,
+            reshare_mailbox,
+            orchestrator: orchestrator_actor,
+            orchestrator_mailbox,
+            simplex_observer,
+            simplex_observer_mailbox,
         }
     }
 
@@ -593,7 +850,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey> + Send + 'static,
         Rx: Receiver<PublicKey = C::PublicKey> + Send + 'static,
-        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<EngineBlock<H, C, V>>>,
     {
         spawn_cell!(self.context, self.run(channels, reporter))
     }
@@ -602,7 +859,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey>,
         Rx: Receiver<PublicKey = C::PublicKey>,
-        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<EngineBlock<H, C, V>>>,
     {
         let resolver_context = self.context.into_present();
         let marshal_resolver = marshal_resolver::init(
@@ -625,28 +882,73 @@ where
         let transaction_resolver_handle = self
             .transaction_resolver
             .start(channels.transaction_resolver);
+        let committee_resolver_handle = self.committee_resolver.start(channels.committee_resolver);
         let shard_handle = self.shards.start(channels.marshal);
         let stateful_handle = self.stateful.start();
+        let probe_handle = self.probe;
+        let reshare_handle = self.reshare.start(channels.dkg);
+        let orchestrator_handle =
+            self.orchestrator
+                .start(channels.votes, channels.certificates, channels.resolver);
+        let simplex_observer_handle = self
+            .simplex_observer
+            .map(crate::simplex_observer::Actor::start);
 
-        let reporters: Reporters<Update<EngineBlock<H, C::PublicKey>>, _, Rep> =
-            Reporters::from((self.stateful_mailbox, reporter));
+        // Avoid constructing an always-present empty `Reporters`: cloning an
+        // `Update::Block` for such a branch would clone and then cancel its
+        // acknowledgement when the empty branch drops it.
+        #[expect(
+            clippy::type_complexity,
+            reason = "the annotation selects the Option/Option Reporters constructor"
+        )]
+        let supplemental_reporters: Option<
+            Reporters<
+                Update<EngineBlock<H, C, V>>,
+                crate::simplex_observer::Mailbox<EngineBlock<H, C, V>>,
+                Rep,
+            >,
+        > = if self.simplex_observer_mailbox.is_some() || reporter.is_some() {
+            Some(Reporters::from((self.simplex_observer_mailbox, reporter)))
+        } else {
+            None
+        };
+        #[expect(
+            clippy::type_complexity,
+            reason = "the annotation selects the reporter/Option Reporters constructor"
+        )]
+        let reshare_reporters: Reporters<
+            Update<EngineBlock<H, C, V>>,
+            reshare::Mailbox<EngineBlock<H, C, V>, V, C>,
+            Reporters<
+                Update<EngineBlock<H, C, V>>,
+                crate::simplex_observer::Mailbox<EngineBlock<H, C, V>>,
+                Rep,
+            >,
+        > = Reporters::from((self.reshare_mailbox, supplemental_reporters));
+        let reporters = Reporters::from((
+            self.stateful_mailbox,
+            Reporters::from((self.orchestrator_mailbox, reshare_reporters)),
+        ));
         let marshal_handle = self
             .marshal
             .start(reporters, self.shard_mailbox, marshal_resolver);
-        let simplex_handle =
-            self.simplex
-                .start(channels.votes, channels.certificates, channels.resolver);
 
-        if let Err(error) = try_join_all(vec![
+        let mut handles = vec![
+            probe_handle,
             state_resolver_handle,
             transaction_resolver_handle,
+            committee_resolver_handle,
             shard_handle,
             stateful_handle,
+            reshare_handle,
+            orchestrator_handle,
             marshal_handle,
-            simplex_handle,
-        ])
-        .await
-        {
+        ];
+        if let Some(handle) = simplex_observer_handle {
+            handles.push(handle);
+        }
+
+        if let Err(error) = try_join_all(handles).await {
             error!(?error, "engine task failed");
         } else {
             warn!("engine stopped");
@@ -673,15 +975,17 @@ where
     }
 }
 
-fn block_targets<H, P>(
-    block: &EngineBlock<H, P>,
+fn block_targets<H, C, V>(
+    block: &EngineBlock<H, C, V>,
 ) -> (
     StateSyncTarget<H::Digest>,
     TransactionHistoryTarget<H::Digest>,
+    CommitteeSyncTarget<H::Digest>,
 )
 where
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     (
         StateSyncTarget::new(
@@ -695,6 +999,13 @@ where
             root: block.header.transactions_root,
             leaf_count: mmr::Location::new(block.header.transactions_range.end()),
         },
+        CommitteeSyncTarget::new(
+            block.header.committee_root,
+            non_empty_range!(
+                mmr::Location::new(block.header.committee_range.start()),
+                mmr::Location::new(block.header.committee_range.end())
+            ),
+        ),
     )
 }
 
@@ -732,17 +1043,18 @@ where
     archive
 }
 
-async fn init_finalized_blocks_archive<E, H, P>(
+async fn init_finalized_blocks_archive<E, H, C, V>(
     context: &E,
     page_cache: &CacheRef,
     partition_prefix: &str,
-    block_codec: &BlockCfg,
+    block_codec: &EngineBlockCfg<C, V>,
     items_per_section: NonZero<u64>,
-) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, P>>
+) -> PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C, V>>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
-    P: PublicKey,
+    C: Signer,
+    V: Variant,
 {
     let start = Instant::now();
     let archive = prunable::Archive::init(
@@ -791,6 +1103,8 @@ where
         },
         translator: EightCap,
         init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -813,5 +1127,35 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         commit_codec_config: (),
+    }
+}
+
+fn committee_db_config<T>(
+    partition_prefix: &str,
+    page_cache: &CacheRef,
+    strategy: T,
+) -> FixedConfig<EightCap, T>
+where
+    T: Strategy,
+{
+    FixedConfig {
+        merkle_config: MmrConfig {
+            journal_partition: format!("{partition_prefix}-committee-journal"),
+            metadata_partition: format!("{partition_prefix}-committee-metadata"),
+            items_per_blob: ITEMS_PER_BLOB,
+            write_buffer: DB_WRITE_BUFFER,
+            strategy,
+            page_cache: page_cache.clone(),
+        },
+        journal_config: FixedJournalConfig {
+            partition: format!("{partition_prefix}-committee-log"),
+            items_per_blob: ITEMS_PER_BLOB,
+            page_cache: page_cache.clone(),
+            write_buffer: DB_WRITE_BUFFER,
+        },
+        translator: EightCap,
+        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }

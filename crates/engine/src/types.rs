@@ -4,11 +4,15 @@
 //! coding, marshal, probe, and finalization types that appear throughout the
 //! engine and test modules.
 
-use crate::ThresholdScheme;
+use crate::{
+    CommitteeParticipants, DynamicProvider, Registrar, ThresholdScheme,
+    secret_store::FileSecretStore,
+};
 use commonware_actor::Feedback;
+use commonware_codec::Read;
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
-    Reporter, Reporters,
+    Reporter,
     marshal::{
         coding::{
             Coding, Marshaled, shards,
@@ -17,38 +21,63 @@ use commonware_consensus::{
         core::Mailbox as MarshalMailbox,
     },
     simplex::{self, types::Finalization},
-    types::{Epoch, FixedEpocher, coding::Commitment},
+    types::{FixedEpocher, coding::Commitment},
 };
-use commonware_cryptography::{
-    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
+use commonware_cryptography::{Hasher, PublicKey, Signer, bls12381::primitives::variant::Variant};
+use commonware_glue::{
+    dkg::{network, orchestrator, reshare, types::Payload},
+    stateful::{Stateful, db::Shared},
 };
-use commonware_glue::stateful::Stateful;
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
-use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_application::consensus::{
-    Application, TransactionHistoryDb, TransactionHistoryOperation,
+    Application, CommitteeDatabase, CommitteeDb, CommitteeOperation, TransactionHistoryDb,
+    TransactionHistoryOperation,
 };
-use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
-use std::{marker::PhantomData, sync::Arc};
+use constantinople_primitives::{Account, AccountKey, Block, BlockCfg, Header, Sealed};
+use std::marker::PhantomData;
 
 /// A finalized block with its seal (commitment-based).
-pub type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
+pub type EngineBlock<H, C, V> = Sealed<
+    Block<
+        Commitment,
+        <C as Signer>::PublicKey,
+        H,
+        Payload<V, C, network::Addresses<<C as Signer>::PublicKey>>,
+    >,
+    H,
+>;
 
 /// The digestible execution header portion of an [`EngineBlock`].
-pub type EngineHeader<H, P> = Sealed<Header<Commitment, <H as Hasher>::Digest, P>, H>;
+pub type EngineHeader<H, C, V> = Sealed<
+    Header<
+        Commitment,
+        <H as Hasher>::Digest,
+        <C as Signer>::PublicKey,
+        Payload<V, C, network::Addresses<<C as Signer>::PublicKey>>,
+    >,
+    H,
+>;
 
 /// The erasure-coding variant used by the marshal for block availability.
-pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
+pub type EngineVariant<H, C, V> =
+    Coding<EngineBlock<H, C, V>, ReedSolomon<H>, H, <C as Signer>::PublicKey>;
 
 /// A marshal-coded engine block.
-pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
+pub type EngineCodedBlock<H, C, V> = CodedBlock<EngineBlock<H, C, V>, ReedSolomon<H>, H>;
+
+/// Codec configuration for a block carrying DKG reshare payloads.
+pub type EngineBlockCfg<C, V> =
+    BlockCfg<<Payload<V, C, network::Addresses<<C as Signer>::PublicKey>> as Read>::Cfg>;
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
-pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
+pub type EngineMarshalMailbox<H, C, V> =
+    MarshalMailbox<ThresholdScheme<<C as Signer>::PublicKey, V>, EngineVariant<H, C, V>>;
 
 /// Probe mailbox parameterized over the engine's threshold scheme.
-pub type EngineProbeMailbox<H, P, V> =
-    commonware_glue::stateful::probe::Mailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
+pub type EngineProbeMailbox<H, C, V> = commonware_glue::stateful::probe::Mailbox<
+    ThresholdScheme<<C as Signer>::PublicKey, V>,
+    EngineVariant<H, C, V>,
+>;
 
 /// A finalization certificate over the engine's threshold scheme.
 pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;
@@ -94,11 +123,11 @@ where
     }
 }
 
-pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
+pub(crate) type CodingBlock<H, C, V> = StoredCodedBlock<EngineBlock<H, C, V>, ReedSolomon<H>, H>;
 
 pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
 
-pub type StateSyncDb<E, H, T> = Arc<TracedAsyncRwLock<StateDb<E, H, T>>>;
+pub type StateSyncDb<E, H, T> = Shared<StateDb<E, H, T>>;
 
 pub(crate) type StateResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::p2p::standard::Mailbox<
@@ -113,7 +142,7 @@ pub(crate) type StateResolverActor<E, P, M, B, H, T> =
 
 pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
-pub type TransactionSyncDb<E, H, T> = Arc<TracedAsyncRwLock<TransactionDb<E, H, T>>>;
+pub type TransactionSyncDb<E, H, T> = Shared<TransactionDb<E, H, T>>;
 
 pub(crate) type TransactionResolverMailbox<E, H, T> =
     commonware_glue::stateful::db::p2p::compact::Mailbox<
@@ -134,54 +163,116 @@ pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
         H,
     >;
 
-pub(crate) type App<E, H, P, V, I, B, St> =
-    Application<E, H, Commitment, ThresholdScheme<P, V>, P, I, B, St>;
+pub type CommitteeSyncDb<E, H, T> = CommitteeDatabase<E, H, EightCap, T>;
 
-pub(crate) type AppMailbox<E, H, P, V, I, B, St> =
-    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, St>>;
+pub(crate) type CommitteeResolverMailbox<E, H, T> =
+    commonware_glue::stateful::db::p2p::standard::Mailbox<
+        CommitteeDb<E, H, EightCap, T>,
+        mmr::Family,
+        CommitteeOperation,
+        <H as Hasher>::Digest,
+    >;
 
-pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
+pub(crate) type CommitteeResolverActor<E, P, M, B, H, T> =
+    commonware_glue::stateful::db::p2p::standard::Actor<
+        E,
+        P,
+        M,
+        B,
+        mmr::Family,
+        CommitteeDb<E, H, EightCap, T>,
+    >;
 
-pub(crate) type StatefulApp<E, H, P, V, I, B, St> = Stateful<
+pub(crate) type App<E, H, C, V, I, St> = Application<
     E,
-    App<E, H, P, V, I, B, St>,
-    ThresholdScheme<P, V>,
-    EngineVariant<H, P>,
+    H,
+    Commitment,
+    ThresholdScheme<<C as Signer>::PublicKey, V>,
+    <C as Signer>::PublicKey,
+    I,
+    Payload<V, C, network::Addresses<<C as Signer>::PublicKey>>,
+    St,
+>;
+
+pub(crate) type AppMailbox<E, H, C, V, I, St> =
+    commonware_glue::stateful::Mailbox<E, App<E, H, C, V, I, St>>;
+
+pub(crate) type SchemeProvider<P, V> = DynamicProvider<P, V>;
+
+pub(crate) type StatefulApp<E, H, C, V, I, St> = Stateful<
+    E,
+    App<E, H, C, V, I, St>,
+    ThresholdScheme<<C as Signer>::PublicKey, V>,
+    EngineVariant<H, C, V>,
     (
         StateResolverMailbox<E, H, St>,
         TransactionResolverMailbox<E, H, St>,
+        CommitteeResolverMailbox<E, H, St>,
     ),
 >;
 
-pub(crate) type MarshaledApp<E, H, P, V, I, B, St> = Marshaled<
+pub(crate) type ReshareApp<E, H, C, V, I, St> =
+    reshare::Application<AppMailbox<E, H, C, V, I, St>, EngineBlock<H, C, V>, V, C>;
+
+pub(crate) type MarshaledApp<E, H, C, V, I, St> = Marshaled<
     E,
-    AppMailbox<E, H, P, V, I, B, St>,
-    EngineBlock<H, P>,
+    ReshareApp<E, H, C, V, I, St>,
+    EngineBlock<H, C, V>,
     ReedSolomon<H>,
     H,
-    SchemeProvider<P, V>,
+    SchemeProvider<<C as Signer>::PublicKey, V>,
     St,
     FixedEpocher,
 >;
 
-pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
-    shards::Engine<E, SchemeProvider<P, V>, B, M, ReedSolomon<H>, H, EngineBlock<H, P>, P, T>;
-
-pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
-
-/// Reporter combinator that fans simplex activity to the marshal mailbox and
-/// an optional external observer (e.g. the indexer's certificate publisher).
-pub(crate) type SimplexReporter<H, P, V, O> =
-    Reporters<EngineActivity<P, V>, EngineMarshalMailbox<H, P, V>, O>;
-
-pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
+pub(crate) type ShardsEngine<E, B, M, H, C, V, T> = shards::Engine<
     E,
-    ThresholdScheme<P, V>,
-    L,
+    SchemeProvider<<C as Signer>::PublicKey, V>,
     B,
-    Commitment,
-    MarshaledApp<E, H, P, V, I, BV, St>,
-    MarshaledApp<E, H, P, V, I, BV, St>,
-    SimplexReporter<H, P, V, O>,
+    M,
+    ReedSolomon<H>,
+    H,
+    EngineBlock<H, C, V>,
+    <C as Signer>::PublicKey,
+    T,
+>;
+
+pub(crate) type ShardsMailbox<H, C, V> =
+    shards::Mailbox<EngineBlock<H, C, V>, ReedSolomon<H>, H, <C as Signer>::PublicKey>;
+
+pub(crate) type DkgManager<M> = network::AddressableManager<M>;
+
+pub(crate) type DkgReshareActor<E, M, B, H, V, C, St, BV> = reshare::Actor<
+    E,
+    EngineBlock<H, C, V>,
+    V,
+    C,
+    DkgManager<M>,
+    B,
+    CommitteeParticipants<
+        E,
+        H,
+        St,
+        ThresholdScheme<<C as Signer>::PublicKey, V>,
+        EngineVariant<H, C, V>,
+    >,
+    FileSecretStore,
+    St,
+    BV,
+    ThresholdScheme<<C as Signer>::PublicKey, V>,
+    EngineVariant<H, C, V>,
+    Registrar<<C as Signer>::PublicKey, V>,
+>;
+
+pub(crate) type DkgOrchestratorActor<E, M, B, H, V, C, L, St, I> = orchestrator::Actor<
+    E,
+    B,
+    DkgManager<M>,
+    SchemeProvider<<C as Signer>::PublicKey, V>,
+    EngineVariant<H, C, V>,
+    V,
+    C,
+    MarshaledApp<E, H, C, V, I, St>,
+    L,
     St,
 >;

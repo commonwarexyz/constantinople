@@ -8,23 +8,30 @@
 //!
 //! - stateful QMDB management
 //! - erasure-coded marshal
-//! - fixed-epoch threshold simplex consensus
+//! - epoch-scoped threshold simplex consensus
+//! - continuous DKG reshare and state-sync recovery
 //!
 //! The public API stays narrow. [`Engine`] owns the assembled actors and
 //! [`Config`] describes the validator-specific inputs needed to initialize
 //! them. Tests can drive the same engine under the deterministic runtime and
 //! simulated networking.
 
+pub mod secret_store;
 pub mod types;
+
+mod dkg;
+mod simplex_observer;
+
+pub use dkg::{CommitteeParticipants, DynamicProvider, FinalizedParticipants, Registrar};
 
 mod engine;
 
 #[doc(inline)]
 pub use engine::{
-    CERTIFICATE_CHANNEL, CHANNELS, Channels, Config, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL,
-    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme,
-    VOTE_CHANNEL,
+    CERTIFICATE_CHANNEL, CHANNELS, COMMITTEE_RESOLVER_CHANNEL, Channels, Config, DKG_CHANNEL,
+    DKG_PROBE_CHANNEL, EPOCH_LENGTH, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
+    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
 };
 
 #[cfg(all(test, feature = "test-utils"))]
