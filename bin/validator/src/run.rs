@@ -257,7 +257,7 @@ type EngineFinalizedHook = FinalizedHookFn<
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, ed25519::PrivateKey, MinSig>;
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
-type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
+type CursorMetadata<E = RuntimeContext> = Metadata<E, U64, U64>;
 
 /// Logs every finalized block delivered by marshal.
 ///
@@ -449,6 +449,7 @@ impl LazyPublisher {
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
     metadata: Arc<Mutex<Option<CursorMetadata>>>,
+    metadata_partition: Arc<str>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
     publisher: Arc<LazyPublisher>,
 }
@@ -461,7 +462,10 @@ struct FinalizedUploadCursor {
 }
 
 impl FinalizedUploadCursor {
-    fn from_metadata(metadata: &CursorMetadata) -> Option<Self> {
+    fn from_metadata<E>(metadata: &CursorMetadata<E>) -> Option<Self>
+    where
+        E: commonware_storage::Context,
+    {
         let state_next = metadata.get(&CURSOR_STATE_KEY).cloned().map(u64::from);
         let transaction_next = metadata
             .get(&CURSOR_TRANSACTION_KEY)
@@ -574,7 +578,13 @@ impl FinalizedUploadProducer {
             let next = FinalizedUploadCursor::from_upload(&upload);
             match self.writer.enqueue(upload).await {
                 Ok(position) => {
-                    persist_finalized_cursor(&self.metadata, next).await;
+                    persist_finalized_cursor(
+                        self.publisher.context.child("finalized_cursor_retry"),
+                        &self.metadata_partition,
+                        &self.metadata,
+                        next,
+                    )
+                    .await;
                     *cursor = next;
                     info!(
                         height = block.header.height,
@@ -600,23 +610,64 @@ impl FinalizedUploadProducer {
     }
 }
 
-async fn persist_finalized_cursor(
-    metadata: &Arc<Mutex<Option<CursorMetadata>>>,
+async fn persist_finalized_cursor<E>(
+    context: E,
+    partition: &str,
+    metadata: &Arc<Mutex<Option<CursorMetadata<E>>>>,
     cursor: FinalizedUploadCursor,
-) {
-    let mut slot = metadata.lock().await;
-    let mut store = slot
-        .take()
-        .expect("finalized index cursor metadata must be present");
-    store.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-    store.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-    store.put(CURSOR_COMMITTEE_KEY, U64::new(cursor.committee_next));
-    *slot = Some(
-        store
-            .sync()
+) where
+    E: commonware_storage::Context,
+{
+    loop {
+        let mut slot = metadata.lock().await;
+        let mut store = match slot.take() {
+            Some(store) => store,
+            None => match Metadata::init(
+                context.child("reopen"),
+                MetadataConfig {
+                    partition: partition.to_string(),
+                    codec_config: (),
+                },
+            )
             .await
-            .expect("failed to persist finalized index cursor"),
-    );
+            {
+                Ok(store) => store,
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        cursor.state_next,
+                        cursor.transaction_next,
+                        cursor.committee_next,
+                        "failed to reopen finalized index cursor, retrying",
+                    );
+                    drop(slot);
+                    context.sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+        store.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+        store.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+        store.put(CURSOR_COMMITTEE_KEY, U64::new(cursor.committee_next));
+
+        match store.sync().await {
+            Ok(store) => {
+                *slot = Some(store);
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    cursor.state_next,
+                    cursor.transaction_next,
+                    cursor.committee_next,
+                    "failed to persist finalized index cursor, retrying",
+                );
+            }
+        }
+        drop(slot);
+        context.sleep(Duration::from_secs(1)).await;
+    }
 }
 
 async fn scan_finalized_queue_cursor(
@@ -838,10 +889,11 @@ async fn maybe_build_indexer(
     )
     .await
     .expect("failed to initialize finalized index queue");
+    let metadata_partition: Arc<str> = format!("{partition_prefix}-finalized-index-cursor").into();
     let mut metadata = Metadata::init(
         context.child("finalized_cursor"),
         MetadataConfig {
-            partition: format!("{partition_prefix}-finalized-index-cursor"),
+            partition: metadata_partition.to_string(),
             codec_config: (),
         },
     )
@@ -863,6 +915,7 @@ async fn maybe_build_indexer(
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         metadata,
+        metadata_partition,
         cursor: Arc::new(Mutex::new(cursor)),
         publisher: publisher.clone(),
     };
@@ -1302,8 +1355,8 @@ mod tests {
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedBlockLogger,
         FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor, IndexerReporter,
         ValidatorPayload, add_persistent_secondaries, default_mempool_drop_grace_blocks,
-        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
-        wait_for_critical_task_exit,
+        maybe_build_indexer, persist_finalized_cursor, recovered_finalized_upload_cursor,
+        scan_finalized_queue_cursor, wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
     use commonware_actor::Feedback;
@@ -1320,9 +1373,13 @@ mod tests {
         sha256::{Digest as Sha256Digest, Sha256},
     };
     use commonware_p2p::{Address, AddressableTrackedPeers};
-    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_runtime::{
+        Clock as _, Runner as _, Spawner as _, Supervisor as _, deterministic,
+        mocks::{WriteFaultContext, WriteFaults},
+    };
     use commonware_storage::{
         merkle::mmr,
+        metadata::{Config as MetadataConfig, Metadata},
         qmdb::any::{unordered::Operation as UnorderedOperation, value::FixedEncoding},
         queue,
     };
@@ -1334,7 +1391,8 @@ mod tests {
         Account, AccountKey, Block, Header, Sealable, SignedTransaction,
     };
     use futures::FutureExt as _;
-    use std::{future::pending, time::Duration};
+    use std::{future::pending, sync::Arc, time::Duration};
+    use tokio::sync::Mutex;
 
     type TestAccountValue = FixedBytes<{ Account::SIZE }>;
     type TestStateOperation =
@@ -1564,6 +1622,60 @@ mod tests {
                 committee_next: 30,
             }),
         );
+    }
+
+    #[test]
+    fn finalized_cursor_reopens_after_sync_failure() {
+        deterministic::Runner::default().start(|context| async move {
+            let faults = WriteFaults::default();
+            let context = WriteFaultContext {
+                inner: context.child("metadata"),
+                faults: faults.clone(),
+            };
+            let partition = "finalized-cursor-retry";
+            let metadata = Metadata::init(
+                context.child("initial"),
+                MetadataConfig {
+                    partition: partition.to_string(),
+                    codec_config: (),
+                },
+            )
+            .await
+            .expect("metadata initializes");
+            let metadata = Arc::new(Mutex::new(Some(metadata)));
+            let expected = FinalizedUploadCursor {
+                state_next: 10,
+                transaction_next: 20,
+                committee_next: 30,
+            };
+
+            faults.arm();
+            let monitor_metadata = metadata.clone();
+            let monitor_faults = faults.clone();
+            let monitor =
+                context
+                    .inner
+                    .child("sync_failure_monitor")
+                    .spawn(move |context| async move {
+                        loop {
+                            if monitor_metadata.lock().await.is_none() {
+                                monitor_faults.disarm();
+                                return;
+                            }
+                            context.sleep(Duration::from_millis(1)).await;
+                        }
+                    });
+
+            persist_finalized_cursor(context.child("retry"), partition, &metadata, expected).await;
+            monitor.await.expect("sync failure monitor completes");
+
+            let metadata = metadata.lock().await;
+            let metadata = metadata.as_ref().expect("metadata reopens after failure");
+            assert_eq!(
+                FinalizedUploadCursor::from_metadata(metadata),
+                Some(expected)
+            );
+        });
     }
 
     #[test]
