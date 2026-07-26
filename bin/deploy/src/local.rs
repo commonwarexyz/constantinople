@@ -4,8 +4,9 @@ use crate::{
     METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
     QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
     absolute_path, eligible_peer_entries, ensure_output_dir_missing,
-    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    generate_local_cluster_material, indexer_enabled, permanent_secondary_hex, secondary_roles,
+    total_secondaries, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_cryptography::{Signer, ed25519};
@@ -649,6 +650,7 @@ fn build_validators(
     let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
+    let permanent_secondaries = permanent_secondary_hex(args, material);
 
     for index in 0..args.validators {
         let validator_index = index as usize;
@@ -671,6 +673,7 @@ fn build_validators(
             num_validators: args.validators,
             primary_validators: primary_validators.clone(),
             secondary_validators: secondary_validators.clone(),
+            permanent_secondaries: permanent_secondaries.clone(),
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
@@ -713,6 +716,7 @@ fn build_secondaries(
     let eligible_peers = eligible_peer_entries(material);
     let primary_validators = material.primary_hex();
     let secondary_validators = material.secondary_hex();
+    let permanent_secondaries = permanent_secondary_hex(args, material);
 
     for (secondary_index, role) in roles.into_iter().enumerate() {
         let index = secondary_index as u32;
@@ -731,6 +735,7 @@ fn build_secondaries(
             num_validators: args.validators,
             primary_validators: primary_validators.clone(),
             secondary_validators: secondary_validators.clone(),
+            permanent_secondaries: permanent_secondaries.clone(),
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
@@ -1793,6 +1798,7 @@ mod tests {
                     .config
                     .secondary_validators
                     .contains(&indexer_public_key_hex)
+                && validator.config.permanent_secondaries == vec![indexer_public_key_hex.clone()]
                 && validator
                     .config
                     .eligible_peers

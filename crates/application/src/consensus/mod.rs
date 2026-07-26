@@ -34,7 +34,7 @@ use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
-use commonware_utils::ordered::Map;
+use commonware_utils::ordered::{Map, Set};
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{
     future::Future, marker::PhantomData, net::SocketAddr, num::NonZeroU64, pin::Pin, sync::Arc,
@@ -101,6 +101,7 @@ where
     blocks_per_epoch: NonZeroU64,
     initial_committee: Committee,
     initial_next_committee: Committee,
+    permanent_secondaries: Set<ed25519::PublicKey>,
     finalized_hook: Option<FinalizedHookFn<E, C, H, P, R, St>>,
     proposed_transactions: Counter,
     _marker: PhantomData<(E, C, S, I)>,
@@ -131,6 +132,7 @@ where
             blocks_per_epoch: self.blocks_per_epoch,
             initial_committee: self.initial_committee.clone(),
             initial_next_committee: self.initial_next_committee.clone(),
+            permanent_secondaries: self.permanent_secondaries.clone(),
             finalized_hook: self.finalized_hook.clone(),
             proposed_transactions: self.proposed_transactions.clone(),
             _marker: PhantomData,
@@ -169,6 +171,7 @@ where
         eligible_peers_root: H::Digest,
         blocks_per_epoch: NonZeroU64,
         initial_peer_addresses: Map<ed25519::PublicKey, SocketAddr>,
+        permanent_secondaries: Set<ed25519::PublicKey>,
         finalized_hook: Option<FinalizedHookFn<E, C, H, P, Payload<V, D, Dir>, St>>,
     ) -> Self {
         let proposed_transactions = context.counter(
@@ -212,6 +215,7 @@ where
             blocks_per_epoch,
             initial_committee,
             initial_next_committee,
+            permanent_secondaries,
             finalized_hook,
             proposed_transactions,
             _marker: PhantomData,

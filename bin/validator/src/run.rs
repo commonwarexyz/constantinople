@@ -1198,8 +1198,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .expect("failed to initialize validator-local DKG secret store");
 
         // Build indexer wiring from the genesis/bootstrap metadata up-front.
-        // Config loading rejects indexer wiring on genesis primaries, so the
-        // uploader can never start as part of the epoch-zero committee.
+        // Config loading requires uploaders to be permanent secondaries, and
+        // committee execution rejects attempts to promote them.
         let indexer_partition_prefix = decoded.partition_prefix.clone();
         let mut indexer_handle = maybe_build_indexer(
             context.child("indexer"),
@@ -1233,6 +1233,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                     share: decoded.share,
                     genesis,
                     eligible_peers: decoded.eligible_peers.clone(),
+                    permanent_secondaries: decoded.permanent_secondaries,
                     secret_store,
                     dkg_namespace: DKG_NAMESPACE,
                     input: mempool_mailbox.clone(),
@@ -1409,7 +1410,7 @@ mod tests {
     fn bootstrap_secondaries_remain_tracked_across_committee_rotations() {
         let primary = PrivateKey::from_seed(1).public_key();
         let scheduled = PrivateKey::from_seed(2).public_key();
-        let indexer = PrivateKey::from_seed(3).public_key();
+        let bootstrap_secondary = PrivateKey::from_seed(3).public_key();
         let primary_address: Address = "127.0.0.1:1001"
             .parse::<std::net::SocketAddr>()
             .unwrap()
@@ -1418,7 +1419,7 @@ mod tests {
             .parse::<std::net::SocketAddr>()
             .unwrap()
             .into();
-        let indexer_address: Address = "127.0.0.1:1003"
+        let bootstrap_secondary_address: Address = "127.0.0.1:1003"
             .parse::<std::net::SocketAddr>()
             .unwrap()
             .into();
@@ -1426,7 +1427,10 @@ mod tests {
             Map::from_iter_dedup([(primary.clone(), primary_address)]),
             Map::from_iter_dedup([(scheduled.clone(), scheduled_address.clone())]),
         );
-        let persistent = Map::from_iter_dedup([(indexer.clone(), indexer_address.clone())]);
+        let persistent = Map::from_iter_dedup([(
+            bootstrap_secondary.clone(),
+            bootstrap_secondary_address.clone(),
+        )]);
 
         let initial = add_persistent_secondaries(initial, &persistent);
 
@@ -1434,17 +1438,20 @@ mod tests {
         assert!(initial.secondary.get_value(&primary).is_none());
         assert!(initial.secondary.get_value(&scheduled).is_some());
         assert_eq!(
-            initial.secondary.get_value(&indexer),
-            Some(&indexer_address)
+            initial.secondary.get_value(&bootstrap_secondary),
+            Some(&bootstrap_secondary_address)
         );
 
         let promoted = AddressableTrackedPeers::new(
-            Map::from_iter_dedup([(indexer.clone(), indexer_address.clone())]),
+            Map::from_iter_dedup([(
+                bootstrap_secondary.clone(),
+                bootstrap_secondary_address.clone(),
+            )]),
             Map::default(),
         );
         let promoted = add_persistent_secondaries(promoted, &persistent);
-        assert!(promoted.primary.get_value(&indexer).is_some());
-        assert!(promoted.secondary.get_value(&indexer).is_none());
+        assert!(promoted.primary.get_value(&bootstrap_secondary).is_some());
+        assert!(promoted.secondary.get_value(&bootstrap_secondary).is_none());
 
         let rotated = AddressableTrackedPeers::new(
             Map::from_iter_dedup([(scheduled, scheduled_address)]),
@@ -1452,8 +1459,8 @@ mod tests {
         );
         let rotated = add_persistent_secondaries(rotated, &persistent);
         assert_eq!(
-            rotated.secondary.get_value(&indexer),
-            Some(&indexer_address)
+            rotated.secondary.get_value(&bootstrap_secondary),
+            Some(&bootstrap_secondary_address)
         );
     }
 

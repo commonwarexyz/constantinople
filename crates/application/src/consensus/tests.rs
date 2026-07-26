@@ -286,6 +286,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             sha256::Digest::EMPTY,
             NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
             peer_addresses(&eligible_committee_members),
+            Set::default(),
             None,
         ),
         dbs,
@@ -347,6 +348,7 @@ struct ReducerHarness {
     dbs: TestDbs,
     initial: Committee,
     initial_next: Committee,
+    permanent_secondaries: Set<ed25519::PublicKey>,
     sender: ed25519::PrivateKey,
 }
 
@@ -393,6 +395,7 @@ async fn reducer_harness(
         dbs,
         initial,
         initial_next,
+        permanent_secondaries: Set::default(),
         sender,
     }
 }
@@ -419,6 +422,7 @@ async fn execute_committee_block(
         body,
         &harness.initial,
         &harness.initial_next,
+        &harness.permanent_secondaries,
         BLOCKS_PER_EPOCH,
     )
     .await?;
@@ -544,6 +548,23 @@ fn committee_reducer_adds_unknown_peers_and_preserves_addresses_across_blocks() 
         assert_eq!(selected, expected);
         assert_eq!(selected.addresses().get_value(&b), Some(&test_address()));
         assert_eq!(exact_committee_row(&harness.dbs, 2).await, Some(expected));
+    });
+}
+
+#[test]
+fn committee_reducer_rejects_permanent_secondary_addition() {
+    deterministic::Runner::default().start(|context| async move {
+        let sender = ed25519::PrivateKey::from_seed(114);
+        let permanent_secondary = ed25519::PrivateKey::from_seed(115).public_key();
+        let initial = committee(Set::from_iter_dedup([sender.public_key()]));
+        let mut harness = reducer_harness(&context, initial.clone(), initial, sender).await;
+        harness.permanent_secondaries = Set::from_iter_dedup([permanent_secondary.clone()]);
+
+        let transaction = committee_transaction(&harness.sender, permanent_secondary, true, 0);
+        assert_eq!(
+            execute_committee_block(&harness, 1, vec![transaction]).await,
+            Err(super::STATIC_INVALID_TRANSACTION),
+        );
     });
 }
 
@@ -1202,6 +1223,7 @@ fn build_timeout_bounds_refill_rounds() {
             sha256::Digest::EMPTY,
             NonZeroU64::new(BLOCKS_PER_EPOCH).expect("epoch length is non-zero"),
             peer_addresses(&harness.eligible_committee_members),
+            Set::default(),
             None,
         );
 

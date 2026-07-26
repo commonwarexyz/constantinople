@@ -67,7 +67,9 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU16, NZU32, NZU64, NZUsize, non_empty_range, ordered::Map, union,
+    NZDuration, NZU16, NZU32, NZU64, NZUsize, non_empty_range,
+    ordered::{Map, Set},
+    union,
 };
 use constantinople_application::consensus::{
     Application, CommitteeSyncTarget, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
@@ -248,6 +250,8 @@ where
     /// Immutable genesis/bootstrap peer directory committed by genesis.
     /// Finalized committee snapshots provide addresses for later committees.
     pub eligible_peers: Map<C::PublicKey, Address>,
+    /// Peers that must remain non-voting across every epoch.
+    pub permanent_secondaries: Set<C::PublicKey>,
     /// Plaintext validator-local storage for DKG private material.
     ///
     /// [`crate::secret_store::FileSecretStore`] is explicitly not a
@@ -728,6 +732,7 @@ where
             eligible_peers_root,
             config.blocks_per_epoch,
             bootstrap_addresses.clone(),
+            config.permanent_secondaries,
             Some(finalized_hook),
         );
         let state_sync = probe_artifact.map(|artifact| StateSync {

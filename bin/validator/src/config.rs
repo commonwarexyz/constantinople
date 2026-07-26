@@ -13,7 +13,10 @@ use commonware_cryptography::{
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::Address;
-use commonware_utils::{NZU32, TryCollect, ordered::Map};
+use commonware_utils::{
+    NZU32, TryCollect,
+    ordered::{Map, Set},
+};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::Path};
 
@@ -103,6 +106,10 @@ pub struct ValidatorConfig {
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     pub secondary_validators: Vec<String>,
+    /// Hex-encoded ed25519 public keys that must remain non-voting.
+    /// Must be identical across every validator config in the deployment.
+    #[serde(default)]
+    pub permanent_secondaries: Vec<String>,
     /// Logging verbosity.
     pub log_level: String,
     /// Tokio worker threads.
@@ -138,8 +145,8 @@ pub struct ValidatorConfig {
     /// Immutable genesis/bootstrap peer directory committed by the checkpoint.
     /// Later committee snapshots carry their own peer addresses.
     pub eligible_peers: Vec<EligiblePeerEntry>,
-    /// Optional indexer wiring. Honored only for validators that are
-    /// secondaries at genesis; the service remains available after promotion.
+    /// Optional indexer wiring. Honored only for validators configured as
+    /// permanent secondaries, which consensus excludes from future committees.
     #[serde(default)]
     pub indexer: Option<IndexerConfig>,
     /// Optional relayer wiring. Honored only for genesis-secondary validators.
@@ -213,6 +220,8 @@ pub struct DecodedConfig {
     pub primary_participants: Vec<ed25519::PublicKey>,
     /// Secondary (non-voting) validators.
     pub secondary_participants: Vec<ed25519::PublicKey>,
+    /// Validators excluded from every future committee.
+    pub permanent_secondaries: Set<ed25519::PublicKey>,
     /// Immutable genesis/bootstrap p2p directory.
     pub eligible_peers: Map<ed25519::PublicKey, Address>,
     /// Storage partition prefix for this validator.
@@ -334,6 +343,18 @@ fn decode_with_network(
     let public_key = signer.public_key();
     let dkg_output = decode_dkg_output(&config.dkg_output, config.num_validators);
     let share = decode_share_opt(&config.dkg_share);
+    let permanent_secondaries: Set<ed25519::PublicKey> = config
+        .permanent_secondaries
+        .iter()
+        .map(|key| decode_public_key("permanent_secondaries", key))
+        .try_collect()
+        .expect("permanent_secondaries must be unique");
+    if permanent_secondaries
+        .iter()
+        .any(|peer| !secondary_participants.contains(peer))
+    {
+        panic!("permanent_secondaries must be listed in secondary_validators");
+    }
     if config.indexer.is_some() && primary_participants.contains(&public_key) {
         panic!("indexer validator cannot be a genesis primary");
     }
@@ -342,6 +363,9 @@ fn decode_with_network(
     }
     if config.indexer.is_some() && !secondary_participants.contains(&public_key) {
         panic!("indexer validator must be listed in secondary_validators");
+    }
+    if config.indexer.is_some() && permanent_secondaries.position(&public_key).is_none() {
+        panic!("indexer validator must be listed in permanent_secondaries");
     }
     if share.is_some() && config.relayer.is_some() {
         panic!("relayer config is only valid on secondary validators");
@@ -373,6 +397,7 @@ fn decode_with_network(
             listen_bind,
             primary_participants,
             secondary_participants,
+            permanent_secondaries,
             eligible_peers,
             partition_prefix: config.partition_prefix,
         },
@@ -719,6 +744,7 @@ mod tests {
                 num_validators: self.primary_keys.len() as u32,
                 primary_validators: self.primary_hex_list(),
                 secondary_validators: self.secondary_hex_list(),
+                permanent_secondaries: Vec::new(),
                 log_level: "info".to_string(),
                 worker_threads: 2,
                 rayon_threads: 2,
@@ -755,6 +781,7 @@ mod tests {
                 num_validators: self.primary_keys.len() as u32,
                 primary_validators: self.primary_hex_list(),
                 secondary_validators: self.secondary_hex_list(),
+                permanent_secondaries: Vec::new(),
                 log_level: "info".to_string(),
                 worker_threads: 2,
                 rayon_threads: 2,
@@ -856,6 +883,30 @@ mod tests {
             config,
             cluster.primary_keys.clone(),
             Vec::new(),
+            cluster.eligible_address_map(),
+            None,
+            false,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "indexer validator must be listed in permanent_secondaries")]
+    fn indexer_uploader_must_be_a_permanent_secondary() {
+        let cluster = Cluster::new(2, 1);
+        let mut config = cluster.secondary_config(
+            0,
+            StartupModeConfig::MarshalSync,
+            cluster.eligible_entries(),
+        );
+        config.indexer = Some(IndexerConfig {
+            chain_indexer_url: "http://127.0.0.1:8090".to_string(),
+            upload_buffer: default_upload_buffer(),
+        });
+
+        let _ = decode_with_network(
+            config,
+            cluster.primary_keys.clone(),
+            cluster.secondary_keys.clone(),
             cluster.eligible_address_map(),
             None,
             false,
@@ -1285,6 +1336,7 @@ hosts:
             StartupModeConfig::MarshalSync,
             cluster.eligible_entries(),
         );
+        config.permanent_secondaries = vec![hex(&cluster.secondary_keys[0].encode())];
         config.indexer = Some(IndexerConfig {
             chain_indexer_url: "http://chain-indexer:8090".to_string(),
             upload_buffer: default_upload_buffer(),

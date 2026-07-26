@@ -160,6 +160,7 @@ where
             input,
             &self.initial_committee,
             &self.initial_next_committee,
+            &self.permanent_secondaries,
             self.blocks_per_epoch.get(),
         )
         .await;
@@ -303,6 +304,7 @@ where
             body,
             &self.initial_committee,
             &self.initial_next_committee,
+            &self.permanent_secondaries,
             self.blocks_per_epoch.get(),
         );
         let wait = wait_for_timestamp(runtime, time::block_deadline(header.timestamp));
@@ -394,6 +396,7 @@ where
             strategy,
             &self.initial_committee,
             &self.initial_next_committee,
+            &self.permanent_secondaries,
             self.blocks_per_epoch.get(),
         )
         .await

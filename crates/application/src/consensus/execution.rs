@@ -105,7 +105,7 @@ use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
 };
 use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
-use commonware_utils::{non_empty_range, sequence::U64};
+use commonware_utils::{non_empty_range, ordered::Set, sequence::U64};
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{
     Account, Action, Header, LazySignedTransaction, SignedTransaction,
@@ -193,6 +193,7 @@ where
     current: Committee,
     entering: Committee,
     committee: Committee,
+    permanent_secondaries: Set<ed25519::PublicKey>,
     dirty: bool,
     mutations_allowed: bool,
 }
@@ -213,6 +214,7 @@ where
         height: u64,
         initial: &Committee,
         initial_next: &Committee,
+        permanent_secondaries: &Set<ed25519::PublicKey>,
         blocks_per_epoch: u64,
     ) -> Self {
         let epoch = Epoch::new(height / blocks_per_epoch);
@@ -262,6 +264,7 @@ where
             current,
             entering,
             committee,
+            permanent_secondaries: permanent_secondaries.clone(),
             // The final block materializes an absent carry-forward row after
             // reshare has read the same value through its fallback.
             dirty: final_block && direct.is_none(),
@@ -271,6 +274,14 @@ where
 
     fn updated(&self, mutation: &CommitteeMutation) -> Option<Committee> {
         if !self.mutations_allowed {
+            return None;
+        }
+        if mutation.address.is_some()
+            && self
+                .permanent_secondaries
+                .position(&mutation.peer)
+                .is_some()
+        {
             return None;
         }
         if let Some(address) = mutation.address
@@ -567,6 +578,7 @@ pub(super) async fn execute_proposal<E, C, P, H, S, I, R>(
     input: &mut I,
     initial_committee: &Committee,
     initial_next_committee: &Committee,
+    permanent_secondaries: &Set<ed25519::PublicKey>,
     blocks_per_epoch: u64,
 ) -> ProposalExecution<E, H, S>
 where
@@ -588,6 +600,7 @@ where
         parent_header.height + 1,
         initial_committee,
         initial_next_committee,
+        permanent_secondaries,
         blocks_per_epoch,
     )
     .await;
@@ -821,6 +834,7 @@ pub(super) async fn execute_body<E, H, S>(
     body: PreparedBody<H>,
     initial_committee: &Committee,
     initial_next_committee: &Committee,
+    permanent_secondaries: &Set<ed25519::PublicKey>,
     blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
 where
@@ -839,6 +853,7 @@ where
         height,
         initial_committee,
         initial_next_committee,
+        permanent_secondaries,
         blocks_per_epoch,
     )
     .await;
@@ -901,6 +916,7 @@ pub(super) async fn apply_prepared_body<E, H, S>(
     strategy: S,
     initial_committee: &Committee,
     initial_next_committee: &Committee,
+    permanent_secondaries: &Set<ed25519::PublicKey>,
     blocks_per_epoch: u64,
 ) -> Result<BlockExecution<E, H, S>>
 where
@@ -913,6 +929,7 @@ where
         height,
         initial_committee,
         initial_next_committee,
+        permanent_secondaries,
         blocks_per_epoch,
     )
     .await;

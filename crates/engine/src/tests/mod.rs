@@ -567,6 +567,7 @@ impl EngineDefinition for TestEngineDefinition {
                     share,
                     genesis,
                     eligible_peers: eligible,
+                    permanent_secondaries: Set::default(),
                     secret_store,
                     dkg_namespace: DKG_NAMESPACE,
                     input,

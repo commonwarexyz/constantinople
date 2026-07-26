@@ -404,6 +404,9 @@ pub(crate) struct ValidatorConfig {
     /// Hex-encoded ed25519 public keys of the secondary (non-voting) validators.
     /// Must be identical across every validator config in the deployment.
     secondary_validators: Vec<String>,
+    /// Hex-encoded ed25519 public keys that must remain non-voting.
+    /// Must be identical across every validator config in the deployment.
+    permanent_secondaries: Vec<String>,
     /// Logging verbosity.
     log_level: String,
     /// Tokio worker threads.
@@ -626,6 +629,18 @@ pub(crate) fn secondary_roles(args: &GenerateArgs) -> Vec<SecondaryRole> {
 
 pub(crate) fn total_secondaries(args: &GenerateArgs) -> u32 {
     secondary_roles(args).len() as u32
+}
+
+pub(crate) fn permanent_secondary_hex(
+    args: &GenerateArgs,
+    material: &ClusterMaterial,
+) -> Vec<String> {
+    secondary_roles(args)
+        .into_iter()
+        .zip(&material.secondary_public_keys)
+        .filter(|(role, _)| *role == SecondaryRole::Indexer)
+        .map(|(_, key)| hex(&key.encode()))
+        .collect()
 }
 
 pub(crate) const fn indexer_enabled(args: &GenerateArgs) -> bool {
