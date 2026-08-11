@@ -34,6 +34,7 @@ fi
 # so the 256 MiB mempool leaves headroom for continuous admission.
 # Paged storage uses 4 KiB physical pages with checksum-adjusted payloads.
 # Page-size changes require fresh data directories, which this deployment creates.
+# Sample traces without making telemetry part of the benchmark workload.
 cargo run --locked --bin constantinople-deploy -- generate \
     --validators 50 --leader-term-length 1000000 --leader-delay-ms 10 --relayer --spammer \
     --spammer-accounts 50000 --spammer-accounts-jitter 0.1 \
@@ -47,7 +48,7 @@ cargo run --locked --bin constantinople-deploy -- generate \
     --instance-type c8id.4xlarge --storage-size 150 \
     --spammer-instance-type c8a.4xlarge \
     --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
-    --dashboard ./dashboard.json --traces 1
+    --dashboard ./dashboard.json --traces 0.01
 
 for artifact in config.yaml spammer.yaml; do
     if [ ! -f "./deploy/$artifact" ]; then

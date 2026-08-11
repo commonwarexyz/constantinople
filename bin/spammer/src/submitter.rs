@@ -1,7 +1,7 @@
 //! Async submission engine.
 //!
 //! Each relayer stream submits one batch at a time and advances to the next
-//! pre-signed batch after finalization, drop, or submit failure.
+//! pre-signed batch only after finalization or drop.
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
@@ -92,6 +92,7 @@ impl Stats {
 }
 
 const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const RELAYER_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Submits batches through a relayer and records each batch outcome.
 pub struct RelayerSubmitter {
@@ -132,41 +133,45 @@ impl RelayerSubmitter {
         }
     }
 
-    /// Submits a signed batch once. Failed or dropped batches are abandoned so
-    /// the next outer loop iteration uses a fresh nonce set.
+    /// Submits a signed batch until the relayer reports a terminal outcome.
     pub async fn submit(&self, batch: Vec<Tx>) {
         let count = batch.len() as u64;
         let body = batch.encode();
         self.stats.record_submitted(count);
-        match self.submit_encoded(body).await {
-            Ok(RelayerBatchStatus::Finalized { height }) => {
-                self.stats.record_finalized(count);
-                debug!(height, count, "relayed batch finalized");
-            }
-            Ok(RelayerBatchStatus::PartiallyFinalized {
-                height,
-                included,
-                filtered,
-            }) => {
-                self.stats.record_finalized(included);
-                self.stats.record_filtered(filtered);
-                info!(
+        loop {
+            match self.submit_encoded(body.clone()).await {
+                Ok(RelayerBatchStatus::Finalized { height }) => {
+                    self.stats.record_finalized(count);
+                    debug!(height, count, "relayed batch finalized");
+                    return;
+                }
+                Ok(RelayerBatchStatus::PartiallyFinalized {
                     height,
-                    included, filtered, "relayed batch partially finalized, advancing"
-                );
-            }
-            Ok(RelayerBatchStatus::Dropped) => {
-                self.stats.record_dropped(count);
-                debug!(count, "relayed batch dropped, advancing");
-            }
-            Err(error) => {
-                self.stats.record_error();
-                warn!(
-                    error = %error,
-                    backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
-                    "relayer submit error, advancing"
-                );
-                tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                    included,
+                    filtered,
+                }) => {
+                    self.stats.record_finalized(included);
+                    self.stats.record_filtered(filtered);
+                    info!(
+                        height,
+                        included, filtered, "relayed batch partially finalized, advancing"
+                    );
+                    return;
+                }
+                Ok(RelayerBatchStatus::Dropped) => {
+                    self.stats.record_dropped(count);
+                    debug!(count, "relayed batch dropped, advancing");
+                    return;
+                }
+                Err(error) => {
+                    self.stats.record_error();
+                    warn!(
+                        error = %error,
+                        backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
+                        "relayer submit error, retrying same batch"
+                    );
+                    tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                }
             }
         }
     }
@@ -183,7 +188,11 @@ impl RelayerSubmitter {
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
         }
-        let response = request.body(body).send().await?;
+        let response = request
+            .body(body)
+            .timeout(RELAYER_REQUEST_TIMEOUT)
+            .send()
+            .await?;
 
         match response.status().as_u16() {
             200 => {
@@ -242,18 +251,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn submit_error_advances_without_retrying() {
+    async fn submit_error_retries_same_batch_until_terminal() {
         let stats = test_stats();
-        let (url, requests) =
-            spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
+        let batch = test_batch();
+        let count = batch.len() as u64;
+        let (url, requests) = spawn_response_server(vec![
+            empty_response("503 Service Unavailable"),
+            json_response(r#"{"status":"dropped"}"#),
+        ])
+        .await;
         let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
 
-        tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
-            .expect("submit error should not be retried");
+            .expect("submit error should be retried until a terminal response");
 
         assert_eq!(stats.totals().errors, 1);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.totals().dropped, count);
+        assert_eq!(requests.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]

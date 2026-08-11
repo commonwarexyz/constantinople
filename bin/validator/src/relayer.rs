@@ -26,6 +26,7 @@ use std::{
     collections::{HashMap, HashSet},
     net::SocketAddr,
     sync::{Arc, OnceLock},
+    time::Duration,
 };
 use tokio::sync::{Semaphore, watch};
 use tower_http::cors::{Any, CorsLayer};
@@ -36,6 +37,8 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
 const PINNED_SUBMIT_RETRIES: usize = 3;
+const LEADER_HTTP_TIMEOUT: Duration = Duration::from_secs(5);
+const PINNED_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum batches admitted to CPU decoding concurrently.
 ///
@@ -134,6 +137,7 @@ struct AppState<St: Strategy> {
     http: reqwest::Client,
     strategy: St,
     decode_permits: Arc<Semaphore>,
+    leader_http_timeout: Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -201,6 +205,7 @@ pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
         http: reqwest::Client::new(),
         strategy: config.strategy,
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+        leader_http_timeout: LEADER_HTTP_TIMEOUT,
     };
     let listen = config.listen;
     let app = router(state);
@@ -305,10 +310,10 @@ async fn submit_with_retries<St: Strategy>(
     // round, which recovers accepts lost in transit.
     let mut posted = Vec::<(String, Leader)>::new();
 
-    // Accepted pairs are never re-POSTed. Repeat POSTs elsewhere are safe:
-    // leaders cache each batch id's status and acknowledge repeats without
-    // re-admitting transactions.
+    // Accepted and terminal pairs are never re-POSTed. Repeat POSTs for an
+    // unresolved attempt are safe because leaders key status by batch id.
     let mut accepted: HashSet<(String, String)> = HashSet::new();
+    let mut terminal_attempts: HashSet<(String, String)> = HashSet::new();
     let mut views = state.view_clock.current_view.subscribe();
     let mut view = *views.borrow();
     let mut unaccepted_retries = 0;
@@ -339,14 +344,15 @@ async fn submit_with_retries<St: Strategy>(
         let target = next_leader(&state.leaders, view, state.view_clock.term_length)
             .expect("non-empty leader set");
         let accepted_key = (sent_batch_id.clone(), target.public_key.clone());
-        if !accepted.contains(&accepted_key) {
+        if !accepted.contains(&accepted_key) && !terminal_attempts.contains(&accepted_key) {
             let has_prior_attempt = !posted.is_empty();
             if !posted.iter().any(|(batch_id, leader)| {
                 batch_id == &sent_batch_id && leader.public_key == target.public_key
             }) {
                 posted.push((sent_batch_id.clone(), target.clone()));
             }
-            match forward_to_leader(&state.http, target, send_body).await {
+            match forward_to_leader(&state.http, target, send_body, state.leader_http_timeout).await
+            {
                 ForwardResult::Accepted { leader } => {
                     debug!(leader = %leader.public_key, "relayer forward accepted");
                     accepted.insert((sent_batch_id.clone(), leader.public_key));
@@ -371,6 +377,7 @@ async fn submit_with_retries<St: Strategy>(
             &sent,
             &batch,
             &mut accepted,
+            &mut terminal_attempts,
             &mut digest_index,
             &mut included,
             &mut filtered,
@@ -407,21 +414,28 @@ async fn merge_statuses<St: Strategy>(
     sent: &HashMap<String, Vec<usize>>,
     batch: &Arc<DecodedBatch>,
     accepted: &mut HashSet<(String, String)>,
+    terminal_attempts: &mut HashSet<(String, String)>,
     digest_index: &mut Option<DigestIndex>,
     included: &mut HashSet<usize>,
     filtered: &mut HashSet<usize>,
     height: &mut u64,
 ) {
-    let fetches = posted.iter().map(|(batch_id, leader)| {
-        let http = state.http.clone();
-        async move {
-            (
-                batch_id,
-                leader,
-                fetch_status_from_leader(&http, leader, batch_id).await,
-            )
-        }
-    });
+    let fetches = posted
+        .iter()
+        .filter(|(batch_id, leader)| {
+            !terminal_attempts.contains(&(batch_id.clone(), leader.public_key.clone()))
+        })
+        .map(|(batch_id, leader)| {
+            let http = state.http.clone();
+            async move {
+                (
+                    batch_id,
+                    leader,
+                    fetch_status_from_leader(&http, leader, batch_id, state.leader_http_timeout)
+                        .await,
+                )
+            }
+        });
     for (batch_id, leader, status) in join_all(fetches).await {
         let Some(status) = status else {
             continue;
@@ -433,6 +447,7 @@ async fn merge_statuses<St: Strategy>(
             }
             BatchStatus::Dropped => {
                 accepted.remove(&accepted_key);
+                terminal_attempts.insert(accepted_key);
                 if let Some(indices) = sent.get(batch_id) {
                     filtered.extend(indices.iter().copied());
                 }
@@ -444,6 +459,7 @@ async fn merge_statuses<St: Strategy>(
                 height: finalized_height,
             } => {
                 accepted.remove(&accepted_key);
+                terminal_attempts.insert(accepted_key);
                 *height = (*height).max(finalized_height);
                 if let Some(indices) = sent.get(batch_id) {
                     included.extend(indices.iter().copied());
@@ -455,6 +471,7 @@ async fn merge_statuses<St: Strategy>(
                 filtered: leader_filtered,
             } => {
                 accepted.remove(&accepted_key);
+                terminal_attempts.insert(accepted_key);
                 *height = (*height).max(finalized_height);
                 if digest_index.is_none() {
                     let batch = Arc::clone(batch);
@@ -594,11 +611,17 @@ async fn ready<St: Strategy>(State(state): State<AppState<St>>) -> StatusCode {
     StatusCode::OK
 }
 
-async fn forward_to_leader(http: &reqwest::Client, leader: Leader, body: Bytes) -> ForwardResult {
+async fn forward_to_leader(
+    http: &reqwest::Client,
+    leader: Leader,
+    body: Bytes,
+    timeout: Duration,
+) -> ForwardResult {
     match http
         .post(format!("{}/transactions/ingest", leader.url))
         .header("content-type", "application/octet-stream")
         .body(body)
+        .timeout(timeout)
         .send()
         .await
     {
@@ -626,6 +649,7 @@ async fn submit_blocking_to_leader(
             .post(format!("{}/transactions", leader.url))
             .header("content-type", "application/octet-stream")
             .body(body.clone())
+            .timeout(PINNED_SUBMIT_TIMEOUT)
             .send()
             .await
         {
@@ -658,9 +682,11 @@ async fn fetch_status_from_leader(
     http: &reqwest::Client,
     leader: &Leader,
     batch_id: &str,
+    timeout: Duration,
 ) -> Option<BatchStatus> {
     let response = http
         .get(format!("{}/transactions/{batch_id}", leader.url))
+        .timeout(timeout)
         .send()
         .await
         .ok()?;
@@ -858,6 +884,7 @@ mod tests {
             http: reqwest::Client::new(),
             strategy: commonware_parallel::Sequential,
             decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+            leader_http_timeout: Duration::from_millis(50),
         }
     }
 
@@ -1097,6 +1124,7 @@ mod tests {
             http: reqwest::Client::new(),
             strategy: commonware_parallel::Sequential,
             decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
+            leader_http_timeout: Duration::from_millis(50),
         }
     }
 
@@ -1150,6 +1178,56 @@ mod tests {
 
         // Each retry posts to only that view's leader. Accepted batches are
         // polled and are not re-posted when their leader rotates back in.
+        assert_eq!(bodies_a.lock().expect("bodies lock").len(), 1);
+        assert_eq!(bodies_b.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stalled_historical_status_does_not_block_a_terminal_result() {
+        let bodies_a = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let bodies_a_for_handler = bodies_a.clone();
+        let router_a = Router::new()
+            .route(
+                "/transactions/ingest",
+                post(move |body: Bytes| {
+                    let bodies = bodies_a_for_handler.clone();
+                    async move {
+                        bodies.lock().expect("bodies lock").push(body);
+                        (StatusCode::ACCEPTED, String::new())
+                    }
+                }),
+            )
+            .route(
+                "/transactions/{batch_id}",
+                get(|| async { std::future::pending::<(StatusCode, String)>().await }),
+            );
+        let (router_b, bodies_b) = scripted_leader(
+            Vec::new(),
+            vec![
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Finalized { height: 7 }),
+            ],
+        );
+        let leader_a = mock_leader("aa", spawn_mock_leader(router_a).await);
+        let leader_b = mock_leader("bb", spawn_mock_leader(router_b).await);
+        let state = retry_state(vec![leader_a, leader_b], 3);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) =
+            tokio::time::timeout(std::time::Duration::from_millis(250), submit)
+                .await
+                .expect("a stalled historical leader should be bounded")
+                .expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 7 },
+        );
         assert_eq!(bodies_a.lock().expect("bodies lock").len(), 1);
         assert_eq!(bodies_b.lock().expect("bodies lock").len(), 1);
     }
@@ -1305,13 +1383,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn admitted_batch_returns_dropped_only_after_leader_reports_it() {
+    async fn admitted_batch_is_not_reposted_after_leader_reports_drop() {
         let (router, bodies) = scripted_leader(
             Vec::new(),
             vec![Some(BatchStatus::Accepted), Some(BatchStatus::Dropped)],
         );
         let leader = mock_leader("aa", spawn_mock_leader(router).await);
-        let state = retry_state(vec![leader], 0);
+        let state = retry_state(vec![leader], 2);
         let views = state.view_clock.current_view.clone();
         let body: Bytes = vec![signed_transfer(1, 0)].encode();
 
