@@ -45,7 +45,8 @@ cargo run --locked --bin constantinople-deploy -- generate \
     --state-page-cache-bytes 2147483648 --other-page-cache-bytes 2147483648 \
     remote \
     --http-cidr 0.0.0.0/0 --regions us-east-1,us-west-2 \
-    --instance-type c8id.4xlarge --storage-size 150 \
+    --instance-type c8a.4xlarge --storage-size 150 \
+    --storage-iops 5000 --storage-throughput 500 \
     --spammer-instance-type c8a.4xlarge \
     --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
     --dashboard ./dashboard.json --traces 0.01
@@ -57,9 +58,9 @@ for artifact in config.yaml spammer.yaml; do
     fi
 done
 
-# 2. Build binaries into ./deploy. Validators run on Intel Granite Rapids C8id
-# instances; the spammer remains on an AMD C8a compute instance.
-just validator-intel-binary spammer-amd-binary
+# 2. Build binaries into ./deploy. Validators and the spammer run on AMD C8a
+# instances; validator gp3 volumes are provisioned for the write-heavy workload.
+just validator-amd-binary spammer-amd-binary
 for artifact in validator spammer; do
     if [ ! -x "./deploy/$artifact" ]; then
         echo "build did not create executable deploy/$artifact" >&2
