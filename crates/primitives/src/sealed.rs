@@ -19,11 +19,20 @@ pub trait Sealable {
 }
 
 /// A type that has been hashed with a cached digest.
-#[derive(Clone, Debug, Deref)]
+#[derive(Debug, Deref)]
 pub struct Sealed<T, H: Hasher> {
     #[deref]
     inner: T,
     seal: H::Digest,
+}
+
+impl<T: Clone, H: Hasher> Clone for Sealed<T, H> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            seal: self.seal,
+        }
+    }
 }
 
 impl<T, H> PartialEq for Sealed<T, H>
@@ -107,7 +116,7 @@ where
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let inner = T::read_cfg(buf, cfg)?;
-        Ok(inner.seal(&mut H::new()))
+        Ok(inner.seal(&mut H::default()))
     }
 }
 
@@ -118,7 +127,7 @@ where
     H: Hasher,
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
-        Ok(u.arbitrary::<T>()?.seal(&mut H::new()))
+        Ok(u.arbitrary::<T>()?.seal(&mut H::default()))
     }
 }
 
@@ -137,7 +146,9 @@ mod test {
 
         fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
             hasher.update(&self.0);
-            Sealed::new_unchecked(self, hasher.finalize())
+            let (reset, digest) = std::mem::take(hasher).finalize();
+            *hasher = reset;
+            Sealed::new_unchecked(self, digest)
         }
     }
 
@@ -147,7 +158,7 @@ mod test {
             hex!("5eb36b538cf44d53a2a091d3ef6b4d719e9ee0d3805505e2aaa12803d78babe1");
 
         let mock = MockSeal(hex!("beefbabe0badc0de"));
-        let sealed = mock.seal(&mut sha256::Sha256::new());
+        let sealed = mock.seal(&mut sha256::Sha256::default());
 
         assert_eq!(sealed.seal().as_ref(), EXPECTED);
     }
@@ -155,14 +166,14 @@ mod test {
     #[test]
     fn sealed_deref() {
         let mock = MockSeal([1, 2, 3, 4, 5, 6, 7, 8]);
-        let sealed = mock.seal(&mut sha256::Sha256::new());
+        let sealed = mock.seal(&mut sha256::Sha256::default());
         assert_eq!(sealed.0, [1, 2, 3, 4, 5, 6, 7, 8]);
     }
 
     #[test]
     fn sealed_into_inner() {
         let mock = MockSeal([10; 8]);
-        let sealed = mock.seal(&mut sha256::Sha256::new());
+        let sealed = mock.seal(&mut sha256::Sha256::default());
         let inner = sealed.into_inner();
         assert_eq!(inner.0, [10; 8]);
     }
@@ -170,15 +181,15 @@ mod test {
     #[test]
     fn sealed_clone_eq() {
         let mock = MockSeal([0xAB; 8]);
-        let sealed = mock.seal(&mut sha256::Sha256::new());
+        let sealed = mock.seal(&mut sha256::Sha256::default());
         let cloned = sealed.clone();
         assert_eq!(sealed, cloned);
     }
 
     #[test]
     fn different_inputs_produce_different_seals() {
-        let a = MockSeal([0x00; 8]).seal(&mut sha256::Sha256::new());
-        let b = MockSeal([0xFF; 8]).seal(&mut sha256::Sha256::new());
+        let a = MockSeal([0x00; 8]).seal(&mut sha256::Sha256::default());
+        let b = MockSeal([0xFF; 8]).seal(&mut sha256::Sha256::default());
         assert_ne!(a.seal(), b.seal());
     }
 }

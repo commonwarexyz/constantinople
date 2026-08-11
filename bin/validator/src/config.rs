@@ -2,6 +2,7 @@
 
 use ahash::AHashMap;
 use commonware_codec::{Encode, Read as CodecRead, ReadExt};
+use commonware_consensus::types::TermLength;
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -13,9 +14,13 @@ use commonware_cryptography::{
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
-use commonware_utils::NZU32;
+use commonware_utils::{NZU32, NZU64};
 use serde::Deserialize;
-use std::{net::SocketAddr, path::Path};
+use std::{
+    net::SocketAddr,
+    num::{NonZeroU32, NonZeroU64},
+    path::Path,
+};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
@@ -35,6 +40,14 @@ pub(crate) const fn default_max_propose_bytes() -> usize {
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
+}
+
+pub(crate) const fn default_leader_term_length() -> NonZeroU32 {
+    NZU32!(1)
+}
+
+pub(crate) const fn default_leader_delay_ms() -> NonZeroU64 {
+    NZU64!(10)
 }
 
 pub(crate) const fn default_page_cache_bytes() -> usize {
@@ -92,6 +105,12 @@ pub struct ValidatorConfig {
     pub listen_port: u16,
     /// Hex-encoded ed25519 public key of the genesis leader.
     pub genesis_leader: String,
+    /// Number of consecutive views assigned to one leader.
+    #[serde(default = "default_leader_term_length")]
+    pub leader_term_length: NonZeroU32,
+    /// Minimum milliseconds between a locally proposed block and its parent.
+    #[serde(default = "default_leader_delay_ms")]
+    pub leader_delay_ms: NonZeroU64,
     /// Storage partition prefix for this validator.
     pub partition_prefix: String,
     /// Number of primary validators (DKG participant count).
@@ -148,7 +167,8 @@ pub struct ValidatorConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayerConfig {
-    /// Views to retry a submission before giving up.
+    /// Consecutive views to seek an accepting leader before returning 503.
+    /// Admitted work is polled until a leader reports a terminal outcome.
     #[serde(default = "default_relayer_retry_views")]
     pub max_retry_views: u64,
     /// Per-leader relayer endpoints.
@@ -233,6 +253,10 @@ pub struct LoadedConfig {
     pub metrics_listen: SocketAddr,
     /// Maximum bytes proposed per block.
     pub max_propose_bytes: usize,
+    /// Consensus leader term length.
+    pub leader_term_length: TermLength,
+    /// Minimum milliseconds between a locally proposed block and its parent.
+    pub leader_delay_ms: NonZeroU64,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
@@ -370,6 +394,8 @@ fn decode_with_network(
         http_listen,
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
+        leader_term_length: TermLength::new(config.leader_term_length),
+        leader_delay_ms: config.leader_delay_ms,
         state_page_cache_bytes: config.state_page_cache_bytes,
         other_page_cache_bytes: config.other_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
@@ -531,9 +557,9 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        default_leader_delay_ms, default_leader_term_length, default_max_pool_bytes,
+        default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
+        default_upload_buffer, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -642,6 +668,8 @@ mod tests {
                 startup,
                 listen_port: 9000,
                 genesis_leader: hex(&self.primary_keys[0].encode()),
+                leader_term_length: default_leader_term_length(),
+                leader_delay_ms: default_leader_delay_ms(),
                 partition_prefix: format!("validator-{index}"),
                 num_validators: self.primary_keys.len() as u32,
                 primary_validators: self.primary_hex_list(),
@@ -678,6 +706,8 @@ mod tests {
                 startup,
                 listen_port: 9000,
                 genesis_leader: hex(&self.primary_keys[0].encode()),
+                leader_term_length: default_leader_term_length(),
+                leader_delay_ms: default_leader_delay_ms(),
                 partition_prefix: format!("secondary-{index}"),
                 num_validators: self.primary_keys.len() as u32,
                 primary_validators: self.primary_hex_list(),
@@ -709,6 +739,22 @@ mod tests {
     }
 
     #[test]
+    fn validator_config_defaults_leader_delay_when_absent() {
+        let cluster = Cluster::new(1, 0);
+        let config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        let mut value = serde_yaml::to_value(config).expect("config should serialize");
+        value
+            .as_mapping_mut()
+            .expect("config serializes as a mapping")
+            .remove(serde_yaml::Value::String("leader_delay_ms".to_string()));
+
+        let parsed: ValidatorConfig =
+            serde_yaml::from_value(value).expect("legacy config should deserialize");
+
+        assert_eq!(parsed.leader_delay_ms, default_leader_delay_ms());
+    }
+
+    #[test]
     fn local_config_resolves_bootstrapper_peers() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
@@ -723,6 +769,7 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.leader_delay_ms = commonware_utils::NZU64!(12);
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -754,6 +801,7 @@ mod tests {
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
+        assert_eq!(loaded.leader_delay_ms.get(), 12);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,

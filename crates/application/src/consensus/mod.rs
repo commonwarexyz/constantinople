@@ -34,7 +34,7 @@ use commonware_runtime::{
     telemetry::metrics::{Counter, MetricsExt},
 };
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
-use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
+use std::{future::Future, marker::PhantomData, num::NonZeroU64, pin::Pin, sync::Arc};
 
 mod body;
 mod db;
@@ -48,9 +48,9 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, StateBatch, StateDatabase, StateStaged, StateSyncTarget, StateUpdates,
-    TransactionDatabase, TransactionHistoryDb, TransactionHistoryOperation,
-    TransactionHistoryTarget,
+    DatabaseReaders, Databases, StateBatch, StateDatabase, StateDb, StateReader, StateStaged,
+    StateSyncTarget, StateUpdates, TransactionDatabase, TransactionHistoryDb,
+    TransactionHistoryOperation, TransactionHistoryTarget,
 };
 pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
@@ -59,7 +59,7 @@ type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 pub type FinalizedHookFn<E, C, H, P, St> = Arc<
     dyn for<'a> Fn(
             &'a SealedBlock<C, P, H>,
-            &'a Databases<E, H, commonware_storage::translator::EightCap, St>,
+            DatabaseReaders<E, H, commonware_storage::translator::EightCap, St>,
         ) -> FinalizedHookFuture<'a>
         + Send
         + Sync,
@@ -80,6 +80,7 @@ where
     St: Strategy,
 {
     strategy: St,
+    proposal_delay_ms: NonZeroU64,
     genesis_leader: P,
     genesis_parent: C,
     transaction_namespace: &'static [u8],
@@ -103,6 +104,7 @@ where
     fn clone(&self) -> Self {
         Self {
             strategy: self.strategy.clone(),
+            proposal_delay_ms: self.proposal_delay_ms,
             genesis_leader: self.genesis_leader.clone(),
             genesis_parent: self.genesis_parent,
             transaction_namespace: self.transaction_namespace,
@@ -132,6 +134,7 @@ where
     pub fn new(
         context: impl Metrics,
         strategy: St,
+        proposal_delay_ms: NonZeroU64,
         genesis_leader: P,
         genesis_parent: C,
         transaction_namespace: &'static [u8],
@@ -147,6 +150,7 @@ where
 
         Self {
             strategy,
+            proposal_delay_ms,
             genesis_leader,
             genesis_parent,
             transaction_namespace,

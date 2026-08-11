@@ -24,7 +24,7 @@ pub(super) const fn is_valid_child_timestamp(
     parent_timestamp_ms: u64,
     child_timestamp_ms: u64,
 ) -> bool {
-    parent_timestamp_ms < child_timestamp_ms && child_timestamp_ms <= MAX_BLOCK_TIMESTAMP_MS
+    parent_timestamp_ms <= child_timestamp_ms && child_timestamp_ms <= MAX_BLOCK_TIMESTAMP_MS
 }
 
 /// Returns the absolute wakeup time for `block_timestamp_ms`.
@@ -37,4 +37,23 @@ pub(super) fn block_deadline(block_timestamp_ms: u64) -> SystemTime {
     UNIX_EPOCH
         .checked_add(Duration::from_millis(block_timestamp_ms))
         .expect("block timestamp exceeded maximum")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_BLOCK_TIMESTAMP_MS, is_valid_child_timestamp};
+
+    #[test]
+    fn child_timestamp_may_equal_parent() {
+        assert!(is_valid_child_timestamp(7, 7));
+        assert!(!is_valid_child_timestamp(7, 6));
+        assert!(is_valid_child_timestamp(
+            MAX_BLOCK_TIMESTAMP_MS,
+            MAX_BLOCK_TIMESTAMP_MS,
+        ));
+        assert!(!is_valid_child_timestamp(
+            MAX_BLOCK_TIMESTAMP_MS,
+            MAX_BLOCK_TIMESTAMP_MS + 1,
+        ));
+    }
 }

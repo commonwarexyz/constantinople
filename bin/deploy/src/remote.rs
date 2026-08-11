@@ -155,6 +155,8 @@ fn build_validators(
             startup: args.startup,
             listen_port: remote.listen_port,
             genesis_leader: material.genesis_leader.clone(),
+            leader_term_length: args.leader_term_length,
+            leader_delay_ms: args.leader_delay_ms,
             partition_prefix: format!("validator-{index}"),
             num_validators: args.validators,
             primary_validators: primary_validators.clone(),
@@ -211,6 +213,8 @@ fn build_secondaries(
             startup: args.startup,
             listen_port: remote.listen_port,
             genesis_leader: material.genesis_leader.clone(),
+            leader_term_length: args.leader_term_length,
+            leader_delay_ms: args.leader_delay_ms,
             partition_prefix: format!("secondary-{index}"),
             num_validators: args.validators,
             primary_validators: primary_validators.clone(),
@@ -271,6 +275,7 @@ fn remote_spammer_config(
     remote: &RemoteArgs,
     material: &ClusterMaterial,
 ) -> SpammerConfig {
+    let stable_leader = args.leader_term_length.get() > 1;
     SpammerConfig {
         accounts: args.spammer_accounts,
         value: args.spammer_value,
@@ -278,9 +283,22 @@ fn remote_spammer_config(
         rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
-        relayer_submitters: args.validators as usize,
+        relayer_submitters: if stable_leader {
+            1
+        } else {
+            args.validators as usize
+        },
         presigned_batches: args.spammer_presigned_batches,
-        primary_validators: material.primary_hex(),
+        in_flight_batches: if stable_leader {
+            args.spammer_in_flight_batches
+        } else {
+            1
+        },
+        primary_validators: if stable_leader {
+            Vec::new()
+        } else {
+            material.primary_hex()
+        },
         accounts_jitter: args.spammer_accounts_jitter,
     }
 }
@@ -503,6 +521,8 @@ mod tests {
     fn generate_args() -> GenerateArgs {
         GenerateArgs {
             validators: 3,
+            leader_term_length: crate::default_leader_term_length(),
+            leader_delay_ms: crate::default_leader_delay_ms(),
             indexer: false,
             relayer: false,
             output_dir: PathBuf::from("artifacts"),
@@ -522,6 +542,7 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_in_flight_batches: crate::DEFAULT_STABLE_SPAMMER_IN_FLIGHT_BATCHES,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
                 base_http_port: 8080,
@@ -573,6 +594,8 @@ mod tests {
                 startup: StartupModeConfig::MarshalSync,
                 listen_port: 9000,
                 genesis_leader: "leader".to_string(),
+                leader_term_length: crate::default_leader_term_length(),
+                leader_delay_ms: crate::default_leader_delay_ms(),
                 partition_prefix: format!("validator-{index}"),
                 num_validators: 3,
                 primary_validators: Vec::new(),
@@ -685,11 +708,28 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert_eq!(relayed.in_flight_batches, 1);
         assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
         );
+    }
+
+    #[test]
+    fn remote_stable_leader_spammer_uses_one_unpinned_stream() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.leader_term_length = std::num::NonZeroU32::new(1_000_000).unwrap();
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let config = remote_spammer_config(&args, &remote, &material);
+
+        assert_eq!(config.relayer_submitters, 1);
+        assert_eq!(config.in_flight_batches, 16);
+        assert!(config.primary_validators.is_empty());
     }
 
     #[test]

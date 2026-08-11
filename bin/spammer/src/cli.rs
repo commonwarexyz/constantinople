@@ -34,6 +34,10 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::DEFAULT_PRESIGNED_BATCHES)]
     pub presigned_batches: usize,
 
+    /// Source-ordered batches held in flight per submitter.
+    #[arg(long, default_value_t = crate::config::DEFAULT_IN_FLIGHT_BATCHES)]
+    pub in_flight_batches: usize,
+
     /// Hex-encoded primary validator keys used as exact relayer targets.
     #[arg(long, value_delimiter = ',')]
     pub relayer_targets: Vec<String>,
@@ -93,6 +97,10 @@ mod tests {
             cli.presigned_batches,
             crate::config::DEFAULT_PRESIGNED_BATCHES
         );
+        assert_eq!(
+            cli.in_flight_batches,
+            crate::config::DEFAULT_IN_FLIGHT_BATCHES
+        );
         assert!(cli.relayer_targets.is_empty());
         assert!(cli.hosts.is_none());
     }
@@ -109,6 +117,20 @@ mod tests {
         .expect("relayer invocation should parse");
 
         assert_eq!(cli.presigned_batches, 32);
+    }
+
+    #[test]
+    fn parses_in_flight_batches() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--in-flight-batches",
+            "4",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.in_flight_batches, 4);
     }
 
     #[test]

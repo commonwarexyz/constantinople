@@ -2,7 +2,7 @@
 
 use commonware_cryptography::Hasher;
 use commonware_glue::stateful::db::{
-    DatabaseSet, Unmerkleized,
+    DatabaseSet, Reader, Shared, Unmerkleized,
     any::{AnyStaged, AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
@@ -18,17 +18,21 @@ use commonware_storage::{
             value::FixedEncoding,
         },
         keyless::fixed as keyless_fixed,
-        sync::{Target as AnyTarget, compact::Target as CompactTarget},
+        sync::{CompactTarget, Target as AnyTarget},
     },
     translator::EightCap,
 };
-use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_primitives::{Account, AccountKey};
-use std::{future::Future, sync::Arc};
+use std::future::Future;
+
+/// Backing database for application account state.
+pub type StateDb<E, H, T, S> = fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>;
 
 /// Shared QMDB handle for the application state database.
-pub type StateDatabase<E, H, T, S> =
-    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
+pub type StateDatabase<E, H, T, S> = Shared<StateDb<E, H, T, S>>;
+
+/// Read-only handle for observing finalized application state.
+pub type StateReader<E, H, T, S> = Reader<StateDb<E, H, T, S>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -40,10 +44,16 @@ pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
-pub type TransactionDatabase<E, H, S> = Arc<TracedAsyncRwLock<TransactionHistoryDb<E, H, S>>>;
+pub type TransactionDatabase<E, H, S> = Shared<TransactionHistoryDb<E, H, S>>;
 
 /// The backing databases owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
+
+/// Read-only database handles supplied to finalized observers.
+pub type DatabaseReaders<E, H, T, S> = (
+    StateReader<E, H, T, S>,
+    Reader<TransactionHistoryDb<E, H, S>>,
+);
 
 /// Unmerkleized application state batch, staged by the executor before writes.
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
@@ -134,15 +144,21 @@ mod tests {
     use commonware_cryptography::Sha256;
     use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
     use commonware_parallel::Sequential;
-    use commonware_runtime::{Runner as _, buffer::paged::CacheRef, deterministic};
+    use commonware_runtime::{
+        Runner as _,
+        buffer::paged::{CacheRef, page_size as paged_page_size},
+        deterministic,
+    };
     use commonware_storage::{
         journal::contiguous::fixed::Config as FixedJournalConfig,
         merkle::full::Config as MmrConfig, qmdb::any::FixedConfig, translator::EightCap,
     };
-    use commonware_utils::{NZU16, NZU64, NZUsize};
+    use commonware_utils::{NZU64, NZUsize};
     use constantinople_primitives::{Account, AccountKey, Nonce};
+    use std::num::NonZeroUsize;
 
     type Db = StateDatabase<deterministic::Context, Sha256, EightCap, Sequential>;
+    const TEST_PAGE_CACHE_BYTES: usize = 64 * 1024;
 
     fn config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
         FixedConfig {
@@ -162,13 +178,19 @@ mod tests {
             },
             translator: EightCap,
             init_cache_size: Some(NZUsize!(1024)),
+            init_buffer: NZUsize!(1 << 21),
+            init_concurrency: (),
         }
     }
 
     #[test]
     fn state_root_ignores_update_order() {
         deterministic::Runner::default().start(|context| async move {
-            let cache = CacheRef::from_pooler(&context, NZU16!(16), NZUsize!(4096));
+            let physical_page_size = 4_096usize;
+            let page_size = paged_page_size(physical_page_size as u32);
+            let capacity = NonZeroUsize::new(TEST_PAGE_CACHE_BYTES / physical_page_size)
+                .expect("test page cache must hold at least one page");
+            let cache = CacheRef::from_pooler(&context, page_size, capacity);
             let db =
                 <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache)).await;
             let key = |byte| AccountKey::from([byte; AccountKey::SIZE]);
@@ -185,7 +207,7 @@ mod tests {
             seed = seed.write(c, Some(account(300)));
             seed = seed.write(a, Some(account(100)));
             let seed = seed.merkleize().await.expect("seed state");
-            db.finalize(seed).await;
+            assert!(db.finalize(seed).await.durable().await);
 
             // The same final key->value set must produce the same root
             // regardless of staged read order or update-entry order.

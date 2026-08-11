@@ -2,12 +2,16 @@ use ahash::{AHashMap, AHashSet};
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Rayon;
-use commonware_runtime::{Runner as _, buffer::paged::CacheRef, tokio};
+use commonware_runtime::{
+    Runner as _,
+    buffer::paged::{CacheRef, page_size as paged_page_size},
+    tokio,
+};
 use commonware_storage::{
     journal::contiguous::fixed::Config as FixedJournalConfig, merkle::full::Config as MmrConfig,
     qmdb::any::FixedConfig, translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize};
+use commonware_utils::{NZU64, NZUsize};
 use constantinople_application::{
     consensus::{self, StateBatch, StateDatabase},
     executor::PreparedTransfer,
@@ -55,7 +59,7 @@ impl Fixture {
 }
 
 fn key(index: u64) -> AccountKey {
-    AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
 fn signed_key(index: u64) -> AccountKey {
@@ -121,6 +125,8 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -414,9 +420,10 @@ fn main() {
         let cache_pages = env_usize("CONSTANTINOPLE_BENCH_CACHE_PAGES", 65_536).max(1);
         let strategy =
             Rayon::new(NonZeroUsize::new(workers).expect("worker count")).expect("rayon pool");
+        let page_size = paged_page_size(4_096);
         let cache = CacheRef::from_pooler(
             &context,
-            NZU16!(8192),
+            page_size,
             NonZeroUsize::new(cache_pages).expect("cache pages"),
         );
         let db = <Db as DatabaseSet<tokio::Context>>::init(
@@ -447,7 +454,7 @@ fn main() {
             }
         }
         let merkleized = batch.merkleize().await.expect("seed merkleize");
-        db.finalize(merkleized).await;
+        assert!(db.finalize(merkleized).await.durable().await);
 
         let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
         let count_filter = std::env::var("CONSTANTINOPLE_BENCH_COUNT")

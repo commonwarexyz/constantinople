@@ -7,6 +7,11 @@ use std::path::Path;
 
 /// Default number of fully signed local batches kept ready per submitter.
 pub const DEFAULT_PRESIGNED_BATCHES: usize = 16;
+/// Default number of source-ordered batches held in flight per submitter.
+pub const DEFAULT_IN_FLIGHT_BATCHES: usize = 1;
+/// Maximum configured in-flight width, bounded against the account nonce
+/// run-ahead window under the spammer's current batch jitter contract.
+pub const MAX_IN_FLIGHT_BATCHES: usize = 32;
 /// Default number of rayon threads for parallel signing.
 pub const DEFAULT_RAYON_THREADS: usize = 2;
 
@@ -30,6 +35,9 @@ pub struct SpammerConfig {
     /// Fully signed local batches to keep ready per submitter.
     #[serde(default = "default_presigned_batches")]
     pub presigned_batches: usize,
+    /// Source-ordered batches held in flight per submitter.
+    #[serde(default = "default_in_flight_batches")]
+    pub in_flight_batches: usize,
     /// Hex-encoded ed25519 public keys of primary validators. Used to filter
     /// hosts.yaml so secondaries are not spammed. Empty means accept any
     /// hex-named validator host (local/CLI-only fallback).
@@ -44,6 +52,10 @@ pub struct SpammerConfig {
 
 const fn default_presigned_batches() -> usize {
     DEFAULT_PRESIGNED_BATCHES
+}
+
+const fn default_in_flight_batches() -> usize {
+    DEFAULT_IN_FLIGHT_BATCHES
 }
 
 const fn default_rayon_threads() -> usize {
@@ -101,6 +113,7 @@ mod tests {
             relayer_url: "http://relayer:8080".to_string(),
             relayer_submitters: 4,
             presigned_batches: DEFAULT_PRESIGNED_BATCHES,
+            in_flight_batches: 4,
             primary_validators: vec!["deadbeef".to_string()],
             accounts_jitter: 0.25,
         };
@@ -114,6 +127,7 @@ mod tests {
         assert_eq!(parsed.relayer_url, config.relayer_url);
         assert_eq!(parsed.relayer_submitters, config.relayer_submitters);
         assert_eq!(parsed.presigned_batches, config.presigned_batches);
+        assert_eq!(parsed.in_flight_batches, config.in_flight_batches);
         assert_eq!(parsed.primary_validators, config.primary_validators);
         assert_eq!(parsed.accounts_jitter, config.accounts_jitter);
     }
@@ -125,6 +139,7 @@ mod tests {
         let parsed: SpammerConfig = serde_yaml::from_str(yaml).expect("deserialize");
         assert_eq!(parsed.rayon_threads, DEFAULT_RAYON_THREADS);
         assert_eq!(parsed.presigned_batches, DEFAULT_PRESIGNED_BATCHES);
+        assert_eq!(parsed.in_flight_batches, DEFAULT_IN_FLIGHT_BATCHES);
         assert_eq!(parsed.accounts_jitter, 0.0);
     }
 

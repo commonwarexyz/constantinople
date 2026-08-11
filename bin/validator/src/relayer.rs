@@ -10,7 +10,10 @@ use axum::{
 };
 use commonware_actor::Feedback;
 use commonware_codec::{Decode, DecodeExt, Encode, EncodeSize, FixedSize, RangeCfg};
-use commonware_consensus::{Reporter, Viewable};
+use commonware_consensus::{
+    Reporter, Viewable,
+    types::{TermLength, View},
+};
 use commonware_cryptography::{Hasher, bls12381::primitives::variant::MinSig, ed25519, sha256};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
@@ -48,21 +51,27 @@ type Activity = EngineActivity<ed25519::PublicKey, MinSig>;
 #[derive(Clone)]
 pub struct Observer {
     current_view: watch::Sender<u64>,
+    term_length: TermLength,
 }
 
 #[derive(Clone)]
 pub struct ViewClock {
     current_view: watch::Sender<u64>,
+    term_length: TermLength,
 }
 
 impl Observer {
-    pub fn new() -> (Self, ViewClock) {
+    pub fn new(term_length: TermLength) -> (Self, ViewClock) {
         let (current_view, _) = watch::channel(0);
         (
             Self {
                 current_view: current_view.clone(),
+                term_length,
             },
-            ViewClock { current_view },
+            ViewClock {
+                current_view,
+                term_length,
+            },
         )
     }
 }
@@ -71,7 +80,7 @@ impl Reporter for Observer {
     type Activity = Activity;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        let view = activity_view(&activity);
+        let view = activity_view(&activity, self.term_length);
         self.current_view.send_if_modified(|current| {
             if view <= *current {
                 return false;
@@ -83,14 +92,18 @@ impl Reporter for Observer {
     }
 }
 
-fn activity_view(activity: &Activity) -> u64 {
+fn activity_view(activity: &Activity, term_length: TermLength) -> u64 {
     match activity {
         Activity::Notarize(activity) => activity.view().get(),
         Activity::Notarization(activity) | Activity::Certification(activity) => {
             activity.view().get()
         }
         Activity::Nullify(activity) => activity.view().get(),
-        Activity::Nullification(activity) => activity.view().get(),
+        Activity::Nullification(activity) => activity
+            .view()
+            .next_term_start(term_length)
+            .get()
+            .saturating_sub(1),
         Activity::Finalize(activity) => activity.view().get(),
         Activity::Finalization(activity) => activity.view().get(),
         Activity::ConflictingNotarize(activity) => activity.view().get(),
@@ -287,7 +300,6 @@ async fn submit_with_retries<St: Strategy>(
     let mut sent: HashMap<String, Vec<usize>> = HashMap::new();
     let mut digest_index: Option<DigestIndex> = None;
     let mut height = 0;
-    let mut accepted_any = false;
 
     // Every (batch id, leader) pair POSTed at least once; polled every
     // round, which recovers accepts lost in transit.
@@ -299,8 +311,9 @@ async fn submit_with_retries<St: Strategy>(
     let mut accepted: HashSet<(String, String)> = HashSet::new();
     let mut views = state.view_clock.current_view.subscribe();
     let mut view = *views.borrow();
+    let mut unaccepted_retries = 0;
 
-    for retry in 0..=state.max_retry_views {
+    loop {
         // Until something resolves, resends reuse the original request bytes;
         // once the pending set shrinks, the subset is re-encoded and hashed
         // on the strategy's pool.
@@ -321,29 +334,35 @@ async fn submit_with_retries<St: Strategy>(
         sent.entry(sent_batch_id.clone())
             .or_insert_with(|| pending.iter().copied().collect());
 
-        // POST only to leaders that have not already accepted this batch id:
-        // consecutive next-two-leaders windows overlap by one, and a resend
-        // to an accepting leader only re-burns its ingress decode and verify.
-        let targets = next_two_leaders(&state.leaders, view)
-            .into_iter()
-            .filter(|target| {
-                !accepted.contains(&(sent_batch_id.clone(), target.public_key.clone()))
-            })
-            .collect::<Vec<_>>();
-        for target in &targets {
+        // POST only to the leader for the next view. A resend to an accepting
+        // leader only re-burns its ingress decode and verification.
+        let target = next_leader(&state.leaders, view, state.view_clock.term_length)
+            .expect("non-empty leader set");
+        let accepted_key = (sent_batch_id.clone(), target.public_key.clone());
+        if !accepted.contains(&accepted_key) {
+            let has_prior_attempt = !posted.is_empty();
             if !posted.iter().any(|(batch_id, leader)| {
                 batch_id == &sent_batch_id && leader.public_key == target.public_key
             }) {
                 posted.push((sent_batch_id.clone(), target.clone()));
             }
-        }
-        let result = forward_to_targets(&state.http, &targets, send_body).await;
-        if let Some(status) = result.deterministic {
-            return (status, String::new());
-        }
-        accepted_any |= !result.accepted.is_empty();
-        for leader in result.accepted {
-            accepted.insert((sent_batch_id.clone(), leader.public_key));
+            match forward_to_leader(&state.http, target, send_body).await {
+                ForwardResult::Accepted { leader } => {
+                    debug!(leader = %leader.public_key, "relayer forward accepted");
+                    accepted.insert((sent_batch_id.clone(), leader.public_key));
+                }
+                ForwardResult::Deterministic(status) => {
+                    // A prior POST may have been admitted even when its
+                    // response was lost. A later target's rejection is not a
+                    // terminal outcome for that unresolved attempt.
+                    if accepted.is_empty() && !has_prior_attempt {
+                        return (status, String::new());
+                    }
+                }
+                ForwardResult::Transient { leader } => {
+                    debug!(leader = %leader.public_key, "relayer forward transient failure");
+                }
+            }
         }
 
         merge_statuses(
@@ -351,6 +370,7 @@ async fn submit_with_retries<St: Strategy>(
             &posted,
             &sent,
             &batch,
+            &mut accepted,
             &mut digest_index,
             &mut included,
             &mut filtered,
@@ -362,57 +382,21 @@ async fn submit_with_retries<St: Strategy>(
             return json_response(TxStatus::Finalized { height });
         }
 
-        if retry == state.max_retry_views {
-            // A lost accept response must not mask polled progress: report
-            // total failure only when no leader returned 202 AND no status
-            // poll ever reported an outcome for a posted batch id.
-            if !accepted_any && included.is_empty() && filtered.is_empty() && height == 0 {
+        if accepted.is_empty() {
+            if unaccepted_retries == state.max_retry_views {
+                if let Some(status) = terminal_status(total, &included, &filtered, height) {
+                    return json_response(status);
+                }
                 return (StatusCode::SERVICE_UNAVAILABLE, String::new());
             }
-            return json_response(best_effort_status(&included, &filtered, height));
+            unaccepted_retries += 1;
+        } else {
+            // The routing budget bounds attempts to find an accepting leader,
+            // not the lifetime of work a leader has already admitted.
+            unaccepted_retries = 0;
         }
 
         wait_for_view_advance(&mut views, &mut view).await;
-    }
-
-    json_response(best_effort_status(&included, &filtered, height))
-}
-
-struct ForwardSummary {
-    accepted: Vec<Leader>,
-    deterministic: Option<StatusCode>,
-}
-
-async fn forward_to_targets(
-    http: &reqwest::Client,
-    targets: &[Leader],
-    body: Bytes,
-) -> ForwardSummary {
-    let sends = targets.iter().map(|leader| {
-        let leader = leader.clone();
-        let http = http.clone();
-        let body = body.clone();
-        async move { forward_to_leader(&http, leader, body).await }
-    });
-
-    let mut accepted = Vec::new();
-    let mut deterministic = None;
-    for result in join_all(sends).await {
-        match result {
-            ForwardResult::Accepted { leader } => {
-                debug!(leader = %leader.public_key, "relayer forward accepted");
-                accepted.push(leader);
-            }
-            ForwardResult::Deterministic(status) => deterministic = Some(status),
-            ForwardResult::Transient { leader } => {
-                debug!(leader = %leader.public_key, "relayer forward transient failure");
-            }
-        }
-    }
-
-    ForwardSummary {
-        accepted,
-        deterministic,
     }
 }
 
@@ -422,6 +406,7 @@ async fn merge_statuses<St: Strategy>(
     posted: &[(String, Leader)],
     sent: &HashMap<String, Vec<usize>>,
     batch: &Arc<DecodedBatch>,
+    accepted: &mut HashSet<(String, String)>,
     digest_index: &mut Option<DigestIndex>,
     included: &mut HashSet<usize>,
     filtered: &mut HashSet<usize>,
@@ -432,22 +417,33 @@ async fn merge_statuses<St: Strategy>(
         async move {
             (
                 batch_id,
+                leader,
                 fetch_status_from_leader(&http, leader, batch_id).await,
             )
         }
     });
-    for (batch_id, status) in join_all(fetches).await {
+    for (batch_id, leader, status) in join_all(fetches).await {
         let Some(status) = status else {
             continue;
         };
+        let accepted_key = (batch_id.clone(), leader.public_key.clone());
         match status {
-            BatchStatus::Accepted | BatchStatus::Dropped => {}
+            BatchStatus::Accepted => {
+                accepted.insert(accepted_key);
+            }
+            BatchStatus::Dropped => {
+                accepted.remove(&accepted_key);
+                if let Some(indices) = sent.get(batch_id) {
+                    filtered.extend(indices.iter().copied());
+                }
+            }
 
             // A fully finalized batch includes everything that was sent
             // under that batch id.
             BatchStatus::Finalized {
                 height: finalized_height,
             } => {
+                accepted.remove(&accepted_key);
                 *height = (*height).max(finalized_height);
                 if let Some(indices) = sent.get(batch_id) {
                     included.extend(indices.iter().copied());
@@ -458,6 +454,7 @@ async fn merge_statuses<St: Strategy>(
                 included: leader_included,
                 filtered: leader_filtered,
             } => {
+                accepted.remove(&accepted_key);
                 *height = (*height).max(finalized_height);
                 if digest_index.is_none() {
                     let batch = Arc::clone(batch);
@@ -497,24 +494,27 @@ async fn wait_for_view_advance(views: &mut watch::Receiver<u64>, current: &mut u
     }
 }
 
-/// Best-effort outcome when the retry budget ends with transactions still
-/// unresolved. Only leader-reported exclusions count as filtered: a
-/// transaction with no observed outcome may still land and must not be
-/// misreported as filtered.
-fn best_effort_status(
+/// Builds a terminal response only after every original transaction has a
+/// leader-reported outcome. Inclusion wins if different attempts report the
+/// same transaction both included and filtered.
+fn terminal_status(
+    total: usize,
     included: &HashSet<usize>,
     filtered: &HashSet<usize>,
     height: u64,
-) -> TxStatus {
+) -> Option<TxStatus> {
     let filtered = filtered.difference(included).count();
-    if included.is_empty() && filtered == 0 {
-        return TxStatus::Dropped;
+    if included.len() + filtered != total {
+        return None;
     }
-    TxStatus::PartiallyFinalized {
+    if included.is_empty() {
+        return Some(TxStatus::Dropped);
+    }
+    Some(TxStatus::PartiallyFinalized {
         height,
         included: included.len() as u64,
         filtered: filtered as u64,
-    }
+    })
 }
 
 fn json_response(status: TxStatus) -> (StatusCode, String) {
@@ -722,7 +722,7 @@ const fn min_signed_transaction_bytes() -> usize {
 }
 
 fn batch_id(body: &Bytes) -> String {
-    sha256::Sha256::hash(body).to_string()
+    sha256::Sha256::hash(&[body.as_ref()]).to_string()
 }
 
 fn requested_target_leader(headers: &HeaderMap) -> Option<String> {
@@ -765,16 +765,14 @@ fn normalize_leaders(leaders: Vec<RelayerLeaderConfig>) -> Vec<Leader> {
     leaders
 }
 
-fn next_two_leaders(leaders: &[Leader], observed_view: u64) -> Vec<Leader> {
+fn next_leader(leaders: &[Leader], observed_view: u64, term_length: TermLength) -> Option<Leader> {
     if leaders.is_empty() {
-        return Vec::new();
+        return None;
     }
-    let first = ((observed_view + 1) as usize) % leaders.len();
-    let second = ((observed_view + 2) as usize) % leaders.len();
-    if first == second {
-        return vec![leaders[first].clone()];
-    }
-    vec![leaders[first].clone(), leaders[second].clone()]
+    let next_view = View::new(observed_view.saturating_add(1));
+    let term = next_view.term_index(term_length);
+    let index = usize::try_from(term % leaders.len() as u64).ok()?;
+    leaders.get(index).cloned()
 }
 
 fn leader_by_id<'a>(leaders: &'a [Leader], public_key: &str) -> Option<&'a Leader> {
@@ -846,7 +844,7 @@ mod tests {
     }
 
     fn pinned_state(leader_url: String) -> AppState<commonware_parallel::Sequential> {
-        let (_, view_clock) = Observer::new();
+        let (_, view_clock) = Observer::new(TermLength::ONE);
         AppState {
             leaders: Arc::new(vec![Leader {
                 public_key: "00".to_string(),
@@ -871,55 +869,73 @@ mod tests {
     }
 
     #[test]
-    fn targets_next_two_views() {
+    fn targets_only_the_next_view_leader() {
         let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
 
-        let targets = next_two_leaders(&leaders, 0)
-            .into_iter()
-            .map(|leader| leader.public_key)
-            .collect::<Vec<_>>();
+        let target = next_leader(&leaders, 0, TermLength::ONE).expect("leader");
 
-        assert_eq!(targets, vec!["01", "02"]);
+        assert_eq!(target.public_key, "01");
     }
 
     #[test]
-    fn targets_deduplicate_single_leader_network() {
+    fn targets_one_leader_for_an_entire_stable_term() {
+        let leaders = vec![leader("00"), leader("01"), leader("02")];
+        let term_length = TermLength::new(std::num::NonZeroU32::new(1_000_000).unwrap());
+
+        assert_eq!(
+            next_leader(&leaders, 0, term_length)
+                .expect("first-term leader")
+                .public_key,
+            "01"
+        );
+        assert_eq!(
+            next_leader(&leaders, 999_999, term_length)
+                .expect("first-term leader")
+                .public_key,
+            "01"
+        );
+        assert_eq!(
+            next_leader(&leaders, 1_000_000, term_length)
+                .expect("second-term leader")
+                .public_key,
+            "02"
+        );
+    }
+
+    #[test]
+    fn targets_single_leader_network() {
         let leaders = vec![leader("00")];
 
-        let targets = next_two_leaders(&leaders, 12)
-            .into_iter()
-            .map(|leader| leader.public_key)
-            .collect::<Vec<_>>();
-
-        assert_eq!(targets, vec!["00"]);
+        assert_eq!(
+            next_leader(&leaders, 12, TermLength::ONE)
+                .expect("leader")
+                .public_key,
+            "00"
+        );
     }
 
     #[test]
-    fn retry_budget_counts_only_observed_filters() {
+    fn terminal_status_requires_an_outcome_for_every_transaction() {
         let included: HashSet<usize> = [0].into_iter().collect();
         let observed: HashSet<usize> = [0, 1].into_iter().collect();
 
         // An index reported both included and filtered counts as included.
         assert_eq!(
-            best_effort_status(&included, &observed, 7),
-            TxStatus::PartiallyFinalized {
+            terminal_status(2, &included, &observed, 7),
+            Some(TxStatus::PartiallyFinalized {
                 height: 7,
                 included: 1,
                 filtered: 1
-            }
+            })
         );
-        // Unresolved transactions are not misreported as filtered.
+        assert_eq!(terminal_status(2, &included, &HashSet::new(), 7), None);
         assert_eq!(
-            best_effort_status(&included, &HashSet::new(), 7),
-            TxStatus::PartiallyFinalized {
-                height: 7,
-                included: 1,
-                filtered: 0
-            }
+            terminal_status(2, &HashSet::new(), &observed, 0),
+            Some(TxStatus::Dropped)
         );
         assert_eq!(
-            best_effort_status(&HashSet::new(), &HashSet::new(), 0),
-            TxStatus::Dropped
+            terminal_status(2, &HashSet::new(), &HashSet::new(), 0),
+            None
         );
     }
 
@@ -1063,7 +1079,15 @@ mod tests {
         leaders: Vec<Leader>,
         max_retry_views: u64,
     ) -> AppState<commonware_parallel::Sequential> {
-        let (_, view_clock) = Observer::new();
+        retry_state_with_term(leaders, max_retry_views, TermLength::ONE)
+    }
+
+    fn retry_state_with_term(
+        leaders: Vec<Leader>,
+        max_retry_views: u64,
+        term_length: TermLength,
+    ) -> AppState<commonware_parallel::Sequential> {
+        let (_, view_clock) = Observer::new(term_length);
         AppState {
             leaders: Arc::new(leaders),
             max_retry_views,
@@ -1098,7 +1122,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpinned_retry_posts_once_per_accepting_leader() {
+    async fn unpinned_retry_tracks_each_rotating_leader_without_fanout() {
         let (router_a, bodies_a) = scripted_leader(
             Vec::new(),
             vec![
@@ -1124,9 +1148,31 @@ mod tests {
             TxStatus::Finalized { height: 7 },
         );
 
-        // Both leaders accepted in round 0 and are polled (not re-POSTed) in
-        // every later round.
+        // Each retry posts to only that view's leader. Accepted batches are
+        // polled and are not re-posted when their leader rotates back in.
         assert_eq!(bodies_a.lock().expect("bodies lock").len(), 1);
+        assert_eq!(bodies_b.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unpinned_stable_term_posts_only_to_its_leader() {
+        let (router_a, bodies_a) = scripted_leader(Vec::new(), Vec::new());
+        let (router_b, bodies_b) =
+            scripted_leader(Vec::new(), vec![Some(BatchStatus::Finalized { height: 7 })]);
+        let leader_a = mock_leader("aa", spawn_mock_leader(router_a).await);
+        let leader_b = mock_leader("bb", spawn_mock_leader(router_b).await);
+        let term_length = TermLength::new(std::num::NonZeroU32::new(1_000_000).unwrap());
+        let state = retry_state_with_term(vec![leader_a, leader_b], 3, term_length);
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let (status, response) = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 7 },
+        );
+        assert!(bodies_a.lock().expect("bodies lock").is_empty());
         assert_eq!(bodies_b.lock().expect("bodies lock").len(), 1);
     }
 
@@ -1156,6 +1202,130 @@ mod tests {
         // single leader stays in the targeting window; the accepted POST is
         // never repeated.
         assert_eq!(bodies.lock().expect("bodies lock").len(), 2);
+    }
+
+    #[tokio::test]
+    async fn accepted_batch_outlives_routing_retry_budget() {
+        let (router, bodies) = scripted_leader(
+            Vec::new(),
+            vec![
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Finalized { height: 3 }),
+            ],
+        );
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 1);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 3 },
+        );
+        assert_eq!(bodies.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn accepted_status_recovers_lost_ingest_response() {
+        let (router, bodies) = scripted_leader(
+            vec![StatusCode::INTERNAL_SERVER_ERROR],
+            vec![
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Finalized { height: 3 }),
+            ],
+        );
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 1);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 3 },
+        );
+        assert_eq!(bodies.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn later_leader_rejection_does_not_override_an_accepted_attempt() {
+        let (router_a, bodies_a) = scripted_leader(vec![StatusCode::BAD_REQUEST], vec![None]);
+        let (router_b, bodies_b) = scripted_leader(
+            Vec::new(),
+            vec![
+                Some(BatchStatus::Accepted),
+                Some(BatchStatus::Finalized { height: 3 }),
+            ],
+        );
+        let leader_a = mock_leader("aa", spawn_mock_leader(router_a).await);
+        let leader_b = mock_leader("bb", spawn_mock_leader(router_b).await);
+        let state = retry_state(vec![leader_a, leader_b], 2);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Finalized { height: 3 },
+        );
+        assert_eq!(bodies_a.lock().expect("bodies lock").len(), 1);
+        assert_eq!(bodies_b.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn initial_leader_deterministic_rejection_is_returned() {
+        let (router, bodies) = scripted_leader(vec![StatusCode::BAD_REQUEST], vec![None]);
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 2);
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let (status, response) = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(response.is_empty());
+        assert_eq!(bodies.lock().expect("bodies lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn admitted_batch_returns_dropped_only_after_leader_reports_it() {
+        let (router, bodies) = scripted_leader(
+            Vec::new(),
+            vec![Some(BatchStatus::Accepted), Some(BatchStatus::Dropped)],
+        );
+        let leader = mock_leader("aa", spawn_mock_leader(router).await);
+        let state = retry_state(vec![leader], 0);
+        let views = state.view_clock.current_view.clone();
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
+        let ticker = advance_views(views);
+        let (status, response) = submit.await.expect("submit task");
+        ticker.abort();
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            serde_json::from_str::<TxStatus>(&response).expect("status json"),
+            TxStatus::Dropped,
+        );
+        assert_eq!(bodies.lock().expect("bodies lock").len(), 1);
     }
 
     #[tokio::test]
@@ -1199,7 +1369,7 @@ mod tests {
     /// A transaction the leader never reported filtered is still pending when
     /// the retry budget ends; it must not be counted as filtered.
     #[tokio::test]
-    async fn unpinned_retry_budget_does_not_report_pending_as_filtered() {
+    async fn unpinned_retry_budget_does_not_report_a_terminal_status_for_pending_work() {
         let first = signed_transfer(1, 0);
         let second = signed_transfer(2, 0);
         let partial = BatchStatus::PartiallyFinalized {
@@ -1218,20 +1388,13 @@ mod tests {
         let (status, response) = submit.await.expect("submit task");
         ticker.abort();
 
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            serde_json::from_str::<TxStatus>(&response).expect("status json"),
-            TxStatus::PartiallyFinalized {
-                height: 5,
-                included: 1,
-                filtered: 0,
-            },
-        );
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(response.is_empty());
     }
 
     /// A leader that admits a batch but whose accept responses are all lost
-    /// (transient POST failures) is still polled for status; progress those
-    /// polls recover must surface as a best-effort outcome, not a 503.
+    /// (transient POST failures) is still polled for status; a complete
+    /// terminal outcome recovered there must surface instead of a 503.
     #[tokio::test]
     async fn unpinned_final_round_reports_polled_progress_when_accepts_lost() {
         let first = signed_transfer(1, 0);

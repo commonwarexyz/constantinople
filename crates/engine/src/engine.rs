@@ -43,7 +43,8 @@ use commonware_p2p::{Blocker, Manager, Receiver, Sender};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, ContextCell, Handle, Metrics, Network, Spawner, Storage,
-    buffer::paged::CacheRef, spawn_cell,
+    buffer::paged::{CacheRef, page_size as paged_page_size},
+    spawn_cell,
 };
 use commonware_storage::{
     archive::{prunable, prunable::Archive as PrunableArchive},
@@ -55,7 +56,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
+use commonware_utils::{NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
     Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
@@ -78,18 +79,27 @@ const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const WRITE_BUFFER: NonZero<usize> = NZUsize!(1024 * 1024);
-const PAGE_CACHE_PAGE_SIZE: NonZeroU16 = NZU16!(8192); // 8 KiB
 const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
-pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
+pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(8);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
+const STATE_INIT_BUFFER: NonZero<usize> = NZUsize!(1 << 21);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
+
+/// Returns the physical on-disk page size and its checksum-adjusted logical payload size.
+const fn page_cache_page_sizes() -> (usize, NonZeroU16) {
+    const PHYSICAL_PAGE_SIZE: u32 = 4_096;
+    (
+        PHYSICAL_PAGE_SIZE as usize,
+        paged_page_size(PHYSICAL_PAGE_SIZE),
+    )
+}
 
 /// Vote channel id.
 pub const VOTE_CHANNEL: u64 = 0;
@@ -148,13 +158,14 @@ pub enum StartupMode {
     StateSync,
 }
 
-pub struct Config<E, C, M, B, V, St, I, H, O>
+pub struct Config<E, C, M, B, V, L, St, I, H, O>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     V: Variant,
+    L: Elector<ThresholdScheme<C::PublicKey, V>>,
     St: Strategy,
     H: Hasher,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
@@ -165,9 +176,12 @@ where
     pub namespace: Vec<u8>,
     pub output: Output<V, C::PublicKey>,
     pub share: Option<group::Share>,
+    pub elector: L,
     pub input: I,
     pub partition_prefix: String,
     pub strategy: St,
+    /// Minimum time between a locally proposed block and its parent.
+    pub proposal_delay_ms: NonZero<u64>,
     pub public_key_cache: PublicKeyCache,
     pub startup: StartupMode,
     pub sync_config: SyncEngineConfig,
@@ -176,6 +190,10 @@ where
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
     pub prunable_items_per_section: NonZero<u64>,
+    pub leader_timeout: Duration,
+    pub certification_timeout: Duration,
+    pub timeout_retry: Duration,
+    pub skip_timeout: Duration,
     /// Capacity in bytes of the state QMDB page cache.
     ///
     /// Must hold the state journal's working set: 512 MiB thrashed once the
@@ -300,17 +318,18 @@ where
 
     /// Initializes the full engine stack.
     #[boxed]
-    pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
+    pub async fn new(context: E, config: Config<E, C, M, B, V, L, St, I, H, O>) -> Self {
+        let (physical_page_size, logical_page_size) = page_cache_page_sizes();
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
-            PAGE_CACHE_PAGE_SIZE,
-            NonZero::new(config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+            logical_page_size,
+            NonZero::new(config.other_page_cache_bytes / physical_page_size)
                 .expect("page cache must hold at least one page"),
         );
         let storage_page_cache = CacheRef::from_pooler(
             &context.child("state"),
-            PAGE_CACHE_PAGE_SIZE,
-            NonZero::new(config.state_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+            logical_page_size,
+            NonZero::new(config.state_page_cache_bytes / physical_page_size)
                 .expect("state page cache must hold at least one page"),
         );
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
@@ -323,7 +342,7 @@ where
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("state_resolver"),
-                qmdb_resolver::standard::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -340,7 +359,7 @@ where
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("transaction_resolver"),
-                qmdb_resolver::compact::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -351,6 +370,7 @@ where
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
+                    max_serve_ops: NZU64!(4096),
                 },
             );
         let n_participants = u16::try_from(config.output.players().len())
@@ -435,7 +455,7 @@ where
         );
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
-        let (marshal, marshal_mailbox, _) = MarshalActor::init(
+        let (marshal, marshal_mailbox, marshal_floor) = MarshalActor::init(
             context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
@@ -445,7 +465,7 @@ where
                 start: marshal_start,
                 partition_prefix: format!("{}_marshal", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
-                view_retention_timeout: ACTIVITY_TIMEOUT,
+                view_retention: ACTIVITY_TIMEOUT,
                 prunable_items_per_section,
                 page_cache: page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
@@ -481,6 +501,7 @@ where
         let application = Application::new(
             context.child("application"),
             config.strategy.clone(),
+            config.proposal_delay_ms,
             config.genesis_leader.clone(),
             genesis_parent,
             config.transaction_namespace,
@@ -501,8 +522,8 @@ where
                     ),
                     transaction_db_config,
                 ),
-                input_provider: config.input,
-                marshal: marshal_mailbox.clone(),
+                provider: config.input,
+                marshal: (marshal_mailbox.clone(), marshal_floor),
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
@@ -523,10 +544,8 @@ where
             },
         );
         // Fan simplex activity to the marshal mailbox and any external
-        // observer (e.g. the indexer's certificate publisher). When
-        // `simplex_observer` is `None`, this combinator is equivalent to
-        // forwarding activity to the marshal mailbox alone — primaries that
-        // pass `None` see exactly the previous behavior.
+        // observer. With no observer, the marshal mailbox remains the sole
+        // recipient.
         #[cfg(all(test, feature = "test-utils"))]
         let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
             Reporters::from((marshal_mailbox.clone(), config.simplex_observer));
@@ -538,11 +557,12 @@ where
             context.child("simplex"),
             simplex::Config {
                 scheme,
-                elector: L::default(),
+                elector: config.elector,
                 blocker: config.blocker.clone(),
                 automaton: application.clone(),
                 relay: application,
                 reporter: simplex_reporter,
+                track_historical_votes: false,
                 strategy: config.strategy.clone(),
                 partition: format!("{}_simplex", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
@@ -551,13 +571,12 @@ where
                 replay_buffer: NZUsize!(1024 * 1024),
                 write_buffer: NZUsize!(1024 * 1024),
                 page_cache,
-                leader_timeout: Duration::from_secs(4),
-                certification_timeout: Duration::from_secs(8),
-                timeout_retry: Duration::from_secs(10),
+                leader_timeout: config.leader_timeout,
+                certification_timeout: config.certification_timeout,
+                timeout_retry: config.timeout_retry,
                 fetch_timeout: Duration::from_secs(4),
-                activity_timeout: ACTIVITY_TIMEOUT,
-                skip_timeout: ViewDelta::new(10),
-                fetch_concurrent: NZUsize!(32),
+                view_retention: ACTIVITY_TIMEOUT,
+                skip_timeout: config.skip_timeout,
                 forwarding: simplex::ForwardingPolicy::Disabled,
             },
         );
@@ -693,7 +712,7 @@ where
         ),
         TransactionHistoryTarget {
             root: block.header.transactions_root,
-            leaf_count: mmr::Location::new(block.header.transactions_range.end()),
+            size: mmr::Location::new(block.header.transactions_range.end()),
         },
     )
 }
@@ -791,6 +810,8 @@ where
         },
         translator: EightCap,
         init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_buffer: STATE_INIT_BUFFER,
+        init_concurrency: (),
     }
 }
 
@@ -813,5 +834,17 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         commit_codec_config: (),
+    }
+}
+
+#[cfg(test)]
+mod page_cache_tests {
+    use super::page_cache_page_sizes;
+
+    #[test]
+    fn page_cache_uses_an_adjusted_storage_page() {
+        let (physical, logical) = page_cache_page_sizes();
+        assert_eq!(physical, 4_096);
+        assert_eq!(logical, commonware_runtime::buffer::paged::page_size(4_096));
     }
 }

@@ -14,7 +14,9 @@ use commonware_cryptography::{
 use commonware_glue::stateful::db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
-    Clock as _, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
+    Clock as _, Runner as _, Supervisor as _,
+    buffer::paged::{CacheRef, page_size as paged_page_size},
+    deterministic,
 };
 use commonware_storage::{
     journal::contiguous::{
@@ -24,7 +26,7 @@ use commonware_storage::{
     qmdb::{any::FixedConfig, batch_chain::Bounds, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
-use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
+use commonware_utils::{NZU64, NZUsize, non_empty_range};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
     Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, SealedBlock,
@@ -45,6 +47,7 @@ type TestApp = Application<
 type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;
 
 const TEST_TX_NS: &[u8] = b"constantinople-application-test-transactions";
+const TEST_PAGE_CACHE_BYTES: usize = 64 * 1024;
 
 fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     StateSyncTarget::new(
@@ -71,6 +74,8 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -90,12 +95,9 @@ fn transaction_config(cache: CacheRef) -> keyless_fixed::CompactConfig<Sequentia
 }
 
 fn sync_range_from_bounds(
-    bounds: &Bounds<mmr::Family>,
+    bounds: &Bounds<mmr::Family, sha256::Digest>,
 ) -> commonware_utils::range::NonEmptyRange<mmr::Location> {
-    non_empty_range!(
-        bounds.inactivity_floor,
-        mmr::Location::new(bounds.total_size)
-    )
+    non_empty_range!(bounds.inactivity_floor, bounds.tip.size)
 }
 
 type TestBlock = SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
@@ -117,7 +119,11 @@ struct VerifyHarness {
 }
 
 async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
-    let cache = CacheRef::from_pooler(context, NZU16!(16), NZUsize!(4096));
+    let physical_page_size = 4_096usize;
+    let page_size = paged_page_size(physical_page_size as u32);
+    let capacity = std::num::NonZeroUsize::new(TEST_PAGE_CACHE_BYTES / physical_page_size)
+        .expect("test page cache must hold at least one page");
+    let cache = CacheRef::from_pooler(context, page_size, capacity);
     let dbs = TestDbs::init(
         context.child("dbs"),
         (
@@ -148,11 +154,11 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         .await
         .expect("genesis transactions");
     let state_target = StateSyncTarget::new(state.root(), sync_range_from_bounds(state.bounds()));
-    let transaction_target = TransactionHistoryTarget::new(
-        transactions.root(),
-        mmr::Location::new(transactions.bounds().total_size),
-    );
-    dbs.finalize((state, transactions)).await;
+    let transaction_target = TransactionHistoryTarget {
+        root: transactions.root(),
+        size: transactions.bounds().tip.size,
+    };
+    assert!(dbs.finalize((state, transactions)).await.durable().await);
 
     let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -165,6 +171,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         app: TestApp::new(
             context.child("app"),
             Sequential,
+            NZU64!(10),
             leader.public_key(),
             sha256::Digest::EMPTY,
             TEST_TX_NS,
@@ -358,7 +365,7 @@ fn propose_drops_inapplicable_and_refills() {
 }
 
 #[test]
-fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
+fn verify_accepts_proposed_child_with_parent_timestamp() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
             mut app,
@@ -367,10 +374,6 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             leader,
             ..
         } = verify_harness(&context).await;
-
-        // Advance past the genesis timestamp so the proposal's clock-derived
-        // timestamp is strictly greater than the parent's.
-        context.sleep(Duration::from_millis(10)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -387,37 +390,52 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             )
             .await
             .expect("empty proposal must succeed");
+        let mut child = proposed.block.into_inner();
+        child.header.timestamp = parent.header.timestamp;
+        let child = child.seal(&mut sha256::Sha256::default());
 
-        // The freshly proposed child verifies against the same parent.
         let accepted = app
             .verify_child(
-                (context.child("verify"), consensus_context.clone()),
-                Arc::new(proposed.block.clone()),
-                std::future::ready(Some(Arc::new(parent.clone()))),
-                dbs.new_batches().await,
-            )
-            .await;
-        assert!(accepted.is_some());
-
-        // The identical block with its timestamp rewound to the parent's is
-        // rejected by the timestamp check alone.
-        let Block { mut header, body } = proposed.block.into_inner();
-        assert!(
-            body.is_empty(),
-            "stale block must mirror the empty proposal"
-        );
-        header.timestamp = parent.header.timestamp;
-        let stale = Block::<sha256::Digest, _, sha256::Sha256>::new(header, Vec::new())
-            .seal(&mut sha256::Sha256::default());
-        let rejected = app
-            .verify_child(
-                (context.child("verify_stale"), consensus_context),
-                Arc::new(stale),
+                (context.child("verify"), consensus_context),
+                Arc::new(child),
                 std::future::ready(Some(Arc::new(parent))),
                 dbs.new_batches().await,
             )
             .await;
-        assert!(rejected.is_none());
+        assert!(accepted.is_some());
+    });
+}
+
+#[test]
+fn proposal_waits_for_configured_block_delay() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = verify_harness(&context).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+
+        let proposed = app
+            .propose_child(
+                (context.child("propose"), consensus_context),
+                Arc::new(parent.clone()),
+                dbs.new_batches().await,
+                &mut StaticTransactionSource::new(Vec::new()),
+            )
+            .await
+            .expect("empty proposal must succeed");
+
+        assert_eq!(
+            proposed.block.header.timestamp,
+            parent.header.timestamp + 10
+        );
     });
 }
 
@@ -427,7 +445,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
     let recipient = ed25519::PrivateKey::from_seed(8);
     let genesis_target = TransactionHistoryTarget {
         root: sha256::Digest::EMPTY,
-        leaf_count: commonware_storage::mmr::Location::new(1),
+        size: commonware_storage::mmr::Location::new(1),
     };
     let mut header = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -471,8 +489,8 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
 fn genesis_block_uses_the_initialized_transaction_target() {
     let leader = ed25519::PrivateKey::from_seed(11).public_key();
     let target = TransactionHistoryTarget {
-        root: sha256::Sha256::hash(b"genesis"),
-        leaf_count: commonware_storage::mmr::Location::new(1),
+        root: sha256::Sha256::hash(&[b"genesis"]),
+        size: commonware_storage::mmr::Location::new(1),
     };
 
     let block = genesis_block::<sha256::Digest, _, sha256::Sha256>(
@@ -570,6 +588,7 @@ fn build_timeout_bounds_refill_rounds() {
         > = Application::new(
             context.child("deadline_app"),
             Sequential,
+            NZU64!(10),
             harness.leader.public_key(),
             sha256::Digest::EMPTY,
             TEST_TX_NS,

@@ -18,7 +18,7 @@ const WARMUP: u32 = 3;
 const ITERS: u32 = 30;
 
 fn key(index: u64) -> AccountKey {
-    AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
 fn transfer(sender: AccountKey, recipient: AccountKey, value: u64, nonce: u64) -> PreparedTransfer {

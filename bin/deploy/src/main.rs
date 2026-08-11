@@ -15,12 +15,13 @@ use commonware_cryptography::{
 };
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
-use commonware_utils::{N3f1, NZU32, TryCollect};
+use commonware_utils::{N3f1, NZU32, NZU64, TryCollect};
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    num::{NonZeroU32, NonZeroU64},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -60,6 +61,8 @@ const DEFAULT_BOOTSTRAPPERS: usize = 3;
 const INDEXER_UPLOAD_BUFFER: usize = 64;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
+const DEFAULT_STABLE_SPAMMER_IN_FLIGHT_BATCHES: usize = 16;
+const MAX_SPAMMER_IN_FLIGHT_BATCHES: usize = 32;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
@@ -96,6 +99,12 @@ pub(crate) struct GenerateArgs {
     /// Number of primary (voting) validators.
     #[arg(long)]
     validators: u32,
+    /// Number of consecutive views assigned to one leader.
+    #[arg(long, default_value_t = default_leader_term_length())]
+    leader_term_length: NonZeroU32,
+    /// Minimum milliseconds between a locally proposed block and its parent.
+    #[arg(long, default_value_t = default_leader_delay_ms())]
+    leader_delay_ms: NonZeroU64,
     /// Include the full indexer secondary and shared indexer services.
     #[arg(long, default_value_t = false)]
     indexer: bool,
@@ -161,6 +170,9 @@ pub(crate) struct GenerateArgs {
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
+    /// Source-ordered batches held in flight by the stable-leader spammer stream.
+    #[arg(long, default_value_t = DEFAULT_STABLE_SPAMMER_IN_FLIGHT_BATCHES)]
+    spammer_in_flight_batches: usize,
 
     /// Deployment target (local or remote).
     #[command(subcommand)]
@@ -301,6 +313,9 @@ pub(crate) struct SpammerConfig {
     /// Fully signed local batches to keep ready per submitter.
     #[serde(default = "default_spammer_presigned_batches")]
     pub presigned_batches: usize,
+    /// Source-ordered batches held in flight per submitter.
+    #[serde(default = "default_spammer_in_flight_batches")]
+    pub in_flight_batches: usize,
     /// Hex-encoded ed25519 public keys of primary (voting) validators.
     ///
     /// In `--hosts` mode the spammer cannot distinguish primaries from
@@ -373,6 +388,10 @@ pub(crate) struct ValidatorConfig {
     listen_port: u16,
     /// Hex-encoded ed25519 public key of the genesis leader.
     genesis_leader: String,
+    /// Number of consecutive views assigned to one leader.
+    leader_term_length: NonZeroU32,
+    /// Minimum milliseconds between a locally proposed block and its parent.
+    leader_delay_ms: NonZeroU64,
     /// Storage partition prefix for this validator.
     partition_prefix: String,
     /// Number of primary validators (DKG participant count).
@@ -535,6 +554,10 @@ const fn default_spammer_presigned_batches() -> usize {
     DEFAULT_SPAMMER_PRESIGNED_BATCHES
 }
 
+const fn default_spammer_in_flight_batches() -> usize {
+    1
+}
+
 const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
 }
@@ -615,6 +638,10 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
+    );
+    assert!(
+        (1..=MAX_SPAMMER_IN_FLIGHT_BATCHES).contains(&args.spammer_in_flight_batches),
+        "--spammer-in-flight-batches must be between 1 and {MAX_SPAMMER_IN_FLIGHT_BATCHES}"
     );
 }
 
@@ -727,6 +754,14 @@ pub(crate) fn default_bootstrappers(
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
     8 * 1024 * 1024
+}
+
+pub(crate) const fn default_leader_term_length() -> NonZeroU32 {
+    NZU32!(1)
+}
+
+pub(crate) const fn default_leader_delay_ms() -> NonZeroU64 {
+    NZU64!(10)
 }
 
 pub(crate) const fn default_max_pool_bytes() -> usize {
@@ -901,6 +936,48 @@ mod tests {
     }
 
     #[test]
+    fn parses_leader_term_length() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--leader-term-length",
+            "1000000",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.leader_term_length.get(), 1_000_000);
+    }
+
+    #[test]
+    fn parses_leader_delay() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--leader-delay-ms",
+            "12",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.leader_delay_ms.get(), 12);
+    }
+
+    #[test]
     fn parses_spammer_presigned_batches() {
         let cli = Cli::try_parse_from([
             "constantinople-deploy",
@@ -920,6 +997,27 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_presigned_batches, 32);
+    }
+
+    #[test]
+    fn parses_spammer_in_flight_batches() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-in-flight-batches",
+            "6",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.spammer_in_flight_batches, 6);
     }
 
     #[test]

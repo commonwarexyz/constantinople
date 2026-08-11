@@ -5,7 +5,7 @@ mod properties;
 
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
@@ -16,7 +16,7 @@ use commonware_consensus::{
     Heightable,
     marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
-    types::{Epoch, coding::Commitment},
+    types::{Epoch, Round, View, coding::Commitment},
 };
 use commonware_cryptography::{
     Signer,
@@ -92,6 +92,10 @@ struct TestEngineDefinition {
     restart_barrier: Option<RestartBarrier>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
+    leader_timeout: Duration,
+    certification_timeout: Duration,
+    timeout_retry: Duration,
+    skip_timeout: Duration,
 }
 
 impl TestEngineDefinition {
@@ -109,6 +113,10 @@ impl TestEngineDefinition {
             restart_barrier: None,
             prunable_items_per_section: NZU64!(4_096),
             retained_marshal_blocks: 16,
+            leader_timeout: Duration::from_secs(4),
+            certification_timeout: Duration::from_secs(8),
+            timeout_retry: Duration::from_secs(10),
+            skip_timeout: Duration::from_secs(12),
         }
     }
 
@@ -152,6 +160,14 @@ impl TestEngineDefinition {
     const fn with_aggressive_pruning(mut self) -> Self {
         self.prunable_items_per_section = NZU64!(1);
         self.retained_marshal_blocks = 0;
+        self
+    }
+
+    const fn with_fast_recovery_timeouts(mut self) -> Self {
+        self.leader_timeout = Duration::from_millis(250);
+        self.certification_timeout = Duration::from_millis(500);
+        self.timeout_retry = Duration::from_millis(550);
+        self.skip_timeout = Duration::from_millis(600);
         self
     }
 }
@@ -201,6 +217,10 @@ impl EngineDefinition for TestEngineDefinition {
         let genesis_commitments = self.genesis_commitments.clone();
         let prunable_items_per_section = self.prunable_items_per_section;
         let retained_marshal_blocks = self.retained_marshal_blocks;
+        let leader_timeout = self.leader_timeout;
+        let certification_timeout = self.certification_timeout;
+        let timeout_retry = self.timeout_retry;
+        let skip_timeout = self.skip_timeout;
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
         let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
@@ -318,9 +338,11 @@ impl EngineDefinition for TestEngineDefinition {
                     other_page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
+                    elector: RoundRobin::default(),
                     input,
                     partition_prefix,
                     strategy: Sequential,
+                    proposal_delay_ms: NZU64!(10),
                     public_key_cache: PublicKeyCache::new(
                         context.child("public_key_cache"),
                         NZUsize!(1024),
@@ -328,13 +350,12 @@ impl EngineDefinition for TestEngineDefinition {
                     startup,
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),
-                        apply_batch_size: 64,
+                        apply_batch_size: NZU64!(64),
                         max_outstanding_requests: 8,
                         update_channel_size: NZUsize!(256),
                         max_retained_roots: 32,
                     },
                     prune_config: Some(PruneConfig {
-                        max_pending_acks: MAX_PENDING_ACKS,
                         maintenance_interval: NZUsize!(16),
                         retained_marshal_blocks,
                         retained_qmdb_blocks: 0,
@@ -343,6 +364,10 @@ impl EngineDefinition for TestEngineDefinition {
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
                     prunable_items_per_section,
+                    leader_timeout,
+                    certification_timeout,
+                    timeout_retry,
+                    skip_timeout,
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,
                     finalized_hook: None,
@@ -497,11 +522,19 @@ fn run_restart_with_archived_finalizations() {
         .unwrap();
 }
 
+fn delay_first_until_view(engine: &TestEngineDefinition, view: u64) -> Crash<TestPublicKey> {
+    Crash::DelayRound {
+        participants: engine.participants().into_iter().take(1).collect(),
+        round: Round::new(Epoch::zero(), View::new(view)),
+    }
+}
+
 fn run_delayed_start(engine: TestEngineDefinition) {
+    let delayed = delay_first_until_view(&engine, 5);
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
-        .crash(Crash::Delay { count: 1, after: 5 })
+        .crash(delayed)
         .exit_condition(FinalizedHeightAtLeast::new(20))
         .property(BlockAgreementAtHeight::new(20))
         .run()
@@ -509,14 +542,12 @@ fn run_delayed_start(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync(engine: TestEngineDefinition) {
+    let delayed = delay_first_until_view(&engine, 80);
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
@@ -526,14 +557,12 @@ fn run_state_sync(engine: TestEngineDefinition) {
 
 fn run_state_sync_deterministic(engine: TestEngineDefinition) {
     let seeds = 0..2;
+    let delayed = delay_first_until_view(&engine, 80);
     let first = PlanBuilder::new(engine.clone())
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed.clone())
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
@@ -543,10 +572,7 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
@@ -562,14 +588,12 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
+    let delayed = delay_first_until_view(&engine, 80);
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .crash(Crash::Random {
             frequency: Duration::from_secs(3),
             downtime: Duration::from_millis(500),
@@ -583,14 +607,12 @@ fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_lossy(engine: TestEngineDefinition) {
+    let delayed = delay_first_until_view(&engine, 80);
     PlanBuilder::new(engine)
         .link(lossy_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::at_least(150, 3))
@@ -609,6 +631,7 @@ fn run_lossy(engine: TestEngineDefinition) {
 }
 
 fn run_random_crashes(engine: TestEngineDefinition) {
+    let engine = engine.with_fast_recovery_timeouts();
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
@@ -624,6 +647,7 @@ fn run_random_crashes(engine: TestEngineDefinition) {
 }
 
 fn run_many_crashes(engine: TestEngineDefinition) {
+    let engine = engine.with_fast_recovery_timeouts();
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
@@ -665,20 +689,18 @@ fn run_total_shutdown(engine: TestEngineDefinition) {
 
 fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
     let delayed = engine.participants().first().cloned().unwrap();
+    let delayed_start = delay_first_until_view(&engine, 80);
 
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
+        .crash(delayed_start)
+        .crash(Crash::ProcessedHeight {
+            participant: delayed,
+            heights: 1..=180,
+            downtime: Duration::from_secs(2),
         })
-        .crash(Crash::Schedule(
-            Schedule::new()
-                .at(Duration::from_millis(9_000), Action::Crash(delayed.clone()))
-                .at(Duration::from_millis(11_000), Action::Restart(delayed)),
-        ))
         .exit_condition(StateSyncReadyAtHeight::new(180))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::at_least(180, 3))
@@ -687,6 +709,7 @@ fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
 }
 
 fn run_rapid_crashes(engine: TestEngineDefinition) {
+    let engine = engine.with_fast_recovery_timeouts();
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)

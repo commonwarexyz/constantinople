@@ -101,6 +101,8 @@ fn build_validators(
             startup: args.startup,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
+            leader_term_length: args.leader_term_length,
+            leader_delay_ms: args.leader_delay_ms,
             partition_prefix: format!("validator-{index}"),
             num_validators: args.validators,
             primary_validators: primary_validators.clone(),
@@ -177,6 +179,8 @@ fn build_secondaries(
             startup: args.startup,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
+            leader_term_length: args.leader_term_length,
+            leader_delay_ms: args.leader_delay_ms,
             partition_prefix: format!("secondary-{index}"),
             num_validators: args.validators,
             primary_validators: primary_validators.clone(),
@@ -353,10 +357,17 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
-        let network_source = format!(
-            "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
-            relayer_port, args.validators, targets,
-        );
+        let network_source = if args.leader_term_length.get() > 1 {
+            format!(
+                "--relayer-url http://127.0.0.1:{relayer_port} --relayer-submitters 1 --in-flight-batches {}",
+                args.spammer_in_flight_batches,
+            )
+        } else {
+            format!(
+                "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --in-flight-batches 1 --relayer-targets {}",
+                relayer_port, args.validators, targets,
+            )
+        };
 
         // Place the spammer's metrics port past the primary and secondary ranges
         // so it does not collide with any validator on the loopback host.
@@ -408,6 +419,8 @@ mod tests {
     fn test_args(spammer: bool) -> GenerateArgs {
         GenerateArgs {
             validators: 2,
+            leader_term_length: crate::default_leader_term_length(),
+            leader_delay_ms: crate::default_leader_delay_ms(),
             indexer: false,
             relayer: false,
             output_dir: PathBuf::from("/tmp/configs"),
@@ -427,6 +440,7 @@ mod tests {
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
+            spammer_in_flight_batches: crate::DEFAULT_STABLE_SPAMMER_IN_FLIGHT_BATCHES,
             target: GenerateTarget::Local(test_local_args()),
         }
     }
@@ -561,6 +575,23 @@ mod tests {
         );
 
         assert!(commands[3].contains("--presigned-batches 32"));
+    }
+
+    #[test]
+    fn stable_local_spammer_uses_configured_in_flight_window() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.leader_term_length = std::num::NonZeroU32::new(1_000_000).unwrap();
+        args.spammer_in_flight_batches = 6;
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--relayer-submitters 1 --in-flight-batches 6"));
     }
 
     #[test]
@@ -797,6 +828,26 @@ mod tests {
         );
 
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+    }
+
+    #[test]
+    fn validator_configs_propagate_leader_delay() {
+        let mut args = test_args(false);
+        args.leader_delay_ms = commonware_utils::NZU64!(12);
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let validators = build_validators(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+
+        assert!(
+            validators
+                .iter()
+                .all(|validator| validator.config.leader_delay_ms.get() == 12)
+        );
     }
 
     #[test]

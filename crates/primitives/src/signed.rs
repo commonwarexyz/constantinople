@@ -22,7 +22,7 @@ use rand::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Signed<T, H, Sig>
 where
     H: Hasher,
@@ -30,6 +30,20 @@ where
 {
     inner: Sealed<T, H>,
     signature: Lazy<Sig>,
+}
+
+impl<T, H, Sig> Clone for Signed<T, H, Sig>
+where
+    T: Clone,
+    H: Hasher,
+    Sig: Signature,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            signature: self.signature.clone(),
+        }
+    }
 }
 
 impl<T, H, Sig> PartialEq for Signed<T, H, Sig>
@@ -167,7 +181,7 @@ where
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self {
-            inner: u.arbitrary::<T>()?.seal(&mut H::new()),
+            inner: u.arbitrary::<T>()?.seal(&mut H::default()),
             signature: Lazy::new(u.arbitrary()?),
         })
     }
@@ -195,13 +209,21 @@ pub trait Signable: Sealable {
 impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
-#[derive(Clone)]
 pub struct LazySignedTransaction<H>
 where
     H: Hasher,
 {
     pending: Option<Bytes>,
     value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
+}
+
+impl<H: Hasher> Clone for LazySignedTransaction<H> {
+    fn clone(&self) -> Self {
+        Self {
+            pending: self.pending.clone(),
+            value: self.value.clone(),
+        }
+    }
 }
 
 impl<H> LazySignedTransaction<H>
@@ -533,7 +555,9 @@ mod test {
             hasher: &mut H,
         ) -> crate::Sealed<Self, H> {
             hasher.update(&self.0);
-            Sealed::new_unchecked(self, hasher.finalize())
+            let (reset, digest) = std::mem::take(hasher).finalize();
+            *hasher = reset;
+            Sealed::new_unchecked(self, digest)
         }
     }
 

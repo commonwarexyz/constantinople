@@ -6,7 +6,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
     marshal::{self, Identifier},
-    types::{Height, View},
+    types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{
     Digestible, Signer,
@@ -169,7 +169,7 @@ where
             let monitor = self.monitor.clone();
             let update = FinalizationUpdate {
                 pk: self.public_key.clone(),
-                view: View::new(height.get()),
+                round: Round::new(Epoch::zero(), View::new(height.get())),
                 block_digest: digest.as_ref().to_vec(),
             };
             let _ = monitor.try_send(update);

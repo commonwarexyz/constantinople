@@ -1589,7 +1589,10 @@ mod tests {
     };
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
     use commonware_parallel::Sequential;
-    use commonware_runtime::{BufferPooler, Runner as _, Supervisor, buffer::paged::CacheRef};
+    use commonware_runtime::{
+        BufferPooler, Runner as _, Supervisor,
+        buffer::paged::{CacheRef, page_size as paged_page_size},
+    };
     use commonware_storage::{
         journal::contiguous::{
             fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
@@ -1598,19 +1601,18 @@ mod tests {
         qmdb::{any::FixedConfig, keyless::fixed as keyless_fixed},
         translator::EightCap,
     };
-    use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
+    use commonware_utils::{NZU64, NZUsize, non_empty_range};
     use constantinople_primitives::{
         Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
     };
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
-    use std::num::NonZeroU64 as StdNonZeroU64;
+    use std::num::{NonZeroU64 as StdNonZeroU64, NonZeroUsize as StdNonZeroUsize};
 
     const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
     const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
-    const TEST_PAGE_CACHE_PAGE_SIZE: std::num::NonZeroU16 = NZU16!(4096);
-    const TEST_PAGE_CACHE_CAPACITY: std::num::NonZero<usize> = NZUsize!(1024);
+    const TEST_PAGE_CACHE_BYTES: usize = 4 * 1024 * 1024;
 
     #[test]
     fn sql_rows_stage_into_store_batch() {
@@ -2111,11 +2113,11 @@ mod tests {
     where
         E: BufferPooler + Clock + Metrics + Storage + Supervisor + Send + Sync + 'static,
     {
-        let page_cache = CacheRef::from_pooler(
-            &context,
-            TEST_PAGE_CACHE_PAGE_SIZE,
-            TEST_PAGE_CACHE_CAPACITY,
-        );
+        let physical_page_size = 4_096usize;
+        let page_size = paged_page_size(physical_page_size as u32);
+        let capacity = StdNonZeroUsize::new(TEST_PAGE_CACHE_BYTES / physical_page_size)
+            .expect("test page cache must hold at least one page");
+        let page_cache = CacheRef::from_pooler(&context, page_size, capacity);
         let config = (
             test_state_db_config(&page_cache, prefix),
             test_transaction_db_config(&page_cache, prefix),

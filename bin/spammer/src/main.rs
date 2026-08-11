@@ -3,9 +3,9 @@
 //! Generates deterministic accounts and submits ring-transfer transactions to
 //! the relayer in a continuous loop.
 //!
-//! Each target gets its own independent account set. A local signer keeps one
-//! batch ready while the submitter has one batch in flight, hiding signing
-//! latency without queueing multiple batches at a proposer.
+//! Each target gets its own independent account set. A bounded, source-ordered
+//! submission window keeps signing and consensus work pipelined without letting
+//! later account nonces advance around a stalled earlier batch.
 
 mod accounts;
 mod cli;
@@ -20,8 +20,10 @@ use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
+use futures::{StreamExt as _, stream::FuturesOrdered};
 use signer::{Tx, sign_batch};
 use std::{
+    future::Future,
     net::{IpAddr, Ipv4Addr, SocketAddr},
     sync::Arc,
     time::Instant,
@@ -44,6 +46,7 @@ fn main() {
         relayer_url,
         relayer_submitters,
         presigned_batches,
+        in_flight_batches,
         primary_validators,
         rayon_threads,
         accounts_jitter,
@@ -61,6 +64,7 @@ fn main() {
             config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
             relayer_submitters,
             cfg.presigned_batches,
+            cfg.in_flight_batches,
             if cfg.primary_validators.is_empty() {
                 cli.relayer_targets.clone()
             } else {
@@ -79,6 +83,7 @@ fn main() {
                 .expect("provide --relayer-url or --config"),
             cli.relayer_submitters.max(1),
             cli.presigned_batches,
+            cli.in_flight_batches,
             cli.relayer_targets.clone(),
             cli.rayon_threads,
             cli.accounts_jitter,
@@ -89,6 +94,11 @@ fn main() {
         "--accounts-jitter must be between 0 and 1"
     );
     assert!(presigned_batches > 0, "--presigned-batches must be > 0");
+    assert!(
+        (1..=config::MAX_IN_FLIGHT_BATCHES).contains(&in_flight_batches),
+        "--in-flight-batches must be between 1 and {}",
+        config::MAX_IN_FLIGHT_BATCHES
+    );
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
@@ -137,6 +147,7 @@ fn main() {
             accounts_jitter,
             relayer_submitters,
             presigned_batches,
+            in_flight_batches,
             relayer_targets: primary_validators,
         };
         let stats = Arc::new(Stats::new(context.child("spammer")));
@@ -152,6 +163,7 @@ struct RelayerModeConfig {
     accounts_jitter: f64,
     relayer_submitters: usize,
     presigned_batches: usize,
+    in_flight_batches: usize,
     relayer_targets: Vec<String>,
 }
 
@@ -168,6 +180,7 @@ async fn run_relayer_mode(
         accounts_jitter,
         relayer_submitters,
         presigned_batches,
+        in_flight_batches,
         relayer_targets,
     } = config;
 
@@ -179,6 +192,7 @@ async fn run_relayer_mode(
         accounts_jitter,
         %relayer_url,
         presigned_batches,
+        in_flight_batches,
         "starting spammer relayer mode"
     );
 
@@ -198,7 +212,11 @@ async fn run_relayer_mode(
             account_offset,
             presigned_batches,
         );
-        tokio::spawn(submit_presigned_batches(submitter, batches));
+        tokio::spawn(submit_presigned_batches(
+            submitter,
+            batches,
+            in_flight_batches,
+        ));
     }
 
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
@@ -262,10 +280,37 @@ where
 
 async fn submit_presigned_batches(
     submitter: RelayerSubmitter,
-    mut batches: mpsc::Receiver<Vec<Tx>>,
+    batches: mpsc::Receiver<Vec<Tx>>,
+    in_flight_batches: usize,
 ) {
-    while let Some(batch) = batches.recv().await {
-        submitter.submit(batch).await;
+    let submitter = Arc::new(submitter);
+    submit_ordered_window(batches, in_flight_batches, move |batch| {
+        let submitter = Arc::clone(&submitter);
+        async move { submitter.submit(batch).await }
+    })
+    .await;
+}
+
+async fn submit_ordered_window<T, F, Fut>(mut items: mpsc::Receiver<T>, width: usize, submit: F)
+where
+    F: Fn(T) -> Fut,
+    Fut: Future<Output = ()>,
+{
+    debug_assert!(width > 0);
+    let mut submissions = FuturesOrdered::new();
+    let mut source_open = true;
+
+    loop {
+        while source_open && submissions.len() < width {
+            match items.recv().await {
+                Some(item) => submissions.push_back(submit(item)),
+                None => source_open = false,
+            }
+        }
+
+        if submissions.next().await.is_none() {
+            return;
+        }
     }
 }
 
@@ -330,11 +375,19 @@ impl JitterRng {
 mod tests {
     use super::{
         JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for, spawn_presigner,
+        submit_ordered_window,
     };
     use crate::accounts::generate_accounts;
     use commonware_parallel::Sequential;
     use core::num::NonZeroU64;
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::{Semaphore, mpsc};
 
     /// `range` must hit both endpoints over enough draws and never escape them.
     #[test]
@@ -434,6 +487,45 @@ mod tests {
         assert_eq!(batch_nonces(&second), vec![1, 1, 1]);
     }
 
+    #[tokio::test]
+    async fn ordered_window_does_not_refill_past_a_stalled_oldest_batch() {
+        let (sender, receiver) = mpsc::channel(4);
+        for index in 0..4 {
+            sender.send(index).await.expect("window receiver is open");
+        }
+        drop(sender);
+
+        let started = Arc::new(AtomicUsize::new(0));
+        let gates = Arc::new((0..4).map(|_| Semaphore::new(0)).collect::<Vec<_>>());
+        let task = tokio::spawn(submit_ordered_window(receiver, 2, {
+            let started = Arc::clone(&started);
+            let gates = Arc::clone(&gates);
+            move |index| {
+                let started = Arc::clone(&started);
+                let gates = Arc::clone(&gates);
+                async move {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    gates[index]
+                        .acquire()
+                        .await
+                        .expect("gate remains open")
+                        .forget();
+                }
+            }
+        }));
+
+        wait_for_count(&started, 2).await;
+        gates[1].add_permits(1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert_eq!(started.load(Ordering::SeqCst), 2);
+
+        gates[0].add_permits(1);
+        wait_for_count(&started, 4).await;
+        gates[2].add_permits(1);
+        gates[3].add_permits(1);
+        task.await.expect("ordered window task");
+    }
+
     async fn wait_for_presigned_batches(
         batches: &tokio::sync::mpsc::Receiver<Vec<super::Tx>>,
         expected: usize,
@@ -445,6 +537,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         panic!("presigner did not fill the local queue");
+    }
+
+    async fn wait_for_count(count: &AtomicUsize, expected: usize) {
+        for _ in 0..50 {
+            if count.load(Ordering::SeqCst) == expected {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        panic!("count did not reach {expected}");
     }
 
     fn batch_nonces(batch: &[super::Tx]) -> Vec<u64> {
