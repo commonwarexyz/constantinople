@@ -27,6 +27,16 @@ just build-intel-image
 The Intel build uses `x86_64-unknown-linux-gnu` with `target-cpu=graniterapids`, which is the
 closest Rust CPU target to AWS C8i's Intel Xeon 6 processors.
 
+For storage-optimized `i7i` instances, use the Emerald Rapids builder instead:
+
+```sh
+just build-i7i-image
+```
+
+This build uses `x86_64-unknown-linux-gnu` with `target-cpu=emeraldrapids`, matching I7i's
+5th-generation Intel Xeon Scalable processors. Keep it separate from the C8i build because a
+Granite Rapids binary may use instructions unavailable on I7i.
+
 To build the AMD image, e.g. for `c8a` instances, run:
 
 ```sh
@@ -53,6 +63,12 @@ To build the Intel validator binary, run:
 
 ```sh
 just validator-intel-binary
+```
+
+To build the I7i validator binary, run:
+
+```sh
+just validator-i7i-binary
 ```
 
 To build the AMD validator binary, run:

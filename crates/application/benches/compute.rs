@@ -454,7 +454,8 @@ fn main() {
             }
         }
         let merkleized = batch.merkleize().await.expect("seed merkleize");
-        assert!(db.finalize(merkleized).await.durable().await);
+        db.finalize(merkleized).await;
+        assert!(db.start_sync().await.durable().await);
 
         let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
         let count_filter = std::env::var("CONSTANTINOPLE_BENCH_COUNT")

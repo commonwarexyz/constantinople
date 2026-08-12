@@ -56,6 +56,10 @@ graviton-binaries: validator-graviton-binary spammer-graviton-binary chain-index
 build-intel-image:
   docker buildx bake --progress plain -f docker/docker-bake.hcl intel
 
+# Build the Intel/I7i Docker builder image
+build-i7i-image:
+  docker buildx bake --progress plain -f docker/docker-bake.hcl i7i
+
 # Build the Intel validator binary into deploy/
 validator-intel-binary: build-intel-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
@@ -63,6 +67,14 @@ validator-intel-binary: build-intel-image prepare-docker-cache
     -e BINARY_NAME=constantinople \
     -e OUTPUT_NAME=validator \
     constantinople-builder:intel-local
+
+# Build the I7i validator binary into deploy/
+validator-i7i-binary: build-i7i-image prepare-docker-cache
+  docker run --rm {{source-mounts}} {{cache-env}} \
+    -e PACKAGE_NAME=constantinople-validator \
+    -e BINARY_NAME=constantinople \
+    -e OUTPUT_NAME=validator \
+    constantinople-builder:i7i-local
 
 # Build the Intel spammer binary into deploy/
 spammer-intel-binary: build-intel-image prepare-docker-cache

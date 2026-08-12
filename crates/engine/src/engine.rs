@@ -83,8 +83,15 @@ const ITEMS_PER_BLOB: NonZero<u64> = NZU64!(1_048_576 * 25); // ~1gb
 const MAX_REPAIR: NonZero<usize> = NZUsize!(200);
 pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(8);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
-const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
-const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
+/// Number of decoded shard messages retained while the shard engine drains network ingress.
+pub const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(2048);
+/// Number of pre-discovery proposal shards retained from each peer.
+///
+/// An honest participant gossips one shard per proposal. Validator configurations
+/// must size this together with [`SHARD_BACKGROUND_CHANNEL_CAPACITY`] above their optimistic
+/// proposal horizon so reordered shards remain available when consensus later announces the
+/// proposal.
+pub const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_INIT_BUFFER: NonZero<usize> = NZUsize!(1 << 21);

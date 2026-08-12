@@ -33,8 +33,9 @@ use commonware_runtime::{
 use commonware_utils::{NZDuration, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, union};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, SHARD_BACKGROUND_CHANNEL_CAPACITY,
+    SHARD_PEER_BUFFER_SIZE, STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL,
+    ThresholdScheme, VOTE_CHANNEL,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
@@ -50,11 +51,22 @@ use tracing::info;
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 const STABLE_LEADER_STALL_TIMEOUT: Duration = Duration::from_secs(12);
-const STABLE_LEADER_OPTIMISTIC_VIEWS: ViewDelta = ViewDelta::new(4);
+// Coded proposals can advance notarization before full reconstruction. This window retains
+// future proposals while validators finish reconstructing and certifying earlier views.
+const STABLE_LEADER_OPTIMISTIC_VIEWS: ViewDelta = ViewDelta::new(16);
 const SIMPLEX_LEADER_TIMEOUT: Duration = Duration::from_secs(4);
 const SIMPLEX_CERTIFICATION_TIMEOUT: Duration = Duration::from_secs(8);
 const SIMPLEX_TIMEOUT_RETRY: Duration = Duration::from_secs(10);
 const SIMPLEX_SKIP_TIMEOUT: Duration = Duration::from_secs(12);
+
+// One honest peer contributes one pre-discovery shard per proposal. This covers the current view,
+// the optimistic future views, one view of leader/follower skew, and one additional complete copy
+// for delivery reordering or rebroadcast.
+const STABLE_SHARD_BUFFER_HORIZON: usize = (STABLE_LEADER_OPTIMISTIC_VIEWS.get() as usize + 2) * 2;
+const _: () = assert!(
+    SHARD_PEER_BUFFER_SIZE.get() >= STABLE_SHARD_BUFFER_HORIZON,
+    "per-peer coding shard buffer does not cover stable-leader horizon",
+);
 
 const STATE_SYNC_APPLY_BATCH_SIZE: NonZeroU64 = NZU64!(1024);
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
@@ -134,6 +146,23 @@ fn leader_elector(term_length: TermLength) -> RoundRobin<Sha256> {
     )
 }
 
+fn assert_coding_shard_capacity(primary_participants: usize, term_length: TermLength) {
+    if term_length == TermLength::ONE {
+        return;
+    }
+
+    let required_background = primary_participants
+        .checked_mul(STABLE_SHARD_BUFFER_HORIZON)
+        .expect("coding shard buffer requirement overflowed");
+    assert!(
+        SHARD_BACKGROUND_CHANNEL_CAPACITY.get() >= required_background,
+        "decoded coding shard buffer requires {required_background} slots for \
+         {primary_participants} validators and lookahead {}, but has {}",
+        STABLE_LEADER_OPTIMISTIC_VIEWS.get(),
+        SHARD_BACKGROUND_CHANNEL_CAPACITY.get(),
+    );
+}
+
 fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     assert!(
         config.indexer.is_none(),
@@ -160,6 +189,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         indexer: _,
         relayer,
     } = config;
+    assert_coding_shard_capacity(decoded.primary_participants.len(), leader_term_length);
 
     let config_dir = config_path
         .parent()
@@ -462,11 +492,14 @@ const fn production_sync_config() -> SyncEngineConfig {
 mod tests {
     use super::{
         P2P_MESSAGE_QUOTA, P2P_TRACKED_PEER_SETS, STABLE_LEADER_OPTIMISTIC_VIEWS,
+        STABLE_SHARD_BUFFER_HORIZON, assert_coding_shard_capacity,
         default_mempool_drop_grace_blocks, wait_for_critical_task_exit,
     };
-    use commonware_consensus::types::ViewDelta;
+    use commonware_consensus::types::{TermLength, ViewDelta};
     use commonware_utils::{NZU32, NZUsize};
-    use constantinople_engine::MAX_PENDING_ACKS;
+    use constantinople_engine::{
+        MAX_PENDING_ACKS, SHARD_BACKGROUND_CHANNEL_CAPACITY, SHARD_PEER_BUFFER_SIZE,
+    };
     use std::{future::pending, time::Duration};
 
     #[test]
@@ -476,14 +509,24 @@ mod tests {
     }
 
     #[test]
-    fn stable_leader_pipeline_keeps_acknowledgement_headroom() {
-        assert_eq!(STABLE_LEADER_OPTIMISTIC_VIEWS, ViewDelta::new(4));
-        assert_eq!(
-            MAX_PENDING_ACKS.get(),
-            usize::try_from(STABLE_LEADER_OPTIMISTIC_VIEWS.get())
-                .expect("optimistic view count must fit in usize")
-                * 2,
-        );
+    fn stable_leader_pipeline_covers_coded_reconstruction_skew_without_growing_ack_window() {
+        assert_eq!(STABLE_LEADER_OPTIMISTIC_VIEWS, ViewDelta::new(16));
+        assert_eq!(STABLE_SHARD_BUFFER_HORIZON, 36);
+        assert!(SHARD_PEER_BUFFER_SIZE.get() >= STABLE_SHARD_BUFFER_HORIZON);
+        assert!(SHARD_BACKGROUND_CHANNEL_CAPACITY.get() >= 50 * STABLE_SHARD_BUFFER_HORIZON,);
+        assert_coding_shard_capacity(50, TermLength::MAX);
+        assert_eq!(MAX_PENDING_ACKS, NZUsize!(8));
+    }
+
+    #[test]
+    #[should_panic(expected = "decoded coding shard buffer requires 2052 slots")]
+    fn stable_leader_rejects_validator_sets_larger_than_coding_shard_buffer() {
+        assert_coding_shard_capacity(57, TermLength::MAX);
+    }
+
+    #[test]
+    fn rotating_leader_does_not_require_optimistic_shard_headroom() {
+        assert_coding_shard_capacity(usize::MAX, TermLength::ONE);
     }
 
     #[test]

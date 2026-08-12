@@ -2208,6 +2208,7 @@ mod tests {
             transaction_history.bounds().total_size
         );
         databases.finalize((state, transaction_history)).await;
+        assert!(databases.start_sync().await.durable().await);
 
         let leader = ed25519::PrivateKey::from_seed(height).public_key();
         let parent_digest = parent.map_or(Sha256Digest::EMPTY, |block| block.digest());

@@ -54,6 +54,14 @@ target "intel" {
   }
 }
 
+target "i7i" {
+  inherits = ["intel"]
+  tags = ["constantinople-builder:i7i-${DEFAULT_TAG}"]
+  args = {
+    TARGET_CPU = "emeraldrapids"
+  }
+}
+
 target "amd" {
   context = "."
   dockerfile = "docker/Dockerfile"

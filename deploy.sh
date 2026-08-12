@@ -32,6 +32,8 @@ fi
 # source-ordered batches in flight; local block production is paced at 10ms.
 # At maximum jitter, the in-flight transactions occupy about 123 MiB encoded,
 # so the 256 MiB mempool leaves headroom for continuous admission.
+# I7i.4xlarge exposes 16 SMT vCPUs. The three Tokio workers and thirteen
+# Rayon workers keep long-lived pool concurrency at 16 total.
 # Paged storage uses 4 KiB physical pages with checksum-adjusted payloads.
 # Page-size changes require fresh data directories, which this deployment creates.
 # Sample traces without making telemetry part of the benchmark workload.
@@ -44,8 +46,9 @@ cargo run --locked --bin constantinople-deploy -- generate \
     --max-propose-bytes 16777216 --max-pool-bytes 268435456 \
     --state-page-cache-bytes 2147483648 --other-page-cache-bytes 2147483648 \
     remote \
-    --http-cidr 0.0.0.0/0 --regions us-east-1,us-west-2 \
-    --instance-type c8a.4xlarge --storage-size 150 \
+    --http-cidr 0.0.0.0/0 \
+    --regions us-east-1,us-west-1,eu-west-1,ap-northeast-1,eu-north-1,ap-south-1,sa-east-1,eu-central-1,ap-northeast-2,ap-southeast-2 \
+    --instance-type i7i.4xlarge --storage-size 150 \
     --storage-iops 5000 --storage-throughput 500 \
     --spammer-instance-type c8a.4xlarge \
     --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
@@ -58,9 +61,9 @@ for artifact in config.yaml spammer.yaml; do
     fi
 done
 
-# 2. Build binaries into ./deploy. Validators and the spammer run on AMD C8a
-# instances; validator gp3 volumes are provisioned for the write-heavy workload.
-just validator-amd-binary spammer-amd-binary
+# 2. Build binaries into ./deploy. I7i validators use an Emerald Rapids build;
+# the C8a spammer retains its Zen 5 build.
+just validator-i7i-binary spammer-amd-binary
 for artifact in validator spammer; do
     if [ ! -x "./deploy/$artifact" ]; then
         echo "build did not create executable deploy/$artifact" >&2

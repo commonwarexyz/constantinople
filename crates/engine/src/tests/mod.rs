@@ -16,7 +16,7 @@ use commonware_consensus::{
     Heightable,
     marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
-    types::{Epoch, Round, View, coding::Commitment},
+    types::{Epoch, Round, TermLength, View, ViewDelta, coding::Commitment},
 };
 use commonware_cryptography::{
     Signer,
@@ -92,6 +92,7 @@ struct TestEngineDefinition {
     restart_barrier: Option<RestartBarrier>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
+    elector: RoundRobin<TestHasher>,
     leader_timeout: Duration,
     certification_timeout: Duration,
     timeout_retry: Duration,
@@ -113,6 +114,7 @@ impl TestEngineDefinition {
             restart_barrier: None,
             prunable_items_per_section: NZU64!(4_096),
             retained_marshal_blocks: 16,
+            elector: RoundRobin::default(),
             leader_timeout: Duration::from_secs(4),
             certification_timeout: Duration::from_secs(8),
             timeout_retry: Duration::from_secs(10),
@@ -160,6 +162,15 @@ impl TestEngineDefinition {
     const fn with_aggressive_pruning(mut self) -> Self {
         self.prunable_items_per_section = NZU64!(1);
         self.retained_marshal_blocks = 0;
+        self
+    }
+
+    fn with_stable_leader(mut self) -> Self {
+        self.elector = RoundRobin::default().with_term(
+            TermLength::MAX,
+            Duration::from_secs(12),
+            ViewDelta::new(16),
+        );
         self
     }
 
@@ -217,6 +228,7 @@ impl EngineDefinition for TestEngineDefinition {
         let genesis_commitments = self.genesis_commitments.clone();
         let prunable_items_per_section = self.prunable_items_per_section;
         let retained_marshal_blocks = self.retained_marshal_blocks;
+        let elector = self.elector.clone();
         let leader_timeout = self.leader_timeout;
         let certification_timeout = self.certification_timeout;
         let timeout_retry = self.timeout_retry;
@@ -338,7 +350,7 @@ impl EngineDefinition for TestEngineDefinition {
                     other_page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
-                    elector: RoundRobin::default(),
+                    elector,
                     input,
                     partition_prefix,
                     strategy: Sequential,
@@ -783,6 +795,12 @@ fn run_secondaries_sync(engine: TestEngineDefinition) {
 #[test_traced("DEBUG")]
 fn all_validators_finalize_and_commit() {
     run_finalize(TestEngineDefinition::new(NUM_VALIDATORS));
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn stable_leader_finalizes_and_commits() {
+    run_finalize(TestEngineDefinition::new(NUM_VALIDATORS).with_stable_leader());
 }
 
 #[test_group("slow")]

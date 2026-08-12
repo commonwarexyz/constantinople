@@ -158,7 +158,8 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         root: transactions.root(),
         size: transactions.bounds().tip.size,
     };
-    assert!(dbs.finalize((state, transactions)).await.durable().await);
+    dbs.finalize((state, transactions)).await;
+    assert!(dbs.start_sync().await.durable().await);
 
     let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
