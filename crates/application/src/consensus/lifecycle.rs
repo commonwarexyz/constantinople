@@ -62,17 +62,11 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        self.proposal_pacer.admit(&runtime).await;
+
         let parent_digest = parent.digest();
         let parent_height = parent.header.height;
         let parent_timestamp = parent.header.timestamp;
-        let min_timestamp = parent_timestamp
-            .checked_add(self.proposal_delay_ms.get())
-            .expect("parent timestamp overflowed");
-        if time::timestamp_ms(&runtime) < min_timestamp {
-            runtime
-                .sleep_until(time::block_deadline(min_timestamp))
-                .await;
-        }
 
         // Select from the mempool, then execute the selection best effort
         // against the parent's state: anything inapplicable there fails its
@@ -108,7 +102,7 @@ where
         self.proposed_transactions
             .inc_by(execution.block.transaction_count as u64);
 
-        let timestamp = time::timestamp_ms(&runtime).max(min_timestamp);
+        let timestamp = time::timestamp_ms(&runtime).max(parent_timestamp);
         assert!(
             time::is_valid_child_timestamp(parent_timestamp, timestamp),
             "proposed timestamp exceeded maximum"

@@ -43,6 +43,7 @@ mod genesis;
 mod glue;
 mod history;
 mod lifecycle;
+mod pacing;
 #[cfg(test)]
 mod tests;
 mod time;
@@ -80,7 +81,7 @@ where
     St: Strategy,
 {
     strategy: St,
-    proposal_delay_ms: NonZeroU64,
+    proposal_pacer: pacing::ProposalPacer,
     genesis_leader: P,
     genesis_parent: C,
     transaction_namespace: &'static [u8],
@@ -104,7 +105,7 @@ where
     fn clone(&self) -> Self {
         Self {
             strategy: self.strategy.clone(),
-            proposal_delay_ms: self.proposal_delay_ms,
+            proposal_pacer: self.proposal_pacer.clone(),
             genesis_leader: self.genesis_leader.clone(),
             genesis_parent: self.genesis_parent,
             transaction_namespace: self.transaction_namespace,
@@ -134,7 +135,7 @@ where
     pub fn new(
         context: impl Metrics,
         strategy: St,
-        proposal_delay_ms: NonZeroU64,
+        proposal_interval_ms: NonZeroU64,
         genesis_leader: P,
         genesis_parent: C,
         transaction_namespace: &'static [u8],
@@ -150,7 +151,7 @@ where
 
         Self {
             strategy,
-            proposal_delay_ms,
+            proposal_pacer: pacing::ProposalPacer::new(proposal_interval_ms),
             genesis_leader,
             genesis_parent,
             transaction_namespace,

@@ -187,8 +187,8 @@ where
     pub input: I,
     pub partition_prefix: String,
     pub strategy: St,
-    /// Minimum time between a locally proposed block and its parent.
-    pub proposal_delay_ms: NonZero<u64>,
+    /// Minimum milliseconds between local proposal starts.
+    pub proposal_interval_ms: NonZero<u64>,
     pub public_key_cache: PublicKeyCache,
     pub startup: StartupMode,
     pub sync_config: SyncEngineConfig,
@@ -508,7 +508,7 @@ where
         let application = Application::new(
             context.child("application"),
             config.strategy.clone(),
-            config.proposal_delay_ms,
+            config.proposal_interval_ms,
             config.genesis_leader.clone(),
             genesis_parent,
             config.transaction_namespace,

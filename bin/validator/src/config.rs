@@ -108,7 +108,7 @@ pub struct ValidatorConfig {
     /// Number of consecutive views assigned to one leader.
     #[serde(default = "default_leader_term_length")]
     pub leader_term_length: NonZeroU32,
-    /// Minimum milliseconds between a locally proposed block and its parent.
+    /// Minimum milliseconds between local proposal starts.
     #[serde(default = "default_leader_delay_ms")]
     pub leader_delay_ms: NonZeroU64,
     /// Storage partition prefix for this validator.
@@ -255,7 +255,7 @@ pub struct LoadedConfig {
     pub max_propose_bytes: usize,
     /// Consensus leader term length.
     pub leader_term_length: TermLength,
-    /// Minimum milliseconds between a locally proposed block and its parent.
+    /// Minimum milliseconds between local proposal starts.
     pub leader_delay_ms: NonZeroU64,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,

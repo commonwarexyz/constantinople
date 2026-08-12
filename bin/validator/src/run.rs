@@ -402,7 +402,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
                 strategy,
-                proposal_delay_ms: leader_delay_ms,
+                proposal_interval_ms: leader_delay_ms,
                 public_key_cache,
                 startup,
                 sync_config: production_sync_config(),

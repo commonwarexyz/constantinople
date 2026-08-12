@@ -102,7 +102,7 @@ pub(crate) struct GenerateArgs {
     /// Number of consecutive views assigned to one leader.
     #[arg(long, default_value_t = default_leader_term_length())]
     leader_term_length: NonZeroU32,
-    /// Minimum milliseconds between a locally proposed block and its parent.
+    /// Minimum milliseconds between local proposal starts.
     #[arg(long, default_value_t = default_leader_delay_ms())]
     leader_delay_ms: NonZeroU64,
     /// Include the full indexer secondary and shared indexer services.
@@ -390,7 +390,7 @@ pub(crate) struct ValidatorConfig {
     genesis_leader: String,
     /// Number of consecutive views assigned to one leader.
     leader_term_length: NonZeroU32,
-    /// Minimum milliseconds between a locally proposed block and its parent.
+    /// Minimum milliseconds between local proposal starts.
     leader_delay_ms: NonZeroU64,
     /// Storage partition prefix for this validator.
     partition_prefix: String,

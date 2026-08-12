@@ -32,7 +32,11 @@ use constantinople_primitives::{
     Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, SealedBlock,
     SignedTransaction, Transaction, TransactionPublicKey,
 };
-use std::{num::NonZeroU64, sync::Arc, time::Duration};
+use std::{
+    num::NonZeroU64,
+    sync::{Arc, Mutex},
+    time::{Duration, SystemTime},
+};
 
 type TestApp = Application<
     deterministic::Context,
@@ -408,7 +412,83 @@ fn verify_accepts_proposed_child_with_parent_timestamp() {
 }
 
 #[test]
-fn proposal_waits_for_configured_block_delay() {
+fn concurrent_proposals_share_start_pacing() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let starts = Arc::new(Mutex::new(Vec::new()));
+        let source = RecordingSource {
+            context: context.child("recording_source"),
+            starts: Arc::clone(&starts),
+            inner: StaticTransactionSource::new(Vec::new()),
+        };
+        let app: Application<
+            deterministic::Context,
+            sha256::Sha256,
+            sha256::Digest,
+            threshold::Scheme<ed25519::PublicKey, MinSig>,
+            ed25519::PublicKey,
+            RecordingSource,
+            (),
+            Sequential,
+        > = Application::new(
+            context.child("paced_app"),
+            Sequential,
+            NZU64!(10),
+            harness.leader.public_key(),
+            sha256::Digest::EMPTY,
+            TEST_TX_NS,
+            PublicKeyCache::new(context.child("paced_pkc"), NZUsize!(64)),
+            harness.state_target.clone(),
+            harness.transaction_target.clone(),
+            None,
+        );
+
+        let first_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: harness.leader.public_key(),
+            parent: (View::zero(), *harness.parent.seal()),
+        };
+        let second_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(2)),
+            ..first_context.clone()
+        };
+        let first_batches = harness.dbs.new_batches().await;
+        let second_batches = harness.dbs.new_batches().await;
+        let mut first_app = app.clone();
+        let mut second_app = app;
+        let mut first_source = source.clone();
+        let mut second_source = source;
+        let first_parent = Arc::new(harness.parent.clone());
+        let second_parent = Arc::new(harness.parent);
+
+        let (first, second) = futures::join!(
+            first_app.propose_child(
+                (context.child("first_proposal"), first_context),
+                first_parent,
+                first_batches,
+                &mut first_source,
+            ),
+            second_app.propose_child(
+                (context.child("second_proposal"), second_context),
+                second_parent,
+                second_batches,
+                &mut second_source,
+            ),
+        );
+        assert!(first.is_some());
+        assert!(second.is_some());
+
+        let starts = starts.lock().expect("recorded proposal starts");
+        assert_eq!(starts.len(), 2);
+        assert!(
+            starts[1].duration_since(starts[0]).unwrap_or_default() >= Duration::from_millis(10),
+            "application clones entered proposal construction without shared pacing"
+        );
+    });
+}
+
+#[test]
+fn proposal_pacing_does_not_advance_block_timestamp() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
             mut app,
@@ -425,7 +505,7 @@ fn proposal_waits_for_configured_block_delay() {
 
         let proposed = app
             .propose_child(
-                (context.child("propose"), consensus_context),
+                (context.child("proposal"), consensus_context),
                 Arc::new(parent.clone()),
                 dbs.new_batches().await,
                 &mut StaticTransactionSource::new(Vec::new()),
@@ -433,10 +513,7 @@ fn proposal_waits_for_configured_block_delay() {
             .await
             .expect("empty proposal must succeed");
 
-        assert_eq!(
-            proposed.block.header.timestamp,
-            parent.header.timestamp + 10
-        );
+        assert_eq!(proposed.block.header.timestamp, parent.header.timestamp);
     });
 }
 
@@ -525,6 +602,48 @@ struct DelayedSource {
     context: deterministic::Context,
     delay: Duration,
     inner: TestSource,
+}
+
+/// Records when proposal construction reaches the transaction source.
+struct RecordingSource {
+    context: deterministic::Context,
+    starts: Arc<Mutex<Vec<SystemTime>>>,
+    inner: TestSource,
+}
+
+impl Clone for RecordingSource {
+    fn clone(&self) -> Self {
+        Self {
+            context: self.context.child("clone"),
+            starts: Arc::clone(&self.starts),
+            inner: self.inner.clone(),
+        }
+    }
+}
+
+impl constantinople_mempool::TransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>
+    for RecordingSource
+{
+    async fn propose(
+        &mut self,
+        parent: &Header<sha256::Digest, sha256::Digest, ed25519::PublicKey>,
+        round: Round,
+        filled: usize,
+    ) -> Vec<constantinople_primitives::VerifiedTransaction<sha256::Sha256>> {
+        self.starts
+            .lock()
+            .expect("record proposal start")
+            .push(self.context.current());
+        self.inner.propose(parent, round, filled).await
+    }
+}
+
+impl commonware_consensus::Reporter for RecordingSource {
+    type Activity = commonware_consensus::marshal::Update<TestBlock>;
+
+    fn report(&mut self, activity: Self::Activity) -> commonware_actor::Feedback {
+        self.inner.report(activity)
+    }
 }
 
 // Required by `TransactionSource`'s `Reporter: Clone` supertrait; never

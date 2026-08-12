@@ -29,7 +29,8 @@ if [ -d ./deploy ]; then
     rm -rf ./deploy
 fi
 # One unpinned spammer stream supplies the active stable leader with sixteen
-# source-ordered batches in flight; local block production is paced at 10ms.
+# source-ordered batches in flight. Proposal starts are at least 100ms apart,
+# which bounds empty-block bursts without delaying the slower full-block path.
 # At maximum jitter, the in-flight transactions occupy about 123 MiB encoded,
 # so the 256 MiB mempool leaves headroom for continuous admission.
 # I7i.4xlarge exposes 16 SMT vCPUs. The three Tokio workers and thirteen
@@ -38,7 +39,7 @@ fi
 # Page-size changes require fresh data directories, which this deployment creates.
 # Sample traces without making telemetry part of the benchmark workload.
 cargo run --locked --bin constantinople-deploy -- generate \
-    --validators 50 --leader-term-length 1000000 --leader-delay-ms 10 --relayer --spammer \
+    --validators 50 --leader-term-length 1000000 --leader-delay-ms 100 --relayer --spammer \
     --spammer-accounts 50000 --spammer-accounts-jitter 0.1 \
     --spammer-rayon-threads 14 --spammer-in-flight-batches 16 \
     --output-dir ./deploy --worker-threads 3 --rayon-threads 13 \

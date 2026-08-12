@@ -354,7 +354,7 @@ impl EngineDefinition for TestEngineDefinition {
                     input,
                     partition_prefix,
                     strategy: Sequential,
-                    proposal_delay_ms: NZU64!(10),
+                    proposal_interval_ms: NZU64!(10),
                     public_key_cache: PublicKeyCache::new(
                         context.child("public_key_cache"),
                         NZUsize!(1024),
