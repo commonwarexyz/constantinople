@@ -12,7 +12,7 @@ use commonware_cryptography::{
     Digest as _, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::Sequential;
+use commonware_parallel::{Manual, Sequential, Strategy};
 use commonware_runtime::{
     Clock as _, Runner as _, Supervisor as _,
     buffer::paged::{CacheRef, page_size as paged_page_size},
@@ -33,12 +33,17 @@ use constantinople_primitives::{
     SignedTransaction, Transaction, TransactionPublicKey,
 };
 use std::{
+    cmp::Ordering,
+    future::Future,
     num::NonZeroU64,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering as AtomicOrdering},
+    },
     time::{Duration, SystemTime},
 };
 
-type TestApp = Application<
+type TestApp<St = Sequential> = Application<
     deterministic::Context,
     sha256::Sha256,
     sha256::Digest,
@@ -46,12 +51,134 @@ type TestApp = Application<
     ed25519::PublicKey,
     StaticTransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>,
     (),
-    Sequential,
+    St,
 >;
-type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;
+type TestDbs<St = Sequential> = Databases<deterministic::Context, sha256::Sha256, EightCap, St>;
 
 const TEST_TX_NS: &[u8] = b"constantinople-application-test-transactions";
 const TEST_PAGE_CACHE_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug)]
+struct ControllableStrategy {
+    pending_spawn: bool,
+    spawns: Arc<AtomicUsize>,
+    manuals: Arc<AtomicUsize>,
+}
+
+impl ControllableStrategy {
+    fn complete() -> Self {
+        Self {
+            pending_spawn: false,
+            spawns: Arc::new(AtomicUsize::new(0)),
+            manuals: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    fn pending() -> Self {
+        Self {
+            pending_spawn: true,
+            spawns: Arc::new(AtomicUsize::new(0)),
+            manuals: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl Strategy for ControllableStrategy {
+    fn manual(&self) -> Manual<Self> {
+        self.manuals.fetch_add(1, AtomicOrdering::Relaxed);
+        Manual::new(self.clone(), NZUsize!(1))
+    }
+
+    fn spawn<F, T>(&self, f: F) -> impl Future<Output = T> + Send + 'static
+    where
+        F: FnOnce(Self) -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.spawns.fetch_add(1, AtomicOrdering::Relaxed);
+        let strategy = self.clone();
+        async move {
+            if strategy.pending_spawn {
+                std::future::pending::<()>().await;
+            }
+            f(strategy)
+        }
+    }
+
+    fn fold_init<I, INIT, T, R, ID, F, RD>(
+        &self,
+        iter: I,
+        init: INIT,
+        identity: ID,
+        fold_op: F,
+        reduce_op: RD,
+    ) -> R
+    where
+        I: IntoIterator<IntoIter: Send, Item: Send> + Send,
+        INIT: Fn() -> T + Send + Sync,
+        T: Send,
+        R: Send,
+        ID: Fn() -> R + Send + Sync,
+        F: Fn(R, &mut T, I::Item) -> R + Send + Sync,
+        RD: Fn(R, R) -> R + Send + Sync,
+    {
+        Sequential.fold_init(iter, init, identity, fold_op, reduce_op)
+    }
+
+    fn try_fold<I, R, E, ID, F, RD>(
+        &self,
+        iter: I,
+        identity: ID,
+        fold_op: F,
+        reduce_op: RD,
+    ) -> Result<R, E>
+    where
+        I: IntoIterator<IntoIter: Send, Item: Send> + Send,
+        R: Send,
+        E: Send,
+        ID: Fn() -> R + Send + Sync,
+        F: Fn(R, I::Item) -> Result<R, E> + Send + Sync,
+        RD: Fn(R, R) -> R + Send + Sync,
+    {
+        Sequential.try_fold(iter, identity, fold_op, reduce_op)
+    }
+
+    fn run<R, SEQ, PAR>(&self, len: usize, serial: SEQ, parallel: PAR) -> R
+    where
+        R: Send,
+        SEQ: FnOnce() -> R + Send,
+        PAR: FnOnce() -> R + Send,
+    {
+        Sequential.run(len, serial, parallel)
+    }
+
+    fn try_run<R, E, SEQ, PAR>(&self, len: usize, serial: SEQ, parallel: PAR) -> Result<R, E>
+    where
+        R: Send,
+        E: Send,
+        SEQ: FnOnce() -> Result<R, E> + Send,
+        PAR: FnOnce() -> Result<R, E> + Send,
+    {
+        Sequential.try_run(len, serial, parallel)
+    }
+
+    fn join<A, B, RA, RB>(&self, a: A, b: B) -> (RA, RB)
+    where
+        A: FnOnce() -> RA + Send,
+        B: FnOnce() -> RB + Send,
+        RA: Send,
+        RB: Send,
+    {
+        Sequential.join(a, b)
+    }
+
+    fn sort_by<T, C>(&self, items: &mut [T], compare: C)
+    where
+        T: Send,
+        C: Fn(&T, &T) -> Ordering + Send + Sync,
+    {
+        Sequential.sort_by(items, compare);
+    }
+}
 
 fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     StateSyncTarget::new(
@@ -60,14 +187,14 @@ fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     )
 }
 
-fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
+fn state_config<St: Strategy>(cache: CacheRef, strategy: St) -> FixedConfig<EightCap, St> {
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: "verify-invalid-state-merkle-journal".into(),
             metadata_partition: "verify-invalid-state-merkle-metadata".into(),
             items_per_blob: NZU64!(1024),
             write_buffer: NZUsize!(4096),
-            strategy: Sequential,
+            strategy,
             page_cache: cache.clone(),
         },
         journal_config: FixedJournalConfig {
@@ -83,9 +210,12 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
     }
 }
 
-fn transaction_config(cache: CacheRef) -> keyless_fixed::CompactConfig<Sequential> {
+fn transaction_config<St: Strategy>(
+    cache: CacheRef,
+    strategy: St,
+) -> keyless_fixed::CompactConfig<St> {
     keyless_fixed::CompactConfig {
-        strategy: Sequential,
+        strategy,
         witness: VariableJournalConfig {
             partition: "verify-invalid-transactions-witness".into(),
             items_per_section: NZU64!(1024),
@@ -110,9 +240,9 @@ type TestBlock = SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>
 ///
 /// `sender` and `alt_sender` are funded at genesis so tests can execute real
 /// transfers; `recipient` starts empty.
-struct VerifyHarness {
-    app: TestApp,
-    dbs: TestDbs,
+struct VerifyHarness<St: Strategy = Sequential> {
+    app: TestApp<St>,
+    dbs: TestDbs<St>,
     parent: TestBlock,
     leader: ed25519::PrivateKey,
     sender: ed25519::PrivateKey,
@@ -123,6 +253,18 @@ struct VerifyHarness {
 }
 
 async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
+    Box::pin(verify_harness_with_strategies(
+        context, Sequential, Sequential, Sequential,
+    ))
+    .await
+}
+
+async fn verify_harness_with_strategies<St: Strategy>(
+    context: &deterministic::Context,
+    database_strategy: St,
+    execution_strategy: St,
+    verification_strategy: St,
+) -> VerifyHarness<St> {
     let physical_page_size = 4_096usize;
     let page_size = paged_page_size(physical_page_size as u32);
     let capacity = std::num::NonZeroUsize::new(TEST_PAGE_CACHE_BYTES / physical_page_size)
@@ -131,8 +273,8 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     let dbs = TestDbs::init(
         context.child("dbs"),
         (
-            state_config(cache.clone()),
-            transaction_config(cache.clone()),
+            state_config(cache.clone(), database_strategy.clone()),
+            transaction_config(cache.clone(), database_strategy),
         ),
     )
     .await;
@@ -162,8 +304,8 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         root: transactions.root(),
         size: transactions.bounds().tip.size,
     };
-    dbs.finalize((state, transactions)).await;
-    assert!(dbs.start_sync().await.durable().await);
+    dbs.apply((state, transactions)).await;
+    assert!(dbs.finalize().await.durable().await);
 
     let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -175,7 +317,8 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
     VerifyHarness {
         app: TestApp::new(
             context.child("app"),
-            Sequential,
+            execution_strategy,
+            verification_strategy,
             NZU64!(10),
             leader.public_key(),
             sha256::Digest::EMPTY,
@@ -240,7 +383,7 @@ fn verify_rejects_invalid_body() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -281,7 +424,7 @@ fn verify_rejects_missing_parent() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -311,6 +454,63 @@ fn verify_rejects_missing_parent() {
 }
 
 #[test]
+fn invalid_signature_does_not_wait_for_execution_strategy() {
+    let config = deterministic::Config::default().with_timeout(Some(Duration::from_secs(1)));
+    deterministic::Runner::new(config).start(|context| async move {
+        let database_strategy = ControllableStrategy::complete();
+        let execution_strategy = ControllableStrategy::pending();
+        let verification_strategy = ControllableStrategy::complete();
+        let verification_spawns = Arc::clone(&verification_strategy.spawns);
+        let verification_manuals = Arc::clone(&verification_strategy.manuals);
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            alt_sender,
+            recipient,
+            ..
+        } = Box::pin(verify_harness_with_strategies(
+            &context,
+            database_strategy,
+            execution_strategy,
+            verification_strategy,
+        ))
+        .await;
+
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let header = unexecuted_child_header(&parent, &consensus_context);
+        let invalid = Transaction::new(
+            TransactionPublicKey::ed25519(sender.public_key()),
+            TransactionPublicKey::ed25519(recipient.public_key()),
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&alt_sender, TEST_TX_NS, &mut sha256::Sha256::default());
+        let block = Block::<sha256::Digest, _, sha256::Sha256>::new(header, vec![invalid])
+            .seal(&mut sha256::Sha256::default());
+        let batches = dbs.new_batches().await;
+        let outcome = app
+            .verify_child(
+                (context.child("verify"), consensus_context),
+                Arc::new(block),
+                std::future::ready(Some(Arc::new(parent))),
+                batches,
+            )
+            .await;
+
+        assert!(outcome.is_none());
+        assert_eq!(verification_spawns.load(AtomicOrdering::Relaxed), 1);
+        assert!(verification_manuals.load(AtomicOrdering::Relaxed) > 0);
+    });
+}
+
+#[test]
 fn propose_drops_inapplicable_and_refills() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
@@ -322,7 +522,7 @@ fn propose_drops_inapplicable_and_refills() {
             alt_sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         context.sleep(Duration::from_millis(10)).await;
 
@@ -378,7 +578,7 @@ fn verify_accepts_proposed_child_with_parent_timestamp() {
             parent,
             leader,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -414,7 +614,7 @@ fn verify_accepts_proposed_child_with_parent_timestamp() {
 #[test]
 fn concurrent_proposals_share_start_pacing() {
     deterministic::Runner::default().start(|context| async move {
-        let harness = verify_harness(&context).await;
+        let harness = Box::pin(verify_harness(&context)).await;
         let starts = Arc::new(Mutex::new(Vec::new()));
         let source = RecordingSource {
             context: context.child("recording_source"),
@@ -432,6 +632,7 @@ fn concurrent_proposals_share_start_pacing() {
             Sequential,
         > = Application::new(
             context.child("paced_app"),
+            Sequential,
             Sequential,
             NZU64!(10),
             harness.leader.public_key(),
@@ -496,7 +697,7 @@ fn proposal_pacing_does_not_advance_block_timestamp() {
             parent,
             leader,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
             leader: leader.public_key(),
@@ -683,7 +884,7 @@ impl commonware_consensus::Reporter for DelayedSource {
 #[test]
 fn build_timeout_bounds_refill_rounds() {
     deterministic::Runner::default().start(|context| async move {
-        let harness = verify_harness(&context).await;
+        let harness = Box::pin(verify_harness(&context)).await;
         let seed_keep = transfer(&harness.sender, &harness.recipient, 1);
         let seed_dup = transfer(&harness.sender, &harness.recipient, 2);
         let refill_one = transfer(&harness.alt_sender, &harness.recipient, 3);
@@ -707,6 +908,7 @@ fn build_timeout_bounds_refill_rounds() {
             Sequential,
         > = Application::new(
             context.child("deadline_app"),
+            Sequential,
             Sequential,
             NZU64!(10),
             harness.leader.public_key(),

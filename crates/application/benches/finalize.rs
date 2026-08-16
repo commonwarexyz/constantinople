@@ -132,8 +132,8 @@ fn main() {
             }
             let state = state_batch.merkleize().await.expect("seed state");
             let transactions = transaction_batch.merkleize().await.expect("seed txs");
-            dbs.finalize((state, transactions)).await;
-            assert!(dbs.start_sync().await.durable().await);
+            dbs.apply((state, transactions)).await;
+            assert!(dbs.finalize().await.durable().await);
 
             let transfers = Arc::new(transfers());
             let digests: Vec<_> = (0..TXS as u64)

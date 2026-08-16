@@ -49,6 +49,9 @@ futures.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+# Commonware
+commonware-storage.workspace = true
+
 # Other
 tower = { workspace = true, features = ["util"] }
 

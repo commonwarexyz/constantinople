@@ -7,12 +7,12 @@ use crate::{
 use commonware_codec::Encode;
 use commonware_consensus::{
     simplex::elector::RoundRobin,
-    types::{Epoch, TermLength, ViewDelta, coding::Commitment},
+    types::{Epoch, TermLength, ViewDelta},
 };
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
     certificate::ConstantProvider,
-    ed25519::{self, Batch, PublicKey},
+    ed25519::{self, Batch},
     sha256::Sha256,
 };
 use commonware_formatting::hex;
@@ -75,6 +75,8 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
     retained_qmdb_blocks: 32,
 };
 const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
+// This is only the largest reusable allocation class. Larger allocations fall back to untracked
+// heap storage, while Marshal's whole-block resolver uses the P2P payload ceiling below.
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
 const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
@@ -82,6 +84,7 @@ const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const P2P_MESSAGE_QUOTA: Quota = Quota::per_second(NZU32!(1_024));
 // This validator runs one fixed participant set for the lifetime of the process.
 const P2P_TRACKED_PEER_SETS: NonZeroUsize = NZUsize!(1);
+const P2P_MAX_MESSAGE_SIZE: u32 = 32 * 1024 * 1024;
 
 /// Returns the default finalized-block window before a proposed mempool batch
 /// is marked dropped.
@@ -98,13 +101,21 @@ fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
 
 fn buffer_pool_configs(
     worker_threads: usize,
+    rayon_threads: usize,
+    ingress_rayon_threads: Option<usize>,
     max_blocking_threads: usize,
 ) -> (BufferPoolConfig, BufferPoolConfig) {
+    // Background P2P decoders move pooled receive buffers into both Rayon strategies, where the
+    // buffers can be returned to thread-local pool caches.
+    let network_parallelism = worker_threads
+        .checked_add(rayon_threads)
+        .and_then(|threads| threads.checked_add(ingress_rayon_threads.unwrap_or_default()))
+        .expect("network buffer pool parallelism overflowed");
     let storage_parallelism = worker_threads
         .checked_add(max_blocking_threads)
         .expect("storage buffer pool parallelism overflowed");
     let network_parallelism =
-        NonZeroUsize::new(worker_threads).expect("network buffer pool parallelism is zero");
+        NonZeroUsize::new(network_parallelism).expect("network buffer pool parallelism is zero");
     let storage_parallelism =
         NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
 
@@ -174,6 +185,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         log_level,
         worker_threads,
         rayon_threads,
+        ingress_rayon_threads,
         http_listen,
         metrics_listen,
         max_propose_bytes,
@@ -198,8 +210,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let runtime_cfg = commonware_runtime::tokio::Config::new()
         .with_storage_directory(storage_dir)
         .with_worker_threads(worker_threads);
-    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) =
-        buffer_pool_configs(worker_threads, runtime_cfg.max_blocking_threads());
+    let (network_buffer_pool_cfg, storage_buffer_pool_cfg) = buffer_pool_configs(
+        worker_threads,
+        rayon_threads,
+        ingress_rayon_threads,
+        runtime_cfg.max_blocking_threads(),
+    );
     let runtime_cfg = runtime_cfg
         .with_network_buffer_pool_config(network_buffer_pool_cfg)
         .with_storage_buffer_pool_config(storage_buffer_pool_cfg);
@@ -222,6 +238,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         info!(
             validator = %hex(&decoded.public_key.encode()),
+            transaction_ed25519_backend = constantinople_primitives::transaction_ed25519_backend(),
+            rayon_threads,
+            ?ingress_rayon_threads,
             leader_term_length = leader_term_length.get(),
             leader_delay_ms = leader_delay_ms.get(),
             listen_bind = %decoded.listen_bind,
@@ -231,6 +250,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             "starting validator"
         );
         let strategy = context.strategy(NZUsize!(rayon_threads));
+        let ingress_strategy = ingress_rayon_threads.map_or_else(
+            || strategy.clone(),
+            |threads| context.strategy(NZUsize!(threads)),
+        );
         let public_key_cache = PublicKeyCache::new(
             context.child("public_key_cache"),
             NonZeroUsize::new(public_key_cache_size)
@@ -252,7 +275,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
                 max_peers_per_set,
-                32 * 1024 * 1024,
+                P2P_MAX_MESSAGE_SIZE,
             )
         } else {
             discovery::Config::local(
@@ -262,7 +285,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
                 max_peers_per_set,
-                32 * 1024 * 1024,
+                P2P_MAX_MESSAGE_SIZE,
             )
         };
         p2p_config.tracked_peer_sets = P2P_TRACKED_PEER_SETS;
@@ -322,7 +345,11 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .map(|(_, view_clock)| view_clock.clone());
         let relayer_observer = relayer_view.map(|(observer, _)| observer);
 
-        let (mempool_mailbox, mempool_receiver) = Mailbox::channel(MEMPOOL_MAILBOX_SIZE);
+        let (mempool_mailbox, mempool_receiver) = Mailbox::channel(
+            MEMPOOL_MAILBOX_SIZE,
+            max_propose_bytes,
+            ingress_strategy.clone(),
+        );
         let account_reader: Arc<OnceLock<Arc<dyn AccountReader>>> = Arc::new(OnceLock::new());
         let mempool_actor = webserver::Actor::new(
             context.child("mempool"),
@@ -331,7 +358,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 max_propose_bytes,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: mempool_drop_grace_blocks,
-                strategy: strategy.clone(),
+                strategy: ingress_strategy.clone(),
                 public_key_cache: public_key_cache.clone(),
             },
             mempool_mailbox.clone(),
@@ -357,7 +384,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 relayer: relayer_config,
                 account_reader: account_reader.clone(),
                 view_clock,
-                strategy: strategy.clone(),
+                strategy: ingress_strategy.clone(),
                 max_batch_bytes: max_propose_bytes,
             }))
         } else {
@@ -402,6 +429,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 input: mempool_mailbox.clone(),
                 partition_prefix: decoded.partition_prefix,
                 strategy,
+                verification_strategy: ingress_strategy,
                 proposal_interval_ms: leader_delay_ms,
                 public_key_cache,
                 startup,
@@ -424,23 +452,25 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         )
         .await;
 
-        // Install the account reader as soon as the stateful actor attaches
-        // its databases. Runs concurrently with engine.start so the HTTP
-        // listener can come up immediately; account lookups return 503 until
-        // the cell is populated.
+        // Install the account reader as soon as the stateful actor attaches its databases. The
+        // setup remains supervised after attachment, so a readiness failure stops the validator.
         let subscribe_fut = engine.subscribe_databases_detached();
         let account_reader_setter = account_reader.clone();
-        let _account_reader_setup = tokio::spawn(async move {
+        let account_reader_setup: CriticalTask = Box::pin(async move {
             let db = subscribe_fut.await;
             let reader: Arc<dyn AccountReader> = Arc::new(StateDbReader::new(db));
-            let _ = account_reader_setter.set(reader);
+            assert!(
+                account_reader_setter.set(reader).is_ok(),
+                "account reader may only be attached once",
+            );
             info!("account reader attached");
+            std::future::pending().await
         });
 
         info!("starting engine");
         // Primaries report to the local mempool. Secondaries do not need
         // marshal updates here.
-        let reporter: Option<Mailbox<Commitment, PublicKey, Sha256>> = if is_primary {
+        let reporter = if is_primary {
             Some(mempool_mailbox.clone())
         } else {
             None
@@ -449,6 +479,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         wait_for_critical_task_exit(
             Some(probe_handle),
+            Some(account_reader_setup),
             engine_handle,
             mempool_handle,
             network_handle,
@@ -461,6 +492,7 @@ type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 async fn wait_for_critical_task_exit<E, M, N>(
     probe_handle: Option<CriticalTask>,
+    account_reader_handle: Option<CriticalTask>,
     engine_handle: E,
     mempool_handle: M,
     network_handle: N,
@@ -470,8 +502,11 @@ async fn wait_for_critical_task_exit<E, M, N>(
     N: Future,
 {
     let mut probe_handle = probe_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
+    let mut account_reader_handle =
+        account_reader_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
     tokio::select! {
         _ = probe_handle.as_mut() => tracing::warn!("probe exited"),
+        _ = account_reader_handle.as_mut() => tracing::warn!("account reader setup exited"),
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
         _ = network_handle => tracing::warn!("network exited"),
@@ -491,21 +526,61 @@ const fn production_sync_config() -> SyncEngineConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        P2P_MESSAGE_QUOTA, P2P_TRACKED_PEER_SETS, STABLE_LEADER_OPTIMISTIC_VIEWS,
-        STABLE_SHARD_BUFFER_HORIZON, assert_coding_shard_capacity,
-        default_mempool_drop_grace_blocks, wait_for_critical_task_exit,
+        NETWORK_BUFFER_POOL_MAX_SIZE, P2P_MAX_MESSAGE_SIZE, P2P_MESSAGE_QUOTA,
+        P2P_TRACKED_PEER_SETS, STABLE_LEADER_OPTIMISTIC_VIEWS, STABLE_SHARD_BUFFER_HORIZON,
+        assert_coding_shard_capacity, buffer_pool_configs, default_mempool_drop_grace_blocks,
+        wait_for_critical_task_exit,
     };
+    use commonware_codec::{EncodeSize, FixedSize};
     use commonware_consensus::types::{TermLength, ViewDelta};
+    use commonware_cryptography::sha256;
     use commonware_utils::{NZU32, NZUsize};
     use constantinople_engine::{
-        MAX_PENDING_ACKS, SHARD_BACKGROUND_CHANNEL_CAPACITY, SHARD_PEER_BUFFER_SIZE,
+        MAX_PENDING_ACKS, MAXIMUM_SHARD_SIZE, SHARD_BACKGROUND_CHANNEL_CAPACITY,
+        SHARD_PEER_BUFFER_SIZE,
     };
+    use constantinople_primitives::{Transaction, TransactionSignature};
     use std::{future::pending, time::Duration};
 
     #[test]
     fn p2p_settings_keep_authenticated_mailboxes_bounded() {
         assert_eq!(P2P_MESSAGE_QUOTA.burst_size(), NZU32!(1_024));
         assert_eq!(P2P_TRACKED_PEER_SETS, NZUsize!(1));
+    }
+
+    #[test]
+    fn pooled_network_buffers_cover_coded_shards() {
+        assert_eq!(MAXIMUM_SHARD_SIZE, 2 * 1024 * 1024);
+        assert!(NETWORK_BUFFER_POOL_MAX_SIZE.get() >= MAXIMUM_SHARD_SIZE);
+    }
+
+    #[test]
+    fn network_buffer_pool_parallelism_covers_all_execution_threads() {
+        let (network, _) = buffer_pool_configs(3, 20, Some(9), 512);
+        assert_eq!(network.parallelism(), NZUsize!(3 + 20 + 9));
+
+        let (shared_strategy, _) = buffer_pool_configs(3, 20, None, 512);
+        assert_eq!(shared_strategy.parallelism(), NZUsize!(3 + 20));
+    }
+
+    #[test]
+    fn p2p_ceiling_covers_whole_twenty_four_mib_proposal_responses() {
+        const TRANSACTION_BUDGET: usize = 24 * 1024 * 1024;
+        const MAX_BLOCK_HEADER_BYTES: usize = 306;
+        const MAX_CODING_CONFIG_BYTES: usize = 4;
+        const RESOLVER_ENVELOPE_HEADROOM: usize = 1024;
+
+        let minimum_transaction_bytes =
+            Transaction::<sha256::Digest>::SIZE + TransactionSignature::MIN_SIZE;
+        let maximum_transaction_count = TRANSACTION_BUDGET / minimum_transaction_bytes;
+        let maximum_block_wire_size = TRANSACTION_BUDGET
+            + maximum_transaction_count * minimum_transaction_bytes.encode_size()
+            + maximum_transaction_count.encode_size()
+            + MAX_BLOCK_HEADER_BYTES
+            + MAX_CODING_CONFIG_BYTES;
+        assert!(
+            maximum_block_wire_size + RESOLVER_ENVELOPE_HEADROOM < P2P_MAX_MESSAGE_SIZE as usize
+        );
     }
 
     #[test]
@@ -543,7 +618,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_critical_task_exit(None, pending::<()>(), pending::<()>(), pending::<()>()),
+            wait_for_critical_task_exit(
+                None,
+                None,
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+            ),
         )
         .await;
 

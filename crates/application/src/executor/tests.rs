@@ -472,6 +472,28 @@ fn prefix_collision_only_demotes_to_the_general_lane() {
     assert_eq!(balance(recipient_b), DEFAULT_ACCOUNT_BALANCE + 5);
 }
 
+#[test]
+fn dense_account_indices_survive_growth_and_prefix_collisions() {
+    let mut table = super::AccountIndexTable::with_capacity(1);
+    let mut keys = Vec::new();
+    for index in 0..128u64 {
+        let mut bytes = [0u8; 32];
+        bytes[..8].copy_from_slice(&7u64.to_le_bytes());
+        bytes[8..16].copy_from_slice(&index.to_le_bytes());
+        let key = AccountKey::try_from(bytes.as_slice()).expect("account-key width");
+        let (dense, inserted) = table.get_or_insert(key.prefix(), &key, &keys);
+        assert!(inserted);
+        assert_eq!(dense as u64, index);
+        keys.push(key);
+    }
+
+    for (index, key) in keys.iter().enumerate() {
+        let (dense, inserted) = table.get_or_insert(key.prefix(), key, &keys);
+        assert!(!inserted);
+        assert_eq!(dense as usize, index);
+    }
+}
+
 /// Runs the selective executor over `transfers` against `state`, returning
 /// the applied flags and the final account values keyed by account.
 fn run_selective(
@@ -479,10 +501,11 @@ fn run_selective(
     transfers: &[PreparedTransfer],
 ) -> (Vec<bool>, Vec<(AccountKey, Account)>) {
     let mut executor = super::SelectiveExecutor::new();
-    let keys = executor.begin_round(transfers);
+    let round = executor.begin_round(transfers);
+    let keys = round.missing().to_vec();
     let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
     executor.register(&values);
-    let applied = executor.apply(transfers);
+    let applied = executor.apply(round, transfers);
     let changes = executor
         .into_updates()
         .into_iter()
@@ -611,15 +634,17 @@ fn selective_multi_round_matches_single_pass() {
 
     // Two rounds through one executor (the refill shape)...
     let mut executor = super::SelectiveExecutor::new();
-    let keys = executor.begin_round(&first);
+    let round = executor.begin_round(&first);
+    let keys = round.missing().to_vec();
     let values: Vec<Option<Account>> = keys.iter().map(|key| state.get(key).copied()).collect();
     executor.register(&values);
-    assert_eq!(executor.apply(&first), vec![true, false]);
-    let more = executor.begin_round(&second);
+    assert_eq!(executor.apply(round, &first), vec![true, false]);
+    let round = executor.begin_round(&second);
+    let more = round.missing().to_vec();
     assert_eq!(more.len(), 1, "only Bob's account is new");
     let values: Vec<Option<Account>> = more.iter().map(|key| state.get(key).copied()).collect();
     executor.register(&values);
-    assert_eq!(executor.apply(&second), vec![true, true]);
+    assert_eq!(executor.apply(round, &second), vec![true, true]);
     let mut all_keys = keys;
     all_keys.extend(more);
     let mut multi: Vec<(AccountKey, Account)> = executor
@@ -633,4 +658,22 @@ fn selective_multi_round_matches_single_pass() {
     let survivors = vec![first[0], second[0], second[1]];
     let baseline = compute(&state, &survivors).expect("survivors verify");
     assert_eq!(baseline, multi);
+}
+
+#[test]
+#[should_panic(expected = "selective round account mapping")]
+fn selective_round_rejects_a_different_transfer_order() {
+    let alice = TestSigner::from_seed(13);
+    let bob = TestSigner::from_seed(14);
+    let carol = TestSigner::from_seed(15);
+    let transfers = [
+        one_prepared(&alice, &bob.public_key, 1, 0),
+        one_prepared(&bob, &carol.public_key, 1, 0),
+    ];
+    let reordered = [transfers[1], transfers[0]];
+
+    let mut executor = super::SelectiveExecutor::new();
+    let round = executor.begin_round(&transfers);
+    executor.register(&vec![None; round.missing().len()]);
+    let _ = executor.apply(round, &reordered);
 }

@@ -3,14 +3,20 @@
 use ahash::AHashMap;
 use commonware_deployer::aws::Hosts;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{
+    fs::{self, File},
+    io::{self, Write as _},
+    path::{Path, PathBuf},
+};
 
 /// Default number of fully signed local batches kept ready per submitter.
 pub const DEFAULT_PRESIGNED_BATCHES: usize = 16;
-/// Default number of source-ordered batches held in flight per submitter.
+/// Default number of concurrent batches in each ordered-refill window.
 pub const DEFAULT_IN_FLIGHT_BATCHES: usize = 1;
-/// Maximum configured in-flight width, bounded against the account nonce
-/// run-ahead window under the spammer's current batch jitter contract.
+/// Maximum configured in-flight width.
+///
+/// Startup also bounds the resulting per-account nonce span using the configured
+/// account universe, batch size, and jitter.
 pub const MAX_IN_FLIGHT_BATCHES: usize = 32;
 /// Default number of rayon threads for parallel signing.
 pub const DEFAULT_RAYON_THREADS: usize = 2;
@@ -19,8 +25,14 @@ pub const DEFAULT_RAYON_THREADS: usize = 2;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpammerConfig {
     pub accounts: u32,
+    /// Transactions per submitted batch. Zero selects the configured account count.
+    #[serde(default)]
+    pub batch_size: u32,
     pub value: u64,
     pub seed_offset: u64,
+    /// Durable counter used to reserve a fresh account range on each process start.
+    #[serde(default)]
+    pub seed_generation_path: Option<PathBuf>,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_rayon_threads")]
     pub rayon_threads: usize,
@@ -35,7 +47,7 @@ pub struct SpammerConfig {
     /// Fully signed local batches to keep ready per submitter.
     #[serde(default = "default_presigned_batches")]
     pub presigned_batches: usize,
-    /// Source-ordered batches held in flight per submitter.
+    /// Concurrent batches in each submitter's ordered-refill window.
     #[serde(default = "default_in_flight_batches")]
     pub in_flight_batches: usize,
     /// Hex-encoded ed25519 public keys of primary validators. Used to filter
@@ -43,9 +55,9 @@ pub struct SpammerConfig {
     /// hex-named validator host (local/CLI-only fallback).
     #[serde(default)]
     pub primary_validators: Vec<String>,
-    /// Fractional account-count jitter per submitted batch.
+    /// Fractional batch-size jitter per submitted batch.
     ///
-    /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs.
+    /// `0.2` submits `batch_size + rand(0..=floor(batch_size * 0.2))` txs.
     #[serde(default)]
     pub accounts_jitter: f64,
 }
@@ -66,6 +78,52 @@ const fn default_rayon_threads() -> usize {
 pub fn load_config(path: &Path) -> SpammerConfig {
     let raw = std::fs::read_to_string(path).expect("failed to read spammer config");
     serde_yaml::from_str(&raw).expect("failed to parse spammer config")
+}
+
+/// Durably reserves the next non-overlapping account range for a spammer process.
+pub fn reserve_seed_offset(
+    path: &Path,
+    base_seed_offset: u64,
+    accounts: u32,
+    submitters: usize,
+) -> io::Result<u64> {
+    let submitters = u64::try_from(submitters)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    let account_range = u64::from(accounts)
+        .checked_mul(submitters)
+        .filter(|range| *range > 0)
+        .ok_or_else(|| io::Error::other("spammer account range overflowed or was empty"))?;
+    let generation = match fs::read_to_string(path) {
+        Ok(raw) => raw.trim().parse::<u64>().map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid seed counter: {error}"),
+            )
+        })?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error),
+    };
+    let seed_offset = generation
+        .checked_mul(account_range)
+        .and_then(|offset| base_seed_offset.checked_add(offset))
+        .ok_or_else(|| io::Error::other("spammer seed range overflowed"))?;
+    let next_generation = generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("spammer seed generation overflowed"))?;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let temporary = path.with_extension(format!("tmp-{}", std::process::id()));
+    let mut file = File::create(&temporary)?;
+    writeln!(file, "{next_generation}")?;
+    file.sync_all()?;
+    fs::rename(&temporary, path)?;
+    File::open(parent)?.sync_all()?;
+
+    Ok(seed_offset)
 }
 
 /// Resolves a deployer-named relayer URL through `hosts.yaml` when provided.
@@ -106,8 +164,10 @@ mod tests {
     fn config_yaml_roundtrip() {
         let config = SpammerConfig {
             accounts: 20,
+            batch_size: 12,
             value: 5,
             seed_offset: 2000,
+            seed_generation_path: Some(PathBuf::from("/tmp/spammer-seed-generation")),
             rayon_threads: 6,
             http_port: 9090,
             relayer_url: "http://relayer:8080".to_string(),
@@ -120,8 +180,10 @@ mod tests {
         let yaml = serde_yaml::to_string(&config).expect("serialize");
         let parsed: SpammerConfig = serde_yaml::from_str(&yaml).expect("deserialize");
         assert_eq!(parsed.accounts, config.accounts);
+        assert_eq!(parsed.batch_size, config.batch_size);
         assert_eq!(parsed.value, config.value);
         assert_eq!(parsed.seed_offset, config.seed_offset);
+        assert_eq!(parsed.seed_generation_path, config.seed_generation_path);
         assert_eq!(parsed.rayon_threads, config.rayon_threads);
         assert_eq!(parsed.http_port, config.http_port);
         assert_eq!(parsed.relayer_url, config.relayer_url);
@@ -138,9 +200,26 @@ mod tests {
         let yaml = "accounts: 10\nvalue: 1\nseed_offset: 1000\nhttp_port: 8080\nrelayer_url: http://127.0.0.1:8084\n";
         let parsed: SpammerConfig = serde_yaml::from_str(yaml).expect("deserialize");
         assert_eq!(parsed.rayon_threads, DEFAULT_RAYON_THREADS);
+        assert_eq!(parsed.batch_size, 0);
         assert_eq!(parsed.presigned_batches, DEFAULT_PRESIGNED_BATCHES);
         assert_eq!(parsed.in_flight_batches, DEFAULT_IN_FLIGHT_BATCHES);
         assert_eq!(parsed.accounts_jitter, 0.0);
+        assert_eq!(parsed.seed_generation_path, None);
+    }
+
+    #[test]
+    fn durable_seed_generation_reserves_disjoint_account_ranges() {
+        let path = std::env::temp_dir().join(format!(
+            "constantinople-spammer-seed-generation-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+
+        assert_eq!(reserve_seed_offset(&path, 1_000, 20, 4).unwrap(), 1_000);
+        assert_eq!(reserve_seed_offset(&path, 1_000, 20, 4).unwrap(), 1_080);
+        assert_eq!(fs::read_to_string(&path).unwrap().trim(), "2");
+
+        let _ = fs::remove_file(path);
     }
 
     #[test]

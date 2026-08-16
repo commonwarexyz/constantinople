@@ -42,11 +42,11 @@ const PINNED_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum batches admitted to CPU decoding concurrently.
 ///
-/// Batch decoding seal-hashes every transaction on the strategy's pool, which
-/// the co-located validator engine also depends on; admitting one batch at a
-/// time keeps client bursts from queueing CPU ahead of consensus work. The
-/// owned permit moves into the pool job, so a client disconnect cannot
-/// release it while the job runs.
+/// Batch decoding seal-hashes every transaction on the configured ingress
+/// strategy. Admitting one batch at a time bounds CPU queueing whether that
+/// strategy has a dedicated pool or shares the engine pool. The owned permit
+/// moves into the pool job, so a client disconnect cannot release it while
+/// the job runs.
 const MAX_CONCURRENT_DECODES: usize = 1;
 
 type Activity = EngineActivity<ed25519::PublicKey, MinSig>;

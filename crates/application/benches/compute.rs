@@ -46,6 +46,7 @@ enum Fixture {
     Unique,
     Shared,
     Mixed,
+    Ring,
 }
 
 impl Fixture {
@@ -54,6 +55,7 @@ impl Fixture {
             Self::Unique => "unique",
             Self::Shared => "shared",
             Self::Mixed => "mixed",
+            Self::Ring => "ring",
         }
     }
 }
@@ -245,6 +247,20 @@ fn transfers(fixture: Fixture, n: usize) -> Vec<PreparedTransfer> {
             });
             shared_transfers.chain(unique_transfers).collect()
         }
+        Fixture::Ring => (0..n)
+            .map(|i| {
+                let sender = key(i as u64);
+                let recipient = key(i as u64 + 1);
+                PreparedTransfer {
+                    sender,
+                    recipient,
+                    sender_prefix: sender.prefix(),
+                    recipient_prefix: recipient.prefix(),
+                    value: 1,
+                    nonce: 0,
+                }
+            })
+            .collect(),
     }
 }
 
@@ -298,6 +314,18 @@ fn signed_txs(fixture: Fixture, n: usize) -> Vec<TestTx> {
                 signers[sender_index].sign(signers[recipient_index].public_key.clone(), 1, 0)
             });
             shared_txs.chain(unique_txs).collect()
+        }
+        Fixture::Ring => {
+            assert!(
+                n < MAX_SIGNED_ACCOUNTS as usize,
+                "signed ring fixture needs one more signer than transfers"
+            );
+            let signers = (0..=n)
+                .map(|index| TestSigner::from_seed(index as u64))
+                .collect::<Vec<_>>();
+            (0..n)
+                .map(|i| signers[i].sign(signers[i + 1].public_key.clone(), 1, 0))
+                .collect()
         }
     }
 }
@@ -454,18 +482,21 @@ fn main() {
             }
         }
         let merkleized = batch.merkleize().await.expect("seed merkleize");
-        db.finalize(merkleized).await;
-        assert!(db.start_sync().await.durable().await);
+        db.apply(merkleized).await;
+        assert!(db.finalize().await.durable().await);
 
         let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
         let count_filter = std::env::var("CONSTANTINOPLE_BENCH_COUNT")
             .ok()
             .and_then(|count| count.parse::<usize>().ok());
-        for &n in COUNTS {
-            if count_filter.is_some_and(|filter| filter != n) {
-                continue;
-            }
-            for fixture in [Fixture::Unique, Fixture::Shared, Fixture::Mixed] {
+        let counts = count_filter.map_or_else(|| COUNTS.to_vec(), |count| vec![count]);
+        let fixtures = if fixture_filter.as_deref() == Some("ring") {
+            vec![Fixture::Ring]
+        } else {
+            vec![Fixture::Unique, Fixture::Shared, Fixture::Mixed]
+        };
+        for n in counts {
+            for &fixture in &fixtures {
                 if fixture_filter
                     .as_deref()
                     .is_some_and(|filter| filter != fixture.name())

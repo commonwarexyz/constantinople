@@ -9,7 +9,7 @@ use commonware_codec::{Error as CodecError, FixedArray, FixedSize, Read, ReadExt
 use commonware_cryptography::{Hasher, ed25519, sha256};
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
-use core::ops::Deref;
+use core::{cmp::Ordering, ops::Deref};
 use derive_more::{Debug, Display};
 
 /// Default starting balance for accounts that have not been written yet.
@@ -28,7 +28,7 @@ const ACCOUNT_KEY_SIZE: usize = ed25519::PublicKey::SIZE;
 /// [`AccountKey`] does not validate or decompress the curve point. This keeps
 /// state-database replay, indexing, and lookup on cheap byte comparisons while
 /// preserving the legacy Ed25519 account format.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, FixedArray)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, FixedArray)]
 #[fixed_array(infallible)]
 pub struct AccountKey {
     bytes: [u8; ACCOUNT_KEY_SIZE],
@@ -68,6 +68,40 @@ impl AccountKey {
         let mut prefix = [0u8; 8];
         prefix.copy_from_slice(&self.bytes[..8]);
         u64::from_le_bytes(prefix)
+    }
+
+    #[inline(always)]
+    const fn ordering_word(&self, offset: usize) -> u64 {
+        u64::from_be_bytes([
+            self.bytes[offset],
+            self.bytes[offset + 1],
+            self.bytes[offset + 2],
+            self.bytes[offset + 3],
+            self.bytes[offset + 4],
+            self.bytes[offset + 5],
+            self.bytes[offset + 6],
+            self.bytes[offset + 7],
+        ])
+    }
+}
+
+impl Ord for AccountKey {
+    #[inline]
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Big-endian words preserve bytewise lexicographic order and usually
+        // distinguish uniformly distributed account keys with one comparison.
+        self.ordering_word(0)
+            .cmp(&other.ordering_word(0))
+            .then_with(|| self.ordering_word(8).cmp(&other.ordering_word(8)))
+            .then_with(|| self.ordering_word(16).cmp(&other.ordering_word(16)))
+            .then_with(|| self.ordering_word(24).cmp(&other.ordering_word(24)))
+    }
+}
+
+impl PartialOrd for AccountKey {
+    #[inline]
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
     }
 }
 
@@ -305,6 +339,51 @@ mod tests {
             key.as_ref(),
             sha256::Sha256::hash(&[public_key.as_ref()]).as_ref()
         );
+    }
+
+    #[test]
+    fn account_key_order_matches_lexicographic_byte_order() {
+        let mut raw = Vec::with_capacity(10_000);
+        let mut state = 0x9e37_79b9_7f4a_7c15u64;
+        for _ in 0..raw.capacity() {
+            let mut key = [0; AccountKey::SIZE];
+            for chunk in key.as_chunks_mut::<8>().0 {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                chunk.copy_from_slice(&state.to_be_bytes());
+            }
+            raw.push(key);
+        }
+
+        let mut expected = raw.clone();
+        expected.sort_unstable();
+        let mut actual: Vec<_> = raw.iter().copied().map(AccountKey::from).collect();
+        actual.sort_unstable();
+
+        assert!(
+            actual
+                .iter()
+                .map(|key| key.bytes)
+                .eq(expected.iter().copied())
+        );
+        for query in raw {
+            assert_eq!(
+                actual.binary_search(&AccountKey::from(query)),
+                expected.binary_search(&query)
+            );
+        }
+
+        for differing_byte in 0..AccountKey::SIZE {
+            let mut lower = [0x55; AccountKey::SIZE];
+            let mut upper = lower;
+            lower[differing_byte] = 0;
+            upper[differing_byte] = u8::MAX;
+            assert_eq!(
+                AccountKey::from(lower).cmp(&AccountKey::from(upper)),
+                lower.cmp(&upper)
+            );
+        }
     }
 
     #[test]

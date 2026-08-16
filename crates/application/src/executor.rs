@@ -113,7 +113,7 @@ where
 #[derive(Default)]
 pub(crate) struct AccountEffect {
     /// Transfer indices sent by this account, in block order.
-    sent: Vec<u32>,
+    sent: SentTransfers,
     /// Total non-self debit to subtract from the account.
     debit: u64,
     /// Largest self-transfer value that must be affordable.
@@ -122,101 +122,107 @@ pub(crate) struct AccountEffect {
     credit: u64,
 }
 
+/// Sender transfer indices with the common single-transfer case stored inline.
+#[derive(Default)]
+enum SentTransfers {
+    #[default]
+    Empty,
+    One(u32),
+    Many(Vec<u32>),
+}
+
+impl SentTransfers {
+    fn push(&mut self, index: u32) {
+        match self {
+            Self::Empty => *self = Self::One(index),
+            Self::One(first) => {
+                let first = *first;
+                let mut indices = Vec::with_capacity(4);
+                indices.extend([first, index]);
+                *self = Self::Many(indices);
+            }
+            Self::Many(indices) => indices.push(index),
+        }
+    }
+
+    fn consume_nonces(&self, account: &mut Account, transfers: &[PreparedTransfer]) -> bool {
+        let mut consume = |index: u32| account.nonce.consume(transfers[index as usize].nonce);
+        match self {
+            Self::Empty => true,
+            Self::One(index) => consume(*index),
+            Self::Many(indices) => indices.iter().copied().all(consume),
+        }
+    }
+}
+
+/// Prefix-seeded open-addressing table over an owning dense key vector.
+///
+/// Each occupied slot stores only its dense index; full-key equality reads the
+/// canonical key from the caller's vector. A new slot reserves `keys.len()`,
+/// and the caller appends that key before the next table operation.
 struct AccountIndexTable {
-    slots: Vec<AccountIndexSlot>,
+    slots: Vec<u32>,
     mask: usize,
     len: usize,
 }
 
-#[derive(Clone, Copy)]
-struct AccountIndexSlot {
-    key: Option<AccountKey>,
-    index: u32,
-}
+const EMPTY_ACCOUNT_INDEX: u32 = u32::MAX;
 
 impl AccountIndexTable {
     fn with_capacity(capacity: usize) -> Self {
         let slots = capacity.saturating_mul(2).next_power_of_two().max(16);
         Self {
-            slots: vec![
-                AccountIndexSlot {
-                    key: None,
-                    index: 0
-                };
-                slots
-            ],
+            slots: vec![EMPTY_ACCOUNT_INDEX; slots],
             mask: slots - 1,
             len: 0,
         }
     }
 
-    /// Looks up a key without inserting.
-    fn get(&self, prefix: u64, key: &AccountKey) -> Option<u32> {
-        let mut slot = (prefix as usize) & self.mask;
-        loop {
-            let entry = self.slots[slot];
-            entry.key?;
-            if entry.key == Some(*key) {
-                return Some(entry.index);
-            }
-            slot = (slot + 1) & self.mask;
-        }
-    }
-
-    fn get_or_insert(&mut self, prefix: u64, key: AccountKey, index: u32) -> (u32, bool) {
+    fn get_or_insert(&mut self, prefix: u64, key: &AccountKey, keys: &[AccountKey]) -> (u32, bool) {
         if self.len.saturating_mul(2) >= self.slots.len() {
-            self.grow();
+            self.grow(keys);
         }
 
         let mut slot = (prefix as usize) & self.mask;
         loop {
-            let entry = self.slots[slot];
-            if entry.key.is_none() {
-                self.slots[slot] = AccountIndexSlot {
-                    key: Some(key),
-                    index,
-                };
+            let index = self.slots[slot];
+            if index == EMPTY_ACCOUNT_INDEX {
+                let index = u32::try_from(keys.len()).expect("account index must fit in u32");
+                assert_ne!(
+                    index, EMPTY_ACCOUNT_INDEX,
+                    "account index space reserves the sentinel"
+                );
+                self.slots[slot] = index;
                 self.len += 1;
                 return (index, true);
             }
-            if entry.key == Some(key) {
-                return (entry.index, false);
+            if keys[index as usize] == *key {
+                return (index, false);
             }
             slot = (slot + 1) & self.mask;
         }
     }
 
-    fn grow(&mut self) {
+    fn grow(&mut self, keys: &[AccountKey]) {
         let new_slots = self.slots.len() * 2;
-        let old_slots = core::mem::replace(
-            &mut self.slots,
-            vec![
-                AccountIndexSlot {
-                    key: None,
-                    index: 0
-                };
-                new_slots
-            ],
-        );
+        let old_slots = core::mem::replace(&mut self.slots, vec![EMPTY_ACCOUNT_INDEX; new_slots]);
         self.mask = new_slots - 1;
         self.len = 0;
 
-        for slot in old_slots {
-            if let Some(key) = slot.key {
-                self.insert_unique(key, slot.index);
+        for index in old_slots {
+            if index != EMPTY_ACCOUNT_INDEX {
+                self.insert_unique(index, keys);
             }
         }
     }
 
-    fn insert_unique(&mut self, key: AccountKey, index: u32) {
+    fn insert_unique(&mut self, index: u32, keys: &[AccountKey]) {
+        let key = &keys[index as usize];
         let mut slot = (key.prefix() as usize) & self.mask;
-        while self.slots[slot].key.is_some() {
+        while self.slots[slot] != EMPTY_ACCOUNT_INDEX {
             slot = (slot + 1) & self.mask;
         }
-        self.slots[slot] = AccountIndexSlot {
-            key: Some(key),
-            index,
-        };
+        self.slots[slot] = index;
         self.len += 1;
     }
 }
@@ -235,7 +241,9 @@ struct GeneralBuilder {
 
 impl GeneralBuilder {
     fn new(transfers: usize) -> Self {
-        let expected_accounts = transfers.saturating_mul(2).max(16);
+        // This is a capacity hint, not a bound. The production ring touches
+        // N + 1 accounts; the vectors and table grow for sparser graphs.
+        let expected_accounts = transfers.saturating_add(1).max(16);
         Self {
             account_keys: Vec::with_capacity(expected_accounts),
             effects: Vec::with_capacity(expected_accounts),
@@ -244,9 +252,7 @@ impl GeneralBuilder {
     }
 
     fn account(&mut self, prefix: u64, key: &AccountKey) -> &mut AccountEffect {
-        let (account, inserted) =
-            self.indices
-                .get_or_insert(prefix, *key, self.account_keys.len() as u32);
+        let (account, inserted) = self.indices.get_or_insert(prefix, key, &self.account_keys);
         if inserted {
             self.account_keys.push(*key);
             self.effects.push(AccountEffect::default());
@@ -351,11 +357,8 @@ pub(crate) fn apply_general_accounts(
     let mut writes = Vec::with_capacity(workload.effects.len());
     for (effect, value) in workload.effects.iter().zip(values) {
         let mut account = value.unwrap_or_default();
-        for index in &effect.sent {
-            let transfer = &transfers[*index as usize];
-            if !account.nonce.consume(transfer.nonce) {
-                return None;
-            }
+        if !effect.sent.consume_nonces(&mut account, transfers) {
+            return None;
         }
         if account.balance < effect.self_transfer_floor || account.balance < effect.debit {
             return None;
@@ -428,6 +431,24 @@ pub struct SelectiveExecutor {
     accounts: Vec<WorkingAccount>,
 }
 
+/// Dense account indices and newly discovered keys for one candidate round.
+pub struct SelectiveRound {
+    missing: Vec<AccountKey>,
+    accounts: Vec<[u32; 2]>,
+}
+
+impl SelectiveRound {
+    /// Keys whose block-start values must be staged before applying the round.
+    pub fn missing(&self) -> &[AccountKey] {
+        &self.missing
+    }
+
+    /// Number of prepared transfers in the round.
+    pub(crate) const fn len(&self) -> usize {
+        self.accounts.len()
+    }
+}
+
 #[derive(Clone, Copy)]
 struct WorkingAccount {
     /// Block-start balance.
@@ -450,36 +471,57 @@ impl Default for SelectiveExecutor {
 
 impl SelectiveExecutor {
     pub fn new() -> Self {
+        Self::with_capacity(16)
+    }
+
+    /// Creates an executor sized for the expected number of touched accounts.
+    pub fn with_capacity(expected_accounts: usize) -> Self {
         Self {
-            indices: AccountIndexTable::with_capacity(16),
-            keys: Vec::new(),
-            accounts: Vec::new(),
+            indices: AccountIndexTable::with_capacity(expected_accounts),
+            keys: Vec::with_capacity(expected_accounts),
+            accounts: Vec::with_capacity(expected_accounts),
         }
     }
 
-    /// Records the accounts a candidate round touches, returning the keys not
-    /// seen in any earlier round, in the order their block-start values must
-    /// be staged (their dense indices continue the staged read space).
-    pub fn begin_round(&mut self, transfers: &[PreparedTransfer]) -> Vec<AccountKey> {
+    /// Resolves the accounts a candidate round touches. Newly seen keys retain
+    /// first-touch order so their dense indices continue the staged read space.
+    pub fn begin_round<'a>(
+        &mut self,
+        transfers: impl IntoIterator<Item = &'a PreparedTransfer>,
+    ) -> SelectiveRound {
+        let transfers = transfers.into_iter();
         let before = self.keys.len();
+        let mut accounts = Vec::with_capacity(transfers.size_hint().1.unwrap_or_default());
         for transfer in transfers {
-            for (prefix, key) in [
-                (transfer.sender_prefix, transfer.sender),
-                (transfer.recipient_prefix, transfer.recipient),
-            ] {
-                let (_, inserted) = self
-                    .indices
-                    .get_or_insert(prefix, key, self.keys.len() as u32);
-                if inserted {
-                    self.keys.push(key);
-                }
+            let (sender, inserted) =
+                self.indices
+                    .get_or_insert(transfer.sender_prefix, &transfer.sender, &self.keys);
+            if inserted {
+                self.keys.push(transfer.sender);
             }
+            let recipient = if transfer.sender == transfer.recipient {
+                sender
+            } else {
+                let (recipient, inserted) = self.indices.get_or_insert(
+                    transfer.recipient_prefix,
+                    &transfer.recipient,
+                    &self.keys,
+                );
+                if inserted {
+                    self.keys.push(transfer.recipient);
+                }
+                recipient
+            };
+            accounts.push([sender, recipient]);
         }
-        self.keys[before..].to_vec()
+        SelectiveRound {
+            missing: self.keys[before..].to_vec(),
+            accounts,
+        }
     }
 
-    /// Registers the staged block-start values for the keys the last
-    /// [`begin_round`](Self::begin_round) returned, in the same order.
+    /// Registers staged block-start values for the round's missing keys, in
+    /// the same order returned by [`SelectiveRound::missing`].
     pub fn register(&mut self, values: &[Option<Account>]) {
         assert_eq!(
             self.accounts.len() + values.len(),
@@ -498,21 +540,35 @@ impl SelectiveExecutor {
         }
     }
 
-    /// Applies `transfers` in order, returning one applied/dropped flag per
-    /// transfer. Every touched account must be registered.
-    pub fn apply(&mut self, transfers: &[PreparedTransfer]) -> Vec<bool> {
-        let mut applied = Vec::with_capacity(transfers.len());
-        for transfer in transfers {
-            applied.push(self.apply_one(transfer));
+    /// Applies a prepared round in order, returning one applied/dropped flag
+    /// per transfer. Every touched account must be registered.
+    pub fn apply<'a>(
+        &mut self,
+        round: SelectiveRound,
+        transfers: impl IntoIterator<Item = &'a PreparedTransfer>,
+    ) -> Vec<bool> {
+        let mut transfers = transfers.into_iter();
+        let mut applied = Vec::with_capacity(round.accounts.len());
+        for accounts in round.accounts {
+            let transfer = transfers
+                .next()
+                .expect("round must contain one account pair per transfer");
+            applied.push(self.apply_one(transfer, accounts));
         }
+        assert!(
+            transfers.next().is_none(),
+            "round must contain one account pair per transfer"
+        );
         applied
     }
 
-    fn apply_one(&mut self, transfer: &PreparedTransfer) -> bool {
-        let sender = self
-            .indices
-            .get(transfer.sender_prefix, &transfer.sender)
-            .expect("touched account must be registered") as usize;
+    fn apply_one(&mut self, transfer: &PreparedTransfer, accounts: [u32; 2]) -> bool {
+        let [sender, recipient] = accounts.map(|index| index as usize);
+        assert!(
+            self.keys.get(sender) == Some(&transfer.sender)
+                && self.keys.get(recipient) == Some(&transfer.recipient),
+            "selective round account mapping must match supplied transfers"
+        );
 
         if transfer.sender == transfer.recipient {
             let account = &mut self.accounts[sender];
@@ -525,11 +581,6 @@ impl SelectiveExecutor {
             account.touched = true;
             return true;
         }
-        let recipient = self
-            .indices
-            .get(transfer.recipient_prefix, &transfer.recipient)
-            .expect("touched account must be registered") as usize;
-
         // Check everything that could fail before consuming the nonce, so a
         // dropped transfer leaves no trace.
         let Some(debit) = self.accounts[sender].debit.checked_add(transfer.value) else {

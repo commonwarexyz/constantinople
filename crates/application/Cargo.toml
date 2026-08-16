@@ -37,6 +37,7 @@ ahash.workspace = true
 
 [dev-dependencies]
 # Workspace
+constantinople-curve25519.workspace = true
 constantinople-mempool = { workspace = true, features = ["mocks"] }
 
 # Commonware
@@ -50,6 +51,8 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 rand.workspace = true
 criterion.workspace = true
 mimalloc.workspace = true
+sysinfo.workspace = true
+tracing-subscriber.workspace = true
 
 [[bench]]
 name = "executor"
@@ -65,4 +68,12 @@ harness = false
 
 [[bench]]
 name = "finalize"
+harness = false
+
+[[bench]]
+name = "verify"
+harness = false
+
+[[bench]]
+name = "cadence"
 harness = false

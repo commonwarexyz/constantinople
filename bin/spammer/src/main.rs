@@ -3,9 +3,9 @@
 //! Generates deterministic accounts and submits ring-transfer transactions to
 //! the relayer in a continuous loop.
 //!
-//! Each target gets its own independent account set. A bounded, source-ordered
-//! submission window keeps signing and consensus work pipelined without letting
-//! later account nonces advance around a stalled earlier batch.
+//! Each target gets its own independent account set. A bounded submission window
+//! refills in source order, keeping signing and consensus work pipelined while
+//! bounding the nonce values that concurrent requests can expose per account.
 
 mod accounts;
 mod cli;
@@ -18,7 +18,7 @@ use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
 use commonware_utils::NZUsize;
-use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
+use constantinople_primitives::{DEFAULT_ACCOUNT_BALANCE, NONCE_BITMAP_CAPACITY};
 use core::num::NonZeroU64;
 use futures::{StreamExt as _, stream::FuturesOrdered};
 use signer::{Tx, sign_batch};
@@ -41,8 +41,10 @@ fn main() {
     // Load config file if provided (deployer mode); CLI defaults are used otherwise.
     let (
         accounts_count,
+        batch_size,
         value,
         seed_offset,
+        seed_generation_path,
         relayer_url,
         relayer_submitters,
         presigned_batches,
@@ -57,10 +59,17 @@ fn main() {
         } else {
             cfg.relayer_submitters
         };
+        let batch_size = if cfg.batch_size == 0 {
+            cfg.accounts
+        } else {
+            cfg.batch_size
+        };
         (
             cfg.accounts,
+            batch_size,
             cfg.value,
             cfg.seed_offset,
+            cfg.seed_generation_path,
             config::resolve_named_http_url(&cfg.relayer_url, cli.hosts.as_deref()),
             relayer_submitters,
             cfg.presigned_batches,
@@ -76,8 +85,10 @@ fn main() {
     } else {
         (
             cli.accounts,
+            cli.batch_size.unwrap_or(cli.accounts),
             cli.value,
             cli.seed_offset,
+            None,
             cli.relayer_url
                 .clone()
                 .expect("provide --relayer-url or --config"),
@@ -102,11 +113,27 @@ fn main() {
 
     // Validate parameters.
     assert!(accounts_count >= 2, "need at least 2 accounts for a ring");
+    assert!(batch_size > 0, "--batch-size must be > 0");
+    validate_nonce_window(
+        accounts_count,
+        batch_size,
+        accounts_jitter,
+        in_flight_batches,
+    );
     assert!(value > 0, "transfer value must be > 0");
     assert!(
         value <= DEFAULT_ACCOUNT_BALANCE,
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
     );
+    let seed_offset = seed_generation_path.map_or(seed_offset, |path| {
+        config::reserve_seed_offset(&path, seed_offset, accounts_count, relayer_submitters)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to reserve spammer seed range at {}: {error}",
+                    path.display()
+                )
+            })
+    });
     let value = NonZeroU64::new(value).expect("checked above");
 
     let runtime_cfg = commonware_runtime::tokio::Config::default();
@@ -142,6 +169,7 @@ fn main() {
         let config = RelayerModeConfig {
             relayer_url,
             accounts_count,
+            batch_size,
             value,
             seed_offset,
             accounts_jitter,
@@ -158,6 +186,7 @@ fn main() {
 struct RelayerModeConfig {
     relayer_url: String,
     accounts_count: u32,
+    batch_size: u32,
     value: NonZeroU64,
     seed_offset: u64,
     accounts_jitter: f64,
@@ -175,6 +204,7 @@ async fn run_relayer_mode(
     let RelayerModeConfig {
         relayer_url,
         accounts_count,
+        batch_size,
         value,
         seed_offset,
         accounts_jitter,
@@ -187,6 +217,7 @@ async fn run_relayer_mode(
     info!(
         submitters = relayer_submitters,
         accounts = accounts_count,
+        batch_size,
         value = value.get(),
         seed_offset,
         accounts_jitter,
@@ -207,6 +238,7 @@ async fn run_relayer_mode(
         let batches = spawn_presigner(
             strategy,
             accounts,
+            batch_size as usize,
             value,
             accounts_jitter,
             account_offset,
@@ -244,6 +276,7 @@ async fn run_relayer_mode(
 fn spawn_presigner<St>(
     strategy: St,
     accounts: Vec<SpamAccount>,
+    batch_size: usize,
     value: NonZeroU64,
     accounts_jitter: f64,
     account_offset: u64,
@@ -261,7 +294,7 @@ where
         let mut cursor = 0;
 
         loop {
-            let batch_size = jittered_batch_size(accounts.len(), accounts_jitter, &mut rng);
+            let batch_size = jittered_batch_size(batch_size, accounts_jitter, &mut rng);
             let batch = sign_batch(
                 &strategy,
                 &accounts,
@@ -284,15 +317,18 @@ async fn submit_presigned_batches(
     in_flight_batches: usize,
 ) {
     let submitter = Arc::new(submitter);
-    submit_ordered_window(batches, in_flight_batches, move |batch| {
+    submit_ordered_refill_window(batches, in_flight_batches, move |batch| {
         let submitter = Arc::clone(&submitter);
         async move { submitter.submit(batch).await }
     })
     .await;
 }
 
-async fn submit_ordered_window<T, F, Fut>(mut items: mpsc::Receiver<T>, width: usize, submit: F)
-where
+async fn submit_ordered_refill_window<T, F, Fut>(
+    mut items: mpsc::Receiver<T>,
+    width: usize,
+    submit: F,
+) where
     F: Fn(T) -> Fut,
     Fut: Future<Output = ()>,
 {
@@ -314,16 +350,34 @@ where
     }
 }
 
-fn jittered_batch_size(accounts: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {
-    let extra = max_extra_accounts(accounts, accounts_jitter);
+fn jittered_batch_size(batch_size: usize, accounts_jitter: f64, rng: &mut JitterRng) -> usize {
+    let extra = max_extra_transactions(batch_size, accounts_jitter);
     if extra == 0 {
-        return accounts;
+        return batch_size;
     }
-    accounts.saturating_add(rng.range(0, extra))
+    batch_size.saturating_add(rng.range(0, extra))
 }
 
-fn max_extra_accounts(accounts: usize, accounts_jitter: f64) -> usize {
-    (accounts as f64 * accounts_jitter).floor() as usize
+fn max_extra_transactions(batch_size: usize, accounts_jitter: f64) -> usize {
+    (batch_size as f64 * accounts_jitter).floor() as usize
+}
+
+fn validate_nonce_window(
+    accounts: u32,
+    batch_size: u32,
+    accounts_jitter: f64,
+    in_flight_batches: usize,
+) {
+    let max_batch_size =
+        u64::from(batch_size) + (f64::from(batch_size) * accounts_jitter).floor() as u64;
+    let active_transactions =
+        max_batch_size * u64::try_from(in_flight_batches).expect("in-flight batch count fits u64");
+    let active_nonces = active_transactions.div_ceil(u64::from(accounts));
+    let nonce_window = NONCE_BITMAP_CAPACITY + 1;
+    assert!(
+        active_nonces <= nonce_window,
+        "account nonce window permits {nonce_window} active values per account, but this configuration can expose {active_nonces}"
+    );
 }
 
 fn relayer_target_for(targets: &[String], index: usize) -> Option<String> {
@@ -374,8 +428,8 @@ impl JitterRng {
 #[cfg(test)]
 mod tests {
     use super::{
-        JitterRng, jittered_batch_size, max_extra_accounts, relayer_target_for, spawn_presigner,
-        submit_ordered_window,
+        JitterRng, jittered_batch_size, max_extra_transactions, relayer_target_for,
+        spawn_presigner, submit_ordered_refill_window, validate_nonce_window,
     };
     use crate::accounts::generate_accounts;
     use commonware_parallel::Sequential;
@@ -419,11 +473,26 @@ mod tests {
     }
 
     #[test]
-    fn max_extra_accounts_uses_fractional_jitter() {
-        assert_eq!(max_extra_accounts(100, 0.0), 0);
-        assert_eq!(max_extra_accounts(100, 0.25), 25);
-        assert_eq!(max_extra_accounts(3, 0.5), 1);
-        assert_eq!(max_extra_accounts(10, 1.0), 10);
+    fn max_extra_transactions_uses_fractional_jitter() {
+        assert_eq!(max_extra_transactions(100, 0.0), 0);
+        assert_eq!(max_extra_transactions(100, 0.25), 25);
+        assert_eq!(max_extra_transactions(3, 0.5), 1);
+        assert_eq!(max_extra_transactions(10, 1.0), 10);
+    }
+
+    #[test]
+    fn nonce_window_covers_every_concurrent_request_order() {
+        validate_nonce_window(1_000_000, 50_000, 0.1, 32);
+        validate_nonce_window(10, 10, 1.0, 32);
+
+        let panic = std::panic::catch_unwind(|| validate_nonce_window(10, 11, 1.0, 32))
+            .expect_err("71 active values should exceed the 65-value nonce window");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .expect("panic should carry validation message");
+        assert!(message.contains("account nonce window"));
     }
 
     #[test]
@@ -472,10 +541,10 @@ mod tests {
         let value = NonZeroU64::new(1).expect("non-zero value");
         let presigned_batches = 4;
         let mut batches =
-            spawn_presigner(Sequential, accounts, value, 0.0, 1000, presigned_batches);
+            spawn_presigner(Sequential, accounts, 2, value, 0.0, 1000, presigned_batches);
 
         let first = batches.recv().await.expect("first batch should be signed");
-        assert_eq!(batch_nonces(&first), vec![0, 0, 0]);
+        assert_eq!(batch_nonces(&first), vec![0, 0]);
 
         wait_for_presigned_batches(&batches, presigned_batches).await;
         assert_eq!(batches.len(), presigned_batches);
@@ -484,7 +553,7 @@ mod tests {
         assert_eq!(batches.len(), presigned_batches);
 
         let second = batches.recv().await.expect("second batch should be ready");
-        assert_eq!(batch_nonces(&second), vec![1, 1, 1]);
+        assert_eq!(batch_nonces(&second), vec![0, 1]);
     }
 
     #[tokio::test]
@@ -497,7 +566,7 @@ mod tests {
 
         let started = Arc::new(AtomicUsize::new(0));
         let gates = Arc::new((0..4).map(|_| Semaphore::new(0)).collect::<Vec<_>>());
-        let task = tokio::spawn(submit_ordered_window(receiver, 2, {
+        let task = tokio::spawn(submit_ordered_refill_window(receiver, 2, {
             let started = Arc::clone(&started);
             let gates = Arc::clone(&gates);
             move |index| {

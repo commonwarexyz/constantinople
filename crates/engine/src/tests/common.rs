@@ -1,6 +1,6 @@
 use crate::{
     ThresholdScheme,
-    types::{EngineBlock, EngineMarshalMailbox},
+    types::{EngineBlock, EngineMarshalMailbox, StateSyncDb, TransactionSyncDb},
 };
 use commonware_actor::Feedback;
 use commonware_consensus::{
@@ -17,11 +17,19 @@ use commonware_cryptography::{
     ed25519,
     sha256::Sha256,
 };
-use commonware_glue::simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate};
-use commonware_runtime::Quota;
-use commonware_utils::{
-    Acknowledgement, N3f1, TryCollect, acknowledgement::Exact, channel::mpsc, sync::Mutex, test_rng,
+use commonware_glue::{
+    simulate::{processed::ProcessedHeight, tracker::FinalizationUpdate},
+    stateful::db::DatabaseSet,
 };
+use commonware_parallel::Sequential;
+use commonware_runtime::{Quota, deterministic};
+use commonware_storage::mmr;
+use commonware_utils::{
+    Acknowledgement, N3f1, TryCollect, acknowledgement::Exact, channel::mpsc, non_empty_range,
+    sync::Mutex, test_rng,
+};
+use constantinople_application::consensus::{StateSyncTarget, TransactionHistoryTarget};
+use constantinople_primitives::{Account, AccountKey};
 use std::{
     collections::BTreeMap,
     sync::{
@@ -36,6 +44,14 @@ pub(crate) type TestPublicKey = ed25519::PublicKey;
 pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
 pub(crate) type TestBlock = EngineBlock<TestHasher, TestPublicKey>;
 pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
+pub(crate) type TestDatabases = (
+    StateSyncDb<deterministic::Context, TestHasher, Sequential>,
+    TransactionSyncDb<deterministic::Context, TestHasher, Sequential>,
+);
+pub(crate) type TestTargets = (
+    StateSyncTarget<<TestHasher as commonware_cryptography::Hasher>::Digest>,
+    TransactionHistoryTarget<<TestHasher as commonware_cryptography::Hasher>::Digest>,
+);
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
 pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);
 
@@ -183,6 +199,9 @@ where
 pub(crate) struct ValidatorState {
     pub(crate) marshal: TestMarshalMailbox,
     pub(crate) startup_sync_height: Option<u64>,
+    pub(crate) databases: TestDatabases,
+    pub(crate) startup_account: Option<Account>,
+    pub(crate) restarted: bool,
 }
 
 impl PartialEq for ValidatorState {
@@ -207,6 +226,46 @@ impl ValidatorState {
             .await
             .map_or(0, |height| height.get())
     }
+
+    pub(crate) async fn account(&self, key: &AccountKey) -> Result<Option<Account>, String> {
+        read_account(&self.databases, key).await
+    }
+
+    pub(crate) async fn committed_targets(&self) -> TestTargets {
+        self.databases.committed_targets().await
+    }
+
+    pub(crate) async fn targets_at_height(&self, height: u64) -> Option<TestTargets> {
+        let block = self
+            .marshal
+            .get_block(Identifier::Height(Height::new(height)))
+            .await?;
+        let block = block.inner();
+        Some((
+            StateSyncTarget::new(
+                block.header.state_root,
+                non_empty_range!(
+                    mmr::Location::new(block.header.state_range.start()),
+                    mmr::Location::new(block.header.state_range.end())
+                ),
+            ),
+            TransactionHistoryTarget {
+                root: block.header.transactions_root,
+                size: mmr::Location::new(block.header.transactions_range.end()),
+            },
+        ))
+    }
+}
+
+pub(crate) async fn read_account(
+    databases: &TestDatabases,
+    key: &AccountKey,
+) -> Result<Option<Account>, String> {
+    let database = databases.0.read().await;
+    database
+        .get(key)
+        .await
+        .map_err(|error| format!("state database read failed: {error}"))
 }
 
 impl ProcessedHeight for ValidatorState {

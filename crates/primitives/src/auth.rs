@@ -4,10 +4,14 @@ use crate::DecompressedPublicKey;
 use bytes::{Buf, BufMut};
 use commonware_codec::{EncodeSize, Error, FixedSize, Read, ReadExt as _, Write};
 use commonware_cryptography::{
-    BatchVerifier, Hasher as _, ed25519, secp256r1::standard as secp256r1, sha256,
+    BatchVerifier as _, Hasher as _, ed25519, secp256r1::standard as secp256r1, sha256,
 };
 use commonware_parallel::Strategy;
 use commonware_utils::{Array, Span};
+use constantinople_curve25519::signing::{
+    BatchVerifier as BorrowedEd25519Batch, Signature as Ed25519Signature,
+    VerifyingKey as Ed25519VerifyingKey,
+};
 use core::{
     fmt::{Debug, Display},
     hash::Hash,
@@ -33,10 +37,9 @@ const WEBAUTHN_USER_VERIFIED_FLAG: u8 = 0x04;
 /// fixed-size public-key traits.
 ///
 /// Decoding is intentionally cheap: it validates only the scheme byte and (for
-/// Ed25519) the trailing padding. The expensive compressed-to-decompressed
-/// point conversion is deferred to signature verification, where it is served
-/// from a shared [`PublicKeyCache`](crate::PublicKeyCache) so a recurring sender's key is decompressed
-/// at most once.
+/// Ed25519) the trailing padding. Signature verification batch-decompresses
+/// Ed25519 points with its SIMD backend and serves secp256r1 points from a shared
+/// [`PublicKeyCache`](crate::PublicKeyCache).
 #[derive(Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub enum TransactionPublicKey {
     /// Commonware Ed25519.
@@ -358,15 +361,33 @@ impl From<ed25519::Signature> for TransactionSignature {
 /// Verifies mixed transaction signatures with separate scheme groups.
 pub struct TransactionBatchVerifier {
     ed25519: ed25519::Batch,
-    secp256r1: Vec<Secp256r1Item>,
+    secp256r1: Vec<Secp256r1Item<Vec<u8>>>,
 }
 
-struct Secp256r1Item {
-    message: Vec<u8>,
+struct Secp256r1Item<M> {
+    message: M,
     verifying_key: VerifyingKey,
     signature: secp256r1::Signature,
     authenticator_data: Vec<u8>,
     client_data_json: Vec<u8>,
+}
+
+impl<M> Secp256r1Item<M> {
+    fn new(
+        message: M,
+        verifying_key: VerifyingKey,
+        signature: &secp256r1::Signature,
+        authenticator_data: &[u8],
+        client_data_json: &[u8],
+    ) -> Self {
+        Self {
+            message,
+            verifying_key,
+            signature: signature.clone(),
+            authenticator_data: authenticator_data.to_vec(),
+            client_data_json: client_data_json.to_vec(),
+        }
+    }
 }
 
 impl TransactionBatchVerifier {
@@ -406,13 +427,13 @@ impl TransactionBatchVerifier {
                     ..
                 },
             ) => {
-                self.secp256r1.push(Secp256r1Item {
-                    message: message.to_vec(),
-                    verifying_key: *verifying_key,
-                    signature: signature.clone(),
-                    authenticator_data: authenticator_data.clone(),
-                    client_data_json: client_data_json.clone(),
-                });
+                self.secp256r1.push(Secp256r1Item::new(
+                    message.to_vec(),
+                    *verifying_key,
+                    signature,
+                    authenticator_data,
+                    client_data_json,
+                ));
                 true
             }
             _ => false,
@@ -435,7 +456,78 @@ impl Default for TransactionBatchVerifier {
     }
 }
 
-fn verify_secp256r1(strategy: &impl Strategy, items: Vec<Secp256r1Item>) -> bool {
+/// A borrowing verifier for transaction data that remains live until verification completes.
+pub(crate) struct BorrowedTransactionBatchVerifier<'a> {
+    ed25519: BorrowedEd25519Batch<'a>,
+    secp256r1: Vec<Secp256r1Item<&'a [u8]>>,
+}
+
+impl<'a> BorrowedTransactionBatchVerifier<'a> {
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self {
+            ed25519: BorrowedEd25519Batch::new(capacity),
+            secp256r1: Vec::new(),
+        }
+    }
+
+    pub(crate) fn add_ed25519(
+        &mut self,
+        namespace: &'a [u8],
+        message: &'a [u8],
+        key: Ed25519VerifyingKey,
+        signature: &TransactionSignature,
+    ) -> bool {
+        let TransactionSignature::Ed25519 { signature, .. } = signature else {
+            return false;
+        };
+        let Ok(signature) = Ed25519Signature::read(&mut &signature.as_ref()[..]) else {
+            return false;
+        };
+        self.ed25519.add_owned(namespace, message, key, &signature);
+        true
+    }
+
+    pub(crate) fn add_decompressed(
+        &mut self,
+        message: &'a [u8],
+        key: DecompressedPublicKey,
+        signature: &TransactionSignature,
+    ) -> bool {
+        let (
+            DecompressedPublicKey::Secp256r1(verifying_key),
+            TransactionSignature::Secp256r1 {
+                signature,
+                authenticator_data,
+                client_data_json,
+                ..
+            },
+        ) = (key, signature)
+        else {
+            return false;
+        };
+        self.secp256r1.push(Secp256r1Item::new(
+            message,
+            verifying_key,
+            signature,
+            authenticator_data,
+            client_data_json,
+        ));
+        true
+    }
+
+    pub(crate) fn verify<R: CryptoRng>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
+        if !self.ed25519.verify(rng, strategy) {
+            return false;
+        }
+
+        verify_secp256r1(strategy, self.secp256r1)
+    }
+}
+
+fn verify_secp256r1<M>(strategy: &impl Strategy, items: Vec<Secp256r1Item<M>>) -> bool
+where
+    M: AsRef<[u8]> + Send,
+{
     if items.is_empty() {
         return true;
     }
@@ -447,7 +539,7 @@ fn verify_secp256r1(strategy: &impl Strategy, items: Vec<Secp256r1Item>) -> bool
             valid
                 && verify_webauthn_assertion(
                     &item.verifying_key,
-                    &item.message,
+                    item.message.as_ref(),
                     &item.signature,
                     &item.authenticator_data,
                     &item.client_data_json,
@@ -565,6 +657,21 @@ mod tests {
             TransactionSignature::decode(encoded.as_ref()).unwrap(),
             signature
         );
+    }
+
+    #[test]
+    fn transaction_batch_verifier_owns_loop_local_messages() {
+        let signer = ed25519::PrivateKey::random(test_rng());
+        let key = DecompressedPublicKey::Ed25519(signer.public_key());
+        let mut verifier = TransactionBatchVerifier::new(4);
+
+        for i in 0..4 {
+            let message = format!("loop-local message {i}").into_bytes();
+            let signature = TransactionSignature::ed25519(signer.sign(NAMESPACE, &message));
+            assert!(verifier.add(NAMESPACE, &message, &key, &signature));
+        }
+
+        assert!(verifier.verify(&mut test_rng(), &Sequential));
     }
 
     #[test]

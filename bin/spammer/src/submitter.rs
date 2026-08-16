@@ -1,7 +1,7 @@
 //! Async submission engine.
 //!
-//! Each relayer stream submits one batch at a time and advances to the next
-//! pre-signed batch only after finalization or drop.
+//! Each request retries one encoded batch until it reaches a terminal outcome.
+//! The caller owns the bounded, ordered-refill submission window.
 
 use crate::signer::Tx;
 use commonware_codec::Encode;

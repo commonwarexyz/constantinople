@@ -402,7 +402,7 @@
           "calcs": [],
           "displayMode": "list",
           "placement": "bottom",
-          "showLegend": false
+          "showLegend": true
         },
         "tooltip": {
           "hideZeros": false,
@@ -419,17 +419,33 @@
           },
           "disableTextWrap": false,
           "editorMode": "code",
+          "expr": "sum(rate(spammer_finalized_transactions_total[1m]))",
+          "fullMetaSearch": false,
+          "includeNullMetadata": true,
+          "instant": false,
+          "legendFormat": "Finalized",
+          "range": true,
+          "refId": "A",
+          "useBackend": false
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "disableTextWrap": false,
+          "editorMode": "code",
           "expr": "sum(rate(engine_application_proposed_transactions_total[1m]))",
           "fullMetaSearch": false,
           "includeNullMetadata": true,
           "instant": false,
-          "legendFormat": "__auto",
+          "legendFormat": "Proposed",
           "range": true,
-          "refId": "A",
+          "refId": "B",
           "useBackend": false
         }
       ],
-      "title": "TPS",
+      "title": "Finalized vs Proposed TPS",
       "transparent": true,
       "type": "timeseries"
     },
@@ -4739,7 +4755,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "High-water mark of tracked network buffers per size class (never decremented; capped at max_per_class=8192). A class pinned at its cap is undersized; a class near zero is dead weight.",
+      "description": "High-water mark of tracked network buffers per size class (never decremented; capped at max_per_class=1024). A class pinned at its cap is undersized; a class near zero is dead weight.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -4945,7 +4961,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Requests larger than the pool max (network 1 MiB, storage 8 MiB) bypass pooling entirely and heap-allocate. A steady rate means a hot path is sized past the pool and should either shrink or the pool max should grow.",
+      "description": "Requests larger than the pool max (network 2 MiB, storage 8 MiB) bypass pooling entirely and heap-allocate. Whole proposal messages may legitimately exceed the network pool ceiling and use the separate 32 MiB P2P limit; the 2 MiB pool ceiling covers coded shards.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5063,7 +5079,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "High-water mark of tracked storage buffers per size class (cap 1024 per class). One pool backs every page cache (engine state, engine other, indexer) plus journal write buffers; classes pinned at cap mean the caches could not pre-allocate what they were configured for.",
+      "description": "High-water mark of tracked storage buffers per size class (cap 128 per class). One pool backs every page cache (engine state, engine other, indexer) plus journal write buffers; classes pinned at cap mean the caches could not pre-allocate what they were configured for.",
       "fieldConfig": {
         "defaults": {
           "color": {

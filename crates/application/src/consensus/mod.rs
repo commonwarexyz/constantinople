@@ -81,6 +81,7 @@ where
     St: Strategy,
 {
     strategy: St,
+    verification_strategy: St,
     proposal_pacer: pacing::ProposalPacer,
     genesis_leader: P,
     genesis_parent: C,
@@ -105,6 +106,7 @@ where
     fn clone(&self) -> Self {
         Self {
             strategy: self.strategy.clone(),
+            verification_strategy: self.verification_strategy.clone(),
             proposal_pacer: self.proposal_pacer.clone(),
             genesis_leader: self.genesis_leader.clone(),
             genesis_parent: self.genesis_parent,
@@ -135,6 +137,7 @@ where
     pub fn new(
         context: impl Metrics,
         strategy: St,
+        verification_strategy: St,
         proposal_interval_ms: NonZeroU64,
         genesis_leader: P,
         genesis_parent: C,
@@ -151,6 +154,7 @@ where
 
         Self {
             strategy,
+            verification_strategy,
             proposal_pacer: pacing::ProposalPacer::new(proposal_interval_ms),
             genesis_leader,
             genesis_parent,

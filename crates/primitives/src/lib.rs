@@ -19,6 +19,7 @@ pub use auth::{TransactionBatchVerifier, TransactionPublicKey, TransactionSignat
 
 mod cache;
 pub use cache::{DecompressedPublicKey, PublicKeyCache};
+pub use constantinople_curve25519::backend_name as transaction_ed25519_backend;
 
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};

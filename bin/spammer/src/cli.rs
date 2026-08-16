@@ -34,7 +34,7 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::DEFAULT_PRESIGNED_BATCHES)]
     pub presigned_batches: usize,
 
-    /// Source-ordered batches held in flight per submitter.
+    /// Concurrent batches in each submitter's ordered-refill window.
     #[arg(long, default_value_t = crate::config::DEFAULT_IN_FLIGHT_BATCHES)]
     pub in_flight_batches: usize,
 
@@ -45,6 +45,10 @@ pub struct Cli {
     /// Number of spam accounts per relayer submitter.
     #[arg(long, default_value_t = 10)]
     pub accounts: u32,
+
+    /// Transactions per submitted batch. Defaults to `accounts`.
+    #[arg(long)]
+    pub batch_size: Option<u32>,
 
     /// Value to transfer per transaction (must be > 0 and <= 100).
     #[arg(long, default_value_t = 1)]
@@ -58,9 +62,9 @@ pub struct Cli {
     #[arg(long, default_value_t = crate::config::DEFAULT_RAYON_THREADS)]
     pub rayon_threads: usize,
 
-    /// Fractional account-count jitter per submitted batch.
+    /// Fractional batch-size jitter per submitted batch.
     ///
-    /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per
+    /// `0.2` submits `batch_size + rand(0..=floor(batch_size * 0.2))` txs per
     /// batch. Must be in `0..=1`.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     pub accounts_jitter: f64,
@@ -103,6 +107,24 @@ mod tests {
         );
         assert!(cli.relayer_targets.is_empty());
         assert!(cli.hosts.is_none());
+        assert!(cli.batch_size.is_none());
+    }
+
+    #[test]
+    fn parses_batch_size() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--accounts",
+            "1000000",
+            "--batch-size",
+            "50000",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.accounts, 1_000_000);
+        assert_eq!(cli.batch_size, Some(50_000));
     }
 
     #[test]

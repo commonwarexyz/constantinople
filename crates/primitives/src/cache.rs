@@ -315,6 +315,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_invalid_ed25519_point_and_does_not_cache() {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(4));
+            let mut encoded = [0u8; TransactionPublicKey::SIZE];
+            encoded[1] = 2;
+            let key = TransactionPublicKey::read(&mut &encoded[..])
+                .expect("transaction decoding defers point validation");
+
+            assert!(decompress_one(&cache, &key).is_none());
+            assert!(cache.is_empty());
+        });
+    }
+
+    #[test]
     fn registers_and_counts_misses() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(4));

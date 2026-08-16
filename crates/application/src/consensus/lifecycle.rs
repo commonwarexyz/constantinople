@@ -175,7 +175,7 @@ where
             self.transaction_namespace,
             self.public_key_cache.clone(),
             Arc::clone(&body),
-            &self.strategy,
+            &self.verification_strategy,
         );
 
         let parent = parent
@@ -194,10 +194,9 @@ where
             return None;
         }
 
-        // Signatures verify concurrently with execution on the shared pool:
-        // the join measures ~2ms faster than sequencing the merkleize after
-        // the signature burst, and the merkleize's stretched wall time
-        // during the burst reflects pool sharing, not lost work.
+        // Signature verification and state execution use independent strategy
+        // instances so either CPU burst can make progress while both futures
+        // are joined here.
         let execution = execute_body(
             self.strategy.clone(),
             state_batch,

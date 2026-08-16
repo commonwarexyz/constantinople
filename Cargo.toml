@@ -14,6 +14,7 @@ exclude = ["**/target"]
 resolver = "2"
 members = [
   "crates/application",
+  "crates/curve25519",
   "crates/engine",
   "crates/mempool",
   "crates/primitives",
@@ -43,31 +44,35 @@ constantinople-engine = { path = "crates/engine" }
 constantinople-mempool = { path = "crates/mempool" }
 constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
+constantinople-curve25519 = { path = "crates/curve25519" }
 
 # Commonware
-commonware-actor = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-glue = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-math = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-codec = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-utils = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a" }
-commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "23e286373479e7db6e6e5824b4b24351e8875d6a", default-features = false }
+commonware-actor = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/actor" }
+commonware-p2p = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/p2p" }
+commonware-glue = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/glue" }
+commonware-math = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/math" }
+commonware-codec = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/codec" }
+commonware-formatting = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/formatting" }
+commonware-utils = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/utils" }
+commonware-coding = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/coding" }
+commonware-macros = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/macros" }
+commonware-runtime = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/runtime" }
+commonware-storage = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/storage" }
+commonware-deployer = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/deployer" }
+commonware-parallel = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/parallel" }
+commonware-resolver = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/resolver" }
+commonware-broadcast = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/broadcast" }
+commonware-consensus = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/consensus" }
+commonware-cryptography = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/cryptography", default-features = false }
+commonware-conformance = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/conformance" }
+commonware-invariants = { path = "../monorepo-optimize-glue-sync-glue-tweaks-plus/invariants" }
 
 # Other
 axum = "0.8"
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
 clap = { version = "4", default-features = false }
 rand = { version = "0.10.2", default-features = false }
+rand_core = { version = "0.10.1", default-features = false }
 bytes = { version = "1.11.1", default-features = false }
 criterion = "0.7.0"
 rayon = "1.10"
@@ -84,9 +89,14 @@ thiserror = { version = "2.0.18", default-features = false }
 serde_json = { version = "1.0.149", default-features = false }
 serde_yaml = "0.9"
 mimalloc = "0.1.52"
+sysinfo = "0.39.6"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+sha2 = { version = "0.11.0", default-features = false }
+subtle = { version = "2.6.1", default-features = false }
+zeroize = "1.9.0"
+ed25519-consensus = "2.1.0"
 
 [profile.samply]
 inherits = "release"

@@ -412,7 +412,8 @@ where
 {
     let mut unstaged = Some(state_batch);
     let mut staged: Option<StateStaged<E, H, EightCap, S>> = None;
-    let mut selector = executor::SelectiveExecutor::new();
+    let mut selector =
+        executor::SelectiveExecutor::with_capacity(candidates.len().saturating_add(1));
     let mut body: Vec<SignedTransaction<H>> = Vec::new();
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
@@ -432,48 +433,49 @@ where
         // Prepare the candidates on the pool: a proposer chooses its body,
         // so a candidate that fails preparation is simply excluded (unlike
         // verification's all-or-nothing preparation). Results stay
-        // index-aligned with the candidate vector; the same job compacts the
-        // well-formed transfers and records first-touched accounts.
+        // index-aligned with the candidate vector; the selector iterates the
+        // well-formed entries directly while recording first-touched accounts.
         let prepare_span = info_span!(
             "application.execute.prepare",
             txs = candidates.len().traced()
         );
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
-        let (candidates_back, prepared, transfers, selector_back, missing) = strategy
+        let (candidates_back, prepared, selector_back, execution_round) = strategy
             .spawn({
                 let accounts_span = accounts_span.clone();
                 let mut selector = selector;
                 move |s: S| {
-                    let (prepared, transfers) = prepare_span.in_scope(|| {
+                    let prepared = prepare_span.in_scope(|| {
                         let prepared: Vec<Option<(PreparedTransfer, H::Digest)>> = s
                             .map_collect_vec(&candidates, |tx| {
                                 executor::prepare_transfer(tx)
                                     .map(|transfer| (transfer, *tx.message_digest()))
                             });
-                        let transfers: Vec<PreparedTransfer> = prepared
-                            .iter()
-                            .flatten()
-                            .map(|(transfer, _)| *transfer)
-                            .collect();
-                        (prepared, transfers)
+                        prepared
                     });
-                    let missing = accounts_span.in_scope(|| selector.begin_round(&transfers));
-                    (candidates, prepared, transfers, selector, missing)
+                    let execution_round = accounts_span.in_scope(|| {
+                        selector
+                            .begin_round(prepared.iter().flatten().map(|(transfer, _)| transfer))
+                    });
+                    (candidates, prepared, selector, execution_round)
                 }
             })
             .await;
         candidates = candidates_back;
         selector = selector_back;
-        accounts_span.record("keys", missing.len().traced());
+        accounts_span.record("keys", execution_round.missing().len().traced());
 
         // Load block-start values for accounts this round touches for the
         // first time; later rounds expand the same staged read space, whose
         // indices continue exactly where the selector's dense table does.
-        if !missing.is_empty() {
-            let stage_span = info_span!("application.execute.stage", keys = missing.len().traced());
+        if !execution_round.missing().is_empty() {
+            let stage_span = info_span!(
+                "application.execute.stage",
+                keys = execution_round.missing().len().traced()
+            );
             async {
-                let keys: Vec<&_> = missing.iter().collect();
+                let keys: Vec<&_> = execution_round.missing().iter().collect();
                 if let Some(batch) = unstaged.take() {
                     let (values, next) = batch
                         .stage(&keys)
@@ -501,7 +503,7 @@ where
         // straight into the body.
         let select_span = info_span!(
             "application.execute.select",
-            txs = transfers.len().traced(),
+            txs = execution_round.len().traced(),
             dropped = tracing::field::Empty,
         );
         let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
@@ -511,9 +513,12 @@ where
                 let mut body = body;
                 move |_: S| {
                     span.in_scope(|| {
-                        let applied = selector.apply(&transfers);
+                        let applied = selector.apply(
+                            execution_round,
+                            prepared.iter().flatten().map(|(transfer, _)| transfer),
+                        );
+                        let mut chunk: Vec<H::Digest> = Vec::with_capacity(applied.len());
                         let mut flags = applied.into_iter();
-                        let mut chunk: Vec<H::Digest> = Vec::with_capacity(transfers.len());
                         let mut included = 0usize;
                         let mut dropped = 0usize;
                         for (transaction, prepared) in candidates.into_iter().zip(prepared) {
@@ -553,7 +558,7 @@ where
             };
             let apply_span = info_span!("application.execute.apply", txs = chunk.len().traced());
             pending_append = Some(Box::pin(strategy.spawn(move |_: S| {
-                apply_span.in_scope(|| apply_transaction_digests(batch, &chunk))
+                apply_span.in_scope(|| apply_transaction_digests::<E, H, S>(batch, &chunk))
             })));
         }
 
@@ -636,7 +641,7 @@ where
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
     let apply = strategy.spawn(move |_: S| {
-        apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
+        apply_span.in_scope(|| apply_transaction_digests::<E, H, S>(transaction_batch, &digests))
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
 
@@ -677,7 +682,7 @@ where
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
     let apply = strategy.spawn(move |_: S| {
         apply_span.in_scope(|| {
-            apply_transaction_digests(transaction_batch, &digests)
+            apply_transaction_digests::<E, H, S>(transaction_batch, &digests)
                 .with_inactivity_floor(transaction_floor)
         })
     });

@@ -3,7 +3,166 @@ use commonware_cryptography::PublicKey;
 use commonware_glue::simulate::{
     exit::ExitCondition, property::Property, tracker::ProgressTracker,
 };
+use constantinople_primitives::{Account, AccountKey, DEFAULT_ACCOUNT_BALANCE, Nonce};
 use std::{future::Future, pin::Pin};
+
+#[derive(Clone, Copy)]
+pub(crate) struct FreshStartupStateReadable;
+
+impl<P: PublicKey> Property<P, ValidatorState> for FreshStartupStateReadable {
+    fn name(&self) -> &str {
+        "fresh_startup_state_readable"
+    }
+
+    fn check<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<P>,
+        states: &'a [&'a ValidatorState],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            if states.is_empty() {
+                return Err("no validator state was available".to_string());
+            }
+            if states.iter().any(|state| state.startup_account.is_some()) {
+                return Err("fresh zero-suffix startup returned an unexpected account".to_string());
+            }
+            Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Copy)]
+enum TransferBoundary {
+    Restart,
+    StateSync,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommittedTransferAtBoundary {
+    boundary: TransferBoundary,
+    target_height: Option<u64>,
+    sender: AccountKey,
+    recipient: AccountKey,
+    value: u64,
+    sender_nonce: Nonce,
+}
+
+impl CommittedTransferAtBoundary {
+    pub(crate) const fn after_restart(
+        target_height: u64,
+        sender: AccountKey,
+        recipient: AccountKey,
+        value: u64,
+        sender_nonce: Nonce,
+    ) -> Self {
+        Self {
+            boundary: TransferBoundary::Restart,
+            target_height: Some(target_height),
+            sender,
+            recipient,
+            value,
+            sender_nonce,
+        }
+    }
+
+    pub(crate) const fn after_archived_restart(
+        sender: AccountKey,
+        recipient: AccountKey,
+        value: u64,
+        sender_nonce: Nonce,
+    ) -> Self {
+        Self {
+            boundary: TransferBoundary::Restart,
+            target_height: None,
+            sender,
+            recipient,
+            value,
+            sender_nonce,
+        }
+    }
+
+    pub(crate) const fn after_state_sync(
+        target_height: u64,
+        sender: AccountKey,
+        recipient: AccountKey,
+        value: u64,
+        sender_nonce: Nonce,
+    ) -> Self {
+        Self {
+            boundary: TransferBoundary::StateSync,
+            target_height: Some(target_height),
+            sender,
+            recipient,
+            value,
+            sender_nonce,
+        }
+    }
+
+    const fn selects(&self, state: &ValidatorState) -> bool {
+        match self.boundary {
+            TransferBoundary::Restart => state.restarted,
+            TransferBoundary::StateSync => state.startup_sync_height.is_some(),
+        }
+    }
+}
+
+impl<P: PublicKey> Property<P, ValidatorState> for CommittedTransferAtBoundary {
+    fn name(&self) -> &str {
+        "committed_transfer_at_lifecycle_boundary"
+    }
+
+    fn check<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<P>,
+        states: &'a [&'a ValidatorState],
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(async move {
+            let expected_sender = Account {
+                balance: DEFAULT_ACCOUNT_BALANCE - self.value,
+                nonce: self.sender_nonce,
+            };
+            let expected_recipient = Account {
+                balance: DEFAULT_ACCOUNT_BALANCE + self.value,
+                nonce: Nonce::default(),
+            };
+            let mut selected = 0usize;
+
+            for state in states.iter().copied().filter(|state| self.selects(state)) {
+                selected += 1;
+                if state.startup_account != Some(expected_sender) {
+                    return Err("startup handoff did not expose the committed sender".to_string());
+                }
+                if state.account(&self.sender).await? != Some(expected_sender) {
+                    return Err("sender state diverged after lifecycle handoff".to_string());
+                }
+                if state.account(&self.recipient).await? != Some(expected_recipient) {
+                    return Err("recipient state diverged after lifecycle handoff".to_string());
+                }
+
+                let target_height = match self.target_height {
+                    Some(height) => height,
+                    None => state.processed_height().await,
+                };
+                let expected_targets = state
+                    .targets_at_height(target_height)
+                    .await
+                    .ok_or_else(|| format!("missing finalized block at height {target_height}"))?;
+                let committed_targets = state.committed_targets().await;
+                if committed_targets.0 != expected_targets.0 {
+                    return Err("full QMDB target diverged after lifecycle handoff".to_string());
+                }
+                if committed_targets.1 != expected_targets.1 {
+                    return Err("compact QMDB target diverged after lifecycle handoff".to_string());
+                }
+            }
+
+            if selected == 0 {
+                return Err("no validator crossed the requested lifecycle boundary".to_string());
+            }
+            Ok(())
+        })
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(crate) struct BlockAgreementAtHeight {
@@ -83,6 +242,46 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState> for BlockAgre
 #[derive(Clone, Copy)]
 pub(crate) struct FinalizedHeightAtLeast {
     height: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RestartedAtHeight {
+    height: u64,
+}
+
+impl RestartedAtHeight {
+    pub(crate) const fn new(height: u64) -> Self {
+        Self { height }
+    }
+}
+
+impl<P: PublicKey> ExitCondition<P, ValidatorState> for RestartedAtHeight {
+    fn name(&self) -> &str {
+        "restarted_at_height"
+    }
+
+    fn requires_polling(&self) -> bool {
+        true
+    }
+
+    fn reached<'a>(
+        &'a self,
+        _tracker: &'a ProgressTracker<P>,
+        states: &'a [&'a ValidatorState],
+        target_count: usize,
+    ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
+        Box::pin(async move {
+            if states.len() < target_count || !states.iter().any(|state| state.restarted) {
+                return Ok(false);
+            }
+            for state in states {
+                if state.digest_at_height(self.height).await.is_none() {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+    }
 }
 
 #[derive(Clone)]

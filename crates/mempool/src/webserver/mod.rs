@@ -7,11 +7,13 @@
 //!
 //! - **HTTP handlers** (axum) run on tokio worker threads, decoding and
 //!   verifying transactions in parallel.
-//! - **Actor** owns a byte-bounded FIFO pool and processes submit,
-//!   propose, and report messages from a single channel.
+//! - **Actor** owns batch status and processes submissions and consensus
+//!   reports from a single channel.
 //! - **Mailbox** is the cloneable handle that implements
 //!   [`TransactionSource`](crate::TransactionSource) and
-//!   [`Reporter`](commonware_consensus::Reporter).
+//!   [`Reporter`](commonware_consensus::Reporter). Proposal selection runs on
+//!   its configured parallel strategy against a shared byte-bounded FIFO; the
+//!   actor drains the resulting proposal journal before handling reports.
 
 use derive_more::Display;
 

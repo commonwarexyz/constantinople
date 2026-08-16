@@ -110,6 +110,7 @@ fn build_validators(
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
+            ingress_rayon_threads: args.ingress_rayon_threads,
             http_port,
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
@@ -188,6 +189,7 @@ fn build_secondaries(
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
+            ingress_rayon_threads: args.ingress_rayon_threads,
             http_port,
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
@@ -379,6 +381,7 @@ fn local_run_commands(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
              --accounts {} \
+             --batch-size {} \
              --value {} \
              --seed-offset {} \
              --rayon-threads {} \
@@ -386,6 +389,7 @@ fn local_run_commands(
              --presigned-batches {} \
              --metrics-port {metrics_port}",
             args.spammer_accounts,
+            args.spammer_batch_size.unwrap_or(args.spammer_accounts),
             args.spammer_value,
             args.spammer_seed_offset,
             args.spammer_rayon_threads,
@@ -427,6 +431,7 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            ingress_rayon_threads: None,
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
@@ -435,6 +440,7 @@ mod tests {
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,
+            spammer_batch_size: None,
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
@@ -499,6 +505,7 @@ mod tests {
         assert!(commands[3].contains("--relayer-url http://127.0.0.1:8082"));
         assert!(commands[3].contains("--relayer-submitters 2"));
         assert!(commands[3].contains("--accounts 10"));
+        assert!(commands[3].contains("--batch-size 10"));
         assert!(commands[3].contains("--value 1"));
         assert!(commands[3].contains("--seed-offset 1000"));
         assert!(commands[3].contains("--rayon-threads 2"));
@@ -559,6 +566,24 @@ mod tests {
         );
 
         assert!(commands[3].contains("--accounts-jitter 0.25"));
+    }
+
+    #[test]
+    fn local_run_commands_separate_account_universe_from_batch_size() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_accounts = 1_000_000;
+        args.spammer_batch_size = Some(50_000);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--accounts 1000000"));
+        assert!(commands[3].contains("--batch-size 50000"));
     }
 
     #[test]
@@ -847,6 +872,26 @@ mod tests {
             validators
                 .iter()
                 .all(|validator| validator.config.leader_delay_ms.get() == 12)
+        );
+    }
+
+    #[test]
+    fn validator_configs_propagate_ingress_pool_size() {
+        let mut args = test_args(false);
+        args.ingress_rayon_threads = Some(9);
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let validators = build_validators(
+            &args,
+            local_args(&args),
+            Path::new("/tmp/configs"),
+            &material,
+        );
+
+        assert!(
+            validators
+                .iter()
+                .all(|validator| validator.config.ingress_rayon_threads == Some(9))
         );
     }
 

@@ -36,6 +36,11 @@ fn executor(c: &mut Criterion) {
         // recipients, so senders and recipients overlap across the batch.
         let (state, transfers) = build_shared_fixture(transaction_count);
         bench_compute(&mut group, "shared", transaction_count, &state, &transfers);
+
+        // Adjacent transfers over a ring: every interior account is both a
+        // recipient and the next sender, matching the production spammer.
+        let (state, transfers) = build_ring_fixture(transaction_count);
+        bench_compute(&mut group, "ring", transaction_count, &state, &transfers);
     }
 
     group.finish();
@@ -125,6 +130,27 @@ fn build_shared_fixture(transaction_count: usize) -> (State, Transfers) {
         ));
     }
 
+    finalize_fixture(accounts, transactions)
+}
+
+fn build_ring_fixture(transaction_count: usize) -> (State, Transfers) {
+    let signers = (0..=transaction_count)
+        .map(|index| TestSigner::new(index as u64))
+        .collect::<Vec<_>>();
+    let mut accounts = State::with_capacity(signers.len());
+    for signer in &signers {
+        let public_key = TransactionPublicKey::ed25519(signer.public_key.clone());
+        accounts.insert(
+            AccountKey::from_public_key(&public_key),
+            Account {
+                balance: 1,
+                nonce: Nonce::default(),
+            },
+        );
+    }
+    let transactions = (0..transaction_count)
+        .map(|index| signers[index].sign(signers[index + 1].public_key.clone(), 1, 0))
+        .collect();
     finalize_fixture(accounts, transactions)
 }
 

@@ -8,15 +8,12 @@ use commonware_glue::stateful::db::{
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use commonware_storage::{
-    index::unordered::Index as UnorderedIndex,
-    journal::contiguous::fixed::Journal as FixedJournal,
+    index::unordered::Index,
+    journal::contiguous::fixed::Journal,
+    merkle::Location,
     mmr,
     qmdb::{
-        any::{
-            operation::Operation as AnyOperation,
-            unordered::{Update as UnorderedUpdate, fixed},
-            value::FixedEncoding,
-        },
+        any::unordered::fixed,
         keyless::fixed as keyless_fixed,
         sync::{CompactTarget, Target as AnyTarget},
     },
@@ -59,10 +56,10 @@ pub type DatabaseReaders<E, H, T, S> = (
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
-    UnorderedIndex<T, mmr::Location>,
+    Journal<E, fixed::Operation<mmr::Family, AccountKey, Account>>,
+    Index<T, Location<mmr::Family>>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    fixed::Update<AccountKey, Account>,
     S,
 >;
 
@@ -71,10 +68,10 @@ pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
 pub type StateStaged<E, H, T, S> = AnyStaged<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
-    UnorderedIndex<T, mmr::Location>,
+    Journal<E, fixed::Operation<mmr::Family, AccountKey, Account>>,
+    Index<T, Location<mmr::Family>>,
     H,
-    UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
+    fixed::Update<AccountKey, Account>,
     S,
 >;
 
@@ -207,8 +204,8 @@ mod tests {
             seed = seed.write(c, Some(account(300)));
             seed = seed.write(a, Some(account(100)));
             let seed = seed.merkleize().await.expect("seed state");
-            db.finalize(seed).await;
-            assert!(db.start_sync().await.durable().await);
+            db.apply(seed).await;
+            assert!(db.finalize().await.durable().await);
 
             // The same final key->value set must produce the same root
             // regardless of staged read order or update-entry order.

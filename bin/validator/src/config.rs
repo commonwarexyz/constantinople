@@ -129,6 +129,10 @@ pub struct ValidatorConfig {
     /// Rayon threads for parallel verification.
     #[serde(default = "default_rayon_threads")]
     pub rayon_threads: usize,
+    /// Dedicated Rayon threads for transaction ingress. When absent, ingress
+    /// shares the main Rayon pool for compatibility with existing configs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ingress_rayon_threads: Option<usize>,
     /// HTTP service port.
     pub http_port: u16,
     /// Prometheus metrics port.
@@ -147,7 +151,8 @@ pub struct ValidatorConfig {
     /// transaction history, journal).
     #[serde(default = "default_page_cache_bytes")]
     pub other_page_cache_bytes: usize,
-    /// Capacity of the decompressed public key cache.
+    /// Capacity of the fallback decompressed public key cache. Ed25519
+    /// verification uses backend-integrated batch decompression instead.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads. Only honored in
@@ -247,6 +252,9 @@ pub struct LoadedConfig {
     pub worker_threads: usize,
     /// Rayon threads for parallel verification.
     pub rayon_threads: usize,
+    /// Dedicated Rayon threads for transaction ingress. `None` shares the
+    /// main Rayon pool.
+    pub ingress_rayon_threads: Option<usize>,
     /// HTTP service bind address.
     pub http_listen: SocketAddr,
     /// Prometheus metrics bind address.
@@ -264,7 +272,7 @@ pub struct LoadedConfig {
     /// Capacity in bytes of the engine's non-state page cache (archives,
     /// transaction history, journal).
     pub other_page_cache_bytes: usize,
-    /// Capacity of the decompressed public key cache.
+    /// Capacity of the fallback decompressed public key cache.
     pub public_key_cache_size: usize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
     pub otel: Option<(String, f64)>,
@@ -391,6 +399,7 @@ fn decode_with_network(
         log_level: config.log_level,
         worker_threads: config.worker_threads,
         rayon_threads: config.rayon_threads,
+        ingress_rayon_threads: config.ingress_rayon_threads,
         http_listen,
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
@@ -677,6 +686,7 @@ mod tests {
                 log_level: "info".to_string(),
                 worker_threads: 2,
                 rayon_threads: 2,
+                ingress_rayon_threads: None,
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
@@ -715,6 +725,7 @@ mod tests {
                 log_level: "info".to_string(),
                 worker_threads: 2,
                 rayon_threads: 2,
+                ingress_rayon_threads: None,
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
@@ -755,6 +766,17 @@ mod tests {
     }
 
     #[test]
+    fn validator_config_shares_rayon_pool_when_ingress_size_is_absent() {
+        let cluster = Cluster::new(1, 0);
+        let config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        let parsed: ValidatorConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&config).expect("config should serialize"))
+                .expect("config should deserialize");
+
+        assert_eq!(parsed.ingress_rayon_threads, None);
+    }
+
+    #[test]
     fn local_config_resolves_bootstrapper_peers() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
@@ -769,6 +791,7 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.ingress_rayon_threads = Some(9);
         config.leader_delay_ms = commonware_utils::NZU64!(12);
         fs::write(
             &config_path,
@@ -801,6 +824,7 @@ mod tests {
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
+        assert_eq!(loaded.ingress_rayon_threads, Some(9));
         assert_eq!(loaded.leader_delay_ms.get(), 12);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(

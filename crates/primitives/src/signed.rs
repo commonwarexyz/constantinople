@@ -8,8 +8,8 @@
 //!   providing a one-step `seal_and_sign` method.
 
 use crate::{
-    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
-    TransactionSignature,
+    PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionPublicKey,
+    TransactionSignature, auth::BorrowedTransactionBatchVerifier,
 };
 use bytes::{Buf, BufMut, Bytes};
 use commonware_codec::{
@@ -18,6 +18,7 @@ use commonware_codec::{
 };
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
+use constantinople_curve25519::signing::VerifyingKey as Ed25519VerifyingKey;
 use rand::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
@@ -417,8 +418,7 @@ where
 
 /// Forces the lazy transaction to decode and its sender public key to parse, in
 /// parallel with its caller. Returns `false` if decode fails or the sender is
-/// not present. Decompression is deferred to the batch build, which looks each
-/// sender up in the shared cache exactly once.
+/// not present. Point decompression remains deferred to batch verification.
 fn signature_inputs_decode<H>(lazy: &LazySignedTransaction<H>) -> bool
 where
     H: Hasher,
@@ -452,11 +452,13 @@ where
         return true;
     }
 
-    // Resolve every sender's decompressed key up front: when the active
-    // account set exceeds the cache capacity, misses dominate and would
-    // otherwise pay their curve decompression serially in the queueing
-    // loop below.
-    let mut senders = Vec::with_capacity(transactions.len());
+    // Resolve every sender up front. Ed25519 remains encoded so the verifier can
+    // batch-decompress each block's unique keys with its SIMD backend. The
+    // shared cache remains valuable for secp256r1, whose decompression path is
+    // neither batched nor SIMD-accelerated.
+    let mut verifier = BorrowedTransactionBatchVerifier::new(transactions.len());
+    let mut cached_transactions = Vec::new();
+    let mut cached_senders = Vec::new();
     for lazy in transactions {
         let Some(transaction) = lazy.get() else {
             return false;
@@ -464,28 +466,39 @@ where
         let Some(sender) = transaction.value().sender() else {
             return false;
         };
-        senders.push(sender);
+        match sender {
+            TransactionPublicKey::Ed25519 { .. } => {
+                let bytes = &sender.as_ref()[1..1 + Ed25519VerifyingKey::SIZE];
+                let Ok(key) = Ed25519VerifyingKey::read(&mut &bytes[..]) else {
+                    return false;
+                };
+                if !verifier.add_ed25519(
+                    namespace,
+                    transaction.message_digest().as_ref(),
+                    key,
+                    transaction.signature(),
+                ) {
+                    return false;
+                }
+            }
+            TransactionPublicKey::Secp256r1 { .. } => {
+                cached_transactions.push(transaction);
+                cached_senders.push(sender);
+            }
+        }
     }
-    let Some(keys) = cache.decompress(&senders, signature_strategy) else {
-        return false;
-    };
-
-    // Queueing is cheap: transactions are preloaded and sender keys were
-    // resolved above. The expensive per-signature challenge hashing and the
-    // serial-vs-parallel split happen inside `verify`, which shards the batch
-    // across `signature_strategy` internally.
-    let mut verifier = TransactionBatchVerifier::new(transactions.len());
-    for (lazy, key) in transactions.iter().zip(&keys) {
-        let Some(transaction) = lazy.get() else {
+    if !cached_senders.is_empty() {
+        let Some(cached_keys) = cache.decompress(&cached_senders, signature_strategy) else {
             return false;
         };
-        if !verifier.add(
-            namespace,
-            transaction.message_digest().as_ref(),
-            key,
-            transaction.signature(),
-        ) {
-            return false;
+        for (transaction, key) in cached_transactions.into_iter().zip(cached_keys) {
+            if !verifier.add_decompressed(
+                transaction.message_digest().as_ref(),
+                key,
+                transaction.signature(),
+            ) {
+                return false;
+            }
         }
     }
     verifier.verify(rng, signature_strategy)
@@ -642,6 +655,58 @@ mod test {
                 signed.signature(),
             ));
             assert!(verifier.verify(&mut test_rng(), &Sequential));
+        });
+    }
+
+    #[test]
+    fn transaction_batch_batch_decompresses_ed25519_without_caching() {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(64));
+            let mut transactions = Vec::with_capacity(64);
+            let mut rng = test_rng();
+            for nonce in 0..64 {
+                let private_key = ed25519::PrivateKey::random(&mut rng);
+                let public_key = TransactionPublicKey::ed25519(private_key.public_key());
+                let signed = Transaction::new(
+                    public_key.clone(),
+                    public_key,
+                    NonZeroU64::new(1).expect("test value should be non-zero"),
+                    nonce,
+                )
+                .seal_and_sign(
+                    &private_key,
+                    NAMESPACE,
+                    &mut sha256::Sha256::default(),
+                );
+                transactions.push(LazySignedTransaction::new(signed));
+            }
+
+            assert!(super::verify_transaction_batch(
+                NAMESPACE,
+                &mut test_rng(),
+                &cache,
+                &transactions,
+                &Sequential,
+            ));
+            assert!(cache.is_empty());
+
+            assert!(super::verify_transaction_batch(
+                NAMESPACE,
+                &mut test_rng(),
+                &cache,
+                &transactions,
+                &Sequential,
+            ));
+            assert!(cache.is_empty());
+
+            assert!(!super::verify_transaction_batch(
+                b"wrong namespace",
+                &mut test_rng(),
+                &cache,
+                &transactions,
+                &Sequential,
+            ));
+            assert!(cache.is_empty());
         });
     }
 

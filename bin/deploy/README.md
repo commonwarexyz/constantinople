@@ -12,6 +12,7 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./local \
   --worker-threads 2 \
   --rayon-threads 2 \
+  --ingress-rayon-threads 1 \
   local \
   --base-port 3000 \
   --base-http-port 8080
@@ -67,9 +68,11 @@ The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
 
-Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
-batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
-With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
+`--spammer-accounts` configures the recurring account universe per submitter.
+`--spammer-batch-size` independently sets the transactions per submission and defaults to
+the account count. Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize
+each submission as `batch_size + rand(0..=floor(batch_size * J))`, where `J` must be in
+`0..=1`. With `J>0` blocks no longer pin to a flat submission size, which gives the indexer histogram (see
 [Local Deployment with Indexer + Explorer](#local-deployment-with-indexer--explorer)) a
 visibly varying throughput stream:
 
@@ -81,11 +84,17 @@ cargo run --bin constantinople-deploy -- generate \
 ```
 
 Add `--spammer-presigned-batches N` (default `16`) to keep more fully signed batches ready
-locally per submitter. The spammer still submits only one batch at a time to each target leader.
-`--spammer-accounts` configures accounts per submitter, so the generated total is
+locally per submitter. `--spammer-in-flight-batches N` controls the bounded concurrent
+submission window; it refills only after the oldest batch reaches a terminal outcome. Generation
+rejects account, batch-size, jitter, and window combinations that could outrun the account nonce
+bitmap under arbitrary request arrival order. The generated account total is
 `spammer_accounts * relayer_submitters`.
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
+
+Add `--ingress-rayon-threads N` to isolate transaction decoding and signature
+verification from the validator's main Rayon pool. If omitted, ingress shares
+`--rayon-threads`, preserving the behavior of existing configurations.
 
 You can also run the spammer manually against an existing local cluster:
 
@@ -120,11 +129,10 @@ This adds one extra secondary validator with a `relayer` section and starts it w
 the optional indexer secondary, follows consensus directly, and forwards normal user batches to
 the leaders of the next two views.
 
-When `--spammer` is set, the generated spammer command uses `--relayer-url`,
-`--relayer-submitters <validators>`, and `--relayer-targets <primary-keys>`.
-Each relayed submitter pins an exact primary validator target and requests
-single-leader routing, so concurrent streams feed different primaries without
-creating stale duplicate nonce copies.
+With rotating leaders, the generated spammer uses one pinned stream per validator so
+concurrent streams feed different primaries without creating stale duplicate nonce copies.
+With stable leaders, it uses one unpinned stream that follows the relayer's active leader,
+so the total recurring account set is exactly `spammer_accounts`.
 
 ### Local Deployment with Indexer + Explorer
 
@@ -219,6 +227,7 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
+  --ingress-rayon-threads 2 \
   remote \
   --http-cidr 0.0.0.0/0 \
   --regions us-east-1,us-west-2 \
@@ -259,6 +268,8 @@ deployer aws create --config config.yaml
 ```
 
 `--http-cidr` controls who can reach validator mempool HTTP ports in remote deployments.
+`--storage-class` selects the validator and secondary volume type and defaults to `gp3`;
+`--storage-iops` applies to provisioned-IOPS classes such as `io2` as well as tuned `gp3`.
 
 ### Remote Deployment with Spammer
 
@@ -270,6 +281,7 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
+  --ingress-rayon-threads 2 \
   --relayer \
   --spammer \
   --spammer-accounts 10 \
@@ -300,6 +312,7 @@ cargo run --bin constantinople-deploy -- generate \
   --output-dir ./deploy \
   --worker-threads 4 \
   --rayon-threads 4 \
+  --ingress-rayon-threads 2 \
   remote \
   --http-cidr 0.0.0.0/0 \
   --regions us-east-1,us-west-2 \
@@ -315,10 +328,9 @@ configured HTTP port, follows consensus directly, and forwards normal user batch
 of the next two views.
 
 When `--spammer` is used, `spammer.yaml` includes `relayer_url` pointing at
-the relayer secondary and `relayer_submitters: <validators>`. Each relayed
-submitter pins an exact primary validator target and requests single-leader
-routing, so concurrent streams feed different primaries without creating stale
-duplicate nonce copies.
+the relayer secondary. Rotating-leader deployments use one pinned submitter per
+validator; stable-leader deployments use one unpinned submitter that follows the
+active leader.
 
 Build the deployable binaries before creating the deployment. The aggregate
 targets are the usual deploy path and include the validator, spammer, and

@@ -2,6 +2,7 @@
 
 mod common;
 mod properties;
+mod size;
 
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
@@ -10,7 +11,8 @@ use crate::{
 };
 use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
-    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, validator_fixture,
+    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, read_account,
+    validator_fixture,
 };
 use commonware_consensus::{
     Heightable,
@@ -47,10 +49,13 @@ use commonware_utils::{
     NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
-use constantinople_primitives::PublicKeyCache;
+use constantinople_primitives::{
+    AccountKey, Nonce, PublicKeyCache, SignedTransaction, Transaction, TransactionPublicKey,
+};
 use properties::{
-    BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
-    RestartPreservesProcessedHeight, RestartRecoveryComplete, StateSyncReadyAtHeight,
+    BlockAgreementAtHeight, CommittedTransferAtBoundary, FinalizedHeightAtLeast,
+    FreshStartupStateReadable, LateJoinerStateSyncHandoff, RestartPreservesProcessedHeight,
+    RestartRecoveryComplete, RestartedAtHeight, StateSyncReadyAtHeight,
 };
 use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
 use tracing::{info, warn};
@@ -58,6 +63,36 @@ use tracing::{info, warn};
 const NUM_VALIDATORS: u32 = 4;
 const ENGINE_NAMESPACE: &[u8] = b"constantinople-engine-test";
 const MAX_PROBE_MESSAGE_SIZE: u32 = 12 * 1024 * 1024;
+const TRANSFER_VALUE: u64 = 7;
+const TRANSFER_NONCE: u64 = 2;
+const TRANSFER_ACCOUNT_NONCE: Nonce = Nonce::new(0, 0b10);
+
+#[derive(Clone)]
+struct TransferFixture {
+    transaction: SignedTransaction<TestHasher>,
+    sender: AccountKey,
+    recipient: AccountKey,
+}
+
+fn transfer_fixture() -> TransferFixture {
+    let sender = TestPrivateKey::from_seed(2_000_000);
+    let recipient = TestPrivateKey::from_seed(2_000_001);
+    let sender_public_key = TransactionPublicKey::ed25519(sender.public_key());
+    let recipient_public_key = TransactionPublicKey::ed25519(recipient.public_key());
+    let transaction = Transaction::new(
+        sender_public_key.clone(),
+        recipient_public_key.clone(),
+        NonZeroU64::new(TRANSFER_VALUE).expect("transfer value must be non-zero"),
+        TRANSFER_NONCE,
+    )
+    .seal_and_sign(&sender, TRANSACTION_NAMESPACE, &mut TestHasher::default());
+
+    TransferFixture {
+        transaction,
+        sender: AccountKey::from_public_key(&sender_public_key),
+        recipient: AccountKey::from_public_key(&recipient_public_key),
+    }
+}
 
 const fn default_link() -> Link {
     Link {
@@ -90,6 +125,7 @@ struct TestEngineDefinition {
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
     genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
     restart_barrier: Option<RestartBarrier>,
+    restart_starts: Option<Arc<Mutex<Vec<usize>>>>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
     elector: RoundRobin<TestHasher>,
@@ -97,6 +133,8 @@ struct TestEngineDefinition {
     certification_timeout: Duration,
     timeout_retry: Duration,
     skip_timeout: Duration,
+    transaction_batches: Vec<Vec<SignedTransaction<TestHasher>>>,
+    startup_read_key: AccountKey,
 }
 
 impl TestEngineDefinition {
@@ -112,6 +150,7 @@ impl TestEngineDefinition {
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
             genesis_commitments: Arc::new(Mutex::new(BTreeMap::new())),
             restart_barrier: None,
+            restart_starts: None,
             prunable_items_per_section: NZU64!(4_096),
             retained_marshal_blocks: 16,
             elector: RoundRobin::default(),
@@ -119,7 +158,17 @@ impl TestEngineDefinition {
             certification_timeout: Duration::from_secs(8),
             timeout_retry: Duration::from_secs(10),
             skip_timeout: Duration::from_secs(12),
+            transaction_batches: Vec::new(),
+            startup_read_key: AccountKey::from_public_key(&TransactionPublicKey::ed25519(
+                TestPrivateKey::from_seed(3_000_000).public_key(),
+            )),
         }
+    }
+
+    fn with_transfer(mut self, fixture: &TransferFixture) -> Self {
+        self.transaction_batches = vec![vec![fixture.transaction.clone()]];
+        self.startup_read_key = fixture.sender;
+        self
     }
 
     /// Extend the node set with `count` secondary (non-voting) participants.
@@ -156,6 +205,11 @@ impl TestEngineDefinition {
     fn with_restart_barrier(mut self, barrier: RestartBarrier) -> Self {
         self.restart_barrier = Some(barrier);
         self.prunable_items_per_section = NZU64!(1);
+        self
+    }
+
+    fn with_restart_tracking(mut self) -> Self {
+        self.restart_starts = Some(Arc::new(Mutex::new(vec![0; self.signers.len()])));
         self
     }
 
@@ -233,12 +287,21 @@ impl EngineDefinition for TestEngineDefinition {
         let certification_timeout = self.certification_timeout;
         let timeout_retry = self.timeout_retry;
         let skip_timeout = self.skip_timeout;
+        let transaction_batches = self.transaction_batches.clone();
+        let startup_read_key = self.startup_read_key;
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
         let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
-        let is_restart = restart_barrier
+        let barrier_restart = restart_barrier
             .as_ref()
             .is_some_and(RestartBarrier::begin_start);
+        let tracked_restart = self.restart_starts.as_ref().is_some_and(|starts| {
+            let mut starts = starts.lock();
+            let restarting = starts[index] > 0;
+            starts[index] += 1;
+            restarting
+        });
+        let is_restart = barrier_restart || tracked_restart;
         let genesis_leader = self.signers[0].public_key();
         let mut manager = oracle.manager();
         let blocker = oracle.control(public_key.clone());
@@ -318,8 +381,9 @@ impl EngineDefinition for TestEngineDefinition {
                 transaction_resolver,
             };
 
-            let input =
-                StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
+            let input = StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(
+                transaction_batches,
+            );
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
@@ -354,6 +418,7 @@ impl EngineDefinition for TestEngineDefinition {
                     input,
                     partition_prefix,
                     strategy: Sequential,
+                    verification_strategy: Sequential,
                     proposal_interval_ms: NZU64!(10),
                     public_key_cache: PublicKeyCache::new(
                         context.child("public_key_cache"),
@@ -398,7 +463,12 @@ impl EngineDefinition for TestEngineDefinition {
             let selected_sync_floor = engine.startup_sync_floor();
             let marshal = engine.marshal_mailbox();
             let restart_marshal = marshal.clone();
+            let databases = engine.subscribe_all_databases_detached();
             let engine_handle = engine.start(channels, Some(reporter));
+            let databases = databases.await;
+            let startup_account = read_account(&databases, &startup_read_key)
+                .await
+                .expect("state database must be readable immediately after startup handoff");
             let startup_sync_height = if let Some(finalization) = selected_sync_floor {
                 let block = marshal
                     .subscribe_by_commitment(
@@ -418,6 +488,9 @@ impl EngineDefinition for TestEngineDefinition {
                 .send(ValidatorState {
                     marshal,
                     startup_sync_height,
+                    databases,
+                    startup_account,
+                    restarted: is_restart,
                 })
                 .is_err()
             {
@@ -425,7 +498,7 @@ impl EngineDefinition for TestEngineDefinition {
                 return;
             }
 
-            if is_restart {
+            if barrier_restart {
                 let processed = restart_marshal
                     .get_processed_height()
                     .await
@@ -494,18 +567,38 @@ fn run_determinism(engine: TestEngineDefinition) {
     }
 }
 
+fn run_fresh_startup_read(engine: TestEngineDefinition) {
+    PlanBuilder::new(engine)
+        .link(default_link())
+        .seed(0)
+        .exit_condition(FinalizedHeightAtLeast::new(1))
+        .property(FreshStartupStateReadable)
+        .run()
+        .unwrap();
+}
+
 fn run_crash_restart(engine: TestEngineDefinition) {
+    let fixture = transfer_fixture();
+    let engine = engine.with_transfer(&fixture).with_restart_tracking();
     let validator = engine.participants()[0].clone();
 
     PlanBuilder::new(engine)
         .link(default_link())
-        .seeds(0..2)
+        .seed(0)
         .crash(Crash::Schedule(
             Schedule::new()
                 .at(Duration::from_millis(500), Action::Crash(validator.clone()))
                 .at(Duration::from_millis(1_000), Action::Restart(validator)),
         ))
-        .exit_condition(FinalizedHeightAtLeast::new(50))
+        .timeout(Duration::from_secs(30))
+        .exit_condition(RestartedAtHeight::new(50))
+        .property(CommittedTransferAtBoundary::after_restart(
+            50,
+            fixture.sender,
+            fixture.recipient,
+            TRANSFER_VALUE,
+            TRANSFER_ACCOUNT_NONCE,
+        ))
         .property(BlockAgreementAtHeight::new(50))
         .run()
         .unwrap();
@@ -513,7 +606,10 @@ fn run_crash_restart(engine: TestEngineDefinition) {
 
 fn run_restart_with_archived_finalizations() {
     let barrier = RestartBarrier::default();
-    let engine = TestEngineDefinition::new(NUM_VALIDATORS).with_restart_barrier(barrier.clone());
+    let fixture = transfer_fixture();
+    let engine = TestEngineDefinition::new(NUM_VALIDATORS)
+        .with_restart_barrier(barrier.clone())
+        .with_transfer(&fixture);
     let validator = engine.participants()[0].clone();
 
     PlanBuilder::new(engine)
@@ -529,6 +625,12 @@ fn run_restart_with_archived_finalizations() {
         ))
         .timeout(Duration::from_secs(30))
         .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
+        .property(CommittedTransferAtBoundary::after_archived_restart(
+            fixture.sender,
+            fixture.recipient,
+            TRANSFER_VALUE,
+            TRANSFER_ACCOUNT_NONCE,
+        ))
         .property(RestartPreservesProcessedHeight::new(barrier))
         .run()
         .unwrap();
@@ -554,6 +656,8 @@ fn run_delayed_start(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync(engine: TestEngineDefinition) {
+    let fixture = transfer_fixture();
+    let engine = engine.with_transfer(&fixture);
     let delayed = delay_first_until_view(&engine, 80);
     PlanBuilder::new(engine)
         .link(default_link())
@@ -561,6 +665,13 @@ fn run_state_sync(engine: TestEngineDefinition) {
         .seeds(0..2)
         .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
+        .property(CommittedTransferAtBoundary::after_state_sync(
+            150,
+            fixture.sender,
+            fixture.recipient,
+            TRANSFER_VALUE,
+            TRANSFER_ACCOUNT_NONCE,
+        ))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
         .run()
@@ -807,6 +918,12 @@ fn stable_leader_finalizes_and_commits() {
 #[test_traced("DEBUG")]
 fn deterministic_across_seeds() {
     run_determinism(TestEngineDefinition::new(NUM_VALIDATORS));
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn fresh_zero_suffix_startup_exposes_state_reader() {
+    run_fresh_startup_read(TestEngineDefinition::new(NUM_VALIDATORS));
 }
 
 #[test_group("slow")]

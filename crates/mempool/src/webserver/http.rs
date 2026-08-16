@@ -41,15 +41,13 @@ const MIN_U64_VARINT_BYTES: usize = 1;
 /// Maximum ingress batches admitted to CPU verification concurrently, shared
 /// across both POST endpoints.
 ///
-/// Ingress decode and verification run on the strategy's worker pool, which
-/// consensus execution and block verification also share. Admitting one
-/// batch at a time keeps a burst of relayer posts from queueing CPU bursts
-/// ahead of consensus-critical work; excess requests wait cheaply on the
-/// semaphore in the async layer instead. The owned permit is acquired in
-/// `verify_body` -- after the request body is buffered, before the pool job
-/// dispatches -- and moves into the job itself, so slow uploads and mailbox
-/// waits never hold it and a client disconnect cannot release it while the
-/// job runs.
+/// Ingress decode and verification run on the configured ingress strategy.
+/// Admitting one batch at a time bounds CPU queueing whether that strategy has
+/// a dedicated pool or shares the engine pool; excess requests wait cheaply
+/// in the async layer. The owned permit is acquired in `verify_body` -- after
+/// the request body is buffered, before the pool job dispatches -- and moves
+/// into the job itself, so slow uploads and mailbox waits never hold it and a
+/// client disconnect cannot release it while the job runs.
 pub(super) const MAX_CONCURRENT_INGRESS: usize = 1;
 
 /// Shared state for HTTP handlers.
@@ -60,7 +58,7 @@ where
     H: Hasher,
     St: Strategy,
 {
-    pub mailbox: Mailbox<C, P, H>,
+    pub mailbox: Mailbox<C, P, H, St>,
     pub namespace: &'static [u8],
     pub max_batch_bytes: usize,
     pub strategy: St,
@@ -413,13 +411,13 @@ mod tests {
     use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
     use std::sync::Arc;
-    use tokio::sync::mpsc;
     use tower::ServiceExt;
 
     fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
-        let (sender, _receiver) = mpsc::channel(1);
+        let (mailbox, _receiver) =
+            super::super::mailbox::Mailbox::channel(1, max_batch_bytes, Sequential);
         let state = Arc::new(AppState {
-            mailbox: super::super::mailbox::Mailbox::new(sender),
+            mailbox,
             namespace: b"mempool-http-test",
             max_batch_bytes,
             strategy: Sequential,

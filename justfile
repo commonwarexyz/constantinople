@@ -30,6 +30,10 @@ lint: fmt-check docs-check
 test *args='': docs-test
   cargo nextest run --workspace --all --all-features $@
 
+# Run the production-shaped state/history cadence benchmark.
+cadence:
+  cargo bench -p constantinople-application --bench cadence
+
 # Test the Rust documentation
 docs-test *args='--all':
     cargo test --doc --locked $@

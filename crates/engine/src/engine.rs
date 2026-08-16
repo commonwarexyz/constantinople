@@ -92,6 +92,11 @@ pub const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(2048);
 /// proposal horizon so reordered shards remain available when consensus later announces the
 /// proposal.
 pub const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
+/// Largest coded shard accepted by the validator.
+///
+/// A 2 MiB ceiling leaves straightforward headroom above the largest shard
+/// produced from the deployment's 24 MiB transaction budget with 50 participants.
+pub const MAXIMUM_SHARD_SIZE: usize = 2 * 1024 * 1024;
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_INIT_BUFFER: NonZero<usize> = NZUsize!(1 << 21);
@@ -187,6 +192,9 @@ where
     pub input: I,
     pub partition_prefix: String,
     pub strategy: St,
+    /// Strategy reserved for transaction signature verification in follower
+    /// block validation.
+    pub verification_strategy: St,
     /// Minimum milliseconds between local proposal starts.
     pub proposal_interval_ms: NonZero<u64>,
     pub public_key_cache: PublicKeyCache,
@@ -321,6 +329,16 @@ where
     ) -> impl std::future::Future<Output = StateSyncDb<E, H, St>> + Send + 'static {
         let mailbox = self.stateful_mailbox.clone();
         async move { mailbox.subscribe_databases().await.0 }
+    }
+
+    #[cfg(all(test, feature = "test-utils"))]
+    pub(crate) fn subscribe_all_databases_detached(
+        &self,
+    ) -> impl std::future::Future<Output = (StateSyncDb<E, H, St>, TransactionSyncDb<E, H, St>)>
+    + Send
+    + 'static {
+        let mailbox = self.stateful_mailbox.clone();
+        async move { mailbox.subscribe_databases().await }
     }
 
     /// Initializes the full engine stack.
@@ -495,7 +513,7 @@ where
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
                 shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
+                    maximum_shard_size: MAXIMUM_SHARD_SIZE,
                 },
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
@@ -508,6 +526,7 @@ where
         let application = Application::new(
             context.child("application"),
             config.strategy.clone(),
+            config.verification_strategy,
             config.proposal_interval_ms,
             config.genesis_leader.clone(),
             genesis_parent,
@@ -846,12 +865,37 @@ where
 
 #[cfg(test)]
 mod page_cache_tests {
-    use super::page_cache_page_sizes;
+    use super::{MAXIMUM_SHARD_SIZE, coding_config_for_participants, page_cache_page_sizes};
+    use commonware_codec::{EncodeSize, FixedSize};
+    use commonware_cryptography::sha256;
+    use constantinople_primitives::{Transaction, TransactionSignature};
 
     #[test]
     fn page_cache_uses_an_adjusted_storage_page() {
         let (physical, logical) = page_cache_page_sizes();
         assert_eq!(physical, 4_096);
         assert_eq!(logical, commonware_runtime::buffer::paged::page_size(4_096));
+    }
+
+    #[test]
+    fn shard_limit_covers_twenty_four_mib_transaction_budget() {
+        const TRANSACTION_BUDGET: usize = 24 * 1024 * 1024;
+        const MAX_BLOCK_HEADER_BYTES: usize = 306;
+        const DATA_SHARDS: usize = 17;
+
+        let minimum_transaction_bytes =
+            Transaction::<sha256::Digest>::SIZE + TransactionSignature::MIN_SIZE;
+        let transaction_count = TRANSACTION_BUDGET / minimum_transaction_bytes;
+        let coded_bytes = TRANSACTION_BUDGET
+            + transaction_count * minimum_transaction_bytes.encode_size()
+            + transaction_count.encode_size()
+            + MAX_BLOCK_HEADER_BYTES
+            + coding_config_for_participants(50).encode_size()
+            + u32::SIZE;
+        let shard_bytes = coded_bytes.div_ceil(DATA_SHARDS).next_multiple_of(2);
+
+        assert!(shard_bytes > 1024 * 1024);
+        assert!(shard_bytes <= MAXIMUM_SHARD_SIZE);
+        assert_eq!(MAXIMUM_SHARD_SIZE, 2 * 1024 * 1024);
     }
 }

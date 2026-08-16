@@ -31,7 +31,7 @@ use tracing_subscriber::fmt;
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-const STORAGE_CLASS: &str = "gp3";
+const DEFAULT_STORAGE_CLASS: &str = "gp3";
 const DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE: &str = "c8gb.4xlarge";
 const DEFAULT_CHAIN_INDEXER_STORAGE_SIZE: i32 = 500;
 const CHAIN_INDEXER_STORAGE_CLASS: &str = "io2";
@@ -123,7 +123,12 @@ pub(crate) struct GenerateArgs {
     /// Rayon threads per validator for parallel verification.
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
-    /// Capacity of each node's decompressed public key cache.
+    /// Dedicated Rayon threads for transaction ingress. When omitted,
+    /// ingress shares the validator's main Rayon pool.
+    #[arg(long)]
+    ingress_rayon_threads: Option<usize>,
+    /// Capacity of each node's fallback decompressed public key cache. Ed25519
+    /// verification uses backend-integrated batch decompression instead.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
     /// Maximum bytes proposed per block (also the maximum accepted
@@ -152,6 +157,9 @@ pub(crate) struct GenerateArgs {
     /// Number of spam accounts per relayer submitter.
     #[arg(long, default_value_t = 10)]
     spammer_accounts: u32,
+    /// Transactions per spammer submission. Defaults to `spammer_accounts`.
+    #[arg(long)]
+    spammer_batch_size: Option<u32>,
     /// Transfer value per spam transaction.
     #[arg(long, default_value_t = 1)]
     spammer_value: u64,
@@ -161,16 +169,15 @@ pub(crate) struct GenerateArgs {
     /// Number of rayon threads for spammer parallel signing.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
     spammer_rayon_threads: usize,
-    /// Fractional account-count jitter per spammer batch.
+    /// Fractional batch-size jitter per spammer submission.
     ///
-    /// `0.2` submits `spammer_accounts + rand(0..=floor(spammer_accounts * 0.2))`
-    /// txs per batch.
+    /// `0.2` adds up to 20% to the effective spammer batch size.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
-    /// Source-ordered batches held in flight by the stable-leader spammer stream.
+    /// Concurrent batches in the stable-leader spammer's ordered-refill window.
     #[arg(long, default_value_t = DEFAULT_STABLE_SPAMMER_IN_FLIGHT_BATCHES)]
     spammer_in_flight_batches: usize,
 
@@ -227,13 +234,14 @@ pub(crate) struct RemoteArgs {
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
-    /// Provisioned IOPS for validator gp3 volumes (EBS default when unset).
+    /// Validator EBS volume class.
+    #[arg(long, default_value = DEFAULT_STORAGE_CLASS)]
+    storage_class: String,
+    /// Provisioned IOPS for validator volumes (EBS default when unset).
     #[arg(long = "storage-iops")]
     storage_iops: Option<i32>,
     /// Provisioned throughput (MiB/s) for validator gp3 volumes (EBS default
-    /// when unset). Validators write ~4x the raw block per view; the gp3
-    /// default of 125 MiB/s throttles the cluster before either the NIC or
-    /// consensus does.
+    /// when unset). Other volume classes may not expose this setting.
     #[arg(long = "storage-throughput")]
     storage_throughput: Option<i32>,
     /// Instance type for the shared chain-indexer instance.
@@ -296,10 +304,16 @@ pub(crate) struct RemoteArgs {
 pub(crate) struct SpammerConfig {
     /// Number of spam accounts per submitter.
     pub accounts: u32,
+    /// Transactions per submitted batch.
+    #[serde(default)]
+    pub batch_size: u32,
     /// Transfer value per spam transaction.
     pub value: u64,
     /// Seed offset for spam account keys.
     pub seed_offset: u64,
+    /// Durable counter used to select a fresh account range after process restarts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_generation_path: Option<PathBuf>,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
@@ -313,7 +327,7 @@ pub(crate) struct SpammerConfig {
     /// Fully signed local batches to keep ready per submitter.
     #[serde(default = "default_spammer_presigned_batches")]
     pub presigned_batches: usize,
-    /// Source-ordered batches held in flight per submitter.
+    /// Concurrent batches in each submitter's ordered-refill window.
     #[serde(default = "default_spammer_in_flight_batches")]
     pub in_flight_batches: usize,
     /// Hex-encoded ed25519 public keys of primary (voting) validators.
@@ -323,9 +337,9 @@ pub(crate) struct SpammerConfig {
     /// the spammer target only primaries.
     #[serde(default)]
     pub primary_validators: Vec<String>,
-    /// Fractional account-count jitter per submitted batch.
+    /// Fractional batch-size jitter per submitted batch.
     ///
-    /// `0.2` submits `accounts + rand(0..=floor(accounts * 0.2))` txs per batch.
+    /// `0.2` adds up to 20% to `batch_size`.
     #[serde(default)]
     pub accounts_jitter: f64,
 }
@@ -409,6 +423,10 @@ pub(crate) struct ValidatorConfig {
     worker_threads: usize,
     /// Rayon threads for parallel verification.
     rayon_threads: usize,
+    /// Dedicated Rayon threads for transaction ingress. `None` shares the
+    /// validator's main Rayon pool for backward compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ingress_rayon_threads: Option<usize>,
     /// HTTP service port.
     http_port: u16,
     /// Prometheus metrics port.
@@ -422,7 +440,7 @@ pub(crate) struct ValidatorConfig {
     /// Capacity in bytes of the engine's non-state page cache (archives,
     /// transaction history, journal).
     other_page_cache_bytes: usize,
-    /// Capacity of the decompressed public key cache.
+    /// Capacity of the fallback decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,
     /// Trace sampling rate (0.0..=1.0); 0.0 disables uploads.
@@ -643,6 +661,46 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         (1..=MAX_SPAMMER_IN_FLIGHT_BATCHES).contains(&args.spammer_in_flight_batches),
         "--spammer-in-flight-batches must be between 1 and {MAX_SPAMMER_IN_FLIGHT_BATCHES}"
     );
+    assert!(
+        args.spammer_batch_size
+            .is_none_or(|batch_size| batch_size > 0),
+        "--spammer-batch-size must be greater than zero"
+    );
+    if args.spammer {
+        assert!(
+            args.spammer_accounts >= 2,
+            "--spammer-accounts must be at least 2"
+        );
+        let batch_size = args.spammer_batch_size.unwrap_or(args.spammer_accounts);
+        let active_nonces = max_active_nonces_per_account(
+            args.spammer_accounts,
+            batch_size,
+            args.spammer_accounts_jitter,
+            args.spammer_in_flight_batches,
+        );
+        let nonce_window = constantinople_primitives::NONCE_BITMAP_CAPACITY + 1;
+        assert!(
+            active_nonces <= nonce_window,
+            "spammer account nonce window permits {nonce_window} active values per account, but this configuration can expose {active_nonces}"
+        );
+    }
+    assert!(
+        args.ingress_rayon_threads.is_none_or(|threads| threads > 0),
+        "--ingress-rayon-threads must be greater than zero"
+    );
+}
+
+fn max_active_nonces_per_account(
+    accounts: u32,
+    batch_size: u32,
+    accounts_jitter: f64,
+    in_flight_batches: usize,
+) -> u64 {
+    let max_batch_size =
+        u64::from(batch_size) + (f64::from(batch_size) * accounts_jitter).floor() as u64;
+    let active_transactions =
+        max_batch_size * u64::try_from(in_flight_batches).expect("in-flight batch count fits u64");
+    active_transactions.div_ceil(u64::from(accounts))
 }
 
 pub(crate) fn generate_local_cluster_material(
@@ -788,9 +846,9 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
-        generate_local_cluster_material, simplex_verification_material_from_config,
-        write_simplex_verification_material,
+        Cli, Command, DEFAULT_PUBLIC_KEY_CACHE_SIZE, GenerateTarget,
+        SIMPLEX_VERIFICATION_MATERIAL_FILE, generate_local_cluster_material,
+        simplex_verification_material_from_config, write_simplex_verification_material,
     };
     use clap::Parser;
     use commonware_codec::Encode;
@@ -975,6 +1033,50 @@ mod tests {
             panic!("expected generate command");
         };
         assert_eq!(generate.leader_delay_ms.get(), 12);
+    }
+
+    #[test]
+    fn parses_ingress_rayon_threads() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--ingress-rayon-threads",
+            "9",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.ingress_rayon_threads, Some(9));
+    }
+
+    #[test]
+    fn stable_deploy_uses_default_public_key_cache_capacity() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(
+            generate.public_key_cache_size,
+            DEFAULT_PUBLIC_KEY_CACHE_SIZE
+        );
+        assert!(!include_str!("../../../deploy.sh").contains("--public-key-cache-size"));
     }
 
     #[test]

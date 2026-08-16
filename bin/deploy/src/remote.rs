@@ -1,15 +1,15 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
     CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
-    DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
+    DASHBOARD_FILE, DEFAULT_STORAGE_CLASS, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP,
+    GenerateArgs, INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
     METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
     QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
-    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
-    SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, SecondaryRole,
+    SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
+    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
+    indexer_enabled, secondary_roles, total_secondaries, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -19,6 +19,8 @@ use std::{
     path::{Path, PathBuf},
 };
 use tracing::info;
+
+const SPAMMER_SEED_GENERATION_PATH: &str = "/home/ubuntu/.constantinople-spammer-seed-generation";
 
 struct GeneratedValidator {
     public_key_hex: String,
@@ -164,6 +166,7 @@ fn build_validators(
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
+            ingress_rayon_threads: args.ingress_rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
             max_propose_bytes: args.max_propose_bytes,
@@ -222,6 +225,7 @@ fn build_secondaries(
             log_level: args.log_level.clone(),
             worker_threads: args.worker_threads,
             rayon_threads: args.rayon_threads,
+            ingress_rayon_threads: args.ingress_rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
             max_propose_bytes: args.max_propose_bytes,
@@ -278,8 +282,10 @@ fn remote_spammer_config(
     let stable_leader = args.leader_term_length.get() > 1;
     SpammerConfig {
         accounts: args.spammer_accounts,
+        batch_size: args.spammer_batch_size.unwrap_or(args.spammer_accounts),
         value: args.spammer_value,
         seed_offset: args.spammer_seed_offset,
+        seed_generation_path: Some(PathBuf::from(SPAMMER_SEED_GENERATION_PATH)),
         rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
@@ -354,7 +360,7 @@ fn build_deployer_config(
             availability_zone_group: None,
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: remote.storage_class.clone(),
             storage_iops: remote.storage_iops,
             storage_throughput: remote.storage_throughput,
             binary: validator_binary.to_string(),
@@ -380,7 +386,7 @@ fn build_deployer_config(
                 .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: remote.storage_class.clone(),
             storage_iops: remote.storage_iops,
             storage_throughput: remote.storage_throughput,
             binary: validator_binary.to_string(),
@@ -409,7 +415,7 @@ fn build_deployer_config(
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
             storage_iops: None,
             storage_throughput: None,
             binary: METADATA_INDEXER_BINARY_FILE.to_string(),
@@ -422,7 +428,7 @@ fn build_deployer_config(
             availability_zone_group: Some(EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
             storage_iops: None,
             storage_throughput: None,
             binary: QMDB_INDEXER_BINARY_FILE.to_string(),
@@ -441,7 +447,7 @@ fn build_deployer_config(
                 .clone()
                 .unwrap_or_else(|| remote.instance_type.clone()),
             storage_size: remote.spammer_storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
             storage_iops: None,
             storage_throughput: None,
             binary: SPAMMER_BINARY_FILE.to_string(),
@@ -455,7 +461,7 @@ fn build_deployer_config(
         monitoring: aws::MonitoringConfig {
             instance_type: remote.monitoring_instance_type.clone(),
             storage_size: remote.monitoring_storage_size,
-            storage_class: STORAGE_CLASS.to_string(),
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
             storage_iops: None,
             storage_throughput: None,
             dashboard: dashboard.to_string(),
@@ -503,16 +509,19 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        SPAMMER_SEED_GENERATION_PATH, build_deployer_config, build_secondaries, build_validators,
+        port_configs, remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
-        DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-        GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
-        RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, generate_local_cluster_material, total_secondaries,
-        validate_generate_args,
+        DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, DEFAULT_STORAGE_CLASS, EXOWARE_AVAILABILITY_ZONE_GROUP,
+        GenerateArgs, GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE,
+        QMDB_INDEXER_BINARY_FILE, RemoteArgs, StartupModeConfig, VALIDATOR_BINARY_FILE,
+        ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, generate_local_cluster_material,
+        total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -529,6 +538,7 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            ingress_rayon_threads: None,
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
@@ -537,6 +547,7 @@ mod tests {
             startup: StartupModeConfig::MarshalSync,
             spammer: false,
             spammer_accounts: 10,
+            spammer_batch_size: None,
             spammer_value: 1,
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
@@ -560,6 +571,7 @@ mod tests {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
             storage_size: 25,
+            storage_class: DEFAULT_STORAGE_CLASS.to_string(),
             storage_iops: None,
             storage_throughput: None,
             chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
@@ -603,6 +615,7 @@ mod tests {
                 log_level: "info".to_string(),
                 worker_threads: 2,
                 rayon_threads: 2,
+                ingress_rayon_threads: None,
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
@@ -637,7 +650,7 @@ mod tests {
         assert_eq!(config.instances[0].region, "us-east-1");
         assert_eq!(config.instances[1].region, "us-west-2");
         assert_eq!(config.instances[2].region, "us-east-1");
-        assert_eq!(config.instances[0].storage_class, STORAGE_CLASS);
+        assert_eq!(config.instances[0].storage_class, DEFAULT_STORAGE_CLASS);
         assert_eq!(config.instances[0].availability_zone_group, None);
         assert_eq!(config.instances[0].storage_iops, None);
         assert_eq!(config.instances[0].binary, VALIDATOR_BINARY_FILE);
@@ -647,6 +660,52 @@ mod tests {
         assert_eq!(config.ports[0].port, 9000);
         assert_eq!(config.ports[1].port, 8080);
         assert_eq!(config.ports[1].cidr, "198.51.100.4/32");
+    }
+
+    #[test]
+    fn remote_storage_class_applies_to_validators_and_secondaries() {
+        let mut args = generate_args();
+        args.relayer = true;
+        let mut remote = remote_args();
+        remote.storage_class = "io2".to_string();
+        remote.storage_iops = Some(8_000);
+        let validators = vec![validator(0), validator(1), validator(2)];
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
+
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &secondaries,
+        );
+
+        assert_eq!(config.instances.len(), 4);
+        assert!(config.instances.iter().all(
+            |instance| instance.storage_class == "io2" && instance.storage_iops == Some(8_000)
+        ));
+        assert_eq!(config.monitoring.storage_class, DEFAULT_STORAGE_CLASS);
+    }
+
+    #[test]
+    fn remote_validator_configs_propagate_ingress_pool_size() {
+        let mut args = generate_args();
+        args.relayer = true;
+        args.ingress_rayon_threads = Some(9);
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let validators = build_validators(&args, &remote, Path::new("/tmp"), &material);
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
+
+        assert!(
+            validators
+                .iter()
+                .chain(&secondaries)
+                .all(|validator| validator.config.ingress_rayon_threads == Some(9))
+        );
     }
 
     #[test]
@@ -696,6 +755,26 @@ mod tests {
     }
 
     #[test]
+    fn remote_spammer_rejects_a_window_that_outruns_account_nonces() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_accounts = 10;
+        args.spammer_batch_size = Some(11);
+        args.spammer_accounts_jitter = 1.0;
+        args.spammer_in_flight_batches = 32;
+
+        let panic = std::panic::catch_unwind(|| validate_generate_args(&args))
+            .expect_err("an unsafe account nonce window should fail validation");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+            .expect("panic should carry validation message");
+        assert!(message.contains("account nonce window"));
+    }
+
+    #[test]
     fn remote_spammer_config_uses_relayer() {
         let mut args = generate_args();
         args.spammer = true;
@@ -730,6 +809,28 @@ mod tests {
         assert_eq!(config.relayer_submitters, 1);
         assert_eq!(config.in_flight_batches, 16);
         assert!(config.primary_validators.is_empty());
+        assert_eq!(
+            config.seed_generation_path.as_deref(),
+            Some(Path::new(SPAMMER_SEED_GENERATION_PATH)),
+        );
+    }
+
+    #[test]
+    fn remote_spammer_separates_account_universe_from_batch_size() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.leader_term_length = std::num::NonZeroU32::new(1_000_000).unwrap();
+        args.spammer_accounts = 1_000_000;
+        args.spammer_batch_size = Some(50_000);
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let config = remote_spammer_config(&args, &remote, &material);
+
+        assert_eq!(config.accounts, 1_000_000);
+        assert_eq!(config.batch_size, 50_000);
+        assert_eq!(config.relayer_submitters, 1);
     }
 
     #[test]
