@@ -70,6 +70,13 @@ struct PhaseResult {
     max_backlog: usize,
 }
 
+struct AncestorPhaseResult {
+    ancestor_setup: Vec<Duration>,
+    leaf: Vec<BuildTiming>,
+    apply: Vec<Duration>,
+    sample_wall: Vec<Duration>,
+}
+
 #[derive(Clone, Copy)]
 struct BuildTiming {
     total: Duration,
@@ -455,6 +462,68 @@ async fn run_phase(
     }
 }
 
+async fn run_forced_ancestor_phase(
+    samples: usize,
+    depth: usize,
+    txs: usize,
+    builder: &mut Builder,
+    dbs: &Dbs,
+    strategy: &Rayon,
+) -> AncestorPhaseResult {
+    assert!(samples > 0, "phase must contain at least one sample");
+    assert!(depth > 0, "forced ancestor depth must be nonzero");
+    let mut ancestor_setup = Vec::with_capacity(samples);
+    let mut leaf = Vec::with_capacity(samples);
+    let mut apply = Vec::with_capacity(samples);
+    let mut sample_wall = Vec::with_capacity(samples);
+
+    for _ in 0..samples {
+        let sample_start = Instant::now();
+        let applied_height = builder.height;
+        let setup_start = Instant::now();
+        let mut retained = Vec::with_capacity(depth);
+        for offset in 0..depth {
+            let (height, ancestor, _) =
+                builder.build_next(txs, dbs, strategy, applied_height).await;
+            assert_eq!(
+                height,
+                applied_height + offset + 1,
+                "forced ancestors must remain consecutive",
+            );
+            retained.push(ancestor);
+        }
+        ancestor_setup.push(setup_start.elapsed());
+
+        let (height, tail, timing) = builder.build_next(txs, dbs, strategy, applied_height).await;
+        assert_eq!(height, applied_height + depth + 1);
+        assert_eq!(
+            tail.0.bounds().ancestors.len(),
+            depth,
+            "timed state leaf must resolve through the requested pending depth",
+        );
+        leaf.push(timing);
+
+        let apply_start = Instant::now();
+        dbs.apply(tail).await;
+        apply.push(apply_start.elapsed());
+        sample_wall.push(sample_start.elapsed());
+        drop(retained);
+
+        let committed = dbs.committed_targets().await;
+        assert!(
+            Dbs::matches_sync_targets(builder.tip(), &committed),
+            "applied state and history must match the forced-depth logical tip",
+        );
+    }
+
+    AncestorPhaseResult {
+        ancestor_setup,
+        leaf,
+        apply,
+        sample_wall,
+    }
+}
+
 fn main() {
     let accounts = env_or("CONSTANTINOPLE_BENCH_ACCOUNTS", DEFAULT_ACCOUNTS);
     let txs = env_or("CONSTANTINOPLE_BENCH_TXS", DEFAULT_TXS);
@@ -462,6 +531,7 @@ fn main() {
     let blocks = env_or("CONSTANTINOPLE_BENCH_BLOCKS", DEFAULT_BLOCKS);
     let required_tps = env_optional::<f64>("CONSTANTINOPLE_BENCH_REQUIRE_TPS");
     let verify_signatures = env_flag("CONSTANTINOPLE_BENCH_VERIFY_SIGNATURES");
+    let forced_ancestor_depth = env_optional::<usize>("CONSTANTINOPLE_BENCH_FORCED_ANCESTOR_DEPTH");
     let tokio_workers = env_or("CONSTANTINOPLE_BENCH_TOKIO_WORKERS", DEFAULT_TOKIO_WORKERS).max(1);
     let engine_workers = env_or(
         "CONSTANTINOPLE_BENCH_ENGINE_WORKERS",
@@ -491,6 +561,18 @@ fn main() {
     assert!(
         required_tps.is_none_or(|required| required.is_finite() && required > 0.0),
         "required TPS must be finite and positive",
+    );
+    assert!(
+        forced_ancestor_depth.is_none_or(|depth| depth > 0),
+        "forced ancestor depth must be positive",
+    );
+    assert!(
+        forced_ancestor_depth.is_none() || !verify_signatures,
+        "forced ancestor mode isolates the state/history path and does not verify signatures",
+    );
+    assert!(
+        forced_ancestor_depth.is_none() || required_tps.is_none(),
+        "forced ancestor mode reports path latency rather than a TPS acceptance rate",
     );
 
     tokio::Runner::new(tokio::Config::default().with_worker_threads(tokio_workers)).start(
@@ -553,6 +635,69 @@ fn main() {
             });
             if signature_fixture.is_some() {
                 eprintln!("prepared {txs} fresh-decode signature fixtures");
+            }
+
+            if let Some(depth) = forced_ancestor_depth {
+                let mut builder = Builder::new(keys);
+                let warmup_result = run_forced_ancestor_phase(
+                    warmup,
+                    depth,
+                    txs,
+                    &mut builder,
+                    &dbs,
+                    &strategy,
+                )
+                .await;
+                drop(warmup_result);
+                let measured = run_forced_ancestor_phase(
+                    blocks,
+                    depth,
+                    txs,
+                    &mut builder,
+                    &dbs,
+                    &strategy,
+                )
+                .await;
+
+                let sync_start = Instant::now();
+                assert!(
+                    dbs.finalize().await.durable().await,
+                    "forced-depth tail must become durable",
+                );
+                let sync_elapsed = sync_start.elapsed();
+                println!(
+                    "forced ancestor state path: {accounts} accounts, {txs} tx/block, depth {depth}, \
+                     {tokio_workers} tokio + {engine_workers} engine workers, {cache_pages} cache pages/db",
+                );
+                print_duration_stats(
+                    "ancestor setup",
+                    measured.ancestor_setup.iter().copied(),
+                );
+                print_duration_stats("leaf build", measured.leaf.iter().map(|timing| timing.total));
+                print_duration_stats(
+                    "leaf compute",
+                    measured.leaf.iter().map(|timing| timing.compute),
+                );
+                print_duration_stats(
+                    "leaf state merkleize",
+                    measured.leaf.iter().map(|timing| timing.state_merkleize),
+                );
+                print_duration_stats(
+                    "leaf history merkleize",
+                    measured.leaf.iter().map(|timing| timing.history_merkleize),
+                );
+                print_duration_stats("tail apply/flush", measured.apply.iter().copied());
+                print_duration_stats(
+                    "full sample wall",
+                    measured.sample_wall.iter().copied(),
+                );
+                println!("  prune-boundary durability: {sync_elapsed:?}");
+                for metric in context.encode().lines().filter(|line| {
+                    line.contains("rebuilds") || line.contains("folds")
+                }) {
+                    println!("  {metric}");
+                }
+                return;
             }
 
             let (jobs, mut job_receiver) = mpsc::unbounded_channel::<ApplyJob>();
