@@ -815,10 +815,12 @@ fn state_db_config<T>(
     partition_prefix: &str,
     page_cache: &CacheRef,
     strategy: T,
-) -> FixedConfig<EightCap, T>
+) -> FixedConfig<EightCap, T, NonZero<usize>>
 where
     T: Strategy,
 {
+    let init_concurrency = NonZero::new(strategy.manual().parallelism())
+        .expect("strategy parallelism must be non-zero");
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: format!("{partition_prefix}-state-journal"),
@@ -837,7 +839,7 @@ where
         translator: EightCap,
         init_cache_size: Some(STATE_INIT_CACHE_SIZE),
         init_buffer: STATE_INIT_BUFFER,
-        init_concurrency: (),
+        init_concurrency,
     }
 }
 

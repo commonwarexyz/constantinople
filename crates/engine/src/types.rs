@@ -23,13 +23,11 @@ use commonware_cryptography::{
     Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
 };
 use commonware_glue::stateful::{Stateful, db::Shared};
-use commonware_storage::{
-    mmr,
-    qmdb::{any::unordered::fixed, sync::Source},
-    translator::EightCap,
+use commonware_storage::{mmr, qmdb::sync::Source, translator::EightCap};
+use constantinople_application::consensus::{
+    Application, StateDb as ApplicationStateDb, TransactionHistoryDb,
 };
-use constantinople_application::consensus::{Application, TransactionHistoryDb};
-use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
+use constantinople_primitives::{Block, Header, Sealed};
 use std::marker::PhantomData;
 
 /// A finalized block with its seal (commitment-based).
@@ -97,7 +95,7 @@ where
 
 pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolomon<H>, H>;
 
-pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
+pub type StateDb<E, H, T> = ApplicationStateDb<E, H, EightCap, T>;
 
 pub type StateSyncDb<E, H, T> = Shared<StateDb<E, H, T>>;
 

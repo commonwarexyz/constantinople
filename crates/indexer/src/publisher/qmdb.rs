@@ -26,7 +26,7 @@ use commonware_storage::{
     },
 };
 use commonware_utils::sequence::FixedBytes;
-use constantinople_application::consensus::{Databases, StateDatabase};
+use constantinople_application::consensus::{Databases, StateDatabase, StateDb};
 use constantinople_engine::types::EngineBlock;
 use constantinople_primitives::{Account, AccountKey, BlockCfg};
 use exoware_qmdb::{
@@ -1424,15 +1424,7 @@ fn account_value_nonce_bitmap(account: &AccountValue) -> u64 {
 }
 
 async fn load_state_ops<E, H, S>(
-    state: &commonware_storage::qmdb::any::unordered::fixed::Db<
-        QmdbFamily,
-        E,
-        AccountKey,
-        Account,
-        H,
-        commonware_storage::translator::EightCap,
-        S,
-    >,
+    state: &StateDb<E, H, commonware_storage::translator::EightCap, S>,
     start: u64,
     end: u64,
 ) -> Result<Vec<StateOperation>, PublishError>
@@ -2128,7 +2120,7 @@ mod tests {
     fn test_state_db_config(
         page_cache: &CacheRef,
         prefix: &str,
-    ) -> FixedConfig<EightCap, Sequential> {
+    ) -> FixedConfig<EightCap, Sequential, StdNonZeroUsize> {
         FixedConfig {
             merkle_config: MmrConfig {
                 journal_partition: format!("{prefix}-state-journal"),
@@ -2146,6 +2138,8 @@ mod tests {
             },
             translator: EightCap,
             init_cache_size: Some(NZUsize!(1024)),
+            init_buffer: NZUsize!(1 << 21),
+            init_concurrency: NZUsize!(1),
         }
     }
 

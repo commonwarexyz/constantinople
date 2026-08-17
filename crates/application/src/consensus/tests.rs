@@ -35,7 +35,7 @@ use constantinople_primitives::{
 use std::{
     cmp::Ordering,
     future::Future,
-    num::NonZeroU64,
+    num::{NonZeroU64, NonZeroUsize},
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
@@ -187,7 +187,12 @@ fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     )
 }
 
-fn state_config<St: Strategy>(cache: CacheRef, strategy: St) -> FixedConfig<EightCap, St> {
+fn state_config<St: Strategy>(
+    cache: CacheRef,
+    strategy: St,
+) -> FixedConfig<EightCap, St, NonZeroUsize> {
+    let init_concurrency = NonZeroUsize::new(strategy.manual().parallelism())
+        .expect("strategy parallelism must be non-zero");
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: "verify-invalid-state-merkle-journal".into(),
@@ -206,7 +211,7 @@ fn state_config<St: Strategy>(cache: CacheRef, strategy: St) -> FixedConfig<Eigh
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1024)),
         init_buffer: NZUsize!(1 << 21),
-        init_concurrency: (),
+        init_concurrency,
     }
 }
 

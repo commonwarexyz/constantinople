@@ -8,7 +8,7 @@ use commonware_glue::stateful::db::{
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Storage};
 use commonware_storage::{
-    index::unordered::Index,
+    index::partitioned::unordered::Index as PartitionedUnorderedIndex,
     journal::contiguous::fixed::Journal,
     merkle::Location,
     mmr,
@@ -23,7 +23,10 @@ use constantinople_primitives::{Account, AccountKey};
 use std::future::Future;
 
 /// Backing database for application account state.
-pub type StateDb<E, H, T, S> = fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>;
+pub type StateDb<E, H, T, S> =
+    fixed::partitioned::p256::Db<mmr::Family, E, AccountKey, Account, H, T, S>;
+
+type StateIndex<T> = PartitionedUnorderedIndex<T, Location<mmr::Family>, 1>;
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> = Shared<StateDb<E, H, T, S>>;
@@ -57,7 +60,7 @@ pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
     Journal<E, fixed::Operation<mmr::Family, AccountKey, Account>>,
-    Index<T, Location<mmr::Family>>,
+    StateIndex<T>,
     H,
     fixed::Update<AccountKey, Account>,
     S,
@@ -69,7 +72,7 @@ pub type StateStaged<E, H, T, S> = AnyStaged<
     mmr::Family,
     E,
     Journal<E, fixed::Operation<mmr::Family, AccountKey, Account>>,
-    Index<T, Location<mmr::Family>>,
+    StateIndex<T>,
     H,
     fixed::Update<AccountKey, Account>,
     S,
@@ -157,7 +160,7 @@ mod tests {
     type Db = StateDatabase<deterministic::Context, Sha256, EightCap, Sequential>;
     const TEST_PAGE_CACHE_BYTES: usize = 64 * 1024;
 
-    fn config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
+    fn config(cache: CacheRef) -> FixedConfig<EightCap, Sequential, NonZeroUsize> {
         FixedConfig {
             merkle_config: MmrConfig {
                 journal_partition: "state-order-test-merkle-journal".into(),
@@ -176,7 +179,7 @@ mod tests {
             translator: EightCap,
             init_cache_size: Some(NZUsize!(1024)),
             init_buffer: NZUsize!(1 << 21),
-            init_concurrency: (),
+            init_concurrency: NZUsize!(1),
         }
     }
 

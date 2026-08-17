@@ -9,7 +9,7 @@
 
 use commonware_cryptography::{Hasher as _, Sha256};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::Rayon;
+use commonware_parallel::{Rayon, Strategy as _};
 use commonware_runtime::{
     Runner as _, Spawner as _, Supervisor as _,
     buffer::paged::{CacheRef, page_size as paged_page_size},
@@ -49,7 +49,9 @@ fn key(index: u64) -> AccountKey {
     AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
-fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayon> {
+fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayon, NonZeroUsize> {
+    let init_concurrency = NonZeroUsize::new(strategy.manual().parallelism())
+        .expect("strategy parallelism must be non-zero");
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: "finalize-state-journal".into(),
@@ -68,7 +70,7 @@ fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayo
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
         init_buffer: NZUsize!(1 << 21),
-        init_concurrency: (),
+        init_concurrency,
     }
 }
 

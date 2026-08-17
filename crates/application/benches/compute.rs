@@ -1,7 +1,7 @@
 use ahash::{AHashMap, AHashSet};
 use commonware_cryptography::{Hasher as _, Sha256, Signer as _, ed25519};
 use commonware_glue::stateful::db::{DatabaseSet, Merkleized as _, Unmerkleized as _};
-use commonware_parallel::Rayon;
+use commonware_parallel::{Rayon, Strategy as _};
 use commonware_runtime::{
     Runner as _,
     buffer::paged::{CacheRef, page_size as paged_page_size},
@@ -109,7 +109,9 @@ impl LoadPlan<'_> {
     }
 }
 
-fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
+fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon, NonZeroUsize> {
+    let init_concurrency = NonZeroUsize::new(strategy.manual().parallelism())
+        .expect("strategy parallelism must be non-zero");
     FixedConfig {
         merkle_config: MmrConfig {
             journal_partition: "bench-state-journal".into(),
@@ -128,7 +130,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
         init_buffer: NZUsize!(1 << 21),
-        init_concurrency: (),
+        init_concurrency,
     }
 }
 
