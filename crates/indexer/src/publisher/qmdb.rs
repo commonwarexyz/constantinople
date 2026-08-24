@@ -220,8 +220,6 @@ pub enum PublishError {
     Sql(#[from] datafusion::error::DataFusionError),
     #[error("failed to encode SQL metadata row: {0}")]
     SqlRow(String),
-    #[error("cannot initialize QMDB writer from {locations} operation locations")]
-    CheckpointTooLarge { locations: u64 },
     #[error("QMDB Store is empty but finalized block height {height} needs historical backfill")]
     StoreEmptyPastGenesis { height: u64 },
     #[error(
@@ -430,6 +428,13 @@ where
 
     /// Capture the finalized-block upload material that must survive local pruning.
     ///
+    /// Returns `None` when both writer cursors sit at or past the block's
+    /// operation ranges. Crash recovery redelivers finalized blocks whose
+    /// uploads already committed, and each block's operations live at
+    /// consensus-assigned locations, so a fully covered block has nothing left
+    /// to capture. Appending its operations again would place duplicates at
+    /// locations owned by later blocks.
+    ///
     /// This deliberately stops at the durable local payload boundary. Remote
     /// Store staging and upload are handled later by the queue consumer:
     ///
@@ -443,13 +448,18 @@ where
         transaction_writer_next: u64,
         block: &EngineBlock<H, P>,
         databases: &Databases<E, H, commonware_storage::translator::EightCap, S>,
-    ) -> Result<QueuedFinalizedUpload<H, P>, PublishError>
+    ) -> Result<Option<QueuedFinalizedUpload<H, P>>, PublishError>
     where
         Cx: Spawner,
         E: BufferPooler + Storage + Clock + Metrics + Send + Sync + 'static,
         S: Strategy + Send + Sync + 'static,
     {
         let state_end = block.header.state_range.end();
+        let transaction_end = block.header.transactions_range.end();
+        if state_writer_next >= state_end && transaction_writer_next >= transaction_end {
+            return Ok(None);
+        }
+
         validate_writer_range(state_writer_next, state_end, block.header.height)?;
         transaction_upload_end(transaction_writer_next, block)?;
         let block = Arc::new(block.clone());
@@ -464,13 +474,13 @@ where
             .await
             .expect("QMDB state queue task exited")?;
 
-        Ok(QueuedFinalizedUpload {
+        Ok(Some(QueuedFinalizedUpload {
             block,
             finalized_ts_micros: current_time_micros(),
             state_start: state_writer_next,
             transaction_start: transaction_writer_next,
             state_delta: Arc::new(state_delta),
-        })
+        }))
     }
 
     /// Queue a previously durable finalized-block payload for remote upload.
@@ -1267,18 +1277,7 @@ where
 {
     let reader =
         UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::new(client, ());
-    recover_writer_state::<H, _, _>(
-        reader.writer_location_watermark().await?,
-        |watermark, max| {
-            let reader = reader.clone();
-            async move {
-                reader
-                    .operation_range_checkpoint(watermark, Location::new(0), max)
-                    .await
-            }
-        },
-    )
-    .await
+    Ok(reader.recover_writer_state().await?)
 }
 
 async fn recover_transaction_writer_state<H>(
@@ -1289,47 +1288,7 @@ where
     H::Digest: Codec + Send + Sync,
 {
     let reader = KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::new(client, ());
-    recover_writer_state::<H, _, _>(
-        reader.writer_location_watermark().await?,
-        |watermark, max| {
-            let reader = reader.clone();
-            async move {
-                reader
-                    .operation_range_checkpoint(watermark, Location::new(0), max)
-                    .await
-            }
-        },
-    )
-    .await
-}
-
-async fn recover_writer_state<H, Fetch, Fut>(
-    watermark: Option<Location<QmdbFamily>>,
-    fetch: Fetch,
-) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
-where
-    H: Hasher,
-    Fetch: FnOnce(Location<QmdbFamily>, u32) -> Fut,
-    Fut: std::future::Future<
-            Output = Result<
-                exoware_qmdb::OperationRangeCheckpoint<H::Digest, QmdbFamily>,
-                QmdbError,
-            >,
-        >,
-{
-    let Some(watermark) = watermark else {
-        return Ok(WriterState::empty());
-    };
-    let locations = watermark
-        .as_u64()
-        .checked_add(1)
-        .ok_or(PublishError::CheckpointTooLarge {
-            locations: u64::MAX,
-        })?;
-    let max =
-        u32::try_from(locations).map_err(|_| PublishError::CheckpointTooLarge { locations })?;
-    let checkpoint = fetch(watermark, max).await?;
-    Ok(WriterState::from_checkpoint::<H>(&checkpoint)?)
+    Ok(reader.recover_writer_state().await?)
 }
 
 struct PendingTransactionUpload<H>
@@ -1993,6 +1952,69 @@ mod tests {
     }
 
     #[test]
+    fn publisher_recovers_writer_state_on_reconnect() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (handle, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("first_publisher"),
+                &url,
+                2,
+                crate::publisher::StoreCommitMetrics::new(&context.child("first_metrics")),
+            )
+            .await
+            .expect("publisher connects to empty store");
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload())
+                .await
+                .expect("first upload accepted");
+            assert!(completion.wait().await);
+            let locations = publisher.next_locations().await;
+            publisher.shutdown().await;
+
+            // Reconnecting rebuilds writer state from a bounded checkpoint
+            // ending at the published watermark rather than the full
+            // operation history.
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("second_publisher"),
+                &url,
+                2,
+                crate::publisher::StoreCommitMetrics::new(&context.child("second_metrics")),
+            )
+            .await
+            .expect("publisher reconnects to populated store");
+            assert_eq!(publisher.next_locations().await, locations);
+
+            // The recovered peaks must support further uploads end to end.
+            let (state_start, transaction_start) = locations;
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload_at(2, state_start, transaction_start))
+                .await
+                .expect("follow-up upload accepted");
+            assert!(completion.wait().await);
+            let locations = publisher.next_locations().await;
+            publisher.shutdown().await;
+
+            // A second reconnect recovers from a checkpoint range that starts
+            // past location zero.
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("third_publisher"),
+                &url,
+                2,
+                crate::publisher::StoreCommitMetrics::new(&context.child("third_metrics")),
+            )
+            .await
+            .expect("publisher reconnects after follow-up upload");
+            assert_eq!(publisher.next_locations().await, locations);
+
+            publisher.shutdown().await;
+            handle.abort();
+        });
+    }
+
+    #[test]
     fn queued_upload_roots_match_application_roots() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (handle, url) = exoware_simulator::open_temp()
@@ -2075,6 +2097,36 @@ mod tests {
             )
             .await;
             assert_transaction_append_locations_match_block(&client, &second).await;
+
+            // Crash recovery redelivers finalized blocks whose uploads already
+            // committed. A fully covered block must skip capture instead of
+            // failing writer validation.
+            let (state_next, transaction_next) = publisher.next_locations().await;
+            let redelivered = Publisher::build_queued_finalized_upload_with_context(
+                context.child("redelivered"),
+                state_next,
+                transaction_next,
+                &second,
+                &databases,
+            )
+            .await
+            .expect("redelivered block builds");
+            assert!(
+                redelivered.is_none(),
+                "fully uploaded block must skip capture"
+            );
+
+            // Cursors covering only one namespace indicate real divergence and
+            // must still fail loudly.
+            let partial = Publisher::build_queued_finalized_upload_with_context(
+                context.child("partial"),
+                state_next,
+                second.header.transactions_range.end() - 1,
+                &second,
+                &databases,
+            )
+            .await;
+            assert!(matches!(partial, Err(PublishError::WriterOutOfSync { .. })));
 
             publisher.shutdown().await;
             handle.abort();
@@ -2245,7 +2297,8 @@ mod tests {
             databases,
         )
         .await
-        .expect("queued upload builds");
+        .expect("queued upload builds")
+        .expect("block is not yet uploaded");
         let state_start = upload.state_start();
         let transaction_start = upload.transaction_start();
         let completion = publisher
@@ -2423,7 +2476,19 @@ mod tests {
     }
 
     fn test_queued_upload() -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {
+        test_queued_upload_at(1, 0, 0)
+    }
+
+    fn test_queued_upload_at(
+        height: u64,
+        state_start: u64,
+        transaction_start: u64,
+    ) -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {
         let leader = ed25519::PrivateKey::from_seed(7).public_key();
+
+        // An empty block body appends one transaction commit operation, plus
+        // the genesis commit when the store starts empty.
+        let transaction_ops = if transaction_start == 0 { 2 } else { 1 };
         let header = Header {
             context: SimplexContext {
                 round: Round::zero(),
@@ -2431,12 +2496,15 @@ mod tests {
                 parent: (View::zero(), Commitment::EMPTY),
             },
             parent: Sha256Digest::EMPTY,
-            height: 1,
+            height,
             timestamp: 0,
             state_root: Sha256Digest::EMPTY,
-            state_range: non_empty_range!(0, 2),
+            state_range: non_empty_range!(state_start, state_start + 2),
             transactions_root: Sha256Digest::EMPTY,
-            transactions_range: non_empty_range!(0, 2),
+            transactions_range: non_empty_range!(
+                transaction_start,
+                transaction_start + transaction_ops
+            ),
         };
         let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
             .seal(&mut Sha256::default());
@@ -2445,7 +2513,7 @@ mod tests {
             StateOperation::Update(UnorderedUpdate(
                 account_key,
                 encode_account(Account {
-                    balance: 1,
+                    balance: height,
                     nonce: Nonce::default(),
                 }),
             )),
@@ -2455,8 +2523,8 @@ mod tests {
         QueuedFinalizedUpload {
             block: Arc::new(block),
             finalized_ts_micros: 1_000,
-            state_start: 0,
-            transaction_start: 0,
+            state_start,
+            transaction_start,
             state_delta: Arc::new(state_delta),
         }
     }

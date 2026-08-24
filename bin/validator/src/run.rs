@@ -314,7 +314,16 @@ impl FinalizedUploadProducer {
             )
             .await
             {
-                Ok(upload) => upload,
+                Ok(Some(upload)) => upload,
+                Ok(None) => {
+                    info!(
+                        height = block.header.height,
+                        state_next = cursor.state_next,
+                        transaction_next = cursor.transaction_next,
+                        "finalized block already uploaded, skipping index capture"
+                    );
+                    return;
+                }
                 Err(PublishError::StoreEmptyPastGenesis { .. }) if cursor.state_next == 0 => {
                     let publisher = self.publisher.publisher().await;
                     let (state_next, transaction_next) = publisher.next_locations().await;

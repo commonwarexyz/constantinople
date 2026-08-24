@@ -2935,7 +2935,7 @@ dependencies = [
 [[package]]
 name = "exoware-qmdb"
 version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=563fc50f98b08a120450a7437f0224d590f1e194#563fc50f98b08a120450a7437f0224d590f1e194"
 dependencies = [
  "axum",
  "buffa",
@@ -2965,7 +2965,7 @@ dependencies = [
 [[package]]
 name = "exoware-sdk"
 version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=563fc50f98b08a120450a7437f0224d590f1e194#563fc50f98b08a120450a7437f0224d590f1e194"
 dependencies = [
  "anyhow",
  "base64",
@@ -2994,7 +2994,7 @@ dependencies = [
 [[package]]
 name = "exoware-server"
 version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=563fc50f98b08a120450a7437f0224d590f1e194#563fc50f98b08a120450a7437f0224d590f1e194"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -3011,7 +3011,7 @@ dependencies = [
 [[package]]
 name = "exoware-simplex"
 version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=563fc50f98b08a120450a7437f0224d590f1e194#563fc50f98b08a120450a7437f0224d590f1e194"
 dependencies = [
  "bytes",
  "clap",
@@ -3036,7 +3036,7 @@ dependencies = [
 [[package]]
 name = "exoware-simulator"
 version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=563fc50f98b08a120450a7437f0224d590f1e194#563fc50f98b08a120450a7437f0224d590f1e194"
 dependencies = [
  "axum",
  "buffa",
@@ -3060,7 +3060,7 @@ dependencies = [
 [[package]]
 name = "exoware-sql"
 version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=563fc50f98b08a120450a7437f0224d590f1e194#563fc50f98b08a120450a7437f0224d590f1e194"
 dependencies = [
  "async-trait",
  "axum",

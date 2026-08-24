@@ -100,13 +100,13 @@ prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
 
 [patch.crates-io]
-# All Exoware libraries must share one SDK crate instance because SDK types cross crate boundaries.
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "8150d0f2a9037875c06f5d833a9617169739bfe3" }
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "8150d0f2a9037875c06f5d833a9617169739bfe3" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "8150d0f2a9037875c06f5d833a9617169739bfe3" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "8150d0f2a9037875c06f5d833a9617169739bfe3" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "8150d0f2a9037875c06f5d833a9617169739bfe3" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "8150d0f2a9037875c06f5d833a9617169739bfe3" }
+# Keep all Exoware crates on one revision because SDK types cross crate boundaries.
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "563fc50f98b08a120450a7437f0224d590f1e194" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "563fc50f98b08a120450a7437f0224d590f1e194" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "563fc50f98b08a120450a7437f0224d590f1e194" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "563fc50f98b08a120450a7437f0224d590f1e194" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "563fc50f98b08a120450a7437f0224d590f1e194" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "563fc50f98b08a120450a7437f0224d590f1e194" }
 
 [profile.samply]
 inherits = "release"
