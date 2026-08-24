@@ -1,5 +1,5 @@
 pub use exoware_sdk::ClientBuildError as StoreClientBuildError;
-use exoware_sdk::{ClientError, StoreClient};
+use exoware_sdk::{BalancedHttp2Config, ClientError, StoreClient, StoreClientBuilder};
 
 /// Failure from the adapter's startup readiness check.
 #[derive(Debug, thiserror::Error)]
@@ -17,10 +17,24 @@ pub fn store_client(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<StoreClient, StoreClientBuildError> {
+    store_client_builder(url, api_key).build()
+}
+
+/// Gives uploads path diversity so one slow connection does not serialize the indexer.
+pub(crate) fn writer_store_client(
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<StoreClient, StoreClientBuildError> {
+    store_client_builder(url, api_key)
+        .balanced_http2_transport(BalancedHttp2Config::default())
+        .build()
+}
+
+fn store_client_builder(url: &str, api_key: Option<&str>) -> StoreClientBuilder {
     let builder = StoreClient::builder().url(url);
     match api_key {
-        Some(api_key) => builder.api_key(api_key).build(),
-        None => builder.build(),
+        Some(api_key) => builder.api_key(api_key),
+        None => builder,
     }
 }
 
@@ -35,7 +49,10 @@ pub async fn require_store_ready(client: &StoreClient) -> Result<(), StoreReadin
 
 #[cfg(test)]
 mod tests {
-    use super::{StoreClientBuildError, StoreReadinessError, require_store_ready, store_client};
+    use super::{
+        StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,
+        writer_store_client,
+    };
     use axum::{
         Router,
         extract::State,
@@ -162,6 +179,12 @@ mod tests {
             .expect_err("invalid key should fail");
 
         assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
+    }
+
+    #[tokio::test]
+    async fn writer_client_builds_in_runtime() {
+        writer_store_client("https://store.example.com", Some("write-key"))
+            .expect("writer client should build");
     }
 
     #[test]

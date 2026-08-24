@@ -7,7 +7,7 @@ use super::{
 use crate::{
     namespaces::{sql_meta_client, state_qmdb_client, transactions_qmdb_client},
     sql_schema::build_meta_schema,
-    store_client,
+    store::writer_store_client,
 };
 use bytes::{Buf as _, Bytes};
 use commonware_codec::{
@@ -517,7 +517,7 @@ where
         Cx: Spawner,
         S: Strategy,
     {
-        let commit_client = store_client(store_url, api_key)?;
+        let commit_client = writer_store_client(store_url, api_key)?;
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
         let sql_writer = build_meta_schema(sql_meta_client(&commit_client)?)

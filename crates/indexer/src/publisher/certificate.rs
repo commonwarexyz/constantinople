@@ -73,7 +73,7 @@ where
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
-        let store_client = crate::store_client(store_url, api_key)?;
+        let store_client = crate::store::writer_store_client(store_url, api_key)?;
         let client = SimplexClient::new(
             crate::namespaces::simplex_client(&store_client)
                 .expect("simplex namespace prefix must be valid"),
