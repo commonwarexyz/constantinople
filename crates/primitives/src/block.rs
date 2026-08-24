@@ -5,8 +5,13 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{LazySignedTransaction, Sealable, Sealed, SignedTransaction};
-use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
+use crate::{
+    LazySignedTransaction, Sealable, Sealed, SignedTransaction, Transaction, TransactionSignature,
+};
+use commonware_codec::{
+    Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
+    varint::MAX_U64_VARINT_SIZE,
+};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
@@ -45,6 +50,12 @@ where
     D: Digest,
     P: PublicKey,
 {
+    const MAX_ENCODED_SIZE: usize = 3 * MAX_U64_VARINT_SIZE
+        + <C as FixedSize>::SIZE
+        + <P as FixedSize>::SIZE
+        + 3 * <D as FixedSize>::SIZE
+        + 6 * u64::SIZE;
+
     /// Hashes the encoded header to produce a digest.
     pub fn hash_slow<H: Hasher<Digest = D>>(&self, hasher: &mut H) -> D {
         hasher.update(self.encode().as_ref());
@@ -229,6 +240,32 @@ where
     P: PublicKey,
     H: Hasher,
 {
+    /// Returns an upper bound on encoded block size for a transaction-byte budget.
+    pub fn maximum_encoded_size(max_transaction_bytes: usize) -> usize {
+        let minimum_transaction_size =
+            Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE;
+        let maximum_transactions = max_transaction_bytes / minimum_transaction_size;
+        let maximum_transaction_size =
+            Transaction::<H::Digest>::SIZE + TransactionSignature::MAX_SIZE;
+        let maximum_transaction_prefix_bytes = maximum_transaction_size.encode_size();
+
+        // Lazy transactions prefix each signed transaction with its encoded length.
+        let maximum_lazy_prefix_bytes = maximum_transactions
+            .checked_mul(maximum_transaction_prefix_bytes)
+            .expect("maximum transaction prefix size must fit in usize");
+        let maximum_body_bytes = if maximum_transactions == 0 {
+            0
+        } else {
+            max_transaction_bytes
+        };
+
+        Header::<C, H::Digest, P>::MAX_ENCODED_SIZE
+            .checked_add(maximum_transactions.encode_size())
+            .and_then(|size| size.checked_add(maximum_lazy_prefix_bytes))
+            .and_then(|size| size.checked_add(maximum_body_bytes))
+            .expect("maximum encoded block size must fit in usize")
+    }
+
     /// Creates a new block from already-decoded transactions.
     pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
@@ -452,6 +489,54 @@ mod tests {
         let mut buf = Vec::new();
         block.write(&mut buf);
         assert_eq!(buf.len(), expected);
+    }
+
+    #[test]
+    fn maximum_encoded_size_includes_block_framing() {
+        use commonware_consensus::types::coding::Commitment;
+
+        type ProductionBlock = Block<Commitment, ed25519::PublicKey, sha256::Sha256>;
+
+        let mut rng = StdRng::from_seed([11u8; 32]);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let public_key = crate::TransactionPublicKey::ed25519(signer.public_key());
+        let transaction = crate::Transaction::<sha256::Digest>::new(
+            public_key.clone(),
+            public_key,
+            core::num::NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(
+            &signer,
+            crate::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
+        let max_transaction_bytes = transaction.encode_size();
+        let header = Header {
+            context: Context {
+                round: Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
+                leader: signer.public_key(),
+                parent: (View::new(u64::MAX), Commitment::default()),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: u64::MAX,
+            timestamp: u64::MAX,
+            state_root: sha256::Digest::EMPTY,
+            state_range: non_empty_range!(u64::MAX - 1, u64::MAX),
+            transactions_root: sha256::Digest::EMPTY,
+            transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
+        };
+        let block = ProductionBlock::new(header, vec![transaction]);
+
+        assert_eq!(
+            block.encode_size(),
+            ProductionBlock::maximum_encoded_size(max_transaction_bytes)
+        );
+
+        assert_eq!(
+            ProductionBlock::maximum_encoded_size(16 * 1024 * 1024),
+            17_005_785
+        );
     }
 
     #[test]

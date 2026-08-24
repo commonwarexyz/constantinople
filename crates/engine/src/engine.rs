@@ -12,7 +12,8 @@
 //! optional local share.
 
 use crate::types::*;
-use commonware_coding::CodecConfig;
+use commonware_codec::FixedSize;
+use commonware_coding::{CodecConfig, Config as CodingConfig};
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
@@ -60,7 +61,7 @@ use constantinople_application::consensus::{
     Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{BlockCfg, PublicKeyCache};
+use constantinople_primitives::{Block, BlockCfg, PublicKeyCache};
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
@@ -85,6 +86,7 @@ pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
+const MINIMUM_HONEST_SHARDS: usize = 2;
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
@@ -175,6 +177,8 @@ where
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
     pub block_codec: BlockCfg,
+    /// Maximum total encoded transaction bytes in a proposed block.
+    pub max_block_transaction_bytes: usize,
     pub prunable_items_per_section: NonZero<u64>,
     /// Capacity in bytes of the state QMDB page cache.
     ///
@@ -467,8 +471,13 @@ where
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
+                // The f = 1 coding threshold produces the largest honest shard.
+                // Higher fault thresholds split the same block across more
+                // original shards.
                 shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
+                    maximum_shard_size: maximum_honest_shard_size::<H, C::PublicKey>(
+                        config.max_block_transaction_bytes,
+                    ),
                 },
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
@@ -654,6 +663,23 @@ where
     }
 }
 
+fn maximum_honest_shard_size<H, P>(max_transaction_bytes: usize) -> usize
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let max_block_size = Block::<Commitment, P, H>::maximum_encoded_size(max_transaction_bytes);
+
+    // The coding input contains the block and its coding config. Reed-Solomon
+    // adds a payload-length prefix and requires an even shard width.
+    let prefixed_size = max_block_size
+        .checked_add(CodingConfig::SIZE)
+        .and_then(|size| size.checked_add(u32::SIZE))
+        .expect("maximum coded block size must fit in usize");
+    let shard_size = prefixed_size.div_ceil(MINIMUM_HONEST_SHARDS);
+    shard_size + shard_size % 2
+}
+
 fn threshold_scheme<C, V>(
     namespace: &[u8],
     output: &Output<V, C::PublicKey>,
@@ -813,5 +839,93 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         commit_codec_config: (),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use commonware_codec::{Decode, Encode, EncodeSize};
+    use commonware_coding::ReedSolomon;
+    use commonware_consensus::{
+        marshal::coding::types::Shard,
+        simplex::types::Context,
+        types::{Epoch, Round, View},
+    };
+    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
+    use commonware_math::algebra::Random;
+    use commonware_parallel::Sequential;
+    use commonware_utils::{NZU16, non_empty_range};
+    use constantinople_primitives::{Sealable, Transaction, TransactionPublicKey};
+    use core::num::NonZeroU64;
+    use rand::{SeedableRng, rngs::StdRng};
+
+    #[test]
+    fn honest_shard_bound_uses_two_original_shards() {
+        assert_eq!(
+            maximum_honest_shard_size::<sha256::Sha256, ed25519::PublicKey>(16 * 1024 * 1024),
+            8_502_898
+        );
+    }
+
+    #[test]
+    fn honest_shard_bound_accepts_maximum_shard() {
+        type TestShard = Shard<ReedSolomon<sha256::Sha256>, sha256::Sha256>;
+
+        let mut rng = StdRng::from_seed([13u8; 32]);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let public_key = TransactionPublicKey::ed25519(signer.public_key());
+        let transaction = Transaction::<sha256::Digest>::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(
+            &signer,
+            constantinople_primitives::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
+        let max_transaction_bytes = transaction.encode_size();
+        let header = constantinople_primitives::Header {
+            context: Context {
+                round: Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
+                leader: signer.public_key(),
+                parent: (View::new(u64::MAX), Commitment::default()),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: u64::MAX,
+            timestamp: u64::MAX,
+            state_root: sha256::Digest::EMPTY,
+            state_range: non_empty_range!(u64::MAX - 1, u64::MAX),
+            transactions_root: sha256::Digest::EMPTY,
+            transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
+        };
+        let block = Block::new(header, vec![transaction]).seal(&mut sha256::Sha256::default());
+        let coding_config = CodingConfig {
+            minimum_shards: NZU16!(2),
+            extra_shards: NZU16!(2),
+        };
+        let coded = EngineCodedBlock::new(block, coding_config, &Sequential);
+        let encoded = coded
+            .shard(0)
+            .expect("coded block should contain shard zero")
+            .encode();
+        let maximum_shard_size =
+            maximum_honest_shard_size::<sha256::Sha256, ed25519::PublicKey>(max_transaction_bytes);
+
+        assert_eq!(maximum_shard_size, 232);
+        assert!(
+            TestShard::decode_cfg(encoded.clone(), &CodecConfig { maximum_shard_size },).is_ok()
+        );
+        assert!(
+            TestShard::decode_cfg(
+                encoded,
+                &CodecConfig {
+                    maximum_shard_size: maximum_shard_size - 1,
+                },
+            )
+            .is_err()
+        );
     }
 }

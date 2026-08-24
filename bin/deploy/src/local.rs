@@ -355,7 +355,9 @@ fn local_run_commands(
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
-            relayer_port, args.validators, targets,
+            relayer_port,
+            args.spammer_submitters.unwrap_or(args.validators as usize),
+            targets,
         );
 
         // Place the spammer's metrics port past the primary and secondary ranges
@@ -426,6 +428,7 @@ mod tests {
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
+            spammer_submitters: None,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(test_local_args()),
         }

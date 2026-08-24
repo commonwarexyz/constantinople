@@ -24,7 +24,7 @@ fmt-check:
 
 # Lint the workspace
 lint: fmt-check docs-check
-  cargo +nightly clippy --workspace --all --all-features --all-targets -- -D warnings
+  RUSTFLAGS="-Znext-solver=coherence" cargo +nightly clippy --workspace --all --all-features --all-targets -- -D warnings
 
 # Run Rust tests
 test *args='': docs-test

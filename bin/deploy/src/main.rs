@@ -158,6 +158,12 @@ pub(crate) struct GenerateArgs {
     /// txs per batch.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
+    /// Concurrent spammer submitters, each cycling its own account range with
+    /// one batch in flight (defaults to the validator count). Offered load is
+    /// roughly submitters x accounts per finalization round trip, so set this
+    /// explicitly to keep load constant when the validator count changes.
+    #[arg(long = "spammer-submitters")]
+    spammer_submitters: Option<usize>,
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
@@ -224,6 +230,12 @@ pub(crate) struct RemoteArgs {
     /// consensus does.
     #[arg(long = "storage-throughput")]
     storage_throughput: Option<i32>,
+    /// Absolute HTTP or HTTPS URL of an external exoware store that supports reads and writes.
+    /// The URL is used verbatim by every store consumer. Providing it replaces
+    /// the simulator-backed chain-indexer. No chain-indexer instance, binary,
+    /// config, or port rule is generated.
+    #[arg(long = "chain-indexer-url")]
+    chain_indexer_url: Option<String>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,
@@ -616,6 +628,11 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
+    assert!(args.validators >= 4, "--validators must be at least 4");
+    assert!(
+        args.spammer_submitters != Some(0),
+        "--spammer-submitters must be at least 1"
+    );
 }
 
 pub(crate) fn generate_local_cluster_material(
@@ -942,6 +959,27 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "--validators must be at least 4")]
+    fn rejects_validator_count_below_coding_minimum() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "3",
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
     }
 
     #[test]

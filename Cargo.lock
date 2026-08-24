@@ -1481,13 +1481,17 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tracing",
@@ -2931,8 +2935,7 @@ dependencies = [
 [[package]]
 name = "exoware-qmdb"
 version = "2026.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac764c476e980b5f535f930316e8888728f7554fae7578e318e097c87f6d5f88"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
 dependencies = [
  "axum",
  "buffa",
@@ -2962,8 +2965,7 @@ dependencies = [
 [[package]]
 name = "exoware-sdk"
 version = "2026.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "494af0d8515926c8ace9fe1fdb63981963d6a05b776ca45fa3027cb27e8a265d"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
 dependencies = [
  "anyhow",
  "base64",
@@ -2981,6 +2983,7 @@ dependencies = [
  "psl",
  "regex",
  "reqwest",
+ "rustls-platform-verifier",
  "serde",
  "thiserror",
  "tokio",
@@ -2991,8 +2994,7 @@ dependencies = [
 [[package]]
 name = "exoware-server"
 version = "2026.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "303ce3e340fcf8c6ea26dfbd5714884675299a0655ff2627f8cb3e7cfc1bc1ff"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -3009,8 +3011,7 @@ dependencies = [
 [[package]]
 name = "exoware-simplex"
 version = "2026.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c9b84e30aef4a827cc4ecc07fcf582a0987214e492098af947ef04e78120b622"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
 dependencies = [
  "bytes",
  "clap",
@@ -3035,13 +3036,13 @@ dependencies = [
 [[package]]
 name = "exoware-simulator"
 version = "2026.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31cebf2c3e8f9bff077341b9cc3556e7b91215938febdfe5eb7ee317306f999a"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
 dependencies = [
  "axum",
  "buffa",
  "bytes",
  "clap",
+ "commonware-codec",
  "exoware-sdk",
  "exoware-server",
  "mimalloc",
@@ -3059,8 +3060,7 @@ dependencies = [
 [[package]]
 name = "exoware-sql"
 version = "2026.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0a9c3cfa2c70cf722b5b261ccaf0bad52a8df6779c745669cdaf54dcbfd1907c"
+source = "git+https://github.com/exowarexyz/monorepo.git?rev=8150d0f2a9037875c06f5d833a9617169739bfe3#8150d0f2a9037875c06f5d833a9617169739bfe3"
 dependencies = [
  "async-trait",
  "axum",
@@ -5122,6 +5122,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
+ "log",
  "once_cell",
  "rustls-pki-types",
  "rustls-webpki",

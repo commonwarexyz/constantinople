@@ -88,20 +88,22 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     );
     if indexer_enabled(args) {
         info!(
-            chain_indexer_port = remote.chain_indexer_port,
+            store_url = %store_url(remote),
             metadata_indexer_port = remote.metadata_indexer_port,
             qmdb_indexer_port = remote.qmdb_indexer_port,
             "configured shared remote indexer services"
         );
     }
     let mut binaries = vec![output_dir.join(VALIDATOR_BINARY_FILE).display().to_string()];
-    if indexer_enabled(args) {
+    if local_chain_indexer(args, remote) {
         binaries.push(
             output_dir
                 .join(CHAIN_INDEXER_BINARY_FILE)
                 .display()
                 .to_string(),
         );
+    }
+    if indexer_enabled(args) {
         binaries.push(
             output_dir
                 .join(METADATA_INDEXER_BINARY_FILE)
@@ -227,8 +229,7 @@ fn build_secondaries(
             public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
-            indexer: matches!(role, SecondaryRole::Indexer)
-                .then(|| remote_indexer_config(remote.chain_indexer_port)),
+            indexer: matches!(role, SecondaryRole::Indexer).then(|| remote_indexer_config(remote)),
             relayer: matches!(role, SecondaryRole::Relayer)
                 .then(|| remote_relayer_config(remote, material)),
         };
@@ -246,9 +247,27 @@ fn build_secondaries(
     secondaries
 }
 
-fn remote_indexer_config(port: u16) -> IndexerConfig {
+// The store URL every consumer dials: the external store when one is supplied,
+// otherwise the deployer-provisioned chain-indexer host (whose name each binary
+// resolves to an IP via its hosts file). An external URL is used verbatim, so
+// it must be reachable from the instances' network.
+fn store_url(remote: &RemoteArgs) -> String {
+    remote
+        .chain_indexer_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port))
+}
+
+// Whether this deployment provisions its own chain-indexer host. An external
+// store replaces the instance and everything that exists only to serve it
+// (binary, config, port rule).
+const fn local_chain_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
+    indexer_enabled(args) && remote.chain_indexer_url.is_none()
+}
+
+fn remote_indexer_config(remote: &RemoteArgs) -> IndexerConfig {
     IndexerConfig {
-        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{port}"),
+        chain_indexer_url: store_url(remote),
         upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
 }
@@ -278,7 +297,7 @@ fn remote_spammer_config(
         rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
-        relayer_submitters: args.validators as usize,
+        relayer_submitters: args.spammer_submitters.unwrap_or(args.validators as usize),
         presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
@@ -292,7 +311,7 @@ fn relayer_url(args: &GenerateArgs, remote: &RemoteArgs, material: &ClusterMater
 }
 
 fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<ChainIndexerConfig> {
-    indexer_enabled(args).then(|| ChainIndexerConfig {
+    local_chain_indexer(args, remote).then(|| ChainIndexerConfig {
         port: remote.chain_indexer_port,
         data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
         db_parallelism: remote.chain_indexer_db_parallelism,
@@ -305,14 +324,14 @@ fn metadata_indexer_config(
 ) -> Option<MetadataIndexerConfig> {
     indexer_enabled(args).then(|| MetadataIndexerConfig {
         port: remote.metadata_indexer_port,
-        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+        chain_indexer_url: store_url(remote),
     })
 }
 
 fn qmdb_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<QmdbIndexerConfig> {
     indexer_enabled(args).then(|| QmdbIndexerConfig {
         port: remote.qmdb_indexer_port,
-        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+        chain_indexer_url: store_url(remote),
     })
 }
 
@@ -371,7 +390,7 @@ fn build_deployer_config(
         });
     }
 
-    if indexer_enabled {
+    if local_chain_indexer(args, remote) {
         instances.push(aws::InstanceConfig {
             name: CHAIN_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
@@ -385,6 +404,9 @@ fn build_deployer_config(
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
         });
+    }
+
+    if indexer_enabled {
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
@@ -443,23 +465,26 @@ fn build_deployer_config(
             dashboard: dashboard.to_string(),
         },
         instances,
-        ports: port_configs(remote, indexer_enabled),
+        ports: port_configs(args, remote),
     }
 }
 
-fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConfig> {
+fn port_configs(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<aws::PortConfig> {
     let mut ports = vec![aws::PortConfig {
         protocol: "tcp".to_string(),
         port: remote.listen_port,
         cidr: "0.0.0.0/0".to_string(),
     }];
 
-    if indexer_enabled {
+    if local_chain_indexer(args, remote) {
         ports.push(aws::PortConfig {
             protocol: "tcp".to_string(),
             port: remote.chain_indexer_port,
             cidr: "0.0.0.0/0".to_string(),
         });
+    }
+
+    if indexer_enabled(args) {
         ports.push(aws::PortConfig {
             protocol: "tcp".to_string(),
             port: remote.metadata_indexer_port,
@@ -521,6 +546,7 @@ mod tests {
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
+            spammer_submitters: None,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
@@ -541,6 +567,7 @@ mod tests {
             storage_size: 25,
             storage_iops: None,
             storage_throughput: None,
+            chain_indexer_url: None,
             chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
             chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
             chain_indexer_storage_iops: DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
@@ -692,6 +719,23 @@ mod tests {
         );
     }
 
+    // Offered load is submitters x accounts per round trip, so the flag exists
+    // to hold load constant when the validator count changes; the default keeps
+    // the pre-flag coupling.
+    #[test]
+    fn remote_spammer_submitters_flag_overrides_validator_count() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_submitters = Some(50);
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let relayed = remote_spammer_config(&args, &remote, &material);
+
+        assert_eq!(relayed.relayer_submitters, 50);
+    }
+
     #[test]
     fn remote_deployer_config_includes_secondaries_and_indexers() {
         let mut args = generate_args();
@@ -700,8 +744,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let mut indexer_secondary_config = validator(0).config;
-        indexer_secondary_config.indexer =
-            Some(super::remote_indexer_config(remote.chain_indexer_port));
+        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&remote));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),
@@ -735,13 +778,69 @@ mod tests {
 
     #[test]
     fn remote_ports_only_open_http_for_explicit_cidrs() {
+        let args = generate_args();
         let mut remote = remote_args();
         remote.http_cidrs.clear();
 
-        let ports = port_configs(&remote, false);
+        let ports = port_configs(&args, &remote);
 
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, 9000);
+    }
+
+    // An external store must replace the chain-indexer wholesale: every consumer
+    // dials the URL verbatim, and nothing that exists only to serve the local
+    // simulator (instance, config, port rule) is generated.
+    #[test]
+    fn remote_external_store_url_replaces_chain_indexer() {
+        let mut args = generate_args();
+        args.indexer = true;
+        args.relayer = true;
+        let mut remote = remote_args();
+        remote.chain_indexer_url = Some("https://store.example.xyz".to_string());
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let secondaries = build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
+        let indexer = secondaries[0]
+            .config
+            .indexer
+            .as_ref()
+            .expect("secondary should have indexer wiring");
+        assert_eq!(indexer.chain_indexer_url, "https://store.example.xyz");
+
+        assert!(
+            super::chain_indexer_config(&args, &remote).is_none(),
+            "no chain-indexer config should be generated for an external store"
+        );
+        let metadata = super::metadata_indexer_config(&args, &remote)
+            .expect("metadata indexer should still be generated");
+        assert_eq!(metadata.chain_indexer_url, "https://store.example.xyz");
+        let qmdb = super::qmdb_indexer_config(&args, &remote)
+            .expect("qmdb indexer should still be generated");
+        assert_eq!(qmdb.chain_indexer_url, "https://store.example.xyz");
+
+        let validators = vec![validator(0), validator(1), validator(2)];
+        let config = build_deployer_config(
+            &args,
+            &remote,
+            VALIDATOR_BINARY_FILE,
+            "dashboard.json",
+            &validators,
+            &secondaries,
+        );
+
+        // 3 primaries + 2 secondaries + metadata/qmdb indexers; no chain-indexer.
+        assert_eq!(config.instances.len(), 7);
+        assert!(
+            config.instances.iter().all(|i| i.name != "chain-indexer"),
+            "no chain-indexer instance should be provisioned for an external store"
+        );
+
+        let ports = port_configs(&args, &remote);
+        assert!(
+            ports.iter().all(|p| p.port != remote.chain_indexer_port),
+            "the chain-indexer port should not be opened for an external store"
+        );
     }
 
     #[test]
@@ -779,8 +878,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let mut indexer_secondary_config = validator(0).config;
-        indexer_secondary_config.indexer =
-            Some(super::remote_indexer_config(remote.chain_indexer_port));
+        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&remote));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),

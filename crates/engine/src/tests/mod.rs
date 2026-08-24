@@ -342,6 +342,7 @@ impl EngineDefinition for TestEngineDefinition {
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
                     block_codec: Default::default(),
+                    max_block_transaction_bytes: 16 * 1024 * 1024,
                     prunable_items_per_section,
                     probe: probe_mailbox.clone(),
                     simplex_observer: None,

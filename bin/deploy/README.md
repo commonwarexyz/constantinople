@@ -411,6 +411,16 @@ Topology and defaults:
 - `qmdb-indexer` listens on port `8092` by default.
 - Full indexer uploads are enabled on only the indexer secondary.
 
+### External store (no chain-indexer)
+
+Pass `--chain-indexer-url <url>` to point every store consumer (the indexer
+secondary, `metadata-indexer`, and `qmdb-indexer`) at an external exoware store
+that supports reads and writes instead of provisioning the simulator-backed
+`chain-indexer` host. The URL is used verbatim, so it must be reachable from
+the instances' network. HTTP and HTTPS URLs are supported. No `chain-indexer`
+instance, binary, config, or port rule is generated. The other
+`--chain-indexer-*` flags are ignored.
+
 QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
 writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
 mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
