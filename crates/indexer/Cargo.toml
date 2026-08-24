@@ -11,6 +11,9 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+chain-indexer = ["dep:exoware-simulator"]
+
 [dependencies]
 # Workspace
 constantinople-application.workspace = true
@@ -35,7 +38,7 @@ exoware-qmdb.workspace = true
 exoware-sdk.workspace = true
 exoware-server.workspace = true
 exoware-simplex.workspace = true
-exoware-simulator.workspace = true
+exoware-simulator = { workspace = true, optional = true }
 exoware-sql.workspace = true
 
 # Datafusion (re-exposed by exoware-sql; needed to declare column types).
@@ -47,6 +50,7 @@ axum.workspace = true
 bytes.workspace = true
 clap = { workspace = true, features = ["derive", "std"] }
 futures.workspace = true
+http-body.workspace = true
 mimalloc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_yaml.workspace = true
@@ -61,6 +65,7 @@ constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-coding.workspace = true
 commonware-glue.workspace = true
 commonware-math.workspace = true
+exoware-simulator.workspace = true
 rand.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true, features = ["util"] }
@@ -68,6 +73,7 @@ tower = { workspace = true, features = ["util"] }
 [[bin]]
 name = "chain-indexer"
 path = "src/main.rs"
+required-features = ["chain-indexer"]
 
 [[bin]]
 name = "metadata-indexer"

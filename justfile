@@ -12,7 +12,7 @@ default:
 
 # Build the workspace
 build *args='':
-  cargo build --workspace --all $@
+  cargo build --workspace --all-features $@
 
 # Fixes the formatting of the workspace
 fmt-fix:
@@ -26,9 +26,13 @@ fmt-check:
 lint: fmt-check docs-check
   RUSTFLAGS="-Znext-solver=coherence" cargo +nightly clippy --workspace --all --all-features --all-targets -- -D warnings
 
-# Run Rust tests
-test *args='': docs-test
+# Run all tests
+test *args='': docs-test deploy-script-test
   cargo nextest run --workspace --all --all-features $@
+
+# Test deployment argument and topology selection.
+deploy-script-test:
+  bash ./deploy.test.sh
 
 # Test the Rust documentation
 docs-test *args='--all':

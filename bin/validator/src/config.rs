@@ -15,7 +15,7 @@ use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
 use serde::Deserialize;
-use std::{net::SocketAddr, path::Path};
+use std::{fmt, net::SocketAddr, path::Path};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
@@ -63,16 +63,30 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
 /// The latest-finalized-height cursor that earlier versions of the
 /// indexer wrote to a separate `META` KV family now lives in
 /// `block_meta`; consumers query `MAX(height) FROM block_meta`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
     /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
+    /// API key used by the writer Store clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Caps concurrent uploads after byte admission.
     #[serde(default = "default_upload_max_in_flight", alias = "upload_buffer")]
     pub upload_max_in_flight: usize,
     /// Bounds estimated memory held across upload stages.
     #[serde(default = "default_upload_budget_bytes")]
     pub upload_budget_bytes: u64,
+}
+
+impl fmt::Debug for IndexerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexerConfig")
+            .field("chain_indexer_url", &self.chain_indexer_url)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("upload_max_in_flight", &self.upload_max_in_flight)
+            .field("upload_budget_bytes", &self.upload_budget_bytes)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -570,12 +584,31 @@ mod tests {
             "chain_indexer_url: http://chain-indexer:8090\nupload_buffer: 8\n",
         )
         .expect("legacy indexer config should parse");
+        assert_eq!(config.api_key, None);
         assert_eq!(config.upload_max_in_flight, 8);
         assert_eq!(config.upload_budget_bytes, default_upload_budget_bytes());
 
         let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
         assert!(encoded.contains("upload_max_in_flight: 8"));
+        assert!(!encoded.contains("api_key"));
         assert!(!encoded.contains("upload_buffer"));
+    }
+
+    #[test]
+    fn indexer_config_serializes_key_without_debugging_it() {
+        let config = IndexerConfig {
+            chain_indexer_url: "https://store.example.com".to_string(),
+            api_key: Some("writer-secret".to_string()),
+            upload_max_in_flight: default_upload_max_in_flight(),
+            upload_budget_bytes: default_upload_budget_bytes(),
+        };
+
+        let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
+        assert!(encoded.contains("api_key: writer-secret"));
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("writer-secret"));
+        assert!(debug.contains("api_key_configured: true"));
     }
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
@@ -1086,6 +1119,7 @@ hosts:
         );
         config.indexer = Some(IndexerConfig {
             chain_indexer_url: "http://chain-indexer:8090".to_string(),
+            api_key: Some("writer-key".to_string()),
             upload_max_in_flight: default_upload_max_in_flight(),
             upload_budget_bytes: default_upload_budget_bytes(),
         });
@@ -1124,6 +1158,7 @@ hosts:
             .indexer
             .expect("secondary should keep indexer config");
         assert_eq!(indexer.chain_indexer_url, "http://203.0.113.9:8090");
+        assert_eq!(indexer.api_key.as_deref(), Some("writer-key"));
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);

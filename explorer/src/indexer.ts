@@ -1,6 +1,6 @@
 // Streaming client for the constantinople indexer (SQL metadata path).
 //
-// Subscribes to the `block_meta` table over the `store.sql.v1.Service`
+// Subscribes to the `block_meta` table over the `sql.v1.Service`
 // `Subscribe` RPC. Each delivered SubscribeResponse frame carries the
 // rows from one atomic ingest batch, and at the indexer's "one flush per
 // finalized block" cadence that is exactly one row per finalized block.

@@ -1649,6 +1649,7 @@ dependencies = [
  "exoware-simulator",
  "exoware-sql",
  "futures",
+ "http-body",
  "mimalloc",
  "prometheus-client 0.24.1",
  "rand 0.10.2",

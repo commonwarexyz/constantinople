@@ -241,6 +241,7 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         chain_indexer_url: url,
+        api_key: None,
         upload_max_in_flight: INDEXER_UPLOAD_MAX_IN_FLIGHT,
         upload_budget_bytes: INDEXER_UPLOAD_BUDGET_BYTES,
     }
@@ -312,14 +313,14 @@ fn local_run_commands(
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
+            "cargo run --release -p constantinople-indexer --features chain-indexer --bin {} -- --port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             data_dir.display(),
             db_parallelism,
         ));
-        // `metadata-indexer`: exposes Constantinople's `block_meta` /
-        // `tx_meta` tables over `store.sql.v1.Service`. The explorer
+        // `metadata-indexer` exposes Constantinople's `block_meta` and
+        // `tx_meta` tables over `sql.v1.Service`. The explorer
         // subscribes to this service (not the raw store) for live block
         // metadata.
         commands.push(format!(
@@ -650,6 +651,7 @@ mod tests {
             .iter()
             .find(|c| c.contains("--bin chain-indexer"))
             .expect("chain-indexer command should be present");
+        assert!(indexer_cmd.contains("--features chain-indexer"));
         assert!(indexer_cmd.contains("--port 8090"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
     }
@@ -779,6 +781,7 @@ mod tests {
         assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
+        assert_eq!(indexer.api_key, None);
         assert!(
             secondaries[1].config.indexer.is_none(),
             "relayer secondary should not have indexer config"

@@ -7,6 +7,7 @@ use super::{
 use crate::{
     namespaces::{sql_meta_client, state_qmdb_client, transactions_qmdb_client},
     sql_schema::build_meta_schema,
+    store_client,
 };
 use bytes::{Buf as _, Bytes};
 use commonware_codec::{
@@ -336,6 +337,8 @@ where
 /// QMDB upload failure.
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
+    #[error("failed to configure Store client due to {0}")]
+    ClientBuild(#[from] crate::StoreClientBuildError),
     #[error("failed to configure QMDB Store prefix: {0}")]
     Prefix(#[from] exoware_sdk::StoreKeyPrefixError),
     #[error("QMDB writer error: {0}")]
@@ -482,13 +485,22 @@ where
     pub async fn connect<Cx>(
         context: Cx,
         store_url: &str,
+        api_key: Option<&str>,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
     {
-        Self::connect_with_strategy(context, store_url, buffer, commit_metrics, Sequential).await
+        Self::connect_with_strategy(
+            context,
+            store_url,
+            api_key,
+            buffer,
+            commit_metrics,
+            Sequential,
+        )
+        .await
     }
 
     /// Construct writers that use `strategy` for Merkle construction and recovery.
@@ -496,6 +508,7 @@ where
     pub async fn connect_with_strategy<Cx, S>(
         context: Cx,
         store_url: &str,
+        api_key: Option<&str>,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
         strategy: S,
@@ -504,7 +517,7 @@ where
         Cx: Spawner,
         S: Strategy,
     {
-        let commit_client = StoreClient::new(store_url);
+        let commit_client = store_client(store_url, api_key)?;
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
         let sql_writer = build_meta_schema(sql_meta_client(&commit_client)?)
@@ -2142,6 +2155,7 @@ mod tests {
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
                 &url,
+                None,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
             )
@@ -2156,6 +2170,49 @@ mod tests {
 
             publisher.shutdown().await;
             handle.abort();
+        });
+    }
+
+    #[test]
+    fn publisher_sends_configured_credentials() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::ObservedStore::open("writer-key")
+                .await
+                .expect("spawn observed Store");
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("qmdb_publisher"),
+                &store.url,
+                Some("writer-key"),
+                2,
+                crate::publisher::StoreCommitMetrics::new(&context),
+            )
+            .await
+            .expect("publisher connects");
+
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload())
+                .await
+                .expect("queued upload accepted");
+            completion.wait().await.expect("queued upload completes");
+
+            let requests = store.requests();
+            assert!(!requests.is_empty());
+            assert!(requests.iter().all(|request| request.authorized));
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.path.starts_with("/store.query.v1.Service/")),
+                "recovery should reach Store query. Observed RPCs were {requests:?}",
+            );
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.path.starts_with("/log.ingest.v1.Service/")),
+                "commits should reach Store ingest. Observed RPCs were {requests:?}",
+            );
+
+            publisher.shutdown().await;
+            store.shutdown().await;
         });
     }
 
@@ -2182,6 +2239,7 @@ mod tests {
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_with_strategy(
                 context.child("first_publisher"),
                 &url,
+                None,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context.child("first_metrics")),
                 strategy.clone(),
@@ -2202,6 +2260,7 @@ mod tests {
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_with_strategy(
                 context.child("second_publisher"),
                 &url,
+                None,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context.child("second_metrics")),
                 strategy.clone(),
@@ -2225,6 +2284,7 @@ mod tests {
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_with_strategy(
                 context.child("third_publisher"),
                 &url,
+                None,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context.child("third_metrics")),
                 strategy,
@@ -2249,6 +2309,7 @@ mod tests {
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_with_strategy(
                 context.child("qmdb_publisher"),
                 &url,
+                None,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
                 strategy,
@@ -2361,6 +2422,7 @@ mod tests {
             >::connect(
                 context.child("qmdb_publisher"),
                 &url,
+                None,
                 1,
                 crate::publisher::StoreCommitMetrics::new(&context),
             )

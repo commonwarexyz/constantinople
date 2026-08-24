@@ -122,6 +122,12 @@ async fn health() -> &'static str {
     "ok"
 }
 
+fn operational_routes() -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(health))
+}
+
 /// Port the deployer scrapes for binary metrics.
 const METRICS_PORT: u16 = 9090;
 /// Ingest latency buckets: 1ms to 60s.
@@ -237,8 +243,7 @@ async fn run(
     )?);
     let (registry, metrics) = ingest_metrics();
     let connect = connect_stack(AppState::new(engine));
-    let app = Router::new()
-        .route("/health", get(health))
+    let app = operational_routes()
         .fallback_service(connect)
         .layer(middleware::from_fn_with_state(metrics, track_ingest))
         .layer(CorsLayer::very_permissive());
@@ -285,13 +290,18 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, load_settings};
+    use super::{Cli, load_settings, operational_routes};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Request, StatusCode},
+    };
     use clap::Parser;
     use std::{
         fs,
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+    use tower::ServiceExt;
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -359,5 +369,26 @@ mod tests {
         );
 
         let _ = fs::remove_file(config_path);
+    }
+
+    #[tokio::test]
+    async fn operational_routes_report_managed_store_readiness() {
+        for path in ["/health", "/ready"] {
+            let response = operational_routes()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("operational request"),
+                )
+                .await
+                .expect("operational response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 16)
+                .await
+                .expect("operational body");
+            assert_eq!(&body[..], b"ok");
+        }
     }
 }

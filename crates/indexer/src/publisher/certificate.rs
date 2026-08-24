@@ -17,7 +17,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use exoware_sdk::{StoreClient, StoreWriteBatch};
+use exoware_sdk::StoreWriteBatch;
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::sync::Arc;
 use tokio::{
@@ -63,22 +63,24 @@ where
     /// Build a reporter and background uploader.
     pub fn connect(
         store_url: &str,
+        api_key: Option<&str>,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
-    ) -> (Self, JoinHandle<()>)
+    ) -> Result<(Self, JoinHandle<()>), crate::StoreClientBuildError>
     where
         H: Hasher + Send + Sync + 'static,
         P: PublicKey + Send + Sync + 'static,
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
+        let store_client = crate::store_client(store_url, api_key)?;
         let client = SimplexClient::new(
-            crate::namespaces::simplex_client(&StoreClient::new(store_url))
+            crate::namespaces::simplex_client(&store_client)
                 .expect("simplex namespace prefix must be valid"),
         );
         let (tx, rx) = mpsc::channel(buffer);
         let join = tokio::spawn(run_uploader::<H, P, S>(client, rx, commit_metrics));
-        (Self { tx }, join)
+        Ok((Self { tx }, join))
     }
 
     /// Queue a finalized block for digest-addressed block upload and later
@@ -506,9 +508,11 @@ mod tests {
                 .expect("spawn simulator");
             let (reporter, uploader) = TestReporter::connect(
                 &url,
+                None,
                 1,
                 super::super::StoreCommitMetrics::new(&context.child("metrics")),
-            );
+            )
+            .expect("reporter connects");
             let block = test_block();
             let digest = *block.seal();
 
@@ -519,8 +523,10 @@ mod tests {
             completion.wait().await.expect("block upload completes");
 
             let client = SimplexClient::new(
-                crate::namespaces::simplex_client(&StoreClient::new(&url))
-                    .expect("simplex namespace"),
+                crate::namespaces::simplex_client(
+                    &crate::store_client(&url, None).expect("Store client builds"),
+                )
+                .expect("simplex namespace"),
             );
             assert!(
                 client
@@ -537,13 +543,51 @@ mod tests {
     }
 
     #[test]
+    fn reporter_sends_configured_credentials() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::ObservedStore::open("writer-key")
+                .await
+                .expect("spawn observed Store");
+            let (reporter, uploader) = TestReporter::connect(
+                &store.url,
+                Some("writer-key"),
+                1,
+                super::super::StoreCommitMetrics::new(&context.child("metrics")),
+            )
+            .expect("reporter connects");
+
+            let completion = reporter
+                .publish_block(test_block())
+                .await
+                .expect("uploader accepts block");
+            completion.wait().await.expect("block upload completes");
+
+            let requests = store.requests();
+            assert!(!requests.is_empty());
+            assert!(requests.iter().all(|request| request.authorized));
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.path.starts_with("/log.ingest.v1.Service/")),
+                "Simplex upload should reach Store ingest. Observed RPCs were {requests:?}",
+            );
+
+            drop(reporter);
+            uploader.await.expect("uploader exits cleanly");
+            store.shutdown().await;
+        });
+    }
+
+    #[test]
     fn publish_block_reports_stopped_uploader() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (reporter, uploader) = TestReporter::connect(
                 "http://127.0.0.1:1",
+                None,
                 1,
                 super::super::StoreCommitMetrics::new(&context.child("metrics")),
-            );
+            )
+            .expect("reporter connects");
             uploader.abort();
             let _ = uploader.await;
 
@@ -559,9 +603,11 @@ mod tests {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (reporter, uploader) = TestReporter::connect(
                 "http://127.0.0.1:1",
+                None,
                 1,
                 super::super::StoreCommitMetrics::new(&context.child("metrics")),
-            );
+            )
+            .expect("reporter connects");
             let completion = reporter
                 .publish_block(test_block())
                 .await

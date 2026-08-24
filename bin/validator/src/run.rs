@@ -56,7 +56,7 @@ use constantinople_engine::{
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
-    CertificateReporter, Publisher,
+    CertificateReporter, Publisher, StoreClientBuildError,
     publisher::{
         StoreCommitMetrics,
         certificate::CertificateUploaderStopped,
@@ -374,6 +374,7 @@ struct IndexerHandle {
 struct LazyPublisher {
     context: RuntimeContext,
     store_url: String,
+    api_key: Option<String>,
     buffer: usize,
     commit_metrics: StoreCommitMetrics,
     strategy: Rayon,
@@ -381,13 +382,20 @@ struct LazyPublisher {
 }
 
 impl LazyPublisher {
-    fn new(context: RuntimeContext, store_url: String, buffer: usize, strategy: Rayon) -> Self {
+    fn new(
+        context: RuntimeContext,
+        store_url: String,
+        api_key: Option<String>,
+        buffer: usize,
+        strategy: Rayon,
+    ) -> Self {
         // Registered once here: `connect` is retried on failure and must not
         // re-register.
         let commit_metrics = StoreCommitMetrics::new(&context);
         Self {
             context,
             store_url,
+            api_key,
             buffer,
             commit_metrics,
             strategy,
@@ -404,6 +412,7 @@ impl LazyPublisher {
             match EnginePublisher::connect_with_strategy(
                 self.context.child("publisher"),
                 &self.store_url,
+                self.api_key.as_deref(),
                 self.buffer,
                 self.commit_metrics.clone(),
                 self.strategy.clone(),
@@ -900,10 +909,12 @@ async fn maybe_build_indexer(
     is_primary: bool,
     indexer: Option<IndexerConfig>,
     partition_prefix: &str,
-) -> Option<IndexerHandle> {
-    let cfg = indexer?;
+) -> Result<Option<IndexerHandle>, StoreClientBuildError> {
+    let Some(cfg) = indexer else {
+        return Ok(None);
+    };
     if is_primary {
-        return None;
+        return Ok(None);
     }
 
     let max_active_uploads = cfg
@@ -924,12 +935,14 @@ async fn maybe_build_indexer(
     );
     let (cert_reporter, cert_join) = EngineCertReporter::connect(
         &cfg.chain_indexer_url,
+        cfg.api_key.as_deref(),
         max_active_uploads,
         StoreCommitMetrics::new(&context.child("simplex_upload")),
-    );
+    )?;
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
         cfg.chain_indexer_url,
+        cfg.api_key,
         max_active_uploads,
         strategy,
     ));
@@ -988,11 +1001,11 @@ async fn maybe_build_indexer(
         max_active_uploads,
         budget,
     ));
-    Some(IndexerHandle {
+    Ok(Some(IndexerHandle {
         cert_reporter,
         finalized_producer,
         critical_task: Some(indexer_critical_task(cert_join, finalized_join)),
-    })
+    }))
 }
 
 fn indexer_finalized_hook(
@@ -1242,7 +1255,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             indexer,
             &indexer_partition_prefix,
         )
-        .await;
+        .await
+        .expect("failed to configure indexer Store client");
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
         let indexer_task = indexer_handle
             .as_mut()
@@ -1370,10 +1384,10 @@ mod tests {
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
         FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueReader, FinalizedQueueWriter,
         FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher, PendingQueuedUpload,
-        PublishError, StoreCommitMetrics, UploadBudget, decode_finalized_queue_entry,
-        default_mempool_drop_grace_blocks, indexer_critical_task, maybe_build_indexer,
-        recovered_finalized_upload_cursor, scan_finalized_queue_cursor, start_queued_upload,
-        wait_for_critical_task_exit, wait_for_finalized_uploads,
+        PublishError, StoreClientBuildError, StoreCommitMetrics, UploadBudget,
+        decode_finalized_queue_entry, default_mempool_drop_grace_blocks, indexer_critical_task,
+        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
+        start_queued_upload, wait_for_critical_task_exit, wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
     use commonware_codec::{Encode as _, FixedSize as _, Read as _, Write as _};
@@ -1529,6 +1543,7 @@ mod tests {
         runner.start(|context| async move {
             let indexer = IndexerConfig {
                 chain_indexer_url: "http://127.0.0.1:1".to_string(),
+                api_key: None,
                 upload_max_in_flight: 1,
                 upload_budget_bytes: super::FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
             };
@@ -1540,9 +1555,30 @@ mod tests {
             )
             .await
             .expect("publisher connection should not block startup")
+            .expect("indexer Store client should build")
             .expect("secondary should keep indexer wiring");
 
             assert!(handle.critical_task.is_some());
+        });
+    }
+
+    #[test]
+    fn invalid_indexer_api_key_fails_secondary_startup() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let indexer = IndexerConfig {
+                chain_indexer_url: "http://127.0.0.1:1".to_string(),
+                api_key: Some("invalid\nkey".to_string()),
+                upload_max_in_flight: 1,
+                upload_budget_bytes: FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+            };
+            let strategy = context.strategy(NZUsize!(2));
+
+            let error = maybe_build_indexer(context, strategy, false, Some(indexer), "test")
+                .await
+                .err()
+                .expect("invalid API key should fail startup");
+
+            assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
         });
     }
 
@@ -1725,15 +1761,18 @@ mod tests {
             let publisher = Arc::new(LazyPublisher::new(
                 context.child("publisher"),
                 url.clone(),
+                None,
                 2,
                 context.strategy(NZUsize!(2)),
             ));
             let engine_publisher = publisher.publisher().await;
             let (cert_reporter, cert_join) = EngineCertReporter::connect(
                 &url,
+                None,
                 2,
                 StoreCommitMetrics::new(&context.child("simplex_upload")),
-            );
+            )
+            .expect("reporter connects");
             let budget = UploadBudget::new(
                 &context.child("upload_budget"),
                 2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
