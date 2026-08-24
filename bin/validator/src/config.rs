@@ -25,8 +25,12 @@ pub(crate) const fn default_metrics_port() -> u16 {
     9090
 }
 
-pub(crate) const fn default_upload_buffer() -> usize {
+pub(crate) const fn default_upload_max_in_flight() -> usize {
     64
+}
+
+pub(crate) const fn default_upload_budget_bytes() -> u64 {
+    3 * 1024 * 1024 * 1024
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
@@ -63,9 +67,12 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
 pub struct IndexerConfig {
     /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
-    /// Number of blocks buffered before upload.
-    #[serde(default = "default_upload_buffer")]
-    pub upload_buffer: usize,
+    /// Caps concurrent uploads after byte admission.
+    #[serde(default = "default_upload_max_in_flight", alias = "upload_buffer")]
+    pub upload_max_in_flight: usize,
+    /// Bounds estimated memory held across upload stages.
+    #[serde(default = "default_upload_budget_bytes")]
+    pub upload_budget_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -532,8 +539,8 @@ mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
         default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        default_public_key_cache_size, default_upload_budget_bytes, default_upload_max_in_flight,
+        load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -556,6 +563,20 @@ mod tests {
     };
 
     static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn indexer_config_accepts_legacy_upload_buffer() {
+        let config: IndexerConfig = serde_yaml::from_str(
+            "chain_indexer_url: http://chain-indexer:8090\nupload_buffer: 8\n",
+        )
+        .expect("legacy indexer config should parse");
+        assert_eq!(config.upload_max_in_flight, 8);
+        assert_eq!(config.upload_budget_bytes, default_upload_budget_bytes());
+
+        let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
+        assert!(encoded.contains("upload_max_in_flight: 8"));
+        assert!(!encoded.contains("upload_buffer"));
+    }
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let unique = SystemTime::now()
@@ -1065,7 +1086,8 @@ hosts:
         );
         config.indexer = Some(IndexerConfig {
             chain_indexer_url: "http://chain-indexer:8090".to_string(),
-            upload_buffer: default_upload_buffer(),
+            upload_max_in_flight: default_upload_max_in_flight(),
+            upload_budget_bytes: default_upload_budget_bytes(),
         });
         fs::write(
             &config_path,

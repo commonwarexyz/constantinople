@@ -2,12 +2,12 @@ use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
     CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
     DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
-    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
-    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
-    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
-    SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
+    INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig,
+    METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig,
+    QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig,
+    RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE,
+    STORAGE_CLASS, SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
+    absolute_path, default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
     generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
     validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
@@ -268,7 +268,8 @@ const fn local_chain_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
 fn remote_indexer_config(remote: &RemoteArgs) -> IndexerConfig {
     IndexerConfig {
         chain_indexer_url: store_url(remote),
-        upload_buffer: INDEXER_UPLOAD_BUFFER,
+        upload_max_in_flight: INDEXER_UPLOAD_MAX_IN_FLIGHT,
+        upload_budget_bytes: INDEXER_UPLOAD_BUDGET_BYTES,
     }
 }
 
@@ -859,7 +860,8 @@ mod tests {
             .as_ref()
             .expect("secondary should have indexer wiring");
         assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
-        assert_eq!(indexer.upload_buffer, 64);
+        assert_eq!(indexer.upload_max_in_flight, 64);
+        assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         assert!(
             secondaries[1].config.indexer.is_none(),
             "relayer secondary should not have indexer wiring"

@@ -25,12 +25,12 @@ use commonware_glue::stateful::{
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
-use commonware_macros::boxed;
 use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    BufferPoolConfig, Quota, Runner as _, Strategizer as _, Supervisor as _,
+    BufferPoolConfig, Metrics, Quota, Runner as _, Strategizer as _, Supervisor as _,
     buffer::paged::CacheRef,
+    telemetry::metrics::{Counter, Gauge, MetricsExt as _},
     tokio::{
         Context as RuntimeContext,
         telemetry::{self, Logs},
@@ -57,7 +57,10 @@ use constantinople_indexer::{
     CertificateReporter, Publisher,
     publisher::{
         StoreCommitMetrics,
-        qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
+        certificate::CertificateUploaderStopped,
+        qmdb::{
+            PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg, StoredFinalizedUpload,
+        },
     },
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
@@ -71,7 +74,7 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    sync::Mutex,
+    sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     task::{JoinHandle, JoinSet},
 };
 use tracing::{info, warn};
@@ -94,6 +97,8 @@ const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
 const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
+const FINALIZED_UPLOAD_AMPLIFICATION: u64 = 8;
+const FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES: u64 = 64 * 1024;
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 
@@ -146,9 +151,188 @@ type EngineCertReporter =
 type EnginePublisher = Publisher<Sha256, PublicKey>;
 type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
-type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
-type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
+type EngineStoredUpload = StoredFinalizedUpload<Sha256, PublicKey>;
+type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineStoredUpload>;
+type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineStoredUpload>;
 type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
+type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Clone)]
+struct UploadBudgetMetrics {
+    _configured_bytes: Gauge,
+    reserved_bytes: Gauge,
+    waiting_bytes: Gauge,
+    admitted: Gauge,
+    admission_blocked: Counter,
+    oversized: Counter,
+}
+
+impl UploadBudgetMetrics {
+    fn new(context: &impl Metrics, configured_bytes: u64) -> Self {
+        let configured = context.gauge(
+            "configured_bytes",
+            "Configured finalized upload memory budget in bytes",
+        );
+        configured.set(metric_bytes(configured_bytes));
+        Self {
+            _configured_bytes: configured,
+            reserved_bytes: context.gauge(
+                "reserved_bytes",
+                "Estimated finalized upload bytes currently reserved",
+            ),
+            waiting_bytes: context.gauge(
+                "waiting_bytes",
+                "Estimated bytes for the finalized upload waiting for admission",
+            ),
+            admitted: context.gauge("admitted", "Finalized uploads currently admitted"),
+            admission_blocked: context.counter(
+                "admission_blocked",
+                "Finalized uploads blocked by the byte budget",
+            ),
+            oversized: context.counter(
+                "oversized",
+                "Finalized uploads admitted exclusively above the byte budget",
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct UploadBudget {
+    permits: Arc<Semaphore>,
+    total_units: u32,
+    metrics: UploadBudgetMetrics,
+}
+
+impl UploadBudget {
+    fn new(context: &impl Metrics, configured_bytes: u64) -> Self {
+        assert!(
+            configured_bytes > 0,
+            "finalized upload budget must be greater than zero"
+        );
+        let total_units = configured_bytes.div_ceil(FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES);
+        let total_units =
+            u32::try_from(total_units).expect("finalized upload budget exceeds semaphore capacity");
+        let total_units_usize = usize::try_from(total_units)
+            .expect("finalized upload budget does not fit this platform");
+        Self {
+            permits: Arc::new(Semaphore::new(total_units_usize)),
+            total_units,
+            metrics: UploadBudgetMetrics::new(context, configured_bytes),
+        }
+    }
+
+    fn charge(&self, encoded_len: usize) -> UploadCharge {
+        let encoded_bytes = u64::try_from(encoded_len).unwrap_or(u64::MAX);
+        let estimated_bytes = encoded_bytes.saturating_mul(FINALIZED_UPLOAD_AMPLIFICATION);
+        let estimated_units = estimated_bytes
+            .div_ceil(FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES)
+            .max(1);
+        let oversized = estimated_units > u64::from(self.total_units);
+        let permit_units = if oversized {
+            self.total_units
+        } else {
+            u32::try_from(estimated_units).expect("admission charge exceeds semaphore capacity")
+        };
+        UploadCharge {
+            estimated_bytes,
+            permit_units,
+            oversized,
+        }
+    }
+
+    fn try_reserve(&self, charge: UploadCharge) -> Option<UploadReservation> {
+        match self
+            .permits
+            .clone()
+            .try_acquire_many_owned(charge.permit_units)
+        {
+            Ok(permit) => Some(self.finish_reservation(charge, permit)),
+            Err(TryAcquireError::NoPermits) => None,
+            Err(TryAcquireError::Closed) => panic!("finalized upload budget closed"),
+        }
+    }
+
+    async fn reserve(&self, charge: UploadCharge) -> UploadReservation {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_many_owned(charge.permit_units)
+            .await
+            .expect("finalized upload budget closed");
+        self.finish_reservation(charge, permit)
+    }
+
+    fn finish_reservation(
+        &self,
+        charge: UploadCharge,
+        permit: OwnedSemaphorePermit,
+    ) -> UploadReservation {
+        let estimated_bytes = metric_bytes(charge.estimated_bytes);
+        self.metrics.reserved_bytes.inc_by(estimated_bytes);
+        self.metrics.admitted.inc();
+        if charge.oversized {
+            self.metrics.oversized.inc();
+        }
+        UploadReservation {
+            _permit: permit,
+            metrics: self.metrics.clone(),
+            estimated_bytes,
+        }
+    }
+
+    fn mark_waiting(&self, charge: UploadCharge) {
+        self.metrics
+            .waiting_bytes
+            .set(metric_bytes(charge.estimated_bytes));
+        self.metrics.admission_blocked.inc();
+    }
+
+    fn clear_waiting(&self) {
+        self.metrics.waiting_bytes.set(0);
+    }
+}
+
+#[derive(Clone, Copy)]
+struct UploadCharge {
+    estimated_bytes: u64,
+    permit_units: u32,
+    oversized: bool,
+}
+
+struct UploadReservation {
+    _permit: OwnedSemaphorePermit,
+    metrics: UploadBudgetMetrics,
+    estimated_bytes: i64,
+}
+
+impl Drop for UploadReservation {
+    fn drop(&mut self) {
+        self.metrics.reserved_bytes.dec_by(self.estimated_bytes);
+        self.metrics.admitted.dec();
+    }
+}
+
+struct PendingQueuedUpload {
+    position: u64,
+    upload: EngineStoredUpload,
+    charge: UploadCharge,
+}
+
+impl PendingQueuedUpload {
+    fn new(position: u64, upload: EngineStoredUpload, budget: &UploadBudget) -> Self {
+        let charge = budget.charge(upload.encoded_len());
+        Self {
+            position,
+            upload,
+            charge,
+        }
+    }
+}
+
+fn metric_bytes(bytes: u64) -> i64 {
+    i64::try_from(bytes).unwrap_or(i64::MAX)
+}
 
 #[derive(Clone)]
 enum SimplexObserver {
@@ -172,8 +356,7 @@ struct IndexerHandle {
     cert_reporter: EngineCertReporter,
     publisher: Arc<LazyPublisher>,
     finalized_producer: FinalizedUploadProducer,
-    /// Kept alive so the uploader tasks are not aborted while the validator runs.
-    _uploaders: Vec<JoinHandle<()>>,
+    critical_task: Option<CriticalTask>,
 }
 
 /// Connects the indexer publisher only when finalized data is ready to upload.
@@ -227,6 +410,17 @@ impl LazyPublisher {
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
             }
+        }
+    }
+
+    #[cfg(test)]
+    async fn shutdown(&self) {
+        let publisher = self.publisher.lock().await.take();
+        if let Some(publisher) = publisher {
+            Arc::try_unwrap(publisher)
+                .expect("test owns the last publisher reference")
+                .shutdown()
+                .await;
         }
     }
 }
@@ -354,7 +548,7 @@ impl FinalizedUploadProducer {
                 }
             };
             let next = FinalizedUploadCursor::from_upload(&upload);
-            match self.writer.enqueue(upload).await {
+            match self.writer.enqueue(upload.into()).await {
                 Ok(position) => {
                     persist_finalized_cursor(&self.metadata, next).await;
                     *cursor = next;
@@ -407,12 +601,17 @@ async fn persist_finalized_cursor(
 
 async fn scan_finalized_queue_cursor(
     reader: &mut FinalizedQueueReader,
+    budget: &UploadBudget,
 ) -> Option<FinalizedUploadCursor> {
     let mut cursor = None;
     loop {
         match reader.try_recv().await {
-            Ok(Some((_position, upload))) => {
+            Ok(Some((position, upload))) => {
+                let charge = budget.charge(upload.encoded_len());
+                let reservation = budget.reserve(charge).await;
+                let upload = decode_finalized_queue_entry(position, upload);
                 cursor = Some(FinalizedUploadCursor::from_upload(&upload));
+                drop(reservation);
             }
             Ok(None) => {
                 reader.reset().await;
@@ -431,50 +630,77 @@ async fn run_finalized_upload_consumer(
     writer: FinalizedQueueWriter,
     mut reader: FinalizedQueueReader,
     max_active: usize,
+    budget: UploadBudget,
 ) {
     let mut active = JoinSet::new();
+    let mut waiting = None;
     let mut reader_closed = false;
     let max_active = max_active.max(1);
 
     loop {
-        while active.len() < max_active {
+        while waiting.is_none() && active.len() < max_active {
             let item = match reader.try_recv().await {
                 Ok(item) => item,
                 Err(error) => {
                     warn!(error = %error, "failed to read finalized index queue, retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
+                    break;
                 }
             };
             let Some((position, upload)) = item else {
                 break;
             };
-            start_queued_upload(
+            let pending = PendingQueuedUpload::new(position, upload, &budget);
+            if let Err(pending) = try_admit_queued_upload(
                 &mut active,
                 publisher.clone(),
                 cert_reporter.clone(),
-                position,
-                upload,
+                &budget,
+                pending,
             )
-            .await;
+            .await
+            {
+                waiting = Some(pending);
+            }
         }
 
-        if reader_closed && active.is_empty() {
+        if reader_closed && active.is_empty() && waiting.is_none() {
             break;
         }
 
+        let waiting_charge = waiting.as_ref().map(|pending| pending.charge);
         tokio::select! {
-            item = reader.recv(), if !reader_closed && active.len() < max_active => {
+            reservation = async {
+                budget
+                    .reserve(waiting_charge.expect("waiting upload has an admission charge"))
+                    .await
+            }, if waiting_charge.is_some() && active.len() < max_active => {
+                budget.clear_waiting();
+                let pending = waiting.take().expect("waiting upload exists");
+                start_queued_upload(
+                    &mut active,
+                    publisher.clone(),
+                    cert_reporter.clone(),
+                    pending,
+                    reservation,
+                )
+                .await;
+            }
+            item = reader.recv(), if !reader_closed && waiting.is_none() && active.len() < max_active => {
                 match item {
                     Ok(Some((position, upload))) => {
-                        start_queued_upload(
+                        let pending = PendingQueuedUpload::new(position, upload, &budget);
+                        if let Err(pending) = try_admit_queued_upload(
                             &mut active,
                             publisher.clone(),
                             cert_reporter.clone(),
-                            position,
-                            upload,
+                            &budget,
+                            pending,
                         )
-                        .await;
+                        .await
+                        {
+                            waiting = Some(pending);
+                        }
                     }
                     Ok(None) => reader_closed = true,
                     Err(error) => {
@@ -484,17 +710,33 @@ async fn run_finalized_upload_consumer(
                 }
             }
             completed = active.join_next(), if !active.is_empty() => {
-                let (position, height) = completed
+                let (position, height, reservation) = completed
                     .expect("active upload set is not empty")
                     .expect("finalized index upload task panicked");
                 ack_finalized_queue_entry(&reader, &writer, position, height).await;
+                drop(reservation);
             }
         }
 
-        if reader_closed && active.is_empty() {
+        if reader_closed && active.is_empty() && waiting.is_none() {
             break;
         }
     }
+}
+
+async fn try_admit_queued_upload(
+    active: &mut JoinSet<(u64, u64, UploadReservation)>,
+    publisher: Arc<LazyPublisher>,
+    cert_reporter: EngineCertReporter,
+    budget: &UploadBudget,
+    pending: PendingQueuedUpload,
+) -> Result<(), PendingQueuedUpload> {
+    let Some(reservation) = budget.try_reserve(pending.charge) else {
+        budget.mark_waiting(pending.charge);
+        return Err(pending);
+    };
+    start_queued_upload(active, publisher, cert_reporter, pending, reservation).await;
+    Ok(())
 }
 
 async fn ack_finalized_queue_entry(
@@ -533,47 +775,85 @@ async fn ack_finalized_queue_entry(
     }
 }
 
-#[boxed]
 async fn start_queued_upload(
-    active: &mut JoinSet<(u64, u64)>,
+    active: &mut JoinSet<(u64, u64, UploadReservation)>,
     publisher: Arc<LazyPublisher>,
     cert_reporter: EngineCertReporter,
-    position: u64,
-    upload: EngineQueuedUpload,
+    pending: PendingQueuedUpload,
+    reservation: UploadReservation,
 ) {
+    let position = pending.position;
+    let upload = decode_finalized_queue_entry(position, pending.upload);
     let height = upload.height();
-    let completion = loop {
-        let engine_publisher = publisher.publisher().await;
-        match engine_publisher
-            .enqueue_queued_finalized(upload.clone())
-            .await
-        {
-            Ok(completion) => break completion,
-            Err(error) => {
-                warn!(
-                    height,
-                    position,
-                    error = %error,
-                    "failed to start finalized index upload, retrying",
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    };
+    let block = upload.block();
+
+    // QMDB admission advances strict cursors and must follow durable queue order.
+    // Persistence waits can run concurrently after the cursor reservation succeeds.
+    let engine_publisher = publisher.publisher().await;
+    let completion = engine_publisher
+        .enqueue_queued_finalized(upload)
+        .await
+        .unwrap_or_else(|error| {
+            panic!("failed to start finalized index upload at height {height}. {error}")
+        });
 
     active.spawn(async move {
-        if completion.wait().await {
-            cert_reporter.publish_block(upload.block()).await;
-            return (position, height);
-        }
-        warn!(
-            height,
-            position, "finalized index uploader stopped after accepting upload",
-        );
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
+        let simplex_completion = cert_reporter
+            .publish_block(block)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("failed to start Simplex block upload at height {height}. {error}")
+            });
+        match wait_for_finalized_uploads(completion.wait(), simplex_completion.wait()).await {
+            Ok(()) => (position, height, reservation),
+            Err(FinalizedUploadFailure::Qmdb(error)) => {
+                panic!("QMDB upload failed at height {height}. {error}")
+            }
+            Err(FinalizedUploadFailure::Simplex(error)) => {
+                panic!("Simplex block upload failed at height {height}. {error}")
+            }
         }
     });
+}
+
+fn decode_finalized_queue_entry(position: u64, upload: EngineStoredUpload) -> EngineQueuedUpload {
+    upload.into_decoded().unwrap_or_else(|error| {
+        panic!("failed to decode finalized index queue entry at position {position}. {error}")
+    })
+}
+
+#[derive(Debug)]
+enum FinalizedUploadFailure {
+    Qmdb(PublishError),
+    Simplex(CertificateUploaderStopped),
+}
+
+async fn wait_for_finalized_uploads<Q, S>(qmdb: Q, simplex: S) -> Result<(), FinalizedUploadFailure>
+where
+    Q: Future<Output = Result<(), PublishError>>,
+    S: Future<Output = Result<(), CertificateUploaderStopped>>,
+{
+    tokio::try_join!(
+        async { qmdb.await.map_err(FinalizedUploadFailure::Qmdb) },
+        async { simplex.await.map_err(FinalizedUploadFailure::Simplex) },
+    )?;
+    Ok(())
+}
+
+fn indexer_critical_task(
+    cert_join: JoinHandle<()>,
+    finalized_join: JoinHandle<()>,
+) -> CriticalTask {
+    Box::pin(async move {
+        let (task, result) = tokio::select! {
+            result = cert_join => ("Simplex certificate uploader", result),
+            result = finalized_join => ("finalized index uploader", result),
+        };
+        match result {
+            Ok(()) => warn!(task, "critical indexer task exited"),
+            Err(error) => warn!(task, error = %error, "critical indexer task failed"),
+        }
+    })
 }
 
 /// Build the indexer wiring iff the secondary validator opted in.
@@ -588,19 +868,31 @@ async fn maybe_build_indexer(
         return None;
     }
 
+    let max_active_uploads = cfg
+        .upload_max_in_flight
+        .clamp(1, MAX_FINALIZED_QUEUE_UPLOADS);
     info!(
         chain_indexer_url = %cfg.chain_indexer_url,
+        upload_budget_bytes = cfg.upload_budget_bytes,
+        upload_max_in_flight = max_active_uploads,
+        configured_upload_max_in_flight = cfg.upload_max_in_flight,
+        upload_amplification = FINALIZED_UPLOAD_AMPLIFICATION,
+        upload_budget_quantum_bytes = FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
         "starting full indexer uploaders",
+    );
+    let budget = UploadBudget::new(
+        &context.child("finalized_upload_budget"),
+        cfg.upload_budget_bytes,
     );
     let (cert_reporter, cert_join) = EngineCertReporter::connect(
         &cfg.chain_indexer_url,
-        cfg.upload_buffer,
+        max_active_uploads,
         StoreCommitMetrics::new(&context.child("simplex_upload")),
     );
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
         cfg.chain_indexer_url,
-        cfg.upload_buffer,
+        max_active_uploads,
     ));
     let page_cache = CacheRef::from_pooler(
         &context,
@@ -630,7 +922,7 @@ async fn maybe_build_indexer(
     .await
     .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
-    let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader).await;
+    let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader, &budget).await;
     let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
@@ -647,19 +939,19 @@ async fn maybe_build_indexer(
         cursor: Arc::new(Mutex::new(cursor)),
         publisher: publisher.clone(),
     };
-    let max_active_uploads = cfg.upload_buffer.clamp(1, MAX_FINALIZED_QUEUE_UPLOADS);
     let finalized_join = tokio::spawn(run_finalized_upload_consumer(
         publisher.clone(),
         cert_reporter.clone(),
         queue_writer,
         queue_reader,
         max_active_uploads,
+        budget,
     ));
     Some(IndexerHandle {
         cert_reporter,
         publisher,
         finalized_producer,
-        _uploaders: vec![cert_join, finalized_join],
+        critical_task: Some(indexer_critical_task(cert_join, finalized_join)),
     })
 }
 
@@ -888,7 +1180,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         // loaded config and returns `None` for primaries or validators that
         // did not declare an `indexer` block.
         let indexer_partition_prefix = decoded.partition_prefix.clone();
-        let indexer_handle = maybe_build_indexer(
+        let mut indexer_handle = maybe_build_indexer(
             context.child("indexer"),
             is_primary,
             indexer,
@@ -896,6 +1188,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         )
         .await;
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
+        let indexer_task = indexer_handle
+            .as_mut()
+            .and_then(|handle| handle.critical_task.take());
 
         info!("initializing engine");
         let engine = Engine::<
@@ -970,6 +1265,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         wait_for_critical_task_exit(
             Some(probe_handle),
+            indexer_task,
             engine_handle,
             mempool_handle,
             network_handle,
@@ -978,10 +1274,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     });
 }
 
-type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
-
 async fn wait_for_critical_task_exit<E, M, N>(
     probe_handle: Option<CriticalTask>,
+    indexer_handle: Option<CriticalTask>,
     engine_handle: E,
     mempool_handle: M,
     network_handle: N,
@@ -991,8 +1286,10 @@ async fn wait_for_critical_task_exit<E, M, N>(
     N: Future,
 {
     let mut probe_handle = probe_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
+    let mut indexer_handle = indexer_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
     tokio::select! {
         _ = probe_handle.as_mut() => tracing::warn!("probe exited"),
+        _ = indexer_handle.as_mut() => panic!("critical indexer task exited"),
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
         _ = network_handle => tracing::warn!("network exited"),
@@ -1012,14 +1309,18 @@ const fn production_sync_config() -> SyncEngineConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
-        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, default_mempool_drop_grace_blocks,
-        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
-        wait_for_critical_task_exit,
+        CertificateUploaderStopped, EngineCertReporter, EngineQueuedUpload,
+        FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
+        FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueReader, FinalizedQueueWriter,
+        FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher, PendingQueuedUpload,
+        PublishError, StoreCommitMetrics, UploadBudget, decode_finalized_queue_entry,
+        default_mempool_drop_grace_blocks, indexer_critical_task, maybe_build_indexer,
+        recovered_finalized_upload_cursor, scan_finalized_queue_cursor, start_queued_upload,
+        wait_for_critical_task_exit, wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
-    use commonware_codec::{FixedSize as _, Read as _, Write as _};
+    use commonware_codec::{Encode as _, FixedSize as _, Read as _, Write as _};
     use commonware_consensus::{
         marshal::coding::types::coding_config_for_participants,
         simplex::types::Context as SimplexContext,
@@ -1030,21 +1331,27 @@ mod tests {
         ed25519::PrivateKey,
         sha256::{Digest as Sha256Digest, Sha256},
     };
-    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _};
     use commonware_storage::{
         merkle::mmr,
-        qmdb::any::{unordered::Operation as UnorderedOperation, value::FixedEncoding},
+        qmdb::any::{
+            unordered::{Operation as UnorderedOperation, Update as UnorderedUpdate},
+            value::FixedEncoding,
+        },
         queue,
     };
     use commonware_utils::{non_empty_range, sequence::FixedBytes};
     use constantinople_primitives::{
         Account, AccountKey, Block, Header, Sealable, SignedTransaction,
     };
-    use std::{future::pending, time::Duration};
+    use std::{future::pending, sync::Arc, time::Duration};
+    use tokio::sync::oneshot;
 
     type TestAccountValue = FixedBytes<{ Account::SIZE }>;
     type TestStateOperation =
         UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
+    type LegacyFinalizedQueueWriter = queue::Writer<super::RuntimeContext, EngineQueuedUpload>;
+    type LegacyFinalizedQueueReader = queue::Reader<super::RuntimeContext, EngineQueuedUpload>;
 
     #[test]
     fn mempool_drop_grace_defaults_to_twice_validator_count() {
@@ -1060,7 +1367,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_critical_task_exit(None, pending::<()>(), pending::<()>(), pending::<()>()),
+            wait_for_critical_task_exit(
+                None,
+                None,
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+            ),
         )
         .await;
 
@@ -1070,6 +1383,89 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn finalized_upload_waits_for_both_destinations() {
+        for qmdb_first in [true, false] {
+            let (qmdb_tx, qmdb_rx) = oneshot::channel();
+            let (simplex_tx, simplex_rx) = oneshot::channel();
+            let qmdb = async move {
+                qmdb_rx
+                    .await
+                    .map_err(|_| PublishError::CommitterStopped { height: 1 })
+            };
+            let simplex = async move { simplex_rx.await.map_err(|_| CertificateUploaderStopped) };
+            let mut completion = Box::pin(wait_for_finalized_uploads(qmdb, simplex));
+            let mut qmdb_tx = Some(qmdb_tx);
+            let mut simplex_tx = Some(simplex_tx);
+
+            if qmdb_first {
+                qmdb_tx.take().expect("QMDB gate exists").send(()).ok();
+            } else {
+                simplex_tx
+                    .take()
+                    .expect("Simplex gate exists")
+                    .send(())
+                    .ok();
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), completion.as_mut())
+                    .await
+                    .is_err()
+            );
+
+            if qmdb_first {
+                simplex_tx
+                    .take()
+                    .expect("Simplex gate exists")
+                    .send(())
+                    .ok();
+            } else {
+                qmdb_tx.take().expect("QMDB gate exists").send(()).ok();
+            }
+            completion.await.expect("both uploads complete");
+        }
+    }
+
+    #[tokio::test]
+    async fn finalized_upload_failure_does_not_wait_for_other_destination() {
+        let (_simplex_tx, simplex_rx) = oneshot::channel::<()>();
+        let qmdb = async { Err::<(), _>(PublishError::CommitterStopped { height: 7 }) };
+        let simplex = async move { simplex_rx.await.map_err(|_| CertificateUploaderStopped) };
+
+        let result = tokio::time::timeout(
+            Duration::from_millis(10),
+            wait_for_finalized_uploads(qmdb, simplex),
+        )
+        .await
+        .expect("QMDB failure returns promptly");
+        assert!(matches!(
+            result,
+            Err(FinalizedUploadFailure::Qmdb(
+                PublishError::CommitterStopped { height: 7 }
+            ))
+        ));
+    }
+
+    #[tokio::test]
+    async fn indexer_uploader_exit_fails_the_runtime() {
+        let certificate_uploader = tokio::spawn(async {});
+        let finalized_uploader = tokio::spawn(pending::<()>());
+        let indexer_task = indexer_critical_task(certificate_uploader, finalized_uploader);
+
+        let runtime = tokio::spawn(wait_for_critical_task_exit(
+            None,
+            Some(indexer_task),
+            pending::<()>(),
+            pending::<()>(),
+            pending::<()>(),
+        ));
+        let error = tokio::time::timeout(Duration::from_secs(1), runtime)
+            .await
+            .expect("indexer failure returns promptly")
+            .expect_err("indexer failure must panic the runtime");
+        assert!(error.is_panic());
+    }
+
     #[test]
     fn publisher_does_not_block_secondary_startup_on_connect_failure() {
         let runner =
@@ -1077,7 +1473,8 @@ mod tests {
         runner.start(|context| async move {
             let indexer = IndexerConfig {
                 chain_indexer_url: "http://127.0.0.1:1".to_string(),
-                upload_buffer: 1,
+                upload_max_in_flight: 1,
+                upload_budget_bytes: super::FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
             };
 
             let handle = tokio::time::timeout(
@@ -1088,7 +1485,7 @@ mod tests {
             .expect("publisher connection should not block startup")
             .expect("secondary should keep indexer wiring");
 
-            assert_eq!(handle._uploaders.len(), 2);
+            assert!(handle.critical_task.is_some());
         });
     }
 
@@ -1158,50 +1555,318 @@ mod tests {
     }
 
     #[test]
+    fn upload_budget_blocks_until_reservations_drop() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let budget = UploadBudget::new(
+                &context.child("upload_budget"),
+                2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+            );
+            let one_unit_encoded = usize::try_from(FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES / 8)
+                .expect("test charge fits usize");
+            let one_unit = budget.charge(one_unit_encoded);
+            let two_units = budget.charge(one_unit_encoded + 1);
+
+            let first = budget
+                .try_reserve(one_unit)
+                .expect("first charge fits budget");
+            assert!(budget.try_reserve(two_units).is_none());
+            budget.mark_waiting(two_units);
+            assert_eq!(budget.metrics.admission_blocked.get(), 1);
+            assert_eq!(
+                budget.metrics.waiting_bytes.get(),
+                i64::try_from(two_units.estimated_bytes).expect("test charge fits metric")
+            );
+            assert_eq!(budget.metrics.admitted.get(), 1);
+
+            drop(first);
+            let second = budget
+                .try_reserve(two_units)
+                .expect("released capacity admits waiting charge");
+            budget.clear_waiting();
+            assert_eq!(budget.metrics.waiting_bytes.get(), 0);
+            assert_eq!(budget.metrics.admitted.get(), 1);
+            assert_eq!(
+                budget.metrics.reserved_bytes.get(),
+                i64::try_from(two_units.estimated_bytes).expect("test charge fits metric")
+            );
+
+            drop(second);
+            assert_eq!(budget.metrics.reserved_bytes.get(), 0);
+            assert_eq!(budget.metrics.admitted.get(), 0);
+            assert_eq!(budget.permits.available_permits(), 2);
+        });
+    }
+
+    #[test]
+    fn oversized_upload_reserves_the_entire_budget() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let configured_bytes = 2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES;
+            let budget = UploadBudget::new(&context.child("upload_budget"), configured_bytes);
+            let one_unit_encoded = usize::try_from(FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES / 8)
+                .expect("test charge fits usize");
+            let regular_charge = budget.charge(one_unit_encoded);
+            let oversized_encoded =
+                usize::try_from(configured_bytes / 8 + 1).expect("test charge fits usize");
+            let oversized_charge = budget.charge(oversized_encoded);
+            assert!(oversized_charge.oversized);
+
+            let regular = budget
+                .try_reserve(regular_charge)
+                .expect("regular charge fits budget");
+            assert!(budget.try_reserve(oversized_charge).is_none());
+            drop(regular);
+
+            let oversized = budget
+                .try_reserve(oversized_charge)
+                .expect("oversized charge runs alone");
+            assert_eq!(budget.permits.available_permits(), 0);
+            assert!(budget.try_reserve(regular_charge).is_none());
+            assert_eq!(budget.metrics.oversized.get(), 1);
+            assert!(
+                budget.metrics.reserved_bytes.get()
+                    > i64::try_from(configured_bytes).expect("test budget fits metric")
+            );
+
+            drop(oversized);
+            assert!(budget.try_reserve(regular_charge).is_some());
+        });
+    }
+
+    #[test]
+    fn completed_task_keeps_its_upload_reservation() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let budget = UploadBudget::new(
+                &context.child("upload_budget"),
+                FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+            );
+            let encoded = usize::try_from(FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES / 8)
+                .expect("test charge fits usize");
+            let charge = budget.charge(encoded);
+            let reservation = budget.try_reserve(charge).expect("test charge fits budget");
+            let mut active = tokio::task::JoinSet::new();
+            active.spawn(async move { (0, 0, reservation) });
+
+            let (_, _, reservation) = active
+                .join_next()
+                .await
+                .expect("completed upload exists")
+                .expect("completed upload succeeds");
+            assert_eq!(budget.permits.available_permits(), 0);
+            assert!(budget.try_reserve(charge).is_none());
+
+            drop(reservation);
+            assert_eq!(budget.permits.available_permits(), 1);
+        });
+    }
+
+    #[test]
+    fn queued_uploads_reserve_qmdb_cursors_before_completion_tasks_spawn() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (store, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let publisher = Arc::new(LazyPublisher::new(
+                context.child("publisher"),
+                url.clone(),
+                2,
+            ));
+            let engine_publisher = publisher.publisher().await;
+            let (cert_reporter, cert_join) = EngineCertReporter::connect(
+                &url,
+                2,
+                StoreCommitMetrics::new(&context.child("simplex_upload")),
+            );
+            let budget = UploadBudget::new(
+                &context.child("upload_budget"),
+                2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+            );
+            let mut active = tokio::task::JoinSet::new();
+
+            let first = publishable_queued_upload(1, 0, 0);
+            let first = PendingQueuedUpload::new(0, first.into(), &budget);
+            let first_reservation = budget
+                .try_reserve(first.charge)
+                .expect("first upload fits budget");
+            start_queued_upload(
+                &mut active,
+                publisher.clone(),
+                cert_reporter.clone(),
+                first,
+                first_reservation,
+            )
+            .await;
+            assert_eq!(engine_publisher.next_locations().await, (2, 2));
+
+            let second = publishable_queued_upload(2, 2, 2);
+            let second = PendingQueuedUpload::new(1, second.into(), &budget);
+            let second_reservation = budget
+                .try_reserve(second.charge)
+                .expect("second upload fits budget");
+            start_queued_upload(
+                &mut active,
+                publisher.clone(),
+                cert_reporter,
+                second,
+                second_reservation,
+            )
+            .await;
+            assert_eq!(engine_publisher.next_locations().await, (4, 3));
+            assert_eq!(active.len(), 2);
+            assert_eq!(budget.metrics.admitted.get(), 2);
+
+            while let Some(completed) = active.join_next().await {
+                let (_, _, reservation) = completed.expect("queued upload completes");
+                drop(reservation);
+            }
+            assert_eq!(budget.metrics.admitted.get(), 0);
+            cert_join.abort();
+            let _ = cert_join.await;
+            drop(engine_publisher);
+            publisher.shutdown().await;
+            drop(publisher);
+            store.abort();
+            let _ = store.await;
+            context
+                .stop(0, Some(Duration::from_secs(1)))
+                .await
+                .expect("runtime stops after strategy threads exit");
+        });
+    }
+
+    #[test]
     fn finalized_queue_scan_recovers_last_cursor_and_resets_reader() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
-                &context,
-                FINALIZED_QUEUE_PAGE_SIZE,
-                FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+            let budget = UploadBudget::new(
+                &context.child("upload_budget"),
+                FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
             );
             let (writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
                 queue::shared::init(
                     context.child("finalized_queue"),
-                    queue::Config {
-                        partition: "finalized-queue-scan-recovers-last-cursor".to_string(),
-                        items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
-                        compression: None,
-                        codec_config: super::QueuedFinalizedUploadCfg::default(),
-                        page_cache,
-                        write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
-                    },
+                    finalized_queue_config(&context, "finalized-queue-scan-recovers-last-cursor"),
                 )
                 .await
                 .expect("queue initializes");
             let first = queued_upload(1, 0, 2, 0, 2);
             let second = queued_upload(2, 2, 5, 2, 3);
-            writer.enqueue(first.clone()).await.expect("enqueue first");
             writer
-                .enqueue(second.clone())
+                .enqueue(first.clone().into())
+                .await
+                .expect("enqueue first");
+            writer
+                .enqueue(second.clone().into())
                 .await
                 .expect("enqueue second");
 
             assert_eq!(
-                scan_finalized_queue_cursor(&mut reader).await,
+                scan_finalized_queue_cursor(&mut reader, &budget).await,
                 Some(FinalizedUploadCursor::from_upload(&second))
             );
+            assert_eq!(budget.permits.available_permits(), 1);
 
-            let (_position, upload) = reader
+            let (position, upload) = reader
                 .try_recv()
                 .await
                 .expect("read after scan")
                 .expect("scan reset leaves first item readable");
+            let upload = decode_finalized_queue_entry(position, upload);
             assert_eq!(
                 FinalizedUploadCursor::from_upload(&upload),
                 FinalizedUploadCursor::from_upload(&first)
             );
         });
+    }
+
+    #[test]
+    fn finalized_queue_codec_is_upgrade_and_rollback_compatible() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let expected = queued_upload(1, 0, 2, 0, 2);
+            let expected_bytes = expected.encode();
+
+            {
+                let (writer, _reader): (LegacyFinalizedQueueWriter, LegacyFinalizedQueueReader) =
+                    queue::shared::init(
+                        context.child("legacy_upgrade_writer"),
+                        finalized_queue_config(&context, "finalized-queue-codec-upgrade"),
+                    )
+                    .await
+                    .expect("legacy queue initializes");
+                writer
+                    .enqueue(expected.clone())
+                    .await
+                    .expect("legacy queue accepts upload");
+                writer.sync().await.expect("legacy queue syncs");
+            }
+
+            {
+                let (_writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
+                    queue::shared::init(
+                        context.child("stored_upgrade_reader"),
+                        finalized_queue_config(&context, "finalized-queue-codec-upgrade"),
+                    )
+                    .await
+                    .expect("stored queue reopens legacy data");
+                let (position, stored) = reader
+                    .try_recv()
+                    .await
+                    .expect("stored queue reads legacy data")
+                    .expect("legacy upload remains queued");
+                assert_eq!(position, 0);
+                assert_eq!(stored.encoded_len(), expected_bytes.len());
+                assert_eq!(stored.encode(), expected_bytes);
+                let decoded = decode_finalized_queue_entry(position, stored);
+                assert_eq!(decoded.encode(), expected_bytes);
+            }
+
+            {
+                let (writer, _reader): (FinalizedQueueWriter, FinalizedQueueReader) =
+                    queue::shared::init(
+                        context.child("stored_rollback_writer"),
+                        finalized_queue_config(&context, "finalized-queue-codec-rollback"),
+                    )
+                    .await
+                    .expect("stored queue initializes");
+                writer
+                    .enqueue(expected.clone().into())
+                    .await
+                    .expect("stored queue accepts upload");
+                writer.sync().await.expect("stored queue syncs");
+            }
+
+            let (_writer, mut reader): (LegacyFinalizedQueueWriter, LegacyFinalizedQueueReader) =
+                queue::shared::init(
+                    context.child("legacy_rollback_reader"),
+                    finalized_queue_config(&context, "finalized-queue-codec-rollback"),
+                )
+                .await
+                .expect("legacy queue reopens stored data");
+            let (position, decoded) = reader
+                .try_recv()
+                .await
+                .expect("legacy queue reads stored data")
+                .expect("stored upload remains queued");
+            assert_eq!(position, 0);
+            assert_eq!(decoded.encode(), expected_bytes);
+        });
+    }
+
+    fn finalized_queue_config(
+        context: &super::RuntimeContext,
+        partition: &str,
+    ) -> queue::Config<super::QueuedFinalizedUploadCfg> {
+        let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
+            context,
+            FINALIZED_QUEUE_PAGE_SIZE,
+            FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+        );
+        queue::Config {
+            partition: partition.to_string(),
+            items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+            compression: None,
+            codec_config: super::QueuedFinalizedUploadCfg::default(),
+            page_cache,
+            write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+        }
     }
 
     fn queued_upload(
@@ -1248,5 +1913,63 @@ mod tests {
         let mut encoded = encoded.freeze();
         EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())
             .expect("queued upload decodes")
+    }
+
+    fn publishable_queued_upload(
+        height: u64,
+        state_start: u64,
+        transaction_start: u64,
+    ) -> EngineQueuedUpload {
+        let transaction_ops = if transaction_start == 0 { 2 } else { 1 };
+        let seed = u8::try_from(height).expect("test height fits account key");
+        let key = AccountKey::from([seed; AccountKey::SIZE]);
+        let account = Account {
+            balance: height,
+            ..Account::default()
+        };
+        let account = account.encode();
+        let mut encoded_account = [0; Account::SIZE];
+        encoded_account.copy_from_slice(&account);
+        let state_delta = vec![
+            TestStateOperation::Update(UnorderedUpdate(key, FixedBytes::new(encoded_account))),
+            TestStateOperation::CommitFloor(None, mmr::Location::new(0)),
+        ];
+
+        let leader = PrivateKey::from_seed(height).public_key();
+        let parent_commitment = Commitment::from((
+            Sha256Digest::EMPTY,
+            Sha256Digest::EMPTY,
+            Sha256Digest::EMPTY,
+            coding_config_for_participants(4),
+        ));
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), parent_commitment),
+            },
+            parent: Sha256Digest::EMPTY,
+            height,
+            timestamp: 0,
+            state_root: Sha256Digest::EMPTY,
+            state_range: non_empty_range!(state_start, state_start + 2),
+            transactions_root: Sha256Digest::EMPTY,
+            transactions_range: non_empty_range!(
+                transaction_start,
+                transaction_start + transaction_ops
+            ),
+        };
+        let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+            .seal(&mut Sha256::default());
+        let mut encoded = bytes::BytesMut::new();
+        block.write(&mut encoded);
+        0i64.write(&mut encoded);
+        state_start.write(&mut encoded);
+        transaction_start.write(&mut encoded);
+        state_delta.write(&mut encoded);
+
+        let mut encoded = encoded.freeze();
+        EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())
+            .expect("publishable queued upload decodes")
     }
 }

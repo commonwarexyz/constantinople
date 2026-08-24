@@ -20,7 +20,10 @@ use constantinople_engine::types::{EngineBlock, EngineHeader};
 use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::sync::Arc;
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{mpsc, oneshot},
+    task::JoinHandle,
+};
 use tracing::{debug, warn};
 
 /// Cloneable reporter over Simplex activity.
@@ -32,6 +35,23 @@ where
     S::Certificate: Send,
 {
     tx: mpsc::Sender<SimplexInput<H, P, S>>,
+}
+
+/// The Simplex uploader stopped before accepting or persisting a block.
+#[derive(Debug, thiserror::Error)]
+#[error("Simplex certificate uploader stopped")]
+pub struct CertificateUploaderStopped;
+
+/// Completion signal for a digest-addressed Simplex block upload.
+pub struct BlockUploadCompletion {
+    rx: oneshot::Receiver<()>,
+}
+
+impl BlockUploadCompletion {
+    /// Wait until the block upload has been marked persisted.
+    pub async fn wait(self) -> Result<(), CertificateUploaderStopped> {
+        self.rx.await.map_err(|_| CertificateUploaderStopped)
+    }
 }
 
 impl<H, P, S> CertificateReporter<H, P, S>
@@ -63,12 +83,20 @@ where
 
     /// Queue a finalized block for digest-addressed block upload and later
     /// certificate pairing.
-    pub async fn publish_block(&self, block: Arc<EngineBlock<H, P>>)
+    pub async fn publish_block(
+        &self,
+        block: Arc<EngineBlock<H, P>>,
+    ) -> Result<BlockUploadCompletion, CertificateUploaderStopped>
     where
         H: Hasher,
         P: PublicKey,
     {
-        let _ = self.tx.send(SimplexInput::Block(block)).await;
+        let (completion, rx) = oneshot::channel();
+        self.tx
+            .send(SimplexInput::Block { block, completion })
+            .await
+            .map_err(|_| CertificateUploaderStopped)?;
+        Ok(BlockUploadCompletion { rx })
     }
 }
 
@@ -131,7 +159,10 @@ where
     P: PublicKey,
     S: Scheme,
 {
-    Block(Arc<EngineBlock<H, P>>),
+    Block {
+        block: Arc<EngineBlock<H, P>>,
+        completion: oneshot::Sender<()>,
+    },
     Notarization(simplex::types::Notarization<S, Commitment>),
     Finalization(simplex::types::Finalization<S, Commitment>),
 }
@@ -191,15 +222,17 @@ async fn run_uploader<H, P, S>(
         }
 
         let mut prepared = PreparedUpload::new();
+        let mut block_completions = Vec::new();
         let mut touched: Vec<Vec<u8>> = Vec::with_capacity(inputs.len());
         for input in inputs {
             let key = input.block_digest_key();
             let entry = pending.entry(key.clone()).or_default();
             match input {
-                SimplexInput::Block(block) => {
+                SimplexInput::Block { block, completion } => {
                     let (header, body) = crate::simplex_block::encode_simplex_block_parts(&block);
                     prepared.extend(client.prepare_block(&header, body));
                     entry.block = Some(block);
+                    block_completions.push(completion);
                 }
                 SimplexInput::Notarization(notarization) => entry.notarization = Some(notarization),
                 SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
@@ -230,6 +263,9 @@ async fn run_uploader<H, P, S>(
         )
         .await;
         let receipt = client.mark_upload_persisted(prepared, seq).await;
+        for completion in block_completions {
+            let _ = completion.send(());
+        }
         debug!(
             headers = receipt.summary.headers,
             blocks = receipt.summary.blocks,
@@ -250,7 +286,7 @@ where
 {
     fn block_digest_key(&self) -> Vec<u8> {
         match self {
-            Self::Block(block) => block.seal().as_ref().to_vec(),
+            Self::Block { block, .. } => block.seal().as_ref().to_vec(),
             Self::Notarization(notarization) => {
                 block_digest_key::<H>(&notarization.proposal.payload)
             }
@@ -263,7 +299,7 @@ where
     /// Encoded body bytes this input stages (certificates are negligible).
     fn body_bytes(&self) -> usize {
         match self {
-            Self::Block(block) => block.body.encode_size(),
+            Self::Block { block, .. } => block.body.encode_size(),
             Self::Notarization(_) | Self::Finalization(_) => 0,
         }
     }
@@ -422,5 +458,130 @@ where
             ));
         }
         Ok(Self { commitment, header })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_consensus::{
+        simplex::types::Context as SimplexContext,
+        types::{Round, View},
+    };
+    use commonware_cryptography::{
+        Digest as _, Signer as _,
+        bls12381::primitives::variant::MinSig,
+        ed25519,
+        sha256::{Digest as Sha256Digest, Sha256},
+    };
+    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_utils::non_empty_range;
+    use constantinople_engine::ThresholdScheme;
+    use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
+
+    type TestReporter = CertificateReporter<
+        Sha256,
+        ed25519::PublicKey,
+        ThresholdScheme<ed25519::PublicKey, MinSig>,
+    >;
+
+    #[test]
+    fn block_completion_implies_store_persistence() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (server, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let (reporter, uploader) = TestReporter::connect(
+                &url,
+                1,
+                super::super::StoreCommitMetrics::new(&context.child("metrics")),
+            );
+            let block = test_block();
+            let digest = *block.seal();
+
+            let completion = reporter
+                .publish_block(block)
+                .await
+                .expect("uploader accepts block");
+            completion.wait().await.expect("block upload completes");
+
+            let client = SimplexClient::new(
+                crate::namespaces::simplex_client(&StoreClient::new(&url))
+                    .expect("simplex namespace"),
+            );
+            assert!(
+                client
+                    .get_block_raw(&digest)
+                    .await
+                    .expect("read uploaded block")
+                    .is_some()
+            );
+
+            drop(reporter);
+            uploader.await.expect("uploader exits cleanly");
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn publish_block_reports_stopped_uploader() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (reporter, uploader) = TestReporter::connect(
+                "http://127.0.0.1:1",
+                1,
+                super::super::StoreCommitMetrics::new(&context.child("metrics")),
+            );
+            uploader.abort();
+            let _ = uploader.await;
+
+            assert!(matches!(
+                reporter.publish_block(test_block()).await,
+                Err(CertificateUploaderStopped)
+            ));
+        });
+    }
+
+    #[test]
+    fn block_completion_reports_stopped_uploader() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (reporter, uploader) = TestReporter::connect(
+                "http://127.0.0.1:1",
+                1,
+                super::super::StoreCommitMetrics::new(&context.child("metrics")),
+            );
+            let completion = reporter
+                .publish_block(test_block())
+                .await
+                .expect("uploader accepts block");
+            uploader.abort();
+            let _ = uploader.await;
+
+            assert!(matches!(
+                completion.wait().await,
+                Err(CertificateUploaderStopped)
+            ));
+        });
+    }
+
+    fn test_block() -> Arc<EngineBlock<Sha256, ed25519::PublicKey>> {
+        let leader = ed25519::PrivateKey::from_seed(1).public_key();
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), Commitment::EMPTY),
+            },
+            parent: Sha256Digest::EMPTY,
+            height: 1,
+            timestamp: 0,
+            state_root: Sha256Digest::EMPTY,
+            state_range: non_empty_range!(0, 2),
+            transactions_root: Sha256Digest::EMPTY,
+            transactions_range: non_empty_range!(0, 2),
+        };
+        Arc::new(
+            Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+                .seal(&mut Sha256::default()),
+        )
     }
 }

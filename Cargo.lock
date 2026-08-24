@@ -1800,6 +1800,7 @@ dependencies = [
  "constantinople-indexer",
  "constantinople-mempool",
  "constantinople-primitives",
+ "exoware-simulator",
  "futures",
  "mimalloc",
  "reqwest",

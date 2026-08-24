@@ -57,7 +57,8 @@ const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
-const INDEXER_UPLOAD_BUFFER: usize = 64;
+const INDEXER_UPLOAD_MAX_IN_FLIGHT: usize = 64;
+const INDEXER_UPLOAD_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
@@ -443,8 +444,10 @@ pub(crate) struct ValidatorConfig {
 pub(crate) struct IndexerConfig {
     /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
-    /// Number of blocks buffered before upload.
-    pub upload_buffer: usize,
+    /// Caps concurrent uploads after byte admission.
+    pub upload_max_in_flight: usize,
+    /// Bounds estimated memory held across upload stages.
+    pub upload_budget_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]

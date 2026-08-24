@@ -8,8 +8,10 @@ use crate::{
     namespaces::{sql_meta_client, state_qmdb_client, transactions_qmdb_client},
     sql_schema::build_meta_schema,
 };
+use bytes::{Buf as _, Bytes};
 use commonware_codec::{
-    Codec, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
+    Codec, Decode, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt,
+    Write,
 };
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::Strategy;
@@ -64,21 +66,22 @@ type TransactionWriter<H> =
 
 /// Completion signal for a queued finalized-block upload.
 pub struct UploadCompletion {
+    height: u64,
     rx: oneshot::Receiver<()>,
 }
 
 impl UploadCompletion {
-    fn completed() -> Self {
+    fn completed(height: u64) -> Self {
         let (tx, rx) = oneshot::channel();
         let _ = tx.send(());
-        Self { rx }
+        Self { height, rx }
     }
 
     /// Waits until the upload has been marked persisted.
-    ///
-    /// Returns `false` if the uploader task exits before reporting success.
-    pub async fn wait(self) -> bool {
-        self.rx.await.is_ok()
+    pub async fn wait(self) -> Result<(), PublishError> {
+        self.rx.await.map_err(|_| PublishError::CommitterStopped {
+            height: self.height,
+        })
     }
 }
 
@@ -201,6 +204,115 @@ where
             state_start: u64::read(buf)?,
             transaction_start: u64::read(buf)?,
             state_delta: Arc::new(Vec::<StateOperation>::read_cfg(buf, &(cfg.state_ops, ()))?),
+        })
+    }
+}
+
+/// Queue representation that defers finalized upload decoding until admission.
+pub struct StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    inner: StoredFinalizedUploadInner<H, P>,
+}
+
+enum StoredFinalizedUploadInner<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    Decoded(QueuedFinalizedUpload<H, P>),
+    Encoded {
+        bytes: Bytes,
+        cfg: QueuedFinalizedUploadCfg,
+    },
+}
+
+impl<H, P> From<QueuedFinalizedUpload<H, P>> for StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn from(upload: QueuedFinalizedUpload<H, P>) -> Self {
+        Self {
+            inner: StoredFinalizedUploadInner::Decoded(upload),
+        }
+    }
+}
+
+impl<H, P> StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+    QueuedFinalizedUpload<H, P>: EncodeSize,
+{
+    /// Reports the admission cost without materializing the structured upload.
+    pub fn encoded_len(&self) -> usize {
+        match &self.inner {
+            StoredFinalizedUploadInner::Decoded(upload) => upload.encode_size(),
+            StoredFinalizedUploadInner::Encoded { bytes, .. } => bytes.len(),
+        }
+    }
+}
+
+impl<H, P> StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+    QueuedFinalizedUpload<H, P>: Read<Cfg = QueuedFinalizedUploadCfg>,
+{
+    /// Materializes an admitted upload while preserving full-buffer validation.
+    pub fn into_decoded(self) -> Result<QueuedFinalizedUpload<H, P>, CodecError> {
+        match self.inner {
+            StoredFinalizedUploadInner::Decoded(upload) => Ok(upload),
+            StoredFinalizedUploadInner::Encoded { bytes, cfg } => {
+                QueuedFinalizedUpload::decode_cfg(bytes, &cfg)
+            }
+        }
+    }
+}
+
+impl<H, P> EncodeSize for StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+    QueuedFinalizedUpload<H, P>: EncodeSize,
+{
+    fn encode_size(&self) -> usize {
+        self.encoded_len()
+    }
+}
+
+impl<H, P> Write for StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+    QueuedFinalizedUpload<H, P>: Write,
+{
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        match &self.inner {
+            StoredFinalizedUploadInner::Decoded(upload) => upload.write(buf),
+            StoredFinalizedUploadInner::Encoded { bytes, .. } => buf.put_slice(bytes),
+        }
+    }
+}
+
+impl<H, P> Read for StoredFinalizedUpload<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+    QueuedFinalizedUpload<H, P>: Read<Cfg = QueuedFinalizedUploadCfg>,
+{
+    type Cfg = QueuedFinalizedUploadCfg;
+
+    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        let bytes = buf.copy_to_bytes(buf.remaining());
+        Ok(Self {
+            inner: StoredFinalizedUploadInner::Encoded {
+                bytes,
+                cfg: cfg.clone(),
+            },
         })
     }
 }
@@ -491,10 +603,11 @@ where
         let mut state_next = self.state_next_location.lock().await;
         let mut transaction_next = self.transaction_next_location.lock().await;
 
+        let height = upload.height();
         let state_end = upload.state_end();
         let transaction_end = upload.transaction_end();
         if *state_next >= state_end && *transaction_next >= transaction_end {
-            return Ok(UploadCompletion::completed());
+            return Ok(UploadCompletion::completed(height));
         }
         if *state_next != upload.state_start {
             return Err(PublishError::WriterOutOfSync {
@@ -509,7 +622,6 @@ where
             });
         }
 
-        let height = upload.height();
         let (completion, rx) = oneshot::channel();
         let prepare_tx = self
             .prepare_tx
@@ -525,7 +637,7 @@ where
             .map_err(|_| PublishError::CommitterStopped { height })?;
         *state_next = state_end;
         *transaction_next = transaction_end;
-        Ok(UploadCompletion { rx })
+        Ok(UploadCompletion { height, rx })
     }
 }
 
@@ -1539,6 +1651,7 @@ mod tests {
     use super::*;
     use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
     use commonware_consensus::{
+        marshal::coding::types::coding_config_for_participants,
         simplex::types::Context as SimplexContext,
         types::{Round, View, coding::Commitment},
     };
@@ -1570,6 +1683,50 @@ mod tests {
     const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
     const TEST_PAGE_CACHE_PAGE_SIZE: std::num::NonZeroU16 = NZU16!(4096);
     const TEST_PAGE_CACHE_CAPACITY: std::num::NonZero<usize> = NZUsize!(1024);
+
+    #[test]
+    fn stored_upload_reads_existing_queue_payload() {
+        let cfg = QueuedFinalizedUploadCfg::default();
+        let upload = test_queued_upload();
+        let existing = upload.encode();
+
+        let stored =
+            StoredFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(existing.clone(), &cfg)
+                .expect("stored upload accepts existing payload");
+        assert_eq!(stored.encoded_len(), existing.len());
+        assert_eq!(stored.encode(), existing);
+
+        let decoded = stored.into_decoded().expect("stored upload decodes");
+        assert_eq!(decoded.encode(), existing);
+    }
+
+    #[test]
+    fn stored_upload_writes_existing_queue_payload() {
+        let cfg = QueuedFinalizedUploadCfg::default();
+        let upload = test_queued_upload();
+        let existing = upload.encode();
+        let encoded = StoredFinalizedUpload::from(upload).encode();
+
+        assert_eq!(encoded, existing);
+        let decoded =
+            QueuedFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(encoded, &cfg)
+                .expect("existing codec decodes stored upload");
+        assert_eq!(decoded.height(), 1);
+    }
+
+    #[test]
+    fn stored_upload_defers_malformed_payload_error() {
+        let cfg = QueuedFinalizedUploadCfg::default();
+        let mut encoded = test_queued_upload().encode().to_vec();
+        encoded.push(0);
+
+        let stored = StoredFinalizedUpload::<Sha256, ed25519::PublicKey>::decode_cfg(
+            Bytes::from(encoded),
+            &cfg,
+        )
+        .expect("stored upload defers structured decoding");
+        assert!(stored.into_decoded().is_err());
+    }
 
     #[test]
     fn sql_rows_stage_into_store_batch() {
@@ -1944,11 +2101,23 @@ mod tests {
                 .enqueue_queued_finalized(test_queued_upload())
                 .await
                 .expect("queued upload accepted");
-            assert!(completion.wait().await);
+            completion.wait().await.expect("queued upload completes");
 
             publisher.shutdown().await;
             handle.abort();
         });
+    }
+
+    #[tokio::test]
+    async fn upload_completion_reports_worker_exit() {
+        let (tx, rx) = oneshot::channel();
+        drop(tx);
+        let completion = UploadCompletion { height: 7, rx };
+
+        assert!(matches!(
+            completion.wait().await,
+            Err(PublishError::CommitterStopped { height: 7 })
+        ));
     }
 
     #[test]
@@ -1970,7 +2139,7 @@ mod tests {
                 .enqueue_queued_finalized(test_queued_upload())
                 .await
                 .expect("first upload accepted");
-            assert!(completion.wait().await);
+            completion.wait().await.expect("first upload completes");
             let locations = publisher.next_locations().await;
             publisher.shutdown().await;
 
@@ -1993,7 +2162,7 @@ mod tests {
                 .enqueue_queued_finalized(test_queued_upload_at(2, state_start, transaction_start))
                 .await
                 .expect("follow-up upload accepted");
-            assert!(completion.wait().await);
+            completion.wait().await.expect("follow-up upload completes");
             let locations = publisher.next_locations().await;
             publisher.shutdown().await;
 
@@ -2305,7 +2474,7 @@ mod tests {
             .enqueue_queued_finalized(upload)
             .await
             .expect("queued upload accepted");
-        assert!(completion.wait().await, "queued upload completed");
+        completion.wait().await.expect("queued upload completes");
 
         let state_reader =
             UnorderedClient::<QmdbFamily, Sha256, AccountKey, AccountValue, StateEncoding>::new(
@@ -2493,7 +2662,15 @@ mod tests {
             context: SimplexContext {
                 round: Round::zero(),
                 leader,
-                parent: (View::zero(), Commitment::EMPTY),
+                parent: (
+                    View::zero(),
+                    Commitment::from((
+                        Sha256Digest::EMPTY,
+                        Sha256Digest::EMPTY,
+                        Sha256Digest::EMPTY,
+                        coding_config_for_participants(4),
+                    )),
+                ),
             },
             parent: Sha256Digest::EMPTY,
             height,

@@ -1,11 +1,11 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
-    PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
-    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig, LocalArgs,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
+    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
+    absolute_path, default_bootstrappers, ensure_output_dir_missing,
+    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -241,7 +241,8 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         chain_indexer_url: url,
-        upload_buffer: INDEXER_UPLOAD_BUFFER,
+        upload_max_in_flight: INDEXER_UPLOAD_MAX_IN_FLIGHT,
+        upload_budget_bytes: INDEXER_UPLOAD_BUDGET_BYTES,
     }
 }
 
@@ -774,7 +775,8 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert_eq!(indexer.upload_buffer, 64);
+        assert_eq!(indexer.upload_max_in_flight, 64);
+        assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
         assert!(
