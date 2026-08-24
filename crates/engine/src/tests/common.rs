@@ -6,7 +6,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
     marshal::{self, Identifier},
-    types::{Height, View},
+    types::Height,
 };
 use commonware_cryptography::{
     Digestible, Signer,
@@ -165,11 +165,11 @@ where
     type Activity = marshal::Update<TestBlock>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        if let marshal::Update::Tip(_, height, digest) = &activity {
+        if let marshal::Update::Tip(round, _, digest) = &activity {
             let monitor = self.monitor.clone();
             let update = FinalizationUpdate {
                 pk: self.public_key.clone(),
-                view: View::new(height.get()),
+                round: *round,
                 block_digest: digest.as_ref().to_vec(),
             };
             let _ = monitor.try_send(update);

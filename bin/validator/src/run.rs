@@ -25,7 +25,10 @@ use commonware_glue::stateful::{
     db::SyncEngineConfig,
     probe::{Config as ProbeConfig, Probe},
 };
-use commonware_p2p::{Ingress, Manager as _, TrackedPeers, authenticated::discovery};
+use commonware_p2p::{
+    Ingress, Manager as _, TrackedPeers,
+    authenticated::{self, discovery},
+};
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     BufferPoolConfig, Metrics, Quota, Runner as _, Strategizer as _, Supervisor as _,
@@ -45,12 +48,11 @@ use commonware_storage::{
 use commonware_utils::{
     NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
 };
-use constantinople_application::consensus::{Databases, FinalizedHookFn};
+use constantinople_application::consensus::{DatabaseReaders, FinalizedHookFn};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL,
-    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme,
-    VOTE_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
@@ -81,9 +83,8 @@ use tracing::{info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
-const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
+const STATE_SYNC_APPLY_BATCH_SIZE: NonZeroU64 = NZU64!(1024);
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
-    max_pending_acks: MAX_PENDING_ACKS,
     maintenance_interval: NZUsize!(1024),
     retained_marshal_blocks: 1024,
     retained_qmdb_blocks: 32,
@@ -95,6 +96,7 @@ const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
+const NETWORK_CHANNEL_MAILBOX_BUDGET: usize = 1_024;
 const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const FINALIZED_UPLOAD_AMPLIFICATION: u64 = 8;
@@ -128,9 +130,12 @@ fn buffer_pool_configs(
         NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
 
     let network_cfg = BufferPoolConfig::for_network()
-        .with_parallelism(network_parallelism)
-        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
-        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
+        .with_size_class_range(
+            NZUsize!(1024),
+            NETWORK_BUFFER_POOL_MAX_SIZE,
+            NETWORK_BUFFER_POOL_MAX_PER_CLASS,
+        )
+        .with_parallelism(network_parallelism);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.
@@ -149,13 +154,20 @@ fn buffer_pool_configs(
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
 type EnginePublisher = Publisher<Sha256, PublicKey>;
-type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
+type EngineDatabaseReaders =
+    DatabaseReaders<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
 type EngineStoredUpload = StoredFinalizedUpload<Sha256, PublicKey>;
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineStoredUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineStoredUpload>;
 type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
 type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+struct FinalizedCursorStore {
+    context: RuntimeContext,
+    config: MetadataConfig<()>,
+    metadata: Mutex<Option<CursorMetadata>>,
+}
 
 #[derive(Clone)]
 struct UploadBudgetMetrics {
@@ -354,7 +366,6 @@ impl Reporter for SimplexObserver {
 /// Bundle of indexer state that needs to outlive engine startup.
 struct IndexerHandle {
     cert_reporter: EngineCertReporter,
-    publisher: Arc<LazyPublisher>,
     finalized_producer: FinalizedUploadProducer,
     critical_task: Option<CriticalTask>,
 }
@@ -365,11 +376,12 @@ struct LazyPublisher {
     store_url: String,
     buffer: usize,
     commit_metrics: StoreCommitMetrics,
+    strategy: Rayon,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
-    fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
+    fn new(context: RuntimeContext, store_url: String, buffer: usize, strategy: Rayon) -> Self {
         // Registered once here: `connect` is retried on failure and must not
         // re-register.
         let commit_metrics = StoreCommitMetrics::new(&context);
@@ -378,6 +390,7 @@ impl LazyPublisher {
             store_url,
             buffer,
             commit_metrics,
+            strategy,
             publisher: Mutex::new(None),
         }
     }
@@ -388,11 +401,12 @@ impl LazyPublisher {
                 return publisher;
             }
 
-            match EnginePublisher::connect(
+            match EnginePublisher::connect_with_strategy(
                 self.context.child("publisher"),
                 &self.store_url,
                 self.buffer,
                 self.commit_metrics.clone(),
+                self.strategy.clone(),
             )
             .await
             {
@@ -428,7 +442,7 @@ impl LazyPublisher {
 #[derive(Clone)]
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
-    metadata: Arc<Mutex<CursorMetadata>>,
+    metadata: Arc<FinalizedCursorStore>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
     publisher: Arc<LazyPublisher>,
 }
@@ -493,14 +507,12 @@ fn recovered_finalized_upload_cursor(
 impl FinalizedUploadProducer {
     async fn enqueue(
         self,
-        context: RuntimeContext,
         block: &EngineBlock<Sha256, PublicKey>,
-        databases: &EngineDatabases,
+        databases: &EngineDatabaseReaders,
     ) {
         loop {
             let mut cursor = self.cursor.lock().await;
-            let upload = match EnginePublisher::build_queued_finalized_upload_with_context(
-                context.child("build"),
+            let upload = match EnginePublisher::build_queued_finalized_upload(
                 cursor.state_next,
                 cursor.transaction_next,
                 block,
@@ -575,16 +587,19 @@ impl FinalizedUploadProducer {
     }
 }
 
-async fn persist_finalized_cursor(
-    metadata: &Arc<Mutex<CursorMetadata>>,
-    cursor: FinalizedUploadCursor,
-) {
+async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: FinalizedUploadCursor) {
+    let mut metadata = store.metadata.lock().await;
     loop {
-        let mut metadata = metadata.lock().await;
-        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        match metadata.sync().await {
-            Ok(()) => return,
+        let mut current = metadata
+            .take()
+            .expect("finalized cursor metadata must be present while locked");
+        current.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+        current.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+        match current.sync().await {
+            Ok(current) => {
+                *metadata = Some(current);
+                return;
+            }
             Err(error) => {
                 warn!(
                     error = %error,
@@ -594,8 +609,27 @@ async fn persist_finalized_cursor(
                 );
             }
         }
-        drop(metadata);
-        tokio::time::sleep(Duration::from_secs(1)).await;
+
+        loop {
+            match Metadata::init(
+                store.context.child("finalized_cursor"),
+                store.config.clone(),
+            )
+            .await
+            {
+                Ok(current) => {
+                    *metadata = Some(current);
+                    break;
+                }
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "failed to reopen finalized index cursor, retrying",
+                    );
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
+        }
     }
 }
 
@@ -614,7 +648,10 @@ async fn scan_finalized_queue_cursor(
                 drop(reservation);
             }
             Ok(None) => {
-                reader.reset().await;
+                reader
+                    .reset()
+                    .await
+                    .expect("failed to reset finalized index queue reader");
                 return cursor;
             }
             Err(error) => {
@@ -859,6 +896,7 @@ fn indexer_critical_task(
 /// Build the indexer wiring iff the secondary validator opted in.
 async fn maybe_build_indexer(
     context: RuntimeContext,
+    strategy: Rayon,
     is_primary: bool,
     indexer: Option<IndexerConfig>,
     partition_prefix: &str,
@@ -893,6 +931,7 @@ async fn maybe_build_indexer(
         context.child("publisher"),
         cfg.chain_indexer_url,
         max_active_uploads,
+        strategy,
     ));
     let page_cache = CacheRef::from_pooler(
         &context,
@@ -912,27 +951,29 @@ async fn maybe_build_indexer(
     )
     .await
     .expect("failed to initialize finalized index queue");
-    let mut metadata = Metadata::init(
-        context.child("finalized_cursor"),
-        MetadataConfig {
-            partition: format!("{partition_prefix}-finalized-index-cursor"),
-            codec_config: (),
-        },
-    )
-    .await
-    .expect("failed to initialize finalized index cursor");
+    let metadata_config = MetadataConfig {
+        partition: format!("{partition_prefix}-finalized-index-cursor"),
+        codec_config: (),
+    };
+    let mut metadata = Metadata::init(context.child("finalized_cursor"), metadata_config.clone())
+        .await
+        .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
     let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader, &budget).await;
     let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        metadata
+        metadata = metadata
             .sync()
             .await
             .expect("failed to persist finalized index cursor");
     }
-    let metadata = Arc::new(Mutex::new(metadata));
+    let metadata = Arc::new(FinalizedCursorStore {
+        context,
+        config: metadata_config,
+        metadata: Mutex::new(Some(metadata)),
+    });
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         metadata,
@@ -949,7 +990,6 @@ async fn maybe_build_indexer(
     ));
     Some(IndexerHandle {
         cert_reporter,
-        publisher,
         finalized_producer,
         critical_task: Some(indexer_critical_task(cert_join, finalized_join)),
     })
@@ -960,14 +1000,9 @@ fn indexer_finalized_hook(
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
 {
     let indexer = indexer?;
-    let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, databases| {
-        Box::pin(finalized_producer.clone().enqueue(
-            publisher.context.child("finalized_queue"),
-            block,
-            databases,
-        ))
+        Box::pin(finalized_producer.clone().enqueue(block, databases))
     }))
 }
 
@@ -1046,6 +1081,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 .expect("public_key_cache_size must be non-zero"),
         );
 
+        let max_peers_per_set = authenticated::peer_set_limit(
+            decoded
+                .primary_participants
+                .iter()
+                .chain(&decoded.secondary_participants),
+            &decoded.public_key,
+        );
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
                 decoded.signer.clone(),
@@ -1053,6 +1095,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
+                max_peers_per_set,
                 32 * 1024 * 1024,
             )
         } else {
@@ -1062,9 +1105,24 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
+                max_peers_per_set,
                 32 * 1024 * 1024,
             )
         };
+
+        // Registration multiplies the burst by the retained-peer bound. Divide the
+        // channel budget across peers to keep every channel mailbox bounded.
+        let retained_peer_bound = max_peers_per_set
+            .get()
+            .checked_mul(p2p_config.tracked_peer_sets.get())
+            .and_then(|count| count.checked_add(p2p_config.bootstrappers.len()))
+            .expect("retained peer bound overflow");
+        let channel_burst =
+            u32::try_from((NETWORK_CHANNEL_MAILBOX_BUDGET / retained_peer_bound).max(1))
+                .expect("network channel burst exceeds u32");
+        let quota = Quota::per_second(NonZeroU32::MAX).allow_burst(
+            NonZeroU32::new(channel_burst).expect("network channel burst must be non-zero"),
+        );
 
         let (mut network, mut oracle) = discovery::Network::new(context.child("p2p"), p2p_config);
 
@@ -1082,19 +1140,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .unwrap();
         oracle.track(0, TrackedPeers::new(primary, secondary));
 
-        // TODO: Add reasonable RL
-        let quota = Quota::per_second(std::num::NonZeroU32::MAX);
-        let backlog = 1024;
         let channels = Channels {
-            votes: network.register(VOTE_CHANNEL, quota, backlog),
-            certificates: network.register(CERTIFICATE_CHANNEL, quota, backlog),
-            resolver: network.register(RESOLVER_CHANNEL, quota, backlog),
-            marshal: network.register(MARSHAL_CHANNEL, quota, backlog),
-            marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota, backlog),
-            state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
-            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
+            votes: network.register(VOTE_CHANNEL, quota),
+            certificates: network.register(CERTIFICATE_CHANNEL, quota),
+            resolver: network.register(RESOLVER_CHANNEL, quota),
+            marshal: network.register(MARSHAL_CHANNEL, quota),
+            marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota),
+            state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota),
+            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota),
         };
-        let probe_network = network.register(PROBE_CHANNEL, quota, backlog);
+        let probe_network = network.register(PROBE_CHANNEL, quota);
         let provider =
             ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
                 &union(b"constantinople", b"_CONSENSUS"),
@@ -1182,6 +1237,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         let indexer_partition_prefix = decoded.partition_prefix.clone();
         let mut indexer_handle = maybe_build_indexer(
             context.child("indexer"),
+            strategy.clone(),
             is_primary,
             indexer,
             &indexer_partition_prefix,
@@ -1331,7 +1387,7 @@ mod tests {
         ed25519::PrivateKey,
         sha256::{Digest as Sha256Digest, Sha256},
     };
-    use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _};
+    use commonware_runtime::{Runner as _, Spawner as _, Strategizer as _, Supervisor as _};
     use commonware_storage::{
         merkle::mmr,
         qmdb::any::{
@@ -1340,7 +1396,7 @@ mod tests {
         },
         queue,
     };
-    use commonware_utils::{non_empty_range, sequence::FixedBytes};
+    use commonware_utils::{NZUsize, non_empty_range, sequence::FixedBytes};
     use constantinople_primitives::{
         Account, AccountKey, Block, Header, Sealable, SignedTransaction,
     };
@@ -1476,10 +1532,11 @@ mod tests {
                 upload_max_in_flight: 1,
                 upload_budget_bytes: super::FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
             };
+            let strategy = context.strategy(NZUsize!(2));
 
             let handle = tokio::time::timeout(
                 Duration::from_secs(2),
-                maybe_build_indexer(context, false, Some(indexer), "test"),
+                maybe_build_indexer(context, strategy, false, Some(indexer), "test"),
             )
             .await
             .expect("publisher connection should not block startup")
@@ -1669,6 +1726,7 @@ mod tests {
                 context.child("publisher"),
                 url.clone(),
                 2,
+                context.strategy(NZUsize!(2)),
             ));
             let engine_publisher = publisher.publisher().await;
             let (cert_reporter, cert_join) = EngineCertReporter::connect(

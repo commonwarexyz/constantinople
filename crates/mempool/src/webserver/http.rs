@@ -249,7 +249,7 @@ where
     let public_key_cache = state.public_key_cache.clone();
     let verified = state.strategy.spawn(move |strategy| {
         let _permit = permit;
-        let batch_id = H::hash(&body).to_string();
+        let batch_id = H::hash(&[body.as_ref()]).to_string();
 
         let decode = info_span!(
             parent: &parent,

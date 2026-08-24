@@ -5,7 +5,7 @@ mod properties;
 
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
@@ -16,7 +16,7 @@ use commonware_consensus::{
     Heightable,
     marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
-    types::{Epoch, coding::Commitment},
+    types::{Epoch, Round, View, coding::Commitment},
 };
 use commonware_cryptography::{
     Signer,
@@ -328,13 +328,12 @@ impl EngineDefinition for TestEngineDefinition {
                     startup,
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),
-                        apply_batch_size: 64,
+                        apply_batch_size: NZU64!(64),
                         max_outstanding_requests: 8,
                         update_channel_size: NZUsize!(256),
                         max_retained_roots: 32,
                     },
                     prune_config: Some(PruneConfig {
-                        max_pending_acks: MAX_PENDING_ACKS,
                         maintenance_interval: NZUsize!(16),
                         retained_marshal_blocks,
                         retained_qmdb_blocks: 0,
@@ -423,6 +422,13 @@ impl EngineDefinition for TestEngineDefinition {
     }
 }
 
+fn delay_first(engine: &TestEngineDefinition, view: u64) -> Crash<TestPublicKey> {
+    Crash::DelayRound {
+        participants: vec![engine.participants()[0].clone()],
+        round: Round::new(Epoch::zero(), View::new(view)),
+    }
+}
+
 fn run_finalize(engine: TestEngineDefinition) {
     PlanBuilder::new(engine)
         .link(default_link())
@@ -486,10 +492,10 @@ fn run_restart_with_archived_finalizations() {
         .crash(Crash::Schedule(
             Schedule::new()
                 .at(
-                    Duration::from_millis(2_500),
+                    Duration::from_millis(10_000),
                     Action::Crash(validator.clone()),
                 )
-                .at(Duration::from_millis(5_000), Action::Restart(validator)),
+                .at(Duration::from_millis(11_000), Action::Restart(validator)),
         ))
         .timeout(Duration::from_secs(30))
         .exit_condition(RestartRecoveryComplete::new(barrier.clone()))
@@ -499,10 +505,11 @@ fn run_restart_with_archived_finalizations() {
 }
 
 fn run_delayed_start(engine: TestEngineDefinition) {
+    let delayed = delay_first(&engine, 5);
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
-        .crash(Crash::Delay { count: 1, after: 5 })
+        .crash(delayed)
         .exit_condition(FinalizedHeightAtLeast::new(20))
         .property(BlockAgreementAtHeight::new(20))
         .run()
@@ -510,14 +517,12 @@ fn run_delayed_start(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync(engine: TestEngineDefinition) {
+    let delayed = delay_first(&engine, 80);
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
@@ -527,14 +532,12 @@ fn run_state_sync(engine: TestEngineDefinition) {
 
 fn run_state_sync_deterministic(engine: TestEngineDefinition) {
     let seeds = 0..2;
+    let delayed = delay_first(&engine, 80);
     let first = PlanBuilder::new(engine.clone())
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed.clone())
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
@@ -544,10 +547,7 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::new(150))
@@ -563,14 +563,12 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
+    let delayed = delay_first(&engine, 80);
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .crash(Crash::Random {
             frequency: Duration::from_secs(3),
             downtime: Duration::from_millis(500),
@@ -584,14 +582,12 @@ fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_lossy(engine: TestEngineDefinition) {
+    let delayed = delay_first(&engine, 80);
     PlanBuilder::new(engine)
         .link(lossy_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed)
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
         .property(BlockAgreementAtHeight::at_least(150, 3))
@@ -625,14 +621,21 @@ fn run_random_crashes(engine: TestEngineDefinition) {
 }
 
 fn run_many_crashes(engine: TestEngineDefinition) {
+    // Recurring three-node faults leave less healthy time than the real-time skip
+    // timeout. A finite outage keeps the intended concurrent-failure coverage.
+    let participants = engine.participants();
+    let mut schedule = Schedule::new();
+    for participant in participants.iter().take(3).cloned() {
+        schedule = schedule.at(Duration::from_millis(500), Action::Crash(participant));
+    }
+    for participant in participants.iter().take(3).cloned() {
+        schedule = schedule.at(Duration::from_millis(1_000), Action::Restart(participant));
+    }
+
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
-        .crash(Crash::Random {
-            frequency: Duration::from_secs(2),
-            downtime: Duration::from_millis(500),
-            count: 3,
-        })
+        .crash(Crash::Schedule(schedule))
         .exit_condition(FinalizedHeightAtLeast::new(50))
         .property(BlockAgreementAtHeight::new(50))
         .run()
@@ -666,19 +669,17 @@ fn run_total_shutdown(engine: TestEngineDefinition) {
 
 fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
     let delayed = engine.participants().first().cloned().unwrap();
+    let delayed_start = delay_first(&engine, 80);
 
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
+        .crash(delayed_start)
         .crash(Crash::Schedule(
             Schedule::new()
-                .at(Duration::from_millis(9_000), Action::Crash(delayed.clone()))
-                .at(Duration::from_millis(11_000), Action::Restart(delayed)),
+                .at(Duration::from_millis(5_000), Action::Crash(delayed.clone()))
+                .at(Duration::from_millis(7_000), Action::Restart(delayed)),
         ))
         .exit_condition(StateSyncReadyAtHeight::new(180))
         .property(LateJoinerStateSyncHandoff)
@@ -688,14 +689,31 @@ fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
 }
 
 fn run_rapid_crashes(engine: TestEngineDefinition) {
+    let validator = engine.participants()[0].clone();
+    let schedule = Schedule::new()
+        .at(Duration::from_millis(500), Action::Crash(validator.clone()))
+        .at(
+            Duration::from_millis(750),
+            Action::Restart(validator.clone()),
+        )
+        .at(
+            Duration::from_millis(1_000),
+            Action::Crash(validator.clone()),
+        )
+        .at(
+            Duration::from_millis(1_250),
+            Action::Restart(validator.clone()),
+        )
+        .at(
+            Duration::from_millis(1_500),
+            Action::Crash(validator.clone()),
+        )
+        .at(Duration::from_millis(1_750), Action::Restart(validator));
+
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
-        .crash(Crash::Random {
-            frequency: Duration::from_millis(750),
-            downtime: Duration::from_millis(250),
-            count: 1,
-        })
+        .crash(Crash::Schedule(schedule))
         .exit_condition(FinalizedHeightAtLeast::new(40))
         .property(BlockAgreementAtHeight::new(40))
         .run()

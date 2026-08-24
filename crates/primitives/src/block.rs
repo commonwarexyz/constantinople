@@ -59,7 +59,9 @@ where
     /// Hashes the encoded header to produce a digest.
     pub fn hash_slow<H: Hasher<Digest = D>>(&self, hasher: &mut H) -> D {
         hasher.update(self.encode().as_ref());
-        hasher.finalize()
+        let (next, digest) = core::mem::take(hasher).finalize();
+        *hasher = next;
+        digest
     }
 }
 
@@ -175,7 +177,7 @@ impl Default for BlockCfg {
 }
 
 /// A block containing signed transactions and required epoch-consensus metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Block<C, P, H>
 where
     C: Digest,
@@ -191,6 +193,20 @@ where
     /// caller's thread. Materialization is typically driven in parallel at
     /// verify time via a [`commonware_parallel::Strategy`].
     pub body: Vec<LazySignedTransaction<H>>,
+}
+
+impl<C, P, H> Clone for Block<C, P, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            body: self.body.clone(),
+        }
+    }
 }
 
 /// A sealed canonical block.

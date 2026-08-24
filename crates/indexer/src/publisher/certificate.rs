@@ -356,7 +356,7 @@ where
 }
 
 /// A finalized header tagged with the marshal commitment certified by Simplex.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CertifiedHeader<H, P>
 where
     H: Hasher,
@@ -364,6 +364,19 @@ where
 {
     commitment: Commitment,
     header: EngineHeader<H, P>,
+}
+
+impl<H, P> Clone for CertifiedHeader<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn clone(&self) -> Self {
+        Self {
+            commitment: self.commitment,
+            header: self.header.clone(),
+        }
+    }
 }
 
 impl<H, P> CertifiedHeader<H, P>

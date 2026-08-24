@@ -9,7 +9,7 @@ use commonware_consensus::{
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
-    Digest as _, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
+    Digest, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Sequential;
@@ -71,6 +71,8 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1024)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -89,13 +91,13 @@ fn transaction_config(cache: CacheRef) -> keyless_fixed::CompactConfig<Sequentia
     }
 }
 
-fn sync_range_from_bounds(
-    bounds: &Bounds<mmr::Family>,
-) -> commonware_utils::range::NonEmptyRange<mmr::Location> {
-    non_empty_range!(
-        bounds.inactivity_floor,
-        mmr::Location::new(bounds.total_size)
-    )
+fn sync_range_from_bounds<D>(
+    bounds: &Bounds<mmr::Family, D>,
+) -> commonware_utils::range::NonEmptyRange<mmr::Location>
+where
+    D: Digest,
+{
+    non_empty_range!(bounds.inactivity_floor, bounds.tip.size)
 }
 
 type TestBlock = SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
@@ -148,11 +150,11 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         .await
         .expect("genesis transactions");
     let state_target = StateSyncTarget::new(state.root(), sync_range_from_bounds(state.bounds()));
-    let transaction_target = TransactionHistoryTarget::new(
-        transactions.root(),
-        mmr::Location::new(transactions.bounds().total_size),
-    );
-    dbs.finalize((state, transactions)).await;
+    let transaction_target = TransactionHistoryTarget {
+        root: transactions.root(),
+        size: transactions.bounds().tip.size,
+    };
+    assert!(dbs.finalize((state, transactions)).await.durable().await);
 
     let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -427,7 +429,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
     let recipient = ed25519::PrivateKey::from_seed(8);
     let genesis_target = TransactionHistoryTarget {
         root: sha256::Digest::EMPTY,
-        leaf_count: commonware_storage::mmr::Location::new(1),
+        size: commonware_storage::mmr::Location::new(1),
     };
     let mut header = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -471,8 +473,8 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
 fn genesis_block_uses_the_initialized_transaction_target() {
     let leader = ed25519::PrivateKey::from_seed(11).public_key();
     let target = TransactionHistoryTarget {
-        root: sha256::Sha256::hash(b"genesis"),
-        leaf_count: commonware_storage::mmr::Location::new(1),
+        root: sha256::Sha256::hash(&[b"genesis"]),
+        size: commonware_storage::mmr::Location::new(1),
     };
 
     let block = genesis_block::<sha256::Digest, _, sha256::Sha256>(

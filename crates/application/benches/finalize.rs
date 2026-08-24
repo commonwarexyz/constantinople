@@ -44,7 +44,7 @@ const WARMUP: usize = 3;
 const ITERS: usize = 10;
 
 fn key(index: u64) -> AccountKey {
-    AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
 fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayon> {
@@ -65,6 +65,8 @@ fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayo
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
@@ -127,11 +129,11 @@ fn main() {
             }
             let state = state_batch.merkleize().await.expect("seed state");
             let transactions = transaction_batch.merkleize().await.expect("seed txs");
-            dbs.finalize((state, transactions)).await;
+            assert!(dbs.finalize((state, transactions)).await.durable().await);
 
             let transfers = Arc::new(transfers());
             let digests: Vec<_> = (0..TXS as u64)
-                .map(|i| Sha256::hash(&(u64::MAX - i).to_le_bytes()))
+                .map(|i| Sha256::hash(&[&(u64::MAX - i).to_le_bytes()]))
                 .collect();
 
             let mut totals = [Duration::ZERO; 3];

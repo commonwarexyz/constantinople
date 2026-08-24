@@ -61,7 +61,6 @@ constantinople-mempool = { workspace = true, features = ["mocks"] }
 commonware-coding.workspace = true
 commonware-glue.workspace = true
 commonware-math.workspace = true
-criterion.workspace = true
 rand.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true, features = ["util"] }

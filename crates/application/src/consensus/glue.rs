@@ -4,7 +4,9 @@ use super::{
     Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
-use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
+use commonware_glue::stateful::{
+    Application as CApplication, Input as CInput, Proposed, db::DatabaseSet,
+};
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, qmdb::sync::Target as AnyTarget, translator::EightCap};
@@ -22,7 +24,7 @@ where
     C: Digest,
     S: Scheme<PublicKey = P>,
     P: PublicKey,
-    I: TransactionSource<C, P, H> + Sync,
+    I: TransactionSource<C, P, H> + Clone + Sync,
     B: Send + Sync + 'static,
     St: Strategy,
 {
@@ -30,7 +32,8 @@ where
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;
-    type InputProvider = I;
+    type Provider = I;
+    type Input = ();
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
@@ -67,11 +70,14 @@ where
         context: (E, Self::Context),
         ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
-        input: &mut Self::InputProvider,
+        input: CInput<Self::Input, Self::Provider>,
     ) -> Option<Proposed<Self, E>> {
+        let mut input = input.provider;
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        let result = self.propose_child(context, parent, batches, input).await;
+        let result = self
+            .propose_child(context, parent, batches, &mut input)
+            .await;
 
         // propose_child releases the parent on the strategy's pool, so only
         // the drained ancestry stream remains; the span keeps its drop cost
@@ -122,10 +128,10 @@ where
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
-        databases: &Self::Databases,
+        readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
         if let Some(hook) = &self.finalized_hook {
-            hook(block, databases).await;
+            hook(block, &readers).await;
         }
     }
 }

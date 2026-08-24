@@ -10,17 +10,33 @@ use core::{
     future::{Future, ready},
     marker::PhantomData,
 };
-use std::collections::VecDeque;
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex},
+};
 
 /// A queue-backed transaction source for deterministic tests.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub struct StaticTransactionSource<C, P, H>
 where
     P: PublicKey,
     H: Hasher,
 {
-    proposals: VecDeque<Vec<VerifiedTransaction<H>>>,
+    proposals: Arc<Mutex<VecDeque<Vec<VerifiedTransaction<H>>>>>,
     _marker: PhantomData<(C, P)>,
+}
+
+impl<C, P, H> Clone for StaticTransactionSource<C, P, H>
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    fn clone(&self) -> Self {
+        Self {
+            proposals: Arc::clone(&self.proposals),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<C, P, H> StaticTransactionSource<C, P, H>
@@ -32,14 +48,17 @@ where
     /// Creates a new static source from queued proposal batches.
     pub fn new(proposals: Vec<Vec<VerifiedTransaction<H>>>) -> Self {
         Self {
-            proposals: proposals.into(),
+            proposals: Arc::new(Mutex::new(proposals.into())),
             _marker: PhantomData,
         }
     }
 
     /// Appends another proposal batch to the queue.
     pub fn push(&mut self, transactions: Vec<VerifiedTransaction<H>>) {
-        self.proposals.push_back(transactions);
+        self.proposals
+            .lock()
+            .expect("static transaction source lock poisoned")
+            .push_back(transactions);
     }
 }
 
@@ -57,7 +76,13 @@ where
         _round: Round,
         _filled: usize,
     ) -> impl Future<Output = Vec<VerifiedTransaction<H>>> + Send {
-        ready(self.proposals.pop_front().unwrap_or_default())
+        let transactions = self
+            .proposals
+            .lock()
+            .expect("static transaction source lock poisoned")
+            .pop_front()
+            .unwrap_or_default();
+        ready(transactions)
     }
 }
 
@@ -140,8 +165,8 @@ mod tests {
         };
 
         let round = Round::new(Epoch::zero(), View::zero());
-        let first = futures::executor::block_on(source.propose(&parent, round, 0));
-        let second = futures::executor::block_on(source.propose(&parent, round, 0));
+        let first = futures::executor::block_on(source.clone().propose(&parent, round, 0));
+        let second = futures::executor::block_on(source.clone().propose(&parent, round, 0));
         let third = futures::executor::block_on(source.propose(&parent, round, 0));
 
         assert_eq!(first.len(), 1);

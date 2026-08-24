@@ -388,9 +388,7 @@ where
         )));
     }
 
-    let mut hasher = H::new();
-    hasher.update(&bytes[..body_len]);
-    let actual = hasher.finalize();
+    let actual = H::hash(&[&bytes[..body_len]]);
     if actual.as_ref() != digest.as_ref() {
         return Err(ReadError::SqlRow(
             "tx_meta.body_hex transaction body does not match tx_digest".to_string(),
@@ -429,8 +427,6 @@ mod tests {
 
     fn digest_transaction_body(bytes: &[u8]) -> sha256::Digest {
         let body_len = Transaction::<sha256::Digest>::SIZE.min(bytes.len());
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes[..body_len]);
-        hasher.finalize()
+        Sha256::hash(&[&bytes[..body_len]])
     }
 }

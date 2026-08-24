@@ -760,25 +760,39 @@ where
     }
 }
 
-fn range_from_bounds<F>(bounds: &Bounds<F>) -> commonware_utils::range::NonEmptyRange<u64>
+fn range_from_bounds<F, D>(bounds: &Bounds<F, D>) -> commonware_utils::range::NonEmptyRange<u64>
 where
     F: Family,
+    D: Digest,
 {
-    non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
+    non_empty_range!(*bounds.inactivity_floor, *bounds.tip.size)
 }
 
 #[cfg(test)]
 mod tests {
     use super::range_from_bounds;
-    use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
+    use commonware_cryptography::{Digest as _, sha256};
+    use commonware_storage::{
+        mmr,
+        qmdb::batch_chain::{Bounds, Commitment},
+    };
     use commonware_utils::non_empty_range;
 
     #[test]
     fn range_comes_from_qmdb_bounds() {
         let bounds = Bounds {
-            base_size: 7,
-            db_size: 9,
-            total_size: 15,
+            base: Commitment {
+                size: mmr::Location::new(7),
+                root: sha256::Digest::EMPTY,
+            },
+            db: Commitment {
+                size: mmr::Location::new(9),
+                root: sha256::Digest::EMPTY,
+            },
+            tip: Commitment {
+                size: mmr::Location::new(15),
+                root: sha256::Digest::EMPTY,
+            },
             ancestors: Vec::new(),
             inactivity_floor: mmr::Location::new(11),
         };
