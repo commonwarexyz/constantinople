@@ -1,4 +1,8 @@
 import { toArrayBuffer } from './codec';
+import {
+    TransactionSubmissionError,
+    classifySubmissionResponse,
+} from './submissionResponse';
 
 export interface AccountView {
     readonly balance: number;
@@ -9,16 +13,6 @@ export interface NonceView {
     readonly base: number;
     readonly bitmap: number;
 }
-
-export type TxStatus =
-    | { readonly status: 'finalized'; readonly height: number }
-    | {
-          readonly status: 'partially_finalized';
-          readonly height: number;
-          readonly included: number;
-          readonly filtered: number;
-      }
-    | { readonly status: 'dropped' };
 
 export async function fetchAccount(baseUrl: string, publicKeyHex: string): Promise<AccountView | null> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/account/${publicKeyHex}`);
@@ -35,7 +29,7 @@ export async function submitTransactions(
     baseUrl: string,
     batch: Uint8Array,
     signal?: AbortSignal,
-): Promise<TxStatus> {
+): Promise<void> {
     const response = await fetch(`${trimTrailingSlash(baseUrl)}/transactions`, {
         method: 'POST',
         headers: { 'content-type': 'application/octet-stream' },
@@ -43,12 +37,15 @@ export async function submitTransactions(
         signal,
     });
 
-    if (!response.ok) {
-        const detail = await response.text();
-        const suffix = detail ? `: ${detail}` : '';
-        throw new Error(`transaction submission failed with HTTP ${response.status}${suffix}`);
+    const kind = classifySubmissionResponse(response.status);
+    if (kind === 'accepted') {
+        return;
     }
-    return response.json();
+
+    throw new TransactionSubmissionError(
+        kind,
+        `transaction submission failed with HTTP ${response.status}`,
+    );
 }
 
 function trimTrailingSlash(value: string): string {

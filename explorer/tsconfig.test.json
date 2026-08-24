@@ -20,8 +20,12 @@
         "src/blockSequence.ts",
         "src/codec.ts",
         "src/historyKey.ts",
+        "src/indexer.ts",
         "src/nonce.ts",
         "src/proofMath.ts",
-        "src/proofRetry.ts"
+        "src/proofRetry.ts",
+        "src/sqlCompatibility.ts",
+        "src/submissionHistory.ts",
+        "src/submissionResponse.ts"
     ]
 }

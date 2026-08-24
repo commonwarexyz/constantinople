@@ -28,11 +28,14 @@ histogram showing tx-count-per-block over the last ~80 blocks so the
 operator can see throughput scale at a glance. The histogram's y-axis
 is auto-scaled to the peak in the visible window.
 
-When the signed-in account submits transactions, the explorer uses the account
-activity digest to look up `tx_meta.qmdb_location` plus the raw signed
-transaction bytes, verifies the SQL bytes hash to that digest, fetches a
-transaction operation-log proof from `qmdb-indexer` under `/transactions`, and
-shows a checkmark after browser-side QMDB and Simplex verification succeeds.
+When the signed-in account submits a transaction, the relayer only acknowledges
+leader admission. The explorer already knows the signed transaction digest and
+uses it to wait for `tx_proof_meta.height` and
+`tx_proof_meta.qmdb_location`. Existing Stores fall back to the unchanged
+`tx_meta` and `block_meta` rows. The explorer then verifies the exact-height
+Simplex certificate and fetches the transaction operation-log proof from
+`qmdb-indexer` under `/transactions`. Finalization and latency are shown only
+after both proofs succeed.
 
 ### Why SQL?
 
@@ -43,8 +46,9 @@ The indexer publishes every finalized block to complementary surfaces
   digest, and finalization indexes. The explorer uses this for browser-side
   certificate/header verification and only fetches full block bodies when a
   workflow needs them.
-- **Metadata and lookup storage (SQL)** — `block_meta`, `tx_meta`,
-  `tx_activity`, and `account_meta` tables on top of the same store. Cheap to
+- **Metadata and lookup storage (SQL).** `block_meta`, `tx_meta`,
+  `tx_activity`, `account_meta`, and `tx_proof_meta` tables share the same
+  store. They are cheap to
   subscribe to from the browser and directly queryable for transaction proof
   metadata, transaction bodies, account activity, and latest account proof
   locations.
@@ -58,7 +62,7 @@ The indexer publishes every finalized block to complementary surfaces
 | `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
 | `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service. Matches the local-deploy `--qmdb-indexer-port` default. |
 | `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for Simplex artifacts. |
-| `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction submission/status endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
+| `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction admission endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
 | `VITE_VERIFY_CERTIFICATES` | `true` | Set to `false` to disable block-list certificate verification while profiling live block streaming. |
 

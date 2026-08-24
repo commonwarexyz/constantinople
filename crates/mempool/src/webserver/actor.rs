@@ -154,9 +154,19 @@ enum DigestOutcome {
     Dropped,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum IngestStatus {
     Accepted,
     Dropped,
+}
+
+const fn ingest_status_from_batch<D>(status: &StoredBatchStatus<D>) -> IngestStatus {
+    match status {
+        StoredBatchStatus::Accepted | StoredBatchStatus::Finalized { .. } => IngestStatus::Accepted,
+        StoredBatchStatus::PartiallyFinalized { .. } | StoredBatchStatus::Dropped => {
+            IngestStatus::Dropped
+        }
+    }
 }
 
 #[cfg(test)]
@@ -671,7 +681,7 @@ where
                     let batch_id: Arc<str> = batch_id.into();
                     if let Some(status) = statuses.get(batch_id.as_ref()) {
                         if let Some(ingest_result) = ingest_result {
-                            let _ = ingest_result.send(IngestStatus::Accepted);
+                            let _ = ingest_result.send(ingest_status_from_batch(status));
                         }
                         if let Some(result) = result {
                             if let Some(status) = tx_status_from_batch(status) {
@@ -806,9 +816,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DigestOutcome, PoolEntry, ProposedBatch, StoredBatchStatus, TxStatus,
-        batch_status_from_outcomes, new_transactions, pop_proposal, resolve_proposed_batches,
-        status_for_finalized_block,
+        DigestOutcome, IngestStatus, PoolEntry, ProposedBatch, StoredBatchStatus, TxStatus,
+        batch_status_from_outcomes, ingest_status_from_batch, new_transactions, pop_proposal,
+        resolve_proposed_batches, status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
     use commonware_cryptography::{Signer, ed25519, sha256};
@@ -817,6 +827,30 @@ mod tests {
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
     use std::collections::VecDeque;
+
+    #[test]
+    fn terminal_batch_statuses_preserve_ingest_truth() {
+        assert_eq!(
+            ingest_status_from_batch::<sha256::Digest>(&StoredBatchStatus::Accepted),
+            IngestStatus::Accepted,
+        );
+        assert_eq!(
+            ingest_status_from_batch::<sha256::Digest>(&StoredBatchStatus::Finalized { height: 7 }),
+            IngestStatus::Accepted,
+        );
+        assert_eq!(
+            ingest_status_from_batch(&StoredBatchStatus::PartiallyFinalized {
+                height: 7,
+                included: vec![sha256::Digest::from([1; 32])],
+                filtered: vec![sha256::Digest::from([2; 32])],
+            }),
+            IngestStatus::Dropped,
+        );
+        assert_eq!(
+            ingest_status_from_batch::<sha256::Digest>(&StoredBatchStatus::Dropped),
+            IngestStatus::Dropped,
+        );
+    }
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {

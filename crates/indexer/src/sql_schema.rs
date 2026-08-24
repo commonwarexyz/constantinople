@@ -11,10 +11,12 @@
 //!   the SQL metadata namespace (see [`crate::namespaces`]) via [`KvSchema`].
 //!   The `block_meta` table is what
 //!   the explorer subscribes to over the `sql.v1.Service` `Subscribe`
-//!   RPC. `tx_meta` stores one row per finalized transaction with proof and
-//!   body data. `tx_activity` stores one account-ordered row for each sender
-//!   and receiver side of a transaction. `account_meta` stores the latest
-//!   indexed account state plus its QMDB operation location.
+//!   RPC. `tx_meta` stores one row per finalized transaction with its proof
+//!   location and body data. `tx_proof_meta` adds digest-keyed finalized height
+//!   and proof location without changing the existing row layout. `tx_activity`
+//!   stores one account-ordered row for each sender and receiver side of a
+//!   transaction. `account_meta` stores the latest indexed account state plus
+//!   its QMDB operation location.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the
@@ -33,6 +35,8 @@ pub const TX_META_TABLE: &str = "tx_meta";
 pub const TX_ACTIVITY_TABLE: &str = "tx_activity";
 /// Name of the SQL table that records the latest indexed account state.
 pub const ACCOUNT_META_TABLE: &str = "account_meta";
+/// Name of the SQL table that records digest-keyed transaction proof metadata.
+pub const TX_PROOF_META_TABLE: &str = "tx_proof_meta";
 
 // ---------- block_meta columns ----------
 
@@ -59,6 +63,15 @@ pub const TX_META_DIGEST: &str = "tx_digest";
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
 /// `tx_meta`: encoded signed transaction bytes.
 pub const TX_META_BODY: &str = "body";
+
+// ---------- tx_proof_meta columns ----------
+
+/// `tx_proof_meta`: 32-byte transaction digest, fixed-size binary.
+pub const TX_PROOF_META_DIGEST: &str = "tx_digest";
+/// `tx_proof_meta`: finalized block height containing the transaction.
+pub const TX_PROOF_META_HEIGHT: &str = "height";
+/// `tx_proof_meta`: transaction-hash QMDB operation location.
+pub const TX_PROOF_META_QMDB_LOCATION: &str = "qmdb_location";
 
 // ---------- tx_activity columns ----------
 
@@ -192,6 +205,22 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 vec![],
             )
         })
+        .and_then(|schema| {
+            schema.table(
+                TX_PROOF_META_TABLE,
+                vec![
+                    TableColumnConfig::new(
+                        TX_PROOF_META_DIGEST,
+                        DataType::FixedSizeBinary(32),
+                        false,
+                    ),
+                    TableColumnConfig::new(TX_PROOF_META_HEIGHT, DataType::UInt64, false),
+                    TableColumnConfig::new(TX_PROOF_META_QMDB_LOCATION, DataType::UInt64, false),
+                ],
+                vec![TX_PROOF_META_DIGEST.to_string()],
+                vec![],
+            )
+        })
 }
 
 #[cfg(test)]
@@ -234,6 +263,39 @@ mod tests {
             tables.iter().any(|t| t == ACCOUNT_META_TABLE),
             "account_meta missing: {tables:?}"
         );
+        assert!(
+            tables.iter().any(|t| t == TX_PROOF_META_TABLE),
+            "tx_proof_meta missing: {tables:?}"
+        );
+
+        let table = ctx.table(TX_META_TABLE).await.expect("tx_meta table");
+        let fields = table.schema().fields();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name(), TX_META_DIGEST);
+        assert_eq!(fields[0].data_type(), &DataType::FixedSizeBinary(32));
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].name(), TX_META_QMDB_LOCATION);
+        assert_eq!(fields[1].data_type(), &DataType::UInt64);
+        assert!(!fields[1].is_nullable());
+        assert_eq!(fields[2].name(), TX_META_BODY);
+        assert_eq!(fields[2].data_type(), &DataType::Binary);
+        assert!(!fields[2].is_nullable());
+
+        let table = ctx
+            .table(TX_PROOF_META_TABLE)
+            .await
+            .expect("tx_proof_meta table");
+        let fields = table.schema().fields();
+        assert_eq!(fields.len(), 3);
+        assert_eq!(fields[0].name(), TX_PROOF_META_DIGEST);
+        assert_eq!(fields[0].data_type(), &DataType::FixedSizeBinary(32));
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].name(), TX_PROOF_META_HEIGHT);
+        assert_eq!(fields[1].data_type(), &DataType::UInt64);
+        assert!(!fields[1].is_nullable());
+        assert_eq!(fields[2].name(), TX_PROOF_META_QMDB_LOCATION);
+        assert_eq!(fields[2].data_type(), &DataType::UInt64);
+        assert!(!fields[2].is_nullable());
     }
 
     /// The string constants must remain stable so the explorer can rely on
@@ -242,6 +304,7 @@ mod tests {
     fn table_and_column_names_are_stable() {
         assert_eq!(BLOCK_META_TABLE, "block_meta");
         assert_eq!(TX_META_TABLE, "tx_meta");
+        assert_eq!(TX_PROOF_META_TABLE, "tx_proof_meta");
         assert_eq!(TX_ACTIVITY_TABLE, "tx_activity");
         assert_eq!(ACCOUNT_META_TABLE, "account_meta");
         assert_eq!(BLOCK_META_HEIGHT, "height");
@@ -254,6 +317,9 @@ mod tests {
         assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_META_BODY, "body");
+        assert_eq!(TX_PROOF_META_DIGEST, "tx_digest");
+        assert_eq!(TX_PROOF_META_HEIGHT, "height");
+        assert_eq!(TX_PROOF_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
         assert_eq!(TX_ACTIVITY_HEIGHT, "height");
         assert_eq!(TX_ACTIVITY_INDEX, "index");

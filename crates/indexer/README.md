@@ -18,7 +18,7 @@ that fits.
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
-| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or latest account proof locations without paying full-block decode cost. |
+| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`, `tx_proof_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or latest account proof locations without paying full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 
@@ -38,10 +38,34 @@ The current SQL table-prefix allocation is:
 | `tx_meta` | `0x1` | none |
 | `tx_activity` | `0x2` | none |
 | `account_meta` | `0x3` | none |
+| `tx_proof_meta` | `0x4` | none |
 
 `exoware-sql` expands those table prefixes into its Store key layout. There are
 currently no secondary SQL index rows, so finalized-block SQL writes only add
 primary table rows.
+
+The digest-keyed `tx_meta` row contract is:
+
+| Column | Type | Nullability | Purpose |
+| ------ | ---- | ----------- | ------- |
+| `tx_digest` | fixed-size binary with 32 bytes | non-null | Transaction digest and primary key. |
+| `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-hash QMDB append location. |
+| `body` | binary | non-null | Encoded signed transaction bytes. |
+
+The digest-keyed `tx_proof_meta` row contract is:
+
+| Column | Type | Nullability | Purpose |
+| ------ | ---- | ----------- | ------- |
+| `tx_digest` | fixed-size binary with 32 bytes | non-null | Transaction digest and primary key. |
+| `height` | unsigned 64-bit integer | non-null | Finalized block height containing the transaction. |
+| `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-hash QMDB append location. |
+
+The sidecar table is appended after all established tables, so existing table
+prefixes and `tx_meta` rows remain readable during an upgrade. New
+`tx_proof_meta` rows share the bulk Store commit with `tx_meta` and the
+transaction QMDB operation rows. Proofs become queryable once an inline or later
+grouped watermark covers that upload. Readers can recover proof height for older
+rows by locating `tx_meta.qmdb_location` within `block_meta`.
 
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate; height/latest reads start from a
@@ -65,8 +89,10 @@ the full body only when requested.
   on the single owning secondary. It commits `block_meta` first, then commits
   transaction lookup rows and both QMDB families through the gated bulk lane.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
-  storage and SQL transaction lookup rows. Latest-finalized-height is derived
-  from the Simplex finalization height index.
+  storage and SQL transaction lookup rows. Digest lookups combine `tx_meta`
+  with `tx_proof_meta` and expose the finalized height, QMDB location, and
+  signed body through `TransactionMetadata`.
+  Latest-finalized-height is derived from the Simplex finalization height index.
 - `[[bin]] chain-indexer` — thin wrapper around `exoware_simulator::server::run`
   for local development and deployer-managed remote bundles.
 - `[[bin]] metadata-indexer` — thin wrapper that registers

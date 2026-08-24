@@ -188,7 +188,7 @@ async fn run_relayer_mode(
         let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
         let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         let strategy = strategy.clone();
         let batches = spawn_presigner(
             strategy,
@@ -206,17 +206,15 @@ async fn run_relayer_mode(
         interval.tick().await;
         let totals = stats.totals();
         let elapsed = start.elapsed().as_secs_f64();
-        let tps = if elapsed > 0.0 {
-            totals.finalized as f64 / elapsed
+        let admission_tps = if elapsed > 0.0 {
+            totals.admitted as f64 / elapsed
         } else {
             0.0
         };
         info!(
-            finalized = totals.finalized,
-            filtered = totals.filtered,
-            dropped = totals.dropped,
+            admitted = totals.admitted,
             errors = totals.errors,
-            tps = format!("{tps:.0}"),
+            admission_tps = format!("{admission_tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"
         );

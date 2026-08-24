@@ -3,14 +3,19 @@
 //! Full blocks are stored in `exoware-simplex` as `{ header, body }` rows
 //! keyed by the certified block-header digest. Height/latest reads go through
 //! Simplex finalization indexes first, so callers can use the verified header
-//! path without fetching the full body. Transaction bodies and lookup metadata
-//! are stored in SQL `tx_meta` rows.
+//! path without fetching the full body. Transaction bodies remain in SQL
+//! `tx_meta` rows. Finalized proof coordinates use `tx_proof_meta` with a
+//! `block_meta` fallback for older Stores.
 
 use crate::{
     codec,
     namespaces::{simplex_client, sql_meta_client},
     publisher::certificate::CertifiedHeader,
-    sql_schema::build_meta_schema,
+    sql_schema::{
+        BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_TIP, TX_META_BODY,
+        TX_META_DIGEST, TX_META_QMDB_LOCATION, TX_META_TABLE, TX_PROOF_META_DIGEST,
+        TX_PROOF_META_HEIGHT, TX_PROOF_META_QMDB_LOCATION, TX_PROOF_META_TABLE, build_meta_schema,
+    },
 };
 use bytes::Bytes;
 use commonware_codec::{FixedSize as _, Read};
@@ -22,7 +27,10 @@ use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
 use datafusion::{
-    arrow::array::{Array, BinaryArray},
+    arrow::{
+        array::{Array, BinaryArray, UInt64Array},
+        record_batch::RecordBatch,
+    },
     prelude::SessionContext,
 };
 use exoware_sdk::{ClientError, StoreClient};
@@ -54,12 +62,23 @@ pub enum ReadError {
     Codec(#[from] commonware_codec::Error),
 }
 
+/// Digest-keyed finalized transaction metadata from the SQL lookup tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TransactionMetadata {
+    /// Finalized block height containing the transaction.
+    pub height: u64,
+    /// Transaction-hash QMDB append location.
+    pub qmdb_location: u64,
+    /// Encoded signed transaction bytes.
+    pub body: Bytes,
+}
+
 /// Typed read client over Simplex block rows and SQL transaction rows.
 ///
 /// | Field          | Families served                                  |
 /// | -------------- | ------------------------------------------------ |
 /// | `blocks`       | Simplex headers, blocks, notarizations, finals   |
-/// | `sql`          | `tx_meta` transaction bodies and lookup metadata |
+/// | `sql`          | Transaction bodies and proof lookup metadata     |
 #[derive(Clone)]
 pub struct IndexerClient {
     blocks: SimplexClient,
@@ -274,7 +293,7 @@ impl IndexerClient {
         H: Hasher,
     {
         let sql = format!(
-            "SELECT body FROM tx_meta WHERE tx_digest = X'{}' LIMIT 1",
+            "SELECT {TX_META_BODY} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{}' LIMIT 1",
             hex_lower(digest.as_ref())
         );
         let batches = self.sql.sql(&sql).await?.collect().await?;
@@ -282,19 +301,124 @@ impl IndexerClient {
             if batch.num_rows() == 0 {
                 continue;
             }
-            let body = batch
+            return Ok(Some(verified_transaction_body::<H>(&batch, 0, digest)?));
+        }
+        Ok(None)
+    }
+
+    /// Fetch the finalized metadata for `digest`, or `None` if absent.
+    ///
+    /// The row is accepted only when every value has the canonical non-null
+    /// SQL type and the transaction body hashes back to `digest`.
+    pub async fn transaction_metadata<H>(
+        &self,
+        digest: &H::Digest,
+    ) -> Result<Option<TransactionMetadata>, ReadError>
+    where
+        H: Hasher,
+    {
+        let digest_hex = hex_lower(digest.as_ref());
+        let sql = format!(
+            "SELECT {TX_META_QMDB_LOCATION}, {TX_META_BODY} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
+        );
+        let batches = self.sql.sql(&sql).await?.collect().await?;
+        for batch in batches {
+            if batch.num_rows() == 0 {
+                continue;
+            }
+            let qmdb_location = batch
                 .column(0)
                 .as_any()
-                .downcast_ref::<BinaryArray>()
-                .ok_or_else(|| ReadError::SqlRow("tx_meta.body must be Binary".to_string()))?;
-            if body.is_null(0) {
+                .downcast_ref::<UInt64Array>()
+                .ok_or_else(|| {
+                    ReadError::SqlRow("tx_meta.qmdb_location must be UInt64".to_string())
+                })?;
+            if qmdb_location.is_null(0) {
                 return Err(ReadError::SqlRow(
-                    "tx_meta.body must not be null".to_string(),
+                    "tx_meta.qmdb_location must not be null".to_string(),
                 ));
             }
-            let bytes = body.value(0).to_vec();
-            verify_signed_transaction_digest::<H>(&bytes, digest)?;
-            return Ok(Some(Bytes::from(bytes)));
+            let qmdb_location = qmdb_location.value(0);
+            let body = verified_transaction_body::<H>(&batch, 1, digest)?;
+
+            let proof_sql = format!(
+                "SELECT {TX_PROOF_META_HEIGHT}, {TX_PROOF_META_QMDB_LOCATION} FROM {TX_PROOF_META_TABLE} WHERE {TX_PROOF_META_DIGEST} = X'{digest_hex}' LIMIT 1"
+            );
+            let proof_batches = self.sql.sql(&proof_sql).await?.collect().await?;
+            let mut height = None;
+            for proof_batch in proof_batches {
+                if proof_batch.num_rows() == 0 {
+                    continue;
+                }
+                let proof_height = proof_batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        ReadError::SqlRow("tx_proof_meta.height must be UInt64".to_string())
+                    })?;
+                let proof_location = proof_batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .ok_or_else(|| {
+                        ReadError::SqlRow("tx_proof_meta.qmdb_location must be UInt64".to_string())
+                    })?;
+                if proof_height.is_null(0) || proof_location.is_null(0) {
+                    return Err(ReadError::SqlRow(
+                        "tx_proof_meta values must not be null".to_string(),
+                    ));
+                }
+                if proof_location.value(0) != qmdb_location {
+                    return Err(ReadError::SqlRow(
+                        "transaction metadata QMDB locations do not match".to_string(),
+                    ));
+                }
+                height = Some(proof_height.value(0));
+                break;
+            }
+
+            let height = match height {
+                Some(height) => height,
+                None => {
+                    let block_sql = format!(
+                        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} > {qmdb_location} ORDER BY {BLOCK_META_HEIGHT} ASC LIMIT 1"
+                    );
+                    let block_batches = self.sql.sql(&block_sql).await?.collect().await?;
+                    let mut height = None;
+                    for block_batch in block_batches {
+                        if block_batch.num_rows() == 0 {
+                            continue;
+                        }
+                        let block_height = block_batch
+                            .column(0)
+                            .as_any()
+                            .downcast_ref::<UInt64Array>()
+                            .ok_or_else(|| {
+                                ReadError::SqlRow("block_meta.height must be UInt64".to_string())
+                            })?;
+                        if block_height.is_null(0) {
+                            return Err(ReadError::SqlRow(
+                                "block_meta.height must not be null".to_string(),
+                            ));
+                        }
+                        height = Some(block_height.value(0));
+                        break;
+                    }
+                    height.ok_or_else(|| {
+                        ReadError::SqlRow(
+                            "transaction QMDB location has no containing finalized block"
+                                .to_string(),
+                        )
+                    })?
+                }
+            };
+
+            return Ok(Some(TransactionMetadata {
+                height,
+                qmdb_location,
+                body,
+            }));
         }
         Ok(None)
     }
@@ -374,6 +498,29 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+fn verified_transaction_body<H>(
+    batch: &RecordBatch,
+    column: usize,
+    digest: &H::Digest,
+) -> Result<Bytes, ReadError>
+where
+    H: Hasher,
+{
+    let body = batch
+        .column(column)
+        .as_any()
+        .downcast_ref::<BinaryArray>()
+        .ok_or_else(|| ReadError::SqlRow("tx_meta.body must be Binary".to_string()))?;
+    if body.is_null(0) {
+        return Err(ReadError::SqlRow(
+            "tx_meta.body must not be null".to_string(),
+        ));
+    }
+    let body = Bytes::copy_from_slice(body.value(0));
+    verify_signed_transaction_digest::<H>(&body, digest)?;
+    Ok(body)
 }
 
 fn verify_signed_transaction_digest<H>(bytes: &[u8], digest: &H::Digest) -> Result<(), ReadError>

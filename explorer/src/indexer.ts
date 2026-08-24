@@ -14,7 +14,7 @@
 
 import { Code, ConnectError } from '@connectrpc/connect';
 import { type DecodedSubscribeFrame, SqlClient } from '@exowarexyz/sql';
-import { collectLiveBlocks, createBlockSequenceCursor } from './blockSequence';
+import { collectLiveBlocks, createBlockSequenceCursor } from './blockSequence.ts';
 
 /** `block_meta` column names (mirror `crates/indexer/src/sql_schema.rs`). */
 const COL_HEIGHT = 'height';
@@ -41,7 +41,8 @@ export interface ObservedBlock {
 
 export interface SubscribeBlocksOptions {
     readonly signal?: AbortSignal;
-    readonly onNetworkError?: (message: string) => void;
+    readonly reconnectDelayMs?: number;
+    readonly onError?: (message: string) => void;
     readonly onReconnect?: () => void;
 }
 
@@ -61,6 +62,7 @@ export async function* subscribeBlocks(
 ): AsyncGenerator<ObservedBlock, void, void> {
     const sql = new SqlClient(sqlUrl);
     const signal = options.signal;
+    const reconnectDelayMs = options.reconnectDelayMs ?? NETWORK_RECONNECT_DELAY_MS;
 
     // Cap consecutive transient retries so a genuinely broken server can't
     // trap us in a tight reconnect loop. A single delivered frame resets
@@ -90,29 +92,23 @@ export async function* subscribeBlocks(
                 yield* collectLiveBlocks(cursor, decodeFrame(frame));
                 nextSequence = frameNextSequence;
             }
-            // Server-streaming RPC ended cleanly (no more frames). Loop
-            // and re-subscribe from `nextSequence` so the UI keeps following
-            // the live tail without dropping batches committed between RPCs.
+            if (signal?.aborted) return;
+            transientRetries = 0;
+            options.onError?.('block subscription ended');
+            if (!(await waitForRetry(reconnectDelayMs, signal))) return;
         } catch (error) {
             if (signal?.aborted) {
                 return;
             }
-            if (isNetworkError(error)) {
-                options.onNetworkError?.(errorMessage(error));
-                await sleep(NETWORK_RECONNECT_DELAY_MS, signal);
+            if (isTransientBatchRaceError(error) && transientRetries < MAX_TRANSIENT_RETRIES) {
+                transientRetries++;
+                if (!(await waitForRetry(250, signal))) return;
                 continue;
             }
-            if (
-                !isTransientBatchRaceError(error) ||
-                transientRetries >= MAX_TRANSIENT_RETRIES
-            ) {
-                throw error;
-            }
-            transientRetries++;
-            // Brief backoff before reconnecting; the race window is short
-            // (commit ordering across the indexer's concurrent uploaders)
-            // so a single reconnect almost always succeeds.
-            await sleep(250);
+
+            transientRetries = 0;
+            options.onError?.(errorMessage(error));
+            if (!(await waitForRetry(reconnectDelayMs, signal))) return;
         }
     }
 }
@@ -187,36 +183,30 @@ function isTransientBatchRaceError(error: unknown): boolean {
     );
 }
 
-function isNetworkError(error: unknown): boolean {
-    if (error instanceof ConnectError) {
-        return (
-            error.code === Code.Unavailable ||
-            error.code === Code.Aborted ||
-            error.code === Code.DeadlineExceeded ||
-            (error.code === Code.Unknown && /fetch|network|transport|failed/i.test(error.message))
-        );
-    }
-    return error instanceof TypeError && /fetch|network|load|failed/i.test(error.message);
-}
-
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
-function sleep(ms: number, signal?: AbortSignal): Promise<void> {
-    return new Promise((resolve, reject) => {
+function waitForRetry(ms: number, signal?: AbortSignal): Promise<boolean> {
+    return new Promise((resolve) => {
+        let settled = false;
+        let timeout: ReturnType<typeof setTimeout> | undefined;
+        const finish = (completed: boolean) => {
+            if (settled) return;
+            settled = true;
+            if (timeout !== undefined) clearTimeout(timeout);
+            signal?.removeEventListener('abort', onAbort);
+            resolve(completed);
+        };
+        const onAbort = () => finish(false);
+
         if (signal?.aborted) {
-            reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
+            resolve(false);
             return;
         }
-        const timeout = window.setTimeout(resolve, ms);
-        signal?.addEventListener(
-            'abort',
-            () => {
-                window.clearTimeout(timeout);
-                reject(signal.reason ?? new DOMException('aborted', 'AbortError'));
-            },
-            { once: true },
-        );
+
+        timeout = setTimeout(() => finish(true), ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
+        if (signal?.aborted) onAbort();
     });
 }

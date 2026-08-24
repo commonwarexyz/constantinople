@@ -3,8 +3,9 @@
 use crate::publisher::{
     SqlRow,
     sql::{
-        BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, encode_block_meta_row,
-        encode_tx_activity_row, encode_tx_meta_row,
+        BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, TxProofMetaRow,
+        encode_block_meta_row, encode_tx_activity_row, encode_tx_meta_row,
+        encode_tx_proof_meta_row,
     },
 };
 use bytes::Bytes;
@@ -118,9 +119,10 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    let mut sql = Vec::with_capacity(3 * body_len);
+    let mut sql = Vec::with_capacity(4 * body_len);
 
-    // One tx_meta row plus sender/receiver tx_activity rows per transaction.
+    // Proof metadata remains separate so the established tx_meta row encoding
+    // stays readable across rolling upgrades.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
     for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
         transaction_digests.push(tx.digest);
@@ -135,6 +137,11 @@ where
             digest,
             qmdb_location,
             body: tx.bytes,
+        }));
+        sql.push(encode_tx_proof_meta_row(TxProofMetaRow {
+            digest,
+            height,
+            qmdb_location,
         }));
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
@@ -392,10 +399,26 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
+        assert_eq!(meta.values.len(), 3);
+        assert!(matches!(meta.values.get(1), Some(CellValue::UInt64(0))));
         let Some(CellValue::Binary(body)) = meta.values.get(2) else {
             panic!("tx_meta body should be binary");
         };
         assert_eq!(body.as_slice(), expected_body);
+
+        let proof_meta = rows
+            .iter()
+            .find(|row| row.table == crate::sql_schema::TX_PROOF_META_TABLE)
+            .expect("tx_proof_meta row should be indexed");
+        assert_eq!(proof_meta.values.len(), 3);
+        assert!(matches!(
+            proof_meta.values.get(1),
+            Some(CellValue::UInt64(7))
+        ));
+        assert!(matches!(
+            proof_meta.values.get(2),
+            Some(CellValue::UInt64(0))
+        ));
     }
 
     fn test_header(

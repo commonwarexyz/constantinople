@@ -8,7 +8,7 @@
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `simplex`        | certified headers, full blocks by digest, certificates       |
 //! | `sql` (fast lane) | `block_meta`                                                 |
-//! | `sql` (bulk)      | `tx_meta`, `tx_activity`, `account_meta`                     |
+//! | `sql` (bulk)      | `tx_meta`, `tx_activity`, `account_meta`, `tx_proof_meta`    |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!

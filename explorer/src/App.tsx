@@ -20,8 +20,8 @@ import {
     fetchAccount,
     submitTransactions,
     type AccountView,
-    type TxStatus,
 } from './mempool';
+import { isDeterministicSubmissionRejection } from './submissionResponse';
 import {
     fetchAccountTransactionsPage,
     fetchAndVerifyAccountProof,
@@ -54,6 +54,26 @@ import {
     signInWithPasskey,
     type ActiveWallet,
 } from './wallet';
+import {
+    WAITING_FINALIZATION_CERTIFICATE,
+    WAITING_FINALIZATION_PROOF,
+    assignReconciliationOrder,
+    isAccountKeyHex,
+    markReconciliationCertificate,
+    markReconciliationError,
+    markReconciliationFetching,
+    markReconciliationWaiting,
+    markSubmissionReconciling,
+    markSubmissionRejected,
+    markTransactionFinalized,
+    normalizeSubmittedTransaction,
+    prependTransaction,
+    reconciliationRetryDelay,
+    shouldReconcileTransaction,
+    type BlockCertificateState,
+    type SubmittedTransaction,
+    type TransactionProofState,
+} from './submissionHistory';
 
 /** Most recent finalized blocks to keep for the centered throughput histogram. */
 const HISTOGRAM_MAX_COLUMNS = 180;
@@ -95,53 +115,6 @@ function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
     return fallback;
 }
 
-interface SubmittedTransaction {
-    readonly sender: string;
-    readonly digest: string;
-    readonly to: string;
-    readonly value: string;
-    readonly nonce: string;
-    readonly submittedAt: number;
-    readonly finalizedInMs: number | null;
-    readonly status: 'pending' | 'finalized' | 'partially_finalized' | 'dropped' | 'error';
-    readonly detail: string;
-    readonly finalizedHeight: number | null;
-    readonly certificate: BlockCertificateState;
-    readonly proof: TransactionProofState;
-}
-
-type BlockCertificateState =
-    | { readonly status: 'waiting'; readonly detail: string }
-    | { readonly status: 'fetching'; readonly detail: string }
-    | {
-          readonly status: 'verified';
-          readonly detail: string;
-          readonly height: string;
-          readonly view: string;
-      }
-    | { readonly status: 'error'; readonly detail: string };
-
-const WAITING_FINALIZATION_CERTIFICATE = {
-    status: 'waiting',
-    detail: 'waiting for finalization',
-} satisfies BlockCertificateState;
-const WAITING_BLOCK_CERTIFICATE = {
-    status: 'waiting',
-    detail: 'waiting for block certificate',
-} satisfies BlockCertificateState;
-
-type TransactionProofState =
-    | { readonly status: 'waiting'; readonly detail: string }
-    | { readonly status: 'fetching'; readonly detail: string }
-    | {
-          readonly status: 'verified';
-          readonly detail: string;
-          readonly location: string;
-          readonly tip: string;
-          readonly proofSizeBytes: number;
-      }
-    | { readonly status: 'error'; readonly detail: string };
-
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
     | { readonly status: 'fetching'; readonly detail: string }
@@ -161,6 +134,13 @@ interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
     readonly latestBlockAt: number | null;
 }
+
+interface TransactionReconciliation {
+    readonly controller: AbortController;
+    timer: number | null;
+}
+
+const MAX_CONCURRENT_RECONCILIATIONS = 3;
 
 export default function App() {
     const [blocks, setBlocks] = useState<ObservedBlock[]>([]);
@@ -202,6 +182,7 @@ export default function App() {
     const [accountNextCursor, setAccountNextCursor] = useState<Uint8Array | null>(null);
     const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
+    const [storageError, setStorageError] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isSubmitting = pendingSubmissionCount > 0;
@@ -221,6 +202,14 @@ export default function App() {
         },
         signedInAccountKey,
     );
+    const activeHistoryKeyRef = useRef<string | null>(historyKey);
+    const loadedHistoryKeyRef = useRef<string | null>(loadedHistoryKey);
+    const reconciliationsRef = useRef(new Map<string, TransactionReconciliation>());
+    const reconciliationOrderRef = useRef(new Map<string, number>());
+    const reconciliationFailuresRef = useRef(new Map<string, number>());
+    const reconciliationSequenceRef = useRef(0);
+    activeHistoryKeyRef.current = historyKey;
+    loadedHistoryKeyRef.current = loadedHistoryKey;
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
 
     const setLocalNonceState = (nextNonce: NonceState) => {
@@ -253,10 +242,15 @@ export default function App() {
     };
 
     useEffect(() => {
-        const restoredWallet = restoreWalletSession();
-        if (!restoredWallet) return;
-        setWallet(restoredWallet);
-        setWalletMessage('signed in');
+        try {
+            const restoredWallet = restoreWalletSession();
+            if (!restoredWallet) return;
+            setWallet(restoredWallet);
+            setWalletMessage('signed in');
+        } catch (error) {
+            setStorageError(storageErrorMessage(error));
+            setWalletMessage('wallet session unavailable');
+        }
     }, []);
 
     useEffect(() => {
@@ -267,8 +261,8 @@ export default function App() {
             try {
                 for await (const block of subscribeBlocks(indexerUrl, {
                     signal: controller.signal,
-                    onNetworkError: (message) =>
-                        setStatus({ kind: 'error', message: `network error: ${message}` }),
+                    onError: (message) =>
+                        setStatus({ kind: 'error', message: `backend error: ${message}` }),
                     onReconnect: () => setStatus({ kind: 'connecting' }),
                 })) {
                     if (cancelled) return;
@@ -290,7 +284,7 @@ export default function App() {
     }, []);
 
     useEffect(() => {
-        setHistory(historyKey === null ? [] : readHistory(historyKey));
+        setHistory(historyKey === null ? [] : readHistory(historyKey, setStorageError));
         setLoadedHistoryKey(historyKey);
     }, [historyKey]);
 
@@ -320,7 +314,8 @@ export default function App() {
     useEffect(() => {
         if (historyKey === null) return;
         if (loadedHistoryKey !== historyKey) return;
-        writeHistory(historyKey, history);
+        const error = writeHistory(historyKey, history);
+        if (error) setStorageError(error);
     }, [historyKey, loadedHistoryKey, history]);
 
     useEffect(() => {
@@ -460,76 +455,197 @@ export default function App() {
     }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
 
     useEffect(() => {
-        const signedInSender = signedInAccountKey;
-        if (hasFetchingProof(history, signedInSender)) return;
+        const reconciliations = reconciliationsRef.current;
+        return () => {
+            for (const reconciliation of reconciliations.values()) {
+                reconciliation.controller.abort();
+                if (reconciliation.timer !== null) {
+                    window.clearTimeout(reconciliation.timer);
+                }
+            }
+            reconciliations.clear();
+            reconciliationOrderRef.current.clear();
+            reconciliationFailuresRef.current.clear();
+            reconciliationSequenceRef.current = 0;
+        };
+    }, [historyKey]);
 
-        const tx = history.find((entry) => shouldFetchTransactionProof(entry, signedInSender));
-        if (!tx) return;
+    useEffect(() => {
+        if (historyKey === null || loadedHistoryKey !== historyKey) return;
 
-        setHistory((current) =>
-            updateTransactionProof(
-                tx.digest,
-                { status: 'fetching', detail: 'fetching QMDB proof' },
-                current,
-            ),
+        const reconciliations = reconciliationsRef.current;
+        const trackedDigests = new Set(history.map((tx) => tx.digest));
+        for (const [digest, reconciliation] of reconciliations) {
+            if (trackedDigests.has(digest)) continue;
+            reconciliation.controller.abort();
+            if (reconciliation.timer !== null) {
+                window.clearTimeout(reconciliation.timer);
+            }
+            reconciliations.delete(digest);
+        }
+        for (const digest of reconciliationOrderRef.current.keys()) {
+            if (!trackedDigests.has(digest)) reconciliationOrderRef.current.delete(digest);
+        }
+        for (const digest of reconciliationFailuresRef.current.keys()) {
+            if (!trackedDigests.has(digest)) reconciliationFailuresRef.current.delete(digest);
+        }
+
+        const eligible = history.filter((tx) =>
+            shouldReconcileTransaction(tx, signedInAccountKey),
         );
-        fetchAndVerifyTransactionProof({
-            qmdbUrl,
-            storeUrl,
-            sqlUrl: indexerUrl,
-            simplexVerificationMaterial,
-            digest: tx.digest,
-            height: tx.finalizedHeight,
-            onFinalizationVerified: (target) => {
-                const certificate = verifiedBlockCertificateState(target);
-                setHistory((current) =>
-                    updateBlockCertificateByHeight(Number(target.height), certificate, current),
-                );
-            },
-        })
-            .then((proof) => {
-                const certificate = verifiedBlockCertificateState(proof);
-                setHistory((current) =>
-                    updateBlockCertificateByHeight(
-                        Number(proof.height),
-                        certificate,
-                        updateTransactionProof(tx.digest, verifiedProofState(proof), current),
-                    ),
-                );
-            })
-            .catch((error) => {
-                const detail = error instanceof Error ? error.message : String(error);
-                if (isRetryableProofError(detail)) {
+        reconciliationSequenceRef.current = assignReconciliationOrder(
+            [...eligible].reverse(),
+            reconciliationOrderRef.current,
+            reconciliationSequenceRef.current,
+        );
+
+        const available = MAX_CONCURRENT_RECONCILIATIONS - reconciliations.size;
+        if (available <= 0) return;
+
+        const transactions = eligible
+            .filter((tx) => !reconciliations.has(tx.digest))
+            .sort(
+                (left, right) =>
+                    (reconciliationOrderRef.current.get(left.digest) ?? 0) -
+                    (reconciliationOrderRef.current.get(right.digest) ?? 0),
+            )
+            .slice(0, available);
+
+        for (const tx of transactions) {
+            const reconciliation: TransactionReconciliation = {
+                controller: new AbortController(),
+                timer: null,
+            };
+            reconciliations.set(tx.digest, reconciliation);
+            const releaseReconciliation = () => {
+                if (reconciliations.get(tx.digest) !== reconciliation) return false;
+                reconciliations.delete(tx.digest);
+                return true;
+            };
+            setHistory((current) => markReconciliationFetching(tx.digest, current));
+
+            fetchAndVerifyTransactionProof({
+                qmdbUrl,
+                storeUrl,
+                sqlUrl: indexerUrl,
+                simplexVerificationMaterial,
+                digest: tx.digest,
+                signal: reconciliation.controller.signal,
+                onFinalizationVerified: (target) => {
+                    if (
+                        reconciliation.controller.signal.aborted ||
+                        activeHistoryKeyRef.current !== historyKey ||
+                        reconciliations.get(tx.digest) !== reconciliation
+                    ) {
+                        return;
+                    }
+                    const height = Number(target.height);
+                    if (!Number.isSafeInteger(height)) {
+                        throw new Error('finalized transaction height exceeds Number.MAX_SAFE_INTEGER');
+                    }
+                    const certificate = verifiedBlockCertificateState(target);
                     setHistory((current) =>
-                        updateTransactionProof(
+                        markReconciliationCertificate(tx.digest, height, certificate, current),
+                    );
+                },
+            })
+                .then((proof) => {
+                    if (
+                        reconciliation.controller.signal.aborted ||
+                        activeHistoryKeyRef.current !== historyKey
+                    ) {
+                        return;
+                    }
+                    if (!releaseReconciliation()) return;
+                    reconciliationOrderRef.current.delete(tx.digest);
+                    reconciliationFailuresRef.current.delete(tx.digest);
+                    const height = Number(proof.height);
+                    const certificate = verifiedBlockCertificateState(proof);
+                    const proofState = verifiedProofState(proof);
+                    setHistory((current) =>
+                        markTransactionFinalized(
                             tx.digest,
-                            { status: 'fetching', detail: 'waiting for indexer metadata' },
+                            height,
+                            certificate,
+                            proofState,
+                            Date.now(),
                             current,
                         ),
                     );
-                    window.setTimeout(() => {
+                    if (wallet !== null && activeHistoryKeyRef.current === historyKey) {
+                        fetchAccount(mempoolUrl, wallet.publicKeyHex)
+                            .then((nextAccount) => {
+                                if (activeHistoryKeyRef.current !== historyKey) return;
+                                setAccount(nextAccount);
+                                mergeLocalNonceState(accountNonceState(nextAccount));
+                                setAccountMessage(
+                                    nextAccount
+                                        ? 'committed account loaded'
+                                        : 'no committed account yet. default balance applies',
+                                );
+                            })
+                            .catch((error) => {
+                                if (activeHistoryKeyRef.current !== historyKey) return;
+                                setAccountMessage(
+                                    error instanceof Error ? error.message : String(error),
+                                );
+                            });
+                    }
+                })
+                .catch((error) => {
+                    if (
+                        reconciliation.controller.signal.aborted ||
+                        activeHistoryKeyRef.current !== historyKey ||
+                        reconciliations.get(tx.digest) !== reconciliation
+                    ) {
+                        releaseReconciliation();
+                        return;
+                    }
+
+                    const detail = error instanceof Error ? error.message : String(error);
+                    if (!isRetryableProofError(detail)) {
+                        if (!releaseReconciliation()) return;
+                        reconciliationOrderRef.current.delete(tx.digest);
+                        reconciliationFailuresRef.current.delete(tx.digest);
                         setHistory((current) =>
-                            updateTransactionProof(
+                            markReconciliationError(tx.digest, detail, current),
+                        );
+                        return;
+                    }
+
+                    const failures =
+                        (reconciliationFailuresRef.current.get(tx.digest) ?? 0) + 1;
+                    reconciliationFailuresRef.current.set(tx.digest, failures);
+                    const waitingDetail = 'reconciliation retry scheduled';
+                    setHistory((current) =>
+                        markReconciliationWaiting(tx.digest, waitingDetail, current),
+                    );
+                    reconciliation.timer = window.setTimeout(() => {
+                        if (reconciliations.get(tx.digest) !== reconciliation) return;
+                        reconciliation.timer = null;
+                        reconciliations.delete(tx.digest);
+                        if (
+                            reconciliation.controller.signal.aborted ||
+                            activeHistoryKeyRef.current !== historyKey
+                        ) {
+                            return;
+                        }
+                        reconciliationSequenceRef.current += 1;
+                        reconciliationOrderRef.current.set(
+                            tx.digest,
+                            reconciliationSequenceRef.current,
+                        );
+                        setHistory((current) =>
+                            markReconciliationWaiting(
                                 tx.digest,
-                                { status: 'waiting', detail: 'waiting for QMDB proof' },
+                                WAITING_FINALIZATION_PROOF.detail,
                                 current,
                             ),
                         );
-                    }, 1_000);
-                    return;
-                }
-                setHistory((current) =>
-                    updateTransactionProof(
-                        tx.digest,
-                        {
-                            status: 'error',
-                            detail,
-                        },
-                        current,
-                    ),
-                );
-            });
-    }, [history, signedInAccountKey]);
+                    }, reconciliationRetryDelay(failures));
+                });
+        }
+    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet]);
 
     useEffect(() => {
         return () => {
@@ -610,7 +726,11 @@ export default function App() {
     };
 
     const handleSignOut = () => {
-        clearSession();
+        try {
+            clearSession();
+        } catch (error) {
+            setStorageError(storageErrorMessage(error));
+        }
         setWallet(null);
         setWalletMessage('signed out');
     };
@@ -692,10 +812,46 @@ export default function App() {
     };
 
     const clearSubmittedTransactionHistory = () => {
+        for (const reconciliation of reconciliationsRef.current.values()) {
+            reconciliation.controller.abort();
+            if (reconciliation.timer !== null) {
+                window.clearTimeout(reconciliation.timer);
+            }
+        }
+        reconciliationsRef.current.clear();
+        reconciliationOrderRef.current.clear();
+        reconciliationFailuresRef.current.clear();
+        reconciliationSequenceRef.current = 0;
         setHistory([]);
         if (historyKey !== null) {
-            clearHistory(historyKey);
+            const error = clearHistory(historyKey);
+            if (error) setStorageError(error);
         }
+    };
+
+    const updateSubmittedHistory = (
+        key: string,
+        update: (current: SubmittedTransaction[]) => SubmittedTransaction[],
+    ) => {
+        const next = update(readHistory(key, setStorageError));
+        const error = writeHistory(key, next);
+        if (error) setStorageError(error);
+        if (loadedHistoryKeyRef.current === key) {
+            setHistory(update);
+        }
+    };
+
+    const cancelReconciliation = (digest: string) => {
+        const reconciliation = reconciliationsRef.current.get(digest);
+        if (reconciliation) {
+            reconciliation.controller.abort();
+            if (reconciliation.timer !== null) {
+                window.clearTimeout(reconciliation.timer);
+            }
+            reconciliationsRef.current.delete(digest);
+        }
+        reconciliationOrderRef.current.delete(digest);
+        reconciliationFailuresRef.current.delete(digest);
     };
 
     const submitTransfer = async () => {
@@ -704,10 +860,16 @@ export default function App() {
             setSubmitMessage('loading account address');
             return;
         }
+        const originHistoryKey = historyKey;
+        if (originHistoryKey === null) {
+            setSubmitMessage('submitted transaction history is unavailable');
+            return;
+        }
 
         setPendingSubmissionCount((count) => count + 1);
         setSubmitMessage('forming transaction');
         let reservation: { previous: NonceState; next: NonceState } | null = null;
+        let submitted: { digest: string; historyKey: string } | null = null;
         try {
             const parsedToKey = parseAccountKeyHex(toKey);
             const parsedValue = parseU64(value, 'value');
@@ -730,6 +892,7 @@ export default function App() {
                 wallet.sign,
             );
             const pending: SubmittedTransaction = {
+                reconciliationVersion: 1,
                 sender: walletAccountKey,
                 digest: encoded.digestHex,
                 to: toHex(parsedToKey),
@@ -737,32 +900,71 @@ export default function App() {
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
                 finalizedInMs: null,
-                status: 'pending',
-                detail: 'submitted to mempool',
+                status: 'reconciling',
+                detail: 'submitting for admission',
                 finalizedHeight: null,
-                certificate: { status: 'waiting', detail: 'waiting for finalization' },
-                proof: { status: 'waiting', detail: 'waiting for finalization' },
+                certificate: WAITING_FINALIZATION_CERTIFICATE,
+                proof: WAITING_FINALIZATION_PROOF,
             };
-            setHistory((current) => prependTransaction(pending, current));
+            cancelReconciliation(encoded.digestHex);
+            updateSubmittedHistory(
+                originHistoryKey,
+                (current) => prependTransaction(pending, current),
+            );
+            submitted = { digest: encoded.digestHex, historyKey: originHistoryKey };
             setSubmitMessage('submitting');
 
-            const txStatus = await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
-            const detail = formatTxStatus(txStatus);
-            setHistory((current) =>
-                updateTransactionStatus(
-                    encoded.digestHex,
-                    txStatus,
-                    detail,
-                    current,
-                ),
+            await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
+            updateSubmittedHistory(
+                originHistoryKey,
+                (current) =>
+                    markSubmissionReconciling(
+                        encoded.digestHex,
+                        'admitted by a leader',
+                        current,
+                    ),
             );
             setSubmitMessage('');
-            await refreshAccount();
         } catch (error) {
-            if (reservation !== null && nonceStatesEqual(nextNonceRef.current, reservation.next)) {
+            const currentSubmission = submitted;
+            const rejected =
+                currentSubmission !== null && isDeterministicSubmissionRejection(error);
+            if (currentSubmission !== null && rejected) {
+                const { digest, historyKey: originHistoryKey } = currentSubmission;
+                cancelReconciliation(digest);
+                const detail = error instanceof Error ? error.message : String(error);
+                updateSubmittedHistory(
+                    originHistoryKey,
+                    (current) => markSubmissionRejected(digest, detail, current),
+                );
+            } else if (currentSubmission !== null) {
+                const { digest, historyKey: originHistoryKey } = currentSubmission;
+                const detail = error instanceof Error ? error.message : String(error);
+                updateSubmittedHistory(
+                    originHistoryKey,
+                    (current) =>
+                        markSubmissionReconciling(
+                            digest,
+                            `delivery uncertain. ${detail}`,
+                            current,
+                        ),
+                );
+            }
+
+            if (
+                (currentSubmission === null || rejected) &&
+                reservation !== null &&
+                nonceStatesEqual(nextNonceRef.current, reservation.next)
+            ) {
                 setLocalNonceState(reservation.previous);
             }
-            setSubmitMessage(error instanceof Error ? error.message : String(error));
+            setSubmitMessage(
+                currentSubmission !== null && !rejected
+                    ? 'delivery uncertain. reconciling by transaction digest'
+                    : error instanceof Error
+                        ? error.message
+                        : String(error),
+            );
         } finally {
             setPendingSubmissionCount((count) => Math.max(0, count - 1));
         }
@@ -798,6 +1000,11 @@ export default function App() {
                         </button>
                     </div>
                 </header>
+                {storageError && (
+                    <div className="app__warning" role="alert">
+                        {storageError}
+                    </div>
+                )}
                 <main className="app__main app__main--minimal">
                     <section className="explorer-stage" aria-label="live transaction throughput">
                         {lookupAccount ? (
@@ -1537,6 +1744,13 @@ function CertificateCell({
             </span>
         );
     }
+    if (certificate.status === 'unavailable') {
+        return (
+            <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
+                -
+            </span>
+        );
+    }
     if (finalizedHeight === null) {
         return (
             <span className="tx-proof-muted" aria-label={certificate.detail} title={certificate.detail}>
@@ -1580,6 +1794,13 @@ function ProofCell({
             </>
         );
     }
+    if (proof.status === 'unavailable') {
+        return (
+            <span className="tx-proof-muted" aria-label={proof.detail} title={proof.detail}>
+                -
+            </span>
+        );
+    }
     return (
         <span className="tx-proof-spinner" aria-label={proof.detail} title={proof.detail} />
     );
@@ -1607,112 +1828,6 @@ function compareBlockHeightDesc(a: bigint, b: bigint): number {
     if (a > b) return -1;
     if (a < b) return 1;
     return 0;
-}
-
-function prependTransaction(
-    transaction: SubmittedTransaction,
-    current: SubmittedTransaction[],
-): SubmittedTransaction[] {
-    return [transaction, ...current.filter((item) => item.digest !== transaction.digest)].slice(0, 100);
-}
-
-function updateTransactionStatus(
-    digest: string,
-    status: TxStatus,
-    detail: string,
-    current: SubmittedTransaction[],
-): SubmittedTransaction[] {
-    return current.map((tx) => {
-        if (tx.digest !== digest) return tx;
-        const finalizedHeight = statusHasHeight(status) ? status.height : tx.finalizedHeight;
-        return {
-            ...tx,
-            status: status.status,
-            detail,
-            finalizedInMs: Date.now() - tx.submittedAt,
-            finalizedHeight,
-            certificate: nextBlockCertificateState(status),
-            proof: nextProofState(status),
-        };
-    });
-}
-
-function updateTransactionProof(
-    digest: string,
-    proof: TransactionProofState,
-    current: SubmittedTransaction[],
-): SubmittedTransaction[] {
-    return current.map((tx) => (tx.digest === digest ? { ...tx, proof } : tx));
-}
-
-function updateBlockCertificateByHeight(
-    height: number,
-    certificate: BlockCertificateState,
-    current: SubmittedTransaction[],
-): SubmittedTransaction[] {
-    let changed = false;
-    const next = current.map((tx) => {
-        if (tx.finalizedHeight !== height) return tx;
-        if (sameBlockCertificate(tx.certificate, certificate)) return tx;
-        changed = true;
-        return { ...tx, certificate };
-    });
-    return changed ? next : current;
-}
-
-function sameBlockCertificate(
-    left: BlockCertificateState,
-    right: BlockCertificateState,
-): boolean {
-    if (left.status !== right.status || left.detail !== right.detail) return false;
-    if (left.status !== 'verified' || right.status !== 'verified') return true;
-    return left.height === right.height && left.view === right.view;
-}
-
-function shouldFetchTransactionProof(
-    tx: SubmittedTransaction,
-    signedInSender: string | null,
-): tx is SubmittedTransaction & { readonly finalizedHeight: number } {
-    return (
-        signedInSender !== null &&
-        tx.sender === signedInSender &&
-        tx.finalizedHeight !== null &&
-        (tx.status === 'finalized' ||
-            (tx.status === 'partially_finalized' && tx.proof.detail !== 'not included')) &&
-        (tx.proof.status === 'waiting' ||
-            (tx.proof.status === 'error' && isRetryableProofError(tx.proof.detail)))
-    );
-}
-
-function hasFetchingProof(
-    transactions: SubmittedTransaction[],
-    signedInSender: string | null,
-): boolean {
-    if (signedInSender === null) return false;
-    return transactions.some(
-        (tx) => tx.sender === signedInSender && tx.proof.status === 'fetching',
-    );
-}
-
-function nextBlockCertificateState(status: TxStatus): BlockCertificateState {
-    if (status.status === 'dropped') {
-        return { status: 'waiting', detail: 'not finalized' };
-    }
-    return { status: 'waiting', detail: 'waiting for block certificate' };
-}
-
-function nextProofState(status: TxStatus): TransactionProofState {
-    if (status.status === 'dropped') {
-        return { status: 'waiting', detail: 'not finalized' };
-    }
-    if (status.status === 'partially_finalized' && status.included === 0) {
-        return { status: 'waiting', detail: 'not included' };
-    }
-    return { status: 'waiting', detail: 'waiting for QMDB proof' };
-}
-
-function statusHasHeight(status: TxStatus): status is Extract<TxStatus, { readonly height: number }> {
-    return status.status === 'finalized' || status.status === 'partially_finalized';
 }
 
 function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofState {
@@ -1760,16 +1875,6 @@ async function retryAccountPageStep<T>(
     throw lastError instanceof Error ? lastError : new Error(String(lastError));
 }
 
-function formatTxStatus(status: TxStatus): string {
-    if (status.status === 'finalized') {
-        return `finalized at ${status.height}`;
-    }
-    if (status.status === 'partially_finalized') {
-        return `partial at ${status.height}: ${status.included} included, ${status.filtered} filtered`;
-    }
-    return status.status;
-}
-
 function sleep(ms: number): Promise<void> {
     return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
@@ -1811,8 +1916,17 @@ function accountFromLocation(): string {
     return pathMatch ? pathMatch[1].toLowerCase() : '';
 }
 
-function readHistory(key: string): SubmittedTransaction[] {
-    const raw = window.localStorage.getItem(key);
+function readHistory(
+    key: string,
+    onError?: (message: string) => void,
+): SubmittedTransaction[] {
+    let raw: string | null;
+    try {
+        raw = window.localStorage.getItem(key);
+    } catch (error) {
+        onError?.(storageErrorMessage(error));
+        return [];
+    }
     if (!raw) return [];
 
     try {
@@ -1829,12 +1943,27 @@ function readHistory(key: string): SubmittedTransaction[] {
     }
 }
 
-function writeHistory(key: string, history: SubmittedTransaction[]) {
-    window.localStorage.setItem(key, JSON.stringify(history));
+function writeHistory(key: string, history: SubmittedTransaction[]): string | null {
+    try {
+        window.localStorage.setItem(key, JSON.stringify(history));
+        return null;
+    } catch (error) {
+        return storageErrorMessage(error);
+    }
 }
 
-function clearHistory(key: string) {
-    window.localStorage.removeItem(key);
+function clearHistory(key: string): string | null {
+    try {
+        window.localStorage.removeItem(key);
+        return null;
+    } catch (error) {
+        return storageErrorMessage(error);
+    }
+}
+
+function storageErrorMessage(error: unknown): string {
+    const detail = error instanceof Error ? error.message : String(error);
+    return `browser storage unavailable. ${detail}`;
 }
 
 function useBrailleSpinner(active: boolean): string {
@@ -1849,112 +1978,6 @@ function useBrailleSpinner(active: boolean): string {
     }, [active]);
 
     return BRAILLE_SPINNER[index];
-}
-
-function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | null {
-    if (typeof value !== 'object' || value === null) {
-        return null;
-    }
-
-    const transaction = value as Record<string, unknown>;
-    if (
-        typeof transaction.sender !== 'string' ||
-        !isAccountKeyHex(transaction.sender) ||
-        typeof transaction.digest !== 'string' ||
-        typeof transaction.to !== 'string' ||
-        !isAccountKeyHex(transaction.to) ||
-        typeof transaction.value !== 'string' ||
-        typeof transaction.nonce !== 'string' ||
-        typeof transaction.submittedAt !== 'number' ||
-        typeof transaction.status !== 'string' ||
-        typeof transaction.detail !== 'string'
-    ) {
-        return null;
-    }
-
-    const finalizedInMs =
-        typeof transaction.finalizedInMs === 'number' ? transaction.finalizedInMs : null;
-    const finalizedHeight =
-        typeof transaction.finalizedHeight === 'number' ? transaction.finalizedHeight : null;
-
-    return {
-        digest: transaction.digest,
-        sender: transaction.sender,
-        to: transaction.to,
-        value: transaction.value,
-        nonce: transaction.nonce,
-        submittedAt: transaction.submittedAt,
-        finalizedInMs,
-        status: transaction.status as SubmittedTransaction['status'],
-        detail: transaction.detail,
-        finalizedHeight,
-        certificate: normalizeBlockCertificate(transaction.certificate, finalizedHeight),
-        proof: normalizeTransactionProof(transaction.proof),
-    };
-}
-
-function isAccountKeyHex(value: string): boolean {
-    return /^[0-9a-f]{64}$/.test(value);
-}
-
-function normalizeBlockCertificate(
-    value: unknown,
-    finalizedHeight: number | null,
-): BlockCertificateState {
-    if (typeof value !== 'object' || value === null) {
-        return defaultBlockCertificate(finalizedHeight);
-    }
-    const certificate = value as Record<string, unknown>;
-    if (
-        certificate.status === 'verified' &&
-        typeof certificate.detail === 'string' &&
-        typeof certificate.height === 'string' &&
-        typeof certificate.view === 'string'
-    ) {
-        return {
-            status: 'verified',
-            detail: certificate.detail,
-            height: certificate.height,
-            view: certificate.view,
-        };
-    }
-    if (
-        (certificate.status === 'waiting' || certificate.status === 'error') &&
-        typeof certificate.detail === 'string'
-    ) {
-        return { status: certificate.status, detail: certificate.detail };
-    }
-    return defaultBlockCertificate(finalizedHeight);
-}
-
-function defaultBlockCertificate(finalizedHeight: number | null): BlockCertificateState {
-    if (finalizedHeight === null) {
-        return WAITING_FINALIZATION_CERTIFICATE;
-    }
-    return WAITING_BLOCK_CERTIFICATE;
-}
-
-function normalizeTransactionProof(value: unknown): TransactionProofState {
-    if (typeof value !== 'object' || value === null) {
-        return { status: 'waiting', detail: 'waiting for finalization' };
-    }
-    const proof = value as Record<string, unknown>;
-    if (proof.status === 'verified' && typeof proof.detail === 'string') {
-        return {
-            status: 'verified',
-            detail: proof.detail,
-            location: typeof proof.location === 'string' ? proof.location : '',
-            tip: typeof proof.tip === 'string' ? proof.tip : '',
-            proofSizeBytes: typeof proof.proofSizeBytes === 'number' ? proof.proofSizeBytes : 0,
-        };
-    }
-    if (proof.status === 'waiting' && typeof proof.detail === 'string') {
-        return { status: 'waiting', detail: proof.detail };
-    }
-    if (proof.status === 'error') {
-        return { status: 'waiting', detail: 'retrying QMDB proof' };
-    }
-    return { status: 'waiting', detail: 'waiting for finalization' };
 }
 
 function StatusBadge({ status, spinner }: { status: Status; spinner: string }) {

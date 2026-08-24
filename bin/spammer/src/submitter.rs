@@ -1,7 +1,7 @@
 //! Async submission engine.
 //!
 //! Each relayer stream submits one batch at a time and advances to the next
-//! pre-signed batch after finalization, drop, or submit failure.
+//! pre-signed batch after admission or submit failure.
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
@@ -11,14 +11,12 @@ use commonware_runtime::{
 };
 use constantinople_mempool::webserver::SubmitError;
 use std::{sync::Arc, time::Duration};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 struct Metrics {
     submitted_batches: Counter,
     submitted_transactions: Counter,
-    finalized_transactions: Counter,
-    filtered_transactions: Counter,
-    dropped_transactions: Counter,
+    admitted_transactions: Counter,
     submit_errors: Counter,
 }
 
@@ -29,11 +27,8 @@ impl Metrics {
                 .counter("submitted_batches", "Submitted transaction batches"),
             submitted_transactions: context
                 .counter("submitted_transactions", "Submitted transactions"),
-            finalized_transactions: context
-                .counter("finalized_transactions", "Finalized transactions"),
-            filtered_transactions: context
-                .counter("filtered_transactions", "Filtered transactions"),
-            dropped_transactions: context.counter("dropped_transactions", "Dropped transactions"),
+            admitted_transactions: context
+                .counter("admitted_transactions", "Admitted transactions"),
             submit_errors: context.counter("submit_errors", "Relayer submit errors"),
         }
     }
@@ -47,9 +42,7 @@ pub struct Stats {
 
 #[derive(Clone, Copy)]
 pub struct Totals {
-    pub finalized: u64,
-    pub filtered: u64,
-    pub dropped: u64,
+    pub admitted: u64,
     pub errors: u64,
 }
 
@@ -62,9 +55,7 @@ impl Stats {
 
     pub fn totals(&self) -> Totals {
         Totals {
-            finalized: self.metrics.finalized_transactions.get(),
-            filtered: self.metrics.filtered_transactions.get(),
-            dropped: self.metrics.dropped_transactions.get(),
+            admitted: self.metrics.admitted_transactions.get(),
             errors: self.metrics.submit_errors.get(),
         }
     }
@@ -74,16 +65,8 @@ impl Stats {
         self.metrics.submitted_transactions.inc_by(count);
     }
 
-    fn record_finalized(&self, count: u64) {
-        self.metrics.finalized_transactions.inc_by(count);
-    }
-
-    fn record_filtered(&self, count: u64) {
-        self.metrics.filtered_transactions.inc_by(count);
-    }
-
-    fn record_dropped(&self, count: u64) {
-        self.metrics.dropped_transactions.inc_by(count);
+    fn record_admitted(&self, count: u64) {
+        self.metrics.admitted_transactions.inc_by(count);
     }
 
     fn record_error(&self) {
@@ -99,65 +82,27 @@ pub struct RelayerSubmitter {
     http: reqwest::Client,
     stats: Arc<Stats>,
     target_leader: Option<String>,
-    leader_fanout: usize,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum RelayerBatchStatus {
-    Finalized {
-        height: u64,
-    },
-    PartiallyFinalized {
-        height: u64,
-        included: u64,
-        filtered: u64,
-    },
-    Dropped,
 }
 
 impl RelayerSubmitter {
-    pub fn new(
-        url: String,
-        stats: Arc<Stats>,
-        _target_offset: usize,
-        target_leader: Option<String>,
-    ) -> Self {
+    pub fn new(url: String, stats: Arc<Stats>, target_leader: Option<String>) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             stats,
             target_leader,
-            leader_fanout: 1,
         }
     }
 
-    /// Submits a signed batch once. Failed or dropped batches are abandoned so
-    /// the next outer loop iteration uses a fresh nonce set.
+    /// Submits a signed batch once and advances after admission or failure.
     pub async fn submit(&self, batch: Vec<Tx>) {
         let count = batch.len() as u64;
         let body = batch.encode();
         self.stats.record_submitted(count);
         match self.submit_encoded(body).await {
-            Ok(RelayerBatchStatus::Finalized { height }) => {
-                self.stats.record_finalized(count);
-                debug!(height, count, "relayed batch finalized");
-            }
-            Ok(RelayerBatchStatus::PartiallyFinalized {
-                height,
-                included,
-                filtered,
-            }) => {
-                self.stats.record_finalized(included);
-                self.stats.record_filtered(filtered);
-                info!(
-                    height,
-                    included, filtered, "relayed batch partially finalized, advancing"
-                );
-            }
-            Ok(RelayerBatchStatus::Dropped) => {
-                self.stats.record_dropped(count);
-                debug!(count, "relayed batch dropped, advancing");
+            Ok(()) => {
+                self.stats.record_admitted(count);
+                debug!(count, "relayed batch admitted");
             }
             Err(error) => {
                 self.stats.record_error();
@@ -171,25 +116,18 @@ impl RelayerSubmitter {
         }
     }
 
-    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<RelayerBatchStatus, SubmitError> {
+    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<(), SubmitError> {
         let mut request = self
             .http
             .post(format!("{}/transactions", self.url))
-            .header("content-type", "application/octet-stream")
-            .header(
-                "x-constantinople-relayer-leader-fanout",
-                self.leader_fanout.to_string(),
-            );
+            .header("content-type", "application/octet-stream");
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
         }
         let response = request.body(body).send().await?;
 
         match response.status().as_u16() {
-            200 => {
-                let bytes = response.bytes().await?;
-                serde_json::from_slice(&bytes).map_err(SubmitError::InvalidResponse)
-            }
+            202 => Ok(()),
             400 => Err(SubmitError::BadRequest),
             413 => Err(SubmitError::PayloadTooLarge),
             500 => Err(SubmitError::InternalServerError),
@@ -225,19 +163,19 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn dropped_batch_advances_without_retrying() {
+    async fn admitted_batch_advances_without_retrying() {
         let stats = test_stats();
-        let (url, requests) =
-            spawn_response_server(vec![json_response(r#"{"status":"dropped"}"#)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let (url, requests) = spawn_response_server(vec![empty_response("202 Accepted")]).await;
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
         let batch = test_batch();
         let count = batch.len() as u64;
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
-            .expect("dropped batch should not be retried");
+            .expect("admitted batch should complete");
 
-        assert_eq!(stats.totals().dropped, count);
+        assert_eq!(stats.totals().admitted, count);
+        assert_eq!(stats.totals().errors, 0);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 
@@ -246,7 +184,7 @@ mod tests {
         let stats = test_stats();
         let (url, requests) =
             spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
@@ -257,21 +195,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn partially_finalized_batch_does_not_resubmit_filtered_transactions() {
+    async fn legacy_finalization_response_is_rejected() {
         let stats = test_stats();
-        let batch = test_batch();
-        let body =
-            r#"{"status":"partially_finalized","height":7,"included":1,"filtered":1}"#.to_string();
+        let body = r#"{"status":"finalized","height":7}"#.to_string();
         let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let submitter = RelayerSubmitter::new(url, stats.clone(), None);
 
-        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
-            .expect("filtered transactions should not be retried");
+            .expect("legacy response should not be retried");
 
         let totals = stats.totals();
-        assert_eq!(totals.finalized, 1);
-        assert_eq!(totals.filtered, 1);
+        assert_eq!(totals.admitted, 0);
+        assert_eq!(totals.errors, 1);
         assert_eq!(requests.load(Ordering::Relaxed), 1);
     }
 

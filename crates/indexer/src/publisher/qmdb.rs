@@ -1867,7 +1867,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
+    use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE, TX_PROOF_META_TABLE};
     use commonware_consensus::{
         marshal::coding::types::coding_config_for_participants,
         simplex::types::Context as SimplexContext,
@@ -1985,6 +1985,14 @@ mod tests {
                     CellValue::Binary(vec![0x01, 0x02, 0x03]),
                 ],
             },
+            super::super::SqlRow {
+                table: TX_PROOF_META_TABLE,
+                values: vec![
+                    CellValue::FixedBinary(vec![3u8; 32]),
+                    CellValue::UInt64(1),
+                    CellValue::UInt64(1),
+                ],
+            },
         ];
         let prepared = prepare_sql_rows(&mut writer, rows.iter())
             .expect("sql rows prepare")
@@ -1993,9 +2001,9 @@ mod tests {
             .stage_flush(&prepared, &mut batch)
             .expect("sql rows stage");
 
-        // One block_meta row and one digest-keyed tx_meta row.
-        assert_eq!(batch.len(), 2);
-        assert_eq!(prepared.entry_count(), 2);
+        // The proof sidecar preserves the established tx_meta row layout.
+        assert_eq!(batch.len(), 3);
+        assert_eq!(prepared.entry_count(), 3);
     }
 
     #[test]
