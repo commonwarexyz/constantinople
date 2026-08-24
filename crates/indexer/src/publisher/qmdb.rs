@@ -1,13 +1,13 @@
 //! Combined publisher for finalized SQL metadata and QMDB rows.
 
 use super::{
-    block::{IndexedBlockRows, encode_indexed_block_rows_at},
+    block::{BulkBlockRows, encode_block_meta_only_at, encode_bulk_block_rows},
     sql::{AccountMetaRow, encode_account_meta_row},
 };
 use crate::{
     namespaces::{sql_meta_client, state_qmdb_client, transactions_qmdb_client},
     sql_schema::build_meta_schema,
-    store::writer_store_client,
+    store::writer_store_clients,
 };
 use bytes::{Buf as _, Bytes};
 use commonware_codec::{
@@ -16,7 +16,9 @@ use commonware_codec::{
 };
 use commonware_cryptography::{Hasher, PublicKey};
 use commonware_parallel::{Sequential, Strategy};
-use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
+use commonware_runtime::{
+    BufferPooler, Clock, Metrics, Spawner, Storage, telemetry::metrics::Histogram,
+};
 use commonware_storage::{
     merkle::{Location, mmr},
     qmdb::{
@@ -43,7 +45,7 @@ use std::{
     marker::PhantomData,
     num::NonZeroU64,
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
@@ -371,9 +373,26 @@ where
     state_next_location: Mutex<u64>,
     transaction_next_location: Mutex<u64>,
     prepare_tx: Option<mpsc::Sender<PendingQueuedFinalizedUpload<H, P>>>,
+    metadata_tx: Option<mpsc::Sender<PendingBlockMetadata<H, P>>>,
     prepare_join: Option<JoinHandle<()>>,
     commit_join: Option<JoinHandle<()>>,
+    metadata_join: Option<JoinHandle<()>>,
     _marker: PhantomData<P>,
+}
+
+/// Metadata fast-lane job.
+///
+/// The worker commits one block_meta row per finalized block and signals when
+/// its gated bulk commit may proceed.
+struct PendingBlockMetadata<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    height: u64,
+    block: Arc<EngineBlock<H, P>>,
+    finalized_ts_micros: i64,
+    persisted: oneshot::Sender<()>,
 }
 
 struct PendingPreparedQmdbUpload<H>
@@ -381,11 +400,12 @@ where
     H: Hasher,
 {
     height: u64,
-    block_rows: IndexedBlockRows<H::Digest>,
+    block_rows: BulkBlockRows<H::Digest>,
     state_delta: Vec<StateOperation>,
     account_rows: Vec<super::SqlRow>,
     transaction_ops: Vec<TransactionOperation<H>>,
     completion: oneshot::Sender<()>,
+    metadata_persisted: oneshot::Receiver<()>,
 }
 
 struct PendingQueuedFinalizedUpload<H, P>
@@ -396,6 +416,7 @@ where
     height: u64,
     upload: QueuedFinalizedUpload<H, P>,
     completion: oneshot::Sender<()>,
+    metadata_persisted: oneshot::Receiver<()>,
 }
 
 struct PreparedQmdbUpload {
@@ -404,6 +425,7 @@ struct PreparedQmdbUpload {
     state: PreparedUpload<QmdbFamily>,
     transactions: PreparedUpload<QmdbFamily>,
     completion: oneshot::Sender<()>,
+    metadata_persisted: oneshot::Receiver<()>,
 }
 
 struct StagedQmdbUpload {
@@ -420,6 +442,7 @@ struct QmdbCommitBatch {
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
     store_batch: StoreWriteBatch,
     rows: usize,
+    metadata_persisted: oneshot::Receiver<()>,
 }
 
 struct CommitBatchStage<H, S>
@@ -445,6 +468,7 @@ where
     commits: &'a mut JoinSet<CommittedQmdbBatch>,
     commit_client: &'a StoreClient,
     commit_metrics: &'a super::StoreCommitMetrics,
+    metadata_gate_wait: &'a Histogram,
     state_writer: &'a Arc<StateWriter<H, S>>,
     transaction_writer: &'a Arc<TransactionWriter<H, S>>,
 }
@@ -487,20 +511,12 @@ where
         store_url: &str,
         api_key: Option<&str>,
         buffer: usize,
-        commit_metrics: super::StoreCommitMetrics,
+        metrics: super::PublisherMetrics,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
     {
-        Self::connect_with_strategy(
-            context,
-            store_url,
-            api_key,
-            buffer,
-            commit_metrics,
-            Sequential,
-        )
-        .await
+        Self::connect_with_strategy(context, store_url, api_key, buffer, metrics, Sequential).await
     }
 
     /// Construct writers that use `strategy` for Merkle construction and recovery.
@@ -510,17 +526,23 @@ where
         store_url: &str,
         api_key: Option<&str>,
         buffer: usize,
-        commit_metrics: super::StoreCommitMetrics,
+        metrics: super::PublisherMetrics,
         strategy: S,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
         S: Strategy,
     {
-        let commit_client = writer_store_client(store_url, api_key)?;
+        let (commit_client, metadata_commit_client) = writer_store_clients(store_url, api_key)?;
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
-        let sql_writer = build_meta_schema(sql_meta_client(&commit_client)?)
+        // Two independent writers over one schema. The bulk committer and the
+        // metadata fast lane each own their whole flush lifecycle, so neither
+        // holds shared mutable writer state across network I/O.
+        let sql_schema =
+            build_meta_schema(sql_meta_client(&commit_client)?).map_err(PublishError::SqlSchema)?;
+        let sql_writer = sql_schema.batch_writer();
+        let metadata_writer = build_meta_schema(sql_meta_client(&metadata_commit_client)?)
             .map_err(PublishError::SqlSchema)?
             .batch_writer();
         let state = recover_state_writer_state::<H, S>(state_client.clone(), &strategy).await?;
@@ -543,13 +565,17 @@ where
         let buffer = buffer.clamp(1, MAX_BUFFERED_QMDB_UPLOADS);
         let (commit_tx, commit_rx) = mpsc::channel(buffer);
         let (prepare_tx, prepare_rx) = mpsc::channel(buffer);
+        // Bounded so a stalled metadata lane backpressures upload admission
+        // instead of accumulating unpersisted block rows.
+        let (metadata_tx, metadata_rx) = mpsc::channel(buffer);
         let max_in_flight_commits = buffer;
         let commit_context = context.child("commit");
         let prepare_context = context.child("prepare");
+        let metadata_context = context.child("metadata");
         let commit_join = tokio::spawn(run_qmdb_committer(
             commit_context,
             commit_client.clone(),
-            commit_metrics,
+            metrics.clone(),
             sql_writer,
             state_writer.clone(),
             transaction_writer.clone(),
@@ -563,13 +589,22 @@ where
             prepare_rx,
             commit_tx,
         ));
+        let metadata_join = tokio::spawn(run_metadata_committer(
+            metadata_context,
+            metadata_commit_client,
+            metrics,
+            metadata_writer,
+            metadata_rx,
+        ));
 
         Ok(Self {
             state_next_location: Mutex::new(state_next_location),
             transaction_next_location: Mutex::new(transaction_next_location),
             prepare_tx: Some(prepare_tx),
+            metadata_tx: Some(metadata_tx),
             prepare_join: Some(prepare_join),
             commit_join: Some(commit_join),
+            metadata_join: Some(metadata_join),
             _marker: PhantomData,
         })
     }
@@ -582,6 +617,12 @@ where
         }
         if let Some(commit_join) = self.commit_join.take() {
             await_qmdb_worker(commit_join, "committer").await;
+        }
+        // The metadata worker drains only after the committer joins because
+        // in-flight bulk commits hold gates the worker must still answer.
+        drop(self.metadata_tx.take());
+        if let Some(metadata_join) = self.metadata_join.take() {
+            await_qmdb_worker(metadata_join, "metadata").await;
         }
     }
 
@@ -668,6 +709,24 @@ where
         }
 
         let (completion, rx) = oneshot::channel();
+        // The metadata fast lane commits the block_meta row ahead of the bulk
+        // upload. Jobs land in durable queue order because the queue consumer
+        // calls this method serially, which keeps the live block feed ordered
+        // by height.
+        let (metadata_persisted_tx, metadata_persisted) = oneshot::channel();
+        let metadata_tx = self
+            .metadata_tx
+            .as_ref()
+            .expect("publisher send channel is open until shutdown");
+        metadata_tx
+            .send(PendingBlockMetadata {
+                height,
+                block: upload.block(),
+                finalized_ts_micros: upload.finalized_ts_micros,
+                persisted: metadata_persisted_tx,
+            })
+            .await
+            .map_err(|_| PublishError::CommitterStopped { height })?;
         let prepare_tx = self
             .prepare_tx
             .as_ref()
@@ -677,6 +736,7 @@ where
                 height,
                 upload,
                 completion,
+                metadata_persisted,
             })
             .await
             .map_err(|_| PublishError::CommitterStopped { height })?;
@@ -697,6 +757,9 @@ where
         }
         if let Some(commit_join) = self.commit_join.take() {
             commit_join.abort();
+        }
+        if let Some(metadata_join) = self.metadata_join.take() {
+            metadata_join.abort();
         }
     }
 }
@@ -787,6 +850,68 @@ async fn run_qmdb_preparer<Cx, H, P, S>(
     debug!("indexer QMDB preparer task exiting: channel closed");
 }
 
+/// Serial metadata fast lane.
+///
+/// Commits one block_meta row per finalized block, ahead of the bulk upload.
+/// The bulk commit for the same block gates on the `persisted` signal so a
+/// published QMDB watermark always implies durable block metadata, which is
+/// what keeps crash recovery's covered-block skip from leaving block_meta
+/// holes. A worker panic drops pending gate senders, which fails the gated
+/// commits and stops publication instead of advancing past missing metadata.
+async fn run_metadata_committer<Cx, H, P>(
+    context: Cx,
+    commit_client: StoreClient,
+    metrics: super::PublisherMetrics,
+    mut sql_writer: BatchWriter,
+    mut rx: mpsc::Receiver<PendingBlockMetadata<H, P>>,
+) where
+    Cx: Spawner,
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+{
+    while let Some(job) = rx.recv().await {
+        let height = job.height;
+        let row = encode_block_meta_only_at(&job.block, job.finalized_ts_micros);
+        sql_writer
+            .insert(row.table, row.values)
+            .unwrap_or_else(|error| panic!("metadata worker failed at height {height}: {error}"));
+        let prepared = sql_writer
+            .prepare_flush()
+            .unwrap_or_else(|error| panic!("metadata worker failed at height {height}: {error}"))
+            .expect("metadata flush stages the block_meta row");
+        let mut store_batch = StoreWriteBatch::new();
+        sql_writer
+            .stage_flush(&prepared, &mut store_batch)
+            .unwrap_or_else(|error| panic!("metadata worker failed at height {height}: {error}"));
+        let store_seq = commit_required_batch_blocking(
+            context
+                .child("metadata_commit")
+                .with_attribute("height", height),
+            commit_client.clone(),
+            metrics.metadata_commit.clone(),
+            store_batch,
+        )
+        .await;
+        let receipt = sql_writer.mark_flush_persisted(prepared, store_seq);
+        metrics.metadata_finalized_lag.observe(
+            current_time_micros()
+                .saturating_sub(job.finalized_ts_micros)
+                .max(0) as f64
+                / 1e6,
+        );
+        // A redelivered block can lose its gate receiver when the bulk upload
+        // already completed, so an unreceived signal is not an error.
+        let _ = job.persisted.send(());
+        debug!(
+            height,
+            request_id = receipt.writer_request_id,
+            store_sequence = store_seq,
+            "indexer persisted block metadata"
+        );
+    }
+    debug!("indexer metadata committer task exiting: channel closed");
+}
+
 async fn prepare_qmdb_upload<Cx, H, P, S>(
     context: Cx,
     state_writer: Arc<StateWriter<H, S>>,
@@ -816,18 +941,21 @@ where
         height,
         upload,
         completion,
+        metadata_persisted,
     } = upload;
     let QueuedFinalizedUpload {
         block,
-        finalized_ts_micros,
+        finalized_ts_micros: _,
         state_start,
         transaction_start,
         state_delta,
     } = upload;
     // This is the upload-time half of the durable queue contract: only data
     // that had to survive prune is persisted in the queue. Everything below is
-    // deterministic from the queued block, timestamp, cursors, and state delta.
-    let block_rows = encode_indexed_block_rows_at(&block, finalized_ts_micros);
+    // deterministic from the queued block, cursors, and state delta. The
+    // block_meta row is absent by design because the metadata fast lane owns
+    // it.
+    let block_rows = encode_bulk_block_rows(&block);
     let transaction_ops = build_transaction_upload_from_digests(
         &block,
         transaction_start,
@@ -843,6 +971,7 @@ where
         account_rows,
         transaction_ops,
         completion,
+        metadata_persisted,
     })
 }
 
@@ -865,8 +994,9 @@ where
         account_rows,
         transaction_ops,
         completion,
+        metadata_persisted,
     } = upload;
-    let IndexedBlockRows {
+    let BulkBlockRows {
         sql,
         transaction_digests: _,
     } = block_rows;
@@ -891,6 +1021,7 @@ where
         state,
         transactions,
         completion,
+        metadata_persisted,
     })
 }
 
@@ -898,7 +1029,7 @@ where
 async fn run_qmdb_committer<Cx, H, S>(
     context: Cx,
     commit_client: StoreClient,
-    commit_metrics: super::StoreCommitMetrics,
+    metrics: super::PublisherMetrics,
     mut sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H, S>>,
     transaction_writer: Arc<TransactionWriter<H, S>>,
@@ -931,7 +1062,8 @@ async fn run_qmdb_committer<Cx, H, S>(
                 CommitPipeline {
                     commits: &mut commits,
                     commit_client: &commit_client,
-                    commit_metrics: &commit_metrics,
+                    commit_metrics: &metrics.commit,
+                    metadata_gate_wait: &metrics.metadata_gate_wait,
                     state_writer: &state_writer,
                     transaction_writer: &transaction_writer,
                 },
@@ -947,7 +1079,7 @@ async fn run_qmdb_committer<Cx, H, S>(
                 context.child("watermarks"),
                 &mut pending_completions,
                 &commit_client,
-                &commit_metrics,
+                &metrics.commit,
                 &state_writer,
                 &transaction_writer,
             )
@@ -971,7 +1103,8 @@ async fn run_qmdb_committer<Cx, H, S>(
                             CommitPipeline {
                                 commits: &mut commits,
                                 commit_client: &commit_client,
-                                commit_metrics: &commit_metrics,
+                                commit_metrics: &metrics.commit,
+                                metadata_gate_wait: &metrics.metadata_gate_wait,
                                 state_writer: &state_writer,
                                 transaction_writer: &transaction_writer,
                             },
@@ -1011,7 +1144,7 @@ async fn run_qmdb_committer<Cx, H, S>(
                     context.child("watermarks"),
                     &mut pending_completions,
                     &commit_client,
-                    &commit_metrics,
+                    &metrics.commit,
                     &state_writer,
                     &transaction_writer,
                 )
@@ -1052,6 +1185,7 @@ where
         context.child("store_commit"),
         pipeline.commit_client.clone(),
         pipeline.commit_metrics.clone(),
+        pipeline.metadata_gate_wait.clone(),
         batch,
     );
     sql_writer
@@ -1075,6 +1209,7 @@ where
         height: upload.height,
         completion: upload.completion,
     };
+    let metadata_persisted = upload.metadata_persisted;
     let sql_upload = SqlUpload {
         sql_rows: upload.sql_rows,
     };
@@ -1128,6 +1263,7 @@ where
         state_watermark,
         transaction_watermark,
         store_batch,
+        metadata_persisted,
     };
     Ok((sql_writer, batch))
 }
@@ -1199,16 +1335,37 @@ fn spawn_commit<Cx>(
     context: Cx,
     commit_client: StoreClient,
     commit_metrics: super::StoreCommitMetrics,
+    metadata_gate_wait: Histogram,
     commit: QmdbCommitBatch,
 ) where
     Cx: Spawner,
 {
     commits.spawn(async move {
+        let QmdbCommitBatch {
+            upload,
+            sql,
+            state_watermark,
+            transaction_watermark,
+            store_batch,
+            rows,
+            metadata_persisted,
+        } = commit;
+        // This batch may carry an in-band QMDB watermark, and a published
+        // watermark covering a block must imply that block's block_meta row
+        // is already durable. Crash recovery skips covered blocks entirely,
+        // so committing ahead of the metadata row would leave a permanent
+        // block_meta hole. Gating here, before the Store commit, upholds the
+        // implication for in-band and grouped watermarks alike.
+        let gate_start = Instant::now();
+        metadata_persisted
+            .await
+            .expect("metadata worker stopped before persisting block_meta");
+        metadata_gate_wait.observe(gate_start.elapsed().as_secs_f64());
         let store_seq = commit_required_batch_blocking(
             context.child("finalized_upload"),
             commit_client,
             commit_metrics,
-            commit.store_batch,
+            store_batch,
         )
         .await;
         debug!(
@@ -1216,11 +1373,11 @@ fn spawn_commit<Cx>(
             "indexer persisted finalized index batch"
         );
         CommittedQmdbBatch {
-            upload: commit.upload,
-            sql: commit.sql,
-            rows: commit.rows,
-            state_watermark: commit.state_watermark,
-            transaction_watermark: commit.transaction_watermark,
+            upload,
+            sql,
+            rows,
+            state_watermark,
+            transaction_watermark,
             store_seq,
         }
     });
@@ -1724,6 +1881,7 @@ mod tests {
     use commonware_parallel::Sequential;
     use commonware_runtime::{
         BufferPooler, Runner as _, Strategizer as _, Supervisor, buffer::paged::CacheRef,
+        telemetry::metrics::has_metric_value,
     };
     use commonware_storage::{
         journal::contiguous::{
@@ -1742,6 +1900,12 @@ mod tests {
     use exoware_sdk::RetryConfig;
     use exoware_sql::CellValue;
     use std::num::NonZeroU64 as StdNonZeroU64;
+
+    fn metadata_ready() -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        tx.send(()).expect("receiver held");
+        rx
+    }
 
     const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
     const TEST_WRITE_BUFFER: std::num::NonZero<usize> = NZUsize!(1024 * 1024);
@@ -1882,6 +2046,7 @@ mod tests {
                 state,
                 transactions,
                 completion,
+                metadata_persisted: metadata_ready(),
             };
 
             let (_sql_writer, batch) = prepare_commit_batch_blocking(
@@ -2053,6 +2218,7 @@ mod tests {
                     .await
                     .expect("first transaction upload"),
                 completion: first_completion,
+                metadata_persisted: metadata_ready(),
             };
             let (next_sql_writer, first_batch) = prepare_commit_batch_blocking(
                 context.child("first"),
@@ -2079,6 +2245,7 @@ mod tests {
                     .await
                     .expect("second transaction upload"),
                 completion: second_completion,
+                metadata_persisted: metadata_ready(),
             };
             let (next_sql_writer, second_batch) = prepare_commit_batch_blocking(
                 context.child("second"),
@@ -2157,7 +2324,7 @@ mod tests {
                 &url,
                 None,
                 2,
-                crate::publisher::StoreCommitMetrics::new(&context),
+                crate::publisher::PublisherMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -2174,6 +2341,54 @@ mod tests {
     }
 
     #[test]
+    fn bulk_upload_waits_for_metadata_persistence() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::GatedIngestStore::open()
+                .await
+                .expect("spawn gated Store");
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
+                context.child("qmdb_publisher"),
+                &store.url,
+                None,
+                2,
+                crate::publisher::PublisherMetrics::new(&context),
+            )
+            .await
+            .expect("publisher connects");
+
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload())
+                .await
+                .expect("queued upload accepted");
+            store.wait_for_first_ingest().await;
+            let bulk_overtook = store
+                .later_ingest_arrives_within(std::time::Duration::from_millis(250))
+                .await;
+            store.release_first_ingest();
+            completion.wait().await.expect("queued upload completes");
+
+            let encoded_metrics = context.encode();
+            assert!(has_metric_value(
+                &encoded_metrics,
+                "metadata_finalized_lag_count",
+                1
+            ));
+            assert!(has_metric_value(
+                &encoded_metrics,
+                "metadata_gate_wait_duration_count",
+                1
+            ));
+            publisher.shutdown().await;
+            store.shutdown().await;
+
+            assert!(
+                !bulk_overtook,
+                "bulk upload reached Store before block metadata persisted"
+            );
+        });
+    }
+
+    #[test]
     fn publisher_sends_configured_credentials() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let store = crate::test_store::ObservedStore::open("writer-key")
@@ -2184,7 +2399,7 @@ mod tests {
                 &store.url,
                 Some("writer-key"),
                 2,
-                crate::publisher::StoreCommitMetrics::new(&context),
+                crate::publisher::PublisherMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -2241,7 +2456,7 @@ mod tests {
                 &url,
                 None,
                 2,
-                crate::publisher::StoreCommitMetrics::new(&context.child("first_metrics")),
+                crate::publisher::PublisherMetrics::new(&context.child("first_metrics")),
                 strategy.clone(),
             )
             .await
@@ -2262,7 +2477,7 @@ mod tests {
                 &url,
                 None,
                 2,
-                crate::publisher::StoreCommitMetrics::new(&context.child("second_metrics")),
+                crate::publisher::PublisherMetrics::new(&context.child("second_metrics")),
                 strategy.clone(),
             )
             .await
@@ -2286,7 +2501,7 @@ mod tests {
                 &url,
                 None,
                 2,
-                crate::publisher::StoreCommitMetrics::new(&context.child("third_metrics")),
+                crate::publisher::PublisherMetrics::new(&context.child("third_metrics")),
                 strategy,
             )
             .await
@@ -2311,7 +2526,7 @@ mod tests {
                 &url,
                 None,
                 2,
-                crate::publisher::StoreCommitMetrics::new(&context),
+                crate::publisher::PublisherMetrics::new(&context),
                 strategy,
             )
             .await
@@ -2424,7 +2639,7 @@ mod tests {
                 &url,
                 None,
                 1,
-                crate::publisher::StoreCommitMetrics::new(&context),
+                crate::publisher::PublisherMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
@@ -2653,7 +2868,7 @@ mod tests {
                 transactions_qmdb_client(client).expect("transaction client"),
                 (),
             );
-        let rows = encode_indexed_block_rows_at(block, 0);
+        let rows = encode_bulk_block_rows(block);
         let tx_count =
             u64::try_from(rows.transaction_digests.len()).expect("transaction count fits u64");
         let append_start = block

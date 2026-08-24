@@ -22,11 +22,14 @@ that fits.
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 
-All paths share the same exoware [`StoreClient`] under the hood. The owning
-secondary stages SQL rows and both QMDB row families into one Store batch from
-the finalized hook; simplex block and certificate artifacts are published from
-the same finalized path after data upload. QMDB uses Store prefixes `0x8` and
-`0x9`; SQL table/index prefixes are owned by [`exoware-sql`'s `KvSchema`][kvschema].
+All paths use the same exoware Store service. The owning secondary commits each
+`block_meta` row through an ordered metadata lane. It commits transaction
+lookup rows and both QMDB families through a bulk lane after that block's
+metadata row is durable. Consumers may therefore observe a block summary
+before its transaction and proof details. Simplex block and certificate
+artifacts use separate Store commits. QMDB uses Store prefixes `0x8` and `0x9`.
+SQL table and index prefixes are owned by
+[`exoware-sql`'s `KvSchema`][kvschema].
 The current SQL table-prefix allocation is:
 
 | SQL table | Table prefix | Secondary indexes |
@@ -59,8 +62,8 @@ the full body only when requested.
   with finalized headers, and uploads `exoware-simplex` proof artifacts to the
   shared Store.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
-  on the single owning secondary and commits SQL, account-state QMDB, and
-  transaction-hash QMDB rows in one Store batch.
+  on the single owning secondary. It commits `block_meta` first, then commits
+  transaction lookup rows and both QMDB families through the gated bulk lane.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
   storage and SQL transaction lookup rows. Latest-finalized-height is derived
   from the Simplex finalization height index.
@@ -83,10 +86,12 @@ block, finalized timestamp, QMDB writer start cursors, and the account-state del
 that must be read while the local QMDB can still prove the finalized range.
 The writer end cursors are derived from the block header and start cursors.
 
-The background uploader derives the rest from that durable entry: SQL rows,
-transaction-hash QMDB operations, account metadata rows, watermarks, and the
-final Store batch. This keeps SQL-row encoding off the durable queue write path
-while still making recovery independent from local database pruning.
+The background uploader derives both persistence lanes from that durable
+entry. The metadata lane commits `block_meta` in queue order. The bulk lane
+derives transaction lookup rows, QMDB operations, account metadata rows, and
+watermarks. A bulk Store commit waits for its block's metadata signal. This
+keeps SQL-row encoding off the durable queue write path while still making
+recovery independent from local database pruning.
 
 Remote Store commits retry indefinitely with a capped exponential backoff using
 the fully staged `StoreWriteBatch`, so a transient store outage stalls queued

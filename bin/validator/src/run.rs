@@ -58,7 +58,7 @@ use constantinople_engine::{
 use constantinople_indexer::{
     CertificateReporter, Publisher, StoreClientBuildError,
     publisher::{
-        StoreCommitMetrics,
+        PublisherMetrics,
         certificate::CertificateUploaderStopped,
         qmdb::{
             PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg, StoredFinalizedUpload,
@@ -376,7 +376,7 @@ struct LazyPublisher {
     store_url: String,
     api_key: Option<String>,
     buffer: usize,
-    commit_metrics: StoreCommitMetrics,
+    metrics: PublisherMetrics,
     strategy: Rayon,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
@@ -391,13 +391,13 @@ impl LazyPublisher {
     ) -> Self {
         // Registered once here: `connect` is retried on failure and must not
         // re-register.
-        let commit_metrics = StoreCommitMetrics::new(&context);
+        let metrics = PublisherMetrics::new(&context);
         Self {
             context,
             store_url,
             api_key,
             buffer,
-            commit_metrics,
+            metrics,
             strategy,
             publisher: Mutex::new(None),
         }
@@ -414,7 +414,7 @@ impl LazyPublisher {
                 &self.store_url,
                 self.api_key.as_deref(),
                 self.buffer,
-                self.commit_metrics.clone(),
+                self.metrics.clone(),
                 self.strategy.clone(),
             )
             .await
@@ -934,10 +934,10 @@ async fn maybe_build_indexer(
         cfg.upload_budget_bytes,
     );
     let (cert_reporter, cert_join) = EngineCertReporter::connect(
+        &context.child("simplex_upload"),
         &cfg.chain_indexer_url,
         cfg.api_key.as_deref(),
         max_active_uploads,
-        StoreCommitMetrics::new(&context.child("simplex_upload")),
     )?;
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
@@ -1384,10 +1384,10 @@ mod tests {
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
         FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueReader, FinalizedQueueWriter,
         FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher, PendingQueuedUpload,
-        PublishError, StoreClientBuildError, StoreCommitMetrics, UploadBudget,
-        decode_finalized_queue_entry, default_mempool_drop_grace_blocks, indexer_critical_task,
-        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
-        start_queued_upload, wait_for_critical_task_exit, wait_for_finalized_uploads,
+        PublishError, StoreClientBuildError, UploadBudget, decode_finalized_queue_entry,
+        default_mempool_drop_grace_blocks, indexer_critical_task, maybe_build_indexer,
+        recovered_finalized_upload_cursor, scan_finalized_queue_cursor, start_queued_upload,
+        wait_for_critical_task_exit, wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
     use commonware_codec::{Encode as _, FixedSize as _, Read as _, Write as _};
@@ -1766,13 +1766,9 @@ mod tests {
                 context.strategy(NZUsize!(2)),
             ));
             let engine_publisher = publisher.publisher().await;
-            let (cert_reporter, cert_join) = EngineCertReporter::connect(
-                &url,
-                None,
-                2,
-                StoreCommitMetrics::new(&context.child("simplex_upload")),
-            )
-            .expect("reporter connects");
+            let (cert_reporter, cert_join) =
+                EngineCertReporter::connect(&context.child("simplex_upload"), &url, None, 2)
+                    .expect("reporter connects");
             let budget = UploadBudget::new(
                 &context.child("upload_budget"),
                 2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,

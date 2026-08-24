@@ -11,9 +11,11 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
+use tokio::sync::Notify;
 
 static STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -75,6 +77,75 @@ impl ObservedStore {
     }
 }
 
+#[derive(Clone)]
+struct IngestGateState {
+    ingests: Arc<AtomicUsize>,
+    first_ingest: Arc<Notify>,
+    later_ingest: Arc<Notify>,
+    release_first: Arc<Notify>,
+}
+
+pub(crate) struct GatedIngestStore {
+    pub url: String,
+    first_ingest: Arc<Notify>,
+    later_ingest: Arc<Notify>,
+    release_first: Arc<Notify>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl GatedIngestStore {
+    pub async fn open() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let directory = TestDirectory::new()?;
+        let engine = RocksStore::open_owned(directory, None).map_err(std::io::Error::other)?;
+        let connect = connect_stack(AppState::new(Arc::new(engine)));
+        let first_ingest = Arc::new(Notify::new());
+        let later_ingest = Arc::new(Notify::new());
+        let release_first = Arc::new(Notify::new());
+        let state = IngestGateState {
+            ingests: Arc::new(AtomicUsize::new(0)),
+            first_ingest: first_ingest.clone(),
+            later_ingest: later_ingest.clone(),
+            release_first: release_first.clone(),
+        };
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .fallback_service(connect)
+            .layer(middleware::from_fn_with_state(state, gate_first_ingest));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok(Self {
+            url,
+            first_ingest,
+            later_ingest,
+            release_first,
+            server,
+        })
+    }
+
+    pub async fn wait_for_first_ingest(&self) {
+        self.first_ingest.notified().await;
+    }
+
+    pub async fn later_ingest_arrives_within(&self, duration: Duration) -> bool {
+        tokio::time::timeout(duration, self.later_ingest.notified())
+            .await
+            .is_ok()
+    }
+
+    pub fn release_first_ingest(&self) {
+        self.release_first.notify_one();
+    }
+
+    pub async fn shutdown(self) {
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+
 async fn observe_authorization(
     State(state): State<ObservationState>,
     request: Request,
@@ -89,6 +160,23 @@ async fn observe_authorization(
         .lock()
         .expect("request lock poisoned")
         .push(observation);
+    next.run(request).await
+}
+
+async fn gate_first_ingest(
+    State(state): State<IngestGateState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path().starts_with("/log.ingest.v1.Service/") {
+        let index = state.ingests.fetch_add(1, Ordering::SeqCst);
+        if index == 0 {
+            state.first_ingest.notify_one();
+            state.release_first.notified().await;
+        } else {
+            state.later_ingest.notify_one();
+        }
+    }
     next.run(request).await
 }
 

@@ -1,4 +1,4 @@
-//! Block row encoding shared by the combined publisher.
+//! Block row encoding shared by the metadata and bulk publisher lanes.
 
 use crate::publisher::{
     SqlRow,
@@ -17,9 +17,13 @@ use constantinople_primitives::{
 use std::array::TryFromSliceError;
 use tracing::warn;
 
-/// Encoded block rows split by index surface.
-pub(crate) struct IndexedBlockRows<D: Digest> {
-    /// SQL rows for block metadata, transaction metadata, and account activity.
+/// Bulk-lane rows for a finalized block.
+///
+/// The `block_meta` row is deliberately absent. The metadata fast lane commits
+/// it separately, ahead of this batch, so feed visibility of the block does
+/// not wait on the multi-MB bulk upload.
+pub(crate) struct BulkBlockRows<D: Digest> {
+    /// SQL rows for transaction metadata and account activity.
     pub sql: Vec<SqlRow>,
     /// Transaction digests in append order.
     pub transaction_digests: Vec<D>,
@@ -35,45 +39,77 @@ struct IndexedTransaction<D: Digest> {
     nonce: u64,
 }
 
-/// Build every row for a finalized block, partitioned by destination store.
-#[cfg(test)]
-pub(crate) fn encode_indexed_block_rows<H, P>(
-    block: &EngineBlock<H, P>,
-) -> IndexedBlockRows<H::Digest>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    let finalized_ts_micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    encode_indexed_block_rows_at(block, finalized_ts_micros)
-}
-
-pub(crate) fn encode_indexed_block_rows_at<H, P>(
+/// Build only the `block_meta` row for the metadata fast lane.
+///
+/// This runs the same transaction classification as the bulk encoding because
+/// `tx_count` must count exactly the transactions the bulk rows index. The
+/// duplicated classification keeps the lanes independent. The metadata Put
+/// never waits behind bulk row expansion or QMDB preparation.
+pub(crate) fn encode_block_meta_only_at<H, P>(
     block: &EngineBlock<H, P>,
     finalized_ts_micros: i64,
-) -> IndexedBlockRows<H::Digest>
+) -> SqlRow
 where
     H: Hasher,
     P: PublicKey,
 {
-    let block_digest = block.seal();
-    let height = block.header.height;
-    let body_len = block.body.len();
-    // SQL `block_meta.digest` is `FixedSizeBinary(32)` — copy it into a
+    let tx_count =
+        u64::try_from(indexed_transactions(block).count()).expect("transaction count fits u64");
+    block_meta_row(block, tx_count, finalized_ts_micros)
+}
+
+fn block_meta_row<H, P>(
+    block: &EngineBlock<H, P>,
+    tx_count: u64,
+    finalized_ts_micros: i64,
+) -> SqlRow
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    // SQL `block_meta.digest` is `FixedSizeBinary(32)`. Copy it into a
     // `[u8; 32]` for the typed CellValue path.
     let mut block_digest_arr = [0u8; 32];
-    block_digest_arr.copy_from_slice(block_digest.as_ref());
+    block_digest_arr.copy_from_slice(block.seal().as_ref());
     let mut transactions_root = [0u8; 32];
     transactions_root.copy_from_slice(block.header.transactions_root.as_ref());
-    let indexed_txs = block
+
+    // `view` is currently 0.
+    // See `encode_block_meta_row` docs for why.
+    encode_block_meta_row(BlockMetaRow {
+        height: block.header.height,
+        digest: block_digest_arr,
+        tx_count,
+        transactions_root,
+        transactions_tip: block.header.transactions_range.end() - 1,
+        view: 0,
+        finalized_ts_micros,
+    })
+}
+
+fn indexed_transactions<H, P>(
+    block: &EngineBlock<H, P>,
+) -> impl Iterator<Item = IndexedTransaction<H::Digest>> + '_
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let height = block.header.height;
+    block
         .body
         .iter()
         .enumerate()
-        .filter_map(|(idx, lazy)| index_transaction::<H>(height, idx, lazy))
-        .collect::<Vec<_>>();
+        .filter_map(move |(idx, lazy)| index_transaction::<H>(height, idx, lazy))
+}
+
+pub(crate) fn encode_bulk_block_rows<H, P>(block: &EngineBlock<H, P>) -> BulkBlockRows<H::Digest>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let height = block.header.height;
+    let body_len = block.body.len();
+    let indexed_txs = indexed_transactions(block).collect::<Vec<_>>();
     let tx_count = u64::try_from(indexed_txs.len()).expect("transaction count fits u64");
     let append_start = block
         .header
@@ -82,7 +118,7 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    let mut sql = Vec::with_capacity(1 + 3 * body_len);
+    let mut sql = Vec::with_capacity(3 * body_len);
 
     // One tx_meta row plus sender/receiver tx_activity rows per transaction.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
@@ -124,22 +160,7 @@ where
         }
     }
 
-    // SQL: one block_meta row per finalized block.
-    // `view` is currently 0; see `encode_block_meta_row` docs for why.
-    sql.insert(
-        0,
-        encode_block_meta_row(BlockMetaRow {
-            height,
-            digest: block_digest_arr,
-            tx_count,
-            transactions_root,
-            transactions_tip: block.header.transactions_range.end() - 1,
-            view: 0,
-            finalized_ts_micros,
-        }),
-    );
-
-    IndexedBlockRows {
+    BulkBlockRows {
         sql,
         transaction_digests,
     }
@@ -216,7 +237,7 @@ fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
+    use crate::sql_schema::{BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
@@ -261,8 +282,53 @@ mod tests {
         )
         .seal(&mut Sha256::default());
 
-        let rows = encode_indexed_block_rows(&block);
+        let rows = encode_bulk_block_rows(&block);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
+    }
+
+    #[test]
+    fn block_meta_row_counts_indexed_transactions() {
+        let mut rng = StdRng::from_seed([5; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let recipient =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+        let transaction = Transaction::<sha256::Digest>::new(
+            sender,
+            recipient,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let mut zero_value_bytes = Vec::with_capacity(transaction.encode_size());
+        transaction.write(&mut zero_value_bytes);
+        let value_start = TransactionPublicKey::SIZE + AccountKey::SIZE;
+        zero_value_bytes[value_start..value_start + u64::SIZE].fill(0);
+        let mut encoded =
+            Vec::with_capacity(zero_value_bytes.len().encode_size() + zero_value_bytes.len());
+        zero_value_bytes.len().write(&mut encoded);
+        encoded.extend_from_slice(&zero_value_bytes);
+        let zero_value = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+            .expect("zero-value lazy transaction should decode");
+        let block = Sealed::new_unchecked(
+            Block {
+                header: test_header(consensus_key.public_key(), 1),
+                body: vec![LazySignedTransaction::new(transaction), zero_value],
+            },
+            sha256::Digest::EMPTY,
+        );
+
+        let row = encode_block_meta_only_at(&block, 1_000);
+        let bulk = encode_bulk_block_rows(&block);
+        assert_eq!(row.table, BLOCK_META_TABLE);
+        assert!(matches!(row.values.first(), Some(CellValue::UInt64(7))));
+        assert!(matches!(row.values.get(2), Some(CellValue::UInt64(1))));
+        assert_eq!(bulk.transaction_digests.len(), 1);
+        assert!(matches!(
+            row.values.get(6),
+            Some(CellValue::Timestamp(1_000))
+        ));
     }
 
     #[test]
@@ -301,7 +367,7 @@ mod tests {
             sha256::Digest::EMPTY,
         );
 
-        let rows = encode_indexed_block_rows(&block);
+        let rows = encode_bulk_block_rows(&block);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_tx_meta_body(&rows.sql, &transaction);

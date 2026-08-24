@@ -67,7 +67,6 @@ const BLOCK_GLYPHS = ' ▁▂▃▄▅▆▇█';
 const BRAILLE_SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 const LIVE_STATUS_TEXT = '>>> live';
 const LIVE_STATUS_SYMBOLS = [...LIVE_STATUS_TEXT];
-const BLOCK_FLUSH_INTERVAL_MS = 250;
 
 type Status =
     | { kind: 'connecting' }
@@ -204,8 +203,6 @@ export default function App() {
     const [searchMessage, setSearchMessage] = useState('');
     const [copyToast, setCopyToast] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
-    const pendingBlocksRef = useRef<ObservedBlock[]>([]);
-    const blockFlushTimeoutRef = useRef<number | null>(null);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
@@ -235,30 +232,24 @@ export default function App() {
         setLocalNonceState(mergeNonceStates(nextNonceRef.current, nextNonce));
     };
 
-    const queueObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
+    // Commit each delivered frame to state immediately. The feed delivers one
+    // block per frame at the chain's cadence, so buffering behind a timer only
+    // added display latency and re-bunched paints. React batches these updates
+    // into one render, and the bounded block list keeps each commit cheap.
+    const applyObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
 
-        pendingBlocksRef.current.push(...nextBlocks);
-        if (blockFlushTimeoutRef.current !== null) return;
-
-        blockFlushTimeoutRef.current = window.setTimeout(() => {
-            blockFlushTimeoutRef.current = null;
-            const flushed = pendingBlocksRef.current;
-            pendingBlocksRef.current = [];
-            if (flushed.length === 0) return;
-
-            setBlocks((current) => upsertBoundedBatch(flushed, current));
-            setTotalTxObserved(
-                (current) =>
-                    current + flushed.reduce((total, block) => total + block.txCount, 0),
-            );
-            setTotalBlocksObserved((current) => current + flushed.length);
-            setObservedRateWindow((current) => ({
-                firstBlockAt: current.firstBlockAt ?? flushed[0].arrivedAt,
-                latestBlockAt: flushed[flushed.length - 1].arrivedAt,
-            }));
-            setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
-        }, BLOCK_FLUSH_INTERVAL_MS);
+        setBlocks((current) => upsertBoundedBatch(nextBlocks, current));
+        setTotalTxObserved(
+            (current) =>
+                current + nextBlocks.reduce((total, block) => total + block.txCount, 0),
+        );
+        setTotalBlocksObserved((current) => current + nextBlocks.length);
+        setObservedRateWindow((current) => ({
+            firstBlockAt: current.firstBlockAt ?? nextBlocks[0].arrivedAt,
+            latestBlockAt: nextBlocks[nextBlocks.length - 1].arrivedAt,
+        }));
+        setStatus((current) => (current.kind === 'live' ? current : { kind: 'live' }));
     };
 
     useEffect(() => {
@@ -281,7 +272,7 @@ export default function App() {
                     onReconnect: () => setStatus({ kind: 'connecting' }),
                 })) {
                     if (cancelled) return;
-                    queueObservedBlocks([block]);
+                    applyObservedBlocks([block]);
                 }
             } catch (error) {
                 if (cancelled || controller.signal.aborted) return;
@@ -542,9 +533,6 @@ export default function App() {
 
     useEffect(() => {
         return () => {
-            if (blockFlushTimeoutRef.current !== null) {
-                window.clearTimeout(blockFlushTimeoutRef.current);
-            }
             if (copyToastTimeoutRef.current !== null) {
                 window.clearTimeout(copyToastTimeoutRef.current);
             }

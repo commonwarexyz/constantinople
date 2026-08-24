@@ -1,12 +1,14 @@
 //! Publisher components for finalized index uploads.
 //!
 //! The production validator path uses [`Publisher`] on the single owning
-//! secondary. It stages finalized-block data into one combined upload path:
+//! secondary. It publishes finalized-block data through ordered metadata and
+//! bulk lanes.
 //!
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `simplex`        | certified headers, full blocks by digest, certificates       |
-//! | `sql` (metadata) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`       |
+//! | `sql` (fast lane) | `block_meta`                                                 |
+//! | `sql` (bulk)      | `tx_meta`, `tx_activity`, `account_meta`                     |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!
@@ -60,6 +62,69 @@ impl StoreCommitMetrics {
             duration: context.histogram(
                 "store_commit_duration",
                 "Store batch commit latency (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+        }
+    }
+
+    /// Metadata fast-lane commits register under distinct names so the bulk
+    /// commit dashboards keep their meaning.
+    pub fn new_metadata(context: &impl Metrics) -> Self {
+        Self {
+            in_flight: context.gauge(
+                "metadata_store_commits_in_flight",
+                "Metadata Store batch commits in flight",
+            ),
+            commits: context.counter(
+                "metadata_store_commits",
+                "Metadata Store batch commits completed",
+            ),
+            rows: context.counter(
+                "metadata_store_commit_rows",
+                "Rows committed to the store by the metadata lane",
+            ),
+            retries: context.counter(
+                "metadata_store_commit_retries",
+                "Metadata Store batch commit attempts that failed",
+            ),
+            duration: context.histogram(
+                "metadata_store_commit_duration",
+                "Metadata Store batch commit latency (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+        }
+    }
+}
+
+/// Metric families used by [`Publisher`].
+///
+/// The caller registers this once because publisher connects are retried on
+/// failure and must not re-register.
+#[derive(Clone)]
+pub struct PublisherMetrics {
+    /// Bulk finalized-index batch commits.
+    pub(crate) commit: StoreCommitMetrics,
+    /// Metadata fast-lane block_meta commits.
+    pub(crate) metadata_commit: StoreCommitMetrics,
+    /// Time bulk commits spend waiting on the metadata persistence gate.
+    pub(crate) metadata_gate_wait: Histogram,
+    /// Block finalization to durable block_meta row.
+    pub(crate) metadata_finalized_lag: Histogram,
+}
+
+impl PublisherMetrics {
+    pub fn new(context: &impl Metrics) -> Self {
+        Self {
+            commit: StoreCommitMetrics::new(context),
+            metadata_commit: StoreCommitMetrics::new_metadata(context),
+            metadata_gate_wait: context.histogram(
+                "metadata_gate_wait_duration",
+                "Time bulk commits wait for block_meta persistence (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            metadata_finalized_lag: context.histogram(
+                "metadata_finalized_lag",
+                "Block finalization to durable block_meta row (s)",
                 COMMIT_DURATION_BUCKETS,
             ),
         }
