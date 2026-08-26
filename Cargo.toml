@@ -58,7 +58,7 @@ commonware-coding = { git = "https://github.com/commonwarexyz/monorepo.git", rev
 commonware-macros = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }
 commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }
 commonware-storage = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }
-commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }
+commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "de8e7e14b05dabcf85f19d97d43692a7150dc00c" }
 commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }
 commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }
 commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo.git", rev = "dfe4c5a9ab89edb1e64052aa931498d6552444d9" }

@@ -165,9 +165,9 @@ pub(crate) struct GenerateArgs {
     /// Transfer value per spam transaction.
     #[arg(long, default_value_t = 1)]
     spammer_value: u64,
-    /// Seed offset for spam account keys.
-    #[arg(long, default_value_t = 1000)]
-    spammer_seed_offset: u64,
+    /// Seed offset for deterministic spam accounts. Omit for fresh accounts.
+    #[arg(long)]
+    spammer_seed_offset: Option<u64>,
     /// Number of rayon threads for spammer parallel signing.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_RAYON_THREADS)]
     spammer_rayon_threads: usize,
@@ -329,8 +329,13 @@ pub(crate) struct SpammerConfig {
     pub accounts: u32,
     /// Transfer value per spam transaction.
     pub value: u64,
-    /// Seed offset for spam account keys.
-    pub seed_offset: u64,
+    /// Explicit seed offset for reproducible spam account keys.
+    #[serde(
+        rename = "deterministic_seed_offset",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub seed_offset: Option<u64>,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_spammer_rayon_threads")]
     pub rayon_threads: usize,
@@ -1084,6 +1089,28 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_accounts_jitter, 0.25);
+    }
+
+    #[test]
+    fn parses_deterministic_spammer_seed_offset() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-seed-offset",
+            "2000",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        assert_eq!(generate.spammer_seed_offset, Some(2000));
     }
 
     #[test]

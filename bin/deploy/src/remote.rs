@@ -549,7 +549,7 @@ mod tests {
             spammer: false,
             spammer_accounts: 10,
             spammer_value: 1,
-            spammer_seed_offset: 1000,
+            spammer_seed_offset: None,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_submitters: None,
@@ -722,11 +722,26 @@ mod tests {
 
         assert_eq!(relayed.relayer_url, format!("http://{relayer_key}:8080"));
         assert_eq!(relayed.relayer_submitters, args.validators as usize);
+        assert!(relayed.seed_offset.is_none());
         assert_eq!(relayed.rayon_threads, crate::DEFAULT_SPAMMER_RAYON_THREADS);
         assert_eq!(
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
         );
+    }
+
+    #[test]
+    fn remote_spammer_config_propagates_deterministic_seed_offset() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_seed_offset = Some(2000);
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let config = remote_spammer_config(&args, &remote, &material);
+
+        assert_eq!(config.seed_offset, Some(2000));
     }
 
     // Offered load is submitters x accounts per round trip, so the flag exists

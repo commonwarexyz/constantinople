@@ -1,7 +1,7 @@
 //! Constantinople spam bot binary.
 //!
-//! Generates deterministic accounts and submits ring-transfer transactions to
-//! the relayer in a continuous loop.
+//! Generates accounts and submits ring-transfer transactions to the relayer in
+//! a continuous loop.
 //!
 //! Each target gets its own independent account set. A local signer keeps one
 //! batch ready while the submitter has one batch in flight, hiding signing
@@ -13,13 +13,14 @@ mod config;
 mod signer;
 mod submitter;
 
-use accounts::{SpamAccount, generate_accounts};
+use accounts::{SpamAccount, generate_accounts, resolve_seed_offset};
 use clap::Parser;
 use cli::Cli;
 use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _, tokio::telemetry};
 use commonware_utils::NZUsize;
 use constantinople_primitives::DEFAULT_ACCOUNT_BALANCE;
 use core::num::NonZeroU64;
+use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use signer::{Tx, sign_batch};
 use std::{
     net::{IpAddr, Ipv4Addr, SocketAddr},
@@ -98,6 +99,12 @@ fn main() {
         "transfer value ({value}) must be <= DEFAULT_ACCOUNT_BALANCE ({DEFAULT_ACCOUNT_BALANCE})"
     );
     let value = NonZeroU64::new(value).expect("checked above");
+    let seed_offset = resolve_seed_offset(
+        seed_offset,
+        accounts_count,
+        relayer_submitters,
+        &mut UnwrapErr(SysRng),
+    );
 
     let runtime_cfg = commonware_runtime::tokio::Config::default();
     let runner = commonware_runtime::tokio::Runner::new(runtime_cfg);
@@ -185,7 +192,9 @@ async fn run_relayer_mode(
     let start = Instant::now();
 
     for index in 0..relayer_submitters {
-        let account_offset = seed_offset + (index as u64) * u64::from(accounts_count);
+        let account_index =
+            u64::try_from(index).expect("submitter count checked during seed selection");
+        let account_offset = seed_offset + account_index * u64::from(accounts_count);
         let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
         let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);

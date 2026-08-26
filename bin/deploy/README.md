@@ -67,6 +67,15 @@ The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
 
+By default, the spammer selects and logs a fresh account seed whenever the
+process starts. A restarted spammer therefore creates new accounts whose
+nonces begin at zero. Pass `--spammer-seed-offset N` to the deployment
+generator, or `--seed-offset N` to the spammer binary, when a reproducible
+account set is required. Reusing an explicit seed after transactions have been
+accepted recreates the old accounts and is not restart-safe. Older generated
+configs used `seed_offset` for the former implicit default. The spammer ignores
+that legacy key so upgrading an existing deployment also selects fresh accounts.
+
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
 With `J>0` blocks no longer pin to a flat `accounts`-per-block size, which gives the indexer histogram (see
