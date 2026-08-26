@@ -507,6 +507,10 @@ The script builds only locally managed adapter binaries. The managed
 chain-indexer Intel build remains last because both chain-indexer recipes
 write `deploy/chain-indexer`.
 
+The script provisions AWS resources through the `constantinople-deploy` binary.
+That binary links `commonware-deployer` as a normal workspace dependency, so
+Cargo uses the exact package selected by the workspace manifest and lockfile.
+
 ### Local Explorer Against Remote
 
 After the remote deployment has completed, run the explorer locally against the
