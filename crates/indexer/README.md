@@ -115,6 +115,10 @@ the full body only when requested.
 
 ## Back-pressure model
 
+The target architecture for replacing cursor-driven publisher recovery with
+authenticated absolute ranges is specified in
+[`DURABLE_QUEUE.md`](DURABLE_QUEUE.md).
+
 The finalized hook runs after finalized database application and before prune.
 It writes a durable finalized upload queue entry before returning to consensus.
 That entry is deliberately the pre-prune boundary: it contains the finalized
