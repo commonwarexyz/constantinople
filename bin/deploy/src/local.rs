@@ -796,7 +796,7 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert_eq!(indexer.upload_max_in_flight, 64);
+        assert_eq!(indexer.upload_max_in_flight, 12);
         assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
