@@ -62,6 +62,7 @@ use constantinople_indexer::{
         certificate::CertificateUploaderStopped,
         qmdb::{
             PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg, StoredFinalizedUpload,
+            WriterNextLocations,
         },
     },
 };
@@ -378,6 +379,7 @@ struct LazyPublisher {
     buffer: usize,
     metrics: PublisherMetrics,
     strategy: Rayon,
+    recovery_cursor: FinalizedUploadCursor,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
@@ -388,6 +390,7 @@ impl LazyPublisher {
         api_key: Option<String>,
         buffer: usize,
         strategy: Rayon,
+        recovery_cursor: FinalizedUploadCursor,
     ) -> Self {
         // Registered once here: `connect` is retried on failure and must not
         // re-register.
@@ -399,6 +402,7 @@ impl LazyPublisher {
             buffer,
             metrics,
             strategy,
+            recovery_cursor,
             publisher: Mutex::new(None),
         }
     }
@@ -409,12 +413,16 @@ impl LazyPublisher {
                 return publisher;
             }
 
-            match EnginePublisher::connect_with_strategy(
+            match EnginePublisher::connect_with_strategy_at(
                 self.context.child("publisher"),
                 &self.store_url,
                 self.api_key.as_deref(),
                 self.buffer,
                 self.metrics.clone(),
+                WriterNextLocations::new(
+                    self.recovery_cursor.state_next,
+                    self.recovery_cursor.transaction_next,
+                ),
                 self.strategy.clone(),
             )
             .await
@@ -428,6 +436,8 @@ impl LazyPublisher {
                     warn!(
                         error = %error,
                         chain_indexer_url = %self.store_url,
+                        state_next = self.recovery_cursor.state_next,
+                        transaction_next = self.recovery_cursor.transaction_next,
                         "indexer publisher connection failed, retrying",
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -453,7 +463,6 @@ struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
     metadata: Arc<FinalizedCursorStore>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
-    publisher: Arc<LazyPublisher>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -489,6 +498,13 @@ impl FinalizedUploadCursor {
         }
     }
 
+    const fn from_upload_start(upload: &EngineQueuedUpload) -> Self {
+        Self {
+            state_next: upload.state_start(),
+            transaction_next: upload.transaction_start(),
+        }
+    }
+
     /// Return the later finalized-upload frontier as a whole cursor pair.
     ///
     /// Do not max fields independently: `state_next` and `transaction_next`
@@ -504,6 +520,12 @@ impl FinalizedUploadCursor {
             self
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FinalizedQueueFrontiers {
+    replay: FinalizedUploadCursor,
+    producer: FinalizedUploadCursor,
 }
 
 fn recovered_finalized_upload_cursor(
@@ -539,23 +561,12 @@ impl FinalizedUploadProducer {
                     );
                     return;
                 }
-                Err(PublishError::StoreEmptyPastGenesis { .. }) if cursor.state_next == 0 => {
-                    let publisher = self.publisher.publisher().await;
-                    let (state_next, transaction_next) = publisher.next_locations().await;
-                    if state_next == 0 && transaction_next == 0 {
-                        warn!(
-                            height = block.header.height,
-                            "finalized index cursor is empty and remote Store has no cursor, retrying",
-                        );
-                        drop(cursor);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
-                    *cursor = FinalizedUploadCursor {
-                        state_next,
-                        transaction_next,
-                    };
-                    continue;
+                Err(error @ PublishError::StoreEmptyPastGenesis { .. })
+                    if cursor.state_next == 0 =>
+                {
+                    panic!(
+                        "finalized index cursor is empty past genesis and cannot be recovered. {error}"
+                    );
                 }
                 Err(error) => {
                     warn!(
@@ -642,18 +653,27 @@ async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: Finalize
     }
 }
 
-async fn scan_finalized_queue_cursor(
+async fn scan_finalized_queue_frontiers(
     reader: &mut FinalizedQueueReader,
     budget: &UploadBudget,
-) -> Option<FinalizedUploadCursor> {
-    let mut cursor = None;
+) -> Option<FinalizedQueueFrontiers> {
+    let mut frontiers: Option<FinalizedQueueFrontiers> = None;
     loop {
         match reader.try_recv().await {
             Ok(Some((position, upload))) => {
                 let charge = budget.charge(upload.encoded_len());
                 let reservation = budget.reserve(charge).await;
                 let upload = decode_finalized_queue_entry(position, upload);
-                cursor = Some(FinalizedUploadCursor::from_upload(&upload));
+                let producer = FinalizedUploadCursor::from_upload(&upload);
+                match frontiers.as_mut() {
+                    Some(frontiers) => frontiers.producer = producer,
+                    None => {
+                        frontiers = Some(FinalizedQueueFrontiers {
+                            replay: FinalizedUploadCursor::from_upload_start(&upload),
+                            producer,
+                        });
+                    }
+                }
                 drop(reservation);
             }
             Ok(None) => {
@@ -661,7 +681,7 @@ async fn scan_finalized_queue_cursor(
                     .reset()
                     .await
                     .expect("failed to reset finalized index queue reader");
-                return cursor;
+                return frontiers;
             }
             Err(error) => {
                 panic!("failed to scan finalized index queue: {error}");
@@ -939,13 +959,6 @@ async fn maybe_build_indexer(
         cfg.api_key.as_deref(),
         max_active_uploads,
     )?;
-    let publisher = Arc::new(LazyPublisher::new(
-        context.child("publisher"),
-        cfg.chain_indexer_url,
-        cfg.api_key,
-        max_active_uploads,
-        strategy,
-    ));
     let page_cache = CacheRef::from_pooler(
         &context,
         FINALIZED_QUEUE_PAGE_SIZE,
@@ -972,8 +985,13 @@ async fn maybe_build_indexer(
         .await
         .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
-    let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader, &budget).await;
+    let queue_frontiers = scan_finalized_queue_frontiers(&mut queue_reader, &budget).await;
+    let queue_cursor = queue_frontiers.map(|frontiers| frontiers.producer);
     let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
+
+    // Retained entries replay from the oldest local cursor even when Store is
+    // farther ahead. An empty queue can resume after its durable producer cursor.
+    let recovery_cursor = queue_frontiers.map_or(cursor, |frontiers| frontiers.replay);
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
@@ -982,6 +1000,14 @@ async fn maybe_build_indexer(
             .await
             .expect("failed to persist finalized index cursor");
     }
+    let publisher = Arc::new(LazyPublisher::new(
+        context.child("publisher"),
+        cfg.chain_indexer_url,
+        cfg.api_key,
+        max_active_uploads,
+        strategy,
+        recovery_cursor,
+    ));
     let metadata = Arc::new(FinalizedCursorStore {
         context,
         config: metadata_config,
@@ -991,10 +1017,9 @@ async fn maybe_build_indexer(
         writer: queue_writer.clone(),
         metadata,
         cursor: Arc::new(Mutex::new(cursor)),
-        publisher: publisher.clone(),
     };
     let finalized_join = tokio::spawn(run_finalized_upload_consumer(
-        publisher.clone(),
+        publisher,
         cert_reporter.clone(),
         queue_writer,
         queue_reader,
@@ -1382,12 +1407,12 @@ mod tests {
         CertificateUploaderStopped, EngineCertReporter, EngineQueuedUpload,
         FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
-        FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueReader, FinalizedQueueWriter,
-        FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher, PendingQueuedUpload,
-        PublishError, StoreClientBuildError, UploadBudget, decode_finalized_queue_entry,
-        default_mempool_drop_grace_blocks, indexer_critical_task, maybe_build_indexer,
-        recovered_finalized_upload_cursor, scan_finalized_queue_cursor, start_queued_upload,
-        wait_for_critical_task_exit, wait_for_finalized_uploads,
+        FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueFrontiers, FinalizedQueueReader,
+        FinalizedQueueWriter, FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher,
+        PendingQueuedUpload, PublishError, StoreClientBuildError, UploadBudget,
+        decode_finalized_queue_entry, default_mempool_drop_grace_blocks, indexer_critical_task,
+        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_frontiers,
+        start_queued_upload, wait_for_critical_task_exit, wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
     use commonware_codec::{Encode as _, FixedSize as _, Read as _, Write as _};
@@ -1764,6 +1789,7 @@ mod tests {
                 None,
                 2,
                 context.strategy(NZUsize!(2)),
+                FinalizedUploadCursor::default(),
             ));
             let engine_publisher = publisher.publisher().await;
             let (cert_reporter, cert_join) =
@@ -1827,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn finalized_queue_scan_recovers_last_cursor_and_resets_reader() {
+    fn finalized_queue_scan_recovers_frontiers_and_resets_reader() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let budget = UploadBudget::new(
                 &context.child("upload_budget"),
@@ -1840,8 +1866,13 @@ mod tests {
                 )
                 .await
                 .expect("queue initializes");
-            let first = queued_upload(1, 0, 2, 0, 2);
-            let second = queued_upload(2, 2, 5, 2, 3);
+            assert_eq!(
+                scan_finalized_queue_frontiers(&mut reader, &budget).await,
+                None
+            );
+
+            let first = queued_upload(1, 4, 6, 3, 4);
+            let second = queued_upload(2, 6, 9, 4, 5);
             writer
                 .enqueue(first.clone().into())
                 .await
@@ -1852,8 +1883,11 @@ mod tests {
                 .expect("enqueue second");
 
             assert_eq!(
-                scan_finalized_queue_cursor(&mut reader, &budget).await,
-                Some(FinalizedUploadCursor::from_upload(&second))
+                scan_finalized_queue_frontiers(&mut reader, &budget).await,
+                Some(FinalizedQueueFrontiers {
+                    replay: FinalizedUploadCursor::from_upload_start(&first),
+                    producer: FinalizedUploadCursor::from_upload(&second),
+                })
             );
             assert_eq!(budget.permits.available_permits(), 1);
 

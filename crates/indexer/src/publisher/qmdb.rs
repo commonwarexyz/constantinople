@@ -68,6 +68,23 @@ type StateWriter<H, S = Sequential> =
 type TransactionWriter<H, S = Sequential> =
     KeylessWriter<QmdbFamily, H, <H as Hasher>::Digest, TransactionEncoding<H>, S>;
 
+/// Next QMDB locations used to reconstruct both writer frontiers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriterNextLocations {
+    state: u64,
+    transactions: u64,
+}
+
+impl WriterNextLocations {
+    /// Construct paired state and transaction writer locations.
+    pub const fn new(state: u64, transactions: u64) -> Self {
+        Self {
+            state,
+            transactions,
+        }
+    }
+}
+
 /// Completion signal for a queued finalized-block upload.
 pub struct UploadCompletion {
     height: u64,
@@ -519,6 +536,31 @@ where
         Self::connect_with_strategy(context, store_url, api_key, buffer, metrics, Sequential).await
     }
 
+    /// Construct writers at explicit next locations.
+    #[commonware_macros::boxed]
+    pub async fn connect_at<Cx>(
+        context: Cx,
+        store_url: &str,
+        api_key: Option<&str>,
+        buffer: usize,
+        metrics: super::PublisherMetrics,
+        next_locations: WriterNextLocations,
+    ) -> Result<Self, PublishError>
+    where
+        Cx: Spawner,
+    {
+        Self::connect_with_strategy_at(
+            context,
+            store_url,
+            api_key,
+            buffer,
+            metrics,
+            next_locations,
+            Sequential,
+        )
+        .await
+    }
+
     /// Construct writers that use `strategy` for Merkle construction and recovery.
     #[commonware_macros::boxed]
     pub async fn connect_with_strategy<Cx, S>(
@@ -527,6 +569,52 @@ where
         api_key: Option<&str>,
         buffer: usize,
         metrics: super::PublisherMetrics,
+        strategy: S,
+    ) -> Result<Self, PublishError>
+    where
+        Cx: Spawner,
+        S: Strategy,
+    {
+        Self::connect_with_strategy_inner(
+            context, store_url, api_key, buffer, metrics, None, strategy,
+        )
+        .await
+    }
+
+    /// Construct writers at explicit next locations using `strategy`.
+    #[commonware_macros::boxed]
+    pub async fn connect_with_strategy_at<Cx, S>(
+        context: Cx,
+        store_url: &str,
+        api_key: Option<&str>,
+        buffer: usize,
+        metrics: super::PublisherMetrics,
+        next_locations: WriterNextLocations,
+        strategy: S,
+    ) -> Result<Self, PublishError>
+    where
+        Cx: Spawner,
+        S: Strategy,
+    {
+        Self::connect_with_strategy_inner(
+            context,
+            store_url,
+            api_key,
+            buffer,
+            metrics,
+            Some(next_locations),
+            strategy,
+        )
+        .await
+    }
+
+    async fn connect_with_strategy_inner<Cx, S>(
+        context: Cx,
+        store_url: &str,
+        api_key: Option<&str>,
+        buffer: usize,
+        metrics: super::PublisherMetrics,
+        next_locations: Option<WriterNextLocations>,
         strategy: S,
     ) -> Result<Self, PublishError>
     where
@@ -545,9 +633,31 @@ where
         let metadata_writer = build_meta_schema(sql_meta_client(&metadata_commit_client)?)
             .map_err(PublishError::SqlSchema)?
             .batch_writer();
-        let state = recover_state_writer_state::<H, S>(state_client.clone(), &strategy).await?;
-        let transactions =
-            recover_transaction_writer_state::<H, S>(transaction_client.clone(), &strategy).await?;
+        let (state, transactions) = match next_locations {
+            Some(next_locations) => {
+                let state = recover_state_writer_state_at::<H, S>(
+                    state_client.clone(),
+                    next_locations.state,
+                    &strategy,
+                )
+                .await?;
+                let transactions = recover_transaction_writer_state_at::<H, S>(
+                    transaction_client.clone(),
+                    next_locations.transactions,
+                    &strategy,
+                )
+                .await?;
+                (state, transactions)
+            }
+            None => {
+                let state =
+                    recover_state_writer_state::<H, S>(state_client.clone(), &strategy).await?;
+                let transactions =
+                    recover_transaction_writer_state::<H, S>(transaction_client.clone(), &strategy)
+                        .await?;
+                (state, transactions)
+            }
+        };
         let state_writer = Arc::new(StateWriter::new_with_strategy(
             state_client,
             state,
@@ -1608,6 +1718,32 @@ where
     Ok(reader.recover_writer_state_with_strategy(strategy).await?)
 }
 
+async fn recover_state_writer_state_at<H, S>(
+    client: PrefixedStoreClient,
+    next_location: u64,
+    strategy: &S,
+) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
+where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+    S: Strategy,
+{
+    if next_location == 0 {
+        return Ok(WriterState::empty());
+    }
+
+    let reader =
+        UnorderedClient::<QmdbFamily, H, AccountKey, AccountValue, StateEncoding>::new(client, ());
+    let watermark = Location::new(next_location - 1);
+    let checkpoint = reader
+        .operation_range_checkpoint(watermark, watermark, 1)
+        .await?;
+    Ok(WriterState::from_checkpoint_with_strategy::<H, S>(
+        &checkpoint,
+        strategy,
+    )?)
+}
+
 async fn recover_transaction_writer_state<H, S>(
     client: PrefixedStoreClient,
     strategy: &S,
@@ -1619,6 +1755,31 @@ where
 {
     let reader = KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::new(client, ());
     Ok(reader.recover_writer_state_with_strategy(strategy).await?)
+}
+
+async fn recover_transaction_writer_state_at<H, S>(
+    client: PrefixedStoreClient,
+    next_location: u64,
+    strategy: &S,
+) -> Result<WriterState<H::Digest, QmdbFamily>, PublishError>
+where
+    H: Hasher + Send + Sync + 'static,
+    H::Digest: Codec + Send + Sync,
+    S: Strategy,
+{
+    if next_location == 0 {
+        return Ok(WriterState::empty());
+    }
+
+    let reader = KeylessClient::<QmdbFamily, H, H::Digest, TransactionEncoding<H>>::new(client, ());
+    let watermark = Location::new(next_location - 1);
+    let checkpoint = reader
+        .operation_range_checkpoint(watermark, watermark, 1)
+        .await?;
+    Ok(WriterState::from_checkpoint_with_strategy::<H, S>(
+        &checkpoint,
+        strategy,
+    )?)
 }
 
 struct PendingTransactionUpload<H>
@@ -2452,6 +2613,33 @@ mod tests {
     }
 
     #[test]
+    fn publisher_rejects_unpublished_recovery_frontier() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (handle, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let result = Publisher::<Sha256, ed25519::PublicKey>::connect_at(
+                context.child("publisher"),
+                &url,
+                None,
+                2,
+                crate::publisher::PublisherMetrics::new(&context),
+                WriterNextLocations::new(1, 0),
+            )
+            .await;
+
+            assert!(matches!(
+                result,
+                Err(PublishError::Qmdb(QmdbError::WatermarkTooLow {
+                    requested: 0,
+                    available: 0,
+                }))
+            ));
+            handle.abort();
+        });
+    }
+
+    #[test]
     fn parallel_publisher_recovers_writer_state_on_reconnect() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (handle, url) = exoware_simulator::open_temp()
@@ -2474,7 +2662,20 @@ mod tests {
                 .await
                 .expect("first upload accepted");
             completion.wait().await.expect("first upload completes");
-            let locations = publisher.next_locations().await;
+            let replay_locations = publisher.next_locations().await;
+            publisher.shutdown().await;
+
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_at(
+                context.child("empty_replay_publisher"),
+                &url,
+                None,
+                2,
+                crate::publisher::PublisherMetrics::new(&context.child("empty_replay_metrics")),
+                WriterNextLocations::new(0, 0),
+            )
+            .await
+            .expect("publisher reconnects at the empty frontier");
+            assert_eq!(publisher.next_locations().await, (0, 0));
             publisher.shutdown().await;
 
             // Reconnecting rebuilds writer state from a bounded checkpoint
@@ -2490,31 +2691,56 @@ mod tests {
             )
             .await
             .expect("publisher reconnects to populated store");
-            assert_eq!(publisher.next_locations().await, locations);
+            assert_eq!(publisher.next_locations().await, replay_locations);
 
             // The recovered peaks must support further uploads end to end.
-            let (state_start, transaction_start) = locations;
+            let (state_start, transaction_start) = replay_locations;
             let completion = publisher
                 .enqueue_queued_finalized(test_queued_upload_at(2, state_start, transaction_start))
                 .await
                 .expect("follow-up upload accepted");
             completion.wait().await.expect("follow-up upload completes");
-            let locations = publisher.next_locations().await;
+            let remote_locations = publisher.next_locations().await;
             publisher.shutdown().await;
 
-            // A second reconnect recovers from a checkpoint range that starts
-            // past location zero.
-            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_with_strategy(
+            // Durable queue replay deliberately recovers behind Store when a
+            // remote upload completed before its local queue entry was pruned.
+            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_with_strategy_at(
                 context.child("third_publisher"),
                 &url,
                 None,
                 2,
                 crate::publisher::PublisherMetrics::new(&context.child("third_metrics")),
+                WriterNextLocations::new(replay_locations.0, replay_locations.1),
                 strategy,
             )
             .await
-            .expect("publisher reconnects after follow-up upload");
-            assert_eq!(publisher.next_locations().await, locations);
+            .expect("publisher reconnects at retained queue frontier");
+            assert_eq!(publisher.next_locations().await, replay_locations);
+
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload_at(
+                    2,
+                    replay_locations.0,
+                    replay_locations.1,
+                ))
+                .await
+                .expect("retained upload replay accepted");
+            completion.wait().await.expect("retained upload replays");
+            assert_eq!(publisher.next_locations().await, remote_locations);
+
+            let completion = publisher
+                .enqueue_queued_finalized(test_queued_upload_at(
+                    3,
+                    remote_locations.0,
+                    remote_locations.1,
+                ))
+                .await
+                .expect("post-replay upload accepted");
+            completion
+                .wait()
+                .await
+                .expect("post-replay upload completes");
 
             publisher.shutdown().await;
             handle.abort();

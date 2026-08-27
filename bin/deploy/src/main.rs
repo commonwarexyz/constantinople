@@ -81,26 +81,8 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[cfg(feature = "aws")]
-    Create(CreateArgs),
     Generate(Box<GenerateArgs>),
     SimplexVerificationMaterial(SimplexVerificationMaterialArgs),
-}
-
-#[cfg(feature = "aws")]
-#[derive(Debug, Args)]
-struct CreateArgs {
-    /// Generated commonware-deployer configuration.
-    #[arg(long)]
-    config: PathBuf,
-
-    /// Maximum number of instances to configure concurrently.
-    #[arg(
-        long,
-        default_value = commonware_deployer::aws::DEFAULT_CONCURRENCY,
-        value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..)
-    )]
-    concurrency: usize,
 }
 
 #[derive(Debug, Args)]
@@ -592,8 +574,6 @@ fn main() {
     let cli = Cli::parse();
 
     match &cli.command {
-        #[cfg(feature = "aws")]
-        Command::Create(args) => create_deployment(args),
         Command::Generate(args) => match &args.target {
             GenerateTarget::Local(local_args) => local::generate(args, local_args),
             GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
@@ -604,18 +584,6 @@ fn main() {
                 simplex_verification_material_from_config(&args.config)
             );
         }
-    }
-}
-
-#[cfg(feature = "aws")]
-fn create_deployment(args: &CreateArgs) {
-    let runtime = tokio::runtime::Runtime::new().expect("failed to create Tokio runtime");
-    if let Err(error) = runtime.block_on(commonware_deployer::aws::create(
-        &args.config,
-        args.concurrency,
-    )) {
-        tracing::error!(?error, "failed to create AWS deployment");
-        std::process::exit(1);
     }
 }
 
@@ -855,26 +823,6 @@ mod tests {
             "--dashboard",
             "dashboard.json",
         ]
-    }
-
-    #[cfg(feature = "aws")]
-    #[test]
-    fn create_parses_config_and_default_concurrency() {
-        let cli =
-            Cli::try_parse_from(["constantinople-deploy", "create", "--config", "config.yaml"])
-                .expect("create invocation should parse");
-
-        let Command::Create(create) = cli.command else {
-            panic!("expected create command");
-        };
-
-        assert_eq!(create.config, PathBuf::from("config.yaml"));
-        assert_eq!(
-            create.concurrency,
-            commonware_deployer::aws::DEFAULT_CONCURRENCY
-                .parse::<usize>()
-                .expect("deployer concurrency should be numeric")
-        );
     }
 
     #[test]

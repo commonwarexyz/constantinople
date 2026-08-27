@@ -2,8 +2,6 @@
 # Generate, build, deploy, and explore a remote Constantinople testnet.
 set -euo pipefail
 
-REPO_ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-
 usage() {
     echo "usage $0 [options]" >&2
     echo "  --store-url <url>                       default managed chain-indexer" >&2
@@ -115,18 +113,6 @@ if (
     fi
 }
 
-create_remote_deployment() {
-    (
-        cd "$REPO_ROOT/deploy"
-        cargo run \
-            --manifest-path "$REPO_ROOT/Cargo.toml" \
-            --release \
-            --bin constantinople-deploy \
-            --features aws \
-            -- create --config config.yaml
-    )
-}
-
 prepare_deployment() {
     if { [ -n "$SQL_URL" ] || [ -n "$QMDB_URL" ]; } && [ -z "$STORE_URL" ]; then
         echo "--sql-url and --qmdb-url require --store-url" >&2
@@ -208,7 +194,7 @@ main() {
     parse_options "$@" || return $?
     prepare_deployment || return $?
 
-    cd "$REPO_ROOT"
+    cd "$(dirname "${BASH_SOURCE[0]}")"
 
     # Generate the deployment bundle. The output directory must not exist.
     if [ -d ./deploy ]; then
@@ -234,7 +220,7 @@ main() {
         just chain-indexer-intel-binary
     fi
 
-    create_remote_deployment
+    (cd deploy && deployer aws create --config config.yaml)
 
     TAG=$(yq -r '.tag' deploy/config.yaml)
     HOSTS=$HOME/.commonware_deployer/$TAG/hosts.yaml

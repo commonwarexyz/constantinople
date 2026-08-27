@@ -66,28 +66,6 @@ assert_invalid_url() {
     fi
 }
 
-test_create_remote_deployment_command() (
-    local temporary_directory
-    local actual
-
-    temporary_directory=$(mktemp -d)
-    trap 'rm -rf "$temporary_directory"' EXIT
-    REPO_ROOT=$temporary_directory
-    mkdir -p "$REPO_ROOT/deploy"
-
-    cargo() {
-        printf '%s\n%s\n' "$PWD" "$*"
-    }
-
-    actual=$(create_remote_deployment)
-    assert_equal \
-        "$REPO_ROOT/deploy"$'\n'"run --manifest-path $REPO_ROOT/Cargo.toml --release --bin constantinople-deploy --features aws -- create --config config.yaml" \
-        "$actual" \
-        "remote deployment command"
-)
-
-test_create_remote_deployment_command
-
 prepare_case
 assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
