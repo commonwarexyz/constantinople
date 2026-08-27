@@ -16,7 +16,7 @@
 use derive_more::Display;
 
 mod account_reader;
-pub use account_reader::AccountReader;
+pub use account_reader::{AccountReader, AccountsUnavailable};
 
 mod actor;
 pub use actor::{Actor, Config, TxStatus};

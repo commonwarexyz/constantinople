@@ -364,10 +364,11 @@ where
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
 
-    reader.get(public_key).await.map_or_else(
-        || (StatusCode::NOT_FOUND, String::new()),
-        |account| ok_json(&AccountResponse::from(account)),
-    )
+    match reader.get(public_key).await {
+        Ok(Some(account)) => ok_json(&AccountResponse::from(account)),
+        Ok(None) => (StatusCode::NOT_FOUND, String::new()),
+        Err(super::AccountsUnavailable) => (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+    }
 }
 
 #[derive(serde::Serialize)]
@@ -419,7 +420,7 @@ mod tests {
     fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
         let (sender, _receiver) = mpsc::channel(1);
         let state = Arc::new(AppState {
-            mailbox: super::super::mailbox::Mailbox::new(sender),
+            mailbox: super::super::mailbox::Mailbox::new(sender, tokio::runtime::Handle::current()),
             namespace: b"mempool-http-test",
             max_batch_bytes,
             strategy: Sequential,

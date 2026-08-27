@@ -1303,6 +1303,7 @@ dependencies = [
  "getrandom 0.2.17",
  "getrandom 0.4.3",
  "governor",
+ "io-uring",
  "libc",
  "opentelemetry",
  "opentelemetry-otlp",
@@ -1772,6 +1773,7 @@ dependencies = [
  "tower",
  "tower-http 0.6.11",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -3724,6 +3726,17 @@ name = "integer-encoding"
 version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8bb03732005da905c88227371639bf1ad885cc712789c011c31c5fb3ab3ccf02"
+
+[[package]]
+name = "io-uring"
+version = "0.7.13"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9080b15e63775b9a2ac7dca720f7050a8b955e092ea0f6020a4a80f69998cdc0"
+dependencies = [
+ "bitflags",
+ "cfg-if",
+ "libc",
+]
 
 [[package]]
 name = "ipnet"

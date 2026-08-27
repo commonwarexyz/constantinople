@@ -542,8 +542,10 @@ async fn account<St: Strategy>(
     let Some(reader) = state.account_reader.get() else {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
-    let Some(account) = reader.get(public_key).await else {
-        return (StatusCode::NOT_FOUND, String::new());
+    let account = match reader.get(public_key).await {
+        Ok(Some(account)) => account,
+        Ok(None) => return (StatusCode::NOT_FOUND, String::new()),
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, String::new()),
     };
 
     (

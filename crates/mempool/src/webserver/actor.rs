@@ -612,15 +612,24 @@ where
         }
     }
 
-    /// Spawns the actor event loop and HTTP server on the runtime.
+    /// Spawns the actor event loop on the runtime and the HTTP server on
+    /// `http_runtime`.
     ///
-    pub fn start(mut self, listener: tokio::net::TcpListener) -> Handle<()> {
-        spawn_cell!(self.context, self.run(listener))
+    /// The HTTP server needs a tokio reactor (axum spawns connection tasks
+    /// with `tokio::spawn`), so it cannot run on the actor's runtime when that
+    /// runtime is not tokio-backed. `listener` must have been bound on
+    /// `http_runtime`. The server is aborted when the actor event loop exits.
+    pub fn start(
+        mut self,
+        listener: tokio::net::TcpListener,
+        http_runtime: tokio::runtime::Handle,
+    ) -> Handle<()> {
+        spawn_cell!(self.context, self.run(listener, http_runtime))
     }
 
-    async fn run(self, listener: tokio::net::TcpListener) {
+    async fn run(self, listener: tokio::net::TcpListener, http_runtime: tokio::runtime::Handle) {
         let Self {
-            context,
+            context: _,
             mailbox,
             mut rx,
             mut pool,
@@ -644,9 +653,14 @@ where
             ingress_permits: Arc::new(Semaphore::new(http::MAX_CONCURRENT_INGRESS)),
         });
         let app = http::router::<C, P, H, St>(app_state);
-        let _http_handle = context.as_present().child("http").spawn(|_| async {
-            let _ = axum::serve(listener, app).await;
-        });
+        // Guard, not a bare JoinHandle: the actor's future can be dropped by
+        // runtime teardown without running loop-exit code, and the server
+        // must not keep accepting connections past the actor's life.
+        let mut http_server = AbortOnDrop(http_runtime.spawn(async {
+            axum::serve(listener, app)
+                .await
+                .expect("mempool HTTP server failed");
+        }));
 
         let mut proposed: VecDeque<ProposedBatch<H::Digest>> = VecDeque::new();
         let mut statuses: AHashMap<Arc<str>, StoredBatchStatus<H::Digest>> = AHashMap::new();
@@ -658,7 +672,17 @@ where
             AHashMap::new();
         let mut known_digests: AHashSet<H::Digest> = AHashSet::new();
 
-        while let Some(message) = rx.recv().await {
+        loop {
+            let message = tokio::select! {
+                result = &mut http_server.0 => {
+                    panic!("mempool HTTP server exited unexpectedly: {result:?}");
+                }
+                message = rx.recv() => message,
+            };
+            let Some(message) = message else {
+                warn!("mempool actor stopped: all senders dropped");
+                break;
+            };
             match message {
                 Message::Submit {
                     batch_id,
@@ -799,7 +823,15 @@ where
                 Message::Report(Update::Tip(..)) => {}
             }
         }
-        warn!("mempool actor stopped: all senders dropped");
+    }
+}
+
+/// Aborts the wrapped HTTP server task when dropped.
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
     }
 }
 

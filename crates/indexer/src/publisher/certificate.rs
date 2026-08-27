@@ -32,6 +32,13 @@ where
     S::Certificate: Send,
 {
     tx: mpsc::Sender<SimplexInput<H, P, S>>,
+    /// Tokio runtime hosting the uploader and the async activity dispatches.
+    ///
+    /// [`Reporter::report`] is called synchronously from the consensus
+    /// runtime, which may not be a tokio runtime, so the reporter carries an
+    /// explicit handle instead of relying on an ambient one. The uploader's
+    /// Store HTTP client (reqwest/hyper) must also be polled on this runtime.
+    runtime: tokio::runtime::Handle,
 }
 
 impl<H, P, S> CertificateReporter<H, P, S>
@@ -40,11 +47,12 @@ where
     P: PublicKey,
     S: Scheme,
 {
-    /// Build a reporter and background uploader.
+    /// Build a reporter and background uploader, spawned on `runtime`.
     pub fn connect(
         store_url: &str,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
+        runtime: tokio::runtime::Handle,
     ) -> (Self, JoinHandle<()>)
     where
         H: Hasher + Send + Sync + 'static,
@@ -57,8 +65,8 @@ where
                 .expect("simplex namespace prefix must be valid"),
         );
         let (tx, rx) = mpsc::channel(buffer);
-        let join = tokio::spawn(run_uploader::<H, P, S>(client, rx, commit_metrics));
-        (Self { tx }, join)
+        let join = runtime.spawn(run_uploader::<H, P, S>(client, rx, commit_metrics));
+        (Self { tx, runtime }, join)
     }
 
     /// Queue a finalized block for digest-addressed block upload and later
@@ -81,6 +89,7 @@ where
     fn clone(&self) -> Self {
         Self {
             tx: self.tx.clone(),
+            runtime: self.runtime.clone(),
         }
     }
 }
@@ -99,10 +108,18 @@ where
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         match activity {
             Activity::Notarization(notarization) => {
-                dispatch_input(&self.tx, SimplexInput::Notarization(notarization));
+                dispatch_input(
+                    &self.runtime,
+                    &self.tx,
+                    SimplexInput::Notarization(notarization),
+                );
             }
             Activity::Finalization(finalization) => {
-                dispatch_input(&self.tx, SimplexInput::Finalization(finalization));
+                dispatch_input(
+                    &self.runtime,
+                    &self.tx,
+                    SimplexInput::Finalization(finalization),
+                );
             }
             _ => {}
         }
@@ -110,15 +127,18 @@ where
     }
 }
 
-fn dispatch_input<H, P, S>(tx: &mpsc::Sender<SimplexInput<H, P, S>>, input: SimplexInput<H, P, S>)
-where
+fn dispatch_input<H, P, S>(
+    runtime: &tokio::runtime::Handle,
+    tx: &mpsc::Sender<SimplexInput<H, P, S>>,
+    input: SimplexInput<H, P, S>,
+) where
     H: Hasher + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
 {
     let tx = tx.clone();
-    tokio::spawn(async move {
+    runtime.spawn(async move {
         if let Err(error) = tx.send(input).await {
             warn!("simplex certificate uploader stopped; dropping activity: {error}");
         }

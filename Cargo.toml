@@ -56,7 +56,7 @@ commonware-formatting = "2026.7.0"
 commonware-utils = "2026.7.0"
 commonware-coding = "2026.7.0"
 commonware-macros = "2026.7.0"
-commonware-runtime = "2026.7.0"
+commonware-runtime = { version = "2026.7.0", features = ["iouring"] }
 commonware-storage = "2026.7.0"
 commonware-deployer = "2026.7.0"
 commonware-parallel = "2026.7.0"
@@ -98,6 +98,7 @@ mimalloc = "0.1.52"
 derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
+tracing-opentelemetry = "0.33.0"
 
 [profile.samply]
 inherits = "release"

@@ -5,6 +5,7 @@ mod config;
 mod relayer;
 mod run;
 mod state_reader;
+mod telemetry;
 
 use clap::Parser;
 

@@ -63,6 +63,12 @@ where
     H: Hasher,
 {
     sender: mpsc::Sender<Message<C, P, H>>,
+    /// Tokio runtime used to complete overflowing [`Reporter::report`] sends.
+    ///
+    /// `report` is called synchronously from the consensus runtime, which may
+    /// not be a tokio runtime, so the async re-send on the overflow path needs
+    /// an explicit handle to spawn on.
+    overflow_runtime: tokio::runtime::Handle,
 }
 
 impl<C, P, H> Clone for Mailbox<C, P, H>
@@ -74,6 +80,7 @@ where
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),
+            overflow_runtime: self.overflow_runtime.clone(),
         }
     }
 }
@@ -84,18 +91,30 @@ where
     P: PublicKey,
     H: Hasher,
 {
-    pub(super) const fn new(sender: mpsc::Sender<Message<C, P, H>>) -> Self {
-        Self { sender }
+    pub(super) const fn new(
+        sender: mpsc::Sender<Message<C, P, H>>,
+        overflow_runtime: tokio::runtime::Handle,
+    ) -> Self {
+        Self {
+            sender,
+            overflow_runtime,
+        }
     }
 
     /// Creates a new mailbox backed by a bounded channel of the given
     /// capacity, returning the mailbox handle and the receiver half.
     ///
+    /// `overflow_runtime` is the tokio runtime used to complete report sends
+    /// that overflow the channel.
+    ///
     /// Use this when the mailbox needs to exist before the [`Actor`](super::Actor)
     /// is constructed (e.g. to hand it to consensus as a transaction source).
-    pub fn channel(capacity: usize) -> (Self, ActorReceiver<C, P, H>) {
+    pub fn channel(
+        capacity: usize,
+        overflow_runtime: tokio::runtime::Handle,
+    ) -> (Self, ActorReceiver<C, P, H>) {
         let (tx, rx) = mpsc::channel(capacity);
-        (Self::new(tx), ActorReceiver { rx })
+        (Self::new(tx, overflow_runtime), ActorReceiver { rx })
     }
 
     /// Non-blocking batch submission for HTTP handlers.
@@ -199,7 +218,7 @@ where
             Ok(()) => Feedback::Ok,
             Err(TrySendError::Full(message)) => {
                 let sender = self.sender.clone();
-                tokio::spawn(async move {
+                self.overflow_runtime.spawn(async move {
                     let _ = sender.send(message).await;
                 });
                 Feedback::Backoff

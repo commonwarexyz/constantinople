@@ -31,7 +31,7 @@ ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true
 serde = { workspace = true, features = ["derive"] }
-tokio = { workspace = true, features = ["sync", "time"] }
+tokio = { workspace = true, features = ["net", "rt", "sync", "time"] }
 reqwest.workspace = true
 tracing.workspace = true
 serde_json.workspace = true
