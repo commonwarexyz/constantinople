@@ -3,17 +3,17 @@
 use super::{
     Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
 };
+use commonware_consensus::marshal::ancestry::Ancestry;
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
-use commonware_glue::stateful::{Application as CApplication, Proposed, db::DatabaseSet};
+use commonware_glue::stateful::{Application as CApplication, Input, Proposed, db::DatabaseSet};
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
 use commonware_storage::{mmr, qmdb::sync::Target as AnyTarget, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
-use futures::{Stream, StreamExt};
+use futures::StreamExt;
 use rand::{CryptoRng, Rng};
-use std::sync::Arc;
 
 impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
 where
@@ -30,7 +30,8 @@ where
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;
-    type InputProvider = I;
+    type Provider = I;
+    type Input = ();
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
         (
@@ -65,13 +66,15 @@ where
     async fn propose(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
+        ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
-        input: &mut Self::InputProvider,
+        mut input: Input<Self::Input, Self::Provider>,
     ) -> Option<Proposed<Self, E>> {
         let mut ancestry = Box::pin(ancestry);
         let parent = ancestry.next().await?;
-        let result = self.propose_child(context, parent, batches, input).await;
+        let result = self
+            .propose_child(context, parent, batches, &mut input.provider)
+            .await;
 
         // propose_child releases the parent on the strategy's pool, so only
         // the drained ancestry stream remains; the span keeps its drop cost
@@ -86,7 +89,7 @@ where
     async fn verify(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
+        ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let mut ancestry = Box::pin(ancestry);
@@ -122,10 +125,10 @@ where
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
-        databases: &Self::Databases,
+        readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
         if let Some(hook) = &self.finalized_hook {
-            hook(block, databases).await;
+            hook(block, &readers).await;
         }
     }
 }

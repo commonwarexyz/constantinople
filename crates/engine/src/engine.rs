@@ -323,7 +323,7 @@ where
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("state_resolver"),
-                qmdb_resolver::standard::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -340,7 +340,7 @@ where
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("transaction_resolver"),
-                qmdb_resolver::compact::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -349,6 +349,7 @@ where
                     initial: STATE_SYNC_INITIAL,
                     timeout: STATE_SYNC_TIMEOUT,
                     fetch_retry_timeout: STATE_SYNC_RETRY,
+                    max_serve_ops: NZU64!(4096),
                     priority_requests: false,
                     priority_responses: false,
                 },
@@ -435,7 +436,7 @@ where
         );
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
-        let (marshal, marshal_mailbox, _) = MarshalActor::init(
+        let (marshal, marshal_mailbox, marshal_floor) = MarshalActor::init(
             context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
@@ -445,7 +446,7 @@ where
                 start: marshal_start,
                 partition_prefix: format!("{}_marshal", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
-                view_retention_timeout: ACTIVITY_TIMEOUT,
+                view_retention: ACTIVITY_TIMEOUT,
                 prunable_items_per_section,
                 page_cache: page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
@@ -501,8 +502,8 @@ where
                     ),
                     transaction_db_config,
                 ),
-                input_provider: config.input,
-                marshal: marshal_mailbox.clone(),
+                provider: config.input,
+                marshal: (marshal_mailbox.clone(), marshal_floor),
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
@@ -555,9 +556,9 @@ where
                 certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
                 fetch_timeout: Duration::from_secs(4),
-                activity_timeout: ACTIVITY_TIMEOUT,
-                skip_timeout: ViewDelta::new(10),
-                fetch_concurrent: NZUsize!(32),
+                track_historical_votes: false,
+                view_retention: ACTIVITY_TIMEOUT,
+                skip_timeout: Duration::from_secs(11),
                 forwarding: simplex::ForwardingPolicy::Disabled,
             },
         );
@@ -693,7 +694,7 @@ where
         ),
         TransactionHistoryTarget {
             root: block.header.transactions_root,
-            leaf_count: mmr::Location::new(block.header.transactions_range.end()),
+            size: mmr::Location::new(block.header.transactions_range.end()),
         },
     )
 }
@@ -791,6 +792,8 @@ where
         },
         translator: EightCap,
         init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_buffer: DB_WRITE_BUFFER,
+        init_concurrency: (),
     }
 }
 

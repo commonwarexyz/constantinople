@@ -1,6 +1,9 @@
 //! Constantinople transaction type and transaction wrappers.
 
-use crate::{AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSignature};
+use crate::{
+    AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSignature,
+    sealed::finalize_reset,
+};
 use bytes::{Buf, BufMut};
 use commonware_codec::{
     Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
@@ -9,13 +12,22 @@ use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
 
 /// A signed transaction accepted by the canonical block format.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SignedTransaction<H>
 where
     H: Hasher,
 {
     inner: Sealed<Transaction<H::Digest>, H>,
     signature: TransactionSignature,
+}
+
+impl<H: Hasher> Clone for SignedTransaction<H> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            signature: self.signature.clone(),
+        }
+    }
 }
 
 impl<H> PartialEq for SignedTransaction<H>
@@ -171,7 +183,7 @@ impl<D: Digest> Transaction<D> {
     /// [`Digest`]: Digest
     pub fn hash_slow<H: Hasher>(&self, hasher: &mut H) -> H::Digest {
         hasher.update(&self.encode());
-        hasher.finalize()
+        finalize_reset(hasher)
     }
 
     /// Seals and signs this transaction with a supported transaction signer.

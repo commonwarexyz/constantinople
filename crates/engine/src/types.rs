@@ -22,14 +22,11 @@ use commonware_consensus::{
 use commonware_cryptography::{
     Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
 };
-use commonware_glue::stateful::Stateful;
+use commonware_glue::stateful::{Stateful, db::Shared};
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
-use commonware_utils::sync::TracedAsyncRwLock;
-use constantinople_application::consensus::{
-    Application, TransactionHistoryDb, TransactionHistoryOperation,
-};
+use constantinople_application::consensus::{Application, TransactionHistoryDb};
 use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 /// A finalized block with its seal (commitment-based).
 pub type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
@@ -98,41 +95,31 @@ pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolo
 
 pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
 
-pub type StateSyncDb<E, H, T> = Arc<TracedAsyncRwLock<StateDb<E, H, T>>>;
+pub type StateSyncDb<E, H, T> = Shared<StateDb<E, H, T>>;
 
-pub(crate) type StateResolverMailbox<E, H, T> =
-    commonware_glue::stateful::db::p2p::standard::Mailbox<
-        StateDb<E, H, T>,
-        mmr::Family,
-        <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
-        <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
-    >;
+pub(crate) type StateResolverMailbox<E, H, T> = commonware_glue::stateful::db::p2p::Mailbox<
+    StateDb<E, H, T>,
+    mmr::Family,
+    <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::Source>::Op,
+    <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::Source>::Digest,
+>;
 
 pub(crate) type StateResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::p2p::standard::Actor<E, P, M, B, mmr::Family, StateDb<E, H, T>>;
+    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, StateDb<E, H, T>>;
 
 pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
-pub type TransactionSyncDb<E, H, T> = Arc<TracedAsyncRwLock<TransactionDb<E, H, T>>>;
+pub type TransactionSyncDb<E, H, T> = Shared<TransactionDb<E, H, T>>;
 
-pub(crate) type TransactionResolverMailbox<E, H, T> =
-    commonware_glue::stateful::db::p2p::compact::Mailbox<
-        TransactionDb<E, H, T>,
-        mmr::Family,
-        TransactionHistoryOperation<H>,
-        H,
-    >;
+pub(crate) type TransactionResolverMailbox<E, H, T> = commonware_glue::stateful::db::p2p::Mailbox<
+    TransactionDb<E, H, T>,
+    mmr::Family,
+    <TransactionSyncDb<E, H, T> as commonware_storage::qmdb::sync::Source>::Op,
+    <TransactionSyncDb<E, H, T> as commonware_storage::qmdb::sync::Source>::Digest,
+>;
 
 pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::p2p::compact::Actor<
-        E,
-        P,
-        M,
-        B,
-        mmr::Family,
-        TransactionDb<E, H, T>,
-        H,
-    >;
+    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, TransactionDb<E, H, T>>;
 
 pub(crate) type App<E, H, P, V, I, B, St> =
     Application<E, H, Commitment, ThresholdScheme<P, V>, P, I, B, St>;

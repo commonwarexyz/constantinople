@@ -2,7 +2,7 @@
 version = "2026.7.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.95"
 authors = ["commonware"]
 homepage = "https://commonware.xyz"
 repository = "https://github.com/commonwarexyz/constantinople"
@@ -102,3 +102,67 @@ tracing-subscriber = "0.3"
 [profile.samply]
 inherits = "release"
 debug = true
+
+# Use commonware from the `andre/iouring-runtime-v7` branch. Use exoware from
+# `main`, which tracks the Commonware APIs included by that branch. The `www`
+# GitHub alias lets the git-source patch below redirect Exoware's pinned
+# Commonware revision without Cargo rejecting a same-source patch.
+[patch.crates-io]
+commonware-actor = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-broadcast = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-codec = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-codec-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-coding = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-conformance = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-conformance-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-consensus = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-cryptography = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-deployer = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-formatting = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-glue = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-invariants = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-macros-impl = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-math = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-p2p = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-parallel = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-resolver = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-runtime = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-runtime-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-storage = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-stream = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-utils = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", branch = "main" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", branch = "main" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", branch = "main" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", branch = "main" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", branch = "main" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", branch = "main" }
+
+# Exoware main currently pins Commonware by git revision. Redirect those git
+# dependencies to the io_uring branch too, avoiding duplicate Commonware types.
+[patch."https://github.com/commonwarexyz/monorepo.git"]
+commonware-actor = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-broadcast = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-codec = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-codec-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-coding = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-conformance = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-conformance-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-consensus = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-cryptography = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-deployer = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-formatting = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-glue = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-invariants = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-macros-impl = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-math = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-p2p = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-parallel = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-resolver = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-runtime = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-runtime-macros = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-storage = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-stream = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }
+commonware-utils = { git = "https://www.github.com/commonwarexyz/monorepo.git", branch = "andre/iouring-runtime-v7" }

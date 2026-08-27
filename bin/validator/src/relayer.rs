@@ -722,7 +722,7 @@ const fn min_signed_transaction_bytes() -> usize {
 }
 
 fn batch_id(body: &Bytes) -> String {
-    sha256::Sha256::hash(body).to_string()
+    sha256::Sha256::hash(&[body.as_ref()]).to_string()
 }
 
 fn requested_target_leader(headers: &HeaderMap) -> Option<String> {

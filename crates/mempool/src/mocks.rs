@@ -13,7 +13,7 @@ use core::{
 use std::collections::VecDeque;
 
 /// A queue-backed transaction source for deterministic tests.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug)]
 pub struct StaticTransactionSource<C, P, H>
 where
     P: PublicKey,
@@ -21,6 +21,32 @@ where
 {
     proposals: VecDeque<Vec<VerifiedTransaction<H>>>,
     _marker: PhantomData<(C, P)>,
+}
+
+impl<C, P, H> Clone for StaticTransactionSource<C, P, H>
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    fn clone(&self) -> Self {
+        Self {
+            proposals: self.proposals.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<C, P, H> Default for StaticTransactionSource<C, P, H>
+where
+    P: PublicKey,
+    H: Hasher,
+{
+    fn default() -> Self {
+        Self {
+            proposals: VecDeque::new(),
+            _marker: PhantomData,
+        }
+    }
 }
 
 impl<C, P, H> StaticTransactionSource<C, P, H>

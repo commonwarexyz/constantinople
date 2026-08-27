@@ -13,7 +13,7 @@ use commonware_cryptography::{
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
-use commonware_utils::NZU32;
+use commonware_utils::{NZU32, Probability};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::Path};
 
@@ -243,7 +243,7 @@ pub struct LoadedConfig {
     /// Capacity of the decompressed public key cache.
     pub public_key_cache_size: usize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
-    pub otel: Option<(String, f64)>,
+    pub otel: Option<(String, Probability)>,
     /// Whether logs are emitted as JSON.
     pub json_logs: bool,
     /// Whether this node is managed by the deployer.
@@ -325,7 +325,7 @@ fn decode_with_network(
     primary_participants: Vec<ed25519::PublicKey>,
     secondary_participants: Vec<ed25519::PublicKey>,
     bootstrappers: Vec<Bootstrapper<ed25519::PublicKey>>,
-    otel: Option<(String, f64)>,
+    otel: Option<(String, Probability)>,
     json_logs: bool,
 ) -> LoadedConfig {
     let signer = decode_private_key(&config.private_key);
@@ -509,10 +509,12 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         })
         .collect();
 
-    let otel = (config.traces > 0.0).then(|| {
+    let trace_rate = Probability::try_from(config.traces)
+        .expect("trace sampling rate must be finite and between 0 and 1");
+    let otel = (!trace_rate.is_zero()).then(|| {
         (
             format!("http://{}:4318/v1/traces", hosts.monitoring.private),
-            config.traces,
+            trace_rate,
         )
     });
 
@@ -545,7 +547,7 @@ mod tests {
         ed25519,
     };
     use commonware_formatting::hex;
-    use commonware_utils::{N3f1, TryCollect};
+    use commonware_utils::{N3f1, Probability, TryCollect};
     use std::{
         collections::BTreeMap,
         fs,
@@ -884,7 +886,10 @@ hosts:
         let loaded = load_deployer_config(&hosts_path, &config_path);
         assert_eq!(
             loaded.otel,
-            Some(("http://10.0.0.2:4318/v1/traces".to_string(), 0.25))
+            Some((
+                "http://10.0.0.2:4318/v1/traces".to_string(),
+                Probability::try_from(0.25).unwrap(),
+            ))
         );
 
         let _ = fs::remove_file(config_path);
