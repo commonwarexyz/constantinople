@@ -178,6 +178,11 @@ async fn run_relayer_mode(
         relayer_targets,
     } = config;
 
+    assert!(
+        !relayer_targets.is_empty(),
+        "finalization-paced spammer mode requires at least one relayer target"
+    );
+
     info!(
         submitters = relayer_submitters,
         accounts = accounts_count,
@@ -215,15 +220,17 @@ async fn run_relayer_mode(
         interval.tick().await;
         let totals = stats.totals();
         let elapsed = start.elapsed().as_secs_f64();
-        let admission_tps = if elapsed > 0.0 {
-            totals.admitted as f64 / elapsed
+        let finalization_tps = if elapsed > 0.0 {
+            totals.finalized as f64 / elapsed
         } else {
             0.0
         };
         info!(
-            admitted = totals.admitted,
+            finalized = totals.finalized,
+            filtered = totals.filtered,
+            dropped = totals.dropped,
             errors = totals.errors,
-            admission_tps = format!("{admission_tps:.0}"),
+            finalization_tps = format!("{finalization_tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"
         );

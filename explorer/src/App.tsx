@@ -21,7 +21,11 @@ import {
     submitTransactions,
     type AccountView,
 } from './mempool';
-import { isDeterministicSubmissionRejection } from './submissionResponse';
+import {
+    TransactionSubmissionError,
+    isDeterministicSubmissionRejection,
+    singleTransactionOutcome,
+} from './submissionResponse';
 import {
     fetchAccountTransactionsPage,
     fetchAndVerifyAccountProof,
@@ -37,9 +41,8 @@ import {
 import {
     consumeNonce,
     emptyNonceState,
-    mergeNonceStates,
     nextAvailableNonce,
-    nonceStatesEqual,
+    reserveNonces,
     type NonceState,
 } from './nonce';
 import {
@@ -66,6 +69,7 @@ import {
     markSubmissionReconciling,
     markSubmissionRejected,
     markTransactionFinalized,
+    markValidatorFinalizationObserved,
     normalizeSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
@@ -184,6 +188,9 @@ export default function App() {
     const [copyToast, setCopyToast] = useState('');
     const [storageError, setStorageError] = useState('');
     const nextNonceRef = useRef<NonceState>(emptyNonceState());
+    const committedNonceRef = useRef<NonceState>(emptyNonceState());
+    const reservedNoncesRef = useRef(new Set<bigint>());
+    const submissionInProgressRef = useRef(false);
     const copyToastTimeoutRef = useRef<number | null>(null);
     const isSubmitting = pendingSubmissionCount > 0;
     const isWalletBusy =
@@ -208,6 +215,7 @@ export default function App() {
     const reconciliationOrderRef = useRef(new Map<string, number>());
     const reconciliationFailuresRef = useRef(new Map<string, number>());
     const reconciliationSequenceRef = useRef(0);
+    const foregroundSubmissionsRef = useRef(new Set<string>());
     activeHistoryKeyRef.current = historyKey;
     loadedHistoryKeyRef.current = loadedHistoryKey;
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
@@ -217,8 +225,15 @@ export default function App() {
         setNonce(nextAvailableNonce(nextNonce).toString());
     };
 
-    const mergeLocalNonceState = (nextNonce: NonceState) => {
-        setLocalNonceState(mergeNonceStates(nextNonceRef.current, nextNonce));
+    const applyLocalNonceReservations = () => {
+        setLocalNonceState(
+            reserveNonces(committedNonceRef.current, reservedNoncesRef.current),
+        );
+    };
+
+    const setCommittedNonceState = (nextNonce: NonceState) => {
+        committedNonceRef.current = nextNonce;
+        applyLocalNonceReservations();
     };
 
     // Commit each delivered frame to state immediately. The feed delivers one
@@ -284,7 +299,18 @@ export default function App() {
     }, []);
 
     useEffect(() => {
-        setHistory(historyKey === null ? [] : readHistory(historyKey, setStorageError));
+        const restored = historyKey === null ? [] : readHistory(historyKey, setStorageError);
+        reservedNoncesRef.current = new Set(
+            restored
+                .filter(
+                    (transaction) =>
+                        transaction.sender === signedInAccountKey &&
+                        transaction.status !== 'rejected',
+                )
+                .map((transaction) => BigInt(transaction.nonce)),
+        );
+        applyLocalNonceReservations();
+        setHistory(restored);
         setLoadedHistoryKey(historyKey);
     }, [historyKey]);
 
@@ -491,7 +517,11 @@ export default function App() {
         }
 
         const eligible = history.filter((tx) =>
-            shouldReconcileTransaction(tx, signedInAccountKey),
+            shouldReconcileTransaction(
+                tx,
+                signedInAccountKey,
+                foregroundSubmissionsRef.current,
+            ),
         );
         reconciliationSequenceRef.current = assignReconciliationOrder(
             [...eligible].reverse(),
@@ -544,8 +574,15 @@ export default function App() {
                         throw new Error('finalized transaction height exceeds Number.MAX_SAFE_INTEGER');
                     }
                     const certificate = verifiedBlockCertificateState(target);
+                    const observedAt = Date.now();
                     setHistory((current) =>
-                        markReconciliationCertificate(tx.digest, height, certificate, current),
+                        markReconciliationCertificate(
+                            tx.digest,
+                            height,
+                            certificate,
+                            observedAt,
+                            current,
+                        ),
                     );
                 },
             })
@@ -562,13 +599,14 @@ export default function App() {
                     const height = Number(proof.height);
                     const certificate = verifiedBlockCertificateState(proof);
                     const proofState = verifiedProofState(proof);
+                    const proofObservedAt = Date.now();
                     setHistory((current) =>
                         markTransactionFinalized(
                             tx.digest,
                             height,
                             certificate,
                             proofState,
-                            Date.now(),
+                            proofObservedAt,
                             current,
                         ),
                     );
@@ -577,7 +615,7 @@ export default function App() {
                             .then((nextAccount) => {
                                 if (activeHistoryKeyRef.current !== historyKey) return;
                                 setAccount(nextAccount);
-                                mergeLocalNonceState(accountNonceState(nextAccount));
+                                setCommittedNonceState(accountNonceState(nextAccount));
                                 setAccountMessage(
                                     nextAccount
                                         ? 'committed account loaded'
@@ -642,7 +680,7 @@ export default function App() {
                                 current,
                             ),
                         );
-                    }, reconciliationRetryDelay(failures));
+                    }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
                 });
         }
     }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet]);
@@ -658,7 +696,9 @@ export default function App() {
     useEffect(() => {
         if (!wallet) {
             setAccount(null);
-            setLocalNonceState(emptyNonceState());
+            committedNonceRef.current = emptyNonceState();
+            reservedNoncesRef.current.clear();
+            applyLocalNonceReservations();
             setAccountMessage('account metadata unavailable');
             return;
         }
@@ -670,7 +710,7 @@ export default function App() {
             .then((nextAccount) => {
                 if (cancelled) return;
                 setAccount(nextAccount);
-                mergeLocalNonceState(accountNonceState(nextAccount));
+                setCommittedNonceState(accountNonceState(nextAccount));
                 setAccountMessage(
                     nextAccount
                         ? 'committed account loaded'
@@ -694,7 +734,7 @@ export default function App() {
         try {
             const nextAccount = await fetchAccount(mempoolUrl, wallet.publicKeyHex);
             setAccount(nextAccount);
-            mergeLocalNonceState(accountNonceState(nextAccount));
+            setCommittedNonceState(accountNonceState(nextAccount));
             setAccountMessage(
                 nextAccount ? 'committed account loaded' : 'no committed account yet; default balance applies',
             );
@@ -856,6 +896,7 @@ export default function App() {
 
     const submitTransfer = async () => {
         if (!wallet) return;
+        if (submissionInProgressRef.current) return;
         if (!walletAccountKey) {
             setSubmitMessage('loading account address');
             return;
@@ -866,9 +907,10 @@ export default function App() {
             return;
         }
 
+        submissionInProgressRef.current = true;
         setPendingSubmissionCount((count) => count + 1);
         setSubmitMessage('forming transaction');
-        let reservation: { previous: NonceState; next: NonceState } | null = null;
+        let reservedNonce: bigint | null = null;
         let submitted: { digest: string; historyKey: string } | null = null;
         try {
             const parsedToKey = parseAccountKeyHex(toKey);
@@ -879,8 +921,9 @@ export default function App() {
             if (nextNonce === null) {
                 throw new Error('nonce must fit in u64');
             }
-            setLocalNonceState(nextNonce);
-            reservation = { previous: previousNonce, next: nextNonce };
+            reservedNoncesRef.current.add(parsedNonce);
+            applyLocalNonceReservations();
+            reservedNonce = parsedNonce;
 
             const encoded = await encodeSignedTransaction(
                 {
@@ -892,14 +935,16 @@ export default function App() {
                 wallet.sign,
             );
             const pending: SubmittedTransaction = {
-                reconciliationVersion: 1,
+                reconciliationVersion: 2,
                 sender: walletAccountKey,
                 digest: encoded.digestHex,
                 to: toHex(parsedToKey),
                 value: parsedValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
-                finalizedInMs: null,
+                admittedInMs: null,
+                finalizationObservedInMs: null,
+                proofObservedInMs: null,
                 status: 'reconciling',
                 detail: 'submitting for admission',
                 finalizedHeight: null,
@@ -907,6 +952,7 @@ export default function App() {
                 proof: WAITING_FINALIZATION_PROOF,
             };
             cancelReconciliation(encoded.digestHex);
+            foregroundSubmissionsRef.current.add(encoded.digestHex);
             updateSubmittedHistory(
                 originHistoryKey,
                 (current) => prependTransaction(pending, current),
@@ -914,13 +960,42 @@ export default function App() {
             submitted = { digest: encoded.digestHex, historyKey: originHistoryKey };
             setSubmitMessage('submitting');
 
-            await submitTransactions(mempoolUrl, encodeTransactionBatch([encoded.bytes]));
+            const status = await submitTransactions(
+                mempoolUrl,
+                encodeTransactionBatch([encoded.bytes]),
+            );
+            if (status.status === 'pending') {
+                updateSubmittedHistory(
+                    originHistoryKey,
+                    (current) =>
+                        markSubmissionReconciling(
+                            encoded.digestHex,
+                            'finality wait timed out. checking finalized proof',
+                            current,
+                        ),
+                );
+                setSubmitMessage('');
+                return;
+            }
+            const outcome = singleTransactionOutcome(status);
+            if (outcome.kind === 'dropped') {
+                throw new TransactionSubmissionError(
+                    'rejected',
+                    'validator reported transaction dropped before finalization',
+                );
+            }
+            if (outcome.kind === 'ambiguous') {
+                throw new TransactionSubmissionError('ambiguous', outcome.detail);
+            }
+
+            const observedAt = Date.now();
             updateSubmittedHistory(
                 originHistoryKey,
                 (current) =>
-                    markSubmissionReconciling(
+                    markValidatorFinalizationObserved(
                         encoded.digestHex,
-                        'admitted by a leader',
+                        outcome.height,
+                        observedAt,
                         current,
                     ),
             );
@@ -953,10 +1028,11 @@ export default function App() {
 
             if (
                 (currentSubmission === null || rejected) &&
-                reservation !== null &&
-                nonceStatesEqual(nextNonceRef.current, reservation.next)
+                reservedNonce !== null &&
+                activeHistoryKeyRef.current === originHistoryKey
             ) {
-                setLocalNonceState(reservation.previous);
+                reservedNoncesRef.current.delete(reservedNonce);
+                applyLocalNonceReservations();
             }
             setSubmitMessage(
                 currentSubmission !== null && !rejected
@@ -966,6 +1042,10 @@ export default function App() {
                         : String(error),
             );
         } finally {
+            submissionInProgressRef.current = false;
+            if (submitted !== null) {
+                foregroundSubmissionsRef.current.delete(submitted.digest);
+            }
             setPendingSubmissionCount((count) => Math.max(0, count - 1));
         }
     };
@@ -1467,7 +1547,11 @@ function WalletPanel({
                         disabled={!wallet}
                     />
                 </label>
-                <button className="transfer__submit" disabled={!wallet} type="submit">
+                <button
+                    className="transfer__submit"
+                    disabled={!wallet || isSubmitting}
+                    type="submit"
+                >
                     submit
                 </button>
             </form>
@@ -1694,11 +1778,25 @@ function TransactionRecord({
                 <span className="tx-sep" aria-hidden="true">·</span>
                 <span className="tx-label">proof</span>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
-                {tx.finalizedInMs !== null && (
+                {tx.admittedInMs !== null && (
                     <>
                         <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">e2e latency</span>
-                        <span>{tx.finalizedInMs}ms</span>
+                        <span className="tx-label">admission observed</span>
+                        <span>{tx.admittedInMs}ms</span>
+                    </>
+                )}
+                {tx.finalizationObservedInMs !== null && (
+                    <>
+                        <span className="tx-sep" aria-hidden="true">·</span>
+                        <span className="tx-label">finalization observed</span>
+                        <span>{tx.finalizationObservedInMs}ms</span>
+                    </>
+                )}
+                {tx.proofObservedInMs !== null && (
+                    <>
+                        <span className="tx-sep" aria-hidden="true">·</span>
+                        <span className="tx-label">proof observed</span>
+                        <span>{tx.proofObservedInMs}ms</span>
                     </>
                 )}
             </div>

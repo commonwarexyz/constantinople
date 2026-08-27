@@ -15,7 +15,7 @@ use commonware_cryptography::{bls12381::primitives::variant::MinSig, ed25519, sh
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
 use constantinople_engine::types::EngineActivity;
-use constantinople_mempool::webserver::AccountReader;
+use constantinople_mempool::webserver::{AccountReader, TxStatus};
 use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPublicKey};
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
@@ -24,7 +24,7 @@ use std::{
     sync::{Arc, OnceLock},
     time::Duration,
 };
-use tokio::sync::{Semaphore, watch};
+use tokio::sync::{Semaphore, oneshot, watch};
 use tower_http::cors::{Any, CorsLayer};
 use tracing::debug;
 
@@ -32,9 +32,11 @@ const MAX_BATCH_LENGTH_PREFIX_BYTES: usize = 5;
 const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
-const PINNED_SUBMIT_RETRIES: usize = 3;
+const SINGLE_TRANSACTION_FANOUT: usize = 4;
+const BATCH_FANOUT: usize = 2;
 const LEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
-const VIEW_ADVANCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
+const LEADER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Maximum batches admitted to CPU decoding concurrently.
 ///
@@ -116,12 +118,12 @@ pub struct ServerConfig<St: Strategy> {
 #[derive(Clone)]
 struct AppState<St: Strategy> {
     leaders: Arc<Vec<Leader>>,
-    max_retry_views: u64,
     max_batch_bytes: usize,
     account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     view_clock: ViewClock,
-    http: reqwest::Client,
-    view_advance_wait_timeout: Duration,
+    blocking_http: reqwest::Client,
+    client_response_timeout: Duration,
+    leader_response_timeout: Duration,
     strategy: St,
     decode_permits: Arc<Semaphore>,
 }
@@ -134,24 +136,26 @@ struct Leader {
 }
 
 #[derive(Debug)]
-enum ForwardResult {
-    Accepted,
+enum LeaderResponse {
+    Terminal(TxStatus),
     Deterministic(StatusCode),
-    Transient,
+    Ambiguous,
 }
+
+type RelayResponse = (StatusCode, String);
 
 pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
     let state = AppState {
         leaders: Arc::new(normalize_leaders(config.relayer.leaders)),
-        max_retry_views: config.relayer.max_retry_views,
         max_batch_bytes: config.max_batch_bytes,
         account_reader: config.account_reader,
         view_clock: config.view_clock,
-        http: reqwest::Client::builder()
-            .timeout(LEADER_REQUEST_TIMEOUT)
+        blocking_http: reqwest::Client::builder()
+            .connect_timeout(LEADER_REQUEST_TIMEOUT)
             .build()
-            .expect("relayer HTTP client configuration is valid"),
-        view_advance_wait_timeout: VIEW_ADVANCE_WAIT_TIMEOUT,
+            .expect("relayer blocking HTTP client configuration is valid"),
+        client_response_timeout: CLIENT_RESPONSE_TIMEOUT,
+        leader_response_timeout: LEADER_RESPONSE_TIMEOUT,
         strategy: config.strategy,
         decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
     };
@@ -187,122 +191,191 @@ async fn submit_transactions<St: Strategy>(
     State(state): State<AppState<St>>,
     headers: HeaderMap,
     body: Bytes,
-) -> StatusCode {
+) -> (StatusCode, String) {
     if let Some(target) = requested_target_leader(&headers) {
         if body.len() > max_request_bytes(state.max_batch_bytes) {
-            return StatusCode::PAYLOAD_TOO_LARGE;
+            return (StatusCode::PAYLOAD_TOO_LARGE, String::new());
         }
         if requested_leader_fanout(&headers).is_some_and(|fanout| fanout != 1) {
-            return StatusCode::BAD_REQUEST;
+            return (StatusCode::BAD_REQUEST, String::new());
         }
         return submit_to_pinned_leader(&state, body, &target).await;
     }
 
     // Decoding seal-hashes every transaction, so it runs on the strategy's
     // pool with the owned permit riding in the job to bound concurrent
-    // decode CPU. Single-threaded: the wire format has no per-transaction
-    // framing to split on.
+    // decode CPU. Decoding stays single-threaded because the wire format has
+    // no per-transaction framing to split on.
     let Ok(permit) = state.decode_permits.clone().acquire_owned().await else {
-        return StatusCode::INTERNAL_SERVER_ERROR;
+        return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
     };
     let max_batch_bytes = state.max_batch_bytes;
     let decoded = state
         .strategy
         .spawn(move |_: St| {
             let _permit = permit;
-            decode_batch(&body, max_batch_bytes).map(|()| body)
+            decode_batch(&body, max_batch_bytes).map(|transactions| (body, transactions))
         })
         .await;
-    let body = match decoded {
-        Ok(body) => body,
-        Err(status) => return status,
+    let (body, transactions) = match decoded {
+        Ok(decoded) => decoded,
+        Err(status) => return (status, String::new()),
     };
 
-    submit_with_retries(&state, body).await
+    let fanout = if transactions == 1 {
+        SINGLE_TRANSACTION_FANOUT
+    } else {
+        BATCH_FANOUT
+    };
+    submit_to_public_leaders(&state, body, fanout).await
 }
 
 async fn submit_to_pinned_leader<St: Strategy>(
     state: &AppState<St>,
     body: Bytes,
     target: &str,
-) -> StatusCode {
+) -> (StatusCode, String) {
     let Some(leader) = leader_by_id(&state.leaders, target).cloned() else {
-        return StatusCode::BAD_REQUEST;
+        return (StatusCode::BAD_REQUEST, String::new());
     };
-    submit_to_leader_with_retries(&state.http, &leader, body).await
+    submit_to_blocking_leader(&state.blocking_http, &leader, body).await
 }
 
-async fn submit_with_retries<St: Strategy>(state: &AppState<St>, body: Bytes) -> StatusCode {
+async fn submit_to_public_leaders<St: Strategy>(
+    state: &AppState<St>,
+    body: Bytes,
+    fanout: usize,
+) -> RelayResponse {
     if state.leaders.is_empty() {
-        return StatusCode::SERVICE_UNAVAILABLE;
+        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     }
 
-    let mut views = state.view_clock.current_view.subscribe();
-    let mut view = *views.borrow();
+    let views = state.view_clock.current_view.subscribe();
+    let view = *views.borrow();
+    let targets = next_leaders(&state.leaders, view, fanout);
+    let http = state.blocking_http.clone();
+    let leader_response_timeout = state.leader_response_timeout;
+    let (response_tx, response_rx) = oneshot::channel();
 
-    for retry in 0..=state.max_retry_views {
-        let targets = next_two_leaders(&state.leaders, view);
-        match forward_to_targets(&state.http, &targets, body.clone()).await {
-            ForwardResult::Accepted => return StatusCode::ACCEPTED,
-            ForwardResult::Deterministic(status) => return status,
-            ForwardResult::Transient => {}
-        }
+    tokio::spawn(async move {
+        forward_to_targets(http, targets, body, leader_response_timeout, response_tx).await;
+    });
 
-        if retry == state.max_retry_views {
-            return StatusCode::SERVICE_UNAVAILABLE;
-        }
-
-        wait_for_view_advance(&mut views, &mut view, state.view_advance_wait_timeout).await;
+    match tokio::time::timeout(state.client_response_timeout, response_rx).await {
+        Ok(Ok(response)) => response,
+        Ok(Err(_)) | Err(_) => (StatusCode::ACCEPTED, String::new()),
     }
-
-    StatusCode::SERVICE_UNAVAILABLE
 }
 
 async fn forward_to_targets(
-    http: &reqwest::Client,
-    targets: &[Leader],
+    http: reqwest::Client,
+    targets: Vec<Leader>,
     body: Bytes,
-) -> ForwardResult {
+    leader_response_timeout: Duration,
+    response_tx: oneshot::Sender<RelayResponse>,
+) {
+    let target_count = targets.len();
     let mut sends = targets
-        .iter()
-        .map(|leader| forward_to_leader(http, leader, body.clone()))
+        .into_iter()
+        .map(|leader| {
+            let http = http.clone();
+            let body = body.clone();
+            async move {
+                tokio::time::timeout(
+                    leader_response_timeout,
+                    forward_to_leader(&http, &leader, body),
+                )
+                .await
+                .unwrap_or(LeaderResponse::Ambiguous)
+            }
+        })
         .collect::<FuturesUnordered<_>>();
+    let mut response_tx = Some(response_tx);
+    let mut partial = None;
     let mut deterministic = None;
+    let mut dropped = 0;
 
     while let Some(result) = sends.next().await {
         match result {
-            ForwardResult::Accepted => return ForwardResult::Accepted,
-            ForwardResult::Deterministic(status) => {
-                deterministic = Some(status);
+            LeaderResponse::Terminal(status @ TxStatus::Finalized { .. }) => {
+                send_once(&mut response_tx, status_response(status));
             }
-            ForwardResult::Transient => {}
+            LeaderResponse::Terminal(status @ TxStatus::PartiallyFinalized { .. }) => {
+                partial = Some(preferred_partial(partial, status));
+            }
+            LeaderResponse::Terminal(TxStatus::Dropped) => dropped += 1,
+            LeaderResponse::Deterministic(status) => {
+                deterministic = Some(status);
+                send_once(&mut response_tx, (status, String::new()));
+            }
+            LeaderResponse::Ambiguous => {}
         }
     }
 
-    deterministic.map_or(ForwardResult::Transient, ForwardResult::Deterministic)
+    let response = partial.map_or_else(
+        || {
+            deterministic.map_or_else(
+                || {
+                    if dropped == target_count {
+                        status_response(TxStatus::Dropped)
+                    } else {
+                        (StatusCode::ACCEPTED, String::new())
+                    }
+                },
+                |status| (status, String::new()),
+            )
+        },
+        status_response,
+    );
+    send_once(&mut response_tx, response);
 }
 
-async fn wait_for_view_advance(
-    views: &mut watch::Receiver<u64>,
-    current: &mut u64,
-    max_wait: Duration,
-) {
-    let observed = tokio::time::timeout(max_wait, async {
-        loop {
-            if views.changed().await.is_err() {
-                return None;
-            }
-            let next = *views.borrow();
-            if next > *current {
-                return Some(next);
-            }
-        }
-    })
-    .await;
+fn send_once(sender: &mut Option<oneshot::Sender<RelayResponse>>, response: RelayResponse) {
+    if let Some(sender) = sender.take() {
+        let _ = sender.send(response);
+    }
+}
 
-    match observed {
-        Ok(Some(observed)) => *current = observed,
-        Ok(None) | Err(_) => *current = (*current).saturating_add(1),
+fn status_response(status: TxStatus) -> RelayResponse {
+    serde_json::to_string(&status).map_or_else(
+        |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+        |body| (StatusCode::OK, body),
+    )
+}
+
+fn preferred_partial(current: Option<TxStatus>, candidate: TxStatus) -> TxStatus {
+    let Some(current) = current else {
+        return candidate;
+    };
+    let TxStatus::PartiallyFinalized {
+        height: current_height,
+        included: current_included,
+        filtered: current_filtered,
+    } = current
+    else {
+        unreachable!("partial aggregation stores only partial results")
+    };
+    let TxStatus::PartiallyFinalized {
+        height: candidate_height,
+        included: candidate_included,
+        filtered: candidate_filtered,
+    } = candidate
+    else {
+        unreachable!("partial aggregation receives only partial results")
+    };
+
+    if (
+        candidate_included,
+        std::cmp::Reverse(candidate_filtered),
+        candidate_height,
+    ) > (
+        current_included,
+        std::cmp::Reverse(current_filtered),
+        current_height,
+    ) {
+        candidate
+    } else {
+        current
     }
 }
 
@@ -376,55 +449,62 @@ async fn ready<St: Strategy>(State(state): State<AppState<St>>) -> StatusCode {
     StatusCode::OK
 }
 
-async fn forward_to_leader(http: &reqwest::Client, leader: &Leader, body: Bytes) -> ForwardResult {
-    match http
-        .post(format!("{}/transactions/ingest", leader.url))
+async fn forward_to_leader(http: &reqwest::Client, leader: &Leader, body: Bytes) -> LeaderResponse {
+    let response = match http
+        .post(format!("{}/transactions", leader.url))
         .header("content-type", "application/octet-stream")
         .body(body)
         .send()
         .await
     {
-        Ok(response) if response.status() == StatusCode::ACCEPTED => {
-            debug!(leader = %leader.public_key, "relayer forward accepted");
-            ForwardResult::Accepted
-        }
-        Ok(response)
-            if response.status() == StatusCode::BAD_REQUEST
-                || response.status() == StatusCode::PAYLOAD_TOO_LARGE =>
-        {
-            ForwardResult::Deterministic(response.status())
-        }
-        Ok(_) | Err(_) => {
+        Ok(response) => response,
+        Err(_) => {
             debug!(leader = %leader.public_key, "relayer forward transient failure");
-            ForwardResult::Transient
+            return LeaderResponse::Ambiguous;
         }
+    };
+    if response.status() == StatusCode::BAD_REQUEST
+        || response.status() == StatusCode::PAYLOAD_TOO_LARGE
+    {
+        return LeaderResponse::Deterministic(response.status());
     }
+    if response.status() != StatusCode::OK {
+        debug!(leader = %leader.public_key, status = %response.status(), "relayer forward ambiguous response");
+        return LeaderResponse::Ambiguous;
+    }
+
+    response.json::<TxStatus>().await.map_or_else(
+        |_| {
+            debug!(leader = %leader.public_key, "relayer forward invalid terminal response");
+            LeaderResponse::Ambiguous
+        },
+        LeaderResponse::Terminal,
+    )
 }
 
-async fn submit_to_leader_with_retries(
+async fn submit_to_blocking_leader(
     http: &reqwest::Client,
     leader: &Leader,
     body: Bytes,
-) -> StatusCode {
-    let mut backoff = std::time::Duration::from_millis(50);
-    for attempt in 0..PINNED_SUBMIT_RETRIES {
-        match forward_to_leader(http, leader, body.clone()).await {
-            ForwardResult::Accepted => return StatusCode::ACCEPTED,
-            ForwardResult::Deterministic(status) => return status,
-            ForwardResult::Transient if attempt + 1 < PINNED_SUBMIT_RETRIES => {
-                tokio::time::sleep(backoff).await;
-                backoff *= 2;
-            }
-            ForwardResult::Transient => {
-                return StatusCode::SERVICE_UNAVAILABLE;
-            }
-        }
-    }
-
-    StatusCode::SERVICE_UNAVAILABLE
+) -> (StatusCode, String) {
+    let response = match http
+        .post(format!("{}/transactions/background", leader.url))
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(_) => return (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+    };
+    let status = response.status();
+    response.text().await.map_or_else(
+        |_| (StatusCode::SERVICE_UNAVAILABLE, String::new()),
+        |body| (status, body),
+    )
 }
 
-fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<(), StatusCode> {
+fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<usize, StatusCode> {
     if body.len() > max_request_bytes(max_batch_bytes) {
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
@@ -442,7 +522,7 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<(), StatusCode> 
         return Err(StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    Ok(())
+    Ok(transactions.len())
 }
 
 const fn max_request_bytes(max_batch_bytes: usize) -> usize {
@@ -500,19 +580,24 @@ fn normalize_leaders(leaders: Vec<RelayerLeaderConfig>) -> Vec<Leader> {
             .cmp(&right.sort_key)
             .then_with(|| left.public_key.cmp(&right.public_key))
     });
+    for pair in leaders.windows(2) {
+        assert_ne!(
+            pair[0].public_key, pair[1].public_key,
+            "leader public_key must be unique: {}",
+            pair[0].public_key
+        );
+    }
     leaders
 }
 
-fn next_two_leaders(leaders: &[Leader], observed_view: u64) -> Vec<Leader> {
+fn next_leaders(leaders: &[Leader], observed_view: u64, fanout: usize) -> Vec<Leader> {
     if leaders.is_empty() {
         return Vec::new();
     }
-    let first = ((observed_view + 1) as usize) % leaders.len();
-    let second = ((observed_view + 2) as usize) % leaders.len();
-    if first == second {
-        return vec![leaders[first].clone()];
-    }
-    vec![leaders[first].clone(), leaders[second].clone()]
+    let observed = (observed_view % leaders.len() as u64) as usize;
+    (0..fanout.min(leaders.len()))
+        .map(|offset| leaders[(observed + 1 + offset) % leaders.len()].clone())
+        .collect()
 }
 
 fn leader_by_id<'a>(leaders: &'a [Leader], public_key: &str) -> Option<&'a Leader> {
@@ -527,6 +612,7 @@ mod tests {
     use axum::http::HeaderValue;
     use commonware_codec::Encode as _;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::sync::Notify;
 
     const DEFAULT_MAX_BATCH_BYTES: usize = 8 * 1024 * 1024;
 
@@ -541,6 +627,7 @@ mod tests {
     fn signed_transfer(seed: u64, nonce: u64) -> SignedTransaction<sha256::Sha256> {
         use commonware_cryptography::Signer as _;
         use constantinople_primitives::Transaction;
+
         let sender = ed25519::PrivateKey::from_seed(seed);
         let recipient = ed25519::PrivateKey::from_seed(seed + 1).public_key();
         Transaction::new(
@@ -550,13 +637,6 @@ mod tests {
             nonce,
         )
         .seal_and_sign(&sender, b"relayer-test", &mut sha256::Sha256::default())
-    }
-
-    #[test]
-    fn decode_batch_accepts_valid_transactions() {
-        let body = vec![signed_transfer(1, 0), signed_transfer(2, 0)].encode();
-
-        assert_eq!(decode_batch(&body, DEFAULT_MAX_BATCH_BYTES), Ok(()));
     }
 
     async fn spawn_mock_leader(mock: Router) -> String {
@@ -572,23 +652,30 @@ mod tests {
         leader_url
     }
 
-    fn pinned_state(leader_url: String) -> AppState<commonware_parallel::Sequential> {
+    fn mock_leader(key: &str, url: String) -> Leader {
+        Leader {
+            public_key: key.to_string(),
+            sort_key: from_hex(key).expect("hex key"),
+            url,
+        }
+    }
+
+    fn test_state(
+        leaders: Vec<Leader>,
+        client_response_timeout: Duration,
+        leader_response_timeout: Duration,
+    ) -> AppState<commonware_parallel::Sequential> {
         let (_, view_clock) = Observer::new();
         AppState {
-            leaders: Arc::new(vec![Leader {
-                public_key: "00".to_string(),
-                sort_key: vec![0],
-                url: leader_url,
-            }]),
-            max_retry_views: 1,
+            leaders: Arc::new(leaders),
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             account_reader: Arc::new(OnceLock::new()),
             view_clock,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_millis(100))
+            blocking_http: reqwest::Client::builder()
                 .build()
-                .expect("test HTTP client configuration is valid"),
-            view_advance_wait_timeout: Duration::from_millis(20),
+                .expect("test blocking HTTP client configuration is valid"),
+            client_response_timeout,
+            leader_response_timeout,
             strategy: commonware_parallel::Sequential,
             decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
         }
@@ -601,28 +688,54 @@ mod tests {
         headers
     }
 
-    #[test]
-    fn targets_next_two_views() {
-        let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
+    fn terminal_router(
+        status: TxStatus,
+        delay: Duration,
+        completion: Option<Arc<Notify>>,
+    ) -> Router {
+        Router::new().route(
+            "/transactions",
+            post(move || {
+                let completion = completion.clone();
+                async move {
+                    tokio::time::sleep(delay).await;
+                    if let Some(completion) = completion {
+                        completion.notify_one();
+                    }
+                    status_response(status)
+                }
+            }),
+        )
+    }
 
-        let targets = next_two_leaders(&leaders, 0)
-            .into_iter()
-            .map(|leader| leader.public_key)
-            .collect::<Vec<_>>();
-
-        assert_eq!(targets, vec!["01", "02"]);
+    async fn counted_leaders(count: usize) -> (Vec<Leader>, Vec<Arc<AtomicUsize>>) {
+        let mut leaders = Vec::with_capacity(count);
+        let mut requests = Vec::with_capacity(count);
+        for index in 0..count {
+            let request_count = Arc::new(AtomicUsize::new(0));
+            let request_count_for_handler = request_count.clone();
+            let router = Router::new().route(
+                "/transactions",
+                post(move || {
+                    let request_count = request_count_for_handler.clone();
+                    async move {
+                        request_count.fetch_add(1, Ordering::Relaxed);
+                        status_response(TxStatus::Dropped)
+                    }
+                }),
+            );
+            let key = format!("{index:02x}");
+            leaders.push(mock_leader(&key, spawn_mock_leader(router).await));
+            requests.push(request_count);
+        }
+        (leaders, requests)
     }
 
     #[test]
-    fn targets_deduplicate_single_leader_network() {
-        let leaders = vec![leader("00")];
+    fn decode_batch_reports_transaction_count() {
+        let body = vec![signed_transfer(1, 0), signed_transfer(2, 0)].encode();
 
-        let targets = next_two_leaders(&leaders, 12)
-            .into_iter()
-            .map(|leader| leader.public_key)
-            .collect::<Vec<_>>();
-
-        assert_eq!(targets, vec!["00"]);
+        assert_eq!(decode_batch(&body, DEFAULT_MAX_BATCH_BYTES), Ok(2));
     }
 
     #[test]
@@ -633,347 +746,315 @@ mod tests {
         );
     }
 
+    #[test]
+    fn targets_next_two_views() {
+        let leaders = vec![leader("00"), leader("01"), leader("02"), leader("03")];
+
+        let targets = next_leaders(&leaders, 0, 2)
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["01", "02"]);
+    }
+
+    #[test]
+    fn targets_cap_fanout_at_network_size() {
+        let leaders = vec![leader("00"), leader("01"), leader("02")];
+
+        let targets = next_leaders(&leaders, 1, 4)
+            .into_iter()
+            .map(|leader| leader.public_key)
+            .collect::<Vec<_>>();
+
+        assert_eq!(targets, vec!["02", "00", "01"]);
+    }
+
+    #[test]
+    #[should_panic(expected = "leader public_key must be unique")]
+    fn duplicate_leader_ids_are_rejected() {
+        normalize_leaders(vec![
+            RelayerLeaderConfig {
+                public_key: "00".to_string(),
+                url: "http://first".to_string(),
+            },
+            RelayerLeaderConfig {
+                public_key: "00".to_string(),
+                url: "http://second".to_string(),
+            },
+        ]);
+    }
+
     #[tokio::test]
-    async fn pinned_target_forwards_to_ingest_without_decoding() {
-        let submit_count = Arc::new(AtomicUsize::new(0));
-        let ingest_count = Arc::new(AtomicUsize::new(0));
-        let submit_count_for_handler = submit_count.clone();
-        let ingest_count_for_handler = ingest_count.clone();
+    async fn pinned_target_uses_background_once_and_proxies_terminal_response() {
+        let foreground_count = Arc::new(AtomicUsize::new(0));
+        let background_count = Arc::new(AtomicUsize::new(0));
+        let foreground_count_for_handler = foreground_count.clone();
+        let background_count_for_handler = background_count.clone();
         let mock = Router::new()
             .route(
                 "/transactions",
-                post(move |body: Bytes| {
-                    let submit_count = submit_count_for_handler.clone();
+                post(move || {
+                    let foreground_count = foreground_count_for_handler.clone();
                     async move {
-                        submit_count.fetch_add(1, Ordering::Relaxed);
-                        assert_eq!(body, Bytes::from_static(b"not a codec batch"));
-                        StatusCode::INTERNAL_SERVER_ERROR
+                        foreground_count.fetch_add(1, Ordering::Relaxed);
+                        status_response(TxStatus::Dropped)
                     }
                 }),
             )
             .route(
-                "/transactions/ingest",
+                "/transactions/background",
                 post(move |body: Bytes| {
-                    let ingest_count = ingest_count_for_handler.clone();
+                    let background_count = background_count_for_handler.clone();
                     async move {
-                        ingest_count.fetch_add(1, Ordering::Relaxed);
+                        background_count.fetch_add(1, Ordering::Relaxed);
                         assert_eq!(body, Bytes::from_static(b"not a codec batch"));
-                        StatusCode::ACCEPTED
+                        tokio::time::sleep(Duration::from_millis(30)).await;
+                        (StatusCode::OK, r#"{"status":"finalized","height":7}"#)
                     }
                 }),
             );
-        let state = pinned_state(spawn_mock_leader(mock).await);
+        let url = spawn_mock_leader(mock).await;
+        let state = test_state(
+            vec![mock_leader("00", url)],
+            Duration::from_millis(5),
+            Duration::from_millis(10),
+        );
 
-        let status = submit_transactions(
+        let response = submit_transactions(
             State(state),
             pinned_headers(),
             Bytes::from_static(b"not a codec batch"),
         )
         .await;
 
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(submit_count.load(Ordering::Relaxed), 0);
-        assert_eq!(ingest_count.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            response,
+            (
+                StatusCode::OK,
+                r#"{"status":"finalized","height":7}"#.to_string()
+            )
+        );
+        assert_eq!(background_count.load(Ordering::Relaxed), 1);
+        assert_eq!(foreground_count.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
-    async fn pinned_target_retries_transient_ingest() {
-        let submit_count = Arc::new(AtomicUsize::new(0));
-        let submit_count_for_handler = submit_count.clone();
-        let mock = Router::new().route(
-            "/transactions/ingest",
-            post(move |body: Bytes| {
-                let submit_count = submit_count_for_handler.clone();
-                async move {
-                    assert_eq!(body, Bytes::from_static(b"not a codec batch"));
-                    let attempt = submit_count.fetch_add(1, Ordering::Relaxed);
-                    if attempt == 0 {
-                        return StatusCode::SERVICE_UNAVAILABLE;
-                    }
-                    StatusCode::ACCEPTED
-                }
-            }),
+    async fn unpinned_returns_fast_finalized_response() {
+        let slow = terminal_router(TxStatus::Dropped, Duration::from_millis(200), None);
+        let finalized = terminal_router(TxStatus::Finalized { height: 9 }, Duration::ZERO, None);
+        let slow = mock_leader("00", spawn_mock_leader(slow).await);
+        let finalized = mock_leader("01", spawn_mock_leader(finalized).await);
+        let state = test_state(
+            vec![slow, finalized],
+            Duration::from_millis(300),
+            Duration::from_millis(400),
         );
-        let state = pinned_state(spawn_mock_leader(mock).await);
-
-        let status = submit_transactions(
-            State(state),
-            pinned_headers(),
-            Bytes::from_static(b"not a codec batch"),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(submit_count.load(Ordering::Relaxed), 2);
-    }
-
-    #[tokio::test]
-    async fn pinned_target_does_not_retry_deterministic_rejection() {
-        let submit_count = Arc::new(AtomicUsize::new(0));
-        let submit_count_for_handler = submit_count.clone();
-        let mock = Router::new().route(
-            "/transactions/ingest",
-            post(move || {
-                let submit_count = submit_count_for_handler.clone();
-                async move {
-                    submit_count.fetch_add(1, Ordering::Relaxed);
-                    StatusCode::BAD_REQUEST
-                }
-            }),
-        );
-        let state = pinned_state(spawn_mock_leader(mock).await);
-
-        let status = submit_transactions(
-            State(state),
-            pinned_headers(),
-            Bytes::from_static(b"not a codec batch"),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(submit_count.load(Ordering::Relaxed), 1);
-    }
-
-    #[tokio::test]
-    async fn pinned_target_bounds_transient_retries() {
-        let submit_count = Arc::new(AtomicUsize::new(0));
-        let submit_count_for_handler = submit_count.clone();
-        let mock = Router::new().route(
-            "/transactions/ingest",
-            post(move || {
-                let submit_count = submit_count_for_handler.clone();
-                async move {
-                    submit_count.fetch_add(1, Ordering::Relaxed);
-                    StatusCode::SERVICE_UNAVAILABLE
-                }
-            }),
-        );
-        let state = pinned_state(spawn_mock_leader(mock).await);
-
-        let status = submit_transactions(
-            State(state),
-            pinned_headers(),
-            Bytes::from_static(b"not a codec batch"),
-        )
-        .await;
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(submit_count.load(Ordering::Relaxed), PINNED_SUBMIT_RETRIES);
-    }
-
-    /// Pops the next scripted response, repeating the last one once the
-    /// script is down to a single entry; `None` for an empty script.
-    fn take_scripted<T: Clone>(script: &std::sync::Mutex<Vec<T>>) -> Option<T> {
-        let mut script = script.lock().expect("script lock");
-        match script.len() {
-            0 => None,
-            1 => Some(script[0].clone()),
-            _ => Some(script.remove(0)),
-        }
-    }
-
-    /// A mock leader whose ingest endpoint records bodies and repeats its last
-    /// scripted status once the script reaches one entry.
-    fn scripted_leader(ingest: Vec<StatusCode>) -> (Router, Arc<std::sync::Mutex<Vec<Bytes>>>) {
-        let bodies = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let ingest = Arc::new(std::sync::Mutex::new(ingest));
-        let bodies_for_handler = bodies.clone();
-        let router = Router::new().route(
-            "/transactions/ingest",
-            post(move |body: Bytes| {
-                let bodies = bodies_for_handler.clone();
-                let ingest = ingest.clone();
-                async move {
-                    bodies.lock().expect("bodies lock").push(body);
-                    take_scripted(&ingest).unwrap_or(StatusCode::ACCEPTED)
-                }
-            }),
-        );
-        (router, bodies)
-    }
-
-    fn retry_state(
-        leaders: Vec<Leader>,
-        max_retry_views: u64,
-    ) -> AppState<commonware_parallel::Sequential> {
-        let (_, view_clock) = Observer::new();
-        AppState {
-            leaders: Arc::new(leaders),
-            max_retry_views,
-            max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
-            account_reader: Arc::new(OnceLock::new()),
-            view_clock,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_millis(100))
-                .build()
-                .expect("test HTTP client configuration is valid"),
-            view_advance_wait_timeout: Duration::from_millis(20),
-            strategy: commonware_parallel::Sequential,
-            decode_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_DECODES)),
-        }
-    }
-
-    fn mock_leader(key: &str, url: String) -> Leader {
-        Leader {
-            public_key: key.to_string(),
-            sort_key: from_hex(key).expect("hex key"),
-            url,
-        }
-    }
-
-    /// Advances the relayer's observed view every few milliseconds so
-    /// `wait_for_view_advance` never stalls a retry round.
-    fn advance_views(sender: watch::Sender<u64>) -> tokio::task::JoinHandle<()> {
-        tokio::spawn(async move {
-            let mut view = 0u64;
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                view += 1;
-                sender.send_replace(view);
-            }
-        })
-    }
-
-    #[tokio::test]
-    async fn unpinned_returns_empty_accepted_after_ingest() {
-        let (router, bodies) = scripted_leader(vec![StatusCode::ACCEPTED]);
-        let leader = mock_leader("aa", spawn_mock_leader(router).await);
-        let state = retry_state(vec![leader], 3);
         let body: Bytes = vec![signed_transfer(1, 0)].encode();
 
-        let status = submit_transactions(State(state), HeaderMap::new(), body).await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(bodies.lock().expect("bodies lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unpinned_retry_reposts_transient_leader_within_window() {
-        let (router, bodies) =
-            scripted_leader(vec![StatusCode::SERVICE_UNAVAILABLE, StatusCode::ACCEPTED]);
-        let leader = mock_leader("aa", spawn_mock_leader(router).await);
-        let state = retry_state(vec![leader], 2);
-        let views = state.view_clock.current_view.clone();
-        let body: Bytes = vec![signed_transfer(1, 0)].encode();
-
-        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
-        let ticker = advance_views(views);
-        let status = submit.await.expect("submit task");
-        ticker.abort();
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(bodies.lock().expect("bodies lock").len(), 2);
-    }
-
-    #[tokio::test]
-    async fn unpinned_retry_remains_bounded_when_view_stops() {
-        let (router, bodies) =
-            scripted_leader(vec![StatusCode::SERVICE_UNAVAILABLE, StatusCode::ACCEPTED]);
-        let leader = mock_leader("aa", spawn_mock_leader(router).await);
-        let state = retry_state(vec![leader], 1);
-        let body: Bytes = vec![signed_transfer(1, 0)].encode();
-
-        let status = tokio::time::timeout(
-            Duration::from_secs(1),
+        let response = tokio::time::timeout(
+            Duration::from_millis(100),
             submit_transactions(State(state), HeaderMap::new(), body),
         )
         .await
-        .expect("view timeout should advance the retry window");
+        .expect("finalized response should not wait for other leaders");
 
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(bodies.lock().expect("bodies lock").len(), 2);
+        assert_eq!(response, status_response(TxStatus::Finalized { height: 9 }));
     }
 
     #[tokio::test]
-    async fn unpinned_does_not_retry_deterministic_rejection() {
-        let (router, bodies) = scripted_leader(vec![StatusCode::BAD_REQUEST]);
-        let leader = mock_leader("aa", spawn_mock_leader(router).await);
-        let state = retry_state(vec![leader], 3);
-        let body: Bytes = vec![signed_transfer(1, 0)].encode();
-
-        let status = submit_transactions(State(state), HeaderMap::new(), body).await;
-
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!(bodies.lock().expect("bodies lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unpinned_retry_budget_returns_service_unavailable() {
-        let (router, bodies) = scripted_leader(vec![StatusCode::SERVICE_UNAVAILABLE]);
-        let leader = mock_leader("aa", spawn_mock_leader(router).await);
-        let state = retry_state(vec![leader], 2);
-        let views = state.view_clock.current_view.clone();
-        let body: Bytes = vec![signed_transfer(1, 0)].encode();
-
-        let submit = tokio::spawn(submit_transactions(State(state), HeaderMap::new(), body));
-        let ticker = advance_views(views);
-        let status = submit.await.expect("submit task");
-        ticker.abort();
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
-        assert_eq!(bodies.lock().expect("bodies lock").len(), 3);
-    }
-
-    #[tokio::test]
-    async fn unpinned_returns_after_first_acceptance() {
-        let slow = Router::new().route(
-            "/transactions/ingest",
-            post(|| async { std::future::pending::<StatusCode>().await }),
+    async fn unpinned_returns_dropped_only_after_all_leaders_drop() {
+        let first = terminal_router(TxStatus::Dropped, Duration::ZERO, None);
+        let second = terminal_router(TxStatus::Dropped, Duration::from_millis(20), None);
+        let first = mock_leader("00", spawn_mock_leader(first).await);
+        let second = mock_leader("01", spawn_mock_leader(second).await);
+        let state = test_state(
+            vec![first, second],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
         );
-        let (accepted, accepted_bodies) = scripted_leader(vec![StatusCode::ACCEPTED]);
-        let accepted = mock_leader("aa", spawn_mock_leader(accepted).await);
-        let slow = mock_leader("bb", spawn_mock_leader(slow).await);
-        let state = retry_state(vec![accepted, slow], 1);
         let body: Bytes = vec![signed_transfer(1, 0)].encode();
 
-        let status = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(response, status_response(TxStatus::Dropped));
+    }
+
+    #[tokio::test]
+    async fn unpinned_dropped_waits_for_delayed_finalized() {
+        let dropped = terminal_router(TxStatus::Dropped, Duration::ZERO, None);
+        let finalized = terminal_router(
+            TxStatus::Finalized { height: 11 },
+            Duration::from_millis(30),
+            None,
+        );
+        let dropped = mock_leader("00", spawn_mock_leader(dropped).await);
+        let finalized = mock_leader("01", spawn_mock_leader(finalized).await);
+        let state = test_state(
+            vec![dropped, finalized],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(
+            response,
+            status_response(TxStatus::Finalized { height: 11 })
+        );
+    }
+
+    #[tokio::test]
+    async fn unpinned_timeout_returns_accepted_while_owned_request_completes() {
+        let completion = Arc::new(Notify::new());
+        let delayed = terminal_router(
+            TxStatus::Dropped,
+            Duration::from_millis(50),
+            Some(completion.clone()),
+        );
+        let delayed = mock_leader("00", spawn_mock_leader(delayed).await);
+        let state = test_state(
+            vec![delayed],
+            Duration::from_millis(5),
+            Duration::from_millis(100),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(response, (StatusCode::ACCEPTED, String::new()));
+        tokio::time::timeout(Duration::from_millis(200), completion.notified())
+            .await
+            .expect("owned request should complete after client timeout");
+    }
+
+    #[tokio::test]
+    async fn unpinned_partial_waits_for_all_leaders() {
+        let completion = Arc::new(Notify::new());
+        let partial = terminal_router(
+            TxStatus::PartiallyFinalized {
+                height: 12,
+                included: 1,
+                filtered: 1,
+            },
+            Duration::ZERO,
+            None,
+        );
+        let dropped = terminal_router(
+            TxStatus::Dropped,
+            Duration::from_millis(30),
+            Some(completion.clone()),
+        );
+        let partial = mock_leader("00", spawn_mock_leader(partial).await);
+        let dropped = mock_leader("01", spawn_mock_leader(dropped).await);
+        let state = test_state(
+            vec![partial, dropped],
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0), signed_transfer(2, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(
+            response,
+            status_response(TxStatus::PartiallyFinalized {
+                height: 12,
+                included: 1,
+                filtered: 1,
+            })
+        );
+        tokio::time::timeout(Duration::from_millis(10), completion.notified())
+            .await
+            .expect("partial result should wait for every leader");
+    }
+
+    #[tokio::test]
+    async fn unpinned_single_transaction_fans_out_to_four_leaders() {
+        let (leaders, requests) = counted_leaders(5).await;
+        let state = test_state(
+            leaders,
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+        let requests = requests
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+
+        assert_eq!(response, status_response(TxStatus::Dropped));
+        assert_eq!(requests, vec![0, 1, 1, 1, 1]);
+    }
+
+    #[tokio::test]
+    async fn unpinned_multi_transaction_batch_fans_out_to_two_leaders() {
+        let (leaders, requests) = counted_leaders(5).await;
+        let state = test_state(
+            leaders,
+            Duration::from_millis(100),
+            Duration::from_millis(200),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0), signed_transfer(2, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+        let requests = requests
+            .iter()
+            .map(|count| count.load(Ordering::Relaxed))
+            .collect::<Vec<_>>();
+
+        assert_eq!(response, status_response(TxStatus::Dropped));
+        assert_eq!(requests, vec![0, 1, 1, 0, 0]);
+    }
+
+    #[tokio::test]
+    async fn unpinned_preserves_deterministic_validator_rejection() {
+        let rejected = Router::new().route(
+            "/transactions",
+            post(|| async { (StatusCode::BAD_REQUEST, String::new()) }),
+        );
+        let unresponsive = Router::new().route(
+            "/transactions",
+            post(|| async { std::future::pending::<(StatusCode, String)>().await }),
+        );
+        let rejected = mock_leader("00", spawn_mock_leader(rejected).await);
+        let unresponsive = mock_leader("01", spawn_mock_leader(unresponsive).await);
+        let state = test_state(
+            vec![rejected, unresponsive],
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(response, (StatusCode::BAD_REQUEST, String::new()));
+    }
+
+    #[tokio::test]
+    async fn unpinned_bounds_owned_leader_waits() {
+        let unresponsive = Router::new().route(
+            "/transactions",
+            post(|| async { std::future::pending::<(StatusCode, String)>().await }),
+        );
+        let unresponsive = mock_leader("00", spawn_mock_leader(unresponsive).await);
+        let state = test_state(
+            vec![unresponsive],
+            Duration::from_millis(100),
+            Duration::from_millis(15),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = tokio::time::timeout(
+            Duration::from_millis(50),
             submit_transactions(State(state), HeaderMap::new(), body),
         )
         .await
-        .expect("accepted leader should complete the request");
+        .expect("owned leader wait should remain bounded");
 
-        assert_eq!(status, StatusCode::ACCEPTED);
-        assert_eq!(accepted_bodies.lock().expect("bodies lock").len(), 1);
-    }
-
-    #[tokio::test]
-    async fn unpinned_acceptance_wins_over_concurrent_rejection() {
-        let rejected = scripted_leader(vec![StatusCode::BAD_REQUEST]).0;
-        let accepted = Router::new().route(
-            "/transactions/ingest",
-            post(|| async {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                StatusCode::ACCEPTED
-            }),
-        );
-        let rejected = mock_leader("aa", spawn_mock_leader(rejected).await);
-        let accepted = mock_leader("bb", spawn_mock_leader(accepted).await);
-        let state = retry_state(vec![rejected, accepted], 0);
-        let body: Bytes = vec![signed_transfer(1, 0)].encode();
-
-        let status = submit_transactions(State(state), HeaderMap::new(), body).await;
-
-        assert_eq!(status, StatusCode::ACCEPTED);
-    }
-
-    #[tokio::test]
-    async fn unpinned_unresponsive_leader_returns_service_unavailable() {
-        let slow = Router::new().route(
-            "/transactions/ingest",
-            post(|| async { std::future::pending::<StatusCode>().await }),
-        );
-        let slow = mock_leader("aa", spawn_mock_leader(slow).await);
-        let state = retry_state(vec![slow], 0);
-        let body: Bytes = vec![signed_transfer(1, 0)].encode();
-
-        let status = tokio::time::timeout(
-            Duration::from_secs(1),
-            submit_transactions(State(state), HeaderMap::new(), body),
-        )
-        .await
-        .expect("leader request timeout should bound the admission attempt");
-
-        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response, (StatusCode::ACCEPTED, String::new()));
     }
 }

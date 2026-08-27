@@ -1,10 +1,13 @@
 //! Mempool webserver actor.
 //!
-//! Owns a byte-bounded FIFO pool of verified transactions. Receives
+//! Owns byte-bounded foreground and background FIFO pools. Receives
 //! batch submissions from HTTP handlers and serves proposals to the
 //! consensus layer via the [`Mailbox`].
 
-use super::{AccountReader, ActorReceiver, Mailbox, http, mailbox::Message};
+use super::{
+    AccountReader, ActorReceiver, Mailbox, http,
+    mailbox::{Message, SubmissionLane},
+};
 use ahash::{AHashMap, AHashSet};
 use commonware_codec::EncodeSize;
 use commonware_consensus::marshal::Update;
@@ -140,6 +143,20 @@ pub struct Config<St: Strategy> {
 struct PoolEntry<H: Hasher> {
     transactions: Vec<VerifiedTransaction<H>>,
     total_bytes: usize,
+}
+
+struct PoolLane<H: Hasher> {
+    entries: VecDeque<PoolEntry<H>>,
+    bytes: usize,
+}
+
+impl<H: Hasher> PoolLane<H> {
+    const fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            bytes: 0,
+        }
+    }
 }
 
 /// A batch proposed at a given height.
@@ -388,14 +405,13 @@ where
 /// block (`filled > 0`) never overshoots that headroom, so refills cannot
 /// inflate the block; an initial selection (`filled == 0`) may overshoot by
 /// one entry so an oversized head entry cannot wedge the pool.
-fn pop_proposal<H>(
-    pool: &mut VecDeque<PoolEntry<H>>,
-    pool_bytes: &mut usize,
+fn pop_lane_proposal<H>(
+    pool: &mut PoolLane<H>,
     proposed: &mut VecDeque<ProposedBatch<H::Digest>>,
     height: u64,
     filled: usize,
     max_propose_bytes: usize,
-) -> Vec<VerifiedTransaction<H>>
+) -> (Vec<VerifiedTransaction<H>>, usize)
 where
     H: Hasher,
 {
@@ -404,12 +420,12 @@ where
     let mut batch_txs = Vec::new();
     let mut batch_bytes = 0;
 
-    while let Some(entry) = pool.front() {
+    while let Some(entry) = pool.entries.front() {
         if batch_bytes + entry.total_bytes > budget && (strict || !batch_txs.is_empty()) {
             break;
         }
-        let entry = pool.pop_front().expect("front was Some");
-        *pool_bytes -= entry.total_bytes;
+        let entry = pool.entries.pop_front().expect("front was Some");
+        pool.bytes -= entry.total_bytes;
         batch_bytes += entry.total_bytes;
         let mut digests = Vec::with_capacity(entry.transactions.len());
         for tx in &entry.transactions {
@@ -418,7 +434,31 @@ where
         proposed.push_back(ProposedBatch { height, digests });
         batch_txs.extend(entry.transactions);
     }
-    batch_txs
+    (batch_txs, batch_bytes)
+}
+
+fn pop_proposal<H>(
+    foreground_pool: &mut PoolLane<H>,
+    background_pool: &mut PoolLane<H>,
+    proposed: &mut VecDeque<ProposedBatch<H::Digest>>,
+    height: u64,
+    filled: usize,
+    max_propose_bytes: usize,
+) -> Vec<VerifiedTransaction<H>>
+where
+    H: Hasher,
+{
+    let (mut transactions, foreground_bytes) =
+        pop_lane_proposal(foreground_pool, proposed, height, filled, max_propose_bytes);
+    let (background_transactions, _) = pop_lane_proposal(
+        background_pool,
+        proposed,
+        height,
+        filled.saturating_add(foreground_bytes),
+        max_propose_bytes,
+    );
+    transactions.extend(background_transactions);
+    transactions
 }
 
 /// Applies one finalized block's digest set to the outstanding proposed
@@ -556,6 +596,32 @@ where
     transactions.iter().map(EncodeSize::encode_size).sum()
 }
 
+fn can_admit_submission(
+    lane: SubmissionLane,
+    foreground_pool_bytes: usize,
+    background_pool_bytes: usize,
+    batch_bytes: usize,
+    max_pool_bytes: usize,
+    max_propose_bytes: usize,
+) -> bool {
+    let Some(total_bytes) = foreground_pool_bytes
+        .checked_add(background_pool_bytes)
+        .and_then(|total| total.checked_add(batch_bytes))
+    else {
+        return false;
+    };
+    if total_bytes > max_pool_bytes {
+        return false;
+    }
+
+    match lane {
+        SubmissionLane::Foreground => true,
+        SubmissionLane::Background => background_pool_bytes
+            .checked_add(batch_bytes)
+            .is_some_and(|bytes| bytes <= max_pool_bytes.saturating_sub(max_propose_bytes)),
+    }
+}
+
 /// The mempool actor.
 ///
 /// Create via [`Actor::new`], which consumes the receiver half of a mailbox
@@ -572,8 +638,8 @@ where
     context: ContextCell<E>,
     mailbox: Mailbox<C, P, H>,
     rx: mpsc::Receiver<Message<C, P, H>>,
-    pool: VecDeque<PoolEntry<H>>,
-    pool_bytes: usize,
+    foreground_pool: PoolLane<H>,
+    background_pool: PoolLane<H>,
     max_pool_bytes: usize,
     max_propose_bytes: usize,
     namespace: &'static [u8],
@@ -610,8 +676,8 @@ where
             context: ContextCell::new(context),
             mailbox,
             rx: receiver.rx,
-            pool: VecDeque::new(),
-            pool_bytes: 0,
+            foreground_pool: PoolLane::new(),
+            background_pool: PoolLane::new(),
             max_pool_bytes: config.max_pool_bytes,
             max_propose_bytes: config.max_propose_bytes,
             namespace: config.namespace,
@@ -633,8 +699,8 @@ where
             context,
             mailbox,
             mut rx,
-            mut pool,
-            mut pool_bytes,
+            mut foreground_pool,
+            mut background_pool,
             max_pool_bytes,
             max_propose_bytes,
             namespace,
@@ -671,6 +737,7 @@ where
         while let Some(message) = rx.recv().await {
             match message {
                 Message::Submit {
+                    lane,
                     batch_id,
                     digests,
                     transactions,
@@ -695,7 +762,16 @@ where
 
                     let transactions = new_transactions(transactions, &mut known_digests);
                     let total_bytes = total_bytes_for(&transactions).min(total_bytes);
-                    if !transactions.is_empty() && pool_bytes + total_bytes > max_pool_bytes {
+                    if !transactions.is_empty()
+                        && !can_admit_submission(
+                            lane,
+                            foreground_pool.bytes,
+                            background_pool.bytes,
+                            total_bytes,
+                            max_pool_bytes,
+                            max_propose_bytes,
+                        )
+                    {
                         remove_known_digests(&transactions, &mut known_digests);
                         if let Some(result) = result {
                             let _ = result.send(TxStatus::Dropped);
@@ -731,11 +807,20 @@ where
                         let _ = ingest_result.send(IngestStatus::Accepted);
                     }
                     if !transactions.is_empty() {
-                        pool_bytes += total_bytes;
-                        pool.push_back(PoolEntry {
+                        let entry = PoolEntry {
                             transactions,
                             total_bytes,
-                        });
+                        };
+                        match lane {
+                            SubmissionLane::Foreground => {
+                                foreground_pool.bytes += total_bytes;
+                                foreground_pool.entries.push_back(entry);
+                            }
+                            SubmissionLane::Background => {
+                                background_pool.bytes += total_bytes;
+                                background_pool.entries.push_back(entry);
+                            }
+                        }
                     }
                 }
                 Message::QueryStatus { batch_id, response } => {
@@ -747,8 +832,8 @@ where
                     response,
                 } => {
                     let batch_txs = pop_proposal(
-                        &mut pool,
-                        &mut pool_bytes,
+                        &mut foreground_pool,
+                        &mut background_pool,
                         &mut proposed,
                         height,
                         filled,
@@ -816,8 +901,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DigestOutcome, IngestStatus, PoolEntry, ProposedBatch, StoredBatchStatus, TxStatus,
-        batch_status_from_outcomes, ingest_status_from_batch, new_transactions, pop_proposal,
+        DigestOutcome, IngestStatus, PoolEntry, PoolLane, ProposedBatch, StoredBatchStatus,
+        SubmissionLane, TxStatus, batch_status_from_outcomes, can_admit_submission,
+        ingest_status_from_batch, new_transactions, pop_lane_proposal, pop_proposal,
         resolve_proposed_batches, status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
@@ -1147,35 +1233,126 @@ mod tests {
     /// headroom; an initial selection may overshoot by exactly one entry.
     #[test]
     fn pop_proposal_respects_remaining_headroom() {
-        let mut pool = VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]);
-        let mut pool_bytes = 900;
+        let mut pool = PoolLane {
+            entries: VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]),
+            bytes: 900,
+        };
         let mut proposed = VecDeque::new();
 
         // Refill headroom (1_000 - 500) below the head entry: nothing served.
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 500, 1_000);
+        let (txs, selected_bytes) = pop_lane_proposal(&mut pool, &mut proposed, 5, 500, 1_000);
         assert!(txs.is_empty());
-        assert_eq!(pool.len(), 2);
-        assert_eq!(pool_bytes, 900);
+        assert_eq!(selected_bytes, 0);
+        assert_eq!(pool.entries.len(), 2);
+        assert_eq!(pool.bytes, 900);
         assert!(proposed.is_empty());
 
         // Headroom covering only the head entry stops before the next.
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 1_000);
+        let (txs, selected_bytes) = pop_lane_proposal(&mut pool, &mut proposed, 5, 300, 1_000);
         assert_eq!(txs.len(), 2);
-        assert_eq!(pool.len(), 1);
-        assert_eq!(pool_bytes, 300);
+        assert_eq!(selected_bytes, 600);
+        assert_eq!(pool.entries.len(), 1);
+        assert_eq!(pool.bytes, 300);
         assert_eq!(proposed.len(), 1);
 
         // A full block has no headroom and nothing is served.
-        let mut pool = VecDeque::from([pool_entry(3, 1, 400)]);
-        let mut pool_bytes = 400;
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 300);
+        let mut pool = PoolLane {
+            entries: VecDeque::from([pool_entry(3, 1, 400)]),
+            bytes: 400,
+        };
+        let (txs, selected_bytes) = pop_lane_proposal(&mut pool, &mut proposed, 5, 300, 300);
         assert!(txs.is_empty(), "no headroom left");
+        assert_eq!(selected_bytes, 0);
 
         // An initial selection overshoots by one entry so an oversized head
         // cannot wedge the pool.
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 0, 300);
+        let (txs, selected_bytes) = pop_lane_proposal(&mut pool, &mut proposed, 5, 0, 300);
         assert_eq!(txs.len(), 1);
-        assert!(pool.is_empty());
-        assert_eq!(pool_bytes, 0);
+        assert_eq!(selected_bytes, 400);
+        assert!(pool.entries.is_empty());
+        assert_eq!(pool.bytes, 0);
+    }
+
+    #[test]
+    fn foreground_consumes_proposal_before_background() {
+        let foreground_entry = pool_entry(4, 1, 1_000);
+        let foreground_digest = *foreground_entry.transactions[0].message_digest();
+        let mut foreground_pool = PoolLane {
+            entries: VecDeque::from([foreground_entry]),
+            bytes: 1_000,
+        };
+        let mut background_pool = PoolLane {
+            entries: VecDeque::from([pool_entry(5, 1, 400)]),
+            bytes: 400,
+        };
+        let mut proposed = VecDeque::new();
+
+        let transactions = pop_proposal(
+            &mut foreground_pool,
+            &mut background_pool,
+            &mut proposed,
+            5,
+            0,
+            1_000,
+        );
+
+        assert_eq!(transactions.len(), 1);
+        assert_eq!(*transactions[0].message_digest(), foreground_digest);
+        assert!(foreground_pool.entries.is_empty());
+        assert_eq!(foreground_pool.bytes, 0);
+        assert_eq!(background_pool.entries.len(), 1);
+        assert_eq!(background_pool.bytes, 400);
+    }
+
+    #[test]
+    fn background_borrows_full_proposal_when_foreground_is_empty() {
+        let mut foreground_pool = PoolLane::new();
+        let mut background_pool = PoolLane {
+            entries: VecDeque::from([pool_entry(6, 1, 600), pool_entry(7, 1, 400)]),
+            bytes: 1_000,
+        };
+        let mut proposed = VecDeque::new();
+
+        let transactions = pop_proposal(
+            &mut foreground_pool,
+            &mut background_pool,
+            &mut proposed,
+            5,
+            0,
+            1_000,
+        );
+
+        assert_eq!(transactions.len(), 2);
+        assert!(background_pool.entries.is_empty());
+        assert_eq!(background_pool.bytes, 0);
+        assert_eq!(proposed.len(), 2);
+    }
+
+    #[test]
+    fn saturated_background_preserves_foreground_admission() {
+        assert!(can_admit_submission(
+            SubmissionLane::Foreground,
+            0,
+            700,
+            300,
+            1_000,
+            300,
+        ));
+        assert!(!can_admit_submission(
+            SubmissionLane::Background,
+            0,
+            700,
+            1,
+            1_000,
+            300,
+        ));
+        assert!(!can_admit_submission(
+            SubmissionLane::Foreground,
+            0,
+            700,
+            301,
+            1_000,
+            300,
+        ));
     }
 }
