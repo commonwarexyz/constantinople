@@ -761,7 +761,7 @@ mod tests {
     };
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, telemetry::metrics::has_metric_value};
-    use commonware_utils::{NZU16, non_empty_range};
+    use commonware_utils::{NZU16, non_empty, non_empty_range};
     use constantinople_engine::ThresholdScheme;
     use constantinople_primitives::{
         Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
@@ -1166,7 +1166,7 @@ mod tests {
             .iter()
             .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("sign finalization"))
             .collect::<Vec<_>>();
-        Finalization::from_finalizes(&fixture.verifier, &finalizes, &Sequential)
+        Finalization::from_finalizes(&fixture.verifier, non_empty![@&finalizes], &Sequential)
             .expect("assemble finalization")
     }
 }

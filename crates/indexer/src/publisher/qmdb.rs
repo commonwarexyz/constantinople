@@ -2986,13 +2986,8 @@ mod tests {
             *transaction_history.bounds().inactivity_floor,
             *transaction_history.bounds().tip.size
         );
-        assert!(
-            databases
-                .finalize((state, transaction_history))
-                .await
-                .durable()
-                .await
-        );
+        databases.apply((state, transaction_history)).await;
+        assert!(databases.finalize().await.durable().await);
 
         let leader = ed25519::PrivateKey::from_seed(height).public_key();
         let parent_digest = parent.map_or(Sha256Digest::EMPTY, |block| block.digest());

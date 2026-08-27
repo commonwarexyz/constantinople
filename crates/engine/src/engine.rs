@@ -211,7 +211,7 @@ where
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>>,
+    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Clone + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
@@ -262,7 +262,7 @@ where
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>>,
+    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Clone + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
@@ -567,8 +567,11 @@ where
                 timeout_retry: Duration::from_secs(10),
                 fetch_timeout: Duration::from_secs(4),
                 view_retention: ACTIVITY_TIMEOUT,
-                skip_timeout: Duration::from_secs(11),
-                forwarding: simplex::ForwardingPolicy::Disabled,
+                skip: simplex::SkipPolicy::Enabled {
+                    timeout: Duration::from_secs(11),
+                    budget: simplex::SkipBudget::Participants,
+                },
+                forward: simplex::ForwardPolicy::Disabled,
             },
         );
 

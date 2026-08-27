@@ -358,6 +358,7 @@ impl From<ed25519::Signature> for TransactionSignature {
 /// Verifies mixed transaction signatures with separate scheme groups.
 pub struct TransactionBatchVerifier {
     ed25519: ed25519::Batch,
+    ed25519_len: usize,
     secp256r1: Vec<Secp256r1Item>,
 }
 
@@ -375,6 +376,7 @@ impl TransactionBatchVerifier {
     pub fn new(capacity: usize) -> Self {
         Self {
             ed25519: ed25519::Batch::new(capacity),
+            ed25519_len: 0,
             secp256r1: Vec::new(),
         }
     }
@@ -396,7 +398,13 @@ impl TransactionBatchVerifier {
             (
                 DecompressedPublicKey::Ed25519(key),
                 TransactionSignature::Ed25519 { signature, .. },
-            ) => self.ed25519.add(namespace, message, key, signature),
+            ) => {
+                let added = self.ed25519.add(namespace, message, key, signature);
+                if added {
+                    self.ed25519_len += 1;
+                }
+                added
+            }
             (
                 DecompressedPublicKey::Secp256r1(verifying_key),
                 TransactionSignature::Secp256r1 {
@@ -421,11 +429,16 @@ impl TransactionBatchVerifier {
 
     /// Verifies every queued signature.
     pub fn verify<R: CryptoRng>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
-        if !self.ed25519.verify(rng, strategy) {
+        let Self {
+            ed25519,
+            ed25519_len,
+            secp256r1,
+        } = self;
+        if ed25519_len > 0 && !ed25519.verify(rng, strategy) {
             return false;
         }
 
-        verify_secp256r1(strategy, self.secp256r1)
+        verify_secp256r1(strategy, secp256r1)
     }
 }
 

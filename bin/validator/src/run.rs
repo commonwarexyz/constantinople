@@ -1100,7 +1100,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             otel.map(|(endpoint, rate)| TracesConfig {
                 endpoint,
                 name: hex(&decoded.public_key.encode()),
-                rate,
+                rate: rate.try_into().expect("bad trace sampling rate"),
             }),
         );
 

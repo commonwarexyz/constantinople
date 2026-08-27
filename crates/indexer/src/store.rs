@@ -1,6 +1,7 @@
 pub use exoware_sdk::ClientBuildError as StoreClientBuildError;
 use exoware_sdk::{
-    BalancedHttp2Config, ClientError, ConnectRequestCompression, StoreClient, StoreClientBuilder,
+    ClientError, ConnectRequestCompression, StoreClient, StoreClientBuilder,
+    transport::BalancedHttp2Config,
 };
 
 /// Failure from the adapter's startup readiness check.

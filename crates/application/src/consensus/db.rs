@@ -191,7 +191,8 @@ mod tests {
             seed = seed.write(c, Some(account(300)));
             seed = seed.write(a, Some(account(100)));
             let seed = seed.merkleize().await.expect("seed state");
-            assert!(db.finalize(seed).await.durable().await);
+            db.apply(seed).await;
+            assert!(db.finalize().await.durable().await);
 
             // The same final key->value set must produce the same root
             // regardless of staged read order or update-entry order.

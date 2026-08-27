@@ -12,7 +12,7 @@ use commonware_cryptography::{
     Digestible, Signer,
     bls12381::{
         dkg::feldman_desmedt::{Output, deal},
-        primitives::{group::Share, variant::MinSig},
+        primitives::{group::Share, sharing::Mode, variant::MinSig},
     },
     ed25519,
     sha256::Sha256,
@@ -226,7 +226,7 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
         .unwrap();
 
     let mut rng = test_rng();
-    let (output, shares) = deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+    let (output, shares) = deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
         .expect("fixture deal should succeed");
     let shares = shares
         .into_iter()

@@ -561,7 +561,7 @@ mod tests {
         Signer,
         bls12381::{
             dkg::feldman_desmedt as dkg,
-            primitives::{group::Share, variant::MinSig},
+            primitives::{group::Share, sharing::Mode, variant::MinSig},
         },
         ed25519,
     };
@@ -652,7 +652,7 @@ mod tests {
             let participants = primary_keys.clone().into_iter().try_collect().unwrap();
             let mut rng = commonware_utils::test_rng();
             let (dkg_output, raw_shares) =
-                dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+                dkg::deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
                     .expect("DKG deal failed");
             let shares = raw_shares.into_iter().collect();
 

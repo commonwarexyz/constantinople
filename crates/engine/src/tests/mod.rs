@@ -44,7 +44,8 @@ use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Handle, Quota, Spawner, Supervisor};
 use commonware_utils::{
-    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
+    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, probability,
+    sync::Mutex, union,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::PublicKeyCache;
@@ -63,7 +64,7 @@ const fn default_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
-        success_rate: 1.0,
+        success_rate: probability!(1.0),
     }
 }
 
@@ -71,7 +72,7 @@ const fn lossy_link() -> Link {
     Link {
         latency: Duration::from_millis(200),
         jitter: Duration::from_millis(150),
-        success_rate: 0.7,
+        success_rate: probability!(0.7),
     }
 }
 
@@ -727,7 +728,7 @@ fn run_network_partition(engine: TestEngineDefinition) {
     let dead_link = Link {
         latency: Duration::from_secs(1),
         jitter: Duration::ZERO,
-        success_rate: 0.0,
+        success_rate: probability!(0.0),
     };
     let mut schedule = Schedule::new();
     for peer in &participants[1..] {
