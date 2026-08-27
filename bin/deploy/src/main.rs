@@ -439,6 +439,8 @@ pub(crate) struct IndexerConfig {
 pub(crate) struct ChainIndexerConfig {
     /// Store port the chain-indexer listens on.
     pub port: u16,
+    /// Prometheus metrics port the chain-indexer listens on.
+    pub metrics_port: u16,
     /// Directory for chain-indexer data.
     pub data_dir: PathBuf,
     /// RocksDB parallelism (background compaction/flush jobs). Omitted

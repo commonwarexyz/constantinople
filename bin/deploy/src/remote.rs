@@ -294,6 +294,7 @@ fn relayer_url(args: &GenerateArgs, remote: &RemoteArgs, material: &ClusterMater
 fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<ChainIndexerConfig> {
     indexer_enabled(args).then(|| ChainIndexerConfig {
         port: remote.chain_indexer_port,
+        metrics_port: METRICS_PORT,
         data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
         db_parallelism: remote.chain_indexer_db_parallelism,
     })

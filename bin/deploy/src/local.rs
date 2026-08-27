@@ -245,6 +245,19 @@ fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     }
 }
 
+fn chain_indexer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
+    let node_count = args
+        .validators
+        .checked_add(total_secondaries(args))
+        .and_then(|count| count.checked_add(u32::from(args.spammer)))
+        .expect("local node count overflow");
+    let node_count = u16::try_from(node_count).expect("local node count exceeds port space");
+    local
+        .base_metrics_port
+        .checked_add(node_count)
+        .expect("chain-indexer metrics port overflow")
+}
+
 fn print_local_run_commands(
     output_dir: &Path,
     args: &GenerateArgs,
@@ -306,14 +319,16 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
+        let metrics_port = chain_indexer_metrics_port(args, local);
         let db_parallelism = local
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --data-dir {}{}",
+            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
+            metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
@@ -647,7 +662,34 @@ mod tests {
             .find(|c| c.contains("--bin chain-indexer"))
             .expect("chain-indexer command should be present");
         assert!(indexer_cmd.contains("--port 8090"));
+        assert!(indexer_cmd.contains("--metrics-port 9094"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
+    }
+
+    #[test]
+    fn local_chain_indexer_metrics_follow_spammer_metrics() {
+        let mut args = test_args(true);
+        args.indexer = true;
+        args.relayer = true;
+
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let indexer_cmd = commands
+            .iter()
+            .find(|command| command.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+        let spammer_cmd = commands
+            .iter()
+            .find(|command| command.contains("--bin constantinople-spammer"))
+            .expect("spammer command should be present");
+        assert!(spammer_cmd.contains("--metrics-port 9094"));
+        assert!(indexer_cmd.contains("--metrics-port 9095"));
     }
 
     #[test]
