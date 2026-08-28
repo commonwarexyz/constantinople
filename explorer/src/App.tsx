@@ -129,6 +129,11 @@ type AccountProofState =
       } & VerifiedAccountProof)
     | { readonly status: 'error'; readonly detail: string };
 
+interface AccountPage {
+    readonly account: string;
+    readonly rows: AccountTransactionRow[];
+}
+
 interface AccountTxWithProof {
     readonly row: AccountTransactionRow;
     readonly proof: TransactionProofState;
@@ -180,6 +185,7 @@ export default function App() {
         detail: 'enter an account',
     });
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountPage, setAccountPage] = useState<AccountPage | null>(null);
     const [accountActivityError, setAccountActivityError] = useState('');
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
@@ -368,7 +374,9 @@ export default function App() {
 
         retryAccountPageStep(async () => {
             const target = await fetchLatestProofTarget({
+                qmdbUrl,
                 storeUrl,
+                sqlUrl: indexerUrl,
                 simplexVerificationMaterial,
                 signal: controller.signal,
             });
@@ -414,8 +422,11 @@ export default function App() {
         return () => controller.abort();
     }, [lookupAccount]);
 
+    // Only a change of account, page, or mode replaces the listed rows. The
+    // proof target arrives later and must not clear rows already on screen.
     useEffect(() => {
         if (!lookupAccount) {
+            setAccountPage(null);
             setAccountTransactions([]);
             setAccountNextCursor(null);
             setAccountActivityError('');
@@ -423,6 +434,7 @@ export default function App() {
         }
 
         const controller = new AbortController();
+        setAccountPage(null);
         setAccountTransactions([]);
         setAccountNextCursor(null);
         setAccountActivityError('');
@@ -433,52 +445,69 @@ export default function App() {
             cursor: currentAccountCursor,
             mode: accountActivityMode,
         })
-            .then(async (page) => {
+            .then((page) => {
                 if (controller.signal.aborted) return;
                 setAccountNextCursor(page.nextCursor);
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
                     proof: { status: 'waiting', detail: 'waiting for latest finalization' },
                 })));
-                if (!accountTarget) return;
-
-                setAccountTransactions(page.rows.map((row) => ({
-                    row,
-                    proof: { status: 'fetching', detail: 'fetching transaction proof' },
-                })));
-                const results = await Promise.allSettled(
-                    page.rows.map((row) =>
-                        retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
-                            qmdbUrl,
-                            sqlUrl: indexerUrl,
-                            row,
-                            target: accountTarget,
-                            signal: controller.signal,
-                        }), controller.signal),
-                    ),
-                );
-                if (controller.signal.aborted) return;
-                setAccountTransactions((current) =>
-                    current.map((entry, index) => {
-                        const result = results[index];
-                        if (!result) return entry;
-                        if (result.status === 'fulfilled') {
-                            return { ...entry, proof: verifiedProofState(result.value) };
-                        }
-                        const detail = result.reason instanceof Error ? result.reason.message : String(result.reason);
-                        return { ...entry, proof: { status: 'error', detail } };
-                    }),
-                );
+                setAccountPage({ account: lookupAccount, rows: page.rows });
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
+                setAccountPage(null);
                 setAccountTransactions([]);
                 setAccountNextCursor(null);
                 setAccountActivityError(error instanceof Error ? error.message : String(error));
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode]);
+
+    // Row proofs run once both the page rows and the proof target exist, and
+    // they update proof cells in place so the rows never blink.
+    useEffect(() => {
+        if (!accountPage || !accountTarget || accountPage.account !== lookupAccount) return;
+
+        const controller = new AbortController();
+        const rows = accountPage.rows;
+        const updateRow = (index: number, proof: TransactionProofState) => {
+            setAccountTransactions((current) =>
+                current.map((entry, position) =>
+                    position === index && entry.row.digest === rows[index]?.digest
+                        ? { ...entry, proof }
+                        : entry,
+                ),
+            );
+        };
+
+        rows.forEach((_row, index) => {
+            updateRow(index, { status: 'fetching', detail: 'fetching transaction proof' });
+        });
+        rows.forEach((row, index) => {
+            retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
+                qmdbUrl,
+                storeUrl,
+                sqlUrl: indexerUrl,
+                simplexVerificationMaterial,
+                row,
+                target: accountTarget,
+                signal: controller.signal,
+            }), controller.signal)
+                .then((proof) => {
+                    if (controller.signal.aborted) return;
+                    updateRow(index, verifiedProofState(proof));
+                })
+                .catch((error) => {
+                    if (controller.signal.aborted) return;
+                    const detail = error instanceof Error ? error.message : String(error);
+                    updateRow(index, { status: 'error', detail });
+                });
+        });
+
+        return () => controller.abort();
+    }, [accountPage, accountTarget, lookupAccount]);
 
     useEffect(() => {
         const reconciliations = reconciliationsRef.current;
@@ -942,7 +971,6 @@ export default function App() {
                 value: parsedValue.toString(),
                 nonce: parsedNonce.toString(),
                 submittedAt: Date.now(),
-                admittedInMs: null,
                 finalizationObservedInMs: null,
                 proofObservedInMs: null,
                 status: 'reconciling',
@@ -1778,13 +1806,6 @@ function TransactionRecord({
                 <span className="tx-sep" aria-hidden="true">·</span>
                 <span className="tx-label">proof</span>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
-                {tx.admittedInMs !== null && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">admission observed</span>
-                        <span>{tx.admittedInMs}ms</span>
-                    </>
-                )}
                 {tx.finalizationObservedInMs !== null && (
                     <>
                         <span className="tx-sep" aria-hidden="true">·</span>

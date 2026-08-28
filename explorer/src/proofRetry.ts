@@ -14,6 +14,7 @@ export function isRetryableAccountProofError(detail: string): boolean {
         !isMissingAccountProofError(detail) &&
         (
             detail.includes('outside finalized state range') ||
+            detail.includes('not yet covered by a provable finalization') ||
             detail.includes('[out_of_range]') ||
             detail.includes('[unavailable]') ||
             detail.includes('QMDB') ||

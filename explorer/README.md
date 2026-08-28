@@ -47,10 +47,10 @@ The indexer publishes every finalized block to complementary surfaces
   certificate/header verification and only fetches full block bodies when a
   workflow needs them.
 - **Metadata and lookup storage (SQL).** `block_meta`, `tx_meta`,
-  `tx_activity`, `account_meta`, and `tx_proof_meta` tables share the same
+  `tx_activity`, and `account_meta` tables share the same
   store. They are cheap to
   subscribe to from the browser and directly queryable for transaction proof
-  metadata, transaction bodies, account activity, and latest account proof
+  metadata, transaction bodies, account activity, and account proof
   locations.
 - **QMDB operation logs** — transaction-hash operation proofs. The explorer
   only fetches these for transactions submitted by the signed-in account.

@@ -4,7 +4,6 @@ import test from 'node:test';
 import {
     assignReconciliationOrder,
     markReconciliationCertificate,
-    markSubmissionAdmitted,
     markSubmissionReconciling,
     markSubmissionRejected,
     markTransactionFinalized,
@@ -29,7 +28,6 @@ function reconcilingTransaction(): SubmittedTransaction {
         value: '7',
         nonce: '2',
         submittedAt: 1_000,
-        admittedInMs: null,
         finalizationObservedInMs: null,
         proofObservedInMs: null,
         status: 'reconciling',
@@ -50,7 +48,6 @@ test('legacy dropped rows return to digest reconciliation', () => {
     });
 
     assert.equal(transaction?.status, 'reconciling');
-    assert.equal(transaction?.admittedInMs, null);
     assert.equal(transaction?.finalizationObservedInMs, null);
     assert.equal(transaction?.proofObservedInMs, null);
     assert.equal(transaction?.finalizedHeight, null);
@@ -82,7 +79,6 @@ test('version one finalized rows migrate latency to proof observation only', () 
 
     assert.equal(transaction?.reconciliationVersion, 2);
     assert.equal(transaction?.status, 'finalized');
-    assert.equal(transaction?.admittedInMs, null);
     assert.equal(transaction?.finalizationObservedInMs, null);
     assert.equal(transaction?.proofObservedInMs, 500);
 });
@@ -101,12 +97,6 @@ test('legacy filtered rows return to digest reconciliation', () => {
 });
 
 test('dropped response stops reconciliation without latency', () => {
-    const admitted = markSubmissionAdmitted(
-        digest,
-        'admitted by a leader',
-        1_200,
-        [reconcilingTransaction()],
-    )[0];
     const withCertificate = markReconciliationCertificate(
         digest,
         19,
@@ -117,7 +107,7 @@ test('dropped response stops reconciliation without latency', () => {
             view: '4',
         },
         1_400,
-        [admitted],
+        [reconcilingTransaction()],
     )[0];
     const [transaction] = markSubmissionRejected(
         digest,
@@ -126,7 +116,6 @@ test('dropped response stops reconciliation without latency', () => {
     );
 
     assert.equal(transaction.status, 'rejected');
-    assert.equal(transaction.admittedInMs, null);
     assert.equal(transaction.finalizationObservedInMs, null);
     assert.equal(transaction.proofObservedInMs, null);
     assert.equal(transaction.certificate.status, 'unavailable');
@@ -176,24 +165,13 @@ test('each submission phase records its own first observation', () => {
         height: '19',
         view: '4',
     } as const;
-    const admitted = markSubmissionAdmitted(
-        digest,
-        'admitted by a leader',
-        1_200,
-        [reconcilingTransaction()],
-    )[0];
-    assert.equal(admitted.admittedInMs, 200);
-    assert.equal(admitted.finalizationObservedInMs, null);
-    assert.equal(admitted.proofObservedInMs, null);
-
     const withCertificate = markReconciliationCertificate(
         digest,
         19,
         certificate,
         1_400,
-        [admitted],
+        [reconcilingTransaction()],
     )[0];
-    assert.equal(withCertificate.admittedInMs, 200);
     assert.equal(withCertificate.finalizationObservedInMs, 400);
     assert.equal(withCertificate.proofObservedInMs, null);
 
@@ -233,7 +211,6 @@ test('each submission phase records its own first observation', () => {
     )[0];
     assert.equal(finalized.status, 'finalized');
     assert.equal(finalized.finalizedHeight, 19);
-    assert.equal(finalized.admittedInMs, 200);
     assert.equal(finalized.finalizationObservedInMs, 400);
     assert.equal(finalized.proofObservedInMs, 600);
 
@@ -262,7 +239,6 @@ test('validator finality records height and observations without ending reconcil
 
     assert.equal(observed.status, 'reconciling');
     assert.equal(observed.finalizedHeight, 19);
-    assert.equal(observed.admittedInMs, 250);
     assert.equal(observed.finalizationObservedInMs, 250);
     assert.equal(observed.proofObservedInMs, null);
     assert.equal(observed.certificate.status, 'waiting');
@@ -271,7 +247,6 @@ test('validator finality records height and observations without ending reconcil
     const restored = normalizeSubmittedTransaction(observed);
     assert.equal(restored?.status, 'reconciling');
     assert.equal(restored?.finalizedHeight, 19);
-    assert.equal(restored?.admittedInMs, 250);
     assert.equal(restored?.finalizationObservedInMs, 250);
     assert.equal(restored?.proofObservedInMs, null);
 
@@ -291,39 +266,6 @@ test('validator finality records height and observations without ending reconcil
     assert.equal(withCertificate.finalizationObservedInMs, 250);
     assert.equal(withCertificate.certificate.status, 'verified');
     assert.equal(withCertificate.proof.status, 'fetching');
-});
-
-test('admission response timing survives proof completion racing ahead', () => {
-    const finalized = markTransactionFinalized(
-        digest,
-        19,
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            height: '19',
-            view: '4',
-        },
-        {
-            status: 'verified',
-            detail: 'verified at height 19',
-            location: '120',
-            tip: '130',
-            proofSizeBytes: 240,
-        },
-        1_300,
-        [reconcilingTransaction()],
-    )[0];
-    const admitted = markSubmissionAdmitted(
-        digest,
-        'admitted by a leader',
-        1_400,
-        [finalized],
-    )[0];
-
-    assert.equal(admitted.status, 'finalized');
-    assert.equal(admitted.detail, 'finalized at 19');
-    assert.equal(admitted.admittedInMs, 400);
-    assert.equal(admitted.proofObservedInMs, 300);
 });
 
 test('only waiting rows owned by the current sender are reconciled', () => {

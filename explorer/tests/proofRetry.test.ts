@@ -68,3 +68,12 @@ test('missing account proof rows are not retried as index catch-up', () => {
 test('QMDB account root mismatches are terminal', () => {
     assert.equal(isRetryableAccountProofError('historical ops root did not match expected root'), false);
 });
+
+test('rows newer than the provable finalization are retried until coverage catches up', () => {
+    assert.equal(
+        isRetryableAccountProofError(
+            'transaction location 7849756400 is not yet covered by a provable finalization',
+        ),
+        true,
+    );
+});

@@ -33,7 +33,6 @@ export interface SubmittedTransaction {
     readonly value: string;
     readonly nonce: string;
     readonly submittedAt: number;
-    readonly admittedInMs: number | null;
     readonly finalizationObservedInMs: number | null;
     readonly proofObservedInMs: number | null;
     readonly status: SubmittedTransactionStatus;
@@ -78,22 +77,6 @@ export function markSubmissionReconciling(
     );
 }
 
-export function markSubmissionAdmitted(
-    digest: string,
-    detail: string,
-    admittedAt: number,
-    current: SubmittedTransaction[],
-): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) => {
-        if (tx.status === 'rejected') return tx;
-        return {
-            ...tx,
-            admittedInMs: tx.admittedInMs ?? Math.max(0, admittedAt - tx.submittedAt),
-            detail: tx.status === 'reconciling' ? detail : tx.detail,
-        };
-    });
-}
-
 export function markValidatorFinalizationObserved(
     digest: string,
     height: number,
@@ -105,7 +88,6 @@ export function markValidatorFinalizationObserved(
         const observedInMs = Math.max(0, observedAt - tx.submittedAt);
         return {
             ...tx,
-            admittedInMs: tx.admittedInMs ?? observedInMs,
             finalizationObservedInMs: tx.finalizationObservedInMs ?? observedInMs,
             finalizedHeight: height,
             detail: `validator reported finalized at ${height}`,
@@ -125,7 +107,6 @@ export function markSubmissionRejected(
                   ...tx,
                   status: 'rejected',
                   detail,
-                  admittedInMs: null,
                   finalizationObservedInMs: null,
                   proofObservedInMs: null,
                   finalizedHeight: null,
@@ -314,7 +295,6 @@ function normalizeCurrentTransaction(
 
     const status = transaction.status;
     const finalizedHeight = safeOptionalNumber(transaction.finalizedHeight);
-    const admittedInMs = safeOptionalNumber(transaction.admittedInMs);
     const finalizationObservedInMs = safeOptionalNumber(transaction.finalizationObservedInMs);
     const proofObservedInMs = safeOptionalNumber(transaction.proofObservedInMs);
     const certificate = normalizeBlockCertificate(transaction.certificate, finalizedHeight);
@@ -324,7 +304,6 @@ function normalizeCurrentTransaction(
         return baseTransaction(transaction, {
             status,
             finalizedHeight: null,
-            admittedInMs: null,
             finalizationObservedInMs: null,
             proofObservedInMs: null,
             certificate: { status: 'unavailable', detail: 'transaction rejected' },
@@ -336,7 +315,6 @@ function normalizeCurrentTransaction(
     return baseTransaction(transaction, {
         status,
         finalizedHeight,
-        admittedInMs,
         finalizationObservedInMs:
             finalizedHeight === null ? null : finalizationObservedInMs,
         proofObservedInMs: status === 'finalized' ? proofObservedInMs : null,
@@ -359,7 +337,6 @@ function migrateVersionOneTransaction(
         return baseTransaction(transaction, {
             status,
             finalizedHeight: null,
-            admittedInMs: null,
             finalizationObservedInMs: null,
             proofObservedInMs: null,
             certificate: { status: 'unavailable', detail: 'transaction rejected' },
@@ -371,7 +348,6 @@ function migrateVersionOneTransaction(
     return baseTransaction(transaction, {
         status,
         finalizedHeight,
-        admittedInMs: null,
         finalizationObservedInMs: null,
         proofObservedInMs:
             status === 'finalized' ? safeOptionalNumber(transaction.finalizedInMs) : null,
@@ -388,7 +364,6 @@ function migrateLegacyTransaction(
         return baseTransaction(transaction, {
             status: 'finalized',
             finalizedHeight: safeOptionalNumber(transaction.finalizedHeight),
-            admittedInMs: null,
             finalizationObservedInMs: null,
             proofObservedInMs: null,
             certificate: normalizeBlockCertificate(
@@ -401,7 +376,6 @@ function migrateLegacyTransaction(
     return baseTransaction(transaction, {
         status: 'reconciling',
         finalizedHeight: null,
-        admittedInMs: null,
         finalizationObservedInMs: null,
         proofObservedInMs: null,
         certificate: WAITING_FINALIZATION_CERTIFICATE,
@@ -415,7 +389,6 @@ function baseTransaction(
         SubmittedTransaction,
         | 'status'
         | 'finalizedHeight'
-        | 'admittedInMs'
         | 'finalizationObservedInMs'
         | 'proofObservedInMs'
         | 'certificate'

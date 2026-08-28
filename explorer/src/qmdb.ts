@@ -1,6 +1,12 @@
 import { fromHex, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
 import {
+    parsePublishedWatermark,
+    targetWithinWatermarks,
+    type PublishedWatermarks,
+} from './proofTarget';
+import { Code, ConnectError } from '@connectrpc/connect';
+import {
     SqlClient,
     type CellValue,
     type DecodedQueryResult,
@@ -175,16 +181,145 @@ export async function fetchAndVerifyTransactionProof({
     };
 }
 
+// A tip no writer can have reached. Requesting it is rejected with the
+// published watermark in the error, which is the only way to read it today.
+const WATERMARK_PROBE_TIP = 1n << 62n;
+const WATERMARK_PROBE_ROOT = new Uint8Array(32);
+// The bulk lane trails certificates by a handful of blocks, so the newest
+// provable certificate is close to the newest one. These bound the lookups
+// when it is not.
+const PROOF_TARGET_HEIGHT_SCAN_SPAN = 512n;
+const MAX_PROOF_TARGET_STEP_BACK = 64n;
+
+// The newest finalized certificate whose state and transaction tips the QMDB
+// service has published. Proving against a newer certificate is rejected
+// with out_of_range, and retrying against an ever newer one never converges.
 export async function fetchLatestProofTarget({
+    qmdbUrl,
     storeUrl,
+    sqlUrl,
     simplexVerificationMaterial,
     signal,
 }: {
+    qmdbUrl: string;
     storeUrl: string;
+    sqlUrl: string;
     simplexVerificationMaterial: string;
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
-    return latestProofTarget(storeUrl, simplexVerificationMaterial, signal);
+    const [latest, watermarks] = await Promise.all([
+        latestProofTarget(storeUrl, simplexVerificationMaterial, signal),
+        fetchPublishedWatermarks(qmdbUrl, signal),
+    ]);
+    if (watermarks === null || targetWithinWatermarks(latest, watermarks)) {
+        return latest;
+    }
+    return provableTargetBelowWatermarks(
+        storeUrl,
+        sqlUrl,
+        simplexVerificationMaterial,
+        latest,
+        watermarks,
+        signal,
+    );
+}
+
+async function fetchPublishedWatermarks(
+    qmdbUrl: string,
+    signal?: AbortSignal,
+): Promise<PublishedWatermarks | null> {
+    const base = trimTrailingSlash(qmdbUrl);
+    const [state, transactions] = await Promise.all([
+        fetchPublishedWatermark(`${base}/state`, signal),
+        fetchPublishedWatermark(`${base}/transactions`, signal),
+    ]);
+    if (state === null || transactions === null) {
+        return null;
+    }
+    return { state, transactions };
+}
+
+async function fetchPublishedWatermark(
+    serviceUrl: string,
+    signal?: AbortSignal,
+): Promise<bigint | null> {
+    const client = new QmdbOperationLogClient(serviceUrl);
+    try {
+        await client.getOperationRange(
+            { tip: WATERMARK_PROBE_TIP, startLocation: 0n, maxLocations: 1 },
+            WATERMARK_PROBE_ROOT,
+            { signal },
+        );
+    } catch (error) {
+        if (error instanceof ConnectError && error.code === Code.OutOfRange) {
+            return parsePublishedWatermark(error.rawMessage);
+        }
+        throw error;
+    }
+    return null;
+}
+
+async function provableTargetBelowWatermarks(
+    storeUrl: string,
+    sqlUrl: string,
+    simplexVerificationMaterial: string,
+    latest: LatestProofTarget,
+    watermarks: PublishedWatermarks,
+    signal?: AbortSignal,
+): Promise<LatestProofTarget> {
+    // block_meta.transactions_tip is each block's last transaction location,
+    // the same inclusive tip the QMDB service compares against, so the newest
+    // block at or below the transactions watermark is the newest block whose
+    // bulk upload has been published. Both families publish from that upload.
+    const floor =
+        latest.height > PROOF_TARGET_HEIGHT_SCAN_SPAN
+            ? latest.height - PROOF_TARGET_HEIGHT_SCAN_SPAN
+            : 0n;
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${BLOCK_META_HEIGHT}
+            FROM ${BLOCK_META_TABLE}
+            WHERE ${BLOCK_META_HEIGHT} >= ${floor.toString()}
+                AND ${BLOCK_META_TRANSACTIONS_TIP} <= ${watermarks.transactions.toString()}
+            ORDER BY ${BLOCK_META_HEIGHT} DESC
+            LIMIT 1
+        `,
+        signal,
+    );
+    const row = result.rows[0];
+    if (!row) {
+        throw new Error(
+            `QMDB published watermark ${watermarks.transactions} is behind every block since height ${floor}`,
+        );
+    }
+    const start = expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT);
+
+    // Not every finalized height carries its own certificate, and the state
+    // family can trail by part of a block, so walk down until a certificate
+    // exists and both tips are published.
+    let height = start;
+    for (let steps = 0n; steps < MAX_PROOF_TARGET_STEP_BACK && height > 0n; steps++, height--) {
+        let target: FinalizedTransactionTarget;
+        try {
+            target = await finalizedTransactionTarget(
+                storeUrl,
+                simplexVerificationMaterial,
+                height,
+                signal,
+            );
+        } catch (error) {
+            const detail = error instanceof Error ? error.message : String(error);
+            if (detail.startsWith('finalization missing at height')) continue;
+            throw error;
+        }
+        if (targetWithinWatermarks(target, watermarks)) {
+            return target;
+        }
+    }
+    throw new Error(
+        `QMDB published watermarks are behind every finalized certificate from height ${start} down`,
+    );
 }
 
 export async function fetchAccountTransactionsPage({
@@ -222,9 +357,12 @@ export async function fetchAndVerifyAccountProof({
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
     const accountBytes = parseAccountBytes(account);
-    const row = await fetchAccountProofRow(sqlUrl, accountBytes, signal);
     const stateEnd = target.stateTip;
-    if (row.location < target.stateStart || row.location >= stateEnd) {
+    // account_meta keeps one row per state operation, so the account's value
+    // at this certificate is its newest row below the certificate's state tip.
+    // Rows written after the target are simply not visible to this proof.
+    const row = await fetchAccountProofRow(sqlUrl, accountBytes, stateEnd, signal);
+    if (row.location < target.stateStart) {
         throw new Error(`account location ${row.location} is outside finalized state range`);
     }
 
@@ -260,13 +398,17 @@ export async function fetchAndVerifyAccountProof({
 
 export async function fetchAndVerifyTransactionRowProof({
     qmdbUrl,
+    storeUrl,
     sqlUrl,
+    simplexVerificationMaterial,
     row,
-    target,
+    target: pageTarget,
     signal,
 }: {
     qmdbUrl: string;
+    storeUrl: string;
     sqlUrl: string;
+    simplexVerificationMaterial: string;
     row: AccountTransactionRow;
     target: LatestProofTarget;
     signal?: AbortSignal;
@@ -274,6 +416,25 @@ export async function fetchAndVerifyTransactionRowProof({
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
     const location = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+
+    // The page's target is the newest provable certificate at lookup time.
+    // A row finalized after it needs a newer provable certificate, which the
+    // caller's retry keeps requesting until coverage catches up.
+    let target = pageTarget;
+    if (location >= target.transactionsTip) {
+        target = await fetchLatestProofTarget({
+            qmdbUrl,
+            storeUrl,
+            sqlUrl,
+            simplexVerificationMaterial,
+            signal,
+        });
+        if (location >= target.transactionsTip) {
+            throw new Error(
+                `transaction location ${location} is not yet covered by a provable finalization`,
+            );
+        }
+    }
     assertTransactionLocationBeforeTip(location, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
@@ -688,6 +849,7 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
 async function fetchAccountProofRow(
     sqlUrl: string,
     account: Uint8Array,
+    beforeLocation: bigint,
     signal?: AbortSignal,
 ): Promise<AccountProofRow> {
     const result = await sqlQuery(
@@ -700,6 +862,7 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
+                AND ${ACCOUNT_META_QMDB_LOCATION} < ${beforeLocation.toString()}
             ORDER BY ${ACCOUNT_META_QMDB_LOCATION} DESC
             LIMIT 1
         `,

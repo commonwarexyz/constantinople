@@ -24,7 +24,7 @@
         "src/nonce.ts",
         "src/proofMath.ts",
         "src/proofRetry.ts",
-        "src/sqlCompatibility.ts",
+        "src/proofTarget.ts",
         "src/submissionHistory.ts",
         "src/submissionResponse.ts"
     ]
