@@ -12,11 +12,14 @@
 //!   The `block_meta` table is what
 //!   the explorer subscribes to over the `sql.v1.Service` `Subscribe`
 //!   RPC. `tx_meta` stores one row per finalized transaction with its proof
-//!   location and body data. `tx_proof_meta` adds digest-keyed finalized height
-//!   and proof location without changing the existing row layout. `tx_activity`
-//!   stores one account-ordered row for each sender and receiver side of a
-//!   transaction. `account_meta` stores the latest indexed account state plus
-//!   its QMDB operation location.
+//!   location and body data. `tx_activity` stores one account-ordered row for
+//!   each sender and receiver side of a transaction. `account_meta` stores one
+//!   row per account-state QMDB operation, keyed by account and operation
+//!   location. Readers take the highest location for an account. Store keys
+//!   are immutable, so a latest-value table keyed by account alone would
+//!   rewrite keys with new values and readers would observe stale rows.
+//!   A transaction's finalized height is derived from `block_meta`, which
+//!   keeps the bulk Store commit at three SQL rows per transaction.
 //!
 //! The string constants in this module are intentionally `pub` so that
 //! external consumers (the explorer and the SQL CLI) can hard-code the
@@ -33,10 +36,8 @@ pub const BLOCK_META_TABLE: &str = "block_meta";
 pub const TX_META_TABLE: &str = "tx_meta";
 /// Name of the SQL table that indexes account transaction activity.
 pub const TX_ACTIVITY_TABLE: &str = "tx_activity";
-/// Name of the SQL table that records the latest indexed account state.
+/// Name of the SQL table that records one row per account-state QMDB operation.
 pub const ACCOUNT_META_TABLE: &str = "account_meta";
-/// Name of the SQL table that records digest-keyed transaction proof metadata.
-pub const TX_PROOF_META_TABLE: &str = "tx_proof_meta";
 
 // ---------- block_meta columns ----------
 
@@ -64,15 +65,6 @@ pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
 /// `tx_meta`: encoded signed transaction bytes.
 pub const TX_META_BODY: &str = "body";
 
-// ---------- tx_proof_meta columns ----------
-
-/// `tx_proof_meta`: 32-byte transaction digest, fixed-size binary.
-pub const TX_PROOF_META_DIGEST: &str = "tx_digest";
-/// `tx_proof_meta`: finalized block height containing the transaction.
-pub const TX_PROOF_META_HEIGHT: &str = "height";
-/// `tx_proof_meta`: transaction-hash QMDB operation location.
-pub const TX_PROOF_META_QMDB_LOCATION: &str = "qmdb_location";
-
 // ---------- tx_activity columns ----------
 
 /// `tx_activity`: active account key (primary key first column).
@@ -94,7 +86,7 @@ pub const TX_ACTIVITY_NONCE: &str = "nonce";
 
 // ---------- account_meta columns ----------
 
-/// `account_meta`: account key (primary key), fixed-size binary.
+/// `account_meta`: account key (primary key first column), fixed-size binary.
 pub const ACCOUNT_META_ACCOUNT: &str = "account";
 /// `account_meta`: indexed account balance.
 pub const ACCOUNT_META_BALANCE: &str = "balance";
@@ -102,7 +94,7 @@ pub const ACCOUNT_META_BALANCE: &str = "balance";
 pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 /// `account_meta`: indexed account run-ahead nonce bitmap.
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
-/// `account_meta`: account-state QMDB operation location.
+/// `account_meta`: account-state QMDB operation location (primary key second column).
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
@@ -201,23 +193,10 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                     TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
                     TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
                 ],
-                vec![ACCOUNT_META_ACCOUNT.to_string()],
-                vec![],
-            )
-        })
-        .and_then(|schema| {
-            schema.table(
-                TX_PROOF_META_TABLE,
                 vec![
-                    TableColumnConfig::new(
-                        TX_PROOF_META_DIGEST,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(TX_PROOF_META_HEIGHT, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_PROOF_META_QMDB_LOCATION, DataType::UInt64, false),
+                    ACCOUNT_META_ACCOUNT.to_string(),
+                    ACCOUNT_META_QMDB_LOCATION.to_string(),
                 ],
-                vec![TX_PROOF_META_DIGEST.to_string()],
                 vec![],
             )
         })
@@ -263,10 +242,6 @@ mod tests {
             tables.iter().any(|t| t == ACCOUNT_META_TABLE),
             "account_meta missing: {tables:?}"
         );
-        assert!(
-            tables.iter().any(|t| t == TX_PROOF_META_TABLE),
-            "tx_proof_meta missing: {tables:?}"
-        );
 
         let table = ctx.table(TX_META_TABLE).await.expect("tx_meta table");
         let fields = table.schema().fields();
@@ -280,22 +255,6 @@ mod tests {
         assert_eq!(fields[2].name(), TX_META_BODY);
         assert_eq!(fields[2].data_type(), &DataType::Binary);
         assert!(!fields[2].is_nullable());
-
-        let table = ctx
-            .table(TX_PROOF_META_TABLE)
-            .await
-            .expect("tx_proof_meta table");
-        let fields = table.schema().fields();
-        assert_eq!(fields.len(), 3);
-        assert_eq!(fields[0].name(), TX_PROOF_META_DIGEST);
-        assert_eq!(fields[0].data_type(), &DataType::FixedSizeBinary(32));
-        assert!(!fields[0].is_nullable());
-        assert_eq!(fields[1].name(), TX_PROOF_META_HEIGHT);
-        assert_eq!(fields[1].data_type(), &DataType::UInt64);
-        assert!(!fields[1].is_nullable());
-        assert_eq!(fields[2].name(), TX_PROOF_META_QMDB_LOCATION);
-        assert_eq!(fields[2].data_type(), &DataType::UInt64);
-        assert!(!fields[2].is_nullable());
     }
 
     /// The string constants must remain stable so the explorer can rely on
@@ -304,7 +263,6 @@ mod tests {
     fn table_and_column_names_are_stable() {
         assert_eq!(BLOCK_META_TABLE, "block_meta");
         assert_eq!(TX_META_TABLE, "tx_meta");
-        assert_eq!(TX_PROOF_META_TABLE, "tx_proof_meta");
         assert_eq!(TX_ACTIVITY_TABLE, "tx_activity");
         assert_eq!(ACCOUNT_META_TABLE, "account_meta");
         assert_eq!(BLOCK_META_HEIGHT, "height");
@@ -317,9 +275,6 @@ mod tests {
         assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_META_BODY, "body");
-        assert_eq!(TX_PROOF_META_DIGEST, "tx_digest");
-        assert_eq!(TX_PROOF_META_HEIGHT, "height");
-        assert_eq!(TX_PROOF_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
         assert_eq!(TX_ACTIVITY_HEIGHT, "height");
         assert_eq!(TX_ACTIVITY_INDEX, "index");

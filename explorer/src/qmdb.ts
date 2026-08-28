@@ -1,6 +1,5 @@
 import { fromHex, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
-import { isMissingTransactionProofMetadataTable } from './sqlCompatibility';
 import {
     SqlClient,
     type CellValue,
@@ -45,10 +44,6 @@ const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
 const TX_META_BODY = 'body';
 
-const TX_PROOF_META_TABLE = 'tx_proof_meta';
-const TX_PROOF_META_DIGEST = 'tx_digest';
-const TX_PROOF_META_HEIGHT = 'height';
-const TX_PROOF_META_QMDB_LOCATION = 'qmdb_location';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -340,38 +335,9 @@ async function fetchTransactionProofMetadata(
 ): Promise<TransactionProofMetadata> {
     const digestBytes = fromHex(digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    let proofMetadataRow: DecodedRow | undefined;
+    let location: bigint;
     try {
-        const proofMetadata = await sqlQuery(
-            sqlUrl,
-            `
-                SELECT ${TX_PROOF_META_HEIGHT}, ${TX_PROOF_META_QMDB_LOCATION}
-                FROM ${TX_PROOF_META_TABLE}
-                WHERE ${TX_PROOF_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
-                LIMIT 1
-            `,
-            signal,
-        );
-        proofMetadataRow = proofMetadata.rows[0];
-    } catch (error) {
-        if (!isMissingTransactionProofMetadataTable(error)) throw error;
-    }
-    if (proofMetadataRow) {
-        return {
-            height: expectBigint(
-                proofMetadataRow.values[TX_PROOF_META_HEIGHT],
-                TX_PROOF_META_HEIGHT,
-            ),
-            location: expectBigint(
-                proofMetadataRow.values[TX_PROOF_META_QMDB_LOCATION],
-                TX_PROOF_META_QMDB_LOCATION,
-            ),
-        };
-    }
-
-    let legacyLocation: bigint;
-    try {
-        legacyLocation = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+        location = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         if (detail.includes('missing from raw transaction index')) {
@@ -384,7 +350,7 @@ async function fetchTransactionProofMetadata(
         `
             SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}
             FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${legacyLocation.toString()}
+            WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${location.toString()}
             ORDER BY ${BLOCK_META_HEIGHT} ASC
             LIMIT 1
         `,
@@ -396,7 +362,7 @@ async function fetchTransactionProofMetadata(
     }
     return {
         height: expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT),
-        location: legacyLocation,
+        location,
     };
 }
 
@@ -734,6 +700,7 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
+            ORDER BY ${ACCOUNT_META_QMDB_LOCATION} DESC
             LIMIT 1
         `,
         signal,

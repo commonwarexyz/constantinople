@@ -1,8 +1,6 @@
 //! SQL row encoding shared by the combined publisher.
 
-use crate::sql_schema::{
-    ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE, TX_PROOF_META_TABLE,
-};
+use crate::sql_schema::{ACCOUNT_META_TABLE, BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
 use bytes::Bytes;
 use exoware_sql::CellValue;
 
@@ -34,13 +32,6 @@ pub(crate) struct TxMetaRow {
     pub body: Bytes,
 }
 
-/// Digest-keyed proof metadata stored in `tx_proof_meta`.
-pub(crate) struct TxProofMetaRow {
-    pub digest: [u8; 32],
-    pub height: u64,
-    pub qmdb_location: u64,
-}
-
 /// Transaction activity role stored in `tx_activity`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TxActivityRole {
@@ -69,7 +60,7 @@ pub(crate) struct TxActivityRow {
     pub nonce: u64,
 }
 
-/// Latest account row stored in `account_meta`.
+/// One `account_meta` row per account-state QMDB operation.
 pub(crate) struct AccountMetaRow {
     pub account: [u8; 32],
     pub balance: u64,
@@ -111,18 +102,6 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::UInt64(tx.qmdb_location),
             CellValue::Binary(tx.body.to_vec()),
-        ],
-    }
-}
-
-/// Encode one finalized transaction proof-metadata row.
-pub(crate) fn encode_tx_proof_meta_row(tx: TxProofMetaRow) -> SqlRow {
-    SqlRow {
-        table: TX_PROOF_META_TABLE,
-        values: vec![
-            CellValue::FixedBinary(tx.digest.to_vec()),
-            CellValue::UInt64(tx.height),
-            CellValue::UInt64(tx.qmdb_location),
         ],
     }
 }

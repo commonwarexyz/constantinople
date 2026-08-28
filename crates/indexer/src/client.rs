@@ -4,8 +4,8 @@
 //! keyed by the certified block-header digest. Height/latest reads go through
 //! Simplex finalization indexes first, so callers can use the verified header
 //! path without fetching the full body. Transaction bodies remain in SQL
-//! `tx_meta` rows. Finalized proof coordinates use `tx_proof_meta` with a
-//! `block_meta` fallback for older Stores.
+//! `tx_meta` rows. The finalized height of a transaction is derived from
+//! `block_meta` by locating its QMDB location under a block's transaction tip.
 
 use crate::{
     codec,
@@ -13,8 +13,7 @@ use crate::{
     publisher::certificate::CertifiedHeader,
     sql_schema::{
         BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_TIP, TX_META_BODY,
-        TX_META_DIGEST, TX_META_QMDB_LOCATION, TX_META_TABLE, TX_PROOF_META_DIGEST,
-        TX_PROOF_META_HEIGHT, TX_PROOF_META_QMDB_LOCATION, TX_PROOF_META_TABLE, build_meta_schema,
+        TX_META_DIGEST, TX_META_QMDB_LOCATION, TX_META_TABLE, build_meta_schema,
     },
 };
 use bytes::Bytes;
@@ -341,78 +340,39 @@ impl IndexerClient {
             let qmdb_location = qmdb_location.value(0);
             let body = verified_transaction_body::<H>(&batch, 1, digest)?;
 
-            let proof_sql = format!(
-                "SELECT {TX_PROOF_META_HEIGHT}, {TX_PROOF_META_QMDB_LOCATION} FROM {TX_PROOF_META_TABLE} WHERE {TX_PROOF_META_DIGEST} = X'{digest_hex}' LIMIT 1"
+            // The containing block is the first one whose transaction tip
+            // reaches the location. block_meta is one row per block, so this
+            // stays cheap and avoids a per-transaction proof row in the bulk
+            // lane.
+            let block_sql = format!(
+                "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} > {qmdb_location} ORDER BY {BLOCK_META_HEIGHT} ASC LIMIT 1"
             );
-            let proof_batches = self.sql.sql(&proof_sql).await?.collect().await?;
+            let block_batches = self.sql.sql(&block_sql).await?.collect().await?;
             let mut height = None;
-            for proof_batch in proof_batches {
-                if proof_batch.num_rows() == 0 {
+            for block_batch in block_batches {
+                if block_batch.num_rows() == 0 {
                     continue;
                 }
-                let proof_height = proof_batch
+                let block_height = block_batch
                     .column(0)
                     .as_any()
                     .downcast_ref::<UInt64Array>()
                     .ok_or_else(|| {
-                        ReadError::SqlRow("tx_proof_meta.height must be UInt64".to_string())
+                        ReadError::SqlRow("block_meta.height must be UInt64".to_string())
                     })?;
-                let proof_location = proof_batch
-                    .column(1)
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .ok_or_else(|| {
-                        ReadError::SqlRow("tx_proof_meta.qmdb_location must be UInt64".to_string())
-                    })?;
-                if proof_height.is_null(0) || proof_location.is_null(0) {
+                if block_height.is_null(0) {
                     return Err(ReadError::SqlRow(
-                        "tx_proof_meta values must not be null".to_string(),
+                        "block_meta.height must not be null".to_string(),
                     ));
                 }
-                if proof_location.value(0) != qmdb_location {
-                    return Err(ReadError::SqlRow(
-                        "transaction metadata QMDB locations do not match".to_string(),
-                    ));
-                }
-                height = Some(proof_height.value(0));
+                height = Some(block_height.value(0));
                 break;
             }
-
-            let height = match height {
-                Some(height) => height,
-                None => {
-                    let block_sql = format!(
-                        "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} > {qmdb_location} ORDER BY {BLOCK_META_HEIGHT} ASC LIMIT 1"
-                    );
-                    let block_batches = self.sql.sql(&block_sql).await?.collect().await?;
-                    let mut height = None;
-                    for block_batch in block_batches {
-                        if block_batch.num_rows() == 0 {
-                            continue;
-                        }
-                        let block_height = block_batch
-                            .column(0)
-                            .as_any()
-                            .downcast_ref::<UInt64Array>()
-                            .ok_or_else(|| {
-                                ReadError::SqlRow("block_meta.height must be UInt64".to_string())
-                            })?;
-                        if block_height.is_null(0) {
-                            return Err(ReadError::SqlRow(
-                                "block_meta.height must not be null".to_string(),
-                            ));
-                        }
-                        height = Some(block_height.value(0));
-                        break;
-                    }
-                    height.ok_or_else(|| {
-                        ReadError::SqlRow(
-                            "transaction QMDB location has no containing finalized block"
-                                .to_string(),
-                        )
-                    })?
-                }
-            };
+            let height = height.ok_or_else(|| {
+                ReadError::SqlRow(
+                    "transaction QMDB location has no containing finalized block".to_string(),
+                )
+            })?;
 
             return Ok(Some(TransactionMetadata {
                 height,

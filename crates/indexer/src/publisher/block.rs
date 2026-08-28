@@ -3,9 +3,8 @@
 use crate::publisher::{
     SqlRow,
     sql::{
-        BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, TxProofMetaRow,
-        encode_block_meta_row, encode_tx_activity_row, encode_tx_meta_row,
-        encode_tx_proof_meta_row,
+        BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, encode_block_meta_row,
+        encode_tx_activity_row, encode_tx_meta_row,
     },
 };
 use bytes::Bytes;
@@ -119,10 +118,12 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    let mut sql = Vec::with_capacity(4 * body_len);
+    // Three rows per transaction. No per-transaction proof row is emitted
+    // because readers derive the finalized height from block_meta by
+    // transactions_tip, and every extra row per transaction lands in the bulk
+    // Store commit that bounds indexer throughput.
+    let mut sql = Vec::with_capacity(3 * body_len);
 
-    // Proof metadata remains separate so the established tx_meta row encoding
-    // stays readable across rolling upgrades.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
     for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
         transaction_digests.push(tx.digest);
@@ -137,11 +138,6 @@ where
             digest,
             qmdb_location,
             body: tx.bytes,
-        }));
-        sql.push(encode_tx_proof_meta_row(TxProofMetaRow {
-            digest,
-            height,
-            qmdb_location,
         }));
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
@@ -406,19 +402,15 @@ mod tests {
         };
         assert_eq!(body.as_slice(), expected_body);
 
-        let proof_meta = rows
-            .iter()
-            .find(|row| row.table == crate::sql_schema::TX_PROOF_META_TABLE)
-            .expect("tx_proof_meta row should be indexed");
-        assert_eq!(proof_meta.values.len(), 3);
-        assert!(matches!(
-            proof_meta.values.get(1),
-            Some(CellValue::UInt64(7))
-        ));
-        assert!(matches!(
-            proof_meta.values.get(2),
-            Some(CellValue::UInt64(0))
-        ));
+        // Proof height is derived from block_meta by readers, so the bulk
+        // lane emits only transaction lookup and activity rows.
+        assert!(
+            rows.iter().all(|row| {
+                row.table == crate::sql_schema::TX_META_TABLE
+                    || row.table == crate::sql_schema::TX_ACTIVITY_TABLE
+            }),
+            "bulk lane emits only tx_meta and tx_activity rows"
+        );
     }
 
     fn test_header(

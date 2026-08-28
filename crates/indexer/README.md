@@ -18,7 +18,7 @@ that fits.
 | Path | Surface | Used by |
 | ---- | ------- | ------- |
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
-| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`, `tx_proof_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or latest account proof locations without paying full-block decode cost. |
+| **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or account proof locations without paying full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 
@@ -38,11 +38,17 @@ The current SQL table-prefix allocation is:
 | `tx_meta` | `0x1` | none |
 | `tx_activity` | `0x2` | none |
 | `account_meta` | `0x3` | none |
-| `tx_proof_meta` | `0x4` | none |
 
 `exoware-sql` expands those table prefixes into its Store key layout. There are
 currently no secondary SQL index rows, so finalized-block SQL writes only add
-primary table rows.
+primary table rows. Every table is append-only. Store keys are immutable, so
+no table may rewrite an existing key with a different value. `account_meta` is
+keyed by `(account, qmdb_location)` with one row per account-state QMDB
+operation, and readers take the highest location for an account. Each
+finalized transaction adds exactly three rows to the bulk commit: one `tx_meta`
+row and one `tx_activity` row per side. The bulk commit is what bounds indexer
+throughput, so a per-transaction row is only added when readers cannot derive
+the same information elsewhere.
 
 The digest-keyed `tx_meta` row contract is:
 
@@ -52,20 +58,14 @@ The digest-keyed `tx_meta` row contract is:
 | `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-hash QMDB append location. |
 | `body` | binary | non-null | Encoded signed transaction bytes. |
 
-The digest-keyed `tx_proof_meta` row contract is:
+A transaction proof needs the finalized height that contains the transaction.
+Readers derive it from `block_meta`: the containing block is the first row
+whose `transactions_tip` exceeds `tx_meta.qmdb_location`. `block_meta` holds
+one row per block, so the lookup is a small range query rather than a
+per-transaction table.
 
-| Column | Type | Nullability | Purpose |
-| ------ | ---- | ----------- | ------- |
-| `tx_digest` | fixed-size binary with 32 bytes | non-null | Transaction digest and primary key. |
-| `height` | unsigned 64-bit integer | non-null | Finalized block height containing the transaction. |
-| `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-hash QMDB append location. |
-
-The sidecar table is appended after all established tables, so existing table
-prefixes and `tx_meta` rows remain readable during an upgrade. New
-`tx_proof_meta` rows share the bulk Store commit with `tx_meta` and the
-transaction QMDB operation rows. Proofs become queryable once an inline or later
-grouped watermark covers that upload. Readers can recover proof height for older
-rows by locating `tx_meta.qmdb_location` within `block_meta`.
+Proofs become queryable once an inline or later grouped watermark covers the
+upload that carried the transaction.
 
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate; height/latest reads start from a
@@ -90,7 +90,7 @@ the full body only when requested.
   transaction lookup rows and both QMDB families through the gated bulk lane.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
   storage and SQL transaction lookup rows. Digest lookups combine `tx_meta`
-  with `tx_proof_meta` and expose the finalized height, QMDB location, and
+  with `block_meta` and expose the finalized height, QMDB location, and
   signed body through `TransactionMetadata`.
   Latest-finalized-height is derived from the Simplex finalization height index.
 - `[[bin]] chain-indexer` — thin wrapper around `exoware_simulator::server::run`

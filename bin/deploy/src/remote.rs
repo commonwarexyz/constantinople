@@ -376,7 +376,14 @@ fn build_deployer_config(
                 .indexer
                 .is_some()
                 .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
-            instance_type: remote.instance_type.clone(),
+            instance_type: if secondary.config.indexer.is_some() {
+                remote
+                    .indexer_instance_type
+                    .clone()
+                    .unwrap_or_else(|| remote.instance_type.clone())
+            } else {
+                remote.instance_type.clone()
+            },
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
             storage_iops: remote.storage_iops,
@@ -570,6 +577,7 @@ mod tests {
         RemoteArgs {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
+            indexer_instance_type: Some("c8a.8xlarge".to_string()),
             storage_size: 25,
             storage_iops: None,
             storage_throughput: None,
@@ -798,7 +806,9 @@ mod tests {
         assert_eq!(config.instances[3].name, "secondary-0");
         assert_eq!(config.instances[3].binary, VALIDATOR_BINARY_FILE);
         assert_eq!(config.instances[3].config, "secondary-0.yaml");
+        assert_eq!(config.instances[3].instance_type, "c8a.8xlarge");
         assert_eq!(config.instances[4].name, "secondary-1");
+        assert_eq!(config.instances[4].instance_type, "c8g.large");
     }
 
     #[test]

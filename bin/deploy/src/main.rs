@@ -223,6 +223,9 @@ pub(crate) struct RemoteArgs {
     /// EC2 instance type for validators.
     #[arg(long)]
     instance_type: String,
+    /// EC2 instance type for the indexer secondary. Defaults to --instance-type.
+    #[arg(long)]
+    indexer_instance_type: Option<String>,
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,

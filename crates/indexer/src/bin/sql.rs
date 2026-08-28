@@ -1,8 +1,7 @@
 //! Metadata query/stream service for the shared indexer store.
 //!
 //! `metadata-indexer` exposes Constantinople's SQL metadata schema
-//! (`block_meta`, `tx_meta`, `tx_activity`, `account_meta`, and
-//! `tx_proof_meta`) over
+//! (`block_meta`, `tx_meta`, `tx_activity`, and `account_meta`) over
 //! `sql.v1.Service`. It supports both
 //! direct local invocations (`--store-url`, `--port`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
