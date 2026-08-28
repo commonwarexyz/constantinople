@@ -61,7 +61,7 @@ const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
-const INDEXER_UPLOAD_MAX_IN_FLIGHT: usize = 12;
+const INDEXER_UPLOAD_MAX_IN_FLIGHT: usize = 64;
 const INDEXER_UPLOAD_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
@@ -223,9 +223,6 @@ pub(crate) struct RemoteArgs {
     /// EC2 instance type for validators.
     #[arg(long)]
     instance_type: String,
-    /// EC2 instance type for the indexer secondary. Defaults to --instance-type.
-    #[arg(long)]
-    indexer_instance_type: Option<String>,
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,

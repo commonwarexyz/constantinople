@@ -32,7 +32,7 @@ use commonware_p2p::{
 use commonware_parallel::Rayon;
 use commonware_runtime::{
     BufferPoolConfig, Metrics, Quota, Runner as _, Strategizer as _, Supervisor as _,
-    buffer::paged::CacheRef,
+    buffer::paged::{self, CacheRef},
     telemetry::metrics::{Counter, Gauge, MetricsExt as _},
     tokio::{
         Context as RuntimeContext,
@@ -46,7 +46,7 @@ use commonware_storage::{
     translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+    NZDuration, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
 };
 use constantinople_application::consensus::{DatabaseReaders, FinalizedHookFn};
 use constantinople_engine::{
@@ -92,7 +92,7 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
 };
 const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
-const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = NZU16!(4_096);
+const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = paged::page_size(65_536);
 const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
@@ -1405,8 +1405,7 @@ const fn production_sync_config() -> SyncEngineConfig {
 mod tests {
     use super::{
         CertificateUploaderStopped, EngineCertReporter, EngineQueuedUpload,
-        FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
-        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
+        FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
         FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueFrontiers, FinalizedQueueReader,
         FinalizedQueueWriter, FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher,
         PendingQueuedUpload, PublishError, StoreClientBuildError, UploadBudget,
@@ -1984,7 +1983,7 @@ mod tests {
         let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
             context,
             FINALIZED_QUEUE_PAGE_SIZE,
-            FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+            NZUsize!(8),
         );
         queue::Config {
             partition: partition.to_string(),

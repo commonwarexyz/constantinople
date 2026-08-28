@@ -102,12 +102,12 @@ tracing-subscriber = "0.3"
 
 [patch.crates-io]
 # Keep all Exoware crates on one revision because SDK types cross crate boundaries.
-exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "bff68e3b7f2cd11fcfd1223245ec05f8a814bed0" }
-exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "bff68e3b7f2cd11fcfd1223245ec05f8a814bed0" }
-exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "bff68e3b7f2cd11fcfd1223245ec05f8a814bed0" }
-exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "bff68e3b7f2cd11fcfd1223245ec05f8a814bed0" }
-exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "bff68e3b7f2cd11fcfd1223245ec05f8a814bed0" }
-exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "bff68e3b7f2cd11fcfd1223245ec05f8a814bed0" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo.git", rev = "57d7b6243e3acdac6fbf1689394afaa2f54ff5ea" }
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo.git", rev = "57d7b6243e3acdac6fbf1689394afaa2f54ff5ea" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo.git", rev = "57d7b6243e3acdac6fbf1689394afaa2f54ff5ea" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo.git", rev = "57d7b6243e3acdac6fbf1689394afaa2f54ff5ea" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo.git", rev = "57d7b6243e3acdac6fbf1689394afaa2f54ff5ea" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo.git", rev = "57d7b6243e3acdac6fbf1689394afaa2f54ff5ea" }
 
 [profile.samply]
 inherits = "release"

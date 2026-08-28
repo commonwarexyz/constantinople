@@ -30,7 +30,7 @@ reset_options() {
     MAX_POOL_BYTES=
     STORAGE_SIZE=150
     GENERATE_ARGS=()
-    REMOTE_ARGS=(--indexer-instance-type c8a.8xlarge)
+    REMOTE_ARGS=()
     BINARY_TARGETS=()
     EXPLORER_STORE_URL=
     EXPLORER_SQL_URL=

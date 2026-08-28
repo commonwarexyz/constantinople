@@ -70,7 +70,6 @@ prepare_case
 assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains --chain-indexer-instance-type "${REMOTE_ARGS[@]}"
-assert_pair --indexer-instance-type c8a.8xlarge "${REMOTE_ARGS[@]}"
 
 prepare_case --store-url https://store.example.com
 assert_pair --chain-indexer-url https://store.example.com "${REMOTE_ARGS[@]}"
