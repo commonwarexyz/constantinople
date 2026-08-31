@@ -5,7 +5,9 @@ use super::{
     sql::{AccountMetaRow, encode_account_meta_row},
 };
 use crate::{
-    namespaces::{sql_meta_client, state_qmdb_client, transactions_qmdb_client},
+    namespaces::{
+        provable_target_client, sql_meta_client, state_qmdb_client, transactions_qmdb_client,
+    },
     sql_schema::build_meta_schema,
     store::writer_store_clients,
 };
@@ -417,6 +419,7 @@ where
     H: Hasher,
 {
     height: u64,
+    target: ProvableTarget,
     block_rows: BulkBlockRows<H::Digest>,
     state_delta: Vec<StateOperation>,
     account_rows: Vec<super::SqlRow>,
@@ -438,6 +441,7 @@ where
 
 struct PreparedQmdbUpload {
     height: u64,
+    target: ProvableTarget,
     sql_rows: Vec<super::SqlRow>,
     state: PreparedUpload<QmdbFamily>,
     transactions: PreparedUpload<QmdbFamily>,
@@ -447,6 +451,7 @@ struct PreparedQmdbUpload {
 
 struct StagedQmdbUpload {
     height: u64,
+    target: ProvableTarget,
     state: PreparedUpload<QmdbFamily>,
     transactions: PreparedUpload<QmdbFamily>,
     completion: oneshot::Sender<()>,
@@ -475,6 +480,8 @@ where
     transaction_upload: PreparedUpload<QmdbFamily>,
     state_watermark: Option<PreparedWatermark<QmdbFamily>>,
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
+    provable_target_client: PrefixedStoreClient,
+    provable_target: Option<ProvableTarget>,
 }
 
 struct CommitPipeline<'a, H, S>
@@ -488,6 +495,7 @@ where
     metadata_gate_wait: &'a Histogram,
     state_writer: &'a Arc<StateWriter<H, S>>,
     transaction_writer: &'a Arc<TransactionWriter<H, S>>,
+    provable_target_client: &'a PrefixedStoreClient,
 }
 
 struct StagedCommitBatch {
@@ -510,9 +518,33 @@ struct CommittedQmdbBatch {
 }
 
 struct PendingUploadCompletion {
+    target: ProvableTarget,
     state_latest: Location<QmdbFamily>,
     transaction_latest: Location<QmdbFamily>,
     completion: oneshot::Sender<()>,
+}
+
+impl PendingUploadCompletion {
+    fn target_boundary(&self) -> ProvableTargetBoundary {
+        ProvableTargetBoundary {
+            target: self.target.clone(),
+            state_latest: self.state_latest,
+            transaction_latest: self.transaction_latest,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProvableTarget {
+    height: u64,
+    block_digest: Bytes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProvableTargetBoundary {
+    target: ProvableTarget,
+    state_latest: Location<QmdbFamily>,
+    transaction_latest: Location<QmdbFamily>,
 }
 
 impl<H, P> Publisher<H, P>
@@ -624,6 +656,7 @@ where
         let (commit_client, metadata_commit_client) = writer_store_clients(store_url, api_key)?;
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
+        let provable_target_client = provable_target_client(&commit_client)?;
         // Two independent writers over one schema. The bulk committer and the
         // metadata fast lane each own their whole flush lifecycle, so neither
         // holds shared mutable writer state across network I/O.
@@ -689,6 +722,7 @@ where
             sql_writer,
             state_writer.clone(),
             transaction_writer.clone(),
+            provable_target_client,
             commit_rx,
             max_in_flight_commits,
         ));
@@ -1060,6 +1094,10 @@ where
         transaction_start,
         state_delta,
     } = upload;
+    let target = ProvableTarget {
+        height,
+        block_digest: Bytes::copy_from_slice(block.seal().as_ref()),
+    };
     // This is the upload-time half of the durable queue contract: only data
     // that had to survive prune is persisted in the queue. Everything below is
     // deterministic from the queued block, cursors, and state delta. The
@@ -1076,6 +1114,7 @@ where
     let state_delta = Arc::unwrap_or_clone(state_delta);
     Ok(PendingPreparedQmdbUpload {
         height,
+        target,
         block_rows,
         state_delta,
         account_rows,
@@ -1099,6 +1138,7 @@ where
 {
     let PendingPreparedQmdbUpload {
         height,
+        target,
         block_rows,
         state_delta,
         account_rows,
@@ -1127,6 +1167,7 @@ where
 
     Ok(PreparedQmdbUpload {
         height,
+        target,
         sql_rows: sql,
         state,
         transactions,
@@ -1143,6 +1184,7 @@ async fn run_qmdb_committer<Cx, H, S>(
     mut sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H, S>>,
     transaction_writer: Arc<TransactionWriter<H, S>>,
+    provable_target_client: PrefixedStoreClient,
     mut rx: mpsc::Receiver<PreparedQmdbUpload>,
     max_in_flight_commits: usize,
 ) where
@@ -1176,9 +1218,11 @@ async fn run_qmdb_committer<Cx, H, S>(
                     metadata_gate_wait: &metrics.metadata_gate_wait,
                     state_writer: &state_writer,
                     transaction_writer: &transaction_writer,
+                    provable_target_client: &provable_target_client,
                 },
                 sql_writer,
                 upload,
+                &pending_completions,
                 inline_watermarks,
             )
             .await;
@@ -1192,6 +1236,7 @@ async fn run_qmdb_committer<Cx, H, S>(
                 &metrics.commit,
                 &state_writer,
                 &transaction_writer,
+                &provable_target_client,
             )
             .await;
             assert!(
@@ -1217,9 +1262,11 @@ async fn run_qmdb_committer<Cx, H, S>(
                                 metadata_gate_wait: &metrics.metadata_gate_wait,
                                 state_writer: &state_writer,
                                 transaction_writer: &transaction_writer,
+                                provable_target_client: &provable_target_client,
                             },
                             sql_writer,
                             upload,
+                            &pending_completions,
                             inline_watermarks,
                         )
                         .await;
@@ -1257,6 +1304,7 @@ async fn run_qmdb_committer<Cx, H, S>(
                     &metrics.commit,
                     &state_writer,
                     &transaction_writer,
+                    &provable_target_client,
                 )
                 .await;
             }
@@ -1270,6 +1318,7 @@ async fn stage_and_spawn_commit<Cx, H, S>(
     pipeline: CommitPipeline<'_, H, S>,
     sql_writer: BatchWriter,
     upload: PreparedQmdbUpload,
+    pending: &VecDeque<PendingUploadCompletion>,
     inline_watermarks: bool,
 ) -> BatchWriter
 where
@@ -1283,7 +1332,9 @@ where
         sql_writer,
         pipeline.state_writer.clone(),
         pipeline.transaction_writer.clone(),
+        pipeline.provable_target_client.clone(),
         upload,
+        pending,
         inline_watermarks,
     )
     .await
@@ -1301,12 +1352,18 @@ where
     sql_writer
 }
 
+#[expect(
+    clippy::too_many_arguments,
+    reason = "publisher resources and target candidates stay explicit"
+)]
 async fn prepare_commit_batch_blocking<Cx, H, S>(
     context: Cx,
     sql_writer: BatchWriter,
     state_writer: Arc<StateWriter<H, S>>,
     transaction_writer: Arc<TransactionWriter<H, S>>,
+    provable_target_client: PrefixedStoreClient,
     upload: PreparedQmdbUpload,
+    pending: &VecDeque<PendingUploadCompletion>,
     inline_watermarks: bool,
 ) -> Result<(BatchWriter, QmdbCommitBatch), PublishError>
 where
@@ -1315,8 +1372,19 @@ where
     H::Digest: Codec + Send + Sync,
     S: Strategy,
 {
+    let mut target_boundaries = pending
+        .iter()
+        .map(PendingUploadCompletion::target_boundary)
+        .collect::<Vec<_>>();
+    target_boundaries.push(ProvableTargetBoundary {
+        target: upload.target.clone(),
+        state_latest: upload.state.latest_location(),
+        transaction_latest: upload.transactions.latest_location(),
+    });
+
     let metadata = StagedQmdbUploadMetadata {
         height: upload.height,
+        target: upload.target,
         completion: upload.completion,
     };
     let metadata_persisted = upload.metadata_persisted;
@@ -1335,6 +1403,35 @@ where
         (None, None)
     };
 
+    let state_upload_watermark = state_upload.writer_location_watermark();
+    let transaction_upload_watermark = transaction_upload.writer_location_watermark();
+    let publishes_watermark = state_upload_watermark.is_some()
+        || transaction_upload_watermark.is_some()
+        || state_watermark.is_some()
+        || transaction_watermark.is_some();
+    let state_coverage = [
+        state_writer.latest_published_watermark().await,
+        state_upload_watermark,
+        state_watermark.as_ref().map(PreparedWatermark::location),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let transaction_coverage = [
+        transaction_writer.latest_published_watermark().await,
+        transaction_upload_watermark,
+        transaction_watermark
+            .as_ref()
+            .map(PreparedWatermark::location),
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    let provable_target = publishes_watermark
+        .then(|| newest_covered_target(&target_boundaries, state_coverage, transaction_coverage))
+        .flatten()
+        .cloned();
+
     let staged = stage_commit_batch_blocking(
         context.child("stage_store_batch"),
         CommitBatchStage {
@@ -1346,6 +1443,8 @@ where
             transaction_upload,
             state_watermark,
             transaction_watermark,
+            provable_target_client,
+            provable_target,
         },
     )
     .await?;
@@ -1362,6 +1461,7 @@ where
     let rows = store_batch.len();
     let upload = StagedQmdbUpload {
         height: metadata.height,
+        target: metadata.target,
         state: state_upload,
         transactions: transaction_upload,
         completion: metadata.completion,
@@ -1380,6 +1480,7 @@ where
 
 struct StagedQmdbUploadMetadata {
     height: u64,
+    target: ProvableTarget,
     completion: oneshot::Sender<()>,
 }
 
@@ -1409,6 +1510,8 @@ where
                 transaction_upload,
                 state_watermark,
                 transaction_watermark,
+                provable_target_client,
+                provable_target,
             } = stage;
             let sql = prepare_sql_upload(&mut sql_writer, &mut sql_upload)?;
             let mut store_batch = StoreWriteBatch::new();
@@ -1425,6 +1528,9 @@ where
             }
             if let Some(prepared) = &transaction_watermark {
                 transaction_writer.stage_flush(prepared, &mut store_batch)?;
+            }
+            if let Some(target) = &provable_target {
+                stage_provable_target(&provable_target_client, target, &mut store_batch)?;
             }
             Ok(StagedCommitBatch {
                 sql_writer,
@@ -1547,18 +1653,47 @@ where
         "indexer uploaded finalized index data"
     );
     PendingUploadCompletion {
+        target: upload.target,
         state_latest,
         transaction_latest,
         completion: upload.completion,
     }
 }
 
+fn stage_provable_target(
+    client: &PrefixedStoreClient,
+    target: &ProvableTarget,
+    batch: &mut StoreWriteBatch,
+) -> Result<(), ClientError> {
+    let key = Bytes::copy_from_slice(&target.height.to_be_bytes());
+    batch.push(client, &key, &target.block_digest)?;
+    Ok(())
+}
+
+fn newest_covered_target(
+    targets: &[ProvableTargetBoundary],
+    state_coverage: Option<Location<QmdbFamily>>,
+    transaction_coverage: Option<Location<QmdbFamily>>,
+) -> Option<&ProvableTarget> {
+    targets
+        .iter()
+        .filter(|upload| {
+            state_coverage.is_some_and(|watermark| watermark >= upload.state_latest)
+                && transaction_coverage
+                    .is_some_and(|watermark| watermark >= upload.transaction_latest)
+        })
+        .max_by_key(|upload| upload.target.height)
+        .map(|upload| &upload.target)
+}
+
 async fn flush_qmdb_watermarks<Cx, H, S>(
     context: Cx,
+    pending: &VecDeque<PendingUploadCompletion>,
     commit_client: &StoreClient,
     commit_metrics: &super::StoreCommitMetrics,
     state_writer: &StateWriter<H, S>,
     transaction_writer: &TransactionWriter<H, S>,
+    provable_target_client: &PrefixedStoreClient,
 ) -> Option<u64>
 where
     Cx: Spawner,
@@ -1590,6 +1725,23 @@ where
             .expect("QMDB transaction watermark flush must stage");
     }
 
+    let state_coverage = match &state {
+        Some(prepared) => Some(prepared.location()),
+        None => state_writer.latest_published_watermark().await,
+    };
+    let transaction_coverage = match &transactions {
+        Some(prepared) => Some(prepared.location()),
+        None => transaction_writer.latest_published_watermark().await,
+    };
+    let targets = pending
+        .iter()
+        .map(PendingUploadCompletion::target_boundary)
+        .collect::<Vec<_>>();
+    if let Some(target) = newest_covered_target(&targets, state_coverage, transaction_coverage) {
+        stage_provable_target(provable_target_client, target, &mut batch)
+            .expect("provable target must stage");
+    }
+
     let seq = commit_required_batch_blocking(
         context.child("watermark_store_commit"),
         commit_client.clone(),
@@ -1613,6 +1765,7 @@ async fn flush_and_complete_published_uploads<Cx, H, S>(
     commit_metrics: &super::StoreCommitMetrics,
     state_writer: &StateWriter<H, S>,
     transaction_writer: &TransactionWriter<H, S>,
+    provable_target_client: &PrefixedStoreClient,
 ) where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
@@ -1633,10 +1786,12 @@ async fn flush_and_complete_published_uploads<Cx, H, S>(
 
     let watermark_seq = flush_qmdb_watermarks(
         context,
+        pending,
         commit_client,
         commit_metrics,
         state_writer,
         transaction_writer,
+        provable_target_client,
     )
     .await;
     let completed = complete_published_uploads(pending, state_writer, transaction_writer).await;
@@ -2058,7 +2213,7 @@ mod tests {
         Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
     };
-    use exoware_sdk::RetryConfig;
+    use exoware_sdk::{RangeMode, RetryConfig};
     use exoware_sql::CellValue;
     use std::num::NonZeroU64 as StdNonZeroU64;
 
@@ -2201,21 +2356,27 @@ mod tests {
                 .expect("transaction upload");
             let expected_state_watermark = Some(state.latest_location());
             let expected_transaction_watermark = Some(transactions.latest_location());
+            let target = test_provable_target(u64::from(seed));
+            let target_client = provable_target_client(&client).expect("provable target client");
             let upload = PreparedQmdbUpload {
                 height: u64::from(seed),
+                target: target.clone(),
                 sql_rows: Vec::new(),
                 state,
                 transactions,
                 completion,
                 metadata_persisted: metadata_ready(),
             };
+            let pending = VecDeque::new();
 
             let (_sql_writer, batch) = prepare_commit_batch_blocking(
                 context,
                 sql_writer,
                 state_writer,
                 transaction_writer,
+                target_client.clone(),
                 upload,
+                &pending,
                 true,
             )
             .await
@@ -2232,6 +2393,165 @@ mod tests {
             );
             assert!(batch.state_watermark.is_none());
             assert!(batch.transaction_watermark.is_none());
+            let target_key = Bytes::copy_from_slice(&target.height.to_be_bytes());
+            let physical_target_key = target_client
+                .encode_store_key(&target_key)
+                .expect("provable target key encodes");
+            assert!(batch.store_batch.entries().iter().any(|(key, value)| {
+                key == &physical_target_key && value == &target.block_digest
+            }));
+        });
+    }
+
+    #[test]
+    fn non_inline_upload_publishes_target_for_embedded_watermarks() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (handle, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let client = StoreClient::new(&url);
+            let state_writer = Arc::new(StateWriter::<Sha256>::fresh(
+                state_qmdb_client(&client).expect("state client"),
+            ));
+            let transaction_writer = Arc::new(TransactionWriter::<Sha256>::fresh(
+                transactions_qmdb_client(&client).expect("transaction client"),
+            ));
+
+            let mut first_state = state_writer
+                .prepare_upload(state_ops(1))
+                .await
+                .expect("first state upload");
+            let mut first_transactions = transaction_writer
+                .prepare_upload(transaction_ops(1))
+                .await
+                .expect("first transaction upload");
+            let mut second_state = state_writer
+                .prepare_upload(state_ops(2))
+                .await
+                .expect("second state upload");
+            let second_state_latest = second_state.latest_location();
+            let mut second_transactions = transaction_writer
+                .prepare_upload(transaction_ops(2))
+                .await
+                .expect("second transaction upload");
+            let second_transaction_latest = second_transactions.latest_location();
+            let third_state = state_writer
+                .prepare_upload(state_ops(3))
+                .await
+                .expect("third state upload");
+            let third_transactions = transaction_writer
+                .prepare_upload(transaction_ops(3))
+                .await
+                .expect("third transaction upload");
+
+            let first_seq = commit_staged_upload_pair(
+                &client,
+                &state_writer,
+                &transaction_writer,
+                &mut first_state,
+                &mut first_transactions,
+            )
+            .await;
+            state_writer
+                .mark_upload_persisted(first_state, first_seq)
+                .await;
+            transaction_writer
+                .mark_upload_persisted(first_transactions, first_seq)
+                .await;
+
+            let second_seq = commit_staged_upload_pair(
+                &client,
+                &state_writer,
+                &transaction_writer,
+                &mut second_state,
+                &mut second_transactions,
+            )
+            .await;
+            state_writer
+                .mark_upload_persisted(second_state, second_seq)
+                .await;
+            transaction_writer
+                .mark_upload_persisted(second_transactions, second_seq)
+                .await;
+
+            assert!(third_state.writer_location_watermark().is_none());
+            assert!(third_transactions.writer_location_watermark().is_none());
+
+            let fourth_state = state_writer
+                .prepare_upload(state_ops(4))
+                .await
+                .expect("fourth state upload");
+            let fourth_transactions = transaction_writer
+                .prepare_upload(transaction_ops(4))
+                .await
+                .expect("fourth transaction upload");
+            assert_eq!(
+                fourth_state.writer_location_watermark(),
+                Some(second_state_latest),
+            );
+            assert_eq!(
+                fourth_transactions.writer_location_watermark(),
+                Some(second_transaction_latest),
+            );
+            assert!(
+                state_writer
+                    .prepare_flush()
+                    .await
+                    .expect("state flush prepares")
+                    .is_none(),
+            );
+            assert!(
+                transaction_writer
+                    .prepare_flush()
+                    .await
+                    .expect("transaction flush prepares")
+                    .is_none(),
+            );
+
+            let (pending_completion, _pending_rx) = oneshot::channel();
+            let pending = VecDeque::from([PendingUploadCompletion {
+                target: test_provable_target(2),
+                state_latest: second_state_latest,
+                transaction_latest: second_transaction_latest,
+                completion: pending_completion,
+            }]);
+            let (completion, _rx) = oneshot::channel();
+            let upload = PreparedQmdbUpload {
+                height: 4,
+                target: test_provable_target(4),
+                sql_rows: Vec::new(),
+                state: fourth_state,
+                transactions: fourth_transactions,
+                completion,
+                metadata_persisted: metadata_ready(),
+            };
+            let schema = build_meta_schema(sql_meta_client(&client).expect("sql metadata client"))
+                .expect("schema");
+            let target_client = provable_target_client(&client).expect("provable target client");
+            let (_sql_writer, batch) = prepare_commit_batch_blocking(
+                context,
+                schema.batch_writer(),
+                state_writer,
+                transaction_writer,
+                target_client.clone(),
+                upload,
+                &pending,
+                false,
+            )
+            .await
+            .expect("batch stages");
+
+            let expected = test_provable_target(2);
+            let expected_key = Bytes::copy_from_slice(&expected.height.to_be_bytes());
+            let expected_key = target_client
+                .encode_store_key(&expected_key)
+                .expect("provable target key encodes");
+            assert!(
+                batch.store_batch.entries().iter().any(|(key, value)| {
+                    key == &expected_key && value == &expected.block_digest
+                })
+            );
+            handle.abort();
         });
     }
 
@@ -2303,11 +2623,13 @@ mod tests {
             let (second_completion, mut second_rx) = oneshot::channel();
             let mut pending = VecDeque::from([
                 PendingUploadCompletion {
+                    target: test_provable_target(1),
                     state_latest: first_state_latest,
                     transaction_latest: first_transaction_latest,
                     completion: first_completion,
                 },
                 PendingUploadCompletion {
+                    target: test_provable_target(2),
                     state_latest: second_state_latest,
                     transaction_latest: second_transaction_latest,
                     completion: second_completion,
@@ -2332,6 +2654,7 @@ mod tests {
                 &crate::publisher::StoreCommitMetrics::new(&context),
                 &state_writer,
                 &transaction_writer,
+                &provable_target_client(&client).expect("provable target client"),
             )
             .await;
 
@@ -2344,6 +2667,10 @@ mod tests {
             assert_eq!(
                 transaction_writer.latest_published_watermark().await,
                 Some(second_transaction_latest),
+            );
+            assert_eq!(
+                latest_provable_target(&client).await,
+                Some(test_provable_target(2)),
             );
             handle.abort();
         });
@@ -2369,6 +2696,7 @@ mod tests {
             let (first_completion, mut first_rx) = oneshot::channel();
             let first_upload = PreparedQmdbUpload {
                 height: 1,
+                target: test_provable_target(1),
                 sql_rows: Vec::new(),
                 state: state_writer
                     .prepare_upload(state_ops(1))
@@ -2381,12 +2709,15 @@ mod tests {
                 completion: first_completion,
                 metadata_persisted: metadata_ready(),
             };
+            let no_pending = VecDeque::new();
             let (next_sql_writer, first_batch) = prepare_commit_batch_blocking(
                 context.child("first"),
                 sql_writer,
                 state_writer.clone(),
                 transaction_writer.clone(),
+                provable_target_client(&client).expect("provable target client"),
                 first_upload,
+                &no_pending,
                 true,
             )
             .await
@@ -2396,6 +2727,7 @@ mod tests {
             let (second_completion, mut second_rx) = oneshot::channel();
             let second_upload = PreparedQmdbUpload {
                 height: 2,
+                target: test_provable_target(2),
                 sql_rows: Vec::new(),
                 state: state_writer
                     .prepare_upload(state_ops(2))
@@ -2413,7 +2745,9 @@ mod tests {
                 sql_writer,
                 state_writer.clone(),
                 transaction_writer.clone(),
+                provable_target_client(&client).expect("provable target client"),
                 second_upload,
+                &no_pending,
                 false,
             )
             .await
@@ -2464,12 +2798,17 @@ mod tests {
                 &crate::publisher::StoreCommitMetrics::new(&context),
                 &state_writer,
                 &transaction_writer,
+                &provable_target_client(&client).expect("provable target client"),
             )
             .await;
 
             assert!(pending.is_empty());
             first_rx.try_recv().expect("first upload completed");
             second_rx.try_recv().expect("second upload completed");
+            assert_eq!(
+                latest_provable_target(&client).await,
+                Some(test_provable_target(2)),
+            );
             handle.abort();
         });
     }
@@ -3192,6 +3531,33 @@ mod tests {
             TransactionOperation::<Sha256>::Append(Sha256::hash(&[&[seed]])),
             TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
         ]
+    }
+
+    fn test_provable_target(height: u64) -> ProvableTarget {
+        ProvableTarget {
+            height,
+            block_digest: Bytes::from(vec![height as u8; 32]),
+        }
+    }
+
+    async fn latest_provable_target(client: &StoreClient) -> Option<ProvableTarget> {
+        let client = provable_target_client(client).expect("provable target client");
+        let rows = client
+            .query()
+            .range_with_mode(&Bytes::new(), &Bytes::new(), 1, RangeMode::Reverse)
+            .await
+            .expect("provable target query succeeds");
+        rows.into_iter().next().map(|(key, block_digest)| {
+            let height = u64::from_be_bytes(
+                key.as_ref()
+                    .try_into()
+                    .expect("provable target key is a u64"),
+            );
+            ProvableTarget {
+                height,
+                block_digest,
+            }
+        })
     }
 
     fn test_queued_upload() -> QueuedFinalizedUpload<Sha256, ed25519::PublicKey> {

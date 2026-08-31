@@ -19,15 +19,16 @@ that fits.
 | ---- | ------- | ------- |
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
 | **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or account proof locations without paying full-block decode cost. |
-| **QMDB operation logs** | Account-state operations under Store prefix `0x8`; transaction-hash operations under Store prefix `0x9` | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges; `/transactions` serves transaction-hash operation ranges and proofs. |
+| **QMDB operation logs** | Account-state operations under Store prefix `0x00`. Transaction-hash operations under Store prefix `0x01`. | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges. `/transactions` serves transaction-hash operation ranges and proofs. |
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
+| **Provable targets** | Height-ordered block digests under Store prefix `0x04` | Proof clients that need the newest finalized block covered by both QMDB publication boundaries. |
 
 All paths use the same exoware Store service. The owning secondary commits each
 `block_meta` row through an ordered metadata lane. It commits transaction
 lookup rows and both QMDB families through a bulk lane after that block's
 metadata row is durable. Consumers may therefore observe a block summary
 before its transaction and proof details. Simplex block and certificate
-artifacts use separate Store commits. QMDB uses Store prefixes `0x8` and `0x9`.
+artifacts use separate Store commits. QMDB uses Store prefixes `0x00` and `0x01`.
 SQL table and index prefixes are owned by
 [`exoware-sql`'s `KvSchema`][kvschema].
 The current SQL table-prefix allocation is:
@@ -66,7 +67,10 @@ block. A missing predecessor identifies genesis. The reverse lookup starts at
 the newest height and avoids a scan from genesis for recent transactions.
 
 Proofs become queryable once an inline or later grouped watermark covers the
-upload that carried the transaction.
+upload that carried the transaction. The publisher writes an append-only
+provable target in the same Store batch that establishes coverage in both QMDB
+families. Its big-endian height key makes one reverse range read return the
+newest covered block digest.
 
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate; height/latest reads start from a

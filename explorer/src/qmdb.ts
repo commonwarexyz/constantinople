@@ -1,15 +1,8 @@
 import { fromHex, toArrayBuffer } from './codec';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
-import {
-    parsePublishedWatermark,
-    targetWithinWatermarks,
-    type PublishedWatermarks,
-} from './proofTarget';
-import { Code, ConnectError } from '@connectrpc/connect';
+import { fetchLatestPublishedProofTarget } from './proofTarget';
 import {
     BLOCK_META_HEIGHT,
-    BLOCK_META_TABLE,
-    BLOCK_META_TRANSACTIONS_TIP,
     containingTransactionHeight,
     transactionHeightPredecessorQuery,
 } from './transactionHeight';
@@ -184,145 +177,31 @@ export async function fetchAndVerifyTransactionProof({
     };
 }
 
-// A tip no writer can have reached. Requesting it is rejected with the
-// published watermark in the error, which is the only way to read it today.
-const WATERMARK_PROBE_TIP = 1n << 62n;
-const WATERMARK_PROBE_ROOT = new Uint8Array(32);
-// The bulk lane trails certificates by a handful of blocks, so the newest
-// provable certificate is close to the newest one. These bound the lookups
-// when it is not.
-const PROOF_TARGET_HEIGHT_SCAN_SPAN = 512n;
-const MAX_PROOF_TARGET_STEP_BACK = 64n;
-
-// The newest finalized certificate whose state and transaction tips the QMDB
-// service has published. Proving against a newer certificate is rejected
-// with out_of_range, and retrying against an ever newer one never converges.
+// The published target is committed atomically with the state and transaction
+// QMDB publication boundary. The certificate read authenticates its digest
+// and supplies the roots used for subsequent proofs.
 export async function fetchLatestProofTarget({
-    qmdbUrl,
     storeUrl,
-    sqlUrl,
     simplexVerificationMaterial,
     signal,
 }: {
-    qmdbUrl: string;
     storeUrl: string;
-    sqlUrl: string;
     simplexVerificationMaterial: string;
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
-    const [latest, watermarks] = await Promise.all([
-        latestProofTarget(storeUrl, simplexVerificationMaterial, signal),
-        fetchPublishedWatermarks(qmdbUrl, signal),
-    ]);
-    if (watermarks === null || targetWithinWatermarks(latest, watermarks)) {
-        return latest;
-    }
-    return provableTargetBelowWatermarks(
+    const published = await fetchLatestPublishedProofTarget(storeUrl, signal);
+    const target = await finalizedTransactionTarget(
         storeUrl,
-        sqlUrl,
         simplexVerificationMaterial,
-        latest,
-        watermarks,
+        published.height,
         signal,
     );
-}
-
-async function fetchPublishedWatermarks(
-    qmdbUrl: string,
-    signal?: AbortSignal,
-): Promise<PublishedWatermarks | null> {
-    const base = trimTrailingSlash(qmdbUrl);
-    const [state, transactions] = await Promise.all([
-        fetchPublishedWatermark(`${base}/state`, signal),
-        fetchPublishedWatermark(`${base}/transactions`, signal),
-    ]);
-    if (state === null || transactions === null) {
-        return null;
-    }
-    return { state, transactions };
-}
-
-async function fetchPublishedWatermark(
-    serviceUrl: string,
-    signal?: AbortSignal,
-): Promise<bigint | null> {
-    const client = new QmdbOperationLogClient(serviceUrl);
-    try {
-        await client.getOperationRange(
-            { tip: WATERMARK_PROBE_TIP, startLocation: 0n, maxLocations: 1 },
-            WATERMARK_PROBE_ROOT,
-            { signal },
-        );
-    } catch (error) {
-        if (error instanceof ConnectError && error.code === Code.OutOfRange) {
-            return parsePublishedWatermark(error.rawMessage);
-        }
-        throw error;
-    }
-    return null;
-}
-
-async function provableTargetBelowWatermarks(
-    storeUrl: string,
-    sqlUrl: string,
-    simplexVerificationMaterial: string,
-    latest: LatestProofTarget,
-    watermarks: PublishedWatermarks,
-    signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    // block_meta.transactions_tip is each block's last transaction location,
-    // the same inclusive tip the QMDB service compares against, so the newest
-    // block at or below the transactions watermark is the newest block whose
-    // bulk upload has been published. Both families publish from that upload.
-    const floor =
-        latest.height > PROOF_TARGET_HEIGHT_SCAN_SPAN
-            ? latest.height - PROOF_TARGET_HEIGHT_SCAN_SPAN
-            : 0n;
-    const result = await sqlQuery(
-        sqlUrl,
-        `
-            SELECT ${BLOCK_META_HEIGHT}
-            FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_HEIGHT} >= ${floor.toString()}
-                AND ${BLOCK_META_TRANSACTIONS_TIP} <= ${watermarks.transactions.toString()}
-            ORDER BY ${BLOCK_META_HEIGHT} DESC
-            LIMIT 1
-        `,
-        signal,
-    );
-    const row = result.rows[0];
-    if (!row) {
+    if (!bytesEqual(target.blockDigest, published.blockDigest)) {
         throw new Error(
-            `QMDB published watermark ${watermarks.transactions} is behind every block since height ${floor}`,
+            `provable target digest does not match finalized certificate at height ${published.height}`,
         );
     }
-    const start = expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT);
-
-    // Not every finalized height carries its own certificate, and the state
-    // family can trail by part of a block, so walk down until a certificate
-    // exists and both tips are published.
-    let height = start;
-    for (let steps = 0n; steps < MAX_PROOF_TARGET_STEP_BACK && height > 0n; steps++, height--) {
-        let target: FinalizedTransactionTarget;
-        try {
-            target = await finalizedTransactionTarget(
-                storeUrl,
-                simplexVerificationMaterial,
-                height,
-                signal,
-            );
-        } catch (error) {
-            const detail = error instanceof Error ? error.message : String(error);
-            if (detail.startsWith('finalization missing at height')) continue;
-            throw error;
-        }
-        if (targetWithinWatermarks(target, watermarks)) {
-            return target;
-        }
-    }
-    throw new Error(
-        `QMDB published watermarks are behind every finalized certificate from height ${start} down`,
-    );
+    return target;
 }
 
 export async function fetchAccountTransactionsPage({
@@ -426,9 +305,7 @@ export async function fetchAndVerifyTransactionRowProof({
     let target = pageTarget;
     if (location >= target.transactionsTip) {
         target = await fetchLatestProofTarget({
-            qmdbUrl,
             storeUrl,
-            sqlUrl,
             simplexVerificationMaterial,
             signal,
         });
@@ -599,14 +476,6 @@ function finalizedTransactionTarget(
     );
 }
 
-function latestProofTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    return fetchLatestFinalizedTarget(storeUrl, simplexVerificationMaterial, signal);
-}
-
 async function fetchFinalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
@@ -623,19 +492,6 @@ async function fetchFinalizedTransactionTarget(
         throw new Error(`finalized certificate height ${target.height} does not match requested height ${height}`);
     }
     return target;
-}
-
-async function fetchLatestFinalizedTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    _signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
-    const certificate = await simplex.latestFinalization();
-    if (!certificate) {
-        throw new Error('latest finalization missing');
-    }
-    return finalizedTargetFromCertificate(certificate);
 }
 
 async function verifiedSimplexClient(

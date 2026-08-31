@@ -374,9 +374,7 @@ export default function App() {
 
         retryAccountPageStep(async () => {
             const target = await fetchLatestProofTarget({
-                qmdbUrl,
                 storeUrl,
-                sqlUrl: indexerUrl,
                 simplexVerificationMaterial,
                 signal: controller.signal,
             });
