@@ -57,6 +57,10 @@ use constantinople_engine::{
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher, StoreClientBuildError,
+    namespaces::{
+        PROVABLE_TARGET_PREFIX_VALUE, SIMPLEX_PREFIX_VALUE, SQL_META_PREFIX_VALUE,
+        STATE_QMDB_PREFIX_VALUE, TRANSACTIONS_QMDB_PREFIX_VALUE,
+    },
     publisher::{
         PublisherMetrics,
         certificate::CertificateUploaderStopped,
@@ -65,6 +69,7 @@ use constantinople_indexer::{
             WriterNextLocations,
         },
     },
+    sql_schema::meta_schema_fingerprint,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
@@ -93,7 +98,6 @@ const PRUNE_CONFIG: PruneConfig = PruneConfig {
 const PRUNABLE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(4_096);
 const FINALIZED_QUEUE_ITEMS_PER_SECTION: NonZeroU64 = NZU64!(128);
 const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = paged::page_size(65_536);
-const FINALIZED_QUEUE_PAGE_CACHE_CAPACITY: NonZeroUsize = NZUsize!(8_192);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_SIZE: NonZeroUsize = NZUsize!(2 * 1024 * 1024);
 const NETWORK_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(1_024);
@@ -345,6 +349,15 @@ impl PendingQueuedUpload {
 
 fn metric_bytes(bytes: u64) -> i64 {
     i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
+fn finalized_queue_page_cache_capacity(upload_budget_bytes: u64) -> NonZeroUsize {
+    let encoded_backlog_bytes = upload_budget_bytes
+        .div_ceil(FINALIZED_UPLOAD_AMPLIFICATION)
+        .max(1);
+    let pages = encoded_backlog_bytes.div_ceil(u64::from(FINALIZED_QUEUE_PAGE_SIZE.get()));
+    let pages = usize::try_from(pages).unwrap_or(usize::MAX);
+    NonZeroUsize::new(pages).expect("finalized queue page cache must contain one page")
 }
 
 #[derive(Clone)]
@@ -940,6 +953,7 @@ async fn maybe_build_indexer(
     let max_active_uploads = cfg
         .upload_max_in_flight
         .clamp(1, MAX_FINALIZED_QUEUE_UPLOADS);
+    let queue_page_cache_capacity = finalized_queue_page_cache_capacity(cfg.upload_budget_bytes);
     info!(
         chain_indexer_url = %cfg.chain_indexer_url,
         upload_budget_bytes = cfg.upload_budget_bytes,
@@ -947,7 +961,17 @@ async fn maybe_build_indexer(
         configured_upload_max_in_flight = cfg.upload_max_in_flight,
         upload_amplification = FINALIZED_UPLOAD_AMPLIFICATION,
         upload_budget_quantum_bytes = FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+        queue_page_cache_pages = queue_page_cache_capacity.get(),
         "starting full indexer uploaders",
+    );
+    info!(
+        schema_fingerprint = %meta_schema_fingerprint(),
+        state_qmdb_prefix = %format_args!("0x{STATE_QMDB_PREFIX_VALUE:02x}"),
+        transactions_qmdb_prefix = %format_args!("0x{TRANSACTIONS_QMDB_PREFIX_VALUE:02x}"),
+        simplex_prefix = %format_args!("0x{SIMPLEX_PREFIX_VALUE:02x}"),
+        sql_meta_prefix = %format_args!("0x{SQL_META_PREFIX_VALUE:02x}"),
+        provable_target_prefix = %format_args!("0x{PROVABLE_TARGET_PREFIX_VALUE:02x}"),
+        "indexer Store layout",
     );
     let budget = UploadBudget::new(
         &context.child("finalized_upload_budget"),
@@ -962,7 +986,7 @@ async fn maybe_build_indexer(
     let page_cache = CacheRef::from_pooler(
         &context,
         FINALIZED_QUEUE_PAGE_SIZE,
-        FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+        queue_page_cache_capacity,
     );
     let (queue_writer, mut queue_reader) = queue::shared::init(
         context.child("finalized_queue"),
@@ -1406,11 +1430,13 @@ mod tests {
     use super::{
         CertificateUploaderStopped, EngineCertReporter, EngineQueuedUpload,
         FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
-        FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, FinalizedQueueFrontiers, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, FinalizedUploadFailure, LazyPublisher,
-        PendingQueuedUpload, PublishError, StoreClientBuildError, UploadBudget,
-        decode_finalized_queue_entry, default_mempool_drop_grace_blocks, indexer_critical_task,
-        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_frontiers,
+        FINALIZED_UPLOAD_AMPLIFICATION, FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+        FinalizedQueueFrontiers, FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor,
+        FinalizedUploadFailure, LazyPublisher, PendingQueuedUpload, PublishError,
+        StoreClientBuildError, UploadBudget, decode_finalized_queue_entry,
+        default_mempool_drop_grace_blocks, finalized_queue_page_cache_capacity,
+        indexer_critical_task, maybe_build_indexer, recovered_finalized_upload_cursor,
+        scan_finalized_queue_frontiers,
         start_queued_upload, wait_for_critical_task_exit, wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
@@ -1452,6 +1478,23 @@ mod tests {
         assert_eq!(default_mempool_drop_grace_blocks(1), 2);
         assert_eq!(default_mempool_drop_grace_blocks(4), 8);
         assert_eq!(default_mempool_drop_grace_blocks(50), 100);
+    }
+
+    #[test]
+    fn finalized_queue_cache_tracks_admitted_encoded_backlog() {
+        let one_page_budget = 8 * u64::from(FINALIZED_QUEUE_PAGE_SIZE.get());
+        assert_eq!(
+            finalized_queue_page_cache_capacity(one_page_budget).get(),
+            1
+        );
+
+        let three_gib = 3 * 1024 * 1024 * 1024;
+        let encoded_backlog = three_gib / FINALIZED_UPLOAD_AMPLIFICATION;
+        let expected_pages = encoded_backlog.div_ceil(u64::from(FINALIZED_QUEUE_PAGE_SIZE.get()));
+        assert_eq!(
+            finalized_queue_page_cache_capacity(three_gib).get(),
+            usize::try_from(expected_pages).expect("test page count fits usize"),
+        );
     }
 
     #[tokio::test]

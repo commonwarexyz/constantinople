@@ -25,6 +25,7 @@
 //! external consumers (the explorer and the SQL CLI) can hard-code the
 //! exact same identifiers without an out-of-band agreement.
 
+use commonware_cryptography::{Hasher as _, sha256::Sha256};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::PrefixedStoreClient;
 use exoware_sql::{KvSchema, TableColumnConfig};
@@ -97,6 +98,227 @@ pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
 /// `account_meta`: account-state QMDB operation location (primary key second column).
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
+#[derive(Clone, Copy)]
+enum SchemaDataType {
+    UInt64,
+    FixedBinary32,
+    Binary,
+    TimestampMicros,
+}
+
+impl SchemaDataType {
+    const fn arrow(self) -> DataType {
+        match self {
+            Self::UInt64 => DataType::UInt64,
+            Self::FixedBinary32 => DataType::FixedSizeBinary(32),
+            Self::Binary => DataType::Binary,
+            Self::TimestampMicros => DataType::Timestamp(TimeUnit::Microsecond, None),
+        }
+    }
+
+    const fn fingerprint(self) -> &'static [u8] {
+        match self {
+            Self::UInt64 => b"uint64",
+            Self::FixedBinary32 => b"fixed-binary-32",
+            Self::Binary => b"binary",
+            Self::TimestampMicros => b"timestamp-micros",
+        }
+    }
+}
+
+struct SchemaColumn {
+    name: &'static str,
+    data_type: SchemaDataType,
+    nullable: bool,
+}
+
+struct SchemaTable {
+    name: &'static str,
+    columns: &'static [SchemaColumn],
+    primary_key: &'static [&'static str],
+}
+
+const BLOCK_META_COLUMNS: &[SchemaColumn] = &[
+    SchemaColumn {
+        name: BLOCK_META_HEIGHT,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: BLOCK_META_DIGEST,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: BLOCK_META_TX_COUNT,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: BLOCK_META_TRANSACTIONS_ROOT,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: BLOCK_META_TRANSACTIONS_TIP,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: BLOCK_META_VIEW,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: BLOCK_META_FINALIZED_TS,
+        data_type: SchemaDataType::TimestampMicros,
+        nullable: false,
+    },
+];
+
+const TX_META_COLUMNS: &[SchemaColumn] = &[
+    SchemaColumn {
+        name: TX_META_DIGEST,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_META_QMDB_LOCATION,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_META_BODY,
+        data_type: SchemaDataType::Binary,
+        nullable: false,
+    },
+];
+
+const TX_ACTIVITY_COLUMNS: &[SchemaColumn] = &[
+    SchemaColumn {
+        name: TX_ACTIVITY_ACCOUNT,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_HEIGHT,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_INDEX,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_ROLE,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_DIGEST,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_COUNTERPARTY,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_VALUE,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: TX_ACTIVITY_NONCE,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+];
+
+const ACCOUNT_META_COLUMNS: &[SchemaColumn] = &[
+    SchemaColumn {
+        name: ACCOUNT_META_ACCOUNT,
+        data_type: SchemaDataType::FixedBinary32,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: ACCOUNT_META_BALANCE,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: ACCOUNT_META_NONCE_BASE,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: ACCOUNT_META_NONCE_BITMAP,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+    SchemaColumn {
+        name: ACCOUNT_META_QMDB_LOCATION,
+        data_type: SchemaDataType::UInt64,
+        nullable: false,
+    },
+];
+
+const META_SCHEMA_TABLES: &[SchemaTable] = &[
+    SchemaTable {
+        name: BLOCK_META_TABLE,
+        columns: BLOCK_META_COLUMNS,
+        primary_key: &[BLOCK_META_HEIGHT],
+    },
+    SchemaTable {
+        name: TX_META_TABLE,
+        columns: TX_META_COLUMNS,
+        primary_key: &[TX_META_DIGEST],
+    },
+    SchemaTable {
+        name: TX_ACTIVITY_TABLE,
+        columns: TX_ACTIVITY_COLUMNS,
+        primary_key: &[
+            TX_ACTIVITY_ACCOUNT,
+            TX_ACTIVITY_HEIGHT,
+            TX_ACTIVITY_INDEX,
+            TX_ACTIVITY_ROLE,
+        ],
+    },
+    SchemaTable {
+        name: ACCOUNT_META_TABLE,
+        columns: ACCOUNT_META_COLUMNS,
+        primary_key: &[ACCOUNT_META_ACCOUNT, ACCOUNT_META_QMDB_LOCATION],
+    },
+];
+
+/// Return the fingerprint of the metadata schema built by [`build_meta_schema`].
+pub fn meta_schema_fingerprint() -> String {
+    let mut hasher = Sha256::default();
+    hasher.update(b"constantinople-indexer-meta-schema\0");
+    for table in META_SCHEMA_TABLES {
+        hasher.update(b"table\0");
+        hasher.update(table.name.as_bytes());
+        hasher.update(b"\0");
+        for column in table.columns {
+            hasher.update(b"column\0");
+            hasher.update(column.name.as_bytes());
+            hasher.update(b"\0");
+            hasher.update(column.data_type.fingerprint());
+            hasher.update(b"\0");
+            hasher.update(&[u8::from(column.nullable)]);
+        }
+        for primary_key in table.primary_key {
+            hasher.update(b"primary-key\0");
+            hasher.update(primary_key.as_bytes());
+            hasher.update(b"\0");
+        }
+    }
+    let (_, fingerprint) = hasher.finalize();
+    fingerprint.to_string()
+}
+
 /// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
 ///
 /// The returned schema declares all metadata tables on top of the supplied
@@ -112,91 +334,27 @@ pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 /// [`BatchWriter`]: exoware_sql::BatchWriter
 /// [`SessionContext`]: datafusion::prelude::SessionContext
 pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String> {
-    KvSchema::new(client)
-        .table(
-            BLOCK_META_TABLE,
-            vec![
-                TableColumnConfig::new(BLOCK_META_HEIGHT, DataType::UInt64, false),
-                TableColumnConfig::new(BLOCK_META_DIGEST, DataType::FixedSizeBinary(32), false),
-                TableColumnConfig::new(BLOCK_META_TX_COUNT, DataType::UInt64, false),
-                TableColumnConfig::new(
-                    BLOCK_META_TRANSACTIONS_ROOT,
-                    DataType::FixedSizeBinary(32),
-                    false,
-                ),
-                TableColumnConfig::new(BLOCK_META_TRANSACTIONS_TIP, DataType::UInt64, false),
-                TableColumnConfig::new(BLOCK_META_VIEW, DataType::UInt64, false),
-                TableColumnConfig::new(
-                    BLOCK_META_FINALIZED_TS,
-                    DataType::Timestamp(TimeUnit::Microsecond, None),
-                    false,
-                ),
-            ],
-            vec![BLOCK_META_HEIGHT.to_string()],
-            vec![],
-        )?
-        .table(
-            TX_META_TABLE,
-            vec![
-                TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
-                TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
-                TableColumnConfig::new(TX_META_BODY, DataType::Binary, false),
-            ],
-            vec![TX_META_DIGEST.to_string()],
-            vec![],
-        )
-        .and_then(|schema| {
+    META_SCHEMA_TABLES
+        .iter()
+        .try_fold(KvSchema::new(client), |schema, table| {
             schema.table(
-                TX_ACTIVITY_TABLE,
-                vec![
-                    TableColumnConfig::new(
-                        TX_ACTIVITY_ACCOUNT,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(TX_ACTIVITY_HEIGHT, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_INDEX, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_ROLE, DataType::UInt64, false),
-                    TableColumnConfig::new(
-                        TX_ACTIVITY_DIGEST,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(
-                        TX_ACTIVITY_COUNTERPARTY,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
-                ],
-                vec![
-                    TX_ACTIVITY_ACCOUNT.to_string(),
-                    TX_ACTIVITY_HEIGHT.to_string(),
-                    TX_ACTIVITY_INDEX.to_string(),
-                    TX_ACTIVITY_ROLE.to_string(),
-                ],
-                vec![],
-            )
-        })
-        .and_then(|schema| {
-            schema.table(
-                ACCOUNT_META_TABLE,
-                vec![
-                    TableColumnConfig::new(
-                        ACCOUNT_META_ACCOUNT,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(ACCOUNT_META_BALANCE, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
-                ],
-                vec![
-                    ACCOUNT_META_ACCOUNT.to_string(),
-                    ACCOUNT_META_QMDB_LOCATION.to_string(),
-                ],
+                table.name,
+                table
+                    .columns
+                    .iter()
+                    .map(|column| {
+                        TableColumnConfig::new(
+                            column.name,
+                            column.data_type.arrow(),
+                            column.nullable,
+                        )
+                    })
+                    .collect(),
+                table
+                    .primary_key
+                    .iter()
+                    .map(|column| (*column).to_string())
+                    .collect(),
                 vec![],
             )
         })
@@ -206,6 +364,14 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
 mod tests {
     use super::*;
     use datafusion::prelude::SessionContext;
+
+    #[test]
+    fn schema_fingerprint_is_stable_hex() {
+        let fingerprint = meta_schema_fingerprint();
+        assert_eq!(fingerprint.len(), 64);
+        assert!(fingerprint.bytes().all(|byte| byte.is_ascii_hexdigit()));
+        assert_eq!(fingerprint, meta_schema_fingerprint());
+    }
 
     /// `build_meta_schema` must register all metadata tables onto a fresh
     /// `SessionContext` without error.
