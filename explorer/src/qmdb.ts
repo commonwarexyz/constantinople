@@ -7,6 +7,13 @@ import {
 } from './proofTarget';
 import { Code, ConnectError } from '@connectrpc/connect';
 import {
+    BLOCK_META_HEIGHT,
+    BLOCK_META_TABLE,
+    BLOCK_META_TRANSACTIONS_TIP,
+    containingTransactionHeight,
+    transactionHeightPredecessorQuery,
+} from './transactionHeight';
+import {
     SqlClient,
     type CellValue,
     type DecodedQueryResult,
@@ -40,10 +47,6 @@ const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
-
-const BLOCK_META_TABLE = 'block_meta';
-const BLOCK_META_HEIGHT = 'height';
-const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
 
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
@@ -508,21 +511,14 @@ async function fetchTransactionProofMetadata(
     }
     const result = await sqlQuery(
         sqlUrl,
-        `
-            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}
-            FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${location.toString()}
-            ORDER BY ${BLOCK_META_HEIGHT} ASC
-            LIMIT 1
-        `,
+        transactionHeightPredecessorQuery(location),
         signal,
     );
     const row = result.rows[0];
-    if (!row) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
-    }
     return {
-        height: expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT),
+        height: containingTransactionHeight(
+            row ? expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT) : null,
+        ),
         location,
     };
 }

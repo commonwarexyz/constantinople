@@ -340,15 +340,13 @@ impl IndexerClient {
             let qmdb_location = qmdb_location.value(0);
             let body = verified_transaction_body::<H>(&batch, 1, digest)?;
 
-            // The containing block is the first one whose transaction tip
-            // reaches the location. block_meta is one row per block, so this
-            // stays cheap and avoids a per-transaction proof row in the bulk
-            // lane.
-            let block_sql = format!(
-                "SELECT {BLOCK_META_HEIGHT}, {BLOCK_META_TRANSACTIONS_TIP} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} > {qmdb_location} ORDER BY {BLOCK_META_HEIGHT} ASC LIMIT 1"
-            );
+            // Every block appends a commit after its transactions. The newest
+            // tip at or below this transaction therefore belongs to the prior
+            // block. Scanning backward keeps recent lookups independent of
+            // the total chain height.
+            let block_sql = transaction_height_predecessor_sql(qmdb_location);
             let block_batches = self.sql.sql(&block_sql).await?.collect().await?;
-            let mut height = None;
+            let mut predecessor_height = None;
             for block_batch in block_batches {
                 if block_batch.num_rows() == 0 {
                     continue;
@@ -365,14 +363,10 @@ impl IndexerClient {
                         "block_meta.height must not be null".to_string(),
                     ));
                 }
-                height = Some(block_height.value(0));
+                predecessor_height = Some(block_height.value(0));
                 break;
             }
-            let height = height.ok_or_else(|| {
-                ReadError::SqlRow(
-                    "transaction QMDB location has no containing finalized block".to_string(),
-                )
-            })?;
+            let height = containing_block_height(predecessor_height)?;
 
             return Ok(Some(TransactionMetadata {
                 height,
@@ -460,6 +454,21 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
+fn containing_block_height(predecessor_height: Option<u64>) -> Result<u64, ReadError> {
+    let Some(height) = predecessor_height else {
+        return Ok(0);
+    };
+    height.checked_add(1).ok_or_else(|| {
+        ReadError::SqlRow("transaction containing block height overflows u64".to_string())
+    })
+}
+
+fn transaction_height_predecessor_sql(qmdb_location: u64) -> String {
+    format!(
+        "SELECT {BLOCK_META_HEIGHT} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} <= {qmdb_location} ORDER BY {BLOCK_META_HEIGHT} DESC LIMIT 1"
+    )
+}
+
 fn verified_transaction_body<H>(
     batch: &RecordBatch,
     column: usize,
@@ -508,6 +517,82 @@ where
 mod tests {
     use super::*;
     use commonware_cryptography::{sha256, sha256::Sha256};
+    use exoware_sql::CellValue;
+
+    #[tokio::test]
+    async fn transaction_metadata_handles_genesis_boundaries_and_empty_blocks() {
+        let (server, url) = exoware_simulator::open_temp()
+            .await
+            .expect("spawn simulator");
+        let store = StoreClient::new(&url);
+        let schema = build_meta_schema(sql_meta_client(&store).expect("SQL metadata client"))
+            .expect("metadata schema");
+        let mut writer = schema.batch_writer();
+
+        for (height, transaction_count, transactions_tip) in
+            [(0, 2, 2), (1, 0, 3), (2, 2, 6), (3, 0, 7), (4, 1, 9)]
+        {
+            writer
+                .insert(
+                    BLOCK_META_TABLE,
+                    vec![
+                        CellValue::UInt64(height),
+                        CellValue::FixedBinary(vec![height as u8; 32]),
+                        CellValue::UInt64(transaction_count),
+                        CellValue::FixedBinary(vec![transactions_tip as u8; 32]),
+                        CellValue::UInt64(transactions_tip),
+                        CellValue::UInt64(0),
+                        CellValue::Timestamp(i64::try_from(height).expect("height fits i64")),
+                    ],
+                )
+                .expect("block metadata row");
+        }
+
+        let mut expected = Vec::new();
+        for (seed, location, height) in [(1, 0, 0), (2, 1, 0), (3, 4, 2), (4, 5, 2), (5, 8, 4)] {
+            let body = vec![seed; Transaction::<sha256::Digest>::SIZE];
+            let digest = Sha256::hash(&[body.as_slice()]);
+            writer
+                .insert(
+                    TX_META_TABLE,
+                    vec![
+                        CellValue::FixedBinary(digest.as_ref().to_vec()),
+                        CellValue::UInt64(location),
+                        CellValue::Binary(body),
+                    ],
+                )
+                .expect("transaction metadata row");
+            expected.push((digest, location, height));
+        }
+        writer.flush().await.expect("flush metadata rows");
+
+        let client = IndexerClient::new(store.clone(), store);
+        for (digest, location, height) in expected {
+            let metadata = client
+                .transaction_metadata::<Sha256>(&digest)
+                .await
+                .expect("query transaction metadata")
+                .expect("transaction metadata exists");
+            assert_eq!(metadata.height, height);
+            assert_eq!(metadata.qmdb_location, location);
+        }
+
+        server.abort();
+    }
+
+    #[test]
+    fn containing_block_height_rejects_overflow() {
+        let error = containing_block_height(Some(u64::MAX)).expect_err("height should overflow");
+        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("overflows")));
+    }
+
+    #[test]
+    fn transaction_height_query_scans_backward_from_the_newest_block() {
+        assert_eq!(
+            transaction_height_predecessor_sql(42),
+            "SELECT height FROM block_meta WHERE transactions_tip <= 42 ORDER BY height DESC LIMIT 1"
+        );
+    }
 
     #[test]
     fn verifies_signed_transaction_bytes_against_digest() {

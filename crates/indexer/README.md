@@ -59,10 +59,11 @@ The digest-keyed `tx_meta` row contract is:
 | `body` | binary | non-null | Encoded signed transaction bytes. |
 
 A transaction proof needs the finalized height that contains the transaction.
-Readers derive it from `block_meta`: the containing block is the first row
-whose `transactions_tip` exceeds `tx_meta.qmdb_location`. `block_meta` holds
-one row per block, so the lookup is a small range query rather than a
-per-transaction table.
+Readers derive it from `block_meta`. Every block commits its transaction log
+after appending its transactions, so the newest block whose `transactions_tip`
+is at or below `tx_meta.qmdb_location` immediately precedes the containing
+block. A missing predecessor identifies genesis. The reverse lookup starts at
+the newest height and avoids a scan from genesis for recent transactions.
 
 Proofs become queryable once an inline or later grouped watermark covers the
 upload that carried the transaction.

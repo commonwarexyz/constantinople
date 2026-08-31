@@ -26,6 +26,7 @@
         "src/proofRetry.ts",
         "src/proofTarget.ts",
         "src/submissionHistory.ts",
-        "src/submissionResponse.ts"
+        "src/submissionResponse.ts",
+        "src/transactionHeight.ts"
     ]
 }
