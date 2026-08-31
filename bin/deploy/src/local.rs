@@ -308,14 +308,16 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
+        let metrics_port = local_chain_indexer_metrics_port(args, local);
         let db_parallelism = local
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --features chain-indexer --bin {} -- --port {} --data-dir {}{}",
+            "cargo run --release -p constantinople-indexer --features chain-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
+            metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
@@ -391,6 +393,21 @@ fn local_run_commands(
     }
 
     commands
+}
+
+fn local_chain_indexer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
+    let validator_span = u16::try_from(args.validators).expect("validator count exceeds u16");
+    let secondary_span =
+        u16::try_from(total_secondaries(args)).expect("secondary count exceeds u16");
+    let spammer_span = u16::from(args.spammer);
+    let offset = validator_span
+        .checked_add(secondary_span)
+        .and_then(|offset| offset.checked_add(spammer_span))
+        .expect("local metrics port offset overflow");
+    local
+        .base_metrics_port
+        .checked_add(offset)
+        .expect("chain-indexer metrics port overflow")
 }
 
 fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
@@ -672,7 +689,30 @@ mod tests {
             .expect("chain-indexer command should be present");
         assert!(indexer_cmd.contains("--features chain-indexer"));
         assert!(indexer_cmd.contains("--port 8090"));
+        assert!(indexer_cmd.contains("--metrics-port 9094"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
+    }
+
+    #[test]
+    fn four_validator_demo_assigns_distinct_indexer_metrics_port() {
+        let mut args = test_args(true);
+        args.validators = 4;
+        args.indexer = true;
+        args.relayer = true;
+
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+        let indexer_cmd = commands
+            .iter()
+            .find(|command| command.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+
+        assert!(indexer_cmd.contains("--metrics-port 9097"));
     }
 
     #[test]
