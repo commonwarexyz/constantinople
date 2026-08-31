@@ -37,6 +37,11 @@ Simplex certificate and fetches the transaction operation-log proof from
 `qmdb-indexer` under `/transactions`. Finalization and latency are shown only
 after both proofs succeed.
 
+The explorer bootstraps the newest provable target with one Store range read,
+then keeps it current through a direct Store subscription. The target's Store
+sequence becomes the minimum sequence for the related SQL, Simplex, and QMDB
+reads. A lagging query node must catch up instead of returning a stale miss.
+
 ### Why SQL?
 
 The indexer publishes every finalized block to complementary surfaces
@@ -61,7 +66,7 @@ The indexer publishes every finalized block to complementary surfaces
 | ------- | ------- | ----- |
 | `VITE_SQL_URL` | `http://127.0.0.1:8091` | The `metadata-indexer` service. Matches the local-deploy `--metadata-indexer-port` default. |
 | `VITE_QMDB_URL` | `http://127.0.0.1:8092` | The `qmdb-indexer` service. Matches the local-deploy `--qmdb-indexer-port` default. |
-| `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for Simplex artifacts. |
+| `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for Simplex artifacts and provable-target updates. |
 | `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction admission endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
 | `VITE_VERIFY_CERTIFICATES` | `true` | Set to `false` to disable block-list certificate verification while profiling live block streaming. |

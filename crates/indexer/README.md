@@ -72,6 +72,11 @@ provable target in the same Store batch that establishes coverage in both QMDB
 families. Its big-endian height key makes one reverse range read return the
 newest covered block digest.
 
+The explorer uses that range read only to initialize or recover its direct
+Store subscription. Each target update includes the atomic Store batch
+sequence. Related SQL, Simplex, and QMDB reads use that sequence as their
+freshness floor.
+
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate; height/latest reads start from a
 finalization certificate, verify the commitment/header relationship, and fetch
