@@ -33,7 +33,7 @@ use commonware_parallel::Rayon;
 use commonware_runtime::{
     BufferPoolConfig, Metrics, Quota, Runner as _, Strategizer as _, Supervisor as _,
     buffer::paged::{self, CacheRef},
-    telemetry::metrics::{Counter, Gauge, MetricsExt as _},
+    telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _},
     tokio::{
         Context as RuntimeContext,
         telemetry::{self, Logs},
@@ -79,10 +79,10 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{Arc, OnceLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
     task::{JoinHandle, JoinSet},
 };
 use tracing::{info, warn};
@@ -106,6 +106,9 @@ const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const FINALIZED_UPLOAD_AMPLIFICATION: u64 = 8;
 const FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES: u64 = 64 * 1024;
+const FINALIZED_UPLOAD_DURATION_BUCKETS: [f64; 14] = [
+    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0,
+];
 const CURSOR_STATE_KEY: U64 = U64::new(0);
 const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
 
@@ -182,6 +185,7 @@ struct UploadBudgetMetrics {
     admitted: Gauge,
     admission_blocked: Counter,
     oversized: Counter,
+    reservation_held: Histogram,
 }
 
 impl UploadBudgetMetrics {
@@ -209,6 +213,11 @@ impl UploadBudgetMetrics {
             oversized: context.counter(
                 "oversized",
                 "Finalized uploads admitted exclusively above the byte budget",
+            ),
+            reservation_held: context.histogram(
+                "reservation_held_duration",
+                "Time finalized uploads hold an admission reservation (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
             ),
         }
     }
@@ -295,6 +304,7 @@ impl UploadBudget {
             _permit: permit,
             metrics: self.metrics.clone(),
             estimated_bytes,
+            started_at: Some(Instant::now()),
         }
     }
 
@@ -321,13 +331,77 @@ struct UploadReservation {
     _permit: OwnedSemaphorePermit,
     metrics: UploadBudgetMetrics,
     estimated_bytes: i64,
+    started_at: Option<Instant>,
+}
+
+impl UploadReservation {
+    const fn without_held_duration(mut self) -> Self {
+        self.started_at = None;
+        self
+    }
 }
 
 impl Drop for UploadReservation {
     fn drop(&mut self) {
+        if let Some(started_at) = self.started_at {
+            self.metrics
+                .reservation_held
+                .observe(started_at.elapsed().as_secs_f64());
+        }
         self.metrics.reserved_bytes.dec_by(self.estimated_bytes);
         self.metrics.admitted.dec();
     }
+}
+
+#[derive(Clone)]
+struct FinalizedUploadMetrics {
+    queue_read: Histogram,
+    completion: Histogram,
+}
+
+impl FinalizedUploadMetrics {
+    fn new(context: &impl Metrics) -> Self {
+        Self {
+            queue_read: context.histogram(
+                "queue_read_duration",
+                "Durable queue read time for one finalized upload (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+            completion: context.histogram(
+                "completion_duration",
+                "Finalized upload queue acknowledgement and sync time (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct FinalizedQueueMetrics {
+    pending_uploads: Gauge,
+}
+
+impl FinalizedQueueMetrics {
+    fn new(context: &impl Metrics) -> Self {
+        Self {
+            pending_uploads: context.gauge(
+                "pending_uploads",
+                "Finalized queue entries not yet durably acknowledged",
+            ),
+        }
+    }
+}
+
+struct FinalizedUploadConsumer {
+    publisher: Arc<LazyPublisher>,
+    cert_reporter: EngineCertReporter,
+    writer: FinalizedQueueWriter,
+    reader: FinalizedQueueReader,
+    queue_ready: Arc<Notify>,
+    max_active: usize,
+    budget: UploadBudget,
+    metrics: FinalizedUploadMetrics,
+    queue_metrics: FinalizedQueueMetrics,
 }
 
 struct PendingQueuedUpload {
@@ -349,6 +423,10 @@ impl PendingQueuedUpload {
 
 fn metric_bytes(bytes: u64) -> i64 {
     i64::try_from(bytes).unwrap_or(i64::MAX)
+}
+
+fn metric_usize(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
 }
 
 fn finalized_queue_page_cache_capacity(upload_budget_bytes: u64) -> NonZeroUsize {
@@ -474,8 +552,10 @@ impl LazyPublisher {
 #[derive(Clone)]
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
+    queue_ready: Arc<Notify>,
     metadata: Arc<FinalizedCursorStore>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
+    queue_metrics: FinalizedQueueMetrics,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -539,6 +619,7 @@ impl FinalizedUploadCursor {
 struct FinalizedQueueFrontiers {
     replay: FinalizedUploadCursor,
     producer: FinalizedUploadCursor,
+    pending_uploads: usize,
 }
 
 fn recovered_finalized_upload_cursor(
@@ -595,6 +676,8 @@ impl FinalizedUploadProducer {
             let next = FinalizedUploadCursor::from_upload(&upload);
             match self.writer.enqueue(upload.into()).await {
                 Ok(position) => {
+                    self.queue_metrics.pending_uploads.inc();
+                    self.queue_ready.notify_one();
                     persist_finalized_cursor(&self.metadata, next).await;
                     *cursor = next;
                     info!(
@@ -675,15 +758,22 @@ async fn scan_finalized_queue_frontiers(
         match reader.try_recv().await {
             Ok(Some((position, upload))) => {
                 let charge = budget.charge(upload.encoded_len());
-                let reservation = budget.reserve(charge).await;
+                let reservation = budget.reserve(charge).await.without_held_duration();
                 let upload = decode_finalized_queue_entry(position, upload);
                 let producer = FinalizedUploadCursor::from_upload(&upload);
                 match frontiers.as_mut() {
-                    Some(frontiers) => frontiers.producer = producer,
+                    Some(frontiers) => {
+                        frontiers.producer = producer;
+                        frontiers.pending_uploads = frontiers
+                            .pending_uploads
+                            .checked_add(1)
+                            .expect("finalized queue length overflowed");
+                    }
                     None => {
                         frontiers = Some(FinalizedQueueFrontiers {
                             replay: FinalizedUploadCursor::from_upload_start(&upload),
                             producer,
+                            pending_uploads: 1,
                         });
                     }
                 }
@@ -703,22 +793,25 @@ async fn scan_finalized_queue_frontiers(
     }
 }
 
-async fn run_finalized_upload_consumer(
-    publisher: Arc<LazyPublisher>,
-    cert_reporter: EngineCertReporter,
-    writer: FinalizedQueueWriter,
-    mut reader: FinalizedQueueReader,
-    max_active: usize,
-    budget: UploadBudget,
-) {
+async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
+    let FinalizedUploadConsumer {
+        publisher,
+        cert_reporter,
+        writer,
+        mut reader,
+        queue_ready,
+        max_active,
+        budget,
+        metrics,
+        queue_metrics,
+    } = consumer;
     let mut active = JoinSet::new();
     let mut waiting = None;
-    let mut reader_closed = false;
     let max_active = max_active.max(1);
 
     loop {
         while waiting.is_none() && active.len() < max_active {
-            let item = match reader.try_recv().await {
+            let item = match try_read_finalized_queue_entry(&mut reader, &metrics).await {
                 Ok(item) => item,
                 Err(error) => {
                     warn!(error = %error, "failed to read finalized index queue, retrying");
@@ -743,10 +836,6 @@ async fn run_finalized_upload_consumer(
             }
         }
 
-        if reader_closed && active.is_empty() && waiting.is_none() {
-            break;
-        }
-
         let waiting_charge = waiting.as_ref().map(|pending| pending.charge);
         tokio::select! {
             reservation = async {
@@ -765,42 +854,33 @@ async fn run_finalized_upload_consumer(
                 )
                 .await;
             }
-            item = reader.recv(), if !reader_closed && waiting.is_none() && active.len() < max_active => {
-                match item {
-                    Ok(Some((position, upload))) => {
-                        let pending = PendingQueuedUpload::new(position, upload, &budget);
-                        if let Err(pending) = try_admit_queued_upload(
-                            &mut active,
-                            publisher.clone(),
-                            cert_reporter.clone(),
-                            &budget,
-                            pending,
-                        )
-                        .await
-                        {
-                            waiting = Some(pending);
-                        }
-                    }
-                    Ok(None) => reader_closed = true,
-                    Err(error) => {
-                        warn!(error = %error, "failed to read finalized index queue, retrying");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
+            () = queue_ready.notified(), if waiting.is_none() && active.len() < max_active => {}
             completed = active.join_next(), if !active.is_empty() => {
                 let (position, height, reservation) = completed
                     .expect("active upload set is not empty")
                     .expect("finalized index upload task panicked");
+                let completion_started = Instant::now();
                 ack_finalized_queue_entry(&reader, &writer, position, height).await;
+                metrics
+                    .completion
+                    .observe(completion_started.elapsed().as_secs_f64());
+                queue_metrics.pending_uploads.dec();
                 drop(reservation);
             }
         }
-
-        if reader_closed && active.is_empty() && waiting.is_none() {
-            break;
-        }
     }
+}
+
+async fn try_read_finalized_queue_entry(
+    reader: &mut FinalizedQueueReader,
+    metrics: &FinalizedUploadMetrics,
+) -> Result<Option<(u64, EngineStoredUpload)>, queue::Error> {
+    let started = Instant::now();
+    let item = reader.try_recv().await?;
+    if item.is_some() {
+        metrics.queue_read.observe(started.elapsed().as_secs_f64());
+    }
+    Ok(item)
 }
 
 async fn try_admit_queued_upload(
@@ -977,6 +1057,8 @@ async fn maybe_build_indexer(
         &context.child("finalized_upload_budget"),
         cfg.upload_budget_bytes,
     );
+    let upload_metrics = FinalizedUploadMetrics::new(&context.child("finalized_upload"));
+    let queue_metrics = FinalizedQueueMetrics::new(&context.child("finalized_queue"));
     let (cert_reporter, cert_join) = EngineCertReporter::connect(
         &context.child("simplex_upload"),
         &cfg.chain_indexer_url,
@@ -1010,6 +1092,9 @@ async fn maybe_build_indexer(
         .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
     let queue_frontiers = scan_finalized_queue_frontiers(&mut queue_reader, &budget).await;
+    queue_metrics
+        .pending_uploads
+        .set(queue_frontiers.map_or(0, |frontiers| metric_usize(frontiers.pending_uploads)));
     let queue_cursor = queue_frontiers.map(|frontiers| frontiers.producer);
     let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
 
@@ -1037,19 +1122,25 @@ async fn maybe_build_indexer(
         config: metadata_config,
         metadata: Mutex::new(Some(metadata)),
     });
+    let queue_ready = Arc::new(Notify::new());
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
+        queue_ready: queue_ready.clone(),
         metadata,
         cursor: Arc::new(Mutex::new(cursor)),
+        queue_metrics: queue_metrics.clone(),
     };
-    let finalized_join = tokio::spawn(run_finalized_upload_consumer(
+    let finalized_join = tokio::spawn(run_finalized_upload_consumer(FinalizedUploadConsumer {
         publisher,
-        cert_reporter.clone(),
-        queue_writer,
-        queue_reader,
-        max_active_uploads,
+        cert_reporter: cert_reporter.clone(),
+        writer: queue_writer,
+        reader: queue_reader,
+        queue_ready,
+        max_active: max_active_uploads,
         budget,
-    ));
+        metrics: upload_metrics,
+        queue_metrics,
+    }));
     Ok(Some(IndexerHandle {
         cert_reporter,
         finalized_producer,
@@ -1432,12 +1523,12 @@ mod tests {
         FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
         FINALIZED_UPLOAD_AMPLIFICATION, FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
         FinalizedQueueFrontiers, FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor,
-        FinalizedUploadFailure, LazyPublisher, PendingQueuedUpload, PublishError,
-        StoreClientBuildError, UploadBudget, decode_finalized_queue_entry,
+        FinalizedUploadFailure, FinalizedUploadMetrics, LazyPublisher, PendingQueuedUpload,
+        PublishError, StoreClientBuildError, UploadBudget, decode_finalized_queue_entry,
         default_mempool_drop_grace_blocks, finalized_queue_page_cache_capacity,
         indexer_critical_task, maybe_build_indexer, recovered_finalized_upload_cursor,
-        scan_finalized_queue_frontiers,
-        start_queued_upload, wait_for_critical_task_exit, wait_for_finalized_uploads,
+        scan_finalized_queue_frontiers, start_queued_upload, try_read_finalized_queue_entry,
+        wait_for_critical_task_exit, wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
     use commonware_codec::{Encode as _, FixedSize as _, Read as _, Write as _};
@@ -1451,7 +1542,9 @@ mod tests {
         ed25519::PrivateKey,
         sha256::{Digest as Sha256Digest, Sha256},
     };
-    use commonware_runtime::{Runner as _, Spawner as _, Strategizer as _, Supervisor as _};
+    use commonware_runtime::{
+        Metrics as _, Runner as _, Spawner as _, Strategizer as _, Supervisor as _,
+    };
     use commonware_storage::{
         merkle::mmr,
         qmdb::any::{
@@ -1465,7 +1558,7 @@ mod tests {
         Account, AccountKey, Block, Header, Sealable, SignedTransaction,
     };
     use std::{future::pending, sync::Arc, time::Duration};
-    use tokio::sync::oneshot;
+    use tokio::sync::{Notify, oneshot};
 
     type TestAccountValue = FixedBytes<{ Account::SIZE }>;
     type TestStateOperation =
@@ -1929,9 +2022,15 @@ mod tests {
                 Some(FinalizedQueueFrontiers {
                     replay: FinalizedUploadCursor::from_upload_start(&first),
                     producer: FinalizedUploadCursor::from_upload(&second),
+                    pending_uploads: 2,
                 })
             );
             assert_eq!(budget.permits.available_permits(), 1);
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_budget_reservation_held_duration_count 0")
+            );
 
             let (position, upload) = reader
                 .try_recv()
@@ -1942,6 +2041,48 @@ mod tests {
             assert_eq!(
                 FinalizedUploadCursor::from_upload(&upload),
                 FinalizedUploadCursor::from_upload(&first)
+            );
+        });
+    }
+
+    #[test]
+    fn finalized_queue_live_arrival_records_read_duration() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let metrics = FinalizedUploadMetrics::new(&context.child("finalized_upload"));
+            let queue_ready = Notify::new();
+            let (writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
+                queue::shared::init(
+                    context.child("finalized_queue"),
+                    finalized_queue_config(&context, "finalized-queue-live-read-metric"),
+                )
+                .await
+                .expect("queue initializes");
+
+            assert!(
+                try_read_finalized_queue_entry(&mut reader, &metrics)
+                    .await
+                    .expect("empty queue reads")
+                    .is_none()
+            );
+
+            let notified = queue_ready.notified();
+            writer
+                .enqueue(queued_upload(1, 0, 2, 0, 2).into())
+                .await
+                .expect("live upload enqueues");
+            queue_ready.notify_one();
+            notified.await;
+
+            assert!(
+                try_read_finalized_queue_entry(&mut reader, &metrics)
+                    .await
+                    .expect("live upload reads")
+                    .is_some()
+            );
+            assert!(
+                context
+                    .encode()
+                    .contains("finalized_upload_queue_read_duration_count 1")
             );
         });
     }

@@ -493,9 +493,23 @@ where
     commit_client: &'a StoreClient,
     commit_metrics: &'a super::StoreCommitMetrics,
     metadata_gate_wait: &'a Histogram,
+    staging: &'a Histogram,
     state_writer: &'a Arc<StateWriter<H, S>>,
     transaction_writer: &'a Arc<TransactionWriter<H, S>>,
     provable_target_client: &'a PrefixedStoreClient,
+}
+
+struct WatermarkPipeline<'a, H, S>
+where
+    H: Hasher,
+    S: Strategy,
+{
+    commit_client: &'a StoreClient,
+    commit_metrics: &'a super::StoreCommitMetrics,
+    state_writer: &'a StateWriter<H, S>,
+    transaction_writer: &'a TransactionWriter<H, S>,
+    provable_target_client: &'a PrefixedStoreClient,
+    watermark_wait: &'a Histogram,
 }
 
 struct StagedCommitBatch {
@@ -515,6 +529,7 @@ struct CommittedQmdbBatch {
     state_watermark: Option<PreparedWatermark<QmdbFamily>>,
     transaction_watermark: Option<PreparedWatermark<QmdbFamily>>,
     store_seq: u64,
+    committed_at: Instant,
 }
 
 struct PendingUploadCompletion {
@@ -522,6 +537,7 @@ struct PendingUploadCompletion {
     state_latest: Location<QmdbFamily>,
     transaction_latest: Location<QmdbFamily>,
     completion: oneshot::Sender<()>,
+    committed_at: Instant,
 }
 
 impl PendingUploadCompletion {
@@ -728,6 +744,7 @@ where
         ));
         let prepare_join = tokio::spawn(run_qmdb_preparer(
             prepare_context,
+            metrics.expansion.clone(),
             state_writer.clone(),
             transaction_writer.clone(),
             prepare_rx,
@@ -960,6 +977,7 @@ where
 
 async fn run_qmdb_preparer<Cx, H, P, S>(
     context: Cx,
+    expansion: Histogram,
     state_writer: Arc<StateWriter<H, S>>,
     transaction_writer: Arc<TransactionWriter<H, S>>,
     mut rx: mpsc::Receiver<PendingQueuedFinalizedUpload<H, P>>,
@@ -973,6 +991,7 @@ async fn run_qmdb_preparer<Cx, H, P, S>(
 {
     while let Some(upload) = rx.recv().await {
         let height = upload.height;
+        let started = Instant::now();
         let prepared = prepare_qmdb_upload(
             context
                 .child("prepare_upload")
@@ -983,6 +1002,7 @@ async fn run_qmdb_preparer<Cx, H, P, S>(
         )
         .await
         .unwrap_or_else(|error| panic!("QMDB prepare worker failed at height {height}: {error}"));
+        expansion.observe(started.elapsed().as_secs_f64());
         commit_tx
             .send(prepared)
             .await
@@ -1216,6 +1236,7 @@ async fn run_qmdb_committer<Cx, H, S>(
                     commit_client: &commit_client,
                     commit_metrics: &metrics.commit,
                     metadata_gate_wait: &metrics.metadata_gate_wait,
+                    staging: &metrics.staging,
                     state_writer: &state_writer,
                     transaction_writer: &transaction_writer,
                     provable_target_client: &provable_target_client,
@@ -1232,11 +1253,14 @@ async fn run_qmdb_committer<Cx, H, S>(
             flush_and_complete_published_uploads(
                 context.child("watermarks"),
                 &mut pending_completions,
-                &commit_client,
-                &metrics.commit,
-                &state_writer,
-                &transaction_writer,
-                &provable_target_client,
+                WatermarkPipeline {
+                    commit_client: &commit_client,
+                    commit_metrics: &metrics.commit,
+                    state_writer: &state_writer,
+                    transaction_writer: &transaction_writer,
+                    provable_target_client: &provable_target_client,
+                    watermark_wait: &metrics.watermark_wait,
+                },
             )
             .await;
             assert!(
@@ -1260,6 +1284,7 @@ async fn run_qmdb_committer<Cx, H, S>(
                                 commit_client: &commit_client,
                                 commit_metrics: &metrics.commit,
                                 metadata_gate_wait: &metrics.metadata_gate_wait,
+                                staging: &metrics.staging,
                                 state_writer: &state_writer,
                                 transaction_writer: &transaction_writer,
                                 provable_target_client: &provable_target_client,
@@ -1300,11 +1325,14 @@ async fn run_qmdb_committer<Cx, H, S>(
                 flush_and_complete_published_uploads(
                     context.child("watermarks"),
                     &mut pending_completions,
-                    &commit_client,
-                    &metrics.commit,
-                    &state_writer,
-                    &transaction_writer,
-                    &provable_target_client,
+                    WatermarkPipeline {
+                        commit_client: &commit_client,
+                        commit_metrics: &metrics.commit,
+                        state_writer: &state_writer,
+                        transaction_writer: &transaction_writer,
+                        provable_target_client: &provable_target_client,
+                        watermark_wait: &metrics.watermark_wait,
+                    },
                 )
                 .await;
             }
@@ -1327,6 +1355,7 @@ where
     H::Digest: Codec + Send + Sync,
     S: Strategy,
 {
+    let staging_started = Instant::now();
     let prepared = prepare_commit_batch_blocking(
         context.child("stage_commit_batch"),
         sql_writer,
@@ -1339,6 +1368,9 @@ where
     )
     .await
     .expect("prepared QMDB commit batch must stage");
+    pipeline
+        .staging
+        .observe(staging_started.elapsed().as_secs_f64());
     let sql_writer = prepared.0;
     let batch = prepared.1;
     spawn_commit(
@@ -1595,6 +1627,7 @@ fn spawn_commit<Cx>(
             state_watermark,
             transaction_watermark,
             store_seq,
+            committed_at: Instant::now(),
         }
     });
 }
@@ -1610,6 +1643,7 @@ where
     H::Digest: Codec + Send + Sync,
     S: Strategy,
 {
+    let committed_at = batch.committed_at;
     if let Some(prepared) = batch.sql {
         let receipt = sql_writer.mark_flush_persisted(prepared, batch.store_seq);
         debug!(
@@ -1657,6 +1691,7 @@ where
         state_latest,
         transaction_latest,
         completion: upload.completion,
+        committed_at,
     }
 }
 
@@ -1761,19 +1796,20 @@ where
 async fn flush_and_complete_published_uploads<Cx, H, S>(
     context: Cx,
     pending: &mut VecDeque<PendingUploadCompletion>,
-    commit_client: &StoreClient,
-    commit_metrics: &super::StoreCommitMetrics,
-    state_writer: &StateWriter<H, S>,
-    transaction_writer: &TransactionWriter<H, S>,
-    provable_target_client: &PrefixedStoreClient,
+    pipeline: WatermarkPipeline<'_, H, S>,
 ) where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
     S: Strategy,
 {
-    let already_published =
-        complete_published_uploads(pending, state_writer, transaction_writer).await;
+    let already_published = complete_published_uploads(
+        pending,
+        pipeline.state_writer,
+        pipeline.transaction_writer,
+        pipeline.watermark_wait,
+    )
+    .await;
     if pending.is_empty() {
         if already_published > 0 {
             debug!(
@@ -1787,14 +1823,20 @@ async fn flush_and_complete_published_uploads<Cx, H, S>(
     let watermark_seq = flush_qmdb_watermarks(
         context,
         pending,
-        commit_client,
-        commit_metrics,
-        state_writer,
-        transaction_writer,
-        provable_target_client,
+        pipeline.commit_client,
+        pipeline.commit_metrics,
+        pipeline.state_writer,
+        pipeline.transaction_writer,
+        pipeline.provable_target_client,
     )
     .await;
-    let completed = complete_published_uploads(pending, state_writer, transaction_writer).await;
+    let completed = complete_published_uploads(
+        pending,
+        pipeline.state_writer,
+        pipeline.transaction_writer,
+        pipeline.watermark_wait,
+    )
+    .await;
     if completed > 0 || watermark_seq.is_some() {
         debug!(
             completed_uploads = completed,
@@ -1809,6 +1851,7 @@ async fn complete_published_uploads<H, S>(
     pending: &mut VecDeque<PendingUploadCompletion>,
     state_writer: &StateWriter<H, S>,
     transaction_writer: &TransactionWriter<H, S>,
+    watermark_wait: &Histogram,
 ) -> usize
 where
     H: Hasher + Send + Sync + 'static,
@@ -1824,6 +1867,7 @@ where
         let transactions_ready =
             transactions.is_some_and(|watermark| watermark >= upload.transaction_latest);
         if state_ready && transactions_ready {
+            watermark_wait.observe(upload.committed_at.elapsed().as_secs_f64());
             let _ = upload.completion.send(());
             completed += 1;
         } else {
@@ -2196,8 +2240,9 @@ mod tests {
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
     use commonware_parallel::Sequential;
     use commonware_runtime::{
-        BufferPooler, Runner as _, Strategizer as _, Supervisor, buffer::paged::CacheRef,
-        telemetry::metrics::has_metric_value,
+        BufferPooler, Runner as _, Strategizer as _, Supervisor,
+        buffer::paged::CacheRef,
+        telemetry::metrics::{MetricsExt as _, has_metric_value},
     };
     use commonware_storage::{
         journal::contiguous::{
@@ -2221,6 +2266,14 @@ mod tests {
         let (tx, rx) = oneshot::channel();
         tx.send(()).expect("receiver held");
         rx
+    }
+
+    fn test_watermark_wait(context: &impl Metrics) -> Histogram {
+        context.histogram(
+            "test_watermark_wait_duration",
+            "Test watermark wait duration (s)",
+            [0.001, 1.0],
+        )
     }
 
     const TEST_ITEMS_PER_BLOB: std::num::NonZero<u64> = NZU64!(1024);
@@ -2514,6 +2567,7 @@ mod tests {
                 state_latest: second_state_latest,
                 transaction_latest: second_transaction_latest,
                 completion: pending_completion,
+                committed_at: Instant::now(),
             }]);
             let (completion, _rx) = oneshot::channel();
             let upload = PreparedQmdbUpload {
@@ -2621,23 +2675,32 @@ mod tests {
 
             let (first_completion, first_rx) = oneshot::channel();
             let (second_completion, mut second_rx) = oneshot::channel();
+            let watermark_wait = test_watermark_wait(&context);
             let mut pending = VecDeque::from([
                 PendingUploadCompletion {
                     target: test_provable_target(1),
                     state_latest: first_state_latest,
                     transaction_latest: first_transaction_latest,
                     completion: first_completion,
+                    committed_at: Instant::now(),
                 },
                 PendingUploadCompletion {
                     target: test_provable_target(2),
                     state_latest: second_state_latest,
                     transaction_latest: second_transaction_latest,
                     completion: second_completion,
+                    committed_at: Instant::now(),
                 },
             ]);
 
             assert_eq!(
-                complete_published_uploads(&mut pending, &state_writer, &transaction_writer).await,
+                complete_published_uploads(
+                    &mut pending,
+                    &state_writer,
+                    &transaction_writer,
+                    &watermark_wait,
+                )
+                .await,
                 1,
                 "the in-band first watermark should complete only the first upload",
             );
@@ -2650,11 +2713,15 @@ mod tests {
             flush_and_complete_published_uploads(
                 context.child("grouped_watermark"),
                 &mut pending,
-                &client,
-                &crate::publisher::StoreCommitMetrics::new(&context),
-                &state_writer,
-                &transaction_writer,
-                &provable_target_client(&client).expect("provable target client"),
+                WatermarkPipeline {
+                    commit_client: &client,
+                    commit_metrics: &crate::publisher::StoreCommitMetrics::new(&context),
+                    state_writer: &state_writer,
+                    transaction_writer: &transaction_writer,
+                    provable_target_client: &provable_target_client(&client)
+                        .expect("provable target client"),
+                    watermark_wait: &watermark_wait,
+                },
             )
             .await;
 
@@ -2765,6 +2832,7 @@ mod tests {
                 .expect("first batch commits");
 
             let mut pending = VecDeque::new();
+            let watermark_wait = test_watermark_wait(&context);
             pending.push_back(
                 mark_committed_batch(
                     committed_batch(second_batch, second_seq),
@@ -2775,7 +2843,13 @@ mod tests {
                 .await,
             );
             assert_eq!(
-                complete_published_uploads(&mut pending, &state_writer, &transaction_writer).await,
+                complete_published_uploads(
+                    &mut pending,
+                    &state_writer,
+                    &transaction_writer,
+                    &watermark_wait,
+                )
+                .await,
                 0,
                 "a later commit cannot publish while the first batch is still unacked",
             );
@@ -2794,11 +2868,15 @@ mod tests {
             flush_and_complete_published_uploads(
                 context.child("watermarks"),
                 &mut pending,
-                &client,
-                &crate::publisher::StoreCommitMetrics::new(&context),
-                &state_writer,
-                &transaction_writer,
-                &provable_target_client(&client).expect("provable target client"),
+                WatermarkPipeline {
+                    commit_client: &client,
+                    commit_metrics: &crate::publisher::StoreCommitMetrics::new(&context),
+                    state_writer: &state_writer,
+                    transaction_writer: &transaction_writer,
+                    provable_target_client: &provable_target_client(&client)
+                        .expect("provable target client"),
+                    watermark_wait: &watermark_wait,
+                },
             )
             .await;
 
@@ -2834,6 +2912,15 @@ mod tests {
                 .await
                 .expect("queued upload accepted");
             completion.wait().await.expect("queued upload completes");
+
+            let encoded_metrics = context.encode();
+            for metric in [
+                "expansion_duration_count",
+                "staging_duration_count",
+                "watermark_wait_duration_count",
+            ] {
+                assert!(has_metric_value(&encoded_metrics, metric, 1));
+            }
 
             publisher.shutdown().await;
             handle.abort();
@@ -3509,6 +3596,7 @@ mod tests {
             state_watermark: batch.state_watermark,
             transaction_watermark: batch.transaction_watermark,
             store_seq,
+            committed_at: Instant::now(),
         }
     }
 

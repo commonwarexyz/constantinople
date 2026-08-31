@@ -5680,7 +5680,7 @@
     {
       "id": 75,
       "type": "timeseries",
-      "title": "Upload Delta",
+      "title": "Upload Backlog and Admission",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -5751,10 +5751,21 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "indexer_finalized_queue_tip{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} - indexer_finalized_queue_floor{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
-          "legendFormat": "__auto",
+          "expr": "indexer_finalized_queue_pending_uploads{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "pending",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "indexer_finalized_upload_budget_admitted{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "admitted",
+          "range": true,
+          "refId": "B"
         }
       ],
       "datasource": {
@@ -5763,12 +5774,12 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
         "legend": {
-          "showLegend": false,
+          "showLegend": true,
           "displayMode": "list",
           "placement": "bottom",
           "calcs": []
@@ -6628,6 +6639,172 @@
           "legendFormat": "p99",
           "range": true,
           "refId": "C"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 84,
+      "type": "timeseries",
+      "title": "Finalized Upload Held-Time Decomposition p95",
+      "description": "Stage latency for one finalized upload. Reservation held is the end-to-end admission window.",
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 225
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_queue_read_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "queue read",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_expansion_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "expansion",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_staging_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "staging",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_store_commit_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "Store commit",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_watermark_wait_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "watermark wait",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_completion_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "completion",
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_budget_reservation_held_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "reservation held",
+          "range": true,
+          "refId": "G"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 85,
+      "type": "timeseries",
+      "title": "RSS per Admitted Upload",
+      "description": "Whole-process RSS divided by admitted uploads. Idle periods use one as the divisor.",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 225
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "runtime_process_rss{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} / clamp_min(indexer_finalized_upload_budget_admitted{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, 1)",
+          "legendFormat": "{{deployer_name}}",
+          "range": true,
+          "refId": "A"
         }
       ],
       "datasource": {

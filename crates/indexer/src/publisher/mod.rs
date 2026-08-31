@@ -110,6 +110,12 @@ pub struct PublisherMetrics {
     pub(crate) metadata_gate_wait: Histogram,
     /// Block finalization to durable block_meta row.
     pub(crate) metadata_finalized_lag: Histogram,
+    /// Row expansion and QMDB preparation time for one finalized upload.
+    pub(crate) expansion: Histogram,
+    /// Store batch staging time for one finalized upload.
+    pub(crate) staging: Histogram,
+    /// Time a committed upload waits for both QMDB watermarks to cover it.
+    pub(crate) watermark_wait: Histogram,
 }
 
 impl PublisherMetrics {
@@ -125,6 +131,21 @@ impl PublisherMetrics {
             metadata_finalized_lag: context.histogram(
                 "metadata_finalized_lag",
                 "Block finalization to durable block_meta row (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            expansion: context.histogram(
+                "expansion_duration",
+                "Finalized upload row expansion and QMDB preparation time (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            staging: context.histogram(
+                "staging_duration",
+                "Finalized upload Store batch staging time (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            watermark_wait: context.histogram(
+                "watermark_wait_duration",
+                "Committed upload wait for both QMDB watermarks (s)",
                 COMMIT_DURATION_BUCKETS,
             ),
         }
