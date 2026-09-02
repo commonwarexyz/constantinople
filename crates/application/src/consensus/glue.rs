@@ -33,7 +33,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;
-    type FinalizedArtifact = Option<FinalizedArtifacts<H>>;
+    type Captured = Option<FinalizedArtifacts<H>>;
     type Provider = I;
     type Input = ();
 
@@ -126,13 +126,13 @@ where
         self.apply_certified(context, block, batches).await
     }
 
-    async fn capture_finalized(
+    async fn capture(
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
         batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
-    ) -> Self::FinalizedArtifact {
+    ) -> Self::Captured {
         self.finalized_hook.as_ref()?;
 
         let state = {
@@ -203,11 +203,11 @@ where
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
-        artifact: Self::FinalizedArtifact,
+        captured: Self::Captured,
         _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
         if let Some(hook) = &self.finalized_hook {
-            let artifacts = artifact
+            let artifacts = captured
                 .expect("finalized artifact capture was skipped while a hook was installed");
             hook(block, artifacts).await;
         }

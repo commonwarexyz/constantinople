@@ -398,7 +398,7 @@ fn finalized_capture_preserves_both_authenticated_ranges() {
             )
             .await
             .expect("proposal succeeds");
-        let artifacts = StatefulApplication::capture_finalized(
+        let artifacts = StatefulApplication::capture(
             &mut app,
             (context.child("capture"), consensus_context),
             &proposed.block,

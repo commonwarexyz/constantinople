@@ -168,8 +168,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, P>, P>;
     type Block = EngineBlock<H, P>;
     type Databases = <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::Databases;
-    type FinalizedArtifact =
-        <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::FinalizedArtifact;
+    type Captured = <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::Captured;
     type Provider = I;
     type Input = ();
 
@@ -218,27 +217,25 @@ where
         self.inner.apply(context, block, batches).await
     }
 
-    async fn capture_finalized(
+    async fn capture(
         &mut self,
         context: (E, Self::Context),
         block: &Self::Block,
         batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
-    ) -> Self::FinalizedArtifact {
-        self.inner
-            .capture_finalized(context, block, batches, readers)
-            .await
+    ) -> Self::Captured {
+        self.inner.capture(context, block, batches, readers).await
     }
 
     async fn finalized(
         &mut self,
         context: (E, Self::Context),
         block: &Self::Block,
-        artifact: Self::FinalizedArtifact,
+        captured: Self::Captured,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
         self.inner
-            .finalized(context, block, artifact, readers)
+            .finalized(context, block, captured, readers)
             .await;
     }
 }
