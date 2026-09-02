@@ -6,15 +6,10 @@ proofs through QMDB, and renders both as they arrive.
 
 ## What it does
 
-The explorer opens a single `Subscribe` stream against
-[`sql.v1.Service`][rpc] for the `block_meta` table. Every
-delivered `SubscribeResponse` frame carries the rows from one atomic
-metadata ingest batch, and the indexer flushes one metadata row per finalized block, so most
-frames decode to exactly one new block summary —
-`(height, txCount, arrival time, sequence)`.
-
-The block summary can arrive before transaction lookup rows and QMDB proof
-details from the bulk lane. Explorer proof paths retry this temporary lag.
+The explorer bootstraps the newest publication target with one Store range
+read, then keeps it current through a direct Store subscription. For each
+target it queries the matching `block_meta` row under the target's Store
+sequence floor and renders `(height, txCount, arrival time, sequence)`.
 
 The schema column names (`height`, `tx_count`, …) come from
 [`crates/indexer/src/sql_schema.rs`](../crates/indexer/src/sql_schema.rs),
@@ -30,10 +25,10 @@ is auto-scaled to the peak in the visible window.
 
 When the signed-in account submits a transaction, the relayer only acknowledges
 leader admission. The explorer already knows the signed transaction digest and
-uses it to wait for `tx_proof_meta.height` and
-`tx_proof_meta.qmdb_location`. Existing Stores fall back to the unchanged
-`tx_meta` and `block_meta` rows. The explorer then verifies the exact-height
-Simplex certificate and fetches the transaction operation-log proof from
+uses it to wait for its `tx_meta` row. The containing height is derived from
+`block_meta`, and both rows are read under the selected publication target's
+Store sequence floor. The explorer then verifies the exact-height Simplex
+certificate and fetches the transaction operation-log proof from
 `qmdb-indexer` under `/transactions`. Finalization and latency are shown only
 after both proofs succeed.
 
@@ -47,17 +42,16 @@ reads. A lagging query node must catch up instead of returning a stale miss.
 The indexer publishes every finalized block to complementary surfaces
 (see [`crates/indexer/README.md`](../crates/indexer/README.md)):
 
-- **Simplex block/certificate storage** — certified headers, full blocks by
+- **Simplex block/certificate storage.** Certified headers, full blocks by
   digest, and finalization indexes. The explorer uses this for browser-side
   certificate/header verification and only fetches full block bodies when a
   workflow needs them.
 - **Metadata and lookup storage (SQL).** `block_meta`, `tx_meta`,
-  `tx_activity`, and `account_meta` tables share the same
-  store. They are cheap to
+  `tx_activity`, and `account_meta` tables share the same store. They are cheap to
   subscribe to from the browser and directly queryable for transaction proof
   metadata, transaction bodies, account activity, and account proof
   locations.
-- **QMDB operation logs** — transaction-hash operation proofs. The explorer
+- **QMDB operation logs.** Transaction-hash operation proofs. The explorer
   only fetches these for transactions submitted by the signed-in account.
 
 ## Configuration

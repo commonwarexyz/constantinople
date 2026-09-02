@@ -7,12 +7,8 @@ use crate::{
     state_reader::StateDbReader,
 };
 use commonware_actor::Feedback;
-use commonware_codec::Encode;
-use commonware_consensus::{
-    Reporter,
-    simplex::elector::RoundRobin,
-    types::{Epoch, coding::Commitment},
-};
+use commonware_codec::{Encode, FixedSize, Read, ReadExt as _, Write};
+use commonware_consensus::{Reporter, simplex::elector::RoundRobin, types::Epoch};
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
     certificate::ConstantProvider,
@@ -43,30 +39,28 @@ use commonware_runtime::{
 use commonware_storage::{
     metadata::{Config as MetadataConfig, Metadata},
     queue,
-    translator::EightCap,
 };
 use commonware_utils::{
-    NZDuration, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
+    NZDuration, NZU32, NZU64, NZUsize, Probability, TryCollect, ordered::Set, sequence::U64, union,
 };
-use constantinople_application::consensus::{DatabaseReaders, FinalizedHookFn};
+use constantinople_application::consensus::FinalizedHookFn;
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
     MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
-    types::{EngineActivity, EngineBlock},
+    types::{EngineActivity, EngineBlock, EngineCommitment, EngineMarshalMailbox},
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher, StoreClientBuildError,
     namespaces::{
-        PROVABLE_TARGET_PREFIX_VALUE, SIMPLEX_PREFIX_VALUE, SQL_META_PREFIX_VALUE,
+        PUBLICATION_TARGET_PREFIX_VALUE, SIMPLEX_PREFIX_VALUE, SQL_META_PREFIX_VALUE,
         STATE_QMDB_PREFIX_VALUE, TRANSACTIONS_QMDB_PREFIX_VALUE,
     },
     publisher::{
         PublisherMetrics,
-        certificate::CertificateUploaderStopped,
+        certificate::{CertificateUploaderStopped, PublishFinalizedBlockError},
         qmdb::{
             PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg, StoredFinalizedUpload,
-            WriterNextLocations,
         },
     },
     sql_schema::meta_schema_fingerprint,
@@ -74,6 +68,7 @@ use constantinople_indexer::{
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
 use std::{
+    collections::BTreeMap,
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
@@ -82,7 +77,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, watch},
     task::{JoinHandle, JoinSet},
 };
 use tracing::{info, warn};
@@ -109,8 +104,8 @@ const FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES: u64 = 64 * 1024;
 const FINALIZED_UPLOAD_DURATION_BUCKETS: [f64; 14] = [
     0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0,
 ];
-const CURSOR_STATE_KEY: U64 = U64::new(0);
-const CURSOR_TRANSACTION_KEY: U64 = U64::new(1);
+const CAPTURE_RECEIPT_KEY: U64 = U64::new(0);
+const INITIAL_QMDB_END: u64 = 1;
 
 /// Returns the default finalized-block window before a proposed mempool batch
 /// is marked dropped.
@@ -162,19 +157,79 @@ fn buffer_pool_configs(
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
 type EnginePublisher = Publisher<Sha256, PublicKey>;
-type EngineDatabaseReaders =
-    DatabaseReaders<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
-type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
-type EngineStoredUpload = StoredFinalizedUpload<Sha256, PublicKey>;
+type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey, MinSig>;
+type EngineStoredUpload = StoredFinalizedUpload<Sha256, PublicKey, MinSig>;
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineStoredUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineStoredUpload>;
-type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
+type EngineMarshal = EngineMarshalMailbox<Sha256, PublicKey, MinSig>;
+type CaptureMetadata = Metadata<RuntimeContext, U64, LatestCaptureReceipt>;
 type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
+type ValidatorFinalizedHook =
+    FinalizedHookFn<EngineCommitment<Sha256, PublicKey>, Sha256, PublicKey>;
 
-struct FinalizedCursorStore {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LatestCaptureReceipt {
+    height: u64,
+    block_digest: commonware_cryptography::sha256::Digest,
+    state_end: u64,
+    transaction_end: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CapturePosition {
+    Captured,
+    Next,
+}
+
+impl LatestCaptureReceipt {
+    fn from_upload(upload: &EngineQueuedUpload) -> Self {
+        Self {
+            height: upload.height(),
+            block_digest: *upload.block().seal(),
+            state_end: upload.state_end(),
+            transaction_end: upload.transaction_end(),
+        }
+    }
+
+    fn matches_block(&self, block: &EngineBlock<Sha256, PublicKey>) -> bool {
+        self.height == block.header.height
+            && self.block_digest == *block.seal()
+            && self.state_end == block.header.state_range.end()
+            && self.transaction_end == block.header.transactions_range.end()
+    }
+}
+
+impl FixedSize for LatestCaptureReceipt {
+    const SIZE: usize =
+        u64::SIZE + commonware_cryptography::sha256::Digest::SIZE + u64::SIZE + u64::SIZE;
+}
+
+impl Write for LatestCaptureReceipt {
+    fn write(&self, buf: &mut impl bytes::BufMut) {
+        self.height.write(buf);
+        self.block_digest.write(buf);
+        self.state_end.write(buf);
+        self.transaction_end.write(buf);
+    }
+}
+
+impl Read for LatestCaptureReceipt {
+    type Cfg = ();
+
+    fn read_cfg(buf: &mut impl bytes::Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
+        Ok(Self {
+            height: u64::read(buf)?,
+            block_digest: commonware_cryptography::sha256::Digest::read(buf)?,
+            state_end: u64::read(buf)?,
+            transaction_end: u64::read(buf)?,
+        })
+    }
+}
+
+struct FinalizedReceiptStore {
     context: RuntimeContext,
     config: MetadataConfig<()>,
-    metadata: Mutex<Option<CursorMetadata>>,
+    metadata: Mutex<Option<CaptureMetadata>>,
 }
 
 #[derive(Clone)]
@@ -397,6 +452,7 @@ struct FinalizedUploadConsumer {
     cert_reporter: EngineCertReporter,
     writer: FinalizedQueueWriter,
     reader: FinalizedQueueReader,
+    admitted: watch::Receiver<Option<u64>>,
     queue_ready: Arc<Notify>,
     max_active: usize,
     budget: UploadBudget,
@@ -440,7 +496,6 @@ fn finalized_queue_page_cache_capacity(upload_budget_bytes: u64) -> NonZeroUsize
 
 #[derive(Clone)]
 enum SimplexObserver {
-    Indexer(EngineCertReporter),
     Relayer(crate::relayer::Observer),
 }
 
@@ -449,7 +504,6 @@ impl Reporter for SimplexObserver {
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         match self {
-            Self::Indexer(reporter) => reporter.report(activity),
             Self::Relayer(reporter) => reporter.report(activity),
         }
     }
@@ -457,8 +511,8 @@ impl Reporter for SimplexObserver {
 
 /// Bundle of indexer state that needs to outlive engine startup.
 struct IndexerHandle {
-    cert_reporter: EngineCertReporter,
     finalized_producer: FinalizedUploadProducer,
+    marshal: Arc<OnceLock<EngineMarshal>>,
     critical_task: Option<CriticalTask>,
 }
 
@@ -470,7 +524,7 @@ struct LazyPublisher {
     buffer: usize,
     metrics: PublisherMetrics,
     strategy: Rayon,
-    recovery_cursor: FinalizedUploadCursor,
+    require_fresh: bool,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
@@ -481,7 +535,7 @@ impl LazyPublisher {
         api_key: Option<String>,
         buffer: usize,
         strategy: Rayon,
-        recovery_cursor: FinalizedUploadCursor,
+        require_fresh: bool,
     ) -> Self {
         // Registered once here: `connect` is retried on failure and must not
         // re-register.
@@ -493,7 +547,7 @@ impl LazyPublisher {
             buffer,
             metrics,
             strategy,
-            recovery_cursor,
+            require_fresh,
             publisher: Mutex::new(None),
         }
     }
@@ -504,31 +558,40 @@ impl LazyPublisher {
                 return publisher;
             }
 
-            match EnginePublisher::connect_with_strategy_at(
-                self.context.child("publisher"),
-                &self.store_url,
-                self.api_key.as_deref(),
-                self.buffer,
-                self.metrics.clone(),
-                WriterNextLocations::new(
-                    self.recovery_cursor.state_next,
-                    self.recovery_cursor.transaction_next,
-                ),
-                self.strategy.clone(),
-            )
-            .await
-            {
+            let connect = if self.require_fresh {
+                EnginePublisher::connect_fresh_with_strategy(
+                    self.context.child("publisher"),
+                    &self.store_url,
+                    self.api_key.as_deref(),
+                    self.buffer,
+                    self.metrics.clone(),
+                    self.strategy.clone(),
+                )
+                .await
+            } else {
+                EnginePublisher::connect_with_strategy(
+                    self.context.child("publisher"),
+                    &self.store_url,
+                    self.api_key.as_deref(),
+                    self.buffer,
+                    self.metrics.clone(),
+                    self.strategy.clone(),
+                )
+                .await
+            };
+            match connect {
                 Ok(publisher) => {
                     let publisher = Arc::new(publisher);
                     *self.publisher.lock().await = Some(publisher.clone());
                     return publisher;
                 }
+                Err(error @ PublishError::NonFreshNamespace { .. }) => {
+                    panic!("fresh namespace validation failed. {error}")
+                }
                 Err(error) => {
                     warn!(
                         error = %error,
                         chain_indexer_url = %self.store_url,
-                        state_next = self.recovery_cursor.state_next,
-                        transaction_next = self.recovery_cursor.transaction_next,
                         "indexer publisher connection failed, retrying",
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -536,181 +599,146 @@ impl LazyPublisher {
             }
         }
     }
-
-    #[cfg(test)]
-    async fn shutdown(&self) {
-        let publisher = self.publisher.lock().await.take();
-        if let Some(publisher) = publisher {
-            Arc::try_unwrap(publisher)
-                .expect("test owns the last publisher reference")
-                .shutdown()
-                .await;
-        }
-    }
 }
 
 #[derive(Clone)]
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
+    receipt_store: Arc<FinalizedReceiptStore>,
+    receipt: Arc<Mutex<Option<LatestCaptureReceipt>>>,
+    publisher: Arc<LazyPublisher>,
+    admitted: watch::Sender<Option<u64>>,
     queue_ready: Arc<Notify>,
-    metadata: Arc<FinalizedCursorStore>,
-    cursor: Arc<Mutex<FinalizedUploadCursor>>,
     queue_metrics: FinalizedQueueMetrics,
-}
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct FinalizedUploadCursor {
-    state_next: u64,
-    transaction_next: u64,
-}
-
-impl FinalizedUploadCursor {
-    fn from_metadata(metadata: &CursorMetadata) -> Option<Self> {
-        let state_next = metadata.get(&CURSOR_STATE_KEY).cloned().map(u64::from);
-        let transaction_next = metadata
-            .get(&CURSOR_TRANSACTION_KEY)
-            .cloned()
-            .map(u64::from);
-        Self::from_parts(state_next, transaction_next)
-    }
-
-    const fn from_parts(state_next: Option<u64>, transaction_next: Option<u64>) -> Option<Self> {
-        match (state_next, transaction_next) {
-            (Some(state_next), Some(transaction_next)) => Some(Self {
-                state_next,
-                transaction_next,
-            }),
-            _ => None,
-        }
-    }
-
-    fn from_upload(upload: &EngineQueuedUpload) -> Self {
-        Self {
-            state_next: upload.state_end(),
-            transaction_next: upload.transaction_end(),
-        }
-    }
-
-    const fn from_upload_start(upload: &EngineQueuedUpload) -> Self {
-        Self {
-            state_next: upload.state_start(),
-            transaction_next: upload.transaction_start(),
-        }
-    }
-
-    /// Return the later finalized-upload frontier as a whole cursor pair.
-    ///
-    /// Do not max fields independently: `state_next` and `transaction_next`
-    /// are captured from one finalized block, so mixing halves from different
-    /// sources can create a frontier that never existed.
-    const fn max(self, other: Self) -> Self {
-        if other.state_next > self.state_next
-            || (other.state_next == self.state_next
-                && other.transaction_next > self.transaction_next)
-        {
-            other
-        } else {
-            self
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FinalizedQueueFrontiers {
-    replay: FinalizedUploadCursor,
-    producer: FinalizedUploadCursor,
-    pending_uploads: usize,
-}
-
-fn recovered_finalized_upload_cursor(
-    metadata: Option<FinalizedUploadCursor>,
-    queue: Option<FinalizedUploadCursor>,
-) -> FinalizedUploadCursor {
-    metadata.unwrap_or_default().max(queue.unwrap_or_default())
+    marshal: Arc<OnceLock<EngineMarshal>>,
 }
 
 impl FinalizedUploadProducer {
     async fn enqueue(
         self,
         block: &EngineBlock<Sha256, PublicKey>,
-        databases: &EngineDatabaseReaders,
+        artifacts: constantinople_application::consensus::FinalizedArtifacts<Sha256>,
     ) {
-        loop {
-            let mut cursor = self.cursor.lock().await;
-            let upload = match EnginePublisher::build_queued_finalized_upload(
-                cursor.state_next,
-                cursor.transaction_next,
-                block,
-                databases,
-            )
-            .await
-            {
-                Ok(Some(upload)) => upload,
-                Ok(None) => {
-                    info!(
-                        height = block.header.height,
-                        state_next = cursor.state_next,
-                        transaction_next = cursor.transaction_next,
-                        "finalized block already uploaded, skipping index capture"
-                    );
-                    return;
-                }
-                Err(error @ PublishError::StoreEmptyPastGenesis { .. })
-                    if cursor.state_next == 0 =>
+        let mut current = self.receipt.lock().await;
+        match capture_position(*current, block.header.height) {
+            CapturePosition::Captured => {
+                if let Some(receipt) = *current
+                    && receipt.height == block.header.height
                 {
-                    panic!(
-                        "finalized index cursor is empty past genesis and cannot be recovered. {error}"
+                    assert!(
+                        receipt.matches_block(block),
+                        "finalized replay conflicts with the durable capture receipt"
                     );
                 }
-                Err(error) => {
-                    warn!(
-                        height = block.header.height,
-                        error = %error,
-                        "failed to prepare finalized index queue entry, retrying",
-                    );
-                    drop(cursor);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            let next = FinalizedUploadCursor::from_upload(&upload);
-            match self.writer.enqueue(upload.into()).await {
-                Ok(position) => {
-                    self.queue_metrics.pending_uploads.inc();
-                    self.queue_ready.notify_one();
-                    persist_finalized_cursor(&self.metadata, next).await;
-                    *cursor = next;
-                    info!(
-                        height = block.header.height,
-                        position,
-                        state_next = next.state_next,
-                        transaction_next = next.transaction_next,
-                        "queued finalized index upload"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        height = block.header.height,
-                        error = %error,
-                        "failed to enqueue finalized index upload, retrying",
-                    );
-                }
+                return;
             }
-            drop(cursor);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            CapturePosition::Next => {}
         }
+
+        validate_next_capture(*current, block, &artifacts);
+        if requires_fresh_namespace_validation(*current) {
+            self.publisher.publisher().await;
+        }
+        let marshal = self
+            .marshal
+            .get()
+            .expect("marshal mailbox must be installed before engine start");
+        let finalization = marshal
+            .get_finalization(commonware_consensus::types::Height::new(
+                block.header.height,
+            ))
+            .await
+            .unwrap_or_else(|| {
+                panic!(
+                    "marshal is missing the durable finalization at height {}",
+                    block.header.height
+                )
+            });
+        let upload = EngineQueuedUpload::from_finalized_artifacts(
+            block,
+            finalization,
+            current_time_micros(),
+            artifacts,
+        )
+        .expect("captured finalized artifacts must form a valid queue entry");
+        let receipt = LatestCaptureReceipt::from_upload(&upload);
+        let position = self
+            .writer
+            .enqueue(upload.into())
+            .await
+            .unwrap_or_else(|error| {
+                panic!(
+                    "failed to durably enqueue finalized index upload at height {}. {error}",
+                    block.header.height
+                )
+            });
+        persist_capture_receipt(&self.receipt_store, receipt).await;
+        *current = Some(receipt);
+        self.queue_metrics.pending_uploads.inc();
+        self.admitted.send_replace(Some(position));
+        self.queue_ready.notify_one();
+        info!(
+            height = block.header.height,
+            position,
+            state_end = receipt.state_end,
+            transaction_end = receipt.transaction_end,
+            "queued finalized index upload"
+        );
     }
 }
 
-async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: FinalizedUploadCursor) {
+fn capture_position(current: Option<LatestCaptureReceipt>, height: u64) -> CapturePosition {
+    assert_ne!(height, 0, "genesis must not invoke finalized capture");
+
+    let Some(receipt) = current else {
+        assert_eq!(height, 1, "first finalized capture must have height one");
+        return CapturePosition::Next;
+    };
+    if height <= receipt.height {
+        return CapturePosition::Captured;
+    }
+    assert_eq!(
+        height,
+        receipt
+            .height
+            .checked_add(1)
+            .expect("finalized capture height must not overflow"),
+        "finalized capture height must advance without gaps"
+    );
+    CapturePosition::Next
+}
+
+fn validate_next_capture(
+    current: Option<LatestCaptureReceipt>,
+    block: &EngineBlock<Sha256, PublicKey>,
+    artifacts: &constantinople_application::consensus::FinalizedArtifacts<Sha256>,
+) {
+    let (expected_height, expected_state_start, expected_transaction_start) =
+        current.map_or((1, INITIAL_QMDB_END, INITIAL_QMDB_END), |receipt| {
+            (
+                receipt
+                    .height
+                    .checked_add(1)
+                    .expect("finalized height must not overflow"),
+                receipt.state_end,
+                receipt.transaction_end,
+            )
+        });
+    assert_eq!(block.header.height, expected_height);
+    assert_eq!(artifacts.state.start.as_u64(), expected_state_start);
+    assert_eq!(
+        artifacts.transactions.start.as_u64(),
+        expected_transaction_start
+    );
+}
+
+async fn persist_capture_receipt(store: &FinalizedReceiptStore, receipt: LatestCaptureReceipt) {
     let mut metadata = store.metadata.lock().await;
     loop {
         let mut current = metadata
             .take()
-            .expect("finalized cursor metadata must be present while locked");
-        current.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-        current.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+            .expect("finalized capture metadata must be present while locked");
+        current.put(CAPTURE_RECEIPT_KEY, receipt);
         match current.sync().await {
             Ok(current) => {
                 *metadata = Some(current);
@@ -719,16 +747,15 @@ async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: Finalize
             Err(error) => {
                 warn!(
                     error = %error,
-                    state_next = cursor.state_next,
-                    transaction_next = cursor.transaction_next,
-                    "failed to persist finalized index cursor, retrying",
+                    height = receipt.height,
+                    "failed to persist finalized capture receipt"
                 );
             }
         }
 
         loop {
             match Metadata::init(
-                store.context.child("finalized_cursor"),
+                store.context.child("finalized_capture_receipt"),
                 store.config.clone(),
             )
             .await
@@ -740,7 +767,7 @@ async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: Finalize
                 Err(error) => {
                     warn!(
                         error = %error,
-                        "failed to reopen finalized index cursor, retrying",
+                        "failed to reopen finalized capture receipt"
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
                 }
@@ -749,34 +776,42 @@ async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: Finalize
     }
 }
 
-async fn scan_finalized_queue_frontiers(
+async fn scan_finalized_queue_receipt(
     reader: &mut FinalizedQueueReader,
     budget: &UploadBudget,
-) -> Option<FinalizedQueueFrontiers> {
-    let mut frontiers: Option<FinalizedQueueFrontiers> = None;
+) -> Option<(LatestCaptureReceipt, u64, usize)> {
+    let mut tail: Option<(LatestCaptureReceipt, u64, usize)> = None;
     loop {
         match reader.try_recv().await {
             Ok(Some((position, upload))) => {
                 let charge = budget.charge(upload.encoded_len());
                 let reservation = budget.reserve(charge).await.without_held_duration();
                 let upload = decode_finalized_queue_entry(position, upload);
-                let producer = FinalizedUploadCursor::from_upload(&upload);
-                match frontiers.as_mut() {
-                    Some(frontiers) => {
-                        frontiers.producer = producer;
-                        frontiers.pending_uploads = frontiers
-                            .pending_uploads
-                            .checked_add(1)
-                            .expect("finalized queue length overflowed");
-                    }
-                    None => {
-                        frontiers = Some(FinalizedQueueFrontiers {
-                            replay: FinalizedUploadCursor::from_upload_start(&upload),
-                            producer,
-                            pending_uploads: 1,
-                        });
-                    }
+                assert_eq!(
+                    upload.height(),
+                    position
+                        .checked_add(1)
+                        .expect("finalized queue position must not overflow")
+                );
+                if position == 0 {
+                    assert_eq!(upload.state_start(), INITIAL_QMDB_END);
+                    assert_eq!(upload.transaction_start(), INITIAL_QMDB_END);
                 }
+                if let Some((previous, _, _)) = tail {
+                    assert_eq!(upload.height(), previous.height + 1);
+                    assert_eq!(upload.state_start(), previous.state_end);
+                    assert_eq!(upload.transaction_start(), previous.transaction_end);
+                }
+                let pending_uploads = tail.map_or(1, |(_, _, count)| {
+                    count
+                        .checked_add(1)
+                        .expect("finalized queue length must not overflow")
+                });
+                tail = Some((
+                    LatestCaptureReceipt::from_upload(&upload),
+                    position,
+                    pending_uploads,
+                ));
                 drop(reservation);
             }
             Ok(None) => {
@@ -784,13 +819,49 @@ async fn scan_finalized_queue_frontiers(
                     .reset()
                     .await
                     .expect("failed to reset finalized index queue reader");
-                return frontiers;
+                return tail;
             }
-            Err(error) => {
-                panic!("failed to scan finalized index queue: {error}");
-            }
+            Err(error) => panic!("failed to scan finalized index queue. {error}"),
         }
     }
+}
+
+fn recover_capture_receipt(
+    metadata: Option<LatestCaptureReceipt>,
+    queue: Option<LatestCaptureReceipt>,
+) -> Option<LatestCaptureReceipt> {
+    match (metadata, queue) {
+        (Some(metadata), Some(queue)) if metadata.height == queue.height => {
+            assert_eq!(metadata, queue, "capture receipt conflicts with queue tail");
+            Some(metadata)
+        }
+        (Some(metadata), Some(queue)) if metadata.height > queue.height => {
+            panic!("capture receipt is ahead of the durable queue tail")
+        }
+        (_, Some(queue)) => Some(queue),
+        (Some(metadata), None) => Some(metadata),
+        (None, None) => None,
+    }
+}
+
+const fn requires_fresh_namespace_validation(
+    capture_receipt: Option<LatestCaptureReceipt>,
+) -> bool {
+    capture_receipt.is_none()
+}
+
+const fn requires_fresh_validation_before_receipt_recovery(
+    capture_receipt: Option<LatestCaptureReceipt>,
+    has_queue_tail: bool,
+) -> bool {
+    requires_fresh_namespace_validation(capture_receipt) && has_queue_tail
+}
+
+fn current_time_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
@@ -799,6 +870,7 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
         cert_reporter,
         writer,
         mut reader,
+        mut admitted,
         queue_ready,
         max_active,
         budget,
@@ -806,6 +878,8 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
         queue_metrics,
     } = consumer;
     let mut active = JoinSet::new();
+    let mut completed = BTreeMap::new();
+    let mut next_ack = None;
     let mut waiting = None;
     let max_active = max_active.max(1);
 
@@ -822,8 +896,10 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
             let Some((position, upload)) = item else {
                 break;
             };
+            wait_for_queue_admission(position, &mut admitted).await;
+            next_ack.get_or_insert(position);
             let pending = PendingQueuedUpload::new(position, upload, &budget);
-            if let Err(pending) = try_admit_queued_upload(
+            if let Some(pending) = try_admit_queued_upload(
                 &mut active,
                 publisher.clone(),
                 cert_reporter.clone(),
@@ -855,17 +931,29 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                 .await;
             }
             () = queue_ready.notified(), if waiting.is_none() && active.len() < max_active => {}
-            completed = active.join_next(), if !active.is_empty() => {
-                let (position, height, reservation) = completed
+            result = active.join_next(), if !active.is_empty() => {
+                let (position, height, reservation) = result
                     .expect("active upload set is not empty")
                     .expect("finalized index upload task panicked");
-                let completion_started = Instant::now();
-                ack_finalized_queue_entry(&reader, &writer, position, height).await;
-                metrics
-                    .completion
-                    .observe(completion_started.elapsed().as_secs_f64());
-                queue_metrics.pending_uploads.dec();
-                drop(reservation);
+                let replaced = completed.insert(position, (height, reservation));
+                assert!(replaced.is_none(), "queue position completed more than once");
+                while let Some(position) = next_ack {
+                    let Some((height, reservation)) = completed.remove(&position) else {
+                        break;
+                    };
+                    let completion_started = Instant::now();
+                    ack_finalized_queue_entry(&reader, &writer, position, height).await;
+                    metrics
+                        .completion
+                        .observe(completion_started.elapsed().as_secs_f64());
+                    queue_metrics.pending_uploads.dec();
+                    drop(reservation);
+                    next_ack = Some(
+                        position
+                            .checked_add(1)
+                            .expect("finalized queue position must not overflow"),
+                    );
+                }
             }
         }
     }
@@ -883,19 +971,34 @@ async fn try_read_finalized_queue_entry(
     Ok(item)
 }
 
+async fn wait_for_queue_admission(position: u64, admitted: &mut watch::Receiver<Option<u64>>) {
+    loop {
+        if admitted
+            .borrow_and_update()
+            .is_some_and(|floor| floor >= position)
+        {
+            return;
+        }
+        admitted
+            .changed()
+            .await
+            .expect("finalized capture admission gate closed");
+    }
+}
+
 async fn try_admit_queued_upload(
     active: &mut JoinSet<(u64, u64, UploadReservation)>,
     publisher: Arc<LazyPublisher>,
     cert_reporter: EngineCertReporter,
     budget: &UploadBudget,
     pending: PendingQueuedUpload,
-) -> Result<(), PendingQueuedUpload> {
+) -> Option<PendingQueuedUpload> {
     let Some(reservation) = budget.try_reserve(pending.charge) else {
         budget.mark_waiting(pending.charge);
-        return Err(pending);
+        return Some(pending);
     };
     start_queued_upload(active, publisher, cert_reporter, pending, reservation).await;
-    Ok(())
+    None
 }
 
 async fn ack_finalized_queue_entry(
@@ -944,10 +1047,16 @@ async fn start_queued_upload(
     let position = pending.position;
     let upload = decode_finalized_queue_entry(position, pending.upload);
     let height = upload.height();
-    let block = upload.block();
+    assert_eq!(
+        height,
+        position
+            .checked_add(1)
+            .expect("finalized queue position must not overflow")
+    );
+    let block = Arc::new(upload.block().clone());
+    let finalization = upload.finalization();
 
-    // QMDB admission advances strict cursors and must follow durable queue order.
-    // Persistence waits can run concurrently after the cursor reservation succeeds.
+    // Admission fixes queue order before independent persistence work begins.
     let engine_publisher = publisher.publisher().await;
     let completion = engine_publisher
         .enqueue_queued_finalized(upload)
@@ -958,10 +1067,15 @@ async fn start_queued_upload(
 
     active.spawn(async move {
         let simplex_completion = cert_reporter
-            .publish_block(block)
+            .publish_finalized_block(block, finalization)
             .await
-            .unwrap_or_else(|error| {
-                panic!("failed to start Simplex block upload at height {height}. {error}")
+            .unwrap_or_else(|error| match error {
+                PublishFinalizedBlockError::CommitmentBlockMismatch => {
+                    panic!("queued finalization does not match block at height {height}")
+                }
+                PublishFinalizedBlockError::UploaderStopped(error) => {
+                    panic!("failed to start finalized block upload at height {height}. {error}")
+                }
             });
         match wait_for_finalized_uploads(completion.wait(), simplex_completion.wait()).await {
             Ok(()) => (position, height, reservation),
@@ -969,7 +1083,7 @@ async fn start_queued_upload(
                 panic!("QMDB upload failed at height {height}. {error}")
             }
             Err(FinalizedUploadFailure::Simplex(error)) => {
-                panic!("Simplex block upload failed at height {height}. {error}")
+                panic!("finalized block upload failed at height {height}. {error}")
             }
         }
     });
@@ -987,9 +1101,12 @@ enum FinalizedUploadFailure {
     Simplex(CertificateUploaderStopped),
 }
 
-async fn wait_for_finalized_uploads<Q, S>(qmdb: Q, simplex: S) -> Result<(), FinalizedUploadFailure>
+async fn wait_for_finalized_uploads<Q, S, T>(
+    qmdb: Q,
+    simplex: S,
+) -> Result<(), FinalizedUploadFailure>
 where
-    Q: Future<Output = Result<(), PublishError>>,
+    Q: Future<Output = Result<T, PublishError>>,
     S: Future<Output = Result<(), CertificateUploaderStopped>>,
 {
     tokio::try_join!(
@@ -1050,7 +1167,7 @@ async fn maybe_build_indexer(
         transactions_qmdb_prefix = %format_args!("0x{TRANSACTIONS_QMDB_PREFIX_VALUE:02x}"),
         simplex_prefix = %format_args!("0x{SIMPLEX_PREFIX_VALUE:02x}"),
         sql_meta_prefix = %format_args!("0x{SQL_META_PREFIX_VALUE:02x}"),
-        provable_target_prefix = %format_args!("0x{PROVABLE_TARGET_PREFIX_VALUE:02x}"),
+        publication_target_prefix = %format_args!("0x{PUBLICATION_TARGET_PREFIX_VALUE:02x}"),
         "indexer Store layout",
     );
     let budget = UploadBudget::new(
@@ -1079,62 +1196,74 @@ async fn maybe_build_indexer(
             codec_config: QueuedFinalizedUploadCfg::default(),
             page_cache,
             write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+            replay_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
         },
     )
     .await
     .expect("failed to initialize finalized index queue");
     let metadata_config = MetadataConfig {
-        partition: format!("{partition_prefix}-finalized-index-cursor"),
+        partition: format!("{partition_prefix}-finalized-capture-receipt"),
         codec_config: (),
     };
-    let mut metadata = Metadata::init(context.child("finalized_cursor"), metadata_config.clone())
-        .await
-        .expect("failed to initialize finalized index cursor");
-    let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
-    let queue_frontiers = scan_finalized_queue_frontiers(&mut queue_reader, &budget).await;
+    let mut metadata = Metadata::init(
+        context.child("finalized_capture_receipt"),
+        metadata_config.clone(),
+    )
+    .await
+    .expect("failed to initialize finalized capture receipt");
+    let metadata_receipt = metadata.get(&CAPTURE_RECEIPT_KEY).copied();
+    let queue_tail = scan_finalized_queue_receipt(&mut queue_reader, &budget).await;
     queue_metrics
         .pending_uploads
-        .set(queue_frontiers.map_or(0, |frontiers| metric_usize(frontiers.pending_uploads)));
-    let queue_cursor = queue_frontiers.map(|frontiers| frontiers.producer);
-    let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
-
-    // Retained entries replay from the oldest local cursor even when Store is
-    // farther ahead. An empty queue can resume after its durable producer cursor.
-    let recovery_cursor = queue_frontiers.map_or(cursor, |frontiers| frontiers.replay);
-    if metadata_cursor != Some(cursor) {
-        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        metadata = metadata
-            .sync()
-            .await
-            .expect("failed to persist finalized index cursor");
-    }
+        .set(queue_tail.map_or(0, |(_, _, count)| metric_usize(count)));
+    let require_fresh = requires_fresh_namespace_validation(metadata_receipt);
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
         cfg.chain_indexer_url,
         cfg.api_key,
         max_active_uploads,
         strategy,
-        recovery_cursor,
+        require_fresh,
     ));
-    let metadata = Arc::new(FinalizedCursorStore {
+    if requires_fresh_validation_before_receipt_recovery(metadata_receipt, queue_tail.is_some()) {
+        publisher.publisher().await;
+    }
+    let receipt =
+        recover_capture_receipt(metadata_receipt, queue_tail.map(|(receipt, _, _)| receipt));
+    if metadata_receipt != receipt {
+        metadata.put(
+            CAPTURE_RECEIPT_KEY,
+            receipt.expect("queue recovery must produce a capture receipt"),
+        );
+        metadata = metadata
+            .sync()
+            .await
+            .expect("failed to persist recovered capture receipt");
+    }
+    let receipt_store = Arc::new(FinalizedReceiptStore {
         context,
         config: metadata_config,
         metadata: Mutex::new(Some(metadata)),
     });
+    let (admitted, admitted_rx) = watch::channel(queue_tail.map(|(_, position, _)| position));
     let queue_ready = Arc::new(Notify::new());
+    let marshal = Arc::new(OnceLock::new());
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
+        receipt_store,
+        receipt: Arc::new(Mutex::new(receipt)),
+        publisher: publisher.clone(),
+        admitted,
         queue_ready: queue_ready.clone(),
-        metadata,
-        cursor: Arc::new(Mutex::new(cursor)),
         queue_metrics: queue_metrics.clone(),
+        marshal: marshal.clone(),
     };
     let finalized_join = tokio::spawn(run_finalized_upload_consumer(FinalizedUploadConsumer {
         publisher,
         cert_reporter: cert_reporter.clone(),
         writer: queue_writer,
         reader: queue_reader,
+        admitted: admitted_rx,
         queue_ready,
         max_active: max_active_uploads,
         budget,
@@ -1142,20 +1271,19 @@ async fn maybe_build_indexer(
         queue_metrics,
     }));
     Ok(Some(IndexerHandle {
-        cert_reporter,
         finalized_producer,
+        marshal,
         critical_task: Some(indexer_critical_task(cert_join, finalized_join)),
     }))
 }
 
-fn indexer_finalized_hook(
-    indexer: Option<&IndexerHandle>,
-) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
-{
+fn indexer_finalized_hook(indexer: Option<&IndexerHandle>) -> Option<ValidatorFinalizedHook> {
     let indexer = indexer?;
     let finalized_producer = indexer.finalized_producer.clone();
-    Some(Arc::new(move |block, databases| {
-        Box::pin(finalized_producer.clone().enqueue(block, databases))
+    Some(Arc::new(move |block, artifacts| {
+        let block = EngineBlock::from(block.clone());
+        let finalized_producer = finalized_producer.clone();
+        Box::pin(async move { finalized_producer.enqueue(&block, artifacts).await })
     }))
 }
 
@@ -1215,7 +1343,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             otel.map(|(endpoint, rate)| TracesConfig {
                 endpoint,
                 name: hex(&decoded.public_key.encode()),
-                rate: rate.try_into().expect("bad trace sampling rate"),
+                rate: Probability::try_from(rate).expect("trace rate must be between zero and one"),
             }),
         );
 
@@ -1439,16 +1567,18 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 state_page_cache_bytes,
                 other_page_cache_bytes,
                 probe: Some(probe_mailbox.clone()),
-                simplex_observer: relayer_observer.map(SimplexObserver::Relayer).or_else(|| {
-                    indexer_handle
-                        .as_ref()
-                        .map(|h| h.cert_reporter.clone())
-                        .map(SimplexObserver::Indexer)
-                }),
+                simplex_observer: relayer_observer.map(SimplexObserver::Relayer),
                 finalized_hook,
             },
         )
         .await;
+
+        if let Some(indexer) = indexer_handle.as_ref() {
+            assert!(
+                indexer.marshal.set(engine.marshal_mailbox()).is_ok(),
+                "marshal mailbox must be installed exactly once"
+            );
+        }
 
         // Install the account reader as soon as the stateful actor attaches
         // its databases. Runs concurrently with engine.start so the HTTP
@@ -1466,11 +1596,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         info!("starting engine");
         // Primaries report to the local mempool. Secondaries upload index data
         // from the finalized hook and do not need marshal updates here.
-        let reporter: Option<Mailbox<Commitment, PublicKey, Sha256>> = if is_primary {
-            Some(mempool_mailbox.clone())
-        } else {
-            None
-        };
+        let reporter: Option<Mailbox<EngineCommitment<Sha256, PublicKey>, PublicKey, Sha256>> =
+            if is_primary {
+                Some(mempool_mailbox.clone())
+            } else {
+                None
+            };
         let engine_handle = engine.start(channels, reporter);
 
         wait_for_critical_task_exit(
@@ -1519,75 +1650,26 @@ const fn production_sync_config() -> SyncEngineConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        CertificateUploaderStopped, EngineCertReporter, EngineQueuedUpload,
-        FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER,
-        FINALIZED_UPLOAD_AMPLIFICATION, FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
-        FinalizedQueueFrontiers, FinalizedQueueReader, FinalizedQueueWriter, FinalizedUploadCursor,
-        FinalizedUploadFailure, FinalizedUploadMetrics, LazyPublisher, PendingQueuedUpload,
-        PublishError, StoreClientBuildError, UploadBudget, decode_finalized_queue_entry,
-        default_mempool_drop_grace_blocks, finalized_queue_page_cache_capacity,
-        indexer_critical_task, maybe_build_indexer, recovered_finalized_upload_cursor,
-        scan_finalized_queue_frontiers, start_queued_upload, try_read_finalized_queue_entry,
-        wait_for_critical_task_exit, wait_for_finalized_uploads,
+        CapturePosition, CertificateUploaderStopped, FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+        FinalizedUploadFailure, LatestCaptureReceipt, PublishError, StoreClientBuildError,
+        UploadBudget, capture_position, default_mempool_drop_grace_blocks, indexer_critical_task,
+        maybe_build_indexer, recover_capture_receipt, requires_fresh_namespace_validation,
+        requires_fresh_validation_before_receipt_recovery, wait_for_critical_task_exit,
+        wait_for_finalized_uploads,
     };
     use crate::config::IndexerConfig;
-    use commonware_codec::{Encode as _, FixedSize as _, Read as _, Write as _};
-    use commonware_consensus::{
-        marshal::coding::types::coding_config_for_participants,
-        simplex::types::Context as SimplexContext,
-        types::{Round, View, coding::Commitment},
-    };
-    use commonware_cryptography::{
-        Digest as _, Signer as _,
-        ed25519::PrivateKey,
-        sha256::{Digest as Sha256Digest, Sha256},
-    };
-    use commonware_runtime::{
-        Metrics as _, Runner as _, Spawner as _, Strategizer as _, Supervisor as _,
-    };
-    use commonware_storage::{
-        merkle::mmr,
-        qmdb::any::{
-            unordered::{Operation as UnorderedOperation, Update as UnorderedUpdate},
-            value::FixedEncoding,
-        },
-        queue,
-    };
-    use commonware_utils::{NZUsize, non_empty_range, sequence::FixedBytes};
-    use constantinople_primitives::{
-        Account, AccountKey, Block, Header, Sealable, SignedTransaction,
-    };
-    use std::{future::pending, sync::Arc, time::Duration};
-    use tokio::sync::{Notify, oneshot};
-
-    type TestAccountValue = FixedBytes<{ Account::SIZE }>;
-    type TestStateOperation =
-        UnorderedOperation<mmr::Family, AccountKey, FixedEncoding<TestAccountValue>>;
-    type LegacyFinalizedQueueWriter = queue::Writer<super::RuntimeContext, EngineQueuedUpload>;
-    type LegacyFinalizedQueueReader = queue::Reader<super::RuntimeContext, EngineQueuedUpload>;
+    use commonware_codec::{DecodeExt as _, Encode as _, FixedSize as _};
+    use commonware_cryptography::sha256::Digest as Sha256Digest;
+    use commonware_runtime::{Runner as _, Strategizer as _, Supervisor as _};
+    use commonware_utils::NZUsize;
+    use std::{future::pending, time::Duration};
+    use tokio::sync::oneshot;
 
     #[test]
     fn mempool_drop_grace_defaults_to_twice_validator_count() {
         assert_eq!(default_mempool_drop_grace_blocks(1), 2);
         assert_eq!(default_mempool_drop_grace_blocks(4), 8);
         assert_eq!(default_mempool_drop_grace_blocks(50), 100);
-    }
-
-    #[test]
-    fn finalized_queue_cache_tracks_admitted_encoded_backlog() {
-        let one_page_budget = 8 * u64::from(FINALIZED_QUEUE_PAGE_SIZE.get());
-        assert_eq!(
-            finalized_queue_page_cache_capacity(one_page_budget).get(),
-            1
-        );
-
-        let three_gib = 3 * 1024 * 1024 * 1024;
-        let encoded_backlog = three_gib / FINALIZED_UPLOAD_AMPLIFICATION;
-        let expected_pages = encoded_backlog.div_ceil(u64::from(FINALIZED_QUEUE_PAGE_SIZE.get()));
-        assert_eq!(
-            finalized_queue_page_cache_capacity(three_gib).get(),
-            usize::try_from(expected_pages).expect("test page count fits usize"),
-        );
     }
 
     #[tokio::test]
@@ -1743,68 +1825,98 @@ mod tests {
     }
 
     #[test]
-    fn finalized_upload_cursor_keeps_furthest_recovery_position() {
-        let older = FinalizedUploadCursor {
-            state_next: 10,
-            transaction_next: 20,
-        };
-        let newer_state = FinalizedUploadCursor {
-            state_next: 11,
-            transaction_next: 1,
-        };
-        let newer_transaction = FinalizedUploadCursor {
-            state_next: 10,
-            transaction_next: 21,
-        };
-
-        assert_eq!(older.max(newer_state), newer_state);
-        assert_eq!(older.max(newer_transaction), newer_transaction);
-        assert_eq!(newer_state.max(older), newer_state);
-        assert_eq!(newer_transaction.max(older), newer_transaction);
-    }
-
-    #[test]
-    fn recovered_finalized_upload_cursor_uses_furthest_whole_frontier() {
-        let metadata = FinalizedUploadCursor {
-            state_next: 10,
-            transaction_next: 20,
-        };
-        let queue = FinalizedUploadCursor {
-            state_next: 11,
-            transaction_next: 1,
-        };
-
+    fn capture_receipt_round_trips() {
+        let receipt = capture_receipt(7, 11, 13);
         assert_eq!(
-            recovered_finalized_upload_cursor(None, None),
-            Default::default()
-        );
-        assert_eq!(
-            recovered_finalized_upload_cursor(Some(metadata), None),
-            metadata
-        );
-        assert_eq!(recovered_finalized_upload_cursor(None, Some(queue)), queue);
-        assert_eq!(
-            recovered_finalized_upload_cursor(Some(metadata), Some(queue)),
-            queue
-        );
-        assert_eq!(
-            recovered_finalized_upload_cursor(Some(queue), Some(metadata)),
-            queue
+            LatestCaptureReceipt::decode(receipt.encode()).expect("receipt decodes"),
+            receipt
         );
     }
 
     #[test]
-    fn finalized_upload_cursor_ignores_partial_metadata_pairs() {
-        assert_eq!(FinalizedUploadCursor::from_parts(None, None), None);
-        assert_eq!(FinalizedUploadCursor::from_parts(Some(10), None), None);
-        assert_eq!(FinalizedUploadCursor::from_parts(None, Some(20)), None);
+    fn capture_receipt_covers_older_replays() {
+        let receipt = capture_receipt(7, 11, 13);
+
+        assert_eq!(capture_position(None, 1), CapturePosition::Next);
         assert_eq!(
-            FinalizedUploadCursor::from_parts(Some(10), Some(20)),
-            Some(FinalizedUploadCursor {
-                state_next: 10,
-                transaction_next: 20,
-            }),
+            capture_position(Some(receipt), 6),
+            CapturePosition::Captured
         );
+        assert_eq!(
+            capture_position(Some(receipt), 7),
+            CapturePosition::Captured
+        );
+        assert_eq!(capture_position(Some(receipt), 8), CapturePosition::Next);
+    }
+
+    #[test]
+    #[should_panic(expected = "genesis must not invoke finalized capture")]
+    fn capture_receipt_rejects_genesis() {
+        let _ = capture_position(None, 0);
+    }
+
+    #[test]
+    #[should_panic(expected = "finalized capture height must advance without gaps")]
+    fn capture_receipt_rejects_future_gap() {
+        let _ = capture_position(Some(capture_receipt(7, 11, 13)), 9);
+    }
+
+    #[test]
+    fn queue_tail_repairs_an_older_capture_receipt() {
+        let metadata = capture_receipt(7, 11, 13);
+        let queue = capture_receipt(8, 14, 17);
+
+        assert_eq!(
+            recover_capture_receipt(Some(metadata), Some(queue)),
+            Some(queue)
+        );
+        assert_eq!(recover_capture_receipt(None, Some(queue)), Some(queue));
+        assert_eq!(
+            recover_capture_receipt(Some(metadata), None),
+            Some(metadata)
+        );
+    }
+
+    #[test]
+    fn fresh_validation_precedes_unreceipted_queue_recovery() {
+        let queue = capture_receipt(1, 2, 3);
+
+        assert!(requires_fresh_namespace_validation(None));
+        assert!(requires_fresh_validation_before_receipt_recovery(
+            None, true
+        ));
+        assert_eq!(recover_capture_receipt(None, Some(queue)), Some(queue));
+        assert!(!requires_fresh_namespace_validation(Some(queue)));
+        assert!(!requires_fresh_validation_before_receipt_recovery(
+            Some(queue),
+            true
+        ));
+    }
+
+    #[test]
+    fn fresh_validation_is_deferred_to_first_enqueue_on_empty_startup() {
+        assert!(requires_fresh_namespace_validation(None));
+        assert!(!requires_fresh_validation_before_receipt_recovery(
+            None, false
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "capture receipt is ahead of the durable queue tail")]
+    fn capture_receipt_cannot_advance_past_a_nonempty_queue() {
+        let metadata = capture_receipt(8, 14, 17);
+        let queue = capture_receipt(7, 11, 13);
+
+        let _ = recover_capture_receipt(Some(metadata), Some(queue));
+    }
+
+    #[test]
+    #[should_panic(expected = "capture receipt conflicts with queue tail")]
+    fn capture_receipt_must_match_the_queue_tail() {
+        let metadata = capture_receipt(7, 11, 13);
+        let queue = capture_receipt(7, 12, 13);
+
+        let _ = recover_capture_receipt(Some(metadata), Some(queue));
     }
 
     #[test]
@@ -1912,374 +2024,12 @@ mod tests {
         });
     }
 
-    #[test]
-    fn queued_uploads_reserve_qmdb_cursors_before_completion_tasks_spawn() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let (store, url) = exoware_simulator::open_temp()
-                .await
-                .expect("spawn simulator");
-            let publisher = Arc::new(LazyPublisher::new(
-                context.child("publisher"),
-                url.clone(),
-                None,
-                2,
-                context.strategy(NZUsize!(2)),
-                FinalizedUploadCursor::default(),
-            ));
-            let engine_publisher = publisher.publisher().await;
-            let (cert_reporter, cert_join) =
-                EngineCertReporter::connect(&context.child("simplex_upload"), &url, None, 2)
-                    .expect("reporter connects");
-            let budget = UploadBudget::new(
-                &context.child("upload_budget"),
-                2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
-            );
-            let mut active = tokio::task::JoinSet::new();
-
-            let first = publishable_queued_upload(1, 0, 0);
-            let first = PendingQueuedUpload::new(0, first.into(), &budget);
-            let first_reservation = budget
-                .try_reserve(first.charge)
-                .expect("first upload fits budget");
-            start_queued_upload(
-                &mut active,
-                publisher.clone(),
-                cert_reporter.clone(),
-                first,
-                first_reservation,
-            )
-            .await;
-            assert_eq!(engine_publisher.next_locations().await, (2, 2));
-
-            let second = publishable_queued_upload(2, 2, 2);
-            let second = PendingQueuedUpload::new(1, second.into(), &budget);
-            let second_reservation = budget
-                .try_reserve(second.charge)
-                .expect("second upload fits budget");
-            start_queued_upload(
-                &mut active,
-                publisher.clone(),
-                cert_reporter,
-                second,
-                second_reservation,
-            )
-            .await;
-            assert_eq!(engine_publisher.next_locations().await, (4, 3));
-            assert_eq!(active.len(), 2);
-            assert_eq!(budget.metrics.admitted.get(), 2);
-
-            while let Some(completed) = active.join_next().await {
-                let (_, _, reservation) = completed.expect("queued upload completes");
-                drop(reservation);
-            }
-            assert_eq!(budget.metrics.admitted.get(), 0);
-            cert_join.abort();
-            let _ = cert_join.await;
-            drop(engine_publisher);
-            publisher.shutdown().await;
-            drop(publisher);
-            store.abort();
-            let _ = store.await;
-            context
-                .stop(0, Some(Duration::from_secs(1)))
-                .await
-                .expect("runtime stops after strategy threads exit");
-        });
-    }
-
-    #[test]
-    fn finalized_queue_scan_recovers_frontiers_and_resets_reader() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let budget = UploadBudget::new(
-                &context.child("upload_budget"),
-                FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
-            );
-            let (writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
-                queue::shared::init(
-                    context.child("finalized_queue"),
-                    finalized_queue_config(&context, "finalized-queue-scan-recovers-last-cursor"),
-                )
-                .await
-                .expect("queue initializes");
-            assert_eq!(
-                scan_finalized_queue_frontiers(&mut reader, &budget).await,
-                None
-            );
-
-            let first = queued_upload(1, 4, 6, 3, 4);
-            let second = queued_upload(2, 6, 9, 4, 5);
-            writer
-                .enqueue(first.clone().into())
-                .await
-                .expect("enqueue first");
-            writer
-                .enqueue(second.clone().into())
-                .await
-                .expect("enqueue second");
-
-            assert_eq!(
-                scan_finalized_queue_frontiers(&mut reader, &budget).await,
-                Some(FinalizedQueueFrontiers {
-                    replay: FinalizedUploadCursor::from_upload_start(&first),
-                    producer: FinalizedUploadCursor::from_upload(&second),
-                    pending_uploads: 2,
-                })
-            );
-            assert_eq!(budget.permits.available_permits(), 1);
-            assert!(
-                context
-                    .encode()
-                    .contains("upload_budget_reservation_held_duration_count 0")
-            );
-
-            let (position, upload) = reader
-                .try_recv()
-                .await
-                .expect("read after scan")
-                .expect("scan reset leaves first item readable");
-            let upload = decode_finalized_queue_entry(position, upload);
-            assert_eq!(
-                FinalizedUploadCursor::from_upload(&upload),
-                FinalizedUploadCursor::from_upload(&first)
-            );
-        });
-    }
-
-    #[test]
-    fn finalized_queue_live_arrival_records_read_duration() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let metrics = FinalizedUploadMetrics::new(&context.child("finalized_upload"));
-            let queue_ready = Notify::new();
-            let (writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
-                queue::shared::init(
-                    context.child("finalized_queue"),
-                    finalized_queue_config(&context, "finalized-queue-live-read-metric"),
-                )
-                .await
-                .expect("queue initializes");
-
-            assert!(
-                try_read_finalized_queue_entry(&mut reader, &metrics)
-                    .await
-                    .expect("empty queue reads")
-                    .is_none()
-            );
-
-            let notified = queue_ready.notified();
-            writer
-                .enqueue(queued_upload(1, 0, 2, 0, 2).into())
-                .await
-                .expect("live upload enqueues");
-            queue_ready.notify_one();
-            notified.await;
-
-            assert!(
-                try_read_finalized_queue_entry(&mut reader, &metrics)
-                    .await
-                    .expect("live upload reads")
-                    .is_some()
-            );
-            assert!(
-                context
-                    .encode()
-                    .contains("finalized_upload_queue_read_duration_count 1")
-            );
-        });
-    }
-
-    #[test]
-    fn finalized_queue_codec_is_upgrade_and_rollback_compatible() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let expected = queued_upload(1, 0, 2, 0, 2);
-            let expected_bytes = expected.encode();
-
-            {
-                let (writer, _reader): (LegacyFinalizedQueueWriter, LegacyFinalizedQueueReader) =
-                    queue::shared::init(
-                        context.child("legacy_upgrade_writer"),
-                        finalized_queue_config(&context, "finalized-queue-codec-upgrade"),
-                    )
-                    .await
-                    .expect("legacy queue initializes");
-                writer
-                    .enqueue(expected.clone())
-                    .await
-                    .expect("legacy queue accepts upload");
-                writer.sync().await.expect("legacy queue syncs");
-            }
-
-            {
-                let (_writer, mut reader): (FinalizedQueueWriter, FinalizedQueueReader) =
-                    queue::shared::init(
-                        context.child("stored_upgrade_reader"),
-                        finalized_queue_config(&context, "finalized-queue-codec-upgrade"),
-                    )
-                    .await
-                    .expect("stored queue reopens legacy data");
-                let (position, stored) = reader
-                    .try_recv()
-                    .await
-                    .expect("stored queue reads legacy data")
-                    .expect("legacy upload remains queued");
-                assert_eq!(position, 0);
-                assert_eq!(stored.encoded_len(), expected_bytes.len());
-                assert_eq!(stored.encode(), expected_bytes);
-                let decoded = decode_finalized_queue_entry(position, stored);
-                assert_eq!(decoded.encode(), expected_bytes);
-            }
-
-            {
-                let (writer, _reader): (FinalizedQueueWriter, FinalizedQueueReader) =
-                    queue::shared::init(
-                        context.child("stored_rollback_writer"),
-                        finalized_queue_config(&context, "finalized-queue-codec-rollback"),
-                    )
-                    .await
-                    .expect("stored queue initializes");
-                writer
-                    .enqueue(expected.clone().into())
-                    .await
-                    .expect("stored queue accepts upload");
-                writer.sync().await.expect("stored queue syncs");
-            }
-
-            let (_writer, mut reader): (LegacyFinalizedQueueWriter, LegacyFinalizedQueueReader) =
-                queue::shared::init(
-                    context.child("legacy_rollback_reader"),
-                    finalized_queue_config(&context, "finalized-queue-codec-rollback"),
-                )
-                .await
-                .expect("legacy queue reopens stored data");
-            let (position, decoded) = reader
-                .try_recv()
-                .await
-                .expect("legacy queue reads stored data")
-                .expect("stored upload remains queued");
-            assert_eq!(position, 0);
-            assert_eq!(decoded.encode(), expected_bytes);
-        });
-    }
-
-    fn finalized_queue_config(
-        context: &super::RuntimeContext,
-        partition: &str,
-    ) -> queue::Config<super::QueuedFinalizedUploadCfg> {
-        let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
-            context,
-            FINALIZED_QUEUE_PAGE_SIZE,
-            NZUsize!(8),
-        );
-        queue::Config {
-            partition: partition.to_string(),
-            items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
-            compression: None,
-            codec_config: super::QueuedFinalizedUploadCfg::default(),
-            page_cache,
-            write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+    fn capture_receipt(height: u64, state_end: u64, transaction_end: u64) -> LatestCaptureReceipt {
+        LatestCaptureReceipt {
+            height,
+            block_digest: Sha256Digest::from([height as u8; Sha256Digest::SIZE]),
+            state_end,
+            transaction_end,
         }
-    }
-
-    fn queued_upload(
-        height: u64,
-        state_start: u64,
-        state_end: u64,
-        transaction_start: u64,
-        transaction_end: u64,
-    ) -> EngineQueuedUpload {
-        let leader = PrivateKey::from_seed(height).public_key();
-        let parent_commitment = Commitment::from((
-            Sha256Digest::EMPTY,
-            Sha256Digest::EMPTY,
-            Sha256Digest::EMPTY,
-            coding_config_for_participants(4),
-        ));
-        let header = Header {
-            context: SimplexContext {
-                round: Round::zero(),
-                leader,
-                parent: (View::zero(), parent_commitment),
-            },
-            parent: Sha256Digest::EMPTY,
-            height,
-            timestamp: 0,
-            state_root: Sha256Digest::EMPTY,
-            state_range: non_empty_range!(state_start, state_end),
-            transactions_root: Sha256Digest::EMPTY,
-            transactions_range: non_empty_range!(transaction_start, transaction_end),
-        };
-        let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
-            .seal(&mut Sha256::default());
-        let state_delta: Vec<TestStateOperation> = vec![TestStateOperation::CommitFloor(
-            None,
-            mmr::Location::new(state_start),
-        )];
-        let mut encoded = bytes::BytesMut::new();
-        block.write(&mut encoded);
-        0i64.write(&mut encoded);
-        state_start.write(&mut encoded);
-        transaction_start.write(&mut encoded);
-        state_delta.write(&mut encoded);
-
-        let mut encoded = encoded.freeze();
-        EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())
-            .expect("queued upload decodes")
-    }
-
-    fn publishable_queued_upload(
-        height: u64,
-        state_start: u64,
-        transaction_start: u64,
-    ) -> EngineQueuedUpload {
-        let transaction_ops = if transaction_start == 0 { 2 } else { 1 };
-        let seed = u8::try_from(height).expect("test height fits account key");
-        let key = AccountKey::from([seed; AccountKey::SIZE]);
-        let account = Account {
-            balance: height,
-            ..Account::default()
-        };
-        let account = account.encode();
-        let mut encoded_account = [0; Account::SIZE];
-        encoded_account.copy_from_slice(&account);
-        let state_delta = vec![
-            TestStateOperation::Update(UnorderedUpdate(key, FixedBytes::new(encoded_account))),
-            TestStateOperation::CommitFloor(None, mmr::Location::new(0)),
-        ];
-
-        let leader = PrivateKey::from_seed(height).public_key();
-        let parent_commitment = Commitment::from((
-            Sha256Digest::EMPTY,
-            Sha256Digest::EMPTY,
-            Sha256Digest::EMPTY,
-            coding_config_for_participants(4),
-        ));
-        let header = Header {
-            context: SimplexContext {
-                round: Round::zero(),
-                leader,
-                parent: (View::zero(), parent_commitment),
-            },
-            parent: Sha256Digest::EMPTY,
-            height,
-            timestamp: 0,
-            state_root: Sha256Digest::EMPTY,
-            state_range: non_empty_range!(state_start, state_start + 2),
-            transactions_root: Sha256Digest::EMPTY,
-            transactions_range: non_empty_range!(
-                transaction_start,
-                transaction_start + transaction_ops
-            ),
-        };
-        let block = Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
-            .seal(&mut Sha256::default());
-        let mut encoded = bytes::BytesMut::new();
-        block.write(&mut encoded);
-        0i64.write(&mut encoded);
-        state_start.write(&mut encoded);
-        transaction_start.write(&mut encoded);
-        state_delta.write(&mut encoded);
-
-        let mut encoded = encoded.freeze();
-        EngineQueuedUpload::read_cfg(&mut encoded, &super::QueuedFinalizedUploadCfg::default())
-            .expect("publishable queued upload decodes")
     }
 }

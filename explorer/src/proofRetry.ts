@@ -1,5 +1,18 @@
+import { Code, ConnectError } from '@connectrpc/connect';
+import { HttpError } from '@exowarexyz/sdk';
+
+const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
+const CONSISTENCY_NOT_READY = 'CONSISTENCY_NOT_READY';
+const CONSISTENCY_NOT_READY_BYTES = new TextEncoder().encode(CONSISTENCY_NOT_READY);
+const CONSISTENCY_NOT_READY_FIELD = new Uint8Array([
+    0x0a,
+    CONSISTENCY_NOT_READY_BYTES.length,
+    ...CONSISTENCY_NOT_READY_BYTES,
+]);
+const SERIALIZED_CONSISTENCY_NOT_READY =
+    /^(?:HTTP error: 409 )?\[aborted\] (?:consistency_not_ready\b|minimum consistency token is not yet visible\b)/i;
 const RETRYABLE_PROOF_ERROR =
-    /tx_meta missing|tx digest .* (missing at height|is not finalized yet)|finalization missing|QMDB transaction proof response missing|out_of_range|unavailable|aborted|consistency_not_ready|fetch/i;
+    /tx_meta missing|tx digest .* (missing at height|is not finalized yet)|finalization missing|QMDB transaction proof response missing|out_of_range|unavailable|fetch/i;
 
 const RETRYABLE_ACCOUNT_PROOF_ERRORS = [
     /consistency_not_ready/,
@@ -19,26 +32,30 @@ const ACCOUNT_RETRY_MAX_DELAY_MS = 2_000;
 
 type RetryWait = (delayMs: number, signal: AbortSignal) => Promise<void>;
 
-export function isRetryableProofError(detail: string): boolean {
-    return RETRYABLE_PROOF_ERROR.test(detail);
+export function isRetryableProofError(error: unknown): boolean {
+    return isConsistencyNotReadyError(error) || RETRYABLE_PROOF_ERROR.test(errorDetail(error));
 }
 
 export function isMissingAccountProofError(detail: string): boolean {
     return /^account .+ is not indexed$/.test(detail);
 }
 
-export function isRetryableSequenceConsistencyError(detail: string): boolean {
-    return detail.includes('consistency_not_ready');
+export function isRetryableSequenceConsistencyError(error: unknown): boolean {
+    return isConsistencyNotReadyError(error);
 }
 
-export function isRetryableAccountProofError(detail: string): boolean {
-    return RETRYABLE_ACCOUNT_PROOF_ERRORS.some((pattern) => pattern.test(detail));
+export function isRetryableAccountProofError(error: unknown): boolean {
+    const detail = errorDetail(error);
+    return (
+        isConsistencyNotReadyError(error) ||
+        RETRYABLE_ACCOUNT_PROOF_ERRORS.some((pattern) => pattern.test(detail))
+    );
 }
 
 export async function retryAccountWork<T>(
     run: () => Promise<T>,
     signal: AbortSignal,
-    isRetryable: (detail: string) => boolean,
+    isRetryable: (error: unknown) => boolean,
     wait: RetryWait = waitForRetry,
 ): Promise<T> {
     let failures = 0;
@@ -48,14 +65,71 @@ export async function retryAccountWork<T>(
             return await run();
         } catch (error) {
             throwIfCancelled(signal);
-            const detail = error instanceof Error ? error.message : String(error);
-            if (!isRetryable(detail)) {
+            if (!isRetryable(error)) {
                 throw error;
             }
             await wait(retryDelay(failures), signal);
             failures += 1;
         }
     }
+}
+
+function isConsistencyNotReadyError(error: unknown): boolean {
+    const connectError = asConnectError(error);
+    if (connectError) {
+        return (
+            connectError.code === Code.Aborted &&
+            (connectError.rawMessage.toUpperCase().includes(CONSISTENCY_NOT_READY) ||
+                connectError.details.some(isConsistencyNotReadyDetail))
+        );
+    }
+    return SERIALIZED_CONSISTENCY_NOT_READY.test(errorDetail(error));
+}
+
+function asConnectError(error: unknown): ConnectError | undefined {
+    if (error instanceof ConnectError) return error;
+    if (
+        error instanceof HttpError &&
+        error.connectCode === Code.Aborted &&
+        error.cause instanceof ConnectError
+    ) {
+        return error.cause;
+    }
+    return undefined;
+}
+
+function isConsistencyNotReadyDetail(detail: unknown): boolean {
+    if (!isRecord(detail)) return false;
+
+    const descriptor = detail.desc;
+    const value = detail.value;
+    if (isRecord(descriptor) && descriptor.typeName === ERROR_INFO_TYPE && isRecord(value)) {
+        return isConsistencyNotReadyReason(value.reason);
+    }
+
+    if (detail.type !== ERROR_INFO_TYPE) return false;
+    if (isRecord(detail.debug) && isConsistencyNotReadyReason(detail.debug.reason)) return true;
+    return value instanceof Uint8Array && containsBytes(value, CONSISTENCY_NOT_READY_FIELD);
+}
+
+function isConsistencyNotReadyReason(reason: unknown): boolean {
+    return typeof reason === 'string' && reason.toUpperCase() === CONSISTENCY_NOT_READY;
+}
+
+function containsBytes(bytes: Uint8Array, expected: Uint8Array): boolean {
+    for (let start = 0; start <= bytes.length - expected.length; start++) {
+        if (expected.every((byte, offset) => bytes[start + offset] === byte)) return true;
+    }
+    return false;
+}
+
+function errorDetail(error: unknown): string {
+    if (typeof error === 'string') return error;
+    return error instanceof Error ? error.message : String(error);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+    return typeof value === 'object' && value !== null;
 }
 
 function retryDelay(failures: number): number {

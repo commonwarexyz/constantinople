@@ -1,11 +1,11 @@
-import { fromHex, toArrayBuffer } from './codec';
-import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
-import type { PublishedProofTarget } from './proofTarget';
+import { fromHex, toArrayBuffer } from './codec.ts';
+import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath.ts';
+import type { PublishedProofTarget } from './proofTarget.ts';
 import {
     BLOCK_META_HEIGHT,
     containingTransactionHeight,
     transactionHeightPredecessorQuery,
-} from './transactionHeight';
+} from './transactionHeight.ts';
 import {
     SqlClient,
     type CellValue,
@@ -45,7 +45,6 @@ const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
 const TX_META_BODY = 'body';
-
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -234,6 +233,7 @@ export async function fetchAccountTransactionsPage({
     cursor,
     mode = 'all',
     minSequenceNumber,
+    maxHeight,
     signal,
 }: {
     sqlUrl: string;
@@ -241,6 +241,7 @@ export async function fetchAccountTransactionsPage({
     cursor?: Uint8Array | null;
     mode?: AccountActivityMode;
     minSequenceNumber: bigint;
+    maxHeight: bigint;
     signal?: AbortSignal;
 }): Promise<AccountTransactionPage> {
     const accountBytes = parseAccountBytes(account);
@@ -250,6 +251,7 @@ export async function fetchAccountTransactionsPage({
         cursor ?? null,
         mode,
         minSequenceNumber,
+        maxHeight,
         signal,
     );
     const visible = rows.slice(0, ACCOUNT_PAGE_SIZE);
@@ -537,15 +539,16 @@ async function fetchFinalizedTransactionTarget(
     simplexVerificationMaterial: string,
     height: bigint,
     minSequenceNumber: bigint,
-    _signal?: AbortSignal,
+    signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
     const certificate = await simplex.getFinalizationByHeight(
         height.toString(),
         minSequenceNumber,
+        { signal },
     );
     if (!certificate) {
-        throw new Error(`finalization missing at height ${height}`);
+        throw new Error(`finalization missing at height ${height} while Simplex catches up`);
     }
     const target = await finalizedTargetFromCertificate(certificate);
     if (target.height !== height) {
@@ -706,6 +709,7 @@ async function fetchAccountActivityRows(
     cursor: Uint8Array | null,
     mode: AccountActivityMode,
     minSequenceNumber: bigint,
+    maxHeight: bigint,
     signal?: AbortSignal,
 ): Promise<DecodedRow[]> {
     const predicates = [
@@ -718,6 +722,7 @@ async function fetchAccountActivityRows(
     if (cursor) {
         predicates.push(activityCursorPredicate(decodeActivityCursor(cursor)));
     }
+    predicates.push(`${TX_ACTIVITY_HEIGHT} <= ${maxHeight.toString()}`);
 
     const result = await sqlQuery(
         sqlUrl,

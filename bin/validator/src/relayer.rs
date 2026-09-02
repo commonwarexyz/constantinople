@@ -210,9 +210,10 @@ async fn submit_transactions<St: Strategy>(
         return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
     };
     let max_batch_bytes = state.max_batch_bytes;
+    let work_size = body.len();
     let decoded = state
         .strategy
-        .spawn(move |_: St| {
+        .spawn(work_size, move |_: St| {
             let _permit = permit;
             decode_batch(&body, max_batch_bytes).map(|transactions| (body, transactions))
         })

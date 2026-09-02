@@ -509,9 +509,11 @@ mod tests {
 
     #[test]
     fn maximum_encoded_size_includes_block_framing() {
-        use commonware_consensus::types::coding::Commitment;
+        use commonware_consensus::types::coding::COMMITMENT_SIZE;
 
-        type ProductionBlock = Block<Commitment, ed25519::PublicKey, sha256::Sha256>;
+        type TestBlock = Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+
+        let production_commitment_overhead = COMMITMENT_SIZE - sha256::Digest::SIZE;
 
         let mut rng = StdRng::from_seed([11u8; 32]);
         let signer = ed25519::PrivateKey::random(&mut rng);
@@ -532,7 +534,7 @@ mod tests {
             context: Context {
                 round: Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
                 leader: signer.public_key(),
-                parent: (View::new(u64::MAX), Commitment::default()),
+                parent: (View::new(u64::MAX), sha256::Digest::EMPTY),
             },
             parent: sha256::Digest::EMPTY,
             height: u64::MAX,
@@ -542,15 +544,15 @@ mod tests {
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
         };
-        let block = ProductionBlock::new(header, vec![transaction]);
+        let block = TestBlock::new(header, vec![transaction]);
 
         assert_eq!(
-            block.encode_size(),
-            ProductionBlock::maximum_encoded_size(max_transaction_bytes)
+            block.encode_size() + production_commitment_overhead,
+            TestBlock::maximum_encoded_size(max_transaction_bytes) + production_commitment_overhead
         );
 
         assert_eq!(
-            ProductionBlock::maximum_encoded_size(16 * 1024 * 1024),
+            TestBlock::maximum_encoded_size(16 * 1024 * 1024) + production_commitment_overhead,
             17_005_785
         );
     }

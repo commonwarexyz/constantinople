@@ -23,12 +23,14 @@ that fits.
 | **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 | **Provable targets** | Height-ordered block digests under Store prefix `0x04` | Proof clients that need the newest finalized block covered by both QMDB publication boundaries. |
 
-All paths use the same exoware Store service. The owning secondary commits each
-`block_meta` row through an ordered metadata lane. It commits transaction
-lookup rows and both QMDB families through a bulk lane after that block's
-metadata row is durable. Consumers may therefore observe a block summary
-before its transaction and proof details. Simplex block and certificate
-artifacts use separate Store commits. QMDB uses Store prefixes `0x00` and `0x01`.
+All paths use the same exoware Store service. The owning secondary prepares the
+SQL rows and authenticated QMDB ranges for each finalized block, then commits
+the resulting data chunks. Once a contiguous prefix of blocks has completed,
+one publication barrier advances both QMDB watermarks and publishes the
+height-to-digest targets for that prefix. Simplex block and certificate
+artifacts use separate Store commits, but the durable queue entry remains
+unacknowledged until both publication paths complete. QMDB uses Store prefixes
+`0x00` and `0x01`.
 SQL table and index prefixes are owned by
 [`exoware-sql`'s `KvSchema`][kvschema].
 The current SQL table-prefix allocation is:
@@ -66,10 +68,10 @@ is at or below `tx_meta.qmdb_location` immediately precedes the containing
 block. A missing predecessor identifies genesis. The reverse lookup starts at
 the newest height and avoids a scan from genesis for recent transactions.
 
-Proofs become queryable once an inline or later grouped watermark covers the
-upload that carried the transaction. The publisher writes an append-only
-provable target in the same Store batch that establishes coverage in both QMDB
-families. Its big-endian height key makes one reverse range read return the
+Proofs become queryable once a grouped publication barrier covers the upload
+that carried the transaction. The publisher writes append-only publication
+targets in the same Store batch that establishes coverage in both QMDB
+families. Their big-endian height keys make one reverse range read return the
 newest covered block digest.
 
 The explorer uses that range read only to initialize or recover its direct
@@ -96,12 +98,13 @@ the full body only when requested.
   with finalized headers, and uploads `exoware-simplex` proof artifacts to the
   shared Store.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
-  on the single owning secondary. It commits `block_meta` first, then commits
-  transaction lookup rows and both QMDB families through the gated bulk lane.
+  on the single owning secondary. It commits SQL and authenticated QMDB data,
+  then publishes only the contiguous completed prefix through one barrier.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
   storage and SQL transaction lookup rows. Digest lookups combine `tx_meta`
-  with `block_meta` and expose the finalized height, QMDB location, and
-  signed body through `TransactionMetadata`.
+  with `block_meta` under the publication target's Store sequence floor, then
+  expose the finalized height, QMDB location, and signed body through
+  `TransactionMetadata`.
   Latest-finalized-height is derived from the Simplex finalization height index.
 - `[[bin]] chain-indexer` — thin wrapper around `exoware_simulator::server::run`
   for local development and deployer-managed remote bundles.
@@ -119,18 +122,16 @@ The target architecture for replacing cursor-driven publisher recovery with
 authenticated absolute ranges is specified in
 [`DURABLE_QUEUE.md`](DURABLE_QUEUE.md).
 
-The finalized hook runs after finalized database application and before prune.
-It writes a durable finalized upload queue entry before returning to consensus.
-That entry is deliberately the pre-prune boundary: it contains the finalized
-block, finalized timestamp, QMDB writer start cursors, and the account-state delta
-that must be read while the local QMDB can still prove the finalized range.
-The writer end cursors are derived from the block header and start cursors.
+The application captures owned authenticated range artifacts before applying a
+winning batch. The finalized hook combines those artifacts with the finalized
+block and exact finalization certificate, then writes a durable queue entry
+before returning. The queue entry also records the metadata encoder version so
+replay produces the same rows after an encoder change.
 
-The background uploader derives both persistence lanes from that durable
-entry. The metadata lane commits `block_meta` in queue order. The bulk lane
-derives transaction lookup rows, QMDB operations, account metadata rows, and
-watermarks. A bulk Store commit waits for its block's metadata signal. This
-keeps SQL-row encoding off the durable queue write path while still making
+The background uploader derives SQL rows and authenticated QMDB writes from the
+queue entry. Uploads may complete concurrently, but publication barriers and
+queue acknowledgements advance only through the contiguous completed prefix.
+This keeps SQL-row encoding off the finalized application path while making
 recovery independent from local database pruning.
 
 Remote Store commits retry indefinitely with a capped exponential backoff using

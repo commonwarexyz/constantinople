@@ -13,14 +13,14 @@ use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Writ
 use commonware_consensus::{
     Block, Heightable, Reporter,
     simplex::{self, types::Activity},
-    types::{Height, coding::Commitment},
+    types::Height,
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_runtime::{
     Metrics as RuntimeMetrics,
     telemetry::metrics::{Gauge, Histogram, MetricsExt as _},
 };
-use constantinople_engine::types::{EngineBlock, EngineHeader};
+use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
 use exoware_sdk::StoreWriteBatch;
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::{collections::VecDeque, sync::Arc, time::Instant};
@@ -107,10 +107,21 @@ impl SimplexUploadMetrics {
     }
 }
 
-/// The Simplex uploader stopped before accepting or persisting a block.
+/// The Simplex uploader stopped before accepting or persisting an upload.
 #[derive(Debug, thiserror::Error)]
 #[error("Simplex certificate uploader stopped")]
 pub struct CertificateUploaderStopped;
+
+/// Failure to submit a finalized block for durable upload.
+#[derive(Debug, thiserror::Error)]
+pub enum PublishFinalizedBlockError {
+    /// The finalization certifies a different Constantinople block.
+    #[error("Simplex finalization commitment does not embed the block seal")]
+    CommitmentBlockMismatch,
+    /// The background uploader stopped before accepting the finalized block.
+    #[error(transparent)]
+    UploaderStopped(#[from] CertificateUploaderStopped),
+}
 
 /// Completion signal for a digest-addressed Simplex block upload.
 pub struct BlockUploadCompletion {
@@ -119,6 +130,19 @@ pub struct BlockUploadCompletion {
 
 impl BlockUploadCompletion {
     /// Wait until the block upload has been marked persisted.
+    pub async fn wait(self) -> Result<(), CertificateUploaderStopped> {
+        self.rx.await.map_err(|_| CertificateUploaderStopped)
+    }
+}
+
+/// Completion signal for an exact finalized block upload.
+#[must_use = "persistence is not complete until this completion resolves"]
+pub struct FinalizedBlockUploadCompletion {
+    rx: oneshot::Receiver<()>,
+}
+
+impl FinalizedBlockUploadCompletion {
+    /// Wait until the block and its exact finalization are durable.
     pub async fn wait(self) -> Result<(), CertificateUploaderStopped> {
         self.rx.await.map_err(|_| CertificateUploaderStopped)
     }
@@ -179,6 +203,30 @@ where
         enqueue_input(&self.tx, &self.metrics, input).await?;
         Ok(BlockUploadCompletion { rx })
     }
+
+    /// Queue a block and its exact finalization for one durable Store commit.
+    pub async fn publish_finalized_block(
+        &self,
+        block: Arc<EngineBlock<H, P>>,
+        finalization: simplex::types::Finalization<S, EngineCommitment<H, P>>,
+    ) -> Result<FinalizedBlockUploadCompletion, PublishFinalizedBlockError>
+    where
+        H: Hasher,
+        P: PublicKey,
+    {
+        if finalization.proposal.payload.block() != *block.seal() {
+            return Err(PublishFinalizedBlockError::CommitmentBlockMismatch);
+        }
+
+        let (completion, rx) = oneshot::channel();
+        let input = QueuedSimplexInput::new(SimplexInput::FinalizedBlock {
+            block,
+            finalization,
+            completion,
+        });
+        enqueue_input(&self.tx, &self.metrics, input).await?;
+        Ok(FinalizedBlockUploadCompletion { rx })
+    }
 }
 
 impl<H, P, S> Clone for CertificateReporter<H, P, S>
@@ -201,10 +249,10 @@ where
     P: PublicKey + Send + Sync + 'static,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
-    simplex::types::Notarization<S, Commitment>: Send,
-    simplex::types::Finalization<S, Commitment>: Send,
+    simplex::types::Notarization<S, EngineCommitment<H, P>>: Send,
+    simplex::types::Finalization<S, EngineCommitment<H, P>>: Send,
 {
-    type Activity = Activity<S, Commitment>;
+    type Activity = Activity<S, EngineCommitment<H, P>>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         match activity {
@@ -299,8 +347,13 @@ where
         block: Arc<EngineBlock<H, P>>,
         completion: oneshot::Sender<()>,
     },
-    Notarization(simplex::types::Notarization<S, Commitment>),
-    Finalization(simplex::types::Finalization<S, Commitment>),
+    FinalizedBlock {
+        block: Arc<EngineBlock<H, P>>,
+        finalization: simplex::types::Finalization<S, EngineCommitment<H, P>>,
+        completion: oneshot::Sender<()>,
+    },
+    Notarization(simplex::types::Notarization<S, EngineCommitment<H, P>>),
+    Finalization(simplex::types::Finalization<S, EngineCommitment<H, P>>),
 }
 
 struct PendingBlockCertificates<H, P, S>
@@ -311,8 +364,8 @@ where
 {
     block: Option<Arc<EngineBlock<H, P>>>,
     block_persisted: Option<watch::Receiver<bool>>,
-    notarization: Option<simplex::types::Notarization<S, Commitment>>,
-    finalization: Option<simplex::types::Finalization<S, Commitment>>,
+    notarization: Option<simplex::types::Notarization<S, EngineCommitment<H, P>>>,
+    finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
 }
 
 impl<H, P, S> Default for PendingBlockCertificates<H, P, S>
@@ -343,6 +396,10 @@ enum ReadyUploadKind {
         completion: oneshot::Sender<()>,
         queued_at: Instant,
     },
+    FinalizedBlock {
+        completion: oneshot::Sender<()>,
+        queued_at: Instant,
+    },
     Certificate {
         block_persisted: watch::Receiver<bool>,
     },
@@ -367,6 +424,22 @@ impl ReadyUpload {
         }
     }
 
+    const fn finalized_block(
+        prepared: PreparedUpload,
+        body_bytes: usize,
+        completion: oneshot::Sender<()>,
+        queued_at: Instant,
+    ) -> Self {
+        Self {
+            prepared,
+            body_bytes,
+            kind: ReadyUploadKind::FinalizedBlock {
+                completion,
+                queued_at,
+            },
+        }
+    }
+
     const fn certificate(prepared: PreparedUpload, block_persisted: watch::Receiver<bool>) -> Self {
         Self {
             prepared,
@@ -377,7 +450,7 @@ impl ReadyUpload {
 
     fn can_start(&self) -> bool {
         match &self.kind {
-            ReadyUploadKind::Block { .. } => true,
+            ReadyUploadKind::Block { .. } | ReadyUploadKind::FinalizedBlock { .. } => true,
             ReadyUploadKind::Certificate { block_persisted } => *block_persisted.borrow(),
         }
     }
@@ -445,6 +518,30 @@ where
     S::Certificate: Send + Sync,
 {
     let QueuedSimplexInput { queued_at, input } = queued;
+    let input = match input {
+        SimplexInput::FinalizedBlock {
+            block,
+            finalization,
+            completion,
+        } => {
+            let body_bytes = block.body.encode_size();
+            let commitment = finalization.proposal.payload;
+            let certified = CertifiedHeader::new(commitment, &block);
+            let finalized = Finalized::new(finalization, certified)
+                .expect("validated finalization must match its certified header");
+            let (header, body) = crate::simplex_block::encode_simplex_block_parts(&block);
+            let mut prepared = client.prepare_block(&header, body);
+            prepared.extend(
+                client
+                    .prepare_finalized(&finalized)
+                    .expect("validated finalization upload must prepare"),
+            );
+            return vec![ReadyUpload::finalized_block(
+                prepared, body_bytes, completion, queued_at,
+            )];
+        }
+        input => input,
+    };
     let key = input.block_digest_key();
     let entry = pending.entry(key.clone()).or_default();
     let mut ready = Vec::with_capacity(3);
@@ -465,6 +562,7 @@ where
         }
         SimplexInput::Notarization(notarization) => entry.notarization = Some(notarization),
         SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
+        SimplexInput::FinalizedBlock { .. } => unreachable!(),
     }
     let (certificates, finalized) = prepare_ready_certificates(client, entry);
     if !certificates.is_empty() {
@@ -501,7 +599,11 @@ fn spawn_upload(
             persisted,
             completion,
             queued_at,
-        } => (None, Some((persisted, completion, queued_at))),
+        } => (None, Some((Some(persisted), completion, queued_at))),
+        ReadyUploadKind::FinalizedBlock {
+            completion,
+            queued_at,
+        } => (None, Some((None, completion, queued_at))),
         ReadyUploadKind::Certificate { block_persisted } => (Some(block_persisted), None),
     };
     let mut batch = StoreWriteBatch::new();
@@ -522,10 +624,13 @@ fn spawn_upload(
             "simplex upload",
             &commit_metrics,
         )
-        .await;
+        .await
+        .expect("Simplex Store commit was rejected");
         let receipt = client.mark_upload_persisted(prepared, seq).await;
         if let Some((persisted, completion, queued_at)) = block_completion {
-            persisted.send_replace(true);
+            if let Some(persisted) = persisted {
+                persisted.send_replace(true);
+            }
             metrics
                 .block_persist_duration
                 .observe(queued_at.elapsed().as_secs_f64());
@@ -565,21 +670,23 @@ where
     fn block_digest_key(&self) -> Vec<u8> {
         match self {
             Self::Block { block, .. } => block.seal().as_ref().to_vec(),
+            Self::FinalizedBlock { block, .. } => block.seal().as_ref().to_vec(),
             Self::Notarization(notarization) => {
-                block_digest_key::<H>(&notarization.proposal.payload)
+                block_digest_key::<H, P>(&notarization.proposal.payload)
             }
             Self::Finalization(finalization) => {
-                block_digest_key::<H>(&finalization.proposal.payload)
+                block_digest_key::<H, P>(&finalization.proposal.payload)
             }
         }
     }
 }
 
-fn block_digest_key<H>(commitment: &Commitment) -> Vec<u8>
+fn block_digest_key<H, P>(commitment: &EngineCommitment<H, P>) -> Vec<u8>
 where
     H: Hasher,
+    P: PublicKey,
 {
-    commitment.block::<H::Digest>().as_ref().to_vec()
+    commitment.block().as_ref().to_vec()
 }
 
 /// Prepares the entry's ready certificates and reports when the entry is complete.
@@ -631,7 +738,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    commitment: Commitment,
+    commitment: EngineCommitment<H, P>,
     header: EngineHeader<H, P>,
 }
 
@@ -653,8 +760,8 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    fn new(commitment: Commitment, block: &EngineBlock<H, P>) -> Self {
-        debug_assert_eq!(commitment.block::<H::Digest>(), *block.seal());
+    fn new(commitment: EngineCommitment<H, P>, block: &EngineBlock<H, P>) -> Self {
+        debug_assert_eq!(commitment.block(), *block.seal());
         let header = EngineHeader::<H, P>::new_unchecked(block.header.clone(), *block.seal());
         Self { commitment, header }
     }
@@ -666,7 +773,7 @@ where
 
     /// Return the certified block digest embedded in the marshal commitment.
     pub fn block_digest(&self) -> H::Digest {
-        self.commitment.block::<H::Digest>()
+        self.commitment.block()
     }
 }
 
@@ -685,7 +792,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    type Digest = Commitment;
+    type Digest = EngineCommitment<H, P>;
 
     fn digest(&self) -> Self::Digest {
         self.commitment
@@ -731,9 +838,9 @@ where
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        let commitment = Commitment::read(buf)?;
+        let commitment = EngineCommitment::<H, P>::read(buf)?;
         let header = EngineHeader::<H, P>::read(buf)?;
-        if commitment.block::<H::Digest>() != *header.seal() {
+        if commitment.block() != *header.seal() {
             return Err(CodecError::Invalid(
                 "CertifiedHeader",
                 "commitment block digest does not match header",
@@ -746,6 +853,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use commonware_codec::Encode as _;
     use commonware_consensus::{
         simplex::{
             scheme::bls12381_threshold::standard,
@@ -761,7 +869,7 @@ mod tests {
     };
     use commonware_parallel::Sequential;
     use commonware_runtime::{Runner as _, Supervisor as _, telemetry::metrics::has_metric_value};
-    use commonware_utils::{NZU16, non_empty, non_empty_range};
+    use commonware_utils::{NZU16, non_empty_range};
     use constantinople_engine::ThresholdScheme;
     use constantinople_primitives::{
         Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
@@ -774,6 +882,7 @@ mod tests {
         ed25519::PublicKey,
         ThresholdScheme<ed25519::PublicKey, MinSig>,
     >;
+    type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
 
     #[test]
     fn block_completion_implies_store_persistence() {
@@ -832,6 +941,146 @@ mod tests {
             drop(reporter);
             uploader.await.expect("uploader exits cleanly");
             server.abort();
+        });
+    }
+
+    #[test]
+    fn finalized_block_completion_implies_exact_persistence() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::GatedIngestStore::open()
+                .await
+                .expect("spawn gated Store");
+            let (reporter, uploader) =
+                TestReporter::connect(&context.child("metrics"), &store.url, None, 1)
+                    .expect("reporter connects");
+            let block = test_block(1);
+            let digest = *block.seal();
+            let finalization = test_finalization(&block);
+            let (expected_header, expected_body) =
+                crate::simplex_block::encode_simplex_block_parts(&block);
+            let expected_block =
+                exoware_simplex::encode_block_data(&expected_header, &expected_body);
+            let expected = Finalized::new(
+                finalization.clone(),
+                CertifiedHeader::new(finalization.proposal.payload, &block),
+            )
+            .expect("finalization matches block")
+            .encode();
+
+            let completion = reporter
+                .publish_finalized_block(block, finalization)
+                .await
+                .expect("uploader accepts finalized block");
+            let mut wait = Box::pin(completion.wait());
+            store.wait_for_first_ingest().await;
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), wait.as_mut())
+                    .await
+                    .is_err(),
+                "completion resolved before Store persistence"
+            );
+            store.release_first_ingest();
+            wait.await.expect("finalized block upload completes");
+
+            let client = SimplexClient::new(
+                crate::namespaces::simplex_client(
+                    &crate::store_client(&store.url, None).expect("Store client builds"),
+                )
+                .expect("simplex namespace"),
+            );
+            assert_eq!(
+                client
+                    .get_block_raw(&digest)
+                    .await
+                    .expect("read uploaded block")
+                    .expect("block is persisted"),
+                expected_block
+            );
+            assert_eq!(
+                client
+                    .get_finalized_by_height_raw(Height::new(1))
+                    .await
+                    .expect("read uploaded finalization")
+                    .expect("finalization is persisted"),
+                expected
+            );
+            let encoded_metrics = context.encode();
+            assert!(
+                has_metric_value(&encoded_metrics, "store_commits_total", 1),
+                "{encoded_metrics}"
+            );
+
+            drop(reporter);
+            uploader.await.expect("uploader exits cleanly");
+            store.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn publish_finalized_block_rejects_commitment_mismatch() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (server, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let (reporter, uploader) =
+                TestReporter::connect(&context.child("metrics"), &url, None, 1)
+                    .expect("reporter connects");
+            let finalization = test_finalization(&test_block(2));
+
+            assert!(matches!(
+                reporter
+                    .publish_finalized_block(test_block(1), finalization)
+                    .await,
+                Err(PublishFinalizedBlockError::CommitmentBlockMismatch)
+            ));
+            let encoded_metrics = context.encode();
+            assert!(has_metric_value(&encoded_metrics, "queue_depth", 0));
+
+            drop(reporter);
+            uploader.await.expect("uploader exits cleanly");
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn publish_finalized_block_reports_stopped_uploader() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (reporter, uploader) =
+                TestReporter::connect(&context.child("metrics"), "http://127.0.0.1:1", None, 1)
+                    .expect("reporter connects");
+            uploader.abort();
+            let _ = uploader.await;
+            let block = test_block(1);
+            let finalization = test_finalization(&block);
+
+            assert!(matches!(
+                reporter.publish_finalized_block(block, finalization).await,
+                Err(PublishFinalizedBlockError::UploaderStopped(
+                    CertificateUploaderStopped
+                ))
+            ));
+        });
+    }
+
+    #[test]
+    fn finalized_block_completion_reports_stopped_uploader() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (reporter, uploader) =
+                TestReporter::connect(&context.child("metrics"), "http://127.0.0.1:1", None, 1)
+                    .expect("reporter connects");
+            let block = test_block(1);
+            let finalization = test_finalization(&block);
+            let completion = reporter
+                .publish_finalized_block(block, finalization)
+                .await
+                .expect("uploader accepts finalized block");
+            uploader.abort();
+            let _ = uploader.await;
+
+            assert!(matches!(
+                completion.wait().await,
+                Err(CertificateUploaderStopped)
+            ));
         });
     }
 
@@ -1129,7 +1378,7 @@ mod tests {
             context: SimplexContext {
                 round: Round::zero(),
                 leader,
-                parent: (View::zero(), Commitment::EMPTY),
+                parent: (View::zero(), TestCommitment::EMPTY),
             },
             parent: Sha256Digest::EMPTY,
             height,
@@ -1139,15 +1388,16 @@ mod tests {
             transactions_root: Sha256Digest::EMPTY,
             transactions_range: non_empty_range!(0, 2),
         };
-        Arc::new(Block::new(header, vec![transaction]).seal(&mut Sha256::default()))
+        let block = Block::new(header, vec![transaction]).seal(&mut Sha256::default());
+        Arc::new(EngineBlock::from(block))
     }
 
     fn test_finalization(
         block: &EngineBlock<Sha256, ed25519::PublicKey>,
-    ) -> Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, Commitment> {
+    ) -> Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, TestCommitment> {
         let mut rng = StdRng::from_seed([7; 32]);
         let fixture = standard::fixture::<MinSig, _>(&mut rng, b"indexer-test", 4);
-        let commitment = Commitment::from((
+        let commitment = TestCommitment::from((
             *block.seal(),
             Sha256Digest::EMPTY,
             Sha256Digest::EMPTY,
@@ -1166,7 +1416,9 @@ mod tests {
             .iter()
             .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("sign finalization"))
             .collect::<Vec<_>>();
-        Finalization::from_finalizes(&fixture.verifier, non_empty![@&finalizes], &Sequential)
+        let finalizes = commonware_utils::iter::NonEmpty::try_new(finalizes.iter())
+            .expect("test finalizations are non-empty");
+        Finalization::from_finalizes(&fixture.verifier, finalizes, &Sequential)
             .expect("assemble finalization")
     }
 }

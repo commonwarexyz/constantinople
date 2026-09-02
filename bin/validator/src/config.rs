@@ -313,7 +313,11 @@ fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
 
 fn load_validator_config(path: &Path) -> ValidatorConfig {
     let raw = std::fs::read_to_string(path).expect("failed to read config file");
-    serde_yaml::from_str(&raw).expect("failed to parse config")
+    let config: ValidatorConfig = serde_yaml::from_str(&raw).expect("failed to parse config");
+    if config.indexer.is_some() && config.startup == StartupModeConfig::StateSync {
+        panic!("indexer config cannot use state_sync startup");
+    }
+    config
 }
 
 fn parse_socket(name: &str, socket: &str) -> SocketAddr {
@@ -762,6 +766,23 @@ mod tests {
         }
     }
 
+    fn indexer_config(chain_indexer_url: &str) -> IndexerConfig {
+        IndexerConfig {
+            chain_indexer_url: chain_indexer_url.to_string(),
+            api_key: None,
+            upload_max_in_flight: default_upload_max_in_flight(),
+            upload_budget_bytes: default_upload_budget_bytes(),
+        }
+    }
+
+    fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
+        panic
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| panic.downcast_ref::<&str>().copied())
+            .expect("panic should carry a message")
+    }
+
     #[test]
     fn local_config_resolves_bootstrapper_peers() {
         let cluster = Cluster::new(2, 0);
@@ -1101,6 +1122,33 @@ hosts:
     }
 
     #[test]
+    fn local_config_rejects_indexer_with_state_sync() {
+        let cluster = Cluster::new(2, 1);
+        let config_path = temp_path("validator-config", ".yaml");
+        let peers_path = temp_path("missing-validator-peers", ".yaml");
+        let mut config = cluster.secondary_config(0, StartupModeConfig::StateSync, Vec::new());
+        config.indexer = Some(indexer_config("http://127.0.0.1:8090"));
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+
+        let panic = match std::panic::catch_unwind(|| load_local_config(&peers_path, &config_path))
+        {
+            Ok(_) => panic!("state sync indexer config should fail validation"),
+            Err(panic) => panic,
+        };
+
+        assert_eq!(
+            panic_message(panic.as_ref()),
+            "indexer config cannot use state_sync startup"
+        );
+
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
     fn deployer_config_resolves_named_chain_indexer_url() {
         let cluster = Cluster::new(2, 1);
         let self_key = &cluster.secondary_keys[0];
@@ -1118,10 +1166,8 @@ hosts:
             vec![bootstrapper_entry(primary0_key)],
         );
         config.indexer = Some(IndexerConfig {
-            chain_indexer_url: "http://chain-indexer:8090".to_string(),
             api_key: Some("writer-key".to_string()),
-            upload_max_in_flight: default_upload_max_in_flight(),
-            upload_budget_bytes: default_upload_budget_bytes(),
+            ..indexer_config("http://chain-indexer:8090")
         });
         fs::write(
             &config_path,
@@ -1162,6 +1208,33 @@ hosts:
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);
+    }
+
+    #[test]
+    fn deployer_config_rejects_indexer_with_state_sync() {
+        let cluster = Cluster::new(2, 1);
+        let config_path = temp_path("validator-config", ".yaml");
+        let hosts_path = temp_path("missing-validator-hosts", ".yaml");
+        let mut config = cluster.secondary_config(0, StartupModeConfig::StateSync, Vec::new());
+        config.indexer = Some(indexer_config("http://chain-indexer:8090"));
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+
+        let panic =
+            match std::panic::catch_unwind(|| load_deployer_config(&hosts_path, &config_path)) {
+                Ok(_) => panic!("state sync indexer config should fail validation"),
+                Err(panic) => panic,
+            };
+
+        assert_eq!(
+            panic_message(panic.as_ref()),
+            "indexer config cannot use state_sync startup"
+        );
+
+        let _ = fs::remove_file(config_path);
     }
 
     /// Secondary validator: empty `dkg_share` must decode to `None`.
@@ -1391,11 +1464,12 @@ hosts:
         let config_path = temp_path("validator-config", ".yaml");
         let peers_path = temp_path("validator-peers", ".yaml");
 
-        let config = cluster.secondary_config(
+        let mut config = cluster.secondary_config(
             0,
             StartupModeConfig::MarshalSync,
             vec![bootstrapper_entry(primary0_key)],
         );
+        config.indexer = Some(indexer_config("http://127.0.0.1:8090"));
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -1429,6 +1503,7 @@ secondaries:
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert_eq!(loaded.decoded.secondary_participants.len(), 1);
         assert!(loaded.decoded.secondary_participants.contains(self_key));
+        assert!(loaded.indexer.is_some());
         assert_eq!(
             loaded.decoded.listen_advertise,
             "127.0.0.1:9100".parse::<SocketAddr>().unwrap()

@@ -37,6 +37,7 @@ pub(crate) fn writer_store_client(
         .build()
 }
 
+#[cfg(test)]
 pub(crate) fn writer_store_clients(
     url: &str,
     api_key: Option<&str>,

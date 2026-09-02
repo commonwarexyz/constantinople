@@ -1,782 +1,719 @@
-# Indexer Durable Queue Redesign
+# Indexer Durable Queue
 
 | Item | State |
 | --- | --- |
-| Design status | Proposed target architecture |
-| Current implementation | Cursor-driven durable queue, called V1 below |
-| Target implementation | Authenticated absolute-range durable queue, called V2 below |
-| Primary owners | Constantinople indexer and Exoware QMDB |
+| Design | Locked |
+| Commonware prerequisite | Complete in `michael/qmdb-finalized-handoff` |
+| Exoware prerequisite | Complete in `michael/prepare-authenticated-range` at `93dd027` |
+| Constantinople implementation | Integrated and locally validated in `michael/indexer-durable-queue-redesign` |
+| Deployment | Fresh queue partition and fresh remote namespaces |
+| Dependency mode | Pinned Commonware and Exoware revisions |
+| Final simplification pass | Complete with fixed-point review and full local validation |
+| Production-shaped acceptance | Pending |
+| Dependency completion | Pending until Explorer sibling dependencies are immutably pinned and clean-install validation is complete |
 
-This document is the source of truth for the intended V2 architecture. The
-decisions in this document are the current design. Items under
-[Open questions](#open-questions) still need an explicit decision before
-implementation.
+This document is the live implementation tracker and source of truth for the
+durable queue. The architecture is settled. Items marked as remaining work are
+implementation, validation, rollout, or documentation tasks.
 
-## Decision
+## Locked outcome
 
-V2 replaces the cursor-driven queue of operations to append later with a queue
-of self-contained authenticated QMDB ranges whose absolute locations are
-already known.
+The redesign uses a fresh durable queue partition. It stores self-contained
+finalized block work with exact authenticated state and transaction ranges.
+There is no legacy migration, dual reader, queue conversion, writer-state
+conversion, or remote namespace continuation.
 
-The durable queue becomes the sole authority used to restart the publisher.
-Remote publication becomes at-least-once delivery. Restart replays every
-unacknowledged entry without first reconstructing mutable Exoware writer state.
-Replaying an entry derives the same logical Store keys and values.
+The local queue and one durable latest-capture receipt are the only publisher
+restart authorities. Remote QMDB writer state and remote watermark recovery are
+removed. Remote writes are immutable and safe to repeat. A same-key,
+different-value result is corruption, an encoder mismatch, or evidence of a
+second writer.
 
-This is not a proposal to store a bare Merkle proof. Each QMDB range must carry
-the exact encoded operations, absolute bounds, authenticated prefix frontier,
-and consensus-trusted result. Exoware must gain a stateless preparation API
-that validates this artifact and deterministically creates the physical QMDB
-rows.
+Commonware captures the exact winning artifacts before database apply and
+delivers them after successful application. Blocks reflected through recovery
+or state sync without applying their individual batches invoke neither hook.
+Constantinople does not reconstruct finalized operations from database history
+and does not treat Simplex observer correlation as authoritative.
 
-Operations may be prepared and persisted out of order. Published watermarks
-must still advance only across a contiguous durable prefix.
+Immutable data commits may finish out of order. One coordinator owns
+publication. It advances only through the complete contiguous queue prefix by
+atomically writing both QMDB watermarks and every covered height-to-digest
+publication target.
 
-## Motivation
+## Prerequisite status
 
-V1 solved two important production problems that remain part of V2.
+### Commonware
 
-- The durable queue captures finalized index material before the local QMDB can
-  prune it.
-- Byte-aware admission keeps an on-disk backlog from expanding into an
-  unbounded number of in-memory upload representations.
-- Queue acknowledgement waits for QMDB publication and digest-addressed
-  Simplex block persistence.
+Implementation is complete in `michael/qmdb-finalized-handoff` at
+`a44a32bf6e5b2f48791b874354dbd47fe3731174`.
 
-V1 still has two restart authorities.
+- `Application::capture_finalized` receives the exact winning merkleized
+  batches and pre-apply readers.
+- The processor captures the artifact before `DatabaseSet::apply` consumes the
+  batches.
+- `Application::finalized` receives the owned artifact and post-apply readers
+  after successful application.
+- Both hooks run only for winning batches applied by the stateful actor, in
+  application order.
+- Compact keyless batches retain and hand off the exact operations that formed
+  the root, the range proof, and pinned prefix nodes.
 
-- The local queue owns the unpublished workload.
-- Remote Exoware watermarks and `WriterState` own the Merkle continuation
-  frontier.
+Validation completed for the current working tree.
 
-The publisher must reconstruct state and transaction `WriterState` values from
-Store, then reconcile both with one local queue entry. A production restart
-demonstrated that the two remote recoveries can observe different Store views.
-The resulting mixed cursor pair cannot be reconciled with the local queue and
-causes `WriterOutOfSync` failures even when the underlying QMDB data is not
-corrupt.
+- The combined Commonware storage and glue run passed 3,368 tests. The default
+  profile skipped 471 tests.
+- Focused cached winner, reconstructed winner, duplicate finalization, and
+  startup synchronization tests passed.
+- Focused compact keyless finalized-artifact tests passed for MMR and MMB.
+- Glue and storage Clippy checks passed with warnings denied.
+- Glue documentation, stability, formatting, and assigned-file diff checks
+  passed.
+- Independent review found no actionable defect in the final Commonware diff.
 
-V2 removes that reconciliation boundary. Absolute authenticated ranges contain
-everything needed to recreate their remote rows. Mutable remote writer state is
-no longer required input for restart or preparation.
+Both Exoware and Constantinople pin this Commonware revision.
 
-## Goals
+### Exoware
 
-- Make the local durable queue the publisher's only restart authority.
-- Make every remote write safe to repeat after an ambiguous result or crash.
-- Remove producer cursor metadata and remote `WriterState` recovery from the V2
-  steady-state path.
-- Allow independent QMDB range verification and preparation.
-- Allow Store persistence to overlap without publishing across a gap.
-- Preserve bounded memory and disk-backed backpressure.
-- Preserve the pre-prune durability boundary.
-- Preserve ordered `block_meta` publication.
-- Acknowledge a queue entry only after every required destination is durable.
-- Detect malformed or contradictory artifacts before staging remote writes.
-- Make queue and row encodings safe across binary upgrades.
+Implementation is complete in `michael/prepare-authenticated-range` at
+`93dd027`.
 
-## Non-goals
+- Stateless authenticated-range preparation remains generic across ordered,
+  unordered, immutable, and keyless QMDB variants.
+- The borrowed API accepts a start, exact operation bytes, proof, pins, and a
+  caller-trusted root. The proof leaf count supplies the exclusive end.
+- Validation binds the artifact to the trusted root, checks proof and pins,
+  rejects noncanonical operation encodings, enforces terminal commit rules,
+  and reconstructs the expected Merkle result.
+- Preparation validates exact operation bytes in operation rows and emits
+  deterministic absolute logical rows. Authenticated prefix pins are emitted
+  as node rows so a nonzero suffix is independently readable in an empty
+  namespace.
+- Staging consumes the prepared rows and returns an opaque publication
+  capability. The capability carries the exact presence row and watermark
+  derived from the verified range. A caller cannot publish an arbitrary raw
+  location.
+- Store write batches split deterministically by physical row count and
+  materialized byte size before upload.
+- Preparation does not allocate dispatch identifiers, inspect pending
+  acknowledgements, recover a writer, or choose a publication frontier.
 
-- V2 does not remove QMDB operation locations. It makes them immutable entry
-  data instead of mutable writer state.
-- V2 does not eliminate QMDB row construction. Exoware must still create
-  operation, update, presence, Merkle node, and watermark rows.
-- V2 does not make watermarks unordered.
-- V2 does not by itself give the explorer a fixed finalization-to-display
-  latency. Metadata and QMDB still share a globally ordered Store stream.
-- V2 does not solve a stall before the application finalized hook runs.
-- V2 does not recover acknowledged history after remote Store data loss. The
-  queue is a publication journal, not a permanent backup of pruned entries.
-- V2 does not support multiple publishers for one QMDB namespace.
-- V2 does not migrate an existing V1 queue, uploader, or Store namespace. It is
-  enabled only on fresh networks.
+Independent fixed-point review found no actionable defect in the current
+implementation. The branch includes MMR and MMB authenticated-range coverage,
+established builder parity checks, tamper rejection, namespaced staging
+coverage, and delayed subscription publication coverage. Operation-only Store
+frames remain pending until covering presence and watermark rows arrive. They
+are released in Store sequence order with a proof read floor that includes the
+publication barrier. The full QMDB suite and strict all-target QMDB Clippy pass
+against the local Commonware dependency.
 
-## V1 architecture
+### Constantinople
 
-The current queue payload contains:
+Core integration is complete in `michael/indexer-durable-queue-redesign`.
 
-- The finalized block.
-- The local finalization timestamp.
-- The next state QMDB operation location to capture.
-- The next transaction QMDB operation location to capture.
-- The state operations that may become unavailable after pruning.
+Production-shaped acceptance is pending. The local validation evidence below does
+not establish production-shaped backlog behavior or deployment readiness.
 
-Transaction operations, SQL rows, Exoware QMDB rows, and watermarks are derived
-after queue admission. The queue stores state operations but discards the
-historical proof used to retrieve them.
+The uncommitted working tree contains the following pieces.
 
-```mermaid
-flowchart LR
-    F[Finalized hook] --> C[Local producer cursor pair]
-    C --> Q[Durable V1 queue entry]
-    Q --> A[Byte-aware admission]
-    R[Remote state and transaction WriterState recovery] --> X[Exact cursor reconciliation]
-    A --> X
-    X --> P[Mutable-frontier QMDB preparation]
-    P --> S[Store persistence]
-    S --> W[Contiguous watermarks]
-    A --> M[Ordered block metadata]
-    A --> B[Simplex block upload]
-    W --> D[Queue completion]
-    M --> D
-    B --> D
-    D --> K[Queue ack and sync]
-```
+- Application integration captures state and compact transaction artifacts
+  through the new Commonware two-stage finalized handoff.
+- A queue payload records the frozen identities, full block, exact
+  finalization, timestamp, and both authenticated ranges.
+- Queue reads retain raw bytes until byte admission allows structured decode.
+- A stateless publisher prepares SQL and both QMDB ranges, allows per-entry data
+  commits to finish out of order, and publishes a contiguous prefix through one
+  coordinator.
+- Data rows are committed in deterministic chunks capped at 100,000 physical
+  rows and 32 MiB of materialized Store data. Presence rows remain private
+  until the final publication barrier.
+- The barrier batch contains the paired QMDB watermarks and height-to-digest
+  publication targets.
+- A durable latest-capture receipt and post-receipt consumer admission gate are
+  integrated in the validator.
+- Validator configuration rejects an indexer combined with `StateSync` before
+  runtime work starts.
+- The queue consumer uploads the digest-addressed block and exact archived
+  finalization as one required completion gate.
+- Recovery validates queue positions, heights, digests, and adjacent range
+  continuity before admission. It repairs a receipt behind the queue tail and
+  rejects a receipt ahead of a nonempty queue.
+- Consumer completion, acknowledgement, sync, and pruning advance only across
+  the fully complete contiguous queue prefix.
+- The Rust indexer client exposes publication targets with the Store sequence
+  at which they were observed.
+- Typed Rust transaction reads use an unseeded `tx_meta.height` only as a hint.
+  They require the exact publication target and reread the canonical `tx_meta`
+  row through a DataFusion context seeded at the target Store sequence.
+- The canonical `tx_meta` row contains digest, height, QMDB location, and body.
+  There is no `tx_proof_meta` sidecar or legacy fallback.
+- Explorer target subscription and read-floor integration covers block,
+  transaction, account, Simplex, SQL, and both QMDB read paths.
+- Durable queue codecs are available only for SHA-256, matching the frozen
+  hasher identity written into every queue frame.
 
-V1 already has useful foundations that V2 keeps.
+The branch pins Commonware and Exoware to immutable revisions. Full workspace
+tests, lint, build, explorer tests, and the explorer production build pass. The
+final three-repository review found no remaining actionable defect.
 
-- Disk entries remain raw bytes until byte admission succeeds.
-- Admission charges encoded size at an amplification factor.
-- One oversized entry acquires the whole budget and runs alone.
-- The non-cloneable reservation remains alive through remote persistence,
-  queue acknowledgement, and queue sync.
-- The consumer keeps polling completed tasks while the queue head waits for
-  capacity.
-- `block_meta` persists in queue order before the matching QMDB watermark can
-  become visible.
-- State and transaction Store commits can overlap, while watermark publication
-  follows a contiguous prefix.
+Validation completed for the integrated local trees.
 
-The Rust ownership pattern behind the memory bound is RAII. Each active task
-owns one `UploadReservation`. Dropping the reservation releases its semaphore
-capacity on success, cancellation, or panic. V2 should preserve that single
-owner rather than manually balancing acquire and release calls.
+- Constantinople `just test` passed all 300 selected tests. Two tests were
+  skipped by the configured nextest profile.
+- Constantinople `just lint`, `just fmt-check`, and `just build` passed.
+- Explorer tests passed all 71 tests and the Vite production build completed.
+- Exoware QMDB, SDK, and SQL Rust suites and strict all-target Clippy passed.
+  The Exoware SDK passed all 64 TypeScript tests, TypeScript lint, and its
+  production build.
+- Commonware storage and glue tests, strict Clippy, documentation, stability,
+  and formatting checks passed as recorded above.
 
-## V2 queue entry
+## Queue item contract
 
-The wire type will be versioned. The following structs are conceptual. They do
-not prescribe final Rust names.
+Every item is self-contained. It stores all data needed to regenerate the same
+SQL and QMDB writes after a restart or binary upgrade.
 
-```rust
-struct DurableIndexEntryV2<D> {
-    format_version: u16,
-    row_layout_version: u16,
-    height: u64,
-    block: Bytes,
-    finalized_at_micros: i64,
-    state: AuthenticatedRange<D>,
-    transactions: AuthenticatedRange<D>,
-    metadata: CanonicalMetadataRows,
-}
+| Field | Required meaning |
+| --- | --- |
+| Queue magic and format version | Select the queue decoder |
+| Row layout version | Select the Exoware logical row layout |
+| Metadata encoder version | Select the only SQL encoder allowed for replay |
+| Hasher identity | Select the digest and leaf hashing rules |
+| Merkle family identity | Select proof, pin, and node layout rules |
+| State QMDB kind | Identify the unordered state artifact |
+| Transaction QMDB kind | Identify the keyless transaction artifact |
+| State operation codec | Decode and re-encode exact state operation bytes |
+| Transaction operation codec | Decode and re-encode exact transaction operation bytes |
+| Full block | Supply the digest-addressed block and canonical metadata inputs |
+| Exact finalization certificate | Prove finality for this exact block commitment |
+| Finalized timestamp | Reproduce timestamped metadata |
+| State authenticated range | Supply exact operations, proof, pins, start, and end |
+| Transaction authenticated range | Supply exact operations, proof, pins, start, and end |
 
-struct AuthenticatedRange<D> {
-    kind: QmdbKind,
-    merkle_family_version: u16,
-    hasher_id: u16,
-    start: u64,
-    end: u64,
-    proof_target_end: u64,
-    operation_root: D,
-    operation_root_witness: Option<Bytes>,
-    proof: Bytes,
-    pinned_nodes: Vec<D>,
-    encoded_operations: Vec<Bytes>,
-    operation_codec_version: u16,
-}
-```
+Each range uses half-open bounds `[start, end)`. The final inclusive QMDB
+location is `end - 1`. The proof targets `end` leaves. The number of encoded
+operations equals `end - start`.
 
-Ranges use half-open bounds `[start, end)`. The corresponding inclusive QMDB
-location is `end - 1`. Each artifact authenticates the operations introduced
-by one block against that block's result, so `proof_target_end` must equal
-`end`.
+The encoded operation bytes are canonical queue data. Validation may decode
+them to enforce QMDB-specific rules, but re-encoding must produce the same
+bytes. Leaf hashing, operation rows, proof verification, and replay all use the
+queued bytes.
 
-The exact encoded operation bytes are canonical. Proof verification, Merkle
-leaf hashing, operation rows, and replay all use those bytes. Typed operations
-may be decoded to derive update rows and validate the terminal `Commit` or
-`CommitFloor`, but re-encoding must equal the original bytes.
+The item stores canonical metadata inputs rather than duplicating every SQL
+row. Replay must select the item's `metadata_encoder_version`. An unsupported
+version fails before staging any write. Replay never falls back to the newest
+encoder in the running binary.
 
-`operation_root` authenticates the encoded operations and pinned nodes. It is
-not independently trusted. The validator must either match it directly to the
-root in the finalized block header or verify `operation_root_witness` from it
-to that header root. A proof that is internally consistent with an untrusted
-embedded root is insufficient.
+## Finalized capture and producer ordering
 
-`CanonicalMetadataRows` contains the versioned logical metadata that the entry
-must publish. It includes the `block_meta` fast-lane row and the bulk SQL rows.
-The final representation may store encoded logical rows or the canonical inputs
-for a frozen versioned encoder. It must not silently adopt the current binary's
-latest schema while replaying an older entry.
+The producer follows one ordered path.
 
-The entry continues to carry the full block needed for digest-addressed Simplex
-storage. Simplex certificate artifacts remain owned by the separate consensus
-activity path.
+1. Commonware calls `capture_finalized` with the exact winning batches and
+   pre-apply readers.
+2. Constantinople takes ownership of both operation vectors, proofs, and pins.
+3. Commonware applies the winning batches.
+4. Commonware delivers the captured artifact and post-apply readers.
+5. Constantinople obtains the exact height finalization certificate from the
+   durable marshal archive and verifies that its payload commits to the block.
+6. Under the producer lock, Constantinople checks the next block height and
+   requires both range starts to equal the previous receipt's ends.
+7. The producer durably enqueues the complete queue item.
+8. The producer writes and syncs one atomic latest-capture receipt containing
+   height, block digest, state end, and transaction end.
+9. Only after receipt sync does the producer open that queue position to
+   consumer admission.
+10. The finalized hook returns only after the durable capture boundary is
+    complete.
 
-## Finalized artifact handoff
+The latest-capture receipt is minimal producer deduplication state. It is not a
+remote writer cursor, an upload completion marker, or publication authority.
+It remains durable after older queue items are acknowledged and pruned.
 
-The finalized handoff must provide the exact operation range introduced by the
-block. Block header range starts cannot be used for this purpose. They describe
-the retained range from an inactivity floor, not the base of the block's new
-operations.
+Blocks reflected through startup recovery, duplicate delivery, or state sync
+without applying their individual batches invoke neither hook. Genesis also
+invokes neither hook. The first captured batch is height one. A crash after a
+hook completes but before the node durably records the application may cause
+that batch to be applied and delivered again. A redelivery within the durable
+captured prefix completes without another enqueue.
 
-The preferred handoff exposes the merkleized batch base and authenticated range
-material that execution already computed. Finalization should seal and enqueue
-an existing artifact rather than regenerate a large proof on its latency path.
-
-The account-state QMDB can currently provide historical operations, a range
-proof, and pinned nodes before pruning. The transaction QMDB is compact and
-discards historical operations. A complete V2 handoff therefore needs to
-capture the transaction operations and proof material during execution or pass
-the merkleized transaction batch to finalization.
-
-The finalized hook must not return until the V2 entry is durable. Once it
-returns, local pruning may discard everything not retained in the entry.
-
-V2 removes the separate finalized cursor metadata partition. The operation
-bounds in each entry come from the finalized artifact itself, not from the end
-of the previous queued entry.
+Indexer-enabled peer state sync is unsupported. Startup rejects any
+configuration that combines the indexer with `StateSync`. An indexing node
+must process every finalized block from genesis so it can capture each exact
+authenticated range.
 
 ## Artifact validation
 
-The consumer validates an admitted entry before producing any Store rows.
+The producer validates enough structure to reject an impossible queue item.
+The consumer validates the admitted encoded item again before staging Store
+writes.
 
-For each QMDB range it must verify:
+For both QMDB ranges, validation must establish the following facts.
 
-1. The entry, row layout, operation codec, Merkle family, and hasher versions
-   are supported.
-2. `start < end` and checked range arithmetic succeeds.
+1. Every frozen format and encoder identity is supported.
+2. `start < end` and all range arithmetic is checked.
 3. `start + encoded_operations.len() == end`.
-4. The proof target equals `end` and is structurally consistent with the
-   proof's leaf count.
-5. The exact operation bytes and every pinned node verify against the embedded
-   operation root.
-6. The embedded operation root or its witness resolves to the trusted root from
-   the finalized block header.
-7. Extending the pinned prefix with the exact operations produces the expected
-   size and root.
-8. The last state operation is a valid `CommitFloor` and the last transaction
-   operation is a valid `Commit`.
-9. The inactivity information derived from the terminal operation is
-   consistent with the proof.
-10. The state artifact is assigned to the state namespace and the transaction
-    artifact is assigned to the transaction namespace.
+4. The proof leaf count equals `end`.
+5. The capture-time artifact root equals the finalized block header root.
+6. The queued end equals the corresponding finalized block header end.
+7. The exact operation bytes, proof, and pins authenticate the header root.
+8. Extending the pinned frontier with the operations produces the expected size
+   and root.
+9. Every operation is canonically encoded for the frozen operation codec.
+10. The state range contains exactly one terminal `CommitFloor` with a valid
+    floor.
+11. The transaction range contains exactly one terminal `Commit`.
+12. The QMDB kind and namespace assignment match the state or transaction role.
+13. The exact finalization certificate commits to the queued block digest.
 
-Exoware's existing `OperationRangeCheckpoint` is close to the desired artifact,
-but its current `verify` method is not the complete V2 validator. It authenticates
-operations and pins against the root inside the checkpoint. It does not bind the
-checkpoint watermark or verify the optional operation-root witness. V2 must
-perform the full structural and trusted-root checks above.
+The block header start is the inactivity-floor boundary. It is not the exact
+operation-batch start and is not used for queue continuity. The authenticated
+range start comes from the captured winning batch. The producer and recovery
+paths require that exact start to equal the prior durable range end.
 
-A validation failure is deterministic corruption or an unsupported format. It
-is not a transient Store error. The supervised indexer must fail without
-acknowledging the queue entry.
+A deterministic validation failure is corruption or an unsupported binary. It
+fails the supervised indexer and leaves the item unacknowledged.
 
-## Exoware absolute-range API
+## Stateless Exoware preparation
 
-V2 requires a stateless proof-aware preparation API. A conceptual shape is:
+The consumer passes each validated range to the frozen Exoware preparation
+path. Preparation has no mutable continuation input.
 
-```rust
-fn prepare_authenticated_range(
-    range: VersionedAuthenticatedRange,
-    expected_root: Digest,
-    strategy: &impl Strategy,
-) -> Result<PreparedAbsoluteRange, QmdbError>;
-```
+- It receives the caller-trusted header root.
+- It verifies bounds, exact bytes, proof, pins, terminal operation, inactivity
+  state, computed size, and computed root.
+- It reconstructs Merkle state from the authenticated pinned prefix.
+- It emits deterministic absolute logical rows and authenticated prefix nodes.
+- It verifies that operation rows contain the queue-carried canonical bytes.
+- It returns staged data rows and an opaque publication capability derived
+  from the verified final location.
+- Sequential and parallel hashing must produce byte-identical rows.
+- Public staging applies the configured namespace prefix.
+- Publication staging emits the verified presence row and exact watermark.
 
-The API contract is:
+The publication path never constructs or recovers Exoware `WriterState`. It
+never reads a remote watermark to choose a start, skip a queue item, or rebuild
+a Merkle frontier.
 
-- It does not read or mutate `WriterState`.
-- It does not allocate a process-local dispatch ID.
-- It does not inspect pending acknowledgements.
-- It does not choose a publication watermark.
-- It validates the complete artifact against the caller-trusted root.
-- It extends Merkle state from the authenticated pinned prefix.
-- It preserves proof-carried operation bytes for leaf hashing and operation
-  rows.
-- It emits logical Store keys without applying a namespace prefix.
-- It emits rows in one documented canonical order.
-- It returns the absolute start, exclusive end, latest location, operation
-  counts, computed root, and deterministic rows.
-- The same input produces byte-identical output under sequential and parallel
-  hashing strategies.
+## Persistence and contiguous publication
 
-The current pure row builders can be refactored into this API. The current
-`WriterCore::prepare_upload` path cannot be reused unchanged because it assigns
-locations from mutable `next_location`, serializes builds through `build_gate`,
-and chooses watermarks from live dispatch state.
+After queue-order admission, each item may prepare and commit its immutable SQL
+and QMDB data independently. A later item's data commit may finish first. Its
+rows remain unpublished while an earlier item is incomplete.
 
-Preparation output must not contain schedule-dependent state such as dispatch
-IDs, Store sequence numbers, or a selected watermark.
-
-## Persistence and publication
-
-Range preparation and data persistence may happen independently. Publication
-remains coordinated.
+One logical data batch is split in physical staging order. Each Store request
+contains at most 100,000 rows and at most 32 MiB under Store's materialized
+entry accounting. Chunks commit sequentially for one item. A deterministic
+entry-size violation fails before the first request rather than retrying an
+unchanged rejected request. QMDB presence rows are held for the publication
+barrier, so no intermediate chunk advertises an incomplete range.
 
 ```mermaid
 flowchart LR
-    F[Finalized authenticated artifacts] --> Q[Durable V2 queue]
-    Q --> A[Byte admission and validation]
-    A --> SP[State range preparation]
-    A --> TP[Transaction range preparation]
-    SP --> SD[State rows durable]
-    TP --> TD[Transaction rows durable]
-    A --> MD[Metadata durable]
-    A --> SX[Simplex block durable]
-    SD --> C[Contiguous block publication coordinator]
-    TD --> C
-    MD --> C
-    C --> W[Atomic state and transaction watermarks]
-    W --> D[Entry remotely complete]
-    SX --> D
-    D --> K[Queue ack and sync]
+    A[Captured finalized artifact] --> Q[Durable queue]
+    Q --> R[Latest capture receipt synced]
+    R --> G[Consumer admission]
+    G --> V[Decode and validate]
+    V --> D[Immutable SQL and QMDB data commit]
+    D --> C[Single contiguous-prefix coordinator]
+    C --> B[Atomic paired watermarks and publication targets]
+    B --> X[Barrier Store sequence]
+    V --> S[Digest-addressed block and exact certificate]
+    X --> K[Contiguous completion]
+    S --> K
+    K --> P[Queue ack, sync, and prune]
 ```
 
-Each QMDB data upload contains its operation, update, Merkle node, and end
-presence rows. The presence row identifies one complete batch boundary. It does
-not make that range queryable and does not prove earlier ranges are present.
+Only one coordinator may publish for the two QMDB namespaces. It tracks queue
+order, height, block digest, both range bounds, and immutable data durability.
+It stops at the first missing or incomplete item.
 
-### Watermark representation
+For the largest newly complete prefix, the coordinator creates one atomic
+Store batch containing all of the following rows.
 
-A QMDB watermark is an append-only Store row inside one QMDB namespace. Its
-logical key is the reserved family byte `0x03` followed by the inclusive QMDB
-location encoded as a big-endian `u64`. Its value is empty. Big-endian encoding
-makes lexicographic key order match numeric location order, so a reverse prefix
-scan returns the greatest published location.
+- The state QMDB watermark at the last item's `state.end - 1`.
+- The transaction QMDB watermark at the last item's
+  `transactions.end - 1`.
+- The state and transaction presence rows paired with those watermarks.
+- One height-to-digest publication target for every newly covered block.
 
-The state and transaction QMDBs have separate namespace prefixes and therefore
-separate watermark keyspaces. The joint block barrier is not one shared scalar
-watermark. It is a pair of rows:
+Both QMDB watermarks and all covered publication targets become visible at one
+Store sequence. Intermediate watermark rows are unnecessary because each
+watermark authorizes the complete contiguous prefix through its inclusive
+location.
 
-- State watermark at `state.end - 1`.
-- Transaction watermark at `transactions.end - 1`.
+A failed or ambiguous barrier commit repeats the same keys and values. Older
+watermark rows remain in Store. Readers select the greatest published
+watermark, so replaying an older pair cannot lower the visible prefix.
 
-Both rows are staged in one atomic Store request. The Store sequence returned
-by that request is the shared publication receipt. Older watermark rows remain
-in Store. Publishing a later row advances the frontier because readers select
-the greatest key.
+## Downstream consistency
 
-The publication coordinator tracks durable half-open ranges by queue position
-and absolute bounds. It rejects overlaps, contradictory duplicates, and gaps.
-It may learn about later durable ranges first, but it advances only through the
-first complete contiguous prefix.
+The Store sequence returned by the barrier commit is the downstream
+lower-bound consistency token. It means that a read evaluated at or after that
+sequence can observe the paired watermarks and publication targets from the
+barrier.
 
-The publication barrier is a small atomic Store batch containing the state and
-transaction watermark rows for the highest block that is complete in both QMDB
-instances. This keeps the two reader surfaces aligned at block boundaries
-without forcing their expensive data preparation to run serially.
+The sequence is not an upper-bounded snapshot. Separate services or sessions
+may observe later data. Correct clients still bind the requested height to its
+published digest, obtain roots and ends from the certified block, request both
+QMDB proofs at those ends, and verify the proofs. Missing rows and a
+watermark-too-low response are retryable catch-up states.
 
-### Advancement algorithm
+QMDB readers authorize only the contiguous prefix at or below their published
+watermark. Data rows above the watermark are private staged data. Subscriptions
+may buffer those rows but cannot deliver them until a covering watermark is
+visible. Proof construction uses a Store read floor at least as high as the
+data and barrier sequences.
 
-For each queue entry, the coordinator records its block height, state and
-transaction bounds, and four readiness conditions. The required conditions are
-state rows durable, transaction rows durable, ordered `block_meta` durable, and
-bulk SQL durable. The final presence row is part of QMDB data durability.
+SQL rows may become physically durable before the barrier. A reader that claims
+a block is fully indexed must use the height-to-digest target and the barrier
+sequence. A fast `block_meta` row alone is not a completeness proof.
 
-Starting immediately after the last locally published queue position, the
-coordinator scans entries in queue order. It stops at the first entry that is
-not ready, whose start does not equal the preceding end in either QMDB, or
-whose bounds contradict an already recorded range. A ready entry after that
-gap remains durable but unpublished.
+Typed transaction metadata reads first query only `tx_meta.height` without a
+Store floor. That value is a lookup hint and grants no publication authority.
+The client then requires the exact target for that height and rereads digest,
+height, QMDB location, and body through a DataFusion context seeded at the
+target Store sequence. The reread height must equal the target height. The Store
+sequence remains a lower visibility bound and never acts as a snapshot ceiling.
 
-When one or more entries form a newly complete prefix, the coordinator takes
-the final entry in that prefix and performs one atomic Store request containing
-its two inclusive watermark rows. One request may therefore publish several
-blocks at once. Intermediate watermark rows are unnecessary because the final
-pair authorizes the complete prefix through both final locations.
+The final queue representation stores `EngineBlock` directly because the type
+already owns shared block data internally. The queued ranges omit duplicate
+roots and authenticate against the exact header roots. Exoware preparation
+borrows proof, pins, and operation bytes from the owned queue item. This removes
+deep clones while keeping those buffers alive through preparation. Persisted
+upload coordination retains only height and the two verified watermark
+capabilities.
 
-Only after Store acknowledges that request does the coordinator advance its
-local published position and resolve QMDB completion for every entry covered by
-the pair. A failed or ambiguous request repeats the same two keys and empty
-values. Repeating an older row cannot lower the visible frontier because
-readers continue to select the greatest watermark key.
+`account_meta` is append-only with primary key `(account, qmdb_location)`.
+Target-bound reads select the highest `qmdb_location` below `state_tip`. The
+Store sequence is only a lower visibility bound and does not define the selected
+state location.
 
-Simplex block persistence is not a prerequisite for watermark advancement.
-It remains a separate queue-completion gate. This allows QMDB and SQL
-publication to proceed while the Simplex upload finishes, but the local queue
-entry cannot be acknowledged until both paths complete.
+## Queue completion contract
 
-`block_meta` remains an ordered fast lane. Bulk SQL rows must be durable before
-the publication barrier covers their block. This preserves the current
-metadata-before-watermark contract and avoids exposing proofs for a block whose
-index metadata is incomplete.
+An item is complete only after every required output is durable and its queue
+position belongs to the contiguous completed prefix.
 
-The fast lane is intentionally provisional. A `block_meta` row may become
-visible before that block's bulk SQL rows, and later bulk SQL rows may become
-visible before earlier ones. V2 does not promise atomic SQL visibility or
-strict height ordering for detail rows. The joint state and transaction
-watermark barrier is the publisher's block-completeness fence. A reader that
-requires a fully indexed block must confirm that both of the block's exclusive
-range ends are covered by the joint barrier and must read at or after the
-barrier's Store sequence. The current split read APIs cannot perform both
-checks as one operation. V2 metadata must bind the block to both ends. It may
-store those ends directly or bind the block digest to a certified header that
-contains them. SQL-only endpoints that cannot apply the fence remain
-eventually consistent and must not present the fast-lane row as proof of full
-indexing.
+- All SQL metadata rows generated by the frozen metadata encoder.
+- All state QMDB rows.
+- All transaction QMDB rows.
+- The paired QMDB watermarks that cover the item.
+- The height-to-digest publication target for the item.
+- The digest-addressed full block.
+- The exact finalization certificate.
+- The successful barrier publication receipt.
+- Queue acknowledgement in order.
+- Queue sync and pruning in order.
 
-Data rows may be split into deterministic Store requests when one range is too
-large for the preferred request size. Chunks persist in a fixed order. The
-presence row is staged only in the final request after every earlier request is
-durable. No watermark may be published until the final request succeeds. V2
-must not reintroduce client-side batching across finalized blocks. Store
-sequencing and kv-mk1 ingest workers own backend batching.
+The upload reservation remains owned through acknowledgement and sync. Closed
+completion channels, worker exits, and join failures fail the supervised
+indexer. They must never leave the queue head waiting forever.
 
-The Store sequence that contains the watermark rows is the publication receipt.
-It is useful for telemetry and query read floors. It is not required to rebuild
-publisher state after restart.
-
-### Downstream visibility
-
-QMDB readers treat a watermark as authorization for the entire contiguous
-operation prefix from location zero through that inclusive location. Persisted
-rows above the watermark are implementation detail and must not be returned as
-published data.
-
-Point, range, root, and proof requests at a requested watermark first verify
-that the watermark has been published. A request above the latest published
-location fails with a watermark-too-low error. The absence of every watermark
-row is distinct from a published watermark at location zero.
-
-QMDB subscriptions may observe operation and presence rows before the matching
-watermark frame. They buffer those batches. A batch becomes eligible for
-delivery only after a watermark at or above its end location arrives. Proof
-construction then uses a Store read floor at least as high as both the data
-batch sequence and watermark publication sequence.
-
-The Constantinople QMDB service exposes operation-log proofs and subscriptions
-for account state under `/state` and transactions under `/transactions`. A
-unary operation-proof request supplies an explicit inclusive tip. The service
-does not currently provide a latest-watermark request mode. A request whose tip
-is ahead of the query replica's visible watermark fails and must be retried in
-a new request session.
-
-SQL and Simplex readers are not automatically fenced by QMDB watermarks.
-`block_meta` may advertise a finalized block before its detail rows become
-visible. Simplex may also expose its digest-addressed block on its independent
-path.
-
-The current explorer uses proof-directed eventual consistency. It obtains the
-state and transaction roots and exclusive ends from a certified Simplex
-header, obtains proof coordinates from SQL, and requests each QMDB proof at the
-corresponding inclusive tip. Missing SQL rows and watermark-too-low errors are
-retryable catch-up states. A proof or root mismatch is fatal.
-
-The atomic pair prevents the publisher from intentionally exposing one QMDB for
-a block without the other. It does not make separate downstream RPC sessions
-an exact cross-service snapshot. A Store sequence floor is a lower visibility
-bound, not an upper snapshot bound. Two unrelated sessions may still begin
-before and after the barrier.
-
-A consumer that requires a one-shot fully indexed result needs either one
-server-side Store view spanning SQL and both QMDB namespaces or a consistency
-token derived from the joint barrier sequence and accepted by every downstream
-read path. The empty watermark values do not encode that sequence, and the
-current split RPC services do not expose such a token.
-
-## Completion contract
-
-A V2 queue entry becomes complete only after:
-
-- Ordered `block_meta` persistence.
-- Bulk SQL row persistence.
-- State QMDB data persistence.
-- Transaction QMDB data persistence.
-- State and transaction watermarks covering the entry.
-- Digest-addressed Simplex block persistence.
-- Durable queue acknowledgement and queue sync.
-
-The upload reservation remains owned until acknowledgement and sync finish.
-Simplex certificate persistence remains outside this queue contract because
-certificates arrive through a different observer path.
-
-If a completion channel closes or a deterministic worker exits, the supervised
-indexer fails. It must not wait forever while retaining a reservation and
-blocking the queue head.
+The Simplex observer path may still report unrelated consensus activity. It is
+not the finalized queue completion authority. Block and exact certificate
+completion are driven from the pair stored in the queue item.
 
 ## Restart behavior
 
-V2 restart does not recover Exoware `WriterState` and does not use remote
-watermarks to decide whether a queue entry should be skipped.
+Restart uses only the durable queue and latest-capture receipt.
 
-1. Open the V2 queue.
-2. Replay every unacknowledged entry through byte admission.
-3. Validate and prepare each absolute range independently.
-4. Repeat the same logical Store writes.
-5. Publish watermarks only through the contiguous locally completed prefix.
-6. Acknowledge and sync entries after the full completion contract holds.
+1. Open the fresh queue partition and receipt partition.
+2. When a queue tail exists without a receipt, validate the configured remote
+   namespaces as fresh before repairing the receipt or opening admission.
+3. Scan the unacknowledged queue in order while respecting byte admission.
+4. Reconcile the queue tail with the durable receipt. Equal heights must match
+   exactly. A queue tail ahead of the receipt repairs and syncs the receipt
+   before admission opens. A receipt may remain after the queue becomes empty
+   through pruning and continues to define the producer boundary.
+5. Reject gaps, overlaps, contradictory duplicates, or unsupported formats.
+6. Replay every unacknowledged item through its frozen encoders.
+7. Repeat the same immutable SQL, QMDB, block, and certificate writes.
+8. Publish only the locally known complete contiguous prefix.
+9. Repeat the same atomic paired barrier when its prior result is ambiguous.
+10. Acknowledge, sync, and prune only the contiguous completed queue prefix.
 
-A crash after Store success but before queue acknowledgement repeats the same
-keys and values. A repeated watermark row cannot lower the published frontier
-because Exoware discovers the greatest watermark key.
+Startup never recovers a remote writer and never reads a remote watermark to
+decide progress. A barrier or data commit that succeeded before a crash is
+replayed idempotently.
 
-Remote watermark reads may remain as diagnostics. They are not required input
-for V2 progress.
+An empty first start does not block waiting for remote validation. The first
+finalized artifact validates the configured remote namespaces before its
+queue entry is durably enqueued or its receipt is synced.
 
-The one-writer-per-namespace rule remains. Deterministic replay does not make
-two independent publishers safe to race on publication policy.
+The queue is a publication journal. It is not a permanent backup after an item
+has been acknowledged and pruned. Remote Store loss after pruning requires a
+separate reindex plan.
 
-## Backpressure
+## Fresh deployment contract
 
-V2 keeps the current lazy queue codec and byte budget shape.
+The indexer is enabled only for a new network or a new index built from genesis.
 
-- One raw queue frame may exist outside admission.
-- Structured decode, proof validation, range preparation, staged rows, request
-  encoding, persistence waits, acknowledgement, and sync remain inside the
-  reservation lifetime.
-- One blocked queue head prevents later entries from bypassing it.
-- An oversized entry runs alone.
-- The count limit remains a secondary cap.
-- The consumer continues reaping completed tasks while waiting for capacity.
+- The queue and receipt partitions start empty.
+- The remote state and transaction QMDB namespaces start empty.
+- The publication-target namespace starts empty.
+- The first state and transaction artifacts both start at location one. The
+  canonical location-zero sentinel is authenticated by each range's prefix
+  frontier.
+- Startup does not inspect legacy queue, cursor, writer-state, or remote namespaces.
+- Existing deployments require a separate reindex design.
+- Unexpected data or watermarks in a fresh namespace are deployment errors.
+- One coordinator and one publisher own the namespace pair.
+- Indexer-enabled `StateSync` is rejected.
 
-Proofs, pins, and versioned metadata make V2 entries larger than V1 entries.
-The current eight-times amplification charge is only an initial estimate. A
-production-shaped heap profile must establish the V2 factor before rollout.
+## Backpressure and Rust ownership
 
-The queue is unbounded relative to memory, not relative to disk. Deployment
-alerts must cover queue bytes, oldest entry age, disk free space, and projected
-time to exhaustion.
+The queue keeps the current lazy codec and byte-aware admission model.
+
+- At most one raw queue frame exists outside the admitted budget.
+- Structured decode, proof validation, metadata encoding, QMDB preparation,
+  Store request construction, remote waits, queue acknowledgement, and sync all
+  remain inside the reservation lifetime.
+- A blocked queue head prevents later entries from bypassing admission order.
+- One oversized entry acquires the full budget and runs alone.
+- The active count remains a secondary cap.
+- Completed tasks are reaped while the queue head waits for capacity.
+
+The Rust mechanism is RAII. One non-cloneable `UploadReservation` owns an
+`OwnedSemaphorePermit`. Rust runs `Drop` on success, cancellation, unwind, or
+early return. Keeping one owner through queue sync makes the memory accounting
+follow the real lifetime without manual release calls.
+
+The finalized handoff uses `Arc<Vec<Operation>>`. Cloning an `Arc` copies a
+pointer and increments a reference count. It does not copy the operation
+vector. This lets Commonware consume the winning batch while Constantinople
+retains the exact operations long enough to encode the durable item.
+
+Proofs, pins, exact operations, the block, the certificate, and staged rows can
+amplify in-memory size well beyond the encoded frame size. Production-shaped
+heap profiling must set the final charge factor and concurrency before rollout.
 
 ## Encoding and upgrade policy
 
-V2 uses its own queue partition with an explicit magic value and format
-version. There is no V1 decoder, dual-read path, or in-place queue conversion.
+The queue has its own partition, magic, format version, and encoder identities.
+There is no legacy decoder.
 
-Every entry records enough identity to freeze deterministic replay:
+A binary may open a queue only when it retains every decoder, operation codec,
+row layout, and metadata encoder required by its unacknowledged items. An
+unsupported identity is a startup or admission failure. It cannot silently use
+the latest implementation.
 
-- Queue format version.
-- QMDB backend kind.
-- Merkle family and hasher identity.
-- Operation codec version.
-- Exoware row layout version.
-- Metadata schema or encoder version.
-
-Binaries that can open a V2 queue must retain the decoders and row encoders for
-every unacknowledged version they claim to support. An unsupported version is a
-startup error. It must not fall back to the latest encoder.
-
-The initial implementation should store versioned canonical logical artifacts,
-not fully prefixed physical Store keys. Exoware remains responsible for applying
-the configured namespace prefix during staging. Persisting fully prepared rows
-is a fallback only if golden tests cannot guarantee deterministic reconstruction
-across supported upgrades.
-
-`row_layout_version` identifies the encoder. It does not make incompatible row
-layouts safe inside one QMDB namespace. A future incompatible layout requires a
-new namespace and a separately designed network upgrade.
-
-## Deployment model
-
-V2 is a genesis-time choice for a new network. A network does not switch from
-V1 to V2 in place.
-
-- The V2 queue partition starts empty.
-- The remote state and transaction QMDB namespaces start empty and have no
-  watermark rows.
-- The first queued artifact starts at location zero for both QMDBs and carries
-  every genesis operation through its exclusive end.
-- The V2 row layout may be designed without preserving byte parity with V1.
-- Startup does not inspect V1 queue partitions, cursor metadata, writer state,
-  or remote V1 namespaces.
-- Existing V1 networks remain on their existing uploader unless a separate
-  reindex design is approved later.
-
-During initial network bootstrap, an unexpected pre-existing watermark or QMDB
-row in a fresh-network namespace is a deployment error. The publisher must not
-infer a continuation frontier from it.
+An incompatible future row layout requires a new QMDB namespace and a separate
+network upgrade design. A version number alone cannot make incompatible rows
+safe in one namespace.
 
 ## Failure handling
 
-| Failure | V2 behavior |
+| Failure | Required behavior |
 | --- | --- |
-| Invalid proof, bounds, root, or operation bytes | Fail the supervised indexer. Keep the entry unacknowledged. |
-| Unsupported entry or row version | Refuse startup or fail before staging writes. |
-| Transient Store failure | Retry or rebuild the same deterministic rows. |
-| Ambiguous Store result | Repeat the same deterministic rows. |
-| Later range finishes before an earlier range | Record durability. Do not advance the watermark across the gap. |
-| Metadata worker stops | Fail publication before watermark advancement. |
-| Simplex block worker stops | Fail the indexer. Keep the entry unacknowledged. |
-| Queue ack or sync fails | Retry without releasing the reservation. |
-| Remote namespace contains conflicting bytes for an absolute key | Treat as namespace corruption or multiple-writer violation. Do not repair by advancing the watermark. |
+| Unsupported queue or encoder identity | Fail before staging writes |
+| Invalid proof, pins, bounds, roots, operation bytes, or terminal commit | Fail and keep the item unacknowledged |
+| Finalization certificate does not commit to the block | Fail before durable enqueue or replay writes |
+| Height or range discontinuity | Fail the producer or consumer |
+| Receipt-tip digest or range mismatch | Fail the producer |
+| Indexer configured with `StateSync` | Reject startup before indexer tasks start |
+| Transient or ambiguous Store failure | Retry the same deterministic keys and values |
+| Later immutable data commit finishes first | Record durability and stop publication at the gap |
+| Metadata, QMDB, block, or certificate worker stops | Fail the supervised indexer |
+| Barrier coordinator stops | Fail the supervised indexer |
+| Queue acknowledgement or sync fails | Fail the supervised indexer and resume the unacknowledged prefix after restart |
+| Same absolute key is observed with different bytes | Treat the namespace as corrupt or multiply written |
 
 ## Testing and acceptance
 
-### Artifact tests
+### Queue and artifact tests
 
-- Reject a checkpoint whose embedded root is not the finalized header root.
-- Reject a checkpoint whose watermark does not match the proof leaf count.
-- Reject wrong starts, ends, operation counts, pins, terminal commits, and
-  namespace kinds.
+- Round-trip the full queue item and assert every frozen identity, block byte,
+  certificate byte, timestamp, proof, pin, bound, and operation byte.
+- Reject every unsupported identity independently.
+- Reject wrong starts, ends, operation counts, proof leaves, roots, pins,
+  namespace kinds, terminal commits, and noncanonical encodings.
+- Reject a valid certificate for a different block.
 - Prove that changing any operation byte fails validation.
-- Prove that sequential and parallel hashing produce identical output.
-- Prove that a V2 encoder can replay every supported historical format.
+- Prove metadata replay uses only the queued encoder version.
+- Prove raw queue frames remain undecoded until admission.
+- Prove fresh startup never reads or decodes a legacy partition.
+
+### Capture and receipt tests
+
+- Capture and deliver exact state and compact transaction artifacts through the
+  real Commonware application path.
+- Prove capture happens before apply and the hook runs after apply.
+- Prove height and both range starts are strictly continuous.
+- Prove enqueue durability precedes receipt sync and receipt sync precedes
+  consumer admission.
+- Prove a crash with a queue tail ahead of the receipt repairs the receipt
+  without duplicating the queue item.
+- Prove a crash after capture advances beyond node durability accepts replayed
+  blocks within the captured prefix without another enqueue.
+- Prove genesis and already-reflected blocks invoke neither hook.
+- Reject receipt-tip digest or range mismatch.
+- Reject indexer-enabled `StateSync` through validator and deployment config
+  paths.
 
 ### Exoware parity tests
 
-- Compare V2 absolute preparation with the existing deterministic row builders
-  for the same operations from genesis and from nonzero starts.
-- Cover state updates, deletes, floor movement, transaction appends, and commit
-  operations.
-- Compare every ordered logical key and value, Merkle node, presence row, root,
-  and final size.
+- Compare stateless rows with the established deterministic builders for state
+  and transaction histories from genesis and nonzero starts.
+- Compare operation, update, presence, and Merkle node keys and values in exact
+  order.
+- Cover state updates, deletes, floor movement, transaction appends, and
+  terminal commits.
 - Prepare adjacent ranges in reverse order and prove their outputs do not
   change.
+- Prove sequential and parallel hashing produce byte-identical rows for MMR and
+  every production Merkle family.
+- Stage prepared rows and watermarks under public namespace helpers and verify
+  reads at the exact published ends.
 
-### Publication tests
+### Publication and completion tests
 
-- Start with empty namespaces and prove that no watermark is observably
-  different from a watermark at location zero.
-- Persist range N plus 2 before N plus 1 and prove the watermark stops at N.
-- Close the gap and prove one publication step can advance through every now
-  contiguous range.
-- Prove a publication step may omit intermediate watermark rows without
-  withholding any operation in the newly authorized prefix.
-- Prove both QMDB watermarks publish at the same block barrier.
-- Prove the two watermark rows have the same Store publication sequence.
-- Request an unpublished tip and observe a watermark-too-low error. Advance the
-  barrier and prove a new request session succeeds.
-- Prove subscriptions withhold persisted operation batches until a covering
-  watermark arrives.
-- Prove separate downstream sessions may observe different post-barrier tips
-  even though the paired watermark rows were committed atomically.
-- Prove metadata failure prevents watermark advancement.
-- Prove queue acknowledgement waits for SQL, both QMDB instances, both
-  watermarks, and Simplex block persistence.
+- Commit item N plus 2 before N plus 1 and prove no barrier crosses the gap.
+- Close the gap and prove one barrier can publish the complete ready prefix.
+- Prove paired watermarks and every covered height-to-digest target share the
+  barrier Store sequence.
+- Prove no publication target is visible without both covering watermarks in
+  that barrier.
+- Prove an unpublished QMDB tip returns watermark-too-low.
+- Prove subscriptions withhold staged batches until a covering watermark is
+  visible.
+- Prove metadata or either QMDB failure prevents barrier publication.
+- Prove queue completion waits for SQL, both QMDBs, the digest-addressed block,
+  exact finalization certificate, and barrier publication.
+- Prove acknowledgement, sync, and pruning advance only in queue order.
+- Prove a closed completion channel or failed worker terminates the supervised
+  indexer.
+- Prove the returned barrier sequence works as a downstream lower-bound read
+  token and does not claim an upper snapshot bound.
 
 ### Crash matrix
 
-Restart after each of these boundaries:
+Restart after each boundary below.
 
-1. Before queue enqueue.
-2. After queue enqueue and before artifact admission.
-3. After metadata persistence.
-4. After one QMDB range persists.
-5. After both QMDB ranges persist and before watermark publication.
-6. After watermark publication.
-7. After Simplex block persistence.
-8. After queue acknowledgement and before queue sync.
-9. After queue sync.
+1. Before durable queue enqueue.
+2. After queue enqueue and before receipt sync.
+3. After receipt sync and before consumer admission.
+4. After admission and before structured decode.
+5. After a later item's immutable data commit while an earlier item is still
+   incomplete.
+6. After the contiguous prefix data is complete and before barrier commit.
+7. After barrier commit and before its completion is observed locally.
+8. After digest-addressed block persistence and before certificate persistence.
+9. After certificate persistence and before local item completion.
+10. After local completion and before queue acknowledgement.
+11. After acknowledgement and before queue sync and pruning.
+12. After queue sync and pruning.
 
-Every restart must converge without remote writer recovery, missing SQL rows,
-duplicate logical history, or publication across a gap.
+Every restart must converge without remote writer recovery, remote watermark
+recovery, missing SQL rows, missing certificates, duplicate logical history,
+metadata encoder drift, or publication across a gap.
 
 ### Production-shaped acceptance
 
-- Restart with a multi-thousand-block backlog at the target transaction load.
-- Fail the test if startup requires a QMDB Store read for writer recovery.
-- Confirm that RSS plateaus at baseline plus the configured upload budget and
-  the single raw-frame allowance.
-- Confirm that the queue floor advances throughout catch-up.
-- Confirm that proof preparation overlaps across blocks.
-- Confirm that operation persistence can finish out of order while watermarks
-  remain contiguous.
-- Confirm that repeated ambiguous Store writes produce identical keys and
-  values.
-- Measure queue growth, proof size, preparation time, Store bytes, watermark
-  lag, and replay count.
-
-## Implementation plan
-
-### Phase 0
-
-Prototype the stateless Exoware builder for account state.
-
-- Define the versioned authenticated range envelope.
-- Validate exact bytes, bounds, pins, proof target, and trusted root.
-- Reuse the existing deterministic row builders.
-- Prove parity with the existing row builders and independent preparation.
-
-### Phase 1
-
-Define the finalized artifact handoff for both QMDB instances.
-
-- Expose the exact merkleized batch base.
-- Capture state proof material before prune.
-- Capture transaction operations and proof material before compact history is
-  discarded.
-- Keep expensive proof work off the finalized-hook critical path where
-  possible.
-
-### Phase 2
-
-Implement the V2 queue and publisher.
-
-- Add the versioned queue partition and lazy decoder.
-- Preserve byte admission and reservation ownership.
-- Add independent range preparation and persistence.
-- Add the block-level contiguous publication coordinator.
-- Preserve metadata and Simplex completion gates.
-
-### Phase 3
-
-Bootstrap a fresh-network deployment and run the production-shaped fault
-campaign.
-
-- Exercise the full crash matrix.
-- Validate memory and disk behavior under backlog.
-- Confirm no steady-state V2 path reconstructs remote `WriterState`.
-- Confirm the first artifacts start at location zero in both QMDBs.
-- Refuse unexpected pre-existing QMDB rows or watermarks.
+- Restart with a multi-thousand-block backlog at target transaction load.
+- Fail if startup performs a QMDB Store read for writer or watermark recovery.
+- Confirm RSS plateaus at baseline plus the configured upload budget and one
+  raw-frame allowance.
+- Confirm the acknowledgement floor advances throughout catch-up.
+- Confirm preparation and immutable commits overlap across blocks.
+- Confirm out-of-order completion never advances publication across a gap.
+- Confirm repeated ambiguous data and barrier commits produce identical keys
+  and values.
+- Confirm exact block and certificate persistence remain completion gates under
+  latency and retry.
+- Measure queue growth, proof size, pin size, preparation time, Store bytes,
+  barrier lag, replay count, and projected disk exhaustion.
 
 ## Observability
 
-V2 should expose:
+Dashboards and alerts must cover the following signals.
 
-- Queue entries, encoded bytes, oldest age, and acknowledgement floor.
+- Queue entries, encoded bytes, oldest age, acknowledgement floor, and receipt
+  height.
 - Disk free bytes and projected exhaustion time.
-- Budget configured, reserved, waiting, and oversized-entry counts.
-- Artifact construction and validation duration by QMDB kind.
-- Proof, operation, pinned-node, and metadata bytes per entry.
-- Preparation duration and generated row bytes per range.
-- Store request bytes, row counts, attempts, ambiguous retries, and latency.
-- Durable range gaps and highest prepared, persisted, and published ends.
-- State and transaction watermark lag by block.
-- Joint barrier Store sequence and the number of entries covered per
-  advancement.
-- Watermark-too-low responses and downstream catch-up retries.
-- Metadata and Simplex completion latency.
-- Replay count and entry format versions observed after restart.
+- Budget configuration, reservation bytes, waiters, active uploads, and
+  oversized entries.
+- Capture, validation, metadata encoding, and preparation latency.
+- Proof, pin, operation, block, certificate, and metadata bytes per item.
+- Immutable commit bytes, row counts, attempts, retries, and latency.
+- Highest captured, admitted, data-durable, barrier-published, acknowledged,
+  and pruned heights.
+- Highest state and transaction ends at each stage.
+- Gap count and oldest gap age.
+- Barrier Store sequence and number of heights covered per commit.
+- Block and certificate completion latency.
+- Watermark-too-low responses and downstream retry latency.
+- Encoder identities observed during startup and replay.
+- State-sync configuration rejection count.
 
-## Open questions
+## Remaining Constantinople work
 
-### Finalized handoff API
+### Integration
 
-The target artifact is settled. The exact handoff is not. We need to decide
-whether Commonware passes merkleized batches to `Application::finalized`, or
-Constantinople retains versioned artifacts from execution until their block
-finalizes. The transaction compact QMDB makes this decision unavoidable.
+- Tune byte amplification and maximum active uploads from production-shaped
+  measurements.
 
-### Metadata representation
+### Tests
 
-The queue must replay metadata deterministically. We need to choose between
-storing canonical encoded logical rows and storing inputs for a frozen
-version-specific metadata encoder. Storing the latest Rust structs without an
-encoder version is not acceptable. The selected V2 schema must also expose both
-QMDB range ends or an equivalent identity for the block-completeness fence.
+- Extend the current queue, capture, receipt, Exoware parity, publication, and
+  completion tests with the full crash matrix listed above.
+- Add end-to-end tests that read SQL, state QMDB, transaction QMDB, the block,
+  and exact certificate at one published height.
+- Re-run `just fmt-check`, `just lint`, `just test`, and `just build` after
+  dependency changes.
 
-### Downstream completeness API
+### Documentation and rollout
 
-The current explorer can remain correct by retrying catch-up states and
-verifying every proof against a certified header. We still need to decide
-whether V2 should additionally expose a one-shot completeness endpoint or a
-shared Store consistency token. The joint watermark Store sequence exists as a
-publisher receipt, but it is not encoded in the watermark values or returned
-by the current QMDB operation-log RPC.
+- Document the fresh-network-only cutover and absence of legacy migration.
+- Document the indexer plus `StateSync` rejection in validator and deployment
+  configuration guides.
+- Document one-writer ownership, namespace initialization, replay behavior, and
+  operator recovery expectations.
+- Document the barrier sequence as a lower-bound token for service owners.
 
-### Store request chunking
+### Explorer and client
 
-The publication contract permits deterministic chunks within one range. The
-initial maximum rows or bytes per request should be selected from kv-mk1
-production measurements. Chunking must never place the presence row or
-watermark before every preceding chunk is durable.
+- Add deployed integration coverage for adapter catch-up and later-data
+  visibility. Unit coverage includes bootstrap-to-subscribe races,
+  multi-height barriers, target mismatches, floor propagation, and
+  cancellation.
 
-### Remote conflict audit
+### Dashboards
 
-Steady-state replay does not require remote reads. We may still want a
-background audit that samples already published absolute keys and reports a
-same-key, different-value conflict. Such an audit must not become a hidden
-restart dependency.
+- Add the queue, receipt, gap, barrier, certificate, replay, memory, and disk
+  panels listed under observability.
+- Add alerts for a stalled acknowledgement floor, stale receipt, old gap,
+  repeated ambiguous commits, watermark-too-low spikes, and projected disk
+  exhaustion.
+
+### Dependencies and commits
+
+- Replace all four Explorer sibling file dependencies with reproducible immutable
+  package/revision pins. The dependencies are `@exowarexyz/qmdb`,
+  `@exowarexyz/sdk`, `@exowarexyz/simplex`, and `@exowarexyz/sql`.
+- Refresh `explorer/package-lock.json` after replacing the sibling file
+  dependencies.
+- Run clean-install testing for the Explorer without sibling repository paths.
+- Run the production build.
+- Create the Constantinople commits only after integration, tests,
+  documentation, explorer and client work, and dashboards are complete.
 
 ## Current source map
 
-- [`src/publisher/qmdb.rs`](src/publisher/qmdb.rs) owns the V1 queue payload,
-  cursor admission, metadata lane, QMDB preparation, Store commits, and
-  watermark completion.
-- [`../../bin/validator/src/run.rs`](../../bin/validator/src/run.rs) owns queue
-  initialization, producer cursor persistence, byte admission, Simplex and
-  QMDB completion, acknowledgement, and sync.
+- [`src/publisher/qmdb.rs`](src/publisher/qmdb.rs) owns the queue item,
+  frozen identities, stateless metadata and QMDB preparation, immutable data
+  commits, and contiguous barrier publication.
+- [`../../bin/validator/src/run.rs`](../../bin/validator/src/run.rs) owns the
+  queue, latest-capture receipt, byte admission, completion joins,
+  acknowledgement, sync, and pruning.
 - [`src/publisher/certificate.rs`](src/publisher/certificate.rs) owns
-  digest-addressed Simplex block persistence and certificate correlation.
+  digest-addressed block and exact certificate persistence.
 - [`../application/src/consensus/glue.rs`](../application/src/consensus/glue.rs)
-  invokes the finalized hook after database application.
+  captures the two finalized QMDB artifacts and forwards them after successful
+  application.
 - [`../application/src/consensus/db.rs`](../application/src/consensus/db.rs)
-  defines the full state QMDB and compact transaction QMDB.
+  defines the unordered account-state QMDB and compact keyless transaction
+  QMDB.
+- [`../../bin/validator/src/config.rs`](../../bin/validator/src/config.rs)
+  rejects indexer-enabled `StateSync`.
+- [`src/namespaces.rs`](src/namespaces.rs) defines the Store namespaces and
+  publication-target client.
+- [`../../explorer/src/proofTarget.ts`](../../explorer/src/proofTarget.ts)
+  owns publication-target bootstrap, subscription, and Store sequence floors.

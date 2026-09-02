@@ -12,6 +12,6 @@ mod store;
 #[cfg(test)]
 mod test_store;
 
-pub use client::{IndexerClient, ReadError, TransactionMetadata};
+pub use client::{FinalizedPublicationTarget, IndexerClient, ReadError, TransactionMetadata};
 pub use publisher::{CertificateReporter, Publisher};
 pub use store::{StoreClientBuildError, StoreReadinessError, require_store_ready, store_client};

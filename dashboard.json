@@ -5992,17 +5992,6 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_metadata_store_commit_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "legendFormat": "block metadata",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(ingest_duration_bucket[$__rate_interval])))",
           "legendFormat": "store ingest (server)",
           "range": true,
@@ -6116,17 +6105,6 @@
           "legendFormat": "simplex",
           "range": true,
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "expr": "indexer_publisher_metadata_store_commits_in_flight{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
-          "legendFormat": "block metadata",
-          "range": true,
-          "refId": "C"
         },
         {
           "datasource": {
@@ -6266,17 +6244,6 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "rate(indexer_publisher_metadata_store_commits_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])",
-          "legendFormat": "block metadata",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
           "expr": "rate(ingest_requests_total[$__rate_interval])",
           "legendFormat": "store ingest (server)",
           "range": true,
@@ -6390,17 +6357,6 @@
           "legendFormat": "simplex",
           "range": true,
           "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "expr": "rate(indexer_publisher_metadata_store_commit_retries_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])",
-          "legendFormat": "block metadata",
-          "range": true,
-          "refId": "C"
         }
       ],
       "datasource": {
@@ -6482,89 +6438,6 @@
           "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_simplex_upload_input_queue_wait_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
           "legendFormat": "input queue wait p95",
-          "range": true,
-          "refId": "D"
-        }
-      ],
-      "datasource": {
-        "type": "prometheus",
-        "uid": "PBFA97CFB590B2093"
-      },
-      "options": {
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc",
-          "hideZeros": false
-        },
-        "legend": {
-          "showLegend": true,
-          "displayMode": "list",
-          "placement": "bottom",
-          "calcs": []
-        }
-      }
-    },
-    {
-      "id": 82,
-      "type": "timeseries",
-      "title": "Metadata Fast-Lane Latency",
-      "description": "Finalized lag measures the end-to-end path to durable block metadata. Gate wait measures the delay added to a staged bulk commit.",
-      "gridPos": {
-        "h": 8,
-        "w": 8,
-        "x": 8,
-        "y": 217
-      },
-      "fieldConfig": {
-        "defaults": {
-          "unit": "s"
-        },
-        "overrides": []
-      },
-      "transparent": true,
-      "pluginVersion": "11.5.2",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.50, sum by(le) (rate(indexer_publisher_metadata_finalized_lag_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "legendFormat": "finalized lag p50",
-          "range": true,
-          "refId": "A"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_metadata_finalized_lag_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "legendFormat": "finalized lag p95",
-          "range": true,
-          "refId": "B"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.99, sum by(le) (rate(indexer_publisher_metadata_finalized_lag_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "legendFormat": "finalized lag p99",
-          "range": true,
-          "refId": "C"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_metadata_gate_wait_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "legendFormat": "bulk gate wait p95",
           "range": true,
           "refId": "D"
         }

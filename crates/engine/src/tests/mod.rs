@@ -6,7 +6,7 @@ mod properties;
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
     PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, types::EngineCommitment,
 };
 use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
@@ -16,7 +16,7 @@ use commonware_consensus::{
     Heightable,
     marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
-    types::{Epoch, Round, View, coding::Commitment},
+    types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
     Signer,
@@ -89,7 +89,8 @@ struct TestEngineDefinition {
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
-    genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
+    genesis_commitments:
+        Arc<Mutex<BTreeMap<TestPublicKey, EngineCommitment<TestHasher, TestPublicKey>>>>,
     restart_barrier: Option<RestartBarrier>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
@@ -287,8 +288,11 @@ impl EngineDefinition for TestEngineDefinition {
                 transaction_resolver,
             };
 
-            let input =
-                StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
+            let input = StaticTransactionSource::<
+                EngineCommitment<TestHasher, TestPublicKey>,
+                TestPublicKey,
+                TestHasher,
+            >::new(Vec::new());
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,

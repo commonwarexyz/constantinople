@@ -650,6 +650,10 @@ pub(crate) const fn indexer_enabled(args: &GenerateArgs) -> bool {
 
 pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     assert!(
+        !args.indexer || args.startup != StartupModeConfig::StateSync,
+        "--indexer cannot be combined with --startup state-sync"
+    );
+    assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
@@ -1122,6 +1126,30 @@ mod tests {
             "3",
             "--output-dir",
             "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
+    }
+
+    #[test]
+    #[should_panic(expected = "--indexer cannot be combined with --startup state-sync")]
+    fn rejects_indexer_with_state_sync() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--indexer",
+            "--startup",
+            "state-sync",
             "local",
         ])
         .expect("local invocation should parse");

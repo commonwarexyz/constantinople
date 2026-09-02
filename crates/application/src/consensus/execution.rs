@@ -168,9 +168,12 @@ where
     S: Strategy,
 {
     let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
+    let work_size = transfers.len();
     let plan = {
         let transfers = Arc::clone(&transfers);
-        strategy.spawn(move |_: S| plan_span.in_scope(|| executor::execution_plan(&transfers)))
+        strategy.spawn(work_size, move |_: S| {
+            plan_span.in_scope(|| executor::execution_plan(&transfers))
+        })
     }
     .await;
     let Some(plan) = plan else {
@@ -181,8 +184,11 @@ where
         "application.execute.build",
         accounts = values.len().traced()
     );
+    let work_size = values.len();
     let updates = strategy
-        .spawn(move |_: S| build_span.in_scope(|| build_updates(plan, transfers, values)))
+        .spawn(work_size, move |_: S| {
+            build_span.in_scope(|| build_updates(plan, transfers, values))
+        })
         .await;
     (staged, updates)
 }
@@ -440,8 +446,9 @@ where
         );
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
+        let work_size = candidates.len();
         let (candidates_back, prepared, transfers, selector_back, missing) = strategy
-            .spawn({
+            .spawn(work_size, {
                 let accounts_span = accounts_span.clone();
                 let mut selector = selector;
                 move |s: S| {
@@ -504,8 +511,9 @@ where
             txs = transfers.len().traced(),
             dropped = tracing::field::Empty,
         );
+        let work_size = transfers.len();
         let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
-            .spawn({
+            .spawn(work_size, {
                 let span = select_span.clone();
                 let mut selector = selector;
                 let mut body = body;
@@ -552,7 +560,8 @@ where
                     .expect("transaction batch is owned until the first append"),
             };
             let apply_span = info_span!("application.execute.apply", txs = chunk.len().traced());
-            pending_append = Some(Box::pin(strategy.spawn(move |_: S| {
+            let work_size = chunk.len();
+            pending_append = Some(Box::pin(strategy.spawn(work_size, move |_: S| {
                 apply_span.in_scope(|| apply_transaction_digests(batch, &chunk))
             })));
         }
@@ -625,8 +634,11 @@ where
     S: Strategy,
 {
     let prepare_span = info_span!("application.execute.prepare", txs = body.len().traced());
+    let work_size = body.len();
     let (transfers, digests) = strategy
-        .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice())))
+        .spawn(work_size, move |s| {
+            prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice()))
+        })
         .await?;
 
     let transaction_count = transfers.len();
@@ -635,7 +647,8 @@ where
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let apply = strategy.spawn(move |_: S| {
+    let work_size = digests.len();
+    let apply = strategy.spawn(work_size, move |_: S| {
         apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
@@ -675,7 +688,8 @@ where
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let apply = strategy.spawn(move |_: S| {
+    let work_size = digests.len();
+    let apply = strategy.spawn(work_size, move |_: S| {
         apply_span.in_scope(|| {
             apply_transaction_digests(transaction_batch, &digests)
                 .with_inactivity_floor(transaction_floor)

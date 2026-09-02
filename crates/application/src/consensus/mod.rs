@@ -33,6 +33,7 @@ use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage,
     telemetry::metrics::{Counter, MetricsExt},
 };
+use commonware_storage::{merkle::Proof, mmr};
 use constantinople_primitives::{PublicKeyCache, SealedBlock};
 use std::{future::Future, marker::PhantomData, pin::Pin, sync::Arc};
 
@@ -48,19 +49,47 @@ mod tests;
 mod time;
 
 pub use db::{
-    DatabaseReaders, Databases, StateBatch, StateDatabase, StateStaged, StateSyncTarget,
-    StateUpdates, TransactionDatabase, TransactionHistoryDb, TransactionHistoryOperation,
-    TransactionHistoryTarget,
+    DatabaseReaders, Databases, StateBatch, StateDatabase, StateOperation, StateStaged,
+    StateSyncTarget, StateUpdates, TransactionDatabase, TransactionHistoryDb,
+    TransactionHistoryOperation, TransactionHistoryTarget,
 };
 pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
 
 type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
-pub type FinalizedHookFn<E, C, H, P, St> = Arc<
-    dyn for<'a> Fn(
-            &'a SealedBlock<C, P, H>,
-            &'a DatabaseReaders<E, H, commonware_storage::translator::EightCap, St>,
-        ) -> FinalizedHookFuture<'a>
+
+/// Exact operation range captured from one finalized QMDB batch.
+pub struct FinalizedRange<D, Op>
+where
+    D: Digest,
+{
+    /// Inclusive operation location where this batch starts.
+    pub start: mmr::Location,
+    /// Exclusive operation location where this batch ends.
+    pub end: mmr::Location,
+    /// Root after applying this batch.
+    pub root: D,
+    /// Proof of the batch operations against `root`.
+    pub proof: Proof<mmr::Family, D>,
+    /// Prefix frontier in MMR pin order.
+    pub pinned_nodes: Vec<D>,
+    /// Exact operations introduced by the batch.
+    pub operations: Arc<Vec<Op>>,
+}
+
+/// Finalized operation artifacts for both application databases.
+pub struct FinalizedArtifacts<H>
+where
+    H: Hasher,
+{
+    /// Account-state operation range.
+    pub state: FinalizedRange<H::Digest, StateOperation>,
+    /// Transaction-history operation range.
+    pub transactions: FinalizedRange<H::Digest, TransactionHistoryOperation<H>>,
+}
+
+pub type FinalizedHookFn<C, H, P> = Arc<
+    dyn for<'a> Fn(&'a SealedBlock<C, P, H>, FinalizedArtifacts<H>) -> FinalizedHookFuture<'a>
         + Send
         + Sync,
 >;
@@ -86,7 +115,7 @@ where
     public_key_cache: PublicKeyCache,
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
-    finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
+    finalized_hook: Option<FinalizedHookFn<C, H, P>>,
     proposed_transactions: Counter,
     _marker: PhantomData<(E, C, S, I, B)>,
 }
@@ -138,7 +167,7 @@ where
         public_key_cache: PublicKeyCache,
         genesis_state_target: StateSyncTarget<H::Digest>,
         genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
-        finalized_hook: Option<FinalizedHookFn<E, C, H, P, St>>,
+        finalized_hook: Option<FinalizedHookFn<C, H, P>>,
     ) -> Self {
         let proposed_transactions = context.counter(
             "proposed_transactions",

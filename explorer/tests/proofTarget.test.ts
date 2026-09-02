@@ -1,5 +1,8 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
+import { Code, ConnectError } from '@connectrpc/connect';
+import { HttpError } from '@exowarexyz/sdk';
 
 import {
     decodePublishedProofTarget,
@@ -105,6 +108,35 @@ test('provable target subscription waits for the first target after an empty boo
     await stream.return();
 });
 
+test('provable target subscription releases a pending bootstrap on abort', async () => {
+    const controller = new AbortController();
+    let seenSignal: AbortSignal | undefined;
+    let started!: () => void;
+    const queryStarted = new Promise<void>((resolve) => {
+        started = resolve;
+    });
+    const store = {
+        query(...args: Parameters<PublishedProofTargetStore['query']>) {
+            seenSignal = args[6]?.signal;
+            started();
+            return new Promise<never>(() => {});
+        },
+        subscribe() {
+            return batches([]);
+        },
+    } as PublishedProofTargetStore;
+    const stream = subscribePublishedProofTargetsFromStore(store, {
+        signal: controller.signal,
+    });
+
+    const result = stream.next();
+    await queryStarted;
+    controller.abort();
+
+    assert.deepEqual(await result, { done: true, value: undefined });
+    assert.equal(seenSignal, controller.signal);
+});
+
 test('provable target subscription preserves its cursor after a generic error', async () => {
     const subscriptions: bigint[] = [];
     const controller = new AbortController();
@@ -184,7 +216,7 @@ test('provable target subscription reboots after retention eviction', async () =
         subscribe(filters: Parameters<PublishedProofTargetStore['subscribe']>[0]) {
             subscriptions.push(filters.sinceSequenceNumber ?? 0n);
             return subscriptions.length === 1
-                ? failedBatchStream('BATCH_EVICTED')
+                ? failedBatchStream(storeStreamError(Code.OutOfRange, 'BATCH_EVICTED'))
                 : batches([
                     {
                         sequenceNumber: 34n,
@@ -231,6 +263,20 @@ async function* batches(
     yield* values;
 }
 
-async function* failedBatchStream(message: string) {
-    throw new Error(message);
+async function* failedBatchStream(error: unknown) {
+    throw error;
+}
+
+function storeStreamError(code: Code, reason: string): HttpError {
+    const cause = new ConnectError('Store stream failed', code);
+    cause.details.push({
+        type: 'google.rpc.ErrorInfo',
+        value: new BinaryWriter()
+            .tag(1, WireType.LengthDelimited)
+            .string(reason)
+            .tag(2, WireType.LengthDelimited)
+            .string('log.stream')
+            .finish(),
+    });
+    return new HttpError(400, 'Store stream failed', code, cause);
 }

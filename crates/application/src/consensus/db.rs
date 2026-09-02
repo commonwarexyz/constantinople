@@ -35,6 +35,9 @@ pub type TransactionHistoryDb<E, H, S> =
 pub type TransactionHistoryOperation<H> =
     keyless_fixed::Operation<mmr::Family, <H as Hasher>::Digest>;
 
+pub type StateOperation =
+    AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>;
+
 pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
@@ -53,7 +56,7 @@ pub type DatabaseReaders<E, H, T, S> = (
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
+    FixedJournal<E, StateOperation>,
     UnorderedIndex<T, mmr::Location>,
     H,
     UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
@@ -65,7 +68,7 @@ pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
 pub type StateStaged<E, H, T, S> = AnyStaged<
     mmr::Family,
     E,
-    FixedJournal<E, AnyOperation<mmr::Family, UnorderedUpdate<AccountKey, FixedEncoding<Account>>>>,
+    FixedJournal<E, StateOperation>,
     UnorderedIndex<T, mmr::Location>,
     H,
     UnorderedUpdate<AccountKey, FixedEncoding<Account>>,
@@ -155,6 +158,7 @@ mod tests {
                 metadata_partition: "state-order-test-merkle-metadata".into(),
                 items_per_blob: NZU64!(1024),
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
                 strategy: Sequential,
                 page_cache: cache.clone(),
             },
@@ -163,6 +167,7 @@ mod tests {
                 items_per_blob: NZU64!(1024),
                 page_cache: cache,
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
             },
             translator: EightCap,
             init_cache_size: Some(NZUsize!(1024)),

@@ -15,8 +15,8 @@ pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u8 = 0x01;
 pub const SIMPLEX_PREFIX_VALUE: u8 = 0x02;
 /// Store namespace byte for SQL metadata rows.
 pub const SQL_META_PREFIX_VALUE: u8 = 0x03;
-/// Store namespace byte for published provable targets.
-pub const PROVABLE_TARGET_PREFIX_VALUE: u8 = 0x04;
+/// Store namespace byte for finalized publication targets.
+pub const PUBLICATION_TARGET_PREFIX_VALUE: u8 = 0x04;
 
 /// Store namespace prefix for account-state QMDB rows.
 pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
@@ -38,9 +38,9 @@ pub fn sql_meta_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
     StoreKeyPrefix::new(vec![SQL_META_PREFIX_VALUE])
 }
 
-/// Store namespace prefix for published provable targets.
-pub fn provable_target_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
-    StoreKeyPrefix::new(vec![PROVABLE_TARGET_PREFIX_VALUE])
+/// Store namespace prefix for finalized height-to-digest targets.
+pub fn publication_target_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
+    StoreKeyPrefix::new(vec![PUBLICATION_TARGET_PREFIX_VALUE])
 }
 
 /// Clone `client` into the account-state QMDB namespace.
@@ -71,13 +71,13 @@ pub fn sql_meta_client(client: &StoreClient) -> Result<PrefixedStoreClient, Stor
     Ok(PrefixedStoreClient::new(client.clone(), sql_meta_prefix()?))
 }
 
-/// Clone `client` into the published provable target namespace.
-pub fn provable_target_client(
+/// Clone `client` into the finalized publication-target namespace.
+pub fn publication_target_client(
     client: &StoreClient,
 ) -> Result<PrefixedStoreClient, StoreKeyPrefixError> {
     Ok(PrefixedStoreClient::new(
         client.clone(),
-        provable_target_prefix()?,
+        publication_target_prefix()?,
     ))
 }
 
@@ -93,7 +93,7 @@ mod tests {
             transactions_qmdb_prefix().expect("transaction prefix"),
             simplex_prefix().expect("simplex prefix"),
             sql_meta_prefix().expect("sql metadata prefix"),
-            provable_target_prefix().expect("provable target prefix"),
+            publication_target_prefix().expect("publication target prefix"),
         ];
 
         for (i, a) in prefixes.iter().enumerate() {

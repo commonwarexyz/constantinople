@@ -1,5 +1,6 @@
 import { create } from '@bufbuild/protobuf';
-import { Code } from '@connectrpc/connect';
+import { BinaryReader, WireType } from '@bufbuild/protobuf/wire';
+import { Code, ConnectError } from '@connectrpc/connect';
 import {
     Client,
     HttpError,
@@ -16,6 +17,9 @@ const PROVABLE_TARGET_HEIGHT_BYTES = 8;
 const BLOCK_DIGEST_BYTES = 32;
 const NETWORK_RECONNECT_DELAY_MS = 5_000;
 const TARGET_KEY_REGEX = `(?s-u)^.{${PROVABLE_TARGET_HEIGHT_BYTES}}$`;
+const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
+const STORE_STREAM_ERROR_DOMAIN = 'log.stream';
+const BATCH_EVICTED_REASON = 'BATCH_EVICTED';
 
 export interface PublishedProofTarget {
     readonly height: bigint;
@@ -147,15 +151,19 @@ async function fetchLatestFromStore(
     store: PublishedProofTargetStore,
     signal?: AbortSignal,
 ): Promise<{ target: PublishedProofTarget | null; sequenceNumber: bigint }> {
-    signal?.throwIfAborted();
-    const result = (await store.query(
-        undefined,
-        undefined,
-        1,
-        1,
-        TraversalMode.REVERSE,
+    const result = (await withAbort(
+        () =>
+            store.query(
+                undefined,
+                undefined,
+                1,
+                1,
+                TraversalMode.REVERSE,
+                undefined,
+                { signal },
+            ),
+        signal,
     )) as SequencedQueryResult;
-    signal?.throwIfAborted();
 
     if (result.sequenceNumber === undefined) {
         throw new Error('Store query did not return its evaluated sequence');
@@ -189,17 +197,83 @@ function isNewer(target: PublishedProofTarget, latestHeight: bigint | undefined)
 }
 
 function isBatchEvicted(error: unknown): boolean {
-    return (
-        (error instanceof HttpError && error.connectCode === Code.OutOfRange) ||
-        /batch[_ ]evicted|out[_ ]of[_ ]range/i.test(errorMessage(error))
-    );
+    if (!(error instanceof HttpError) || error.connectCode !== Code.OutOfRange) return false;
+    if (!(error.cause instanceof ConnectError)) return false;
+
+    return error.cause.details.some((detail) => {
+        if (!('type' in detail) || detail.type !== ERROR_INFO_TYPE) return false;
+        try {
+            const info = decodeErrorInfo(detail.value);
+            return (
+                info.reason === BATCH_EVICTED_REASON &&
+                info.domain === STORE_STREAM_ERROR_DOMAIN
+            );
+        } catch {
+            return false;
+        }
+    });
+}
+
+function decodeErrorInfo(value: Uint8Array): { reason: string; domain: string } {
+    const reader = new BinaryReader(value);
+    let reason = '';
+    let domain = '';
+
+    while (reader.pos < reader.len) {
+        const [fieldNumber, wireType] = reader.tag();
+        if (wireType === WireType.LengthDelimited && fieldNumber === 1) {
+            reason = reader.string();
+        } else if (wireType === WireType.LengthDelimited && fieldNumber === 2) {
+            domain = reader.string();
+        } else {
+            reader.skip(wireType, fieldNumber);
+        }
+    }
+    return { reason, domain };
 }
 
 function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
-function waitForRetry(ms: number, signal?: AbortSignal): Promise<boolean> {
+function withAbort<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    if (!signal) return operation();
+    if (signal.aborted) return Promise.reject(signal.reason);
+
+    return new Promise<T>((resolve, reject) => {
+        let settled = false;
+        const finish = () => {
+            if (settled) return false;
+            settled = true;
+            signal.removeEventListener('abort', onAbort);
+            return true;
+        };
+        const onAbort = () => {
+            if (finish()) reject(signal.reason);
+        };
+
+        signal.addEventListener('abort', onAbort, { once: true });
+        if (signal.aborted) {
+            onAbort();
+            return;
+        }
+
+        try {
+            operation().then(
+                (value) => {
+                    if (finish()) resolve(value);
+                },
+                (error: unknown) => {
+                    if (finish()) reject(error);
+                },
+            );
+        } catch (error) {
+            if (finish()) reject(error);
+        }
+    });
+}
+
+export function waitForRetry(ms: number, signal?: AbortSignal): Promise<boolean> {
     return new Promise((resolve) => {
         let settled = false;
         let timeout: ReturnType<typeof setTimeout> | undefined;

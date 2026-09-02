@@ -1,7 +1,8 @@
 //! `commonware_glue::stateful` trait integration.
 
 use super::{
-    Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
+    Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
+    history::header_range_to_target,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
@@ -32,6 +33,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;
+    type FinalizedArtifact = Option<FinalizedArtifacts<H>>;
     type Provider = I;
     type Input = ();
 
@@ -124,14 +126,90 @@ where
         self.apply_certified(context, block, batches).await
     }
 
+    async fn capture_finalized(
+        &mut self,
+        _context: (E, Self::Context),
+        block: &Self::Block,
+        batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
+        readers: <Self::Databases as DatabaseSet<E>>::Readers,
+    ) -> Self::FinalizedArtifact {
+        self.finalized_hook.as_ref()?;
+
+        let state = {
+            let database = readers.0.read().await;
+            let (start, operations) = batches.0.operations();
+            let end = batches.0.bounds().tip.size;
+            let root = batches.0.root();
+            assert_eq!(end.as_u64(), block.header.state_range.end());
+            assert_eq!(
+                end.as_u64() - start.as_u64(),
+                u64::try_from(operations.len()).expect("state operation count must fit u64")
+            );
+            assert_eq!(root, block.header.state_root);
+            let proof = batches
+                .0
+                .proof(&database)
+                .expect("finalized state batch proof must be available before apply");
+            let pinned_nodes = database
+                .pinned_nodes_at(start)
+                .await
+                .expect("finalized state frontier must be available before apply");
+            FinalizedRange {
+                start,
+                end,
+                root,
+                proof,
+                pinned_nodes,
+                operations,
+            }
+        };
+
+        let transactions = {
+            let database = readers.1.read().await;
+            let (start, operations) = batches.1.operations();
+            let end = batches.1.bounds().tip.size;
+            let root = batches.1.root();
+            assert_eq!(end.as_u64(), block.header.transactions_range.end());
+            assert_eq!(
+                end.as_u64() - start.as_u64(),
+                u64::try_from(operations.len()).expect("transaction operation count must fit u64")
+            );
+            assert_eq!(root, block.header.transactions_root);
+            let proof = batches
+                .1
+                .proof(&database)
+                .expect("finalized transaction batch proof must be available before apply");
+            let pinned_nodes = batches
+                .1
+                .pinned_nodes(&database)
+                .expect("finalized transaction frontier must be available before apply");
+            FinalizedRange {
+                start,
+                end,
+                root,
+                proof,
+                pinned_nodes,
+                operations,
+            }
+        };
+
+        Some(FinalizedArtifacts {
+            state,
+            transactions,
+        })
+    }
+
     async fn finalized(
         &mut self,
         _context: (E, Self::Context),
         block: &Self::Block,
-        readers: <Self::Databases as DatabaseSet<E>>::Readers,
+        artifact: Self::FinalizedArtifact,
+        _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
         if let Some(hook) = &self.finalized_hook {
-            hook(block, &readers).await;
+            let artifacts = artifact
+                .expect("finalized artifact capture was skipped while a hook was installed");
+            hook(block, artifacts).await;
         }
     }
 }

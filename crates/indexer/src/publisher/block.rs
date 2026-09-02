@@ -244,7 +244,7 @@ mod tests {
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
-        types::{Epoch, Round, View, coding::Commitment},
+        types::{Epoch, Round, View},
     };
     use commonware_cryptography::{
         Digest, Signer,
@@ -254,6 +254,7 @@ mod tests {
     };
     use commonware_math::algebra::Random;
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
+    use constantinople_engine::types::{EngineBlock, EngineCommitment};
     use constantinople_primitives::{
         Block, Header, LazySignedTransaction, Sealable, Sealed, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
@@ -279,11 +280,13 @@ mod tests {
             0,
         )
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
-        let block = Block::<Commitment, PublicKey, Sha256>::new(
-            test_header(consensus_key.public_key(), 1),
-            vec![transaction],
-        )
-        .seal(&mut Sha256::default());
+        let block = EngineBlock::from(
+            Block::<TestCommitment, PublicKey, Sha256>::new(
+                test_header(consensus_key.public_key(), 1),
+                vec![transaction],
+            )
+            .seal(&mut Sha256::default()),
+        );
 
         let rows = encode_bulk_block_rows(&block);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
@@ -314,13 +317,13 @@ mod tests {
         encoded.extend_from_slice(&zero_value_bytes);
         let zero_value = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
             .expect("zero-value lazy transaction should decode");
-        let block = Sealed::new_unchecked(
+        let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), 1),
                 body: vec![LazySignedTransaction::new(transaction), zero_value],
             },
             sha256::Digest::EMPTY,
-        );
+        ));
 
         let row = encode_block_meta_only_at(&block, 1_000);
         let bulk = encode_bulk_block_rows(&block);
@@ -362,13 +365,13 @@ mod tests {
         let lazy = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
             .expect("outer lazy transaction should decode");
 
-        let block = Sealed::new_unchecked(
+        let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), 1),
                 body: vec![lazy],
             },
             sha256::Digest::EMPTY,
-        );
+        ));
 
         let rows = encode_bulk_block_rows(&block);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
@@ -416,7 +419,7 @@ mod tests {
     fn test_header(
         leader: PublicKey,
         tx_count: usize,
-    ) -> Header<Commitment, sha256::Digest, PublicKey> {
+    ) -> Header<TestCommitment, sha256::Digest, PublicKey> {
         let transactions_end = u64::try_from(tx_count).expect("tx count fits u64") + 1;
         Header {
             context: Context {
@@ -434,8 +437,10 @@ mod tests {
         }
     }
 
-    fn valid_commitment() -> Commitment {
-        Commitment::from((
+    type TestCommitment = EngineCommitment<Sha256, PublicKey>;
+
+    fn valid_commitment() -> TestCommitment {
+        TestCommitment::from((
             sha256::Digest::EMPTY,
             sha256::Digest::EMPTY,
             sha256::Digest::EMPTY,

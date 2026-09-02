@@ -291,7 +291,7 @@ export default function App() {
 
         (async () => {
             try {
-                for await (const block of subscribeBlocks(indexerUrl, {
+                for await (const block of subscribeBlocks(indexerUrl, storeUrl, {
                     signal: controller.signal,
                     onError: (message) =>
                         setStatus({ kind: 'error', message: `backend error: ${message}` }),
@@ -497,6 +497,7 @@ export default function App() {
                 cursor: currentAccountCursor,
                 mode: accountActivityMode,
                 minSequenceNumber,
+                maxHeight: publishedProofTarget.height,
                 signal: controller.signal,
             }),
             controller.signal,

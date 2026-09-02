@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { Code, ConnectError } from '@connectrpc/connect';
+import { HttpError } from '@exowarexyz/sdk';
 
 import {
     isMissingAccountProofError,
@@ -31,6 +33,24 @@ test('sequence freshness gates are retried while a query node catches up', () =>
         true,
     );
     assert.equal(isRetryableSequenceConsistencyError('[unavailable] disconnected'), false);
+});
+
+test('structured consistency lag is retried without accepting unrelated aborted errors', () => {
+    const cause = new ConnectError('minimum consistency token is not yet visible', Code.Aborted);
+    cause.details.push({
+        type: 'google.rpc.ErrorInfo',
+        value: new Uint8Array([
+            0x0a, 0x15,
+            ...new TextEncoder().encode('CONSISTENCY_NOT_READY'),
+        ]),
+    });
+    const retryable = new HttpError(409, cause.message, cause.code, cause);
+
+    assert.equal(isRetryableProofError(retryable), true);
+    assert.equal(
+        isRetryableProofError(new ConnectError('transaction digest mismatch', Code.Aborted)),
+        false,
+    );
 });
 
 test('account work remains pending beyond the old retry bound', async () => {

@@ -8,7 +8,7 @@
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `simplex`        | certified headers, full blocks by digest, certificates       |
 //! | `sql` (fast lane) | `block_meta`                                                 |
-//! | `sql` (bulk)      | `tx_meta`, `tx_activity`, `account_meta`                     |
+//! | `sql` (bulk)      | `tx_meta`, `tx_activity`, `account_meta`                      |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!
@@ -27,7 +27,7 @@ use commonware_runtime::{
     Metrics,
     telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _},
 };
-use exoware_sdk::{StoreClient, StoreWriteBatch};
+use exoware_sdk::{ClientError, ErrorCode, StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
 pub use sql::SqlRow;
 use std::time::{Duration, Instant};
@@ -66,34 +66,6 @@ impl StoreCommitMetrics {
             ),
         }
     }
-
-    /// Metadata fast-lane commits register under distinct names so the bulk
-    /// commit dashboards keep their meaning.
-    pub fn new_metadata(context: &impl Metrics) -> Self {
-        Self {
-            in_flight: context.gauge(
-                "metadata_store_commits_in_flight",
-                "Metadata Store batch commits in flight",
-            ),
-            commits: context.counter(
-                "metadata_store_commits",
-                "Metadata Store batch commits completed",
-            ),
-            rows: context.counter(
-                "metadata_store_commit_rows",
-                "Rows committed to the store by the metadata lane",
-            ),
-            retries: context.counter(
-                "metadata_store_commit_retries",
-                "Metadata Store batch commit attempts that failed",
-            ),
-            duration: context.histogram(
-                "metadata_store_commit_duration",
-                "Metadata Store batch commit latency (s)",
-                COMMIT_DURATION_BUCKETS,
-            ),
-        }
-    }
 }
 
 /// Metric families used by [`Publisher`].
@@ -102,52 +74,14 @@ impl StoreCommitMetrics {
 /// failure and must not re-register.
 #[derive(Clone)]
 pub struct PublisherMetrics {
-    /// Bulk finalized-index batch commits.
+    /// Finalized-index data and publication commits.
     pub(crate) commit: StoreCommitMetrics,
-    /// Metadata fast-lane block_meta commits.
-    pub(crate) metadata_commit: StoreCommitMetrics,
-    /// Time bulk commits spend waiting on the metadata persistence gate.
-    pub(crate) metadata_gate_wait: Histogram,
-    /// Block finalization to durable block_meta row.
-    pub(crate) metadata_finalized_lag: Histogram,
-    /// Row expansion and QMDB preparation time for one finalized upload.
-    pub(crate) expansion: Histogram,
-    /// Store batch staging time for one finalized upload.
-    pub(crate) staging: Histogram,
-    /// Time a committed upload waits for both QMDB watermarks to cover it.
-    pub(crate) watermark_wait: Histogram,
 }
 
 impl PublisherMetrics {
     pub fn new(context: &impl Metrics) -> Self {
         Self {
             commit: StoreCommitMetrics::new(context),
-            metadata_commit: StoreCommitMetrics::new_metadata(context),
-            metadata_gate_wait: context.histogram(
-                "metadata_gate_wait_duration",
-                "Time bulk commits wait for block_meta persistence (s)",
-                COMMIT_DURATION_BUCKETS,
-            ),
-            metadata_finalized_lag: context.histogram(
-                "metadata_finalized_lag",
-                "Block finalization to durable block_meta row (s)",
-                COMMIT_DURATION_BUCKETS,
-            ),
-            expansion: context.histogram(
-                "expansion_duration",
-                "Finalized upload row expansion and QMDB preparation time (s)",
-                COMMIT_DURATION_BUCKETS,
-            ),
-            staging: context.histogram(
-                "staging_duration",
-                "Finalized upload Store batch staging time (s)",
-                COMMIT_DURATION_BUCKETS,
-            ),
-            watermark_wait: context.histogram(
-                "watermark_wait_duration",
-                "Committed upload wait for both QMDB watermarks (s)",
-                COMMIT_DURATION_BUCKETS,
-            ),
         }
     }
 }
@@ -160,7 +94,7 @@ pub(crate) async fn commit_with_retry(
     batch: &StoreWriteBatch,
     what: &'static str,
     metrics: &StoreCommitMetrics,
-) -> u64 {
+) -> Result<u64, ClientError> {
     let start = Instant::now();
     metrics.in_flight.inc();
     let mut attempt = 0u32;
@@ -170,6 +104,11 @@ pub(crate) async fn commit_with_retry(
             Err(error) => {
                 attempt = attempt.saturating_add(1);
                 metrics.retries.inc();
+                if !is_retryable_store_error(&error) {
+                    metrics.in_flight.dec();
+                    metrics.duration.observe(start.elapsed().as_secs_f64());
+                    return Err(error);
+                }
                 warn!(
                     ?error,
                     attempt,
@@ -185,7 +124,27 @@ pub(crate) async fn commit_with_retry(
     metrics.commits.inc();
     metrics.rows.inc_by(batch.len() as u64);
     metrics.duration.observe(start.elapsed().as_secs_f64());
-    seq
+    Ok(seq)
+}
+
+fn is_retryable_store_error(error: &ClientError) -> bool {
+    match error {
+        ClientError::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+        ClientError::Rpc(_) => matches!(
+            error.rpc_code(),
+            Some(
+                ErrorCode::Aborted
+                    | ErrorCode::DeadlineExceeded
+                    | ErrorCode::Internal
+                    | ErrorCode::ResourceExhausted
+                    | ErrorCode::Unavailable
+                    | ErrorCode::Unknown
+            )
+        ),
+        ClientError::Prefix(_)
+        | ClientError::InvalidKeyLength { .. }
+        | ClientError::WireFormat(_) => false,
+    }
 }
 
 fn retry_backoff(attempt: u32) -> Duration {
@@ -193,4 +152,26 @@ fn retry_backoff(attempt: u32) -> Duration {
     const MAX: Duration = Duration::from_secs(2);
     let factor = 1u32 << attempt.min(5);
     INITIAL.saturating_mul(factor).min(MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exoware_sdk::ConnectError;
+
+    #[test]
+    fn store_retry_classification_fails_deterministic_rejections() {
+        let transient =
+            ClientError::Rpc(Box::new(ConnectError::new(ErrorCode::Unavailable, "retry")));
+        let rejected = ClientError::Rpc(Box::new(ConnectError::new(
+            ErrorCode::InvalidArgument,
+            "reject",
+        )));
+
+        assert!(is_retryable_store_error(&transient));
+        assert!(!is_retryable_store_error(&rejected));
+        assert!(!is_retryable_store_error(&ClientError::WireFormat(
+            "reject".to_string()
+        )));
+    }
 }
