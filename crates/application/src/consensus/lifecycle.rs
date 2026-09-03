@@ -151,8 +151,8 @@ where
         St: Strategy,
     {
         // The glue actor retains its own references to the block, so the
-        // header and lazy body are cloned out of the shared reference (one
-        // refcount bump each) instead of moved.
+        // header and lazy body are cloned out of the shared reference
+        // (one refcount bump for the body) instead of moved.
         let header = block.header.clone();
         let body = block.body.clone();
         drop(block);
