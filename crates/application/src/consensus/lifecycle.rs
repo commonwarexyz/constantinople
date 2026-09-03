@@ -151,10 +151,10 @@ where
         St: Strategy,
     {
         // The glue actor retains its own references to the block, so the
-        // header and lazy body are cloned out of the shared reference
-        // (per-transaction refcount bumps) instead of moved.
+        // header and lazy body are cloned out of the shared reference (one
+        // refcount bump each) instead of moved.
         let header = block.header.clone();
-        let body = Arc::new(block.body.clone());
+        let body = block.body.clone();
         drop(block);
 
         // Signature verification needs only the block body, so it starts

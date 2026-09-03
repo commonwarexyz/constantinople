@@ -3,7 +3,7 @@
 use crate::{AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSignature};
 use bytes::{Buf, BufMut};
 use commonware_codec::{
-    Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
+    EncodeFixed, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
 };
 use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
@@ -122,6 +122,14 @@ where
     }
 }
 
+/// Encoded size of a [`Transaction`] in bytes.
+///
+/// Kept as a plain constant (rather than only `<Transaction<D> as FixedSize>::SIZE`)
+/// so it can be used as a const generic argument, which stable Rust does not
+/// allow for associated constants of a generic type.
+const TRANSACTION_SIZE: usize =
+    TransactionPublicKey::SIZE + AccountKey::SIZE + u64::SIZE + u64::SIZE;
+
 /// A transaction on the Constantinople blockchain.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Transaction<D: Digest> {
@@ -170,7 +178,7 @@ impl<D: Digest> Transaction<D> {
     ///
     /// [`Digest`]: Digest
     pub fn hash_slow<H: Hasher>(&self, hasher: &mut H) -> H::Digest {
-        hasher.update(&self.encode());
+        hasher.update(&self.encode_fixed::<TRANSACTION_SIZE>());
         hasher.finalize()
     }
 
@@ -202,7 +210,7 @@ impl<D: Digest> Write for Transaction<D> {
 }
 
 impl<D: Digest> FixedSize for Transaction<D> {
-    const SIZE: usize = TransactionPublicKey::SIZE + AccountKey::SIZE + u64::SIZE + u64::SIZE;
+    const SIZE: usize = TRANSACTION_SIZE;
 }
 
 impl<D: Digest> Read for Transaction<D> {

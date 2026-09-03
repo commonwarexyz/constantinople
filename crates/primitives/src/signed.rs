@@ -19,7 +19,7 @@ use commonware_codec::{
 use commonware_cryptography::{Hasher, PublicKey, Signature, Signer, Verifier};
 use commonware_parallel::Strategy;
 use rand::CryptoRng;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 
 /// A [`Sealed`] object with an attached signature over its seal.
 #[derive(Debug, Clone)]
@@ -201,7 +201,7 @@ where
     H: Hasher,
 {
     pending: Option<Bytes>,
-    value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
+    value: OnceLock<Option<SignedTransaction<H>>>,
 }
 
 impl<H> LazySignedTransaction<H>
@@ -214,7 +214,7 @@ where
     pub fn new(value: SignedTransaction<H>) -> Self {
         Self {
             pending: None,
-            value: Arc::new(Some(value).into()),
+            value: OnceLock::from(Some(value)),
         }
     }
 
@@ -233,15 +233,9 @@ where
 
     /// Consumes the lazy transaction, returning the decoded value if decoding
     /// succeeds.
-    ///
-    /// Moves the cached value out when this handle is its only owner; clones
-    /// only when the decoded value is still shared with another handle.
     pub fn into_value(self) -> Option<SignedTransaction<H>> {
         self.get()?;
-        match Arc::try_unwrap(self.value) {
-            Ok(value) => value.into_inner().flatten(),
-            Err(shared) => shared.get().expect("value was forced above").clone(),
-        }
+        self.value.into_inner().flatten()
     }
 
     /// Returns the encoded signed transaction bytes without the lazy length prefix.
@@ -258,10 +252,10 @@ where
             .encode()
     }
 
-    fn deferred(bytes: Bytes) -> Self {
+    const fn deferred(bytes: Bytes) -> Self {
         Self {
             pending: Some(bytes),
-            value: Default::default(),
+            value: OnceLock::new(),
         }
     }
 }
