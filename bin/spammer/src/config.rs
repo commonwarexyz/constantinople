@@ -15,7 +15,8 @@ pub const DEFAULT_RAYON_THREADS: usize = 2;
 pub struct SpammerConfig {
     pub accounts: u32,
     pub value: u64,
-    pub seed_offset: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed_offset: Option<u64>,
     /// Number of rayon threads used for parallel signing.
     #[serde(default = "default_rayon_threads")]
     pub rayon_threads: usize,
@@ -95,7 +96,7 @@ mod tests {
         let config = SpammerConfig {
             accounts: 20,
             value: 5,
-            seed_offset: 2000,
+            seed_offset: Some(2000),
             rayon_threads: 6,
             http_port: 9090,
             relayer_url: "http://relayer:8080".to_string(),
@@ -123,9 +124,31 @@ mod tests {
     fn config_yaml_defaults_optional_fields_when_absent() {
         let yaml = "accounts: 10\nvalue: 1\nseed_offset: 1000\nhttp_port: 8080\nrelayer_url: http://127.0.0.1:8084\n";
         let parsed: SpammerConfig = serde_yaml::from_str(yaml).expect("deserialize");
+        assert_eq!(parsed.seed_offset, Some(1000));
         assert_eq!(parsed.rayon_threads, DEFAULT_RAYON_THREADS);
         assert_eq!(parsed.presigned_batches, DEFAULT_PRESIGNED_BATCHES);
         assert_eq!(parsed.accounts_jitter, 0.0);
+    }
+
+    #[test]
+    fn config_yaml_omits_random_seed_offset() {
+        let config = SpammerConfig {
+            accounts: 20,
+            value: 5,
+            seed_offset: None,
+            rayon_threads: 6,
+            http_port: 9090,
+            relayer_url: "http://relayer:8080".to_string(),
+            relayer_submitters: 4,
+            presigned_batches: DEFAULT_PRESIGNED_BATCHES,
+            primary_validators: vec!["deadbeef".to_string()],
+            accounts_jitter: 0.25,
+        };
+        let yaml = serde_yaml::to_string(&config).expect("serialize");
+
+        assert!(!yaml.contains("seed_offset"));
+        let parsed: SpammerConfig = serde_yaml::from_str(&yaml).expect("deserialize");
+        assert!(parsed.seed_offset.is_none());
     }
 
     #[test]

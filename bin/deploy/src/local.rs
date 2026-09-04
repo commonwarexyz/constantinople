@@ -353,6 +353,10 @@ fn local_run_commands(
         let targets = relayer_targets.join(",");
         let relayer_port =
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
+        let seed_offset = args
+            .spammer_seed_offset
+            .map(|seed_offset| format!(" --seed-offset {seed_offset}"))
+            .unwrap_or_default();
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
             relayer_port, args.validators, targets,
@@ -368,15 +372,14 @@ fn local_run_commands(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
              --accounts {} \
-             --value {} \
-             --seed-offset {} \
+             --value {}{} \
              --rayon-threads {} \
              --accounts-jitter {} \
              --presigned-batches {} \
              --metrics-port {metrics_port}",
             args.spammer_accounts,
             args.spammer_value,
-            args.spammer_seed_offset,
+            seed_offset,
             args.spammer_rayon_threads,
             args.spammer_accounts_jitter,
             args.spammer_presigned_batches,
@@ -423,7 +426,7 @@ mod tests {
             spammer,
             spammer_accounts: 10,
             spammer_value: 1,
-            spammer_seed_offset: 1000,
+            spammer_seed_offset: None,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
@@ -486,7 +489,7 @@ mod tests {
         assert!(commands[3].contains("--relayer-submitters 2"));
         assert!(commands[3].contains("--accounts 10"));
         assert!(commands[3].contains("--value 1"));
-        assert!(commands[3].contains("--seed-offset 1000"));
+        assert!(!commands[3].contains("--seed-offset"));
         assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
     }
@@ -506,6 +509,22 @@ mod tests {
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople"));
         assert!(commands[2].contains("secondary-0.yaml"));
+    }
+
+    #[test]
+    fn local_run_commands_propagate_deterministic_seed_offset() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_seed_offset = Some(2000);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        assert!(commands[3].contains("--seed-offset 2000"));
     }
 
     #[test]
