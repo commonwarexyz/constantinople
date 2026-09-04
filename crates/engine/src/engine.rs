@@ -85,6 +85,14 @@ pub const MAX_PENDING_ACKS: NonZero<usize> = NZUsize!(4);
 const WITNESS_ITEMS_PER_SECTION: NonZero<u64> = NZU64!(64);
 const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
+
+// Four validators need two original shards, the minimum for any supported set.
+// A 32 MiB transaction proposal adds less than 1 MiB of transaction length
+// prefixes, block headers, and coding metadata. Each shard is therefore below
+// 17 MiB, including Reed-Solomon's even-byte padding. Allow 32 MiB to leave
+// headroom without deriving a limit from each node's proposal configuration.
+const MAXIMUM_SHARD_SIZE: usize = 32 * 1024 * 1024;
+
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
 const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
@@ -468,7 +476,7 @@ where
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
                 shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: 1024 * 1024,
+                    maximum_shard_size: MAXIMUM_SHARD_SIZE,
                 },
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
@@ -813,5 +821,81 @@ where
             write_buffer: DB_WRITE_BUFFER,
         },
         commit_codec_config: (),
+    }
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+    use commonware_codec::{Decode, Encode, EncodeSize};
+    use commonware_coding::ReedSolomon;
+    use commonware_consensus::{
+        marshal::coding::types::Shard,
+        simplex::types::Context,
+        types::{Round, View},
+    };
+    use commonware_cryptography::{ed25519, sha256};
+    use commonware_parallel::Sequential;
+    use constantinople_primitives::{Block, Header, Sealable, Transaction, TransactionPublicKey};
+    use std::num::NonZeroU64;
+
+    #[test]
+    fn shard_limit_accepts_large_proposals_with_four_validators() {
+        let signer = ed25519::PrivateKey::from_seed(13);
+        let public_key = TransactionPublicKey::ed25519(signer.public_key());
+        let transaction = Transaction::<sha256::Digest>::new(
+            public_key.clone(),
+            public_key,
+            NonZeroU64::new(1).unwrap(),
+            0,
+        )
+        .seal_and_sign(
+            &signer,
+            constantinople_primitives::TRANSACTION_NAMESPACE,
+            &mut sha256::Sha256::default(),
+        );
+        let proposal_bytes = 32 * 1024 * 1024;
+        let transaction_count = proposal_bytes / transaction.encode_size();
+        let header = Header {
+            context: Context {
+                round: Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
+                leader: signer.public_key(),
+                parent: (View::new(u64::MAX), Commitment::default()),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: u64::MAX,
+            timestamp: u64::MAX,
+            state_root: sha256::Digest::EMPTY,
+            state_range: non_empty_range!(u64::MAX - 1, u64::MAX),
+            transactions_root: sha256::Digest::EMPTY,
+            transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
+        };
+        let block = Block::new(header, vec![transaction; transaction_count])
+            .seal(&mut sha256::Sha256::default());
+        let coding_config = coding_config_for_participants(4);
+        assert_eq!(coding_config.minimum_shards.get(), 2);
+
+        let coded = EngineCodedBlock::new(block, coding_config, &Sequential);
+        let encoded = coded.shard(0).expect("shard zero should exist").encode();
+        assert!(encoded.len() > 16 * 1024 * 1024);
+        assert!(encoded.len() < 17 * 1024 * 1024);
+
+        type TestShard = Shard<ReedSolomon<sha256::Sha256>, sha256::Sha256>;
+        TestShard::decode_cfg(
+            encoded.clone(),
+            &CodecConfig {
+                maximum_shard_size: MAXIMUM_SHARD_SIZE,
+            },
+        )
+        .expect("the static limit should accept a shard from the largest proposal");
+        assert!(
+            TestShard::decode_cfg(
+                encoded,
+                &CodecConfig {
+                    maximum_shard_size: 1024 * 1024,
+                },
+            )
+            .is_err()
+        );
     }
 }
