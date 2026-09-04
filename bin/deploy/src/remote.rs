@@ -29,7 +29,6 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     validate_generate_args(args);
-    assert!(args.validators >= 1, "need at least one validator");
     assert!(!remote.regions.is_empty(), "need at least one region");
     assert!(
         remote.regions.len() <= args.validators as usize,
@@ -278,7 +277,7 @@ fn remote_spammer_config(
         rayon_threads: args.spammer_rayon_threads,
         http_port: remote.http_port,
         relayer_url: relayer_url(args, remote, material),
-        relayer_submitters: args.validators as usize,
+        relayer_submitters: args.spammer_submitters.unwrap_or(args.validators as usize),
         presigned_batches: args.spammer_presigned_batches,
         primary_validators: material.primary_hex(),
         accounts_jitter: args.spammer_accounts_jitter,
@@ -521,6 +520,7 @@ mod tests {
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
+            spammer_submitters: None,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(LocalArgs {
                 base_port: 9000,
@@ -690,6 +690,20 @@ mod tests {
             relayed.presigned_batches,
             crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES
         );
+    }
+
+    #[test]
+    fn remote_spammer_submitters_override_validator_count() {
+        let mut args = generate_args();
+        args.spammer = true;
+        args.relayer = true;
+        args.spammer_submitters = Some(50);
+        let remote = remote_args();
+        let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
+
+        let config = remote_spammer_config(&args, &remote, &material);
+
+        assert_eq!(config.relayer_submitters, 50);
     }
 
     #[test]
