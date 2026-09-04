@@ -23,7 +23,6 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     validate_generate_args(args);
-    assert!(args.validators >= 1, "need at least one validator");
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -355,7 +354,9 @@ fn local_run_commands(
             relayer_http_port(args, local).expect("--spammer requires a relayer secondary");
         let network_source = format!(
             "--relayer-url http://127.0.0.1:{} --relayer-submitters {} --relayer-targets {}",
-            relayer_port, args.validators, targets,
+            relayer_port,
+            args.spammer_submitters.unwrap_or(args.validators as usize),
+            targets,
         );
 
         // Place the spammer's metrics port past the primary and secondary ranges
@@ -426,6 +427,7 @@ mod tests {
             spammer_seed_offset: 1000,
             spammer_rayon_threads: crate::DEFAULT_SPAMMER_RAYON_THREADS,
             spammer_accounts_jitter: 0.0,
+            spammer_submitters: None,
             spammer_presigned_batches: crate::DEFAULT_SPAMMER_PRESIGNED_BATCHES,
             target: GenerateTarget::Local(test_local_args()),
         }
@@ -489,6 +491,26 @@ mod tests {
         assert!(commands[3].contains("--seed-offset 1000"));
         assert!(commands[3].contains("--rayon-threads 2"));
         assert!(commands[3].contains("--accounts-jitter 0"));
+    }
+
+    #[test]
+    fn local_spammer_submitters_override_validator_count() {
+        let mut args = test_args(true);
+        args.relayer = true;
+        args.spammer_submitters = Some(50);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+
+        let spammer = commands
+            .iter()
+            .find(|command| command.contains("constantinople-spammer"))
+            .expect("spammer command should be present");
+        assert!(spammer.contains("--relayer-submitters 50"));
     }
 
     #[test]
