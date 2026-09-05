@@ -178,7 +178,7 @@ fn build_validators(
         let config_name = format!("{public_key_hex}.yaml");
 
         validators.push(GeneratedValidator {
-            public_key_hex: public_key_hex.clone(),
+            public_key_hex,
             config_name: config_name.clone(),
             config_file: output_dir.join(config_name),
             config,
@@ -236,7 +236,7 @@ fn build_secondaries(
         let config_name = format!("{public_key_hex}.yaml");
 
         secondaries.push(GeneratedValidator {
-            public_key_hex: public_key_hex.clone(),
+            public_key_hex,
             config_name: config_name.clone(),
             config_file: output_dir.join(config_name),
             config,
