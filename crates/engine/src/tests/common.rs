@@ -6,13 +6,13 @@ use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
     marshal::{self, Identifier},
-    types::{Height, View},
+    types::Height,
 };
 use commonware_cryptography::{
     Digestible, Signer,
     bls12381::{
         dkg::feldman_desmedt::{Output, deal},
-        primitives::{group::Share, variant::MinSig},
+        primitives::{group::Share, sharing::Mode, variant::MinSig},
     },
     ed25519,
     sha256::Sha256,
@@ -165,11 +165,11 @@ where
     type Activity = marshal::Update<TestBlock>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        if let marshal::Update::Tip(_, height, digest) = &activity {
+        if let marshal::Update::Tip(round, _, digest) = &activity {
             let monitor = self.monitor.clone();
             let update = FinalizationUpdate {
                 pk: self.public_key.clone(),
-                view: View::new(height.get()),
+                round: *round,
                 block_digest: digest.as_ref().to_vec(),
             };
             let _ = monitor.try_send(update);
@@ -226,7 +226,7 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
         .unwrap();
 
     let mut rng = test_rng();
-    let (output, shares) = deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+    let (output, shares) = deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
         .expect("fixture deal should succeed");
     let shares = shares
         .into_iter()

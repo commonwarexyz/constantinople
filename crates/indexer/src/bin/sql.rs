@@ -2,28 +2,37 @@
 //!
 //! `metadata-indexer` exposes Constantinople's SQL metadata schema
 //! (`block_meta`, `tx_meta`, `tx_activity`, and `account_meta`) over
-//! `store.sql.v1.Service`. It supports both
+//! `sql.v1.Service`. It supports both
 //! direct local invocations (`--store-url`, `--port`) and commonware-deployer's
 //! `--hosts ... --config ...` convention for remote bundles.
 
-use ahash::AHashMap;
-use axum::{Router, routing::get};
-use clap::{ArgGroup, Parser};
-use commonware_deployer::aws::Hosts;
-use constantinople_indexer::{namespaces::sql_meta_client, sql_schema::build_meta_schema};
+use axum::{Router, middleware, routing::get};
+use clap::Parser;
+use constantinople_indexer::{
+    adapter_metrics::{AdapterMetrics, serve_metrics, track_requests},
+    namespaces::sql_meta_client,
+    require_store_ready,
+    sql_schema::build_meta_schema,
+    store_client,
+};
 use exoware_sdk::StoreClient;
 use exoware_sql::{SqlServer, sql_connect_stack};
-use serde::Deserialize;
-use std::{
-    fs,
-    net::{IpAddr, SocketAddr},
-    path::{Path, PathBuf},
-    sync::Arc,
-};
+use std::{net::SocketAddr, sync::Arc};
 use tracing::info;
+
+mod adapter_settings;
+
+use adapter_settings::{AdapterArgs, Environment, Profile, Settings, load_settings};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+const PROFILE: Profile = Profile {
+    name: "metadata-indexer",
+    default_port: 8091,
+};
+
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,111 +40,45 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
     version,
     about = "SQL service over Constantinople metadata tables"
 )]
-#[command(group(
-    ArgGroup::new("mode")
-        .required(true)
-        .args(["store_url", "hosts"])
-))]
 struct Cli {
-    /// URL of the exoware Store the SQL writer publishes to.
-    #[arg(long, conflicts_with_all = ["hosts", "config"])]
-    store_url: Option<String>,
-    /// Bind address (default `0.0.0.0`).
-    #[arg(long, default_value = "0.0.0.0")]
-    host: IpAddr,
-    /// Listen port.
-    #[arg(long, default_value_t = 8091)]
-    port: u16,
-    /// Path to the deployer-generated hosts file.
-    #[arg(long, requires = "config", conflicts_with = "store_url")]
-    hosts: Option<PathBuf>,
-    /// Path to the deployer-provided metadata-indexer config YAML.
-    #[arg(long, requires = "hosts", conflicts_with = "store_url")]
-    config: Option<PathBuf>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DeployerConfig {
-    port: u16,
-    chain_indexer_url: String,
+    #[command(flatten)]
+    adapter: AdapterArgs,
 }
 
 async fn health() -> &'static str {
     "ok"
 }
 
-fn load_deployer_config(path: &Path) -> DeployerConfig {
-    let raw = fs::read_to_string(path).expect("failed to read metadata-indexer config");
-    serde_yaml::from_str(&raw).expect("failed to parse metadata-indexer config")
-}
-
-fn resolve_named_http_url(url: &str, hosts_by_name: &AHashMap<&str, std::net::IpAddr>) -> String {
-    let Some(rest) = url.strip_prefix("http://") else {
-        return url.to_string();
-    };
-    let (authority, suffix) = match rest.split_once('/') {
-        Some((authority, suffix)) => (authority, format!("/{suffix}")),
-        None => (rest, String::new()),
-    };
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        return url.to_string();
-    };
-    let Some(ip) = hosts_by_name.get(host) else {
-        return url.to_string();
-    };
-
-    format!("http://{ip}:{port}{suffix}")
-}
-
-fn load_settings(cli: Cli) -> (String, IpAddr, u16) {
-    if let Some(config_path) = cli.config {
-        let config = load_deployer_config(&config_path);
-        let hosts_path = cli
-            .hosts
-            .expect("clap should require --hosts with --config");
-        let raw_hosts = fs::read_to_string(hosts_path).expect("failed to read hosts file");
-        let hosts: Hosts = serde_yaml::from_str(&raw_hosts).expect("failed to parse hosts file");
-        let hosts_by_name = hosts
-            .hosts
-            .iter()
-            .map(|host| (host.name.as_str(), host.ip))
-            .collect::<AHashMap<_, _>>();
-        let store_url = resolve_named_http_url(&config.chain_indexer_url, &hosts_by_name);
-        return (store_url, cli.host, config.port);
-    }
-
-    (
-        cli.store_url
-            .expect("clap should require --store-url or --hosts"),
-        cli.host,
-        cli.port,
-    )
-}
-
-fn build_server(
-    store_url: &str,
-) -> Result<Arc<SqlServer>, Box<dyn std::error::Error + Send + Sync>> {
-    let client = sql_meta_client(&StoreClient::new(store_url))?;
-    let schema = build_meta_schema(client).map_err(|e| format!("configure schema: {e}"))?;
+fn build_server(client: &StoreClient) -> Result<Arc<SqlServer>, BoxError> {
+    let client = sql_meta_client(client)?;
+    let schema = build_meta_schema(client).map_err(|error| format!("configure schema: {error}"))?;
     let server = SqlServer::new(schema)?;
     Ok(Arc::new(server))
 }
 
-async fn run(
-    store_url: &str,
-    host: IpAddr,
-    port: u16,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let server = build_server(store_url)?;
-    // The explorer hits this server from a browser; allow any origin so
-    // local dev (Vite on a different port) can connect without a proxy.
-    let app = Router::new()
-        .route("/health", get(health))
-        .fallback_service(sql_connect_stack(server))
-        .layer(tower_http::cors::CorsLayer::very_permissive());
+fn build_app(client: &StoreClient) -> Result<Router, BoxError> {
+    let metrics = AdapterMetrics::new();
+    let server = build_server(client)?;
 
-    let addr = SocketAddr::from((host, port));
-    info!(%addr, store_url, "constantinople sql server listening");
+    Ok(Router::new()
+        .route("/health", get(health))
+        .route("/ready", get(health))
+        .route("/metrics", get(serve_metrics))
+        .fallback_service(sql_connect_stack(server))
+        .layer(tower_http::cors::CorsLayer::very_permissive())
+        .layer(middleware::from_fn_with_state(
+            metrics.clone(),
+            track_requests,
+        ))
+        .with_state(metrics))
+}
+
+async fn run(settings: Settings) -> Result<(), BoxError> {
+    let client = store_client(&settings.store_url, settings.api_key.as_deref())?;
+    require_store_ready(&client).await?;
+    let app = build_app(&client)?;
+    let addr = SocketAddr::from((settings.host, settings.port));
+    info!(%addr, store_url = settings.store_url, "constantinople sql server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
     Ok(())
@@ -152,15 +95,15 @@ fn init_tracing() {
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
     init_tracing();
-    let cli = Cli::parse();
-    let (store_url, host, port) = load_settings(cli);
-
-    let result = run(&store_url, host, port).await;
+    let result = match load_settings(PROFILE, Cli::parse().adapter, Environment::read()) {
+        Ok(settings) => run(settings).await,
+        Err(error) => Err(Box::new(error).into()),
+    };
 
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
-        Err(err) => {
-            eprintln!("metadata-indexer failed: {err}");
+        Err(error) => {
+            eprintln!("metadata-indexer failed: {error}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -168,85 +111,70 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, load_settings};
-    use clap::Parser;
-    use std::{
-        fs,
-        path::PathBuf,
-        time::{SystemTime, UNIX_EPOCH},
+    use super::{Cli, build_app, store_client};
+    use axum::{
+        body::{Body, to_bytes},
+        http::{Method, Request, StatusCode, header::CONTENT_TYPE},
     };
-
-    fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock should be after epoch")
-            .as_nanos();
-        std::env::temp_dir().join(format!("{prefix}-{unique}{suffix}"))
-    }
+    use clap::Parser;
+    use tower::ServiceExt;
 
     #[test]
-    fn parses_local_invocation() {
-        let cli = Cli::try_parse_from([
-            "metadata-indexer",
-            "--store-url",
-            "http://127.0.0.1:8090",
-            "--port",
-            "8091",
-        ])
-        .expect("local invocation should parse");
-
-        assert_eq!(cli.store_url, Some("http://127.0.0.1:8090".to_string()));
-        assert_eq!(cli.port, 8091);
-        assert!(cli.hosts.is_none());
-        assert!(cli.config.is_none());
+    fn rejects_incomplete_deployer_pair() {
+        assert!(Cli::try_parse_from(["metadata-indexer", "--hosts", "hosts.yaml"]).is_err());
+        assert!(Cli::try_parse_from(["metadata-indexer", "--config", "config.yaml"]).is_err());
     }
 
-    #[test]
-    fn parses_deployer_invocation() {
-        let cli = Cli::try_parse_from([
-            "metadata-indexer",
-            "--hosts",
-            "hosts.yaml",
-            "--config",
-            "config.conf",
-        ])
-        .expect("deployer invocation should parse");
+    #[tokio::test]
+    async fn app_serves_operational_routes_and_preserves_sql_routes() {
+        let client = store_client("http://127.0.0.1:1", None).expect("client should build");
+        let app = build_app(&client).expect("app should build");
 
-        assert_eq!(cli.hosts, Some(PathBuf::from("hosts.yaml")));
-        assert_eq!(cli.config, Some(PathBuf::from("config.conf")));
-        assert!(cli.store_url.is_none());
-    }
+        for path in ["/health", "/ready"] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(path)
+                        .body(Body::empty())
+                        .expect("operational request"),
+                )
+                .await
+                .expect("operational response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), 16)
+                .await
+                .expect("operational body");
+            assert_eq!(&body[..], b"ok");
+        }
 
-    #[test]
-    fn deployer_mode_resolves_chain_indexer_host_from_hosts_file() {
-        let config_path = temp_path("metadata-indexer", ".yaml");
-        let hosts_path = temp_path("metadata-indexer-hosts", ".yaml");
-        fs::write(
-            &config_path,
-            "port: 18091\nchain_indexer_url: http://chain-indexer:8090\n",
-        )
-        .expect("config should write");
-        fs::write(
-            &hosts_path,
-            "monitoring:\n  public: 10.0.0.1\n  private: 10.0.0.2\nhosts:\n  - name: \"chain-indexer\"\n    region: us-east-1\n    ip: 203.0.113.9\n",
-        )
-        .expect("hosts should write");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).expect("content type"),
+            "application/openmetrics-text; version=1.0.0; charset=utf-8"
+        );
 
-        let cli = Cli::try_parse_from([
-            "metadata-indexer",
-            "--hosts",
-            hosts_path.to_str().expect("utf-8 path"),
-            "--config",
-            config_path.to_str().expect("utf-8 path"),
-        ])
-        .expect("deployer invocation should parse");
-
-        let (store_url, _host, port) = load_settings(cli);
-
-        assert_eq!(store_url, "http://203.0.113.9:8090");
-        assert_eq!(port, 18_091);
-
-        let _ = fs::remove_file(config_path);
-        let _ = fs::remove_file(hosts_path);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/sql.v1.Service/Tables")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .expect("SQL request"),
+            )
+            .await
+            .expect("SQL response");
+        assert_ne!(response.status(), StatusCode::NOT_FOUND);
     }
 }

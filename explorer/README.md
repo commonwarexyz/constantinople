@@ -7,7 +7,7 @@ proofs through QMDB, and renders both as they arrive.
 ## What it does
 
 The explorer opens a single `Subscribe` stream against
-[`store.sql.v1.Service`][rpc] for the `block_meta` table. Every
+[`sql.v1.Service`][rpc] for the `block_meta` table. Every
 delivered `SubscribeResponse` frame carries the rows from one atomic
 ingest batch, and the indexer flushes once per finalized block, so most
 frames decode to exactly one new block summary —
@@ -18,7 +18,7 @@ The schema column names (`height`, `tx_count`, …) come from
 which is the canonical source of truth for both the publisher and this
 client.
 
-[rpc]: https://github.com/exowarexyz/monorepo/blob/main/proto/store/v1/sql.proto
+[rpc]: https://github.com/exowarexyz/monorepo/blob/main/proto/sql/v1/service.proto
 
 The UI renders a one-line block summary plus a multi-line ASCII
 histogram showing tx-count-per-block over the last ~80 blocks so the

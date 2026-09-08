@@ -69,7 +69,7 @@ the full body only when requested.
 - `[[bin]] metadata-indexer` — thin wrapper that registers
   [`build_meta_schema`](src/sql_schema.rs) onto an
   [`exoware_sql::SqlServer`](https://docs.rs/exoware-sql/latest/exoware_sql/struct.SqlServer.html)
-  so the explorer can reach the `store.sql.v1.Service` `Subscribe` RPC.
+  so the explorer can reach the `sql.v1.Service` `Subscribe` RPC.
 - `[[bin]] qmdb-indexer` — QMDB Connect facade over the same Store. It mounts
   account-state operation logs at `/state` and transaction-hash operation logs
   at `/transactions`.

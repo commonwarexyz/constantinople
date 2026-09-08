@@ -10,7 +10,7 @@
 //! - **Metadata and lookup storage (SQL)** — columnar tables registered onto
 //!   the SQL metadata namespace (see [`crate::namespaces`]) via [`KvSchema`].
 //!   The `block_meta` table is what
-//!   the explorer subscribes to over the `store.sql.v1.Service` `Subscribe`
+//!   the explorer subscribes to over the `sql.v1.Service` `Subscribe`
 //!   RPC. `tx_meta` stores one row per finalized transaction with proof and
 //!   body data. `tx_activity` stores one account-ordered row for each sender
 //!   and receiver side of a transaction. `account_meta` stores the latest
