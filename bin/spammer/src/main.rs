@@ -178,6 +178,11 @@ async fn run_relayer_mode(
         relayer_targets,
     } = config;
 
+    assert!(
+        !relayer_targets.is_empty(),
+        "finalization-paced spammer mode requires at least one relayer target"
+    );
+
     info!(
         submitters = relayer_submitters,
         accounts = accounts_count,
@@ -197,7 +202,7 @@ async fn run_relayer_mode(
         let account_offset = seed_offset + account_index * u64::from(accounts_count);
         let accounts = generate_accounts(accounts_count, account_offset);
         let target = relayer_target_for(&relayer_targets, index);
-        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), index, target);
+        let submitter = RelayerSubmitter::new(relayer_url.clone(), stats.clone(), target);
         let strategy = strategy.clone();
         let batches = spawn_presigner(
             strategy,
@@ -215,7 +220,7 @@ async fn run_relayer_mode(
         interval.tick().await;
         let totals = stats.totals();
         let elapsed = start.elapsed().as_secs_f64();
-        let tps = if elapsed > 0.0 {
+        let finalization_tps = if elapsed > 0.0 {
             totals.finalized as f64 / elapsed
         } else {
             0.0
@@ -225,7 +230,7 @@ async fn run_relayer_mode(
             filtered = totals.filtered,
             dropped = totals.dropped,
             errors = totals.errors,
-            tps = format!("{tps:.0}"),
+            finalization_tps = format!("{finalization_tps:.0}"),
             elapsed_s = format!("{elapsed:.1}"),
             "progress"
         );

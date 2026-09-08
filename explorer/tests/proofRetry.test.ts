@@ -10,9 +10,14 @@ import { assertTransactionLocationBeforeTip, transactionProofTip } from '../src/
 
 test('SQL tx metadata misses are retried while the indexer catches up', () => {
     assert.equal(
-        isRetryableProofError('tx digest 1adb68d9800...a2a15bb3 missing at height 127'),
+        isRetryableProofError('tx digest 1adb68d9800...a2a15bb3 is not finalized yet'),
         true,
     );
+});
+
+test('immutable Simplex configuration errors are terminal', () => {
+    assert.equal(isRetryableProofError('failed to decode Simplex verification material'), false);
+    assert.equal(isRetryableProofError('Simplex verification material contains trailing bytes'), false);
 });
 
 test('QMDB transaction root mismatches are terminal', () => {
