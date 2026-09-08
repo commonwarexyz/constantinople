@@ -1,15 +1,15 @@
 use crate::{
-    CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
+    AdapterConfig, CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
     CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
     DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
     INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
-    METADATA_INDEXER_CONFIG_FILE, MetadataIndexerConfig, QMDB_INDEXER_BINARY_FILE,
-    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, QmdbIndexerConfig, RelayerConfig,
-    RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
-    SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
-    default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE,
+    QMDB_INDEXER_HOST, RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE,
+    SPAMMER_CONFIG_FILE, STORAGE_CLASS, SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE,
+    ValidatorConfig, absolute_path, default_bootstrappers, ensure_output_dir_missing,
+    generate_deployer_tag, generate_remote_cluster_material, indexer_enabled, secondary_roles,
+    total_secondaries, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -87,36 +87,16 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     );
     if indexer_enabled(args) {
         info!(
-            chain_indexer_port = remote.chain_indexer_port,
+            store_url = %store_url(remote),
             metadata_indexer_port = remote.metadata_indexer_port,
             qmdb_indexer_port = remote.qmdb_indexer_port,
             "configured shared remote indexer services"
         );
     }
-    let mut binaries = vec![output_dir.join(VALIDATOR_BINARY_FILE).display().to_string()];
-    if indexer_enabled(args) {
-        binaries.push(
-            output_dir
-                .join(CHAIN_INDEXER_BINARY_FILE)
-                .display()
-                .to_string(),
-        );
-        binaries.push(
-            output_dir
-                .join(METADATA_INDEXER_BINARY_FILE)
-                .display()
-                .to_string(),
-        );
-        binaries.push(
-            output_dir
-                .join(QMDB_INDEXER_BINARY_FILE)
-                .display()
-                .to_string(),
-        );
-    }
-    if args.spammer {
-        binaries.push(output_dir.join(SPAMMER_BINARY_FILE).display().to_string());
-    }
+    let binaries = expected_binary_files(args, remote)
+        .into_iter()
+        .map(|binary| output_dir.join(binary).display().to_string())
+        .collect::<Vec<_>>();
     info!(
         ?binaries,
         "build deployment binaries into the output directory before creating the remote deployment"
@@ -226,8 +206,7 @@ fn build_secondaries(
             public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
-            indexer: matches!(role, SecondaryRole::Indexer)
-                .then(|| remote_indexer_config(remote.chain_indexer_port)),
+            indexer: matches!(role, SecondaryRole::Indexer).then(|| remote_indexer_config(remote)),
             relayer: matches!(role, SecondaryRole::Relayer)
                 .then(|| remote_relayer_config(remote, material)),
         };
@@ -245,9 +224,46 @@ fn build_secondaries(
     secondaries
 }
 
-fn remote_indexer_config(port: u16) -> IndexerConfig {
+fn store_url(remote: &RemoteArgs) -> String {
+    remote
+        .chain_indexer_url
+        .clone()
+        .unwrap_or_else(|| format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port))
+}
+
+const fn local_chain_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
+    indexer_enabled(args) && remote.chain_indexer_url.is_none()
+}
+
+const fn local_metadata_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
+    indexer_enabled(args) && remote.metadata_indexer_url.is_none()
+}
+
+const fn local_qmdb_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
+    indexer_enabled(args) && remote.qmdb_indexer_url.is_none()
+}
+
+fn expected_binary_files(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<&'static str> {
+    let mut binaries = vec![VALIDATOR_BINARY_FILE];
+    if local_chain_indexer(args, remote) {
+        binaries.push(CHAIN_INDEXER_BINARY_FILE);
+    }
+    if local_metadata_indexer(args, remote) {
+        binaries.push(METADATA_INDEXER_BINARY_FILE);
+    }
+    if local_qmdb_indexer(args, remote) {
+        binaries.push(QMDB_INDEXER_BINARY_FILE);
+    }
+    if args.spammer {
+        binaries.push(SPAMMER_BINARY_FILE);
+    }
+    binaries
+}
+
+fn remote_indexer_config(remote: &RemoteArgs) -> IndexerConfig {
     IndexerConfig {
-        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{port}"),
+        chain_indexer_url: store_url(remote),
+        api_key: remote.chain_indexer_api_key.clone(),
         upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
 }
@@ -291,27 +307,26 @@ fn relayer_url(args: &GenerateArgs, remote: &RemoteArgs, material: &ClusterMater
 }
 
 fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<ChainIndexerConfig> {
-    indexer_enabled(args).then(|| ChainIndexerConfig {
+    local_chain_indexer(args, remote).then(|| ChainIndexerConfig {
         port: remote.chain_indexer_port,
         data_dir: PathBuf::from(CHAIN_INDEXER_DATA_DIR),
         db_parallelism: remote.chain_indexer_db_parallelism,
     })
 }
 
-fn metadata_indexer_config(
-    args: &GenerateArgs,
-    remote: &RemoteArgs,
-) -> Option<MetadataIndexerConfig> {
-    indexer_enabled(args).then(|| MetadataIndexerConfig {
+fn metadata_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<AdapterConfig> {
+    local_metadata_indexer(args, remote).then(|| AdapterConfig {
         port: remote.metadata_indexer_port,
-        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+        chain_indexer_url: store_url(remote),
+        api_key: remote.adapter_store_api_key.clone(),
     })
 }
 
-fn qmdb_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<QmdbIndexerConfig> {
-    indexer_enabled(args).then(|| QmdbIndexerConfig {
+fn qmdb_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<AdapterConfig> {
+    local_qmdb_indexer(args, remote).then(|| AdapterConfig {
         port: remote.qmdb_indexer_port,
-        chain_indexer_url: format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port),
+        chain_indexer_url: store_url(remote),
+        api_key: remote.adapter_store_api_key.clone(),
     })
 }
 
@@ -325,6 +340,9 @@ fn build_deployer_config(
 ) -> aws::Config {
     let regions = &remote.regions;
     let indexer_enabled = indexer_enabled(args);
+    let has_local_exoware_services = local_chain_indexer(args, remote)
+        || local_metadata_indexer(args, remote)
+        || local_qmdb_indexer(args, remote);
     let shared_indexer_region = regions[0].clone();
     let mut instances: Vec<aws::InstanceConfig> = validators
         .iter()
@@ -354,10 +372,8 @@ fn build_deployer_config(
         instances.push(aws::InstanceConfig {
             name: secondary.public_key_hex.clone(),
             region,
-            availability_zone_group: secondary
-                .config
-                .indexer
-                .is_some()
+            availability_zone_group: (secondary.config.indexer.is_some()
+                && has_local_exoware_services)
                 .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
@@ -370,7 +386,7 @@ fn build_deployer_config(
         });
     }
 
-    if indexer_enabled {
+    if local_chain_indexer(args, remote) {
         instances.push(aws::InstanceConfig {
             name: CHAIN_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
@@ -384,6 +400,9 @@ fn build_deployer_config(
             config: CHAIN_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
         });
+    }
+
+    if local_metadata_indexer(args, remote) {
         instances.push(aws::InstanceConfig {
             name: crate::METADATA_INDEXER_HOST.to_string(),
             region: shared_indexer_region.clone(),
@@ -397,6 +416,9 @@ fn build_deployer_config(
             config: METADATA_INDEXER_CONFIG_FILE.to_string(),
             profiling: false,
         });
+    }
+
+    if local_qmdb_indexer(args, remote) {
         instances.push(aws::InstanceConfig {
             name: QMDB_INDEXER_HOST.to_string(),
             region: shared_indexer_region,
@@ -442,28 +464,34 @@ fn build_deployer_config(
             dashboard: dashboard.to_string(),
         },
         instances,
-        ports: port_configs(remote, indexer_enabled),
+        ports: port_configs(args, remote),
     }
 }
 
-fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConfig> {
+fn port_configs(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<aws::PortConfig> {
     let mut ports = vec![aws::PortConfig {
         protocol: "tcp".to_string(),
         port: remote.listen_port,
         cidr: "0.0.0.0/0".to_string(),
     }];
 
-    if indexer_enabled {
+    if local_chain_indexer(args, remote) {
         ports.push(aws::PortConfig {
             protocol: "tcp".to_string(),
             port: remote.chain_indexer_port,
             cidr: "0.0.0.0/0".to_string(),
         });
+    }
+
+    if local_metadata_indexer(args, remote) {
         ports.push(aws::PortConfig {
             protocol: "tcp".to_string(),
             port: remote.metadata_indexer_port,
             cidr: "0.0.0.0/0".to_string(),
         });
+    }
+
+    if local_qmdb_indexer(args, remote) {
         ports.push(aws::PortConfig {
             protocol: "tcp".to_string(),
             port: remote.qmdb_indexer_port,
@@ -484,7 +512,10 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, chain_indexer_config, expected_binary_files,
+        metadata_indexer_config, port_configs, qmdb_indexer_config, remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
@@ -541,6 +572,11 @@ mod tests {
             storage_size: 25,
             storage_iops: None,
             storage_throughput: None,
+            chain_indexer_url: None,
+            metadata_indexer_url: None,
+            qmdb_indexer_url: None,
+            chain_indexer_api_key: None,
+            adapter_store_api_key: None,
             chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
             chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
             chain_indexer_storage_iops: DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
@@ -733,8 +769,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let mut indexer_secondary_config = validator(0).config;
-        indexer_secondary_config.indexer =
-            Some(super::remote_indexer_config(remote.chain_indexer_port));
+        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&remote));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),
@@ -771,10 +806,248 @@ mod tests {
         let mut remote = remote_args();
         remote.http_cidrs.clear();
 
-        let ports = port_configs(&remote, false);
+        let ports = port_configs(&generate_args(), &remote);
 
         assert_eq!(ports.len(), 1);
         assert_eq!(ports[0].port, 9000);
+    }
+
+    #[test]
+    fn remote_adapter_replacement_matrix_preserves_store_and_credentials() {
+        const STORE_URL: &str = "https://store.example.xyz";
+        const METADATA_URL: &str = "https://sql.example.xyz";
+        const QMDB_URL: &str = "https://qmdb.example.xyz";
+        const WRITER_KEY: &str = "writer-key";
+        const READER_KEY: &str = "reader-key";
+
+        struct Case {
+            name: &'static str,
+            remote_metadata: bool,
+            remote_qmdb: bool,
+        }
+
+        let cases = [
+            Case {
+                name: "no remote adapters",
+                remote_metadata: false,
+                remote_qmdb: false,
+            },
+            Case {
+                name: "metadata only",
+                remote_metadata: true,
+                remote_qmdb: false,
+            },
+            Case {
+                name: "QMDB only",
+                remote_metadata: false,
+                remote_qmdb: true,
+            },
+            Case {
+                name: "both adapters",
+                remote_metadata: true,
+                remote_qmdb: true,
+            },
+        ];
+
+        for case in cases {
+            let mut args = generate_args();
+            args.indexer = true;
+            args.relayer = true;
+
+            let mut remote = remote_args();
+            remote.chain_indexer_url = Some(STORE_URL.to_string());
+            remote.metadata_indexer_url = case.remote_metadata.then(|| METADATA_URL.to_string());
+            remote.qmdb_indexer_url = case.remote_qmdb.then(|| QMDB_URL.to_string());
+            remote.chain_indexer_api_key = Some(WRITER_KEY.to_string());
+            remote.adapter_store_api_key = Some(READER_KEY.to_string());
+
+            let material =
+                generate_local_cluster_material(args.validators, total_secondaries(&args));
+            let secondaries =
+                build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
+            let indexer = secondaries[0]
+                .config
+                .indexer
+                .as_ref()
+                .expect("the owning secondary should have indexer wiring");
+
+            assert_eq!(indexer.chain_indexer_url, STORE_URL, "{}", case.name);
+            assert_eq!(
+                indexer.api_key.as_deref(),
+                Some(WRITER_KEY),
+                "{}",
+                case.name
+            );
+            assert!(secondaries[1].config.indexer.is_none(), "{}", case.name);
+            assert!(
+                chain_indexer_config(&args, &remote).is_none(),
+                "{}",
+                case.name
+            );
+
+            let metadata = metadata_indexer_config(&args, &remote);
+            let qmdb = qmdb_indexer_config(&args, &remote);
+            assert_eq!(metadata.is_some(), !case.remote_metadata, "{}", case.name);
+            assert_eq!(qmdb.is_some(), !case.remote_qmdb, "{}", case.name);
+
+            if let Some(config) = &metadata {
+                assert_eq!(config.chain_indexer_url, STORE_URL, "{}", case.name);
+                assert_eq!(config.api_key.as_deref(), Some(READER_KEY), "{}", case.name);
+            }
+            if let Some(config) = &qmdb {
+                assert_eq!(config.chain_indexer_url, STORE_URL, "{}", case.name);
+                assert_eq!(config.api_key.as_deref(), Some(READER_KEY), "{}", case.name);
+            }
+
+            let validators = vec![validator(0), validator(1), validator(2)];
+            let deployer = build_deployer_config(
+                &args,
+                &remote,
+                VALIDATOR_BINARY_FILE,
+                "dashboard.json",
+                &validators,
+                &secondaries,
+            );
+            let has_instance = |name: &str| {
+                deployer
+                    .instances
+                    .iter()
+                    .any(|instance| instance.name == name)
+            };
+            assert!(!has_instance("chain-indexer"), "{}", case.name);
+            assert_eq!(
+                has_instance("metadata-indexer"),
+                !case.remote_metadata,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                has_instance("qmdb-indexer"),
+                !case.remote_qmdb,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                deployer.instances.len(),
+                validators.len()
+                    + secondaries.len()
+                    + usize::from(!case.remote_metadata)
+                    + usize::from(!case.remote_qmdb),
+                "{}",
+                case.name
+            );
+
+            let indexer_instance = deployer
+                .instances
+                .iter()
+                .find(|instance| instance.name == secondaries[0].public_key_hex)
+                .expect("indexer secondary should be provisioned");
+            assert_eq!(
+                indexer_instance.availability_zone_group.as_deref(),
+                (!case.remote_metadata || !case.remote_qmdb)
+                    .then_some(EXOWARE_AVAILABILITY_ZONE_GROUP),
+                "{}",
+                case.name
+            );
+
+            let mut binaries = vec![VALIDATOR_BINARY_FILE];
+            if !case.remote_metadata {
+                binaries.push(METADATA_INDEXER_BINARY_FILE);
+            }
+            if !case.remote_qmdb {
+                binaries.push(QMDB_INDEXER_BINARY_FILE);
+            }
+            assert_eq!(
+                expected_binary_files(&args, &remote),
+                binaries,
+                "{}",
+                case.name
+            );
+
+            let ports = port_configs(&args, &remote);
+            let has_port = |port| ports.iter().any(|config| config.port == port);
+            assert!(!has_port(remote.chain_indexer_port), "{}", case.name);
+            assert_eq!(
+                has_port(remote.metadata_indexer_port),
+                !case.remote_metadata,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                has_port(remote.qmdb_indexer_port),
+                !case.remote_qmdb,
+                "{}",
+                case.name
+            );
+
+            let mut validator_yamls = validators
+                .iter()
+                .map(|validator| {
+                    serde_yaml::to_string(&validator.config)
+                        .expect("validator config should serialize")
+                })
+                .collect::<Vec<_>>();
+            validator_yamls.extend(secondaries.iter().map(|secondary| {
+                serde_yaml::to_string(&secondary.config).expect("secondary config should serialize")
+            }));
+            assert_eq!(
+                validator_yamls
+                    .iter()
+                    .map(|raw| raw.matches(WRITER_KEY).count())
+                    .sum::<usize>(),
+                1,
+                "{}",
+                case.name
+            );
+            assert!(
+                validator_yamls.iter().all(|raw| !raw.contains(READER_KEY)),
+                "{}",
+                case.name
+            );
+
+            let mut generated_yamls = validator_yamls;
+            if let Some(config) = &metadata {
+                generated_yamls
+                    .push(serde_yaml::to_string(config).expect("metadata config should serialize"));
+            }
+            if let Some(config) = &qmdb {
+                generated_yamls
+                    .push(serde_yaml::to_string(config).expect("QMDB config should serialize"));
+            }
+            generated_yamls
+                .push(serde_yaml::to_string(&deployer).expect("deployer config should serialize"));
+
+            assert_eq!(
+                generated_yamls
+                    .iter()
+                    .map(|raw| raw.matches(WRITER_KEY).count())
+                    .sum::<usize>(),
+                1,
+                "{}",
+                case.name
+            );
+            assert_eq!(
+                generated_yamls
+                    .iter()
+                    .map(|raw| raw.matches(READER_KEY).count())
+                    .sum::<usize>(),
+                usize::from(!case.remote_metadata) + usize::from(!case.remote_qmdb),
+                "{}",
+                case.name
+            );
+            assert!(
+                generated_yamls
+                    .iter()
+                    .all(|raw| !raw.contains(METADATA_URL)),
+                "{}",
+                case.name
+            );
+            assert!(
+                generated_yamls.iter().all(|raw| !raw.contains(QMDB_URL)),
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]
@@ -812,8 +1085,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let mut indexer_secondary_config = validator(0).config;
-        indexer_secondary_config.indexer =
-            Some(super::remote_indexer_config(remote.chain_indexer_port));
+        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&remote));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),

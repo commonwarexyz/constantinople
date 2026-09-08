@@ -9,7 +9,11 @@ use commonware_cryptography::{
     Signer,
     bls12381::{
         dkg::feldman_desmedt as dkg,
-        primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
+        primitives::{
+            group::Share,
+            sharing::{Mode, ModeVersion},
+            variant::MinSig,
+        },
     },
     ed25519,
 };
@@ -228,6 +232,24 @@ pub(crate) struct RemoteArgs {
     /// consensus does.
     #[arg(long = "storage-throughput")]
     storage_throughput: Option<i32>,
+    /// Absolute HTTP or HTTPS URL of an external exoware store that supports reads and writes.
+    /// The URL is used verbatim by every store consumer. Providing it replaces
+    /// the simulator-backed chain-indexer. No chain-indexer instance, binary,
+    /// config, or port rule is generated.
+    #[arg(long = "chain-indexer-url")]
+    chain_indexer_url: Option<String>,
+    /// Origin of an already-running metadata indexer backed by the external store.
+    #[arg(long = "metadata-indexer-url", requires = "chain_indexer_url")]
+    metadata_indexer_url: Option<String>,
+    /// Origin of an already-running QMDB indexer backed by the external store.
+    #[arg(long = "qmdb-indexer-url", requires = "chain_indexer_url")]
+    qmdb_indexer_url: Option<String>,
+    /// Store writer credential for the validator indexer secondary.
+    #[arg(long = "chain-indexer-api-key")]
+    chain_indexer_api_key: Option<String>,
+    /// Store read credential for locally deployed adapter services.
+    #[arg(long = "adapter-store-api-key")]
+    adapter_store_api_key: Option<String>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,
@@ -436,6 +458,9 @@ pub(crate) struct ValidatorConfig {
 pub(crate) struct IndexerConfig {
     /// URL of the shared chain-indexer store.
     pub chain_indexer_url: String,
+    /// Store writer credential used by the indexer secondary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Number of blocks buffered before upload.
     pub upload_buffer: usize,
 }
@@ -453,19 +478,14 @@ pub(crate) struct ChainIndexerConfig {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MetadataIndexerConfig {
-    /// Read-service port the metadata-indexer listens on.
+pub(crate) struct AdapterConfig {
+    /// Port the adapter listens on.
     pub port: u16,
     /// URL of the chain-indexer store to read from.
     pub chain_indexer_url: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct QmdbIndexerConfig {
-    /// Query facade port the qmdb-indexer listens on.
-    pub port: u16,
-    /// URL of the chain-indexer store to read from.
-    pub chain_indexer_url: String,
+    /// Store read credential used by this adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -677,7 +697,7 @@ fn build_cluster_material(
     // primary count or `threshold_scheme` will panic at validator load.
     let participants = public_keys.clone().into_iter().try_collect().unwrap();
     let (dkg_output, raw_shares) =
-        dkg::deal::<MinSig, _, N3f1>(rng, Default::default(), participants)
+        dkg::deal::<MinSig, _, N3f1>(rng, Mode::NonZeroCounter, participants)
             .expect("DKG deal failed");
     let shares = raw_shares.into_iter().collect();
     let genesis_leader = hex(&public_keys[0].encode());
@@ -763,11 +783,11 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
-        generate_local_cluster_material, simplex_verification_material_from_config,
-        write_simplex_verification_material,
+        AdapterConfig, Cli, Command, GenerateTarget, IndexerConfig,
+        SIMPLEX_VERIFICATION_MATERIAL_FILE, generate_local_cluster_material,
+        simplex_verification_material_from_config, write_simplex_verification_material,
     };
-    use clap::Parser;
+    use clap::{Parser, error::ErrorKind};
     use commonware_codec::Encode;
     use commonware_formatting::hex;
     use std::{
@@ -775,6 +795,30 @@ mod tests {
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
+
+    fn remote_cli_args() -> Vec<&'static str> {
+        vec![
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "remote",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8g.large",
+            "--storage-size",
+            "25",
+            "--monitoring-instance-type",
+            "c8g.2xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--dashboard",
+            "dashboard.json",
+        ]
+    }
 
     #[test]
     fn remote_parses_http_cidrs() {
@@ -815,6 +859,86 @@ mod tests {
             remote.http_cidrs,
             vec!["10.0.0.0/8".to_string(), "198.51.100.4/32".to_string()]
         );
+    }
+
+    #[test]
+    fn remote_parses_adapter_origins_and_credentials() {
+        let mut args = remote_cli_args();
+        args.extend([
+            "--chain-indexer-url",
+            "https://store.example.com",
+            "--metadata-indexer-url",
+            "https://sql.example.com",
+            "--qmdb-indexer-url",
+            "https://qmdb.example.com",
+            "--chain-indexer-api-key",
+            "writer-key",
+            "--adapter-store-api-key",
+            "reader-key",
+        ]);
+
+        let cli = Cli::try_parse_from(args).expect("remote invocation should parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("expected remote target");
+        };
+
+        assert_eq!(
+            remote.chain_indexer_url.as_deref(),
+            Some("https://store.example.com")
+        );
+        assert_eq!(
+            remote.metadata_indexer_url.as_deref(),
+            Some("https://sql.example.com")
+        );
+        assert_eq!(
+            remote.qmdb_indexer_url.as_deref(),
+            Some("https://qmdb.example.com")
+        );
+        assert_eq!(remote.chain_indexer_api_key.as_deref(), Some("writer-key"));
+        assert_eq!(remote.adapter_store_api_key.as_deref(), Some("reader-key"));
+    }
+
+    #[test]
+    fn remote_adapter_origins_each_require_external_store() {
+        for flag in ["--metadata-indexer-url", "--qmdb-indexer-url"] {
+            let mut args = remote_cli_args();
+            args.extend([flag, "https://adapter.example.com"]);
+
+            let error = Cli::try_parse_from(args)
+                .expect_err("remote adapter origin without an external store should fail");
+
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn generated_indexer_api_keys_default_and_omit() {
+        let indexer: IndexerConfig = serde_yaml::from_str(
+            "chain_indexer_url: https://store.example.com\nupload_buffer: 64\n",
+        )
+        .expect("indexer config without an API key should parse");
+        let metadata: AdapterConfig =
+            serde_yaml::from_str("port: 8091\nchain_indexer_url: https://store.example.com\n")
+                .expect("metadata config without an API key should parse");
+        let qmdb: AdapterConfig =
+            serde_yaml::from_str("port: 8092\nchain_indexer_url: https://store.example.com\n")
+                .expect("QMDB config without an API key should parse");
+
+        assert_eq!(indexer.api_key, None);
+        assert_eq!(metadata.api_key, None);
+        assert_eq!(qmdb.api_key, None);
+
+        for raw in [
+            serde_yaml::to_string(&indexer).expect("indexer config should serialize"),
+            serde_yaml::to_string(&metadata).expect("metadata config should serialize"),
+            serde_yaml::to_string(&qmdb).expect("QMDB config should serialize"),
+        ] {
+            assert!(!raw.contains("api_key"));
+        }
     }
 
     #[test]

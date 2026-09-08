@@ -170,7 +170,7 @@ relayer is `secondary-1`.
 
 The printed `mprocs` command list grows by four entries:
 
-- `cargo run --release -p constantinople-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
+- `cargo run --release -p constantinople-indexer --features chain-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
   runs the simulator-backed shared store. `--chain-indexer-port` overrides the Store port.
   The metrics port follows the validator, secondary, and spammer metrics range
   starting at `--base-metrics-port`. Direct invocations accept `--metrics-port`,
@@ -445,25 +445,101 @@ the shared Store URL, and clients read them from the Store rather than from
 The deployer opens shared-service ports globally because `commonware-deployer`'s port list is
 deployment-wide rather than per-instance.
 
-Build every deployable binary before creating the deployment. For Graviton instances:
+### External Store and Adapters
+
+Pass `--chain-indexer-url <url>` to use an external exoware Store instead of
+provisioning the simulator-backed `chain-indexer` host. The owning indexer
+secondary and every locally managed adapter receive this URL. No
+`chain-indexer` instance, binary, config, or port rule is generated.
+
+The metadata and QMDB adapters can be replaced independently. Each adapter
+origin requires `--chain-indexer-url`. The generator checks that dependency,
+but it cannot verify service ownership. The operator must ensure every supplied
+adapter is backed by the same Store deployment as `--chain-indexer-url`.
 
 ```sh
-just graviton-binaries
+cargo run --bin constantinople-deploy -- generate \
+  --validators 20 \
+  --indexer \
+  --output-dir ./deploy \
+  remote \
+  --instance-type c8g.2xlarge \
+  --storage-size 75 \
+  --monitoring-instance-type c8g.2xlarge \
+  --monitoring-storage-size 100 \
+  --chain-indexer-url https://store.example.com \
+  --metadata-indexer-url https://sql.example.com \
+  --qmdb-indexer-url https://qmdb.example.com \
+  --regions us-east-1,us-west-2 \
+  --dashboard ./dashboard.json
 ```
 
-For Intel instances:
+`--metadata-indexer-url` and `--qmdb-indexer-url` identify already-running
+explorer origins. They are not written into validator or adapter YAML. Each
+flag suppresses only the matching config file, binary, instance, and port
+rule. An adapter without a remote origin remains local and reads from the
+external Store URL.
+
+| Remote flags | Locally managed services |
+| ------------ | ------------------------ |
+| neither adapter flag | `metadata-indexer`, `qmdb-indexer` |
+| `--metadata-indexer-url` | `qmdb-indexer` |
+| `--qmdb-indexer-url` | `metadata-indexer` |
+| both adapter flags | none |
+
+The validator writer and local adapter readers use independent credentials.
+`--chain-indexer-api-key` is serialized only into the owning indexer
+secondary. It authenticates Simplex, SQL, and QMDB uploads plus writer
+recovery reads. A write-only credential is sufficient when Store reads are
+open. When Store reads require authentication, this credential must have both
+read and write scopes. Supporting separate writer read and write credentials
+is deferred. `--adapter-store-api-key` is serialized only into locally managed
+adapter configs. Remote adapters receive neither value. An omitted key
+preserves the SDK `EXOWARE_API_KEY` fallback.
+
+The adapter binaries also support environment-only startup through
+`CONSTANTINOPLE_STORE_URL` and `CONSTANTINOPLE_PORT`. Runtime values resolve
+from an explicit CLI value, then deployer YAML, then the environment, then a
+compiled default or missing-value error. A deployer YAML API key takes
+precedence over `EXOWARE_API_KEY`.
+
+Each adapter probes Store readiness once before binding. After startup,
+`/health` and `/ready` return static success. `/metrics` shares the service
+port and excludes health, readiness, and metrics requests from its counters.
+
+The deployer opens local shared-service ports globally because
+`commonware-deployer` owns one deployment-wide port list. Remote adapter flags
+remove their matching ports from that list.
+
+### Deployment Script with External Services
+
+The repository deployment script accepts the public Store and adapter
+origins directly.
 
 ```sh
-just intel-binaries
+./deploy.sh \
+  --store-url https://store.example.com \
+  --store-api-key writer-key \
+  --sql-url https://sql.example.com \
+  --qmdb-url https://qmdb.example.com
 ```
 
-Those aggregate targets write:
+`--sql-url` and `--qmdb-url` each require `--store-url`. The script forwards
+the Store key only as `--chain-indexer-api-key`. It forwards
+`--adapter-store-api-key` only to the deployer generator, which writes it only
+for adapters that remain local.
 
-- `deploy/validator`
-- `deploy/spammer`
-- `deploy/chain-indexer`
-- `deploy/metadata-indexer`
-- `deploy/qmdb-indexer`
+Remote adapter origins are exported verbatim to `VITE_SQL_URL` and
+`VITE_QMDB_URL`. A missing adapter origin is constructed from its generated
+host. `VITE_STORE_URL` always points to Store because the explorer reads
+Simplex finalizations directly. Credentials are never exported as `VITE_*`
+values. The static explorer therefore requires tokenless public access to
+Store query, SQL, and QMDB reads. Browser token input is deferred and must be
+implemented before the explorer can use authenticated read origins.
+
+The script builds only locally managed adapter binaries. The managed
+chain-indexer Intel build remains last because both chain-indexer recipes
+write `deploy/chain-indexer`.
 
 ### Local Explorer Against Remote
 
