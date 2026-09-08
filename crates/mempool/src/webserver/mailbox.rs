@@ -23,6 +23,12 @@ where
     pub(super) rx: mpsc::Receiver<Message<C, P, H>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SubmissionLane {
+    Foreground,
+    Background,
+}
+
 pub(super) enum Message<C, P, H>
 where
     C: Digest,
@@ -31,6 +37,7 @@ where
 {
     /// A batch of verified transactions submitted by an HTTP handler.
     Submit {
+        lane: SubmissionLane,
         batch_id: String,
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
@@ -110,9 +117,44 @@ where
         transactions: Vec<VerifiedTransaction<H>>,
         total_bytes: usize,
     ) -> Option<oneshot::Receiver<TxStatus>> {
+        self.try_submit_in_lane(
+            SubmissionLane::Foreground,
+            batch_id,
+            digests,
+            transactions,
+            total_bytes,
+        )
+    }
+
+    /// Blocking batch submission through the background lane.
+    pub(super) fn try_submit_background(
+        &self,
+        batch_id: String,
+        digests: Vec<H::Digest>,
+        transactions: Vec<VerifiedTransaction<H>>,
+        total_bytes: usize,
+    ) -> Option<oneshot::Receiver<TxStatus>> {
+        self.try_submit_in_lane(
+            SubmissionLane::Background,
+            batch_id,
+            digests,
+            transactions,
+            total_bytes,
+        )
+    }
+
+    fn try_submit_in_lane(
+        &self,
+        lane: SubmissionLane,
+        batch_id: String,
+        digests: Vec<H::Digest>,
+        transactions: Vec<VerifiedTransaction<H>>,
+        total_bytes: usize,
+    ) -> Option<oneshot::Receiver<TxStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
             .try_send(Message::Submit {
+                lane,
                 batch_id,
                 digests,
                 transactions,
@@ -138,6 +180,7 @@ where
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
             .try_send(Message::Submit {
+                lane: SubmissionLane::Foreground,
                 batch_id,
                 digests,
                 transactions,
