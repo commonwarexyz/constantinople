@@ -138,14 +138,17 @@ cargo run --bin constantinople-deploy -- generate \
 
 This adds one extra secondary validator with a `relayer` section and starts it with the normal
 `constantinople` binary. The relayer listens on the next local HTTP port after validators and
-the optional indexer secondary, follows consensus directly, and forwards normal user batches to
-the leaders of the next two views.
+the optional indexer secondary and follows consensus directly. It forwards single-transaction
+user submissions to up to four upcoming leaders and larger batches to up to two.
+It waits up to ten seconds for a terminal result before returning an empty HTTP 202.
+Forwarding continues after that response, with a thirty-second timeout per leader.
 
 When `--spammer` is set, the generated spammer command uses `--relayer-url`,
 `--relayer-submitters <validators>`, and `--relayer-targets <primary-keys>`.
-Each relayed submitter pins an exact primary validator target and requests
-single-leader routing, so concurrent streams feed different primaries without
-creating stale duplicate nonce copies.
+Each relayed submitter pins an exact primary validator target and uses its
+background queue. Each stream waits for a terminal result before generating its
+next batch. Transient failures retry the same encoded batch with backoff, so a
+lost response does not advance the stream's nonces prematurely.
 
 ### Local Deployment with Indexer + Explorer
 
