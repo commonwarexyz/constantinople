@@ -46,9 +46,9 @@ pub struct Cli {
     #[arg(long, default_value_t = 1)]
     pub value: u64,
 
-    /// Seed offset for spam account keys (avoids collision with validator keys).
-    #[arg(long, default_value_t = 1000)]
-    pub seed_offset: u64,
+    /// Seed offset for deterministic spam accounts. Omit for fresh accounts.
+    #[arg(long)]
+    pub seed_offset: Option<u64>,
 
     /// Number of rayon threads for parallel signing.
     #[arg(long, default_value_t = crate::config::DEFAULT_RAYON_THREADS)]
@@ -95,6 +95,21 @@ mod tests {
         );
         assert!(cli.relayer_targets.is_empty());
         assert!(cli.hosts.is_none());
+        assert!(cli.seed_offset.is_none());
+    }
+
+    #[test]
+    fn parses_deterministic_seed_offset() {
+        let cli = Cli::try_parse_from([
+            "constantinople-spammer",
+            "--relayer-url",
+            "http://127.0.0.1:8084",
+            "--seed-offset",
+            "2000",
+        ])
+        .expect("relayer invocation should parse");
+
+        assert_eq!(cli.seed_offset, Some(2000));
     }
 
     #[test]
