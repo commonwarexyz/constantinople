@@ -158,6 +158,10 @@ pub(crate) struct GenerateArgs {
     /// txs per batch.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
+    /// Concurrent spammer submitters. Defaults to the validator count.
+    /// Set explicitly to keep offered load independent of validator count.
+    #[arg(long = "spammer-submitters")]
+    spammer_submitters: Option<usize>,
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
@@ -616,6 +620,11 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
     );
+    assert!(args.validators >= 4, "--validators must be at least 4");
+    assert!(
+        args.spammer_submitters != Some(0),
+        "--spammer-submitters must be at least 1"
+    );
 }
 
 pub(crate) fn generate_local_cluster_material(
@@ -942,6 +951,50 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "--validators must be at least 4")]
+    fn rejects_validator_count_below_coding_minimum() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "3",
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
+    }
+
+    #[test]
+    #[should_panic(expected = "--spammer-submitters must be at least 1")]
+    fn rejects_zero_spammer_submitters() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-submitters",
+            "0",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
     }
 
     #[test]

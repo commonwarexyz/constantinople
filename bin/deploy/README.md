@@ -2,6 +2,15 @@
 
 `constantinople-deploy` generates deployment artifacts for local and remote Constantinople clusters.
 
+At least four validators are required for erasure coding. Shard decoding uses a
+static 32 MiB limit, sized to accommodate shards from 32 MiB transaction proposals
+at the minimum validator count. The deployment script still proposes at most
+16 MiB of transaction bytes per block.
+
+`deploy.sh` accepts `--validators`, `--regions`, `--storage-size`,
+`--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
+Run `./deploy.sh --help` for defaults.
+
 ## Local Deployment
 
 Generate a local bundle:
@@ -66,6 +75,10 @@ cargo run --bin constantinople-deploy -- generate \
 The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
+
+`--spammer-submitters N` sets the number of concurrent submitters in both local
+and remote deployments. It defaults to the validator count and must be positive.
+Set it explicitly to keep offered load constant when changing the validator count.
 
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
