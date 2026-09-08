@@ -45,3 +45,11 @@ docs-check *args='':
 # Check for unused dependencies
 udeps:
   cargo +nightly udeps --all-targets
+
+# Test the Explorer submission and proof helpers.
+explorer-test:
+  npm --prefix explorer test
+
+# Build the Explorer.
+explorer-build:
+  npm --prefix explorer run build
