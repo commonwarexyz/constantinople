@@ -80,7 +80,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot, watch},
+    sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot},
     task::{JoinHandle, JoinSet},
 };
 use tracing::{Instrument as _, info, info_span, warn};
@@ -565,7 +565,6 @@ struct FinalizedUploadConsumer {
     payloads: FinalizedPayloads,
     cleanup: PayloadCleanup,
     receipt_store: Arc<FinalizedReceiptStore>,
-    admitted: watch::Receiver<Option<u64>>,
     queue_ready: Arc<Notify>,
     max_active: usize,
     budget: UploadBudget,
@@ -714,7 +713,6 @@ struct FinalizedUploadProducer {
     payloads: FinalizedPayloads,
     receipt: Arc<Mutex<Option<LatestCaptureReceipt>>>,
     publisher: Arc<LazyPublisher>,
-    admitted: watch::Sender<Option<u64>>,
     queue_ready: Arc<Notify>,
     queue_metrics: FinalizedQueueMetrics,
     capture_metrics: FinalizedCaptureMetrics,
@@ -803,6 +801,9 @@ impl FinalizedUploadProducer {
             transaction_start,
             payload,
         };
+
+        // Count the capture before the consumer can complete it.
+        self.queue_metrics.pending_uploads.inc();
         let enqueue_started = Instant::now();
         let position = self
             .writer
@@ -825,8 +826,6 @@ impl FinalizedUploadProducer {
         self.capture_metrics
             .total
             .observe(started.elapsed().as_secs_f64());
-        self.queue_metrics.pending_uploads.inc();
-        self.admitted.send_replace(Some(position));
         self.queue_ready.notify_one();
         info!(
             height = block.header.height,
@@ -1050,7 +1049,6 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
         payloads,
         cleanup,
         receipt_store,
-        mut admitted,
         queue_ready,
         max_active,
         budget,
@@ -1081,7 +1079,6 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
             let Some((position, record)) = item else {
                 break;
             };
-            wait_for_queue_admission(position, &mut admitted).await;
             next_ack.get_or_insert(position);
             retained_records.insert(position, record);
             let pending = PendingQueuedUpload::new(position, record, &budget);
@@ -1168,21 +1165,6 @@ async fn try_read_finalized_queue_entry(
         metrics.queue_read.observe(started.elapsed().as_secs_f64());
     }
     Ok(item)
-}
-
-async fn wait_for_queue_admission(position: u64, admitted: &mut watch::Receiver<Option<u64>>) {
-    loop {
-        if admitted
-            .borrow_and_update()
-            .is_some_and(|floor| floor >= position)
-        {
-            return;
-        }
-        admitted
-            .changed()
-            .await
-            .expect("finalized capture admission gate closed");
-    }
 }
 
 async fn try_admit_queued_upload(
@@ -1566,14 +1548,11 @@ async fn maybe_build_indexer(
         .await
         .expect("failed to read finalized index queue floor");
     sweep_finalized_payloads(&payloads, &records).await;
-    let queue_tail = records
-        .last()
-        .map(|(position, record)| (record.receipt, *position, records.len()));
+    let queue_tail = records.last().map(|(_, record)| record.receipt);
     queue_metrics
         .pending_uploads
-        .set(queue_tail.map_or(0, |(_, _, count)| metric_usize(count)));
-    let receipt =
-        recover_capture_receipt(metadata_receipt, queue_tail.map(|(receipt, _, _)| receipt));
+        .set(metric_usize(records.len()));
+    let receipt = recover_capture_receipt(metadata_receipt, queue_tail);
 
     // Records exist only after a capture, and a captured block may already be
     // uploaded, so the remote namespaces are validated as fresh only when
@@ -1605,7 +1584,6 @@ async fn maybe_build_indexer(
         config: metadata_config,
         metadata: Mutex::new(Some(metadata)),
     });
-    let (admitted, admitted_rx) = watch::channel(queue_tail.map(|(_, position, _)| position));
     let queue_ready = Arc::new(Notify::new());
     let marshal = Arc::new(OnceLock::new());
     let finalized_producer = FinalizedUploadProducer {
@@ -1613,7 +1591,6 @@ async fn maybe_build_indexer(
         payloads: payloads.clone(),
         receipt: Arc::new(Mutex::new(receipt)),
         publisher: publisher.clone(),
-        admitted,
         queue_ready: queue_ready.clone(),
         queue_metrics: queue_metrics.clone(),
         capture_metrics,
@@ -1627,7 +1604,6 @@ async fn maybe_build_indexer(
         payloads,
         cleanup,
         receipt_store,
-        admitted: admitted_rx,
         queue_ready,
         max_active: max_active_uploads,
         budget,

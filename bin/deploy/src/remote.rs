@@ -29,7 +29,6 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     validate_generate_args(args);
-    assert!(args.validators >= 1, "need at least one validator");
     assert!(!remote.regions.is_empty(), "need at least one region");
     assert!(
         remote.regions.len() <= args.validators as usize,

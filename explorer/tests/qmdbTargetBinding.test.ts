@@ -18,11 +18,13 @@ import {
 import { SimplexClient, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { ensureSimplexWasm } from '@exowarexyz/simplex/wasm';
 import { toArrayBuffer, toHex } from '../src/codec.ts';
+import { isRetryableAccountProofError, retryAccountWork } from '../src/proofRetry.ts';
 import {
     fetchAccountTransactionsPage,
     fetchAndVerifyAccountProof,
     fetchAndVerifyTransactionRowProof,
     fetchAndVerifyTransactionProof,
+    fetchLatestProofTarget,
     type LatestProofTarget,
 } from '../src/qmdb.ts';
 
@@ -36,6 +38,34 @@ test.before(async () => {
         import.meta.resolve('@exowarexyz/simplex/wasm'),
     ));
     await ensureSimplexWasm({ module_or_path: wasm });
+});
+
+test('account target retries when publication precedes its Simplex certificate', async (t) => {
+    const certificate = await finalizedCertificate(HEIGHT);
+    let available = false;
+    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => {
+        return available ? certificate : null;
+    });
+    const controller = new AbortController();
+    const target = await retryAccountWork(
+        () => fetchLatestProofTarget({
+            storeUrl: 'http://store',
+            simplexVerificationMaterial: '11',
+            publishedTarget: {
+                height: HEIGHT,
+                blockDigest: certificate.payload.slice(0, 32),
+                sequenceNumber: FLOOR,
+            },
+            signal: controller.signal,
+        }),
+        controller.signal,
+        isRetryableAccountProofError,
+        async () => { available = true; },
+    );
+
+    assert.equal(read.mock.callCount(), 2);
+    assert.equal(target.height, HEIGHT);
+    assert.equal(target.sequenceNumber, FLOOR);
 });
 
 test('reported height starts certificate and metadata reads together and retains proof bindings', async (t) => {
@@ -85,36 +115,40 @@ test('reported height starts certificate and metadata reads together and retains
     assert.deepEqual(reads.slice(2), ['verified', 'proof']);
 });
 
-test('transaction proof discovers the height when no reported height is available', async (t) => {
-    const body = new Uint8Array(82).fill(0x33);
-    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
-    const latest = await finalizedCertificate(HEIGHT + 1n);
-    const containing = await finalizedCertificate(HEIGHT);
-    const heights: string[] = [];
-    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
-        heights.push(height);
-        return height === HEIGHT.toString() ? containing : latest;
-    });
-    const queries: string[] = [];
-    t.mock.method(SqlClient.prototype, 'query', async (sql: string) => {
-        queries.push(sql);
-        return sql.includes('FROM tx_meta')
-            ? queryResult({ qmdb_location: LOCATION, body })
-            : queryResult({ height: HEIGHT - 1n });
-    });
-    t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
-        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
-    ) => keylessProof(request, root, location, value));
-    const options = transactionProofOptions(digest);
-    options.publishedTarget.blockDigest = latest.payload.slice(0, 32);
+for (const containingHeight of [1n, HEIGHT]) {
+    test(`transaction proof discovers height ${containingHeight} without a reported height`, async (t) => {
+        const body = new Uint8Array(82).fill(0x33);
+        const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+        const latest = await finalizedCertificate(HEIGHT + 1n);
+        const containing = await finalizedCertificate(containingHeight);
+        const heights: string[] = [];
+        t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
+            heights.push(height);
+            return height === containingHeight.toString() ? containing : latest;
+        });
+        const queries: string[] = [];
+        t.mock.method(SqlClient.prototype, 'query', async (sql: string) => {
+            queries.push(sql);
+            return sql.includes('FROM tx_meta')
+                ? queryResult({ qmdb_location: LOCATION, body })
+                : containingHeight === 1n
+                    ? emptyQueryResult()
+                    : queryResult({ height: containingHeight - 1n });
+        });
+        t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
+            request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
+        ) => keylessProof(request, root, location, value));
+        const options = transactionProofOptions(digest);
+        options.publishedTarget.blockDigest = latest.payload.slice(0, 32);
 
-    const proof = await fetchAndVerifyTransactionProof(options);
+        const proof = await fetchAndVerifyTransactionProof(options);
 
-    assert.equal(proof.height, HEIGHT);
-    assert.deepEqual(heights, [(HEIGHT + 1n).toString(), HEIGHT.toString()]);
-    assert.equal(queries.length, 2);
-    assert.match(queries[1]!, /FROM block_meta/);
-});
+        assert.equal(proof.height, containingHeight);
+        assert.deepEqual(heights, [(HEIGHT + 1n).toString(), containingHeight.toString()]);
+        assert.equal(queries.length, 2);
+        assert.match(queries[1]!, /FROM block_meta/);
+    });
+}
 
 test('transaction proof waits for publication without reads when the reported height is ahead', async (t) => {
     const query = t.mock.method(SqlClient.prototype, 'query', async () => { throw new Error('unexpected query'); });

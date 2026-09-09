@@ -23,7 +23,6 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
     validate_generate_args(args);
-    assert!(args.validators >= 1, "need at least one validator");
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);

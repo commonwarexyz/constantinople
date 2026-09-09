@@ -184,7 +184,6 @@ where
         "application.execute.build",
         accounts = values.len().traced()
     );
-    let work_size = values.len();
     let updates = strategy
         .spawn(work_size, move |_: S| {
             build_span.in_scope(|| build_updates(plan, transfers, values))

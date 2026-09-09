@@ -273,17 +273,16 @@ where
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    // Hashing, decoding, and verifying a relayer batch is a ~470 core-ms
-    // burst at production sizes, so it runs on the strategy pool; a pool
-    // member (unlike a blocking thread) work-steals during the nested
-    // parallel signature verification. Pool threads have an empty tracing
-    // context, so capture the caller's span explicitly.
+    // Cheap decode failures must not train the scheduler to run expensive
+    // valid batches on the async worker. Force the outer handoff while
+    // retaining adaptive scheduling inside signature verification.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
     let work_size = body.len();
-    let verified = state.strategy.spawn(work_size, move |strategy| {
+    let strategy = state.strategy.clone();
+    let verified = state.strategy.manual().spawn(work_size, move |_| {
         let _permit = permit;
         let batch_id = H::hash(&[body.as_ref()]).to_string();
 

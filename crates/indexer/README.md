@@ -37,14 +37,14 @@ The current SQL table-prefix allocation is:
 
 | SQL table | Table prefix | Secondary indexes |
 | --------- | ------------ | ----------------- |
-| `block_meta` | `0x0` | none |
+| `block_meta` | `0x0` | `transactions_tip` |
 | `tx_meta` | `0x1` | none |
 | `tx_activity` | `0x2` | none |
 | `account_meta` | `0x3` | none |
 
-`exoware-sql` expands those table prefixes into its Store key layout. There are
-currently no secondary SQL index rows, so finalized-block SQL writes only add
-primary table rows. Every table is append-only. Store keys are immutable, so
+`exoware-sql` expands those table prefixes into its Store key layout. A secondary
+index on `block_meta.transactions_tip` adds one entry per block for transaction
+height lookups. Every table is append-only. Store keys are immutable, so
 no table may rewrite an existing key with a different value. `account_meta` is
 keyed by `(account, qmdb_location)` with one row per account-state QMDB
 operation, and readers take the highest location for an account. Each
@@ -65,8 +65,9 @@ A transaction proof needs the finalized height that contains the transaction.
 Readers derive it from `block_meta`. Every block commits its transaction log
 after appending its transactions, so the newest block whose `transactions_tip`
 is at or below `tx_meta.qmdb_location` immediately precedes the containing
-block. A missing predecessor identifies genesis. The reverse lookup starts at
-the newest height and avoids a scan from genesis for recent transactions.
+block. Genesis has no transactions or metadata row, so a missing predecessor
+identifies height one. The reverse lookup seeks the preceding tip through the
+secondary index and reads at most one index entry.
 
 Proofs become queryable once a grouped publication barrier covers the upload
 that carried the transaction. The publisher writes append-only publication
@@ -125,8 +126,8 @@ The application captures owned authenticated range artifacts before applying a
 winning batch. The finalized hook combines those artifacts with the finalized
 block and exact finalization certificate, syncs the encoded entry as one payload
 blob per block, then commits a small queue record before returning. The entry
-records the metadata encoder version so replay produces the same rows after an
-encoder change.
+records the metadata encoder version and rejects unsupported versions before
+replay. This schema requires a fresh index from genesis.
 
 The background uploader derives SQL rows and authenticated QMDB writes from the
 queue entry. Uploads may complete concurrently, but publication barriers and

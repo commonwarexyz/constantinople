@@ -136,12 +136,14 @@ pub struct QueuedAuthenticatedRangeCfg {
     pub operation_bytes: RangeCfg<usize>,
 }
 
+// Valid captures can exceed a fixed operation count. The codec bounds
+// allocations by the remaining payload bytes.
 impl Default for QueuedAuthenticatedRangeCfg {
     fn default() -> Self {
         Self {
             proof_digests: 512,
             pinned_nodes: RangeCfg::from(0..=256),
-            operations: RangeCfg::from(1..=1_000_000),
+            operations: RangeCfg::from(1..),
             operation_bytes: RangeCfg::from(0..=16 * 1024 * 1024),
         }
     }
@@ -289,7 +291,6 @@ where
     block: EngineBlock<H, P>,
     finalization: EngineFinalization<P, V, H>,
     finalized_ts_micros: i64,
-    metadata_encoder_version: u16,
     state: QueuedAuthenticatedRange<H::Digest, S>,
     transactions: QueuedAuthenticatedRange<H::Digest, T>,
 }
@@ -317,7 +318,6 @@ where
             block: self.block.clone(),
             finalization: self.finalization.clone(),
             finalized_ts_micros: self.finalized_ts_micros,
-            metadata_encoder_version: self.metadata_encoder_version,
             state: self.state.clone(),
             transactions: self.transactions.clone(),
         }
@@ -355,7 +355,6 @@ where
             block: block.clone(),
             finalization,
             finalized_ts_micros,
-            metadata_encoder_version: METADATA_ENCODER_VERSION,
             state,
             transactions,
         };
@@ -403,11 +402,6 @@ where
     }
 
     fn validate(&self) -> Result<(), PublishError> {
-        if self.metadata_encoder_version != METADATA_ENCODER_VERSION {
-            return Err(PublishError::UnsupportedMetadataEncoder {
-                version: self.metadata_encoder_version,
-            });
-        }
         if self.finalization.proposal.payload.block() != *self.block.seal() {
             return Err(PublishError::InvalidQueuedUpload {
                 reason: "finalization commitment does not match the block",
@@ -471,7 +465,7 @@ where
         QUEUE_MAGIC.encode_size()
             + QUEUE_FORMAT_VERSION.encode_size()
             + ROW_LAYOUT_VERSION.encode_size()
-            + self.metadata_encoder_version.encode_size()
+            + METADATA_ENCODER_VERSION.encode_size()
             + HASHER_SHA256.encode_size()
             + MERKLE_MMR.encode_size()
             + STATE_UNORDERED.encode_size()
@@ -499,7 +493,7 @@ where
         QUEUE_MAGIC.write(buf);
         QUEUE_FORMAT_VERSION.write(buf);
         ROW_LAYOUT_VERSION.write(buf);
-        self.metadata_encoder_version.write(buf);
+        METADATA_ENCODER_VERSION.write(buf);
         HASHER_SHA256.write(buf);
         MERKLE_MMR.write(buf);
         STATE_UNORDERED.write(buf);
@@ -551,7 +545,6 @@ where
             block: EngineBlock::<Sha256, P>::read_cfg(buf, &cfg.block)?,
             finalization: EngineFinalization::<P, V, Sha256>::read(buf)?,
             finalized_ts_micros: i64::read(buf)?,
-            metadata_encoder_version,
             state: QueuedAuthenticatedRange::read_cfg(buf, &cfg.state)?,
             transactions: QueuedAuthenticatedRange::read_cfg(buf, &cfg.transactions)?,
         };
@@ -579,8 +572,6 @@ pub enum PublishError {
     Sql(#[from] datafusion::error::DataFusionError),
     #[error("failed to encode SQL metadata row due to {0}")]
     SqlRow(String),
-    #[error("unsupported metadata encoder version {version}")]
-    UnsupportedMetadataEncoder { version: u16 },
     #[error("invalid durable finalized upload because {reason}")]
     InvalidQueuedUpload { reason: &'static str },
     #[error("finalized publication expected height {expected}, got {actual}")]
@@ -625,7 +616,6 @@ where
     height: u64,
     block: EngineBlock<H, P>,
     finalized_ts_micros: i64,
-    metadata_encoder_version: u16,
     state: QueuedAuthenticatedRange<H::Digest>,
     transactions: QueuedAuthenticatedRange<H::Digest>,
     persisted: Option<oneshot::Sender<()>>,
@@ -781,7 +771,7 @@ where
                 });
             }
         }
-        *admission = Some(Admission {
+        let next_admission = Admission {
             next_height: height
                 .checked_add(1)
                 .ok_or(PublishError::InvalidQueuedUpload {
@@ -789,14 +779,13 @@ where
                 })?,
             state_next: upload.state.end,
             transaction_next: upload.transactions.end,
-        });
+        };
         let (persisted_tx, persisted) = oneshot::channel();
         let (published_tx, published) = oneshot::channel();
         let pending = PendingUpload {
             height,
             block: upload.block,
             finalized_ts_micros: upload.finalized_ts_micros,
-            metadata_encoder_version: upload.metadata_encoder_version,
             state: upload.state,
             transactions: upload.transactions,
             persisted: Some(persisted_tx),
@@ -808,6 +797,7 @@ where
             .send(pending)
             .await
             .map_err(|_| PublishError::CommitterStopped { height })?;
+        *admission = Some(next_admission);
         Ok(UploadCompletion {
             height,
             persisted,
@@ -1050,7 +1040,6 @@ where
     S: Strategy,
 {
     let metadata_rows = encode_metadata_rows::<H, P>(
-        upload.metadata_encoder_version,
         &upload.block,
         upload.finalized_ts_micros,
         &upload.state,
@@ -1091,7 +1080,6 @@ fn as_authenticated_range<D: Digest>(
 }
 
 fn encode_metadata_rows<H, P>(
-    version: u16,
     block: &EngineBlock<H, P>,
     finalized_ts_micros: i64,
     state: &QueuedAuthenticatedRange<H::Digest>,
@@ -1102,9 +1090,6 @@ where
     H::Digest: Codec,
     P: PublicKey,
 {
-    if version != METADATA_ENCODER_VERSION {
-        return Err(PublishError::UnsupportedMetadataEncoder { version });
-    }
     let block_rows = encode_block_rows(block, finalized_ts_micros);
     validate_transaction_metadata_ops::<H>(&block_rows.transaction_digests, transactions)?;
     let mut rows = block_rows.sql;
@@ -1120,7 +1105,8 @@ where
     H: Hasher,
     H::Digest: Codec,
 {
-    let mut actual = Vec::with_capacity(expected.len());
+    let mut expected = expected.iter();
+    let mut matches = true;
     for encoded in &range.operations {
         let operation = TransactionOperation::<H>::decode(encoded.as_slice()).map_err(|_| {
             PublishError::InvalidQueuedUpload {
@@ -1128,10 +1114,10 @@ where
             }
         })?;
         if let keyless::Operation::Append(digest) = operation {
-            actual.push(digest);
+            matches &= expected.next() == Some(&digest);
         }
     }
-    if actual != expected {
+    if !matches || expected.next().is_some() {
         return Err(PublishError::InvalidQueuedUpload {
             reason: "transaction operations do not match block metadata",
         });
@@ -1350,6 +1336,31 @@ mod tests {
     }
 
     #[test]
+    fn queue_range_round_trips_more_than_one_million_operations() {
+        let operations = vec![
+            StateOperation::Update(UnorderedUpdate(
+                AccountKey::try_from(&[7u8; 32][..]).unwrap(),
+                AccountValue::try_from(Account::default().encode().as_ref()).unwrap(),
+            ));
+            1_000_001
+        ];
+        let range = queued_range(&encode_operations(&operations), 0, operations.len() as u64);
+        let encoded = range.encode();
+        let decoded = QueuedAuthenticatedRange::<Sha256Digest>::decode_cfg(
+            encoded.clone(),
+            &QueuedAuthenticatedRangeCfg::default(),
+        )
+        .expect("captured operation ranges are bounded by payload bytes");
+        assert_eq!(decoded, range);
+
+        let limited = QueuedAuthenticatedRangeCfg {
+            operations: RangeCfg::from(1..=1_000_000),
+            ..QueuedAuthenticatedRangeCfg::default()
+        };
+        assert!(QueuedAuthenticatedRange::<Sha256Digest>::decode_cfg(encoded, &limited).is_err());
+    }
+
+    #[test]
     fn captured_upload_encodes_like_its_decoded_form() {
         let state_operations = vec![
             CapturedStateOperation::CommitFloor(None, Location::new(0)),
@@ -1434,6 +1445,65 @@ mod tests {
                 completion.published().await,
                 Err(PublishError::CommitterStopped { height: 4 })
             ));
+        });
+    }
+
+    #[test]
+    fn canceled_enqueue_preserves_publication_continuity() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::GatedIngestStore::open_gating_ingest(1)
+                .await
+                .expect("open Store");
+            let physical = writer_store_client(&store.url, None).expect("build Store client");
+            let targets = publication_target_client(&physical).expect("target namespace");
+            let publisher = Publisher::connect(
+                context.child("publisher_task"),
+                &store.url,
+                None,
+                1,
+                super::super::PublisherMetrics::new(&context.child("publisher")),
+            )
+            .await
+            .expect("connect publisher");
+            let state_operations = encode_operations(
+                &(0..=3)
+                    .map(|height| StateOperation::CommitFloor(None, Location::new(height)))
+                    .collect::<Vec<_>>(),
+            );
+            let transaction_operations = encode_operations(
+                &(0..=3)
+                    .map(|height| {
+                        TransactionOperation::<Sha256>::Commit(None, Location::new(height))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let upload = |height| {
+                queued_upload(
+                    height,
+                    queued_range(&state_operations, height, height + 1),
+                    queued_range(&transaction_operations, height, height + 1),
+                )
+            };
+
+            let mut first = publisher.enqueue_queued_finalized(upload(1)).await.unwrap();
+            store.wait_for_first_ingest().await;
+            first.persisted().await.unwrap();
+            let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
+            {
+                let mut enqueue = Box::pin(publisher.enqueue_queued_finalized(upload(3)));
+                assert!(futures::poll!(enqueue.as_mut()).is_pending());
+            }
+
+            store.release_first_ingest();
+            let third = publisher.enqueue_queued_finalized(upload(3)).await.unwrap();
+            for completion in [first, second, third] {
+                completion.published().await.unwrap();
+            }
+            for height in 1..=3 {
+                assert!(target(&targets, height).await.is_some());
+            }
+            publisher.shutdown().await;
+            store.shutdown().await;
         });
     }
 
@@ -1794,7 +1864,6 @@ mod tests {
                     height: 1,
                     block,
                     finalized_ts_micros: 1,
-                    metadata_encoder_version: METADATA_ENCODER_VERSION,
                     state,
                     transactions,
                     persisted: None,
@@ -2028,7 +2097,6 @@ mod tests {
             finalized_ts_micros: i64::try_from(block.header.height).expect("height fits timestamp"),
             block,
             finalization,
-            metadata_encoder_version: METADATA_ENCODER_VERSION,
             state,
             transactions,
         };

@@ -214,7 +214,6 @@ impl<E: Storage> PayloadStore<E> {
             .await?;
         if existing != 0 {
             blob.resize(0).await?;
-            blob.sync().await?;
         }
         let write_started = Instant::now();
         blob.write_at(0, payload, WriteOptions::default()).await?;

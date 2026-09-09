@@ -28,7 +28,7 @@
 use commonware_cryptography::{Hasher as _, sha256::Sha256};
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::PrefixedStoreClient;
-use exoware_sql::{KvSchema, TableColumnConfig};
+use exoware_sql::{IndexSpec, KvSchema, TableColumnConfig};
 
 /// Name of the SQL table that the explorer subscribes to.
 pub const BLOCK_META_TABLE: &str = "block_meta";
@@ -136,6 +136,7 @@ struct SchemaTable {
     name: &'static str,
     columns: &'static [SchemaColumn],
     primary_key: &'static [&'static str],
+    secondary_indexes: &'static [&'static str],
 }
 
 const BLOCK_META_COLUMNS: &[SchemaColumn] = &[
@@ -270,11 +271,13 @@ const META_SCHEMA_TABLES: &[SchemaTable] = &[
         name: BLOCK_META_TABLE,
         columns: BLOCK_META_COLUMNS,
         primary_key: &[BLOCK_META_HEIGHT],
+        secondary_indexes: &[BLOCK_META_TRANSACTIONS_TIP],
     },
     SchemaTable {
         name: TX_META_TABLE,
         columns: TX_META_COLUMNS,
         primary_key: &[TX_META_DIGEST],
+        secondary_indexes: &[],
     },
     SchemaTable {
         name: TX_ACTIVITY_TABLE,
@@ -285,11 +288,13 @@ const META_SCHEMA_TABLES: &[SchemaTable] = &[
             TX_ACTIVITY_INDEX,
             TX_ACTIVITY_ROLE,
         ],
+        secondary_indexes: &[],
     },
     SchemaTable {
         name: ACCOUNT_META_TABLE,
         columns: ACCOUNT_META_COLUMNS,
         primary_key: &[ACCOUNT_META_ACCOUNT, ACCOUNT_META_QMDB_LOCATION],
+        secondary_indexes: &[],
     },
 ];
 
@@ -312,6 +317,11 @@ pub fn meta_schema_fingerprint() -> String {
         for primary_key in table.primary_key {
             hasher.update(b"primary-key\0");
             hasher.update(primary_key.as_bytes());
+            hasher.update(b"\0");
+        }
+        for column in table.secondary_indexes {
+            hasher.update(b"lexicographic-index\0");
+            hasher.update(column.as_bytes());
             hasher.update(b"\0");
         }
     }
@@ -355,7 +365,11 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                     .iter()
                     .map(|column| (*column).to_string())
                     .collect(),
-                vec![],
+                table
+                    .secondary_indexes
+                    .iter()
+                    .map(|column| IndexSpec::lexicographic(*column, vec![(*column).to_string()]))
+                    .collect::<Result<_, _>>()?,
             )
         })
 }

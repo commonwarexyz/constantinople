@@ -583,7 +583,7 @@ async function fetchFinalizedTransactionTarget(
         { signal },
     );
     if (!certificate) {
-        throw new Error(`finalization missing at height ${height} while Simplex catches up`);
+        throw new Error(`finalization missing at height ${height}`);
     }
     const target = await finalizedTargetFromCertificate(certificate);
     if (target.height !== height) {
