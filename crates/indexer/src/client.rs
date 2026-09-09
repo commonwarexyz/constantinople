@@ -646,17 +646,17 @@ async fn validate_target_block_digest(
 }
 
 fn containing_block_height(predecessor_height: Option<u64>) -> Result<u64, ReadError> {
-    let Some(height) = predecessor_height else {
-        return Ok(0);
-    };
-    height.checked_add(1).ok_or_else(|| {
-        ReadError::SqlRow("transaction containing block height overflows u64".to_string())
-    })
+    predecessor_height
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            ReadError::SqlRow("transaction containing block height overflows u64".to_string())
+        })
 }
 
 fn transaction_height_predecessor_sql(qmdb_location: u64) -> String {
     format!(
-        "SELECT {BLOCK_META_HEIGHT} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} <= {qmdb_location} ORDER BY {BLOCK_META_HEIGHT} DESC LIMIT 1"
+        "SELECT {BLOCK_META_HEIGHT} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} <= {qmdb_location} ORDER BY {BLOCK_META_TRANSACTIONS_TIP} DESC LIMIT 1"
     )
 }
 
@@ -768,95 +768,128 @@ mod tests {
     }
 
     #[test]
-    fn transaction_height_query_scans_backward_from_the_newest_block() {
+    fn transaction_height_query_seeks_the_preceding_boundary() {
         assert_eq!(
             transaction_height_predecessor_sql(42),
-            "SELECT height FROM block_meta WHERE transactions_tip <= 42 ORDER BY height DESC LIMIT 1"
+            "SELECT height FROM block_meta WHERE transactions_tip <= 42 ORDER BY transactions_tip DESC LIMIT 1"
         );
     }
 
     #[tokio::test]
-    async fn transaction_metadata_waits_for_its_exact_publication_target() {
-        let (simulator, url) = exoware_simulator::open_temp()
+    async fn transaction_height_lookup_uses_a_bounded_index_scan() {
+        let client = IndexerClient::new(
+            StoreClient::new("http://127.0.0.1:1"),
+            StoreClient::new("http://127.0.0.1:1"),
+        );
+        let query = client
+            .sql()
+            .sql(&transaction_height_predecessor_sql(42))
             .await
-            .expect("spawn simulator");
-        let store = StoreClient::new(&url);
-        let schema = build_meta_schema(sql_meta_client(&store).expect("SQL metadata namespace"))
-            .expect("build SQL metadata schema");
-        let body = vec![7u8; Transaction::<sha256::Digest>::SIZE + 1];
-        let digest = digest_transaction_body(&body);
-        let block_digest = Sha256::hash(&[b"second block"]);
-        let mut writer = schema.batch_writer();
-        for (height, transactions_tip) in [(0, 2), (1, 3), (2, 5)] {
+            .expect("plan transaction height lookup");
+        let plan = query
+            .create_physical_plan()
+            .await
+            .expect("build physical plan");
+        let plan = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+
+        assert!(
+            plan.contains("fetch=Some(1), direction=Some(Reverse)"),
+            "{plan}"
+        );
+        assert!(plan.contains("secondary_index"), "{plan}");
+        assert!(plan.contains("exact=true"), "{plan}");
+        assert!(!plan.contains("SortExec"), "{plan}");
+    }
+
+    #[tokio::test]
+    async fn transaction_metadata_waits_for_its_exact_publication_target() {
+        for (height, qmdb_location) in [(1, 1), (2, 4)] {
+            let (simulator, url) = exoware_simulator::open_temp()
+                .await
+                .expect("spawn simulator");
+            let store = StoreClient::new(&url);
+            let schema =
+                build_meta_schema(sql_meta_client(&store).expect("SQL metadata namespace"))
+                    .expect("build SQL metadata schema");
+            let body = vec![7u8; Transaction::<sha256::Digest>::SIZE + 1];
+            let digest = digest_transaction_body(&body);
+            let block_digest = Sha256::hash(&[b"containing block"]);
+            let mut writer = schema.batch_writer();
+            for (block_height, transactions_tip) in [(1, 3), (2, 5)] {
+                writer
+                    .insert(
+                        BLOCK_META_TABLE,
+                        vec![
+                            CellValue::UInt64(block_height),
+                            CellValue::FixedBinary(if block_height == height {
+                                block_digest.as_ref().to_vec()
+                            } else {
+                                vec![block_height as u8; 32]
+                            }),
+                            CellValue::UInt64(1),
+                            CellValue::FixedBinary(vec![transactions_tip as u8; 32]),
+                            CellValue::UInt64(transactions_tip),
+                            CellValue::UInt64(0),
+                            CellValue::Timestamp(
+                                i64::try_from(block_height).expect("height fits i64"),
+                            ),
+                        ],
+                    )
+                    .expect("stage block metadata");
+            }
             writer
                 .insert(
-                    BLOCK_META_TABLE,
+                    TX_META_TABLE,
                     vec![
-                        CellValue::UInt64(height),
-                        CellValue::FixedBinary(if height == 2 {
-                            block_digest.as_ref().to_vec()
-                        } else {
-                            vec![height as u8; 32]
-                        }),
-                        CellValue::UInt64(1),
-                        CellValue::FixedBinary(vec![transactions_tip as u8; 32]),
-                        CellValue::UInt64(transactions_tip),
-                        CellValue::UInt64(0),
-                        CellValue::Timestamp(i64::try_from(height).expect("height fits i64")),
+                        CellValue::FixedBinary(digest.as_ref().to_vec()),
+                        CellValue::UInt64(qmdb_location),
+                        CellValue::Binary(body.clone()),
                     ],
                 )
-                .expect("stage block metadata");
-        }
-        writer
-            .insert(
-                TX_META_TABLE,
-                vec![
-                    CellValue::FixedBinary(digest.as_ref().to_vec()),
-                    CellValue::UInt64(4),
-                    CellValue::Binary(body.clone()),
-                ],
-            )
-            .expect("stage out-of-order transaction metadata");
-        writer
-            .flush()
-            .await
-            .expect("persist out-of-order transaction metadata");
+                .expect("stage out-of-order transaction metadata");
+            writer
+                .flush()
+                .await
+                .expect("persist out-of-order transaction metadata");
 
-        let client = IndexerClient::new(store.clone(), store.clone());
-        assert_eq!(
-            client
+            let client = IndexerClient::new(store.clone(), store.clone());
+            assert_eq!(
+                client
+                    .transaction_metadata::<Sha256>(&digest)
+                    .await
+                    .expect("ungated metadata query succeeds"),
+                None
+            );
+            assert_eq!(
+                client
+                    .transaction_bytes::<Sha256>(&digest)
+                    .await
+                    .expect("ungated body query succeeds"),
+                None
+            );
+
+            let targets = publication_target_client(&store).expect("publication target namespace");
+            let key = publication_target_key(height);
+            targets
+                .ingest()
+                .put(&[(&key, block_digest.as_ref())])
+                .await
+                .expect("publish exact target");
+
+            let metadata = client
                 .transaction_metadata::<Sha256>(&digest)
                 .await
-                .expect("ungated metadata query succeeds"),
-            None
-        );
-        assert_eq!(
-            client
-                .transaction_bytes::<Sha256>(&digest)
-                .await
-                .expect("ungated body query succeeds"),
-            None
-        );
+                .expect("published metadata query succeeds")
+                .expect("metadata becomes visible after its exact target");
+            assert_eq!(metadata.height, height);
+            assert_eq!(metadata.qmdb_location, qmdb_location);
+            assert_eq!(metadata.body, Bytes::from(body));
 
-        let targets = publication_target_client(&store).expect("publication target namespace");
-        let second_key = publication_target_key(2);
-        targets
-            .ingest()
-            .put(&[(&second_key, block_digest.as_ref())])
-            .await
-            .expect("publish exact target");
-
-        let metadata = client
-            .transaction_metadata::<Sha256>(&digest)
-            .await
-            .expect("published metadata query succeeds")
-            .expect("metadata becomes visible after its exact target");
-        assert_eq!(metadata.height, 2);
-        assert_eq!(metadata.qmdb_location, 4);
-        assert_eq!(metadata.body, Bytes::from(body));
-
-        simulator.abort();
-        let _ = simulator.await;
+            simulator.abort();
+            let _ = simulator.await;
+        }
     }
 
     #[test]

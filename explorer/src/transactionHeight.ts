@@ -7,11 +7,11 @@ export function transactionHeightPredecessorQuery(location: bigint): string {
         SELECT ${BLOCK_META_HEIGHT}
         FROM ${BLOCK_META_TABLE}
         WHERE ${BLOCK_META_TRANSACTIONS_TIP} <= ${location.toString()}
-        ORDER BY ${BLOCK_META_HEIGHT} DESC
+        ORDER BY ${BLOCK_META_TRANSACTIONS_TIP} DESC
         LIMIT 1
     `;
 }
 
 export function containingTransactionHeight(predecessorHeight: bigint | null): bigint {
-    return predecessorHeight === null ? 0n : predecessorHeight + 1n;
+    return (predecessorHeight ?? 0n) + 1n;
 }

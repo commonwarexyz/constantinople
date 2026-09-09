@@ -10,7 +10,7 @@ and remote namespaces require a separate migration or reindex design.
 ## Dependencies
 
 Rust uses Commonware 2026.9.0 and Exoware revision
-`91dfe092331ae24c62dbd269ecb9b100f7cdd08b`. Authenticated preparation uses the
+`fe7272b7be18a4ee991002a2c31c9f78a53cad47`. Authenticated preparation uses the
 implementation from Exoware's Commonware update, with the Store, SQL, QMDB, and
 Simplex read-consistency additions on top.
 
@@ -152,9 +152,11 @@ A lagging service or unpublished QMDB tip remains retryable.
 
 `tx_meta` contains the digest, QMDB location, and signed transaction bytes.
 The containing height is derived from the preceding `block_meta` transaction
-boundary. Rust lookups first discover a location and height as hints, then
-require the exact publication target and repeat the metadata reads at its Store
-floor. There is no separate transaction-proof metadata table.
+boundary. A secondary index on `transactions_tip` bounds that lookup to one
+index entry, including for old transactions. Rust lookups first discover a
+location and height as hints, then require the exact publication target and
+repeat the metadata reads at its Store floor. There is no separate
+transaction-proof metadata table.
 
 `account_meta` is append-only with key `(account, qmdb_location)`. Historical
 account reads select the latest location below the certified state boundary.
