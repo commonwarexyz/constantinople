@@ -2,13 +2,13 @@ use crate::{
     AdapterConfig, CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_CONFIG_FILE, CHAIN_INDEXER_DATA_DIR,
     CHAIN_INDEXER_HOST, CHAIN_INDEXER_STORAGE_CLASS, ChainIndexerConfig, ClusterMaterial,
     DASHBOARD_FILE, DEPLOYER_CONFIG_FILE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, METADATA_INDEXER_BINARY_FILE,
-    METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_BINARY_FILE, QMDB_INDEXER_CONFIG_FILE,
-    QMDB_INDEXER_HOST, RelayerConfig, RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE,
-    SPAMMER_CONFIG_FILE, STORAGE_CLASS, SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE,
-    ValidatorConfig, absolute_path, default_bootstrappers, ensure_output_dir_missing,
-    generate_deployer_tag, generate_remote_cluster_material, indexer_enabled, ports::Ports,
-    secondary_roles, total_secondaries, validate_generate_args,
+    INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig,
+    METADATA_INDEXER_BINARY_FILE, METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_BINARY_FILE,
+    QMDB_INDEXER_CONFIG_FILE, QMDB_INDEXER_HOST, RelayerConfig, RelayerLeaderConfig, RemoteArgs,
+    SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SecondaryRole, SpammerConfig,
+    VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
+    ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
+    indexer_enabled, ports::Ports, secondary_roles, total_secondaries, validate_generate_args,
     write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
@@ -211,6 +211,7 @@ fn build_secondaries(
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
 
+        let (worker_threads, rayon_threads) = crate::secondary_runtime_threads(args, role);
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
@@ -223,8 +224,8 @@ fn build_secondaries(
             primary_validators: primary_validators.clone(),
             secondary_validators: secondary_validators.clone(),
             log_level: args.log_level.clone(),
-            worker_threads: args.worker_threads,
-            rayon_threads: args.rayon_threads,
+            worker_threads,
+            rayon_threads,
             http_port: remote.http_port,
             metrics_port: METRICS_PORT,
             max_propose_bytes: args.max_propose_bytes,
@@ -234,7 +235,8 @@ fn build_secondaries(
             public_key_cache_size: args.public_key_cache_size,
             traces: remote.traces,
             bootstrappers: bootstrappers.clone(),
-            indexer: matches!(role, SecondaryRole::Indexer).then(|| remote_indexer_config(remote)),
+            indexer: matches!(role, SecondaryRole::Indexer)
+                .then(|| remote_indexer_config(args, remote)),
             relayer: matches!(role, SecondaryRole::Relayer)
                 .then(|| remote_relayer_config(remote, material)),
         };
@@ -288,11 +290,13 @@ fn expected_binary_files(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<&'stat
     binaries
 }
 
-fn remote_indexer_config(remote: &RemoteArgs) -> IndexerConfig {
+fn remote_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> IndexerConfig {
     IndexerConfig {
         store_url: store_url(remote),
         api_key: remote.store_api_key.clone(),
-        upload_buffer: INDEXER_UPLOAD_BUFFER,
+        publisher_rayon_threads: args.indexer_publisher_rayon_threads,
+        upload_max_in_flight: INDEXER_UPLOAD_MAX_IN_FLIGHT,
+        upload_budget_bytes: INDEXER_UPLOAD_BUDGET_BYTES,
     }
 }
 
@@ -402,7 +406,14 @@ fn build_deployer_config(
             availability_zone_group: (secondary.config.indexer.is_some()
                 && local_chain_indexer(args, remote))
             .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
-            instance_type: remote.instance_type.clone(),
+            instance_type: if secondary.config.indexer.is_some() {
+                remote
+                    .indexer_instance_type
+                    .clone()
+                    .unwrap_or_else(|| remote.instance_type.clone())
+            } else {
+                remote.instance_type.clone()
+            },
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
             storage_iops: remote.storage_iops,
@@ -567,6 +578,9 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            indexer_worker_threads: None,
+            indexer_rayon_threads: None,
+            indexer_publisher_rayon_threads: crate::default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
@@ -597,6 +611,7 @@ mod tests {
         RemoteArgs {
             regions: vec!["us-east-1".to_string(), "us-west-2".to_string()],
             instance_type: "c8g.large".to_string(),
+            indexer_instance_type: Some("c8a.8xlarge".to_string()),
             storage_size: 25,
             storage_iops: None,
             storage_throughput: None,
@@ -885,7 +900,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let mut indexer_secondary_config = validator(0).config;
-        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&remote));
+        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&args, &remote));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),
@@ -914,7 +929,9 @@ mod tests {
         assert_eq!(config.instances[3].name, "secondary-0");
         assert_eq!(config.instances[3].binary, VALIDATOR_BINARY_FILE);
         assert_eq!(config.instances[3].config, "secondary-0.yaml");
+        assert_eq!(config.instances[3].instance_type, "c8a.8xlarge");
         assert_eq!(config.instances[4].name, "secondary-1");
+        assert_eq!(config.instances[4].instance_type, "c8g.large");
     }
 
     #[test]
@@ -1178,10 +1195,26 @@ mod tests {
         let mut args = generate_args();
         args.indexer = true;
         args.relayer = true;
+        args.worker_threads = 3;
+        args.rayon_threads = 13;
+        args.indexer_worker_threads = std::num::NonZeroUsize::new(8);
+        args.indexer_rayon_threads = std::num::NonZeroUsize::new(12);
+        args.indexer_publisher_rayon_threads = commonware_utils::NZUsize!(4);
         let remote = remote_args();
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
 
         let secondaries = build_secondaries(&args, &remote, Path::new("/tmp/configs"), &material);
+        let validators =
+            super::build_validators(&args, &remote, Path::new("/tmp/configs"), &material);
+        assert!(
+            validators
+                .iter()
+                .all(|v| v.config.worker_threads == 3 && v.config.rayon_threads == 13)
+        );
+        assert_eq!(secondaries[0].config.worker_threads, 8);
+        assert_eq!(secondaries[0].config.rayon_threads, 12);
+        assert_eq!(secondaries[1].config.worker_threads, 3);
+        assert_eq!(secondaries[1].config.rayon_threads, 13);
 
         let indexer = secondaries[0]
             .config
@@ -1189,7 +1222,9 @@ mod tests {
             .as_ref()
             .expect("secondary should have indexer wiring");
         assert_eq!(indexer.store_url, "http://chain-indexer:8090");
-        assert_eq!(indexer.upload_buffer, 64);
+        assert_eq!(indexer.upload_max_in_flight, 64);
+        assert_eq!(indexer.publisher_rayon_threads.get(), 4);
+        assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         assert!(
             secondaries[1].config.indexer.is_none(),
             "relayer secondary should not have indexer wiring"
@@ -1208,7 +1243,7 @@ mod tests {
         let remote = remote_args();
         let validators = vec![validator(0), validator(1), validator(2)];
         let mut indexer_secondary_config = validator(0).config;
-        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&remote));
+        indexer_secondary_config.indexer = Some(super::remote_indexer_config(&args, &remote));
         let secondaries = vec![
             super::GeneratedValidator {
                 public_key_hex: "secondary-0".to_string(),

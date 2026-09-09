@@ -13,7 +13,7 @@ mod store;
 #[cfg(test)]
 mod test_store;
 
-pub use client::{IndexerClient, ReadError};
+pub use client::{FinalizedPublicationTarget, IndexerClient, ReadError, TransactionMetadata};
 pub use publisher::{CertificateReporter, Publisher};
 pub use store::{
     StoreClient, StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,

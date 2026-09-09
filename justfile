@@ -22,9 +22,10 @@ fmt-fix:
 fmt-check:
   cargo +nightly fmt --all -- --check
 
-# Lint the workspace
+# Nightly's next trait solver overflows on the recursive application bounds.
+# Keep its use limited to coherence checks while running Clippy.
 lint: fmt-check docs-check
-  cargo +nightly clippy --workspace --all --all-features --all-targets -- -D warnings
+  RUSTFLAGS="-Znext-solver=coherence" cargo +nightly clippy --workspace --all --all-features --all-targets -- -D warnings
 
 # Run all tests
 test *args='': docs-test deploy-script-test
@@ -53,3 +54,7 @@ explorer-test:
 # Build the Explorer.
 explorer-build:
   npm --prefix explorer run build
+
+# Install Explorer dependencies.
+explorer-install:
+  npm --prefix explorer install

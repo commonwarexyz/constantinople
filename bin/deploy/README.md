@@ -18,6 +18,18 @@ receiving valid peer blocks. Network messages remain capped at 32 MiB.
 `--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
 Run `./deploy.sh --help` for defaults.
 
+`--worker-threads` and `--rayon-threads` set each node's async workers and engine
+Rayon pool. Use `--indexer-worker-threads` and `--indexer-rayon-threads` to override
+those counts for the indexer secondary in either deployment mode.
+`--indexer-publisher-rayon-threads` sizes its separate publication pool and defaults
+to `2`. The generated indexer YAML stores this as `indexer.publisher_rayon_threads`.
+
+`deploy.sh` configures the 32-vCPU indexer with 8 async workers, 12 engine Rayon
+threads, and 4 publisher Rayon threads. Other validator runtimes use 3 async
+workers and 13 engine Rayon threads. Chunk request encoding and compression use
+the runtime's shared blocking pool. These counts leave CPU headroom for that work
+but do not pin threads to particular cores.
+
 ## Local Deployment
 
 Generate a local bundle:

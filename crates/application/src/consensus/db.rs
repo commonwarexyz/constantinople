@@ -47,10 +47,8 @@ pub type TransactionDatabase<E, H, S> = Shared<TransactionHistoryDb<E, H, S>>;
 /// The backing databases owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
 
-pub type StateReader<E, H, T, S> = Reader<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>;
-
 pub type DatabaseReaders<E, H, T, S> = (
-    StateReader<E, H, T, S>,
+    Reader<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>,
     Reader<TransactionHistoryDb<E, H, S>>,
 );
 
@@ -160,6 +158,7 @@ mod tests {
                 metadata_partition: "state-order-test-merkle-metadata".into(),
                 items_per_blob: NZU64!(1024),
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
                 strategy: Sequential,
                 page_cache: cache.clone(),
             },
@@ -168,6 +167,7 @@ mod tests {
                 items_per_blob: NZU64!(1024),
                 page_cache: cache,
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
             },
             translator: EightCap,
             init_cache_size: Some(NZUsize!(1024)),

@@ -847,19 +847,21 @@ where
                     // the full-body decode is skipped otherwise; the block is
                     // still released on the strategy's pool off this loop.
                     if proposed.is_empty() {
-                        drop(strategy.spawn(move |_: St| drop(block)));
+                        let work_size = block.body.len();
+                        drop(strategy.spawn(work_size, move |_: St| drop(block)));
                         acknowledgement.acknowledge();
                         continue;
                     }
 
                     let height = block.header.height;
+                    let work_size = block.body.len();
 
                     // Deriving the finalized set decodes any transaction the
                     // application has not already materialized, so it runs on
                     // the strategy's pool (which also releases the block
                     // there).
                     let finalized: AHashSet<H::Digest> = strategy
-                        .spawn(move |_: St| {
+                        .spawn(work_size, move |_: St| {
                             block
                                 .body
                                 .iter()
