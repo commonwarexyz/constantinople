@@ -370,7 +370,7 @@ mod tests {
                     .map(|task| {
                         let cache = cache.clone();
                         let keys = keys.clone();
-                        strategy.spawn(move |strategy: commonware_parallel::Rayon| {
+                        strategy.spawn(256, move |strategy: commonware_parallel::Rayon| {
                             let start = (round * 16 + task * 64) % 768;
                             let refs: Vec<&TransactionPublicKey> =
                                 keys[start..start + 256].iter().collect();

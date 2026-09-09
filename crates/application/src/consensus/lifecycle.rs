@@ -91,9 +91,10 @@ where
         // decoded transactions) is released on the strategy's pool so the
         // drop stays off the propose path.
         let drop_span = info_span!("application.propose.drop_parent");
+        let drop_work = parent.body.len();
         drop(
             self.strategy
-                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
+                .spawn(drop_work, move |_: St| drop_span.in_scope(|| drop(parent))),
         );
 
         self.proposed_transactions
@@ -205,9 +206,10 @@ where
         // decoded transactions) is released on the strategy's pool so the
         // drop stays off the verify path.
         let drop_span = info_span!("application.verify.drop_parent");
+        let drop_work = parent.body.len();
         drop(
             self.strategy
-                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
+                .spawn(drop_work, move |_: St| drop_span.in_scope(|| drop(parent))),
         );
 
         let execution = match result {
@@ -234,7 +236,7 @@ where
         Some(execution.into_merkleized())
     }
 
-    /// Applies a certified block to speculative batches.
+    /// Replays a block into speculative batches.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(
@@ -242,12 +244,12 @@ where
         skip_all,
         fields(height = block.header.height.traced())
     )]
-    pub async fn apply_certified(
+    pub async fn apply_block(
         &mut self,
         (_, _): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
-    ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
+    ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
         E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
@@ -256,11 +258,14 @@ where
     {
         let strategy = self.strategy.clone();
         let body = block.body.clone();
+        let work_size = body.len();
         let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
         let (body, digests) = strategy
-            .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, &body)))
+            .spawn(work_size, move |s| {
+                prepare_span.in_scope(|| prepare_lazy(&s, &body))
+            })
             .await
-            .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+            .ok()?;
 
         let (state_batch, transaction_batch) = batches;
         apply_prepared_body::<E, H, St>(
@@ -272,6 +277,6 @@ where
             strategy,
         )
         .await
-        .unwrap_or_else(|reason| panic!("certified block contained {reason}"))
+        .ok()
     }
 }

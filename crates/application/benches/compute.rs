@@ -110,6 +110,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             metadata_partition: "bench-state-metadata".into(),
             items_per_blob: NZU64!(1 << 20),
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
             strategy,
             page_cache: cache.clone(),
         },
@@ -118,6 +119,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             items_per_blob: NZU64!(1 << 20),
             page_cache: cache,
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
@@ -449,7 +451,8 @@ fn main() {
             }
         }
         let merkleized = batch.merkleize().await.expect("seed merkleize");
-        db.apply(merkleized).await;        assert!(db.finalize().await.durable().await);
+        db.apply(merkleized).await;
+        assert!(db.finalize().await.durable().await);
 
         let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
         let count_filter = std::env::var("CONSTANTINOPLE_BENCH_COUNT")

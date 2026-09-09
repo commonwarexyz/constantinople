@@ -2,7 +2,7 @@
 
 use super::{
     Mailbox,
-    actor::{AccountReaderCell, IngestStatus},
+    actor::{AccountReaderCell, IngestStatus, StoredBatchStatus},
 };
 use axum::{
     Router,
@@ -282,7 +282,8 @@ where
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
-    let verified = state.strategy.spawn(move |strategy| {
+    let work_size = body.len();
+    let verified = state.strategy.spawn(work_size, move |strategy| {
         let _permit = permit;
         let batch_id = H::hash(&[body.as_ref()]).to_string();
 
@@ -359,9 +360,15 @@ where
     // formatting, so it runs on the strategy's pool; every other status is
     // constant-size.
     if status.has_digest_lists() {
+        let work_size = match &status {
+            StoredBatchStatus::PartiallyFinalized {
+                included, filtered, ..
+            } => included.len().saturating_add(filtered.len()),
+            _ => 0,
+        };
         return state
             .strategy
-            .spawn(move |_| ok_json(&status.to_wire()))
+            .spawn(work_size, move |_| ok_json(&status.to_wire()))
             .await;
     }
     ok_json(&status.to_wire())
