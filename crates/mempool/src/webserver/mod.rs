@@ -7,7 +7,7 @@
 //!
 //! - **HTTP handlers** (axum) run on tokio worker threads, decoding and
 //!   verifying transactions in parallel.
-//! - **Actor** owns a byte-bounded FIFO pool and processes submit,
+//! - **Actor** owns byte-bounded foreground and background FIFO pools and processes submit,
 //!   propose, and report messages from a single channel.
 //! - **Mailbox** is the cloneable handle that implements
 //!   [`TransactionSource`](crate::TransactionSource) and

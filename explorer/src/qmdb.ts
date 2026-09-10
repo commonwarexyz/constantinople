@@ -1,5 +1,5 @@
-import { fromHex, toArrayBuffer } from './codec';
-import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath';
+import { fromHex, toArrayBuffer } from './codec.ts';
+import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath.ts';
 import {
     SqlClient,
     type CellValue,
@@ -34,6 +34,10 @@ const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
+
+const BLOCK_META_TABLE = 'block_meta';
+const BLOCK_META_HEIGHT = 'height';
+const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
 
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
@@ -73,6 +77,7 @@ export interface VerifiedFinalizationTarget {
 }
 
 interface TransactionProofMetadata {
+    readonly height: bigint;
     readonly location: bigint;
 }
 
@@ -122,7 +127,6 @@ export async function fetchAndVerifyTransactionProof({
     sqlUrl,
     simplexVerificationMaterial,
     digest,
-    height,
     signal,
     onFinalizationVerified,
 }: {
@@ -131,21 +135,20 @@ export async function fetchAndVerifyTransactionProof({
     sqlUrl: string;
     simplexVerificationMaterial: string;
     digest: string;
-    height: number;
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
+    const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, signal);
     const target = await finalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
-        BigInt(height),
+        metadata.height,
         signal,
     );
-    onFinalizationVerified?.(target);
-    const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, target, signal);
     if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
-        throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
+        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet in the selected block range`);
     }
+    onFinalizationVerified?.(target);
 
     const tip = transactionProofTip(target.transactionsTip);
     let verification: VerifiedFixedKeylessAppendProof;
@@ -269,13 +272,13 @@ export async function fetchAndVerifyTransactionRowProof({
 }): Promise<VerifiedTransactionProof> {
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const metadata = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
-    assertTransactionLocationBeforeTip(metadata.location, target.transactionsTip);
+    const location = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+    assertTransactionLocationBeforeTip(location, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
         `${trimTrailingSlash(qmdbUrl)}/transactions`,
-        metadata.location,
+        location,
         tip,
         target.transactionsRoot,
         digestBytes,
@@ -283,7 +286,7 @@ export async function fetchAndVerifyTransactionRowProof({
     );
 
     return {
-        location: metadata.location,
+        location,
         tip,
         height: target.height,
         view: target.view,
@@ -295,7 +298,7 @@ async function fetchVerifiedSqlTransactionMetadata(
     sqlUrl: string,
     digest: Uint8Array,
     signal?: AbortSignal,
-): Promise<TransactionProofMetadata> {
+): Promise<bigint> {
     const result = await sqlQuery(
         sqlUrl,
         `
@@ -321,35 +324,43 @@ async function fetchVerifiedSqlTransactionMetadata(
     if (!bytesEqual(actual, digest)) {
         throw new Error('SQL transaction body does not match transaction digest');
     }
-    return { location };
+    return location;
 }
 
 async function fetchTransactionProofMetadata(
     sqlUrl: string,
     digest: string,
-    target: FinalizedTransactionTarget,
     signal?: AbortSignal,
 ): Promise<TransactionProofMetadata> {
     const digestBytes = fromHex(digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
+    let location: bigint;
+    try {
+        location = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        if (detail.includes('missing from raw transaction index')) {
+            throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
+        }
+        throw error;
+    }
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_QMDB_LOCATION}
-            FROM ${TX_META_TABLE}
-            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
+            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}
+            FROM ${BLOCK_META_TABLE}
+            WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${location.toString()}
+            ORDER BY ${BLOCK_META_HEIGHT} ASC
             LIMIT 1
         `,
         signal,
     );
     const row = result.rows[0];
     if (!row) {
-        throw new Error(`tx digest ${shortHex(digest)} missing at height ${target.height}`);
+        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
     }
-
-    const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
-
     return {
+        height: expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT),
         location,
     };
 }

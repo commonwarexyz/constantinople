@@ -41,10 +41,6 @@ pub(crate) const fn default_page_cache_bytes() -> usize {
     2 * 1024 * 1024 * 1024
 }
 
-pub(crate) const fn default_relayer_retry_views() -> u64 {
-    8
-}
-
 pub(crate) const fn default_public_key_cache_size() -> usize {
     100_000
 }
@@ -161,9 +157,6 @@ pub struct ValidatorConfig {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct RelayerConfig {
-    /// Views to retry a submission before giving up.
-    #[serde(default = "default_relayer_retry_views")]
-    pub max_retry_views: u64,
     /// Per-leader relayer endpoints.
     pub leaders: Vec<RelayerLeaderConfig>,
 }

@@ -59,6 +59,19 @@ export function mergeNonceStates(left: NonceState, right: NonceState): NonceStat
     return merged;
 }
 
+export function reserveNonces(state: NonceState, nonces: Iterable<bigint>): NonceState {
+    let reserved = state;
+    const ordered = [...new Set(nonces)].sort((left, right) =>
+        left < right ? -1 : left > right ? 1 : 0,
+    );
+
+    for (const nonce of ordered) {
+        reserved = consumeNonce(reserved, nonce) ?? reserved;
+    }
+
+    return reserved;
+}
+
 export function nonceStatesEqual(left: NonceState, right: NonceState): boolean {
     return left.base === right.base && left.bitmap === right.bitmap;
 }
