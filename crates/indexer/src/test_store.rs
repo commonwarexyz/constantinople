@@ -8,6 +8,7 @@ use axum::{
 };
 use exoware_simulator::{AppState, RocksStore, connect_stack};
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -15,7 +16,7 @@ use std::{
     },
     time::Duration,
 };
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 
 static STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -80,17 +81,20 @@ impl ObservedStore {
 #[derive(Clone)]
 struct IngestGateState {
     ingests: Arc<AtomicUsize>,
-    gated_index: usize,
+    gated_indices: Range<usize>,
+    ingest_arrived: Arc<Notify>,
     first_ingest: Arc<Notify>,
     later_ingest: Arc<Notify>,
-    release_first: Arc<Notify>,
+    release_ingest: Arc<Semaphore>,
 }
 
 pub(crate) struct GatedIngestStore {
     pub url: String,
+    ingests: Arc<AtomicUsize>,
+    ingest_arrived: Arc<Notify>,
     first_ingest: Arc<Notify>,
     later_ingest: Arc<Notify>,
-    release_first: Arc<Notify>,
+    release_ingest: Arc<Semaphore>,
     server: tokio::task::JoinHandle<()>,
 }
 
@@ -102,18 +106,27 @@ impl GatedIngestStore {
     pub async fn open_gating_ingest(
         gated_index: usize,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_gating_ingests(gated_index..gated_index + 1).await
+    }
+
+    pub async fn open_gating_ingests(
+        gated_indices: Range<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let directory = TestDirectory::new()?;
         let engine = RocksStore::open_owned(directory, None).map_err(std::io::Error::other)?;
         let connect = connect_stack(AppState::new(Arc::new(engine)));
         let first_ingest = Arc::new(Notify::new());
         let later_ingest = Arc::new(Notify::new());
-        let release_first = Arc::new(Notify::new());
+        let ingests = Arc::new(AtomicUsize::new(0));
+        let ingest_arrived = Arc::new(Notify::new());
+        let release_ingest = Arc::new(Semaphore::new(0));
         let state = IngestGateState {
-            ingests: Arc::new(AtomicUsize::new(0)),
-            gated_index,
+            ingests: ingests.clone(),
+            gated_indices,
+            ingest_arrived: ingest_arrived.clone(),
             first_ingest: first_ingest.clone(),
             later_ingest: later_ingest.clone(),
-            release_first: release_first.clone(),
+            release_ingest: release_ingest.clone(),
         };
         let app = Router::new()
             .route("/health", get(|| async { "ok" }))
@@ -127,15 +140,23 @@ impl GatedIngestStore {
 
         Ok(Self {
             url,
+            ingests,
+            ingest_arrived,
             first_ingest,
             later_ingest,
-            release_first,
+            release_ingest,
             server,
         })
     }
 
     pub async fn wait_for_first_ingest(&self) {
         self.first_ingest.notified().await;
+    }
+
+    pub async fn wait_for_ingests(&self, count: usize) {
+        while self.ingests.load(Ordering::SeqCst) < count {
+            self.ingest_arrived.notified().await;
+        }
     }
 
     pub async fn later_ingest_arrives_within(&self, duration: Duration) -> bool {
@@ -145,7 +166,7 @@ impl GatedIngestStore {
     }
 
     pub fn release_first_ingest(&self) {
-        self.release_first.notify_one();
+        self.release_ingest.add_permits(1);
     }
 
     pub async fn shutdown(self) {
@@ -178,11 +199,14 @@ async fn gate_first_ingest(
 ) -> Response {
     if request.uri().path().starts_with("/log.ingest.v1.Service/") {
         let index = state.ingests.fetch_add(1, Ordering::SeqCst);
-        if index == state.gated_index {
+        state.ingest_arrived.notify_one();
+        if index == state.gated_indices.start {
             state.first_ingest.notify_one();
-            state.release_first.notified().await;
-        } else if index > state.gated_index {
+        } else if index > state.gated_indices.start {
             state.later_ingest.notify_one();
+        }
+        if state.gated_indices.contains(&index) {
+            state.release_ingest.acquire().await.unwrap().forget();
         }
     }
     next.run(request).await

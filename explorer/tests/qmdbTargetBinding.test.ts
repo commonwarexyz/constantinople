@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
+import type { CallOptions } from '@connectrpc/connect';
 
 import {
     QmdbOperationLogClient,
@@ -12,7 +13,6 @@ import {
 import {
     SqlClient,
     type DecodedQueryResult,
-    type SqlQueryOptions,
     type Table,
 } from '@exowarexyz/sql';
 import { SimplexClient, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
@@ -86,8 +86,8 @@ test('reported height starts certificate and metadata reads together and retains
         await metadataReady;
         return certificate;
     });
-    t.mock.method(SqlClient.prototype, 'query', async (sql: string, options: SqlQueryOptions) => {
-        assert.equal(options.minSequenceNumber, FLOOR);
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string, minSequenceNumber?: bigint) => {
+        assert.equal(minSequenceNumber, FLOOR);
         if (sql.includes('FROM block_meta')) {
             reads.push('block');
             return queryResult({ height: HEIGHT, transactions_tip: 7n, tx_count: 3n });
@@ -202,8 +202,8 @@ for (const finalizedHeight of [undefined, HEIGHT + 1n]) {
         options.publishedTarget.blockDigest = later.payload.slice(0, 32);
         let blockPublished = false;
         const floors: Array<bigint | undefined> = [];
-        t.mock.method(SqlClient.prototype, 'query', async (sql: string, queryOptions: SqlQueryOptions) => {
-            floors.push(queryOptions.minSequenceNumber);
+        t.mock.method(SqlClient.prototype, 'query', async (sql: string, minSequenceNumber?: bigint) => {
+            floors.push(minSequenceNumber);
             return sql.includes('FROM tx_meta')
                 ? queryResult({ qmdb_location: LOCATION, body })
                 : queryResult(blockPublished
@@ -388,9 +388,9 @@ test('account proof retains the publication floor for SQL and QMDB', async (t) =
     const target = { ...latestTarget(), stateStart: 2n };
     const sqlFloors: Array<bigint | undefined> = [];
     const sqlQueries: string[] = [];
-    t.mock.method(SqlClient.prototype, 'query', async (sql: string, options: SqlQueryOptions = {}) => {
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string, minSequenceNumber?: bigint) => {
         sqlQueries.push(sql);
-        sqlFloors.push(options.minSequenceNumber);
+        sqlFloors.push(minSequenceNumber);
         return queryResult({
             balance: 9n,
             nonce_base: 2n,
@@ -433,11 +433,13 @@ test('account proof retains the publication floor for SQL and QMDB', async (t) =
 
 test('account page retains the publication floor, height, and abort signal', async (t) => {
     const controller = new AbortController();
-    const sqlOptions: SqlQueryOptions[] = [];
+    const sqlOptions: CallOptions[] = [];
+    const sqlFloors: Array<bigint | undefined> = [];
     const sqlQueries: string[] = [];
-    t.mock.method(SqlClient.prototype, 'query', async (sql: string, options = {}) => {
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string, minSequenceNumber?: bigint, options: CallOptions = {}) => {
         sqlQueries.push(sql);
         sqlOptions.push(options);
+        sqlFloors.push(minSequenceNumber);
         return emptyQueryResult();
     });
 
@@ -451,7 +453,7 @@ test('account page retains the publication floor, height, and abort signal', asy
 
     assert.equal(sqlOptions.length, 1);
     assert.equal(sqlOptions[0]?.signal, controller.signal);
-    assert.equal(sqlOptions[0]?.minSequenceNumber, FLOOR);
+    assert.deepEqual(sqlFloors, [FLOOR]);
     assert.match(sqlQueries[0] ?? '', /height <= 7/);
 });
 
@@ -460,7 +462,7 @@ test('account page SQL request stops when its forwarded signal is aborted', asyn
     t.mock.method(
         SqlClient.prototype,
         'query',
-        async (_sql: string, options: SqlQueryOptions = {}) =>
+        async (_sql: string, _minSequenceNumber?: bigint, options: CallOptions = {}) =>
             new Promise<DecodedQueryResult>((_resolve, reject) => {
                 const signal = options.signal;
                 assert.ok(signal);
@@ -487,8 +489,8 @@ test('transaction row proof retains the publication floor for SQL and QMDB', asy
         await crypto.subtle.digest('SHA-256', toArrayBuffer(body)),
     );
     const sqlFloors: Array<bigint | undefined> = [];
-    t.mock.method(SqlClient.prototype, 'query', async (_sql: string, options: SqlQueryOptions = {}) => {
-        sqlFloors.push(options.minSequenceNumber);
+    t.mock.method(SqlClient.prototype, 'query', async (_sql: string, minSequenceNumber?: bigint) => {
+        sqlFloors.push(minSequenceNumber);
         return queryResult({ qmdb_location: LOCATION, body });
     });
 

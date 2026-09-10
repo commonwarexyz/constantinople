@@ -12,10 +12,10 @@ import type { PublishedProofTarget } from '../src/proofTarget.ts';
 test('block subscription queries SQL after the target and keeps its sequence floor', async () => {
     const events: string[] = [];
     const target = proofTarget(7n, 23n, 0xa5);
-    const sql = sqlClient(async (query, options) => {
+    const sql = sqlClient(async (query, minSequenceNumber) => {
         events.push('sql');
         assert.match(query, /FROM block_meta WHERE height = 7 LIMIT 1/);
-        assert.equal(options?.minSequenceNumber, 23n);
+        assert.equal(minSequenceNumber, 23n);
         return queryResult(41n, 7n, target.blockDigest, 9n);
     });
     const stream = subscribeBlocksFromTargets(sql, targets(target, events));
@@ -42,9 +42,9 @@ test('missing block metadata retries without dropping the target', async () => {
             targetPulls++;
         },
     };
-    const sql = sqlClient(async (_query, options) => {
+    const sql = sqlClient(async (_query, minSequenceNumber) => {
         queries++;
-        assert.equal(options?.minSequenceNumber, 29n);
+        assert.equal(minSequenceNumber, 29n);
         if (queries === 1) return queryResult(29n);
         return queryResult(31n, 8n, target.blockDigest, 4n);
     });
@@ -167,8 +167,8 @@ test('a streamed row beyond the publication sequence requires a point read', asy
     const first = proofTarget(7n, 23n, 0xa5);
     const second = proofTarget(8n, 29n, 0x3c);
     const floors: Array<bigint | undefined> = [];
-    const source = streamingSql([queryResult(30n, 8n, second.blockDigest, 99n)], async (_query, options) => {
-        floors.push(options?.minSequenceNumber);
+    const source = streamingSql([queryResult(30n, 8n, second.blockDigest, 99n)], async (_query, minSequenceNumber) => {
+        floors.push(minSequenceNumber);
         await source.ready;
         return floors.length === 1
             ? queryResult(23n, 7n, first.blockDigest, 1n)

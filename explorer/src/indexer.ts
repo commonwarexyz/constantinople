@@ -101,10 +101,11 @@ export async function* subscribeBlocksFromTargets(
                 } else {
                     let result: DecodedQueryResult;
                     try {
-                        result = await sql.query(blockMetadataQuery(target.height), {
-                            signal,
-                            minSequenceNumber: target.sequenceNumber,
-                        });
+                        result = await sql.query(
+                            blockMetadataQuery(target.height),
+                            target.sequenceNumber,
+                            { signal },
+                        );
                     } catch (error) {
                         if (signal?.aborted) return;
                         options.onError?.(errorMessage(error));
