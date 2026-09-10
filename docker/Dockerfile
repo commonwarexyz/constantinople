@@ -38,6 +38,7 @@ RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --de
 
 ENV PATH="/root/.cargo/bin:${PATH}" \
     PACKAGE_NAME="constantinople-validator" \
+    PACKAGE_FEATURES="" \
     BINARY_NAME="constantinople" \
     OUTPUT_NAME="validator" \
     TARGET_TRIPLE="${TARGET_TRIPLE}" \
@@ -55,4 +56,4 @@ RUN rustup target add ${TARGET_TRIPLE}
 WORKDIR /constantinople
 
 ENTRYPOINT ["/bin/bash", "-c"]
-CMD ["set -euo pipefail && export CARGO_TARGET_${TARGET_CARGO_NAME}_LINKER=${TARGET_LINKER} && export CARGO_TARGET_${TARGET_CARGO_NAME}_RUSTFLAGS=\"-C target-cpu=${TARGET_CPU}\" && export CC_${TARGET_CC_NAME}=${TARGET_LINKER} && export CXX_${TARGET_CC_NAME}=${TARGET_CXX} && export AR_${TARGET_CC_NAME}=${TARGET_AR} && mkdir -p deploy && cargo build --locked --release --package ${PACKAGE_NAME} --bin ${BINARY_NAME} --target ${TARGET_TRIPLE} && cp target/${TARGET_TRIPLE}/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && ${TARGET_STRIP} -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]
+CMD ["set -euo pipefail && export CARGO_TARGET_${TARGET_CARGO_NAME}_LINKER=${TARGET_LINKER} && export CARGO_TARGET_${TARGET_CARGO_NAME}_RUSTFLAGS=\"-C target-cpu=${TARGET_CPU}\" && export CC_${TARGET_CC_NAME}=${TARGET_LINKER} && export CXX_${TARGET_CC_NAME}=${TARGET_CXX} && export AR_${TARGET_CC_NAME}=${TARGET_AR} && mkdir -p deploy && cargo build --locked --release --package ${PACKAGE_NAME} ${PACKAGE_FEATURES:+--features ${PACKAGE_FEATURES}} --bin ${BINARY_NAME} --target ${TARGET_TRIPLE} && cp target/${TARGET_TRIPLE}/release/${BINARY_NAME} deploy/${OUTPUT_NAME}-debug && ${TARGET_STRIP} -o deploy/${OUTPUT_NAME} deploy/${OUTPUT_NAME}-debug"]

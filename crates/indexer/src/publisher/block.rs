@@ -198,11 +198,12 @@ where
     let mut to = [0u8; AccountKey::SIZE];
     to.copy_from_slice(&transaction_bytes[to_start..to_end]);
 
-    let mut hasher = H::new();
+    let mut hasher = H::default();
     hasher.update(transaction_bytes);
+    let (_, digest) = hasher.finalize();
     Some(IndexedTransaction {
         block_index,
-        digest: hasher.finalize(),
+        digest,
         bytes: signed_bytes,
         sender,
         to,

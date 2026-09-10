@@ -29,6 +29,7 @@ spammer-graviton-binary: build-graviton-image prepare-docker-cache
 chain-indexer-graviton-binary: build-graviton-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
+    -e PACKAGE_FEATURES=chain-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:graviton-local
@@ -76,6 +77,7 @@ spammer-intel-binary: build-intel-image prepare-docker-cache
 chain-indexer-intel-binary: build-intel-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
+    -e PACKAGE_FEATURES=chain-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:intel-local
@@ -123,6 +125,7 @@ spammer-amd-binary: build-amd-image prepare-docker-cache
 chain-indexer-amd-binary: build-amd-image prepare-docker-cache
   docker run --rm {{source-mounts}} {{cache-env}} \
     -e PACKAGE_NAME=constantinople-indexer \
+    -e PACKAGE_FEATURES=chain-indexer \
     -e BINARY_NAME=chain-indexer \
     -e OUTPUT_NAME=chain-indexer \
     constantinople-builder:amd-local

@@ -358,6 +358,7 @@ impl From<ed25519::Signature> for TransactionSignature {
 /// Verifies mixed transaction signatures with separate scheme groups.
 pub struct TransactionBatchVerifier {
     ed25519: ed25519::Batch,
+    ed25519_len: usize,
     secp256r1: Vec<Secp256r1Item>,
 }
 
@@ -375,6 +376,7 @@ impl TransactionBatchVerifier {
     pub fn new(capacity: usize) -> Self {
         Self {
             ed25519: ed25519::Batch::new(capacity),
+            ed25519_len: 0,
             secp256r1: Vec::new(),
         }
     }
@@ -396,7 +398,13 @@ impl TransactionBatchVerifier {
             (
                 DecompressedPublicKey::Ed25519(key),
                 TransactionSignature::Ed25519 { signature, .. },
-            ) => self.ed25519.add(namespace, message, key, signature),
+            ) => {
+                let added = self.ed25519.add(namespace, message, key, signature);
+                if added {
+                    self.ed25519_len += 1;
+                }
+                added
+            }
             (
                 DecompressedPublicKey::Secp256r1(verifying_key),
                 TransactionSignature::Secp256r1 {
@@ -421,11 +429,16 @@ impl TransactionBatchVerifier {
 
     /// Verifies every queued signature.
     pub fn verify<R: CryptoRng>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
-        if !self.ed25519.verify(rng, strategy) {
+        let Self {
+            ed25519,
+            ed25519_len,
+            secp256r1,
+        } = self;
+        if ed25519_len > 0 && !ed25519.verify(rng, strategy) {
             return false;
         }
 
-        verify_secp256r1(strategy, self.secp256r1)
+        verify_secp256r1(strategy, secp256r1)
     }
 }
 
@@ -485,7 +498,7 @@ fn verify_webauthn_assertion(
         return false;
     }
 
-    let client_data_hash = sha256::Sha256::hash(client_data_json);
+    let client_data_hash = sha256::Sha256::hash(&[client_data_json]);
     let mut payload =
         Vec::with_capacity(authenticator_data.len() + client_data_hash.as_ref().len());
     payload.extend_from_slice(authenticator_data);
@@ -572,8 +585,8 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let ed25519 = ed25519::PrivateKey::random(test_rng());
-            let ed_message = sha256::Sha256::hash(b"ed25519").to_vec();
-            let r1_message = sha256::Sha256::hash(b"secp256r1").to_vec();
+            let ed_message = sha256::Sha256::hash(&[b"ed25519"]).to_vec();
+            let r1_message = sha256::Sha256::hash(&[b"secp256r1"]).to_vec();
             let (r1_public_key, r1_signature) = webauthn_signature(&r1_message);
 
             let ed_public_key = TransactionPublicKey::ed25519(ed25519.public_key());
@@ -602,7 +615,7 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let ed25519 = ed25519::PrivateKey::random(test_rng());
-            let message = sha256::Sha256::hash(b"message").to_vec();
+            let message = sha256::Sha256::hash(&[b"message"]).to_vec();
             let (_, signature) = webauthn_signature(&message);
 
             let public_key = TransactionPublicKey::ed25519(ed25519.public_key());
@@ -619,8 +632,8 @@ mod tests {
     fn webauthn_signature_rejects_wrong_challenge() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let message = sha256::Sha256::hash(b"message").to_vec();
-            let wrong_message = sha256::Sha256::hash(b"wrong").to_vec();
+            let message = sha256::Sha256::hash(&[b"message"]).to_vec();
+            let wrong_message = sha256::Sha256::hash(&[b"wrong"]).to_vec();
             let (public_key, signature) = webauthn_signature(&wrong_message);
             let key = &cache
                 .decompress(&[&public_key], &Sequential)
@@ -636,7 +649,7 @@ mod tests {
     fn webauthn_signature_rejects_missing_user_verification() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let message = sha256::Sha256::hash(b"message").to_vec();
+            let message = sha256::Sha256::hash(&[b"message"]).to_vec();
             let (public_key, mut signature) = webauthn_signature(&message);
             let TransactionSignature::Secp256r1 {
                 signature: inner,
@@ -694,7 +707,7 @@ mod tests {
     fn webauthn_verification_populates_and_reuses_cache() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let message = sha256::Sha256::hash(b"secp256r1").to_vec();
+            let message = sha256::Sha256::hash(&[b"secp256r1"]).to_vec();
             let (public_key, signature) = webauthn_signature(&message);
 
             let key = &cache
@@ -725,7 +738,7 @@ mod tests {
             base64_url_no_pad(challenge)
         )
         .into_bytes();
-        let client_data_hash = sha256::Sha256::hash(&client_data_json);
+        let client_data_hash = sha256::Sha256::hash(&[client_data_json.as_ref()]);
         let mut payload =
             Vec::with_capacity(authenticator_data.len() + client_data_hash.as_ref().len());
         payload.extend_from_slice(&authenticator_data);
