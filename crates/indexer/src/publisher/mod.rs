@@ -38,6 +38,17 @@ const COMMIT_DURATION_BUCKETS: [f64; 12] = [
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
+// Preserve preparation latency differences below the first Store commit bucket.
+const PREPARE_DURATION_BUCKETS: [f64; 15] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+// Queue recovery can leave finalized blocks waiting much longer than one commit.
+const FINALIZATION_TO_PUBLICATION_BUCKETS: [f64; 17] = [
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    1800.0, 3600.0,
+];
+
 /// Observability for store batch commits issued by the publishers.
 #[derive(Clone)]
 pub struct StoreCommitMetrics {
@@ -75,22 +86,41 @@ impl StoreCommitMetrics {
 pub struct PublisherMetrics {
     /// Finalized-index data and publication commits.
     pub(crate) commit: StoreCommitMetrics,
+    /// Data chunks belonging to successfully persisted blocks.
+    pub(crate) chunk_commits: Counter,
     /// Row preparation for one block, from admission to staged rows.
     pub(crate) prepare_duration: Histogram,
+    pub(crate) expansion_duration: Histogram,
+    pub(crate) staging_duration: Histogram,
     /// One block's data path, from admission until its data is durable.
     pub(crate) persist_duration: Histogram,
     /// Wait from a block's data being durable until its barrier publishes.
     pub(crate) publication_wait_duration: Histogram,
+    pub(crate) finalization_to_publication_duration: Histogram,
 }
 
 impl PublisherMetrics {
     pub fn new(context: &impl Metrics) -> Self {
         Self {
             commit: StoreCommitMetrics::new(context),
+            chunk_commits: context.counter(
+                "chunk_commits",
+                "Data chunks in successfully persisted finalized blocks",
+            ),
             prepare_duration: context.histogram(
                 "prepare_duration",
                 "Finalized block row preparation time (s)",
-                COMMIT_DURATION_BUCKETS,
+                PREPARE_DURATION_BUCKETS,
+            ),
+            expansion_duration: context.histogram(
+                "expansion_duration",
+                "Finalized block metadata and authenticated range preparation time (s)",
+                PREPARE_DURATION_BUCKETS,
+            ),
+            staging_duration: context.histogram(
+                "staging_duration",
+                "Finalized block SQL preparation and Store row staging time (s)",
+                PREPARE_DURATION_BUCKETS,
             ),
             persist_duration: context.histogram(
                 "persist_duration",
@@ -101,6 +131,11 @@ impl PublisherMetrics {
                 "publication_wait_duration",
                 "Finalized block wait from data durable to barrier published (s)",
                 COMMIT_DURATION_BUCKETS,
+            ),
+            finalization_to_publication_duration: context.histogram(
+                "finalization_to_publication_duration",
+                "Finalized block time from recorded finalization to barrier published (s)",
+                FINALIZATION_TO_PUBLICATION_BUCKETS,
             ),
         }
     }

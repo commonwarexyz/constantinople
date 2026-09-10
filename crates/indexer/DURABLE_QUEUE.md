@@ -9,14 +9,12 @@ and remote namespaces require a separate migration or reindex design.
 
 ## Dependencies
 
-Rust uses Commonware 2026.9.0 and Exoware revision
-`fe7272b7be18a4ee991002a2c31c9f78a53cad47`. Authenticated preparation uses the
-implementation from Exoware's Commonware update, with the Store, SQL, QMDB, and
-Simplex read-consistency additions on top.
+Rust uses the Commonware and Exoware 2026.9.0 releases from crates.io.
+Exoware includes authenticated range preparation and Store, SQL, QMDB, and
+Simplex read consistency.
 
-Explorer currently uses the SDK, SQL, QMDB, and Simplex packages in
-`~/Documents/exoware/exoware-monorepo-v9-prep`. Published package pins and a clean
-install without sibling checkouts remain a landing prerequisite.
+Explorer pins the published SDK, SQL, QMDB, and Simplex npm packages to
+2026.9.0. Installation does not require sibling checkouts.
 
 ## Capture and persistence
 
@@ -88,7 +86,9 @@ use a 128 MiB budget that includes conservative protobuf overhead and a
 250,000-row cap for the decoder's separate 32 MiB entry-allocation limit. A 32 MiB
 proposal produced more than 257 MiB of raw rows in the simulator, exceeding
 the Store's 256 MiB limit. Small batches remain one request. Larger batches
-commit sequentially, and every part must finish before publication.
+commit with at most four chunk requests in flight per block. The limit includes
+request encoding, compression, and retries. Every part must finish before
+publication.
 Preparation retains the verified final locations for publication. The Exoware
 API stages presence rows with the immutable data. Visibility remains gated by
 the corresponding published watermark.
@@ -185,9 +185,23 @@ upload concurrency, byte budget, and optional indexer instance sizing. The
 configured amplification estimate needs validation under representative load.
 
 The dashboard includes capture and acknowledgement lag, queue progress, capture
-stage latency, preparation and persistence latency, publication wait, Store
-commit retries and concurrency, and upload memory amplification. Payload cleanup
-metrics expose delayed deletion and disk reclamation costs.
+stage latency, queue record and payload read latency, preparation and persistence
+latency, publication wait, Store commit retries and concurrency, chunks per block,
+and upload memory amplification. Payload cleanup metrics expose delayed deletion
+and disk reclamation costs.
+
+Preparation has separate expansion and staging timings with millisecond buckets.
+Expansion covers metadata rows and authenticated QMDB ranges. Staging covers SQL
+preparation and Store rows. The aggregate preparation duration also includes task
+scheduling and request splitting. These are elapsed stage times, not CPU usage.
+The chunk counter includes data chunks from successfully persisted blocks and
+excludes publication barriers.
+
+Finalization-to-publication latency starts at the finalization timestamp stored
+in the queue and ends when the contiguous QMDB and SQL publication barrier
+completes. It includes queue waiting across restarts. It uses wall time and clamps
+negative values to zero if the clock moves backwards. It does not include waiting
+for Simplex artifacts or Explorer observation.
 
 ## Validation
 

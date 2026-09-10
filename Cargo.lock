@@ -3014,8 +3014,9 @@ dependencies = [
 
 [[package]]
 name = "exoware-qmdb"
-version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=fe7272b7be18a4ee991002a2c31c9f78a53cad47#fe7272b7be18a4ee991002a2c31c9f78a53cad47"
+version = "2026.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5fe6a70ce979a248e3f8a501a9469c096f13d6c66390fabcf1c35c4d1cf8dd77"
 dependencies = [
  "axum",
  "buffa",
@@ -3046,8 +3047,9 @@ dependencies = [
 
 [[package]]
 name = "exoware-sdk"
-version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=fe7272b7be18a4ee991002a2c31c9f78a53cad47#fe7272b7be18a4ee991002a2c31c9f78a53cad47"
+version = "2026.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "abd524b8b4a473f7eda250b95d7afe81d3e4c56b022bb7d8b79889c3a7d1e08e"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3079,8 +3081,9 @@ dependencies = [
 
 [[package]]
 name = "exoware-server"
-version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=fe7272b7be18a4ee991002a2c31c9f78a53cad47#fe7272b7be18a4ee991002a2c31c9f78a53cad47"
+version = "2026.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "601cabf621a3b00fad1adb14f8794d17027376284d811130b150f889584a2edf"
 dependencies = [
  "buffa",
  "buffa-types",
@@ -3097,8 +3100,9 @@ dependencies = [
 
 [[package]]
 name = "exoware-simplex"
-version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=fe7272b7be18a4ee991002a2c31c9f78a53cad47#fe7272b7be18a4ee991002a2c31c9f78a53cad47"
+version = "2026.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a570253e9e5fd053a56b082cd7330d75bedfae0df8c78b3952d6f50d938ea2e"
 dependencies = [
  "bytes",
  "clap",
@@ -3121,8 +3125,9 @@ dependencies = [
 
 [[package]]
 name = "exoware-simulator"
-version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=fe7272b7be18a4ee991002a2c31c9f78a53cad47#fe7272b7be18a4ee991002a2c31c9f78a53cad47"
+version = "2026.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32740192f65332d7e7f7bbd5332aba161bd33bd11fb9d38068642b1eed850b7f"
 dependencies = [
  "axum",
  "buffa",
@@ -3145,8 +3150,9 @@ dependencies = [
 
 [[package]]
 name = "exoware-sql"
-version = "2026.7.1"
-source = "git+https://github.com/exowarexyz/monorepo?rev=fe7272b7be18a4ee991002a2c31c9f78a53cad47#fe7272b7be18a4ee991002a2c31c9f78a53cad47"
+version = "2026.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9125a6fa4a1c012c43721310d60903a15ddb01d94ff0c0bf69fc37d4daab82f2"
 dependencies = [
  "async-trait",
  "axum",

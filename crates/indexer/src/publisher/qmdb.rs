@@ -46,12 +46,12 @@ use exoware_qmdb::{
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, KvSchema};
-use futures::future::BoxFuture;
+use futures::{StreamExt as _, future::BoxFuture, stream};
 use std::{
     collections::{BTreeMap, VecDeque},
     marker::PhantomData,
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     sync::{Mutex, mpsc, oneshot},
@@ -79,6 +79,9 @@ const ROW_WIRE_OVERHEAD: usize = 32;
 
 // The protobuf decoder separately limits repeated-entry allocations to 32 MiB.
 const DATA_REQUEST_ROWS: usize = 250_000;
+
+// Bound request encoding and compression allocations while other blocks upload.
+const MAX_CONCURRENT_CHUNKS: usize = 4;
 
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
@@ -625,6 +628,7 @@ where
 struct PendingPublication<D: Digest> {
     height: u64,
     block_digest: D,
+    finalized_ts_micros: i64,
     published: oneshot::Sender<PublicationReceipt<D>>,
 }
 
@@ -871,6 +875,7 @@ async fn run_publisher<Cx, H, P, S>(
                         let publication = PendingPublication {
                             height: upload.height,
                             block_digest: *upload.block.seal(),
+                            finalized_ts_micros: upload.finalized_ts_micros,
                             published: upload
                                 .published
                                 .take()
@@ -933,44 +938,33 @@ fn spawn_data_commit<Cx, H, P, S>(
     // Supervise preparation and data commits without holding a blocking
     // thread while waiting for their completion.
     let commit = context.spawn(move |context| async move {
+        let prepare_store = store.clone();
+        let prepare_metrics = metrics.clone();
         let prepare = context
             .child("prepare")
             .shared(true)
             .spawn(move |_| async move {
-                prepare_data_batch::<H, P, S>(
+                let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
                     state_client,
                     transaction_client,
                     sql_schema,
                     strategy,
                     upload,
-                )
+                    &prepare_metrics,
+                )?;
+                let batches = data_batches(batch, &prepare_store, DATA_REQUEST_BYTES)?;
+                Ok::<_, PublishError>((batches, state, transactions))
             });
-        let (batch, state, transactions) = prepare
+        let (batches, state, transactions) = prepare
             .await
             .expect("finalized index preparation task failed")?;
         metrics
             .prepare_duration
             .observe(admitted_at.elapsed().as_secs_f64());
-        // Request encoding and compression must not block the async executor.
-        let commit_metrics = metrics.commit.clone();
-        context
-            .child("commit")
-            .shared(true)
-            .spawn(move |_| async move {
-                for batch in data_batches(batch, &store, DATA_REQUEST_BYTES)? {
-                    super::commit_with_retry(
-                        &store,
-                        &batch,
-                        "finalized index data",
-                        &commit_metrics,
-                    )
-                    .await?;
-                }
-                Ok::<_, ClientError>(())
-            })
-            .await
-            .expect("finalized index commit task failed")?;
+        let chunks = batches.len() as u64;
+        commit_chunks(context.child("commit"), &store, &metrics.commit, batches).await?;
         let persisted_at = Instant::now();
+        metrics.chunk_commits.inc_by(chunks);
         metrics
             .persist_duration
             .observe(admitted_at.elapsed().as_secs_f64());
@@ -986,6 +980,32 @@ fn spawn_data_commit<Cx, H, P, S>(
         })
     });
     commits.spawn(async move { commit.await.expect("finalized index data task failed") });
+}
+
+async fn commit_chunks<Cx: Spawner>(
+    context: Cx,
+    store: &StoreClient,
+    metrics: &super::StoreCommitMetrics,
+    batches: Vec<StoreWriteBatch>,
+) -> Result<(), ClientError> {
+    // Spawn lazily so the limit covers request encoding, compression, and retries.
+    let mut commits = stream::iter(batches)
+        .map(|batch| {
+            let store = store.clone();
+            let metrics = metrics.clone();
+            context
+                .child("chunk")
+                .shared(true)
+                .spawn(move |_| async move {
+                    super::commit_with_retry(&store, &batch, "finalized index data", &metrics).await
+                })
+        })
+        .buffer_unordered(MAX_CONCURRENT_CHUNKS);
+
+    while let Some(result) = commits.next().await {
+        result.expect("finalized index chunk commit task failed")?;
+    }
+    Ok(())
 }
 
 fn data_batches(
@@ -1032,6 +1052,7 @@ fn prepare_data_batch<H, P, S>(
     sql_schema: Arc<KvSchema>,
     strategy: S,
     upload: PendingUpload<H, P>,
+    metrics: &super::PublisherMetrics,
 ) -> Result<(StoreWriteBatch, Location<QmdbFamily>, Location<QmdbFamily>), PublishError>
 where
     H: Hasher,
@@ -1039,6 +1060,7 @@ where
     P: PublicKey,
     S: Strategy,
 {
+    let expansion_started = Instant::now();
     let metadata_rows = encode_metadata_rows::<H, P>(
         &upload.block,
         upload.finalized_ts_micros,
@@ -1057,6 +1079,11 @@ where
         &(),
         &strategy,
     )?;
+    metrics
+        .expansion_duration
+        .observe(expansion_started.elapsed().as_secs_f64());
+
+    let staging_started = Instant::now();
     let mut sql_writer = sql_schema.batch_writer();
     let sql = prepare_sql(&mut sql_writer, metadata_rows)?;
     let mut batch = StoreWriteBatch::new();
@@ -1065,6 +1092,9 @@ where
     let transaction_end = transactions.latest_location();
     stage_authenticated_range(&state_client, state, &mut batch)?;
     stage_authenticated_range(&transaction_client, transactions, &mut batch)?;
+    metrics
+        .staging_duration
+        .observe(staging_started.elapsed().as_secs_f64());
     Ok((batch, state_end, transaction_end))
 }
 
@@ -1234,6 +1264,10 @@ fn complete_publication<D: Digest>(
     pending: &mut VecDeque<PendingPublication<D>>,
     persisted: &mut BTreeMap<u64, PersistedUpload>,
 ) {
+    let published_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64();
     for _ in 0..ready {
         let publication = pending
             .pop_front()
@@ -1244,6 +1278,12 @@ fn complete_publication<D: Digest>(
         metrics
             .publication_wait_duration
             .observe(data.persisted_at.elapsed().as_secs_f64());
+
+        // The persisted timestamp includes queue waiting across process restarts.
+        // Clamp negative lag if the wall clock moves backwards.
+        metrics.finalization_to_publication_duration.observe(
+            (published_at - publication.finalized_ts_micros as f64 / 1_000_000.0).max(0.0),
+        );
         debug!(
             height = publication.height,
             barrier_sequence, "published finalized index prefix"
@@ -1274,7 +1314,9 @@ mod tests {
         sha256::{Digest as Sha256Digest, Sha256},
     };
     use commonware_parallel::Sequential;
-    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_runtime::{
+        Metrics as _, Runner as _, Supervisor as _, telemetry::metrics::has_metric_value,
+    };
     use commonware_storage::merkle::{Family as _, mem::Mem};
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
@@ -1508,6 +1550,139 @@ mod tests {
     }
 
     #[test]
+    fn chunk_commits_overlap_within_limit_and_wait_for_every_chunk() {
+        use std::time::Duration;
+
+        commonware_runtime::tokio::Runner::new(
+            commonware_runtime::tokio::Config::default().with_worker_threads(1),
+        )
+        .start(|context| async move {
+            let store =
+                crate::test_store::GatedIngestStore::open_gating_ingests(0..MAX_CONCURRENT_CHUNKS)
+                    .await
+                    .expect("open Store");
+            let physical = writer_store_client(&store.url, None).expect("build Store client");
+            let client = PrefixedStoreClient::empty(physical.clone());
+            let metrics = super::super::StoreCommitMetrics::new(&context);
+            let count = MAX_CONCURRENT_CHUNKS + 2;
+            let mut batch = StoreWriteBatch::new();
+            for index in 0..count {
+                let key = Key::from((index as u64).to_be_bytes().to_vec());
+                batch
+                    .push(&client, &key, Bytes::from(vec![7; 1024]))
+                    .unwrap();
+            }
+            let expected = batch.entries().to_vec();
+            let batches = data_batches(batch, &physical, 8 + 1024 + ROW_WIRE_OVERHEAD).unwrap();
+            assert_eq!(batches.len(), count);
+            let mut commit = context.spawn(move |context| async move {
+                commit_chunks(context, &physical, &metrics, batches).await
+            });
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                store.wait_for_ingests(MAX_CONCURRENT_CHUNKS),
+            )
+            .await
+            .expect("chunks overlap");
+            assert!(
+                tokio::time::timeout(
+                    Duration::from_millis(100),
+                    store.wait_for_ingests(MAX_CONCURRENT_CHUNKS + 1),
+                )
+                .await
+                .is_err()
+            );
+
+            // Later chunks can finish while the other initial chunks remain blocked.
+            store.release_first_ingest();
+            tokio::time::timeout(Duration::from_secs(5), store.wait_for_ingests(count))
+                .await
+                .expect("completed requests free concurrency slots");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut commit)
+                    .await
+                    .is_err()
+            );
+
+            for _ in 1..MAX_CONCURRENT_CHUNKS {
+                store.release_first_ingest();
+            }
+            tokio::time::timeout(Duration::from_secs(5), commit)
+                .await
+                .expect("all chunks finish")
+                .expect("commit task succeeds")
+                .expect("all chunks are durable");
+            for (key, value) in expected {
+                assert_eq!(client.query().get(&key).await.unwrap(), Some(value));
+            }
+            store.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn chunk_commit_rejection_does_not_wait_for_other_chunks() {
+        use axum::{Router, http::StatusCode};
+        use std::time::Duration;
+
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (arrived, mut requests) = mpsc::unbounded_channel();
+            let app = Router::new().fallback(move || {
+                let arrived = arrived.clone();
+                async move {
+                    let (release, status) = oneshot::channel::<StatusCode>();
+                    arrived.send(release).unwrap();
+                    (
+                        status.await.unwrap(),
+                        [("content-type", "application/json")],
+                        r#"{"code":"invalid_argument","message":"invalid chunk"}"#,
+                    )
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let physical = writer_store_client(&url, None).unwrap();
+            let client = PrefixedStoreClient::empty(physical.clone());
+            let metrics = super::super::StoreCommitMetrics::new(&context);
+            let mut batch = StoreWriteBatch::new();
+            batch.push(&client, &Key::from(vec![1]), vec![1]).unwrap();
+            let commit = context.spawn(move |context| async move {
+                commit_chunks(
+                    context,
+                    &physical,
+                    &metrics,
+                    vec![batch; MAX_CONCURRENT_CHUNKS + 1],
+                )
+                .await
+            });
+
+            let mut held = Vec::new();
+            for _ in 0..MAX_CONCURRENT_CHUNKS {
+                held.push(
+                    tokio::time::timeout(Duration::from_secs(5), requests.recv())
+                        .await
+                        .expect("chunk starts")
+                        .unwrap(),
+                );
+            }
+            held.pop().unwrap().send(StatusCode::BAD_REQUEST).unwrap();
+            let error = tokio::time::timeout(Duration::from_secs(5), commit)
+                .await
+                .expect("rejection does not wait for blocked chunks")
+                .expect("commit task succeeds")
+                .expect_err("rejected chunk fails the block");
+            assert_eq!(
+                error.rpc_code(),
+                Some(exoware_sdk::ErrorCode::InvalidArgument)
+            );
+            assert!(requests.try_recv().is_err());
+            server.abort();
+            let _ = server.await;
+        });
+    }
+
+    #[test]
     fn delayed_publication_allows_bounded_data_progress_and_coalesces_completions() {
         commonware_runtime::tokio::Runner::new(
             commonware_runtime::tokio::Config::default().with_worker_threads(1),
@@ -1524,7 +1699,7 @@ mod tests {
                 &store.url,
                 None,
                 3,
-                metrics,
+                metrics.clone(),
             )
             .await
             .expect("connect publisher");
@@ -1540,12 +1715,21 @@ mod tests {
                     })
                     .collect::<Vec<_>>(),
             );
+            let finalized_ts_micros = i64::try_from(
+                (SystemTime::now() - std::time::Duration::from_secs(60))
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_micros(),
+            )
+            .unwrap();
             let upload = |height| {
-                queued_upload(
+                let mut upload = queued_upload(
                     height,
                     queued_range(&state_operations, height, height + 1),
                     queued_range(&transaction_operations, height, height + 1),
-                )
+                );
+                upload.finalized_ts_micros = finalized_ts_micros;
+                upload
             };
 
             let mut first = publisher.enqueue_queued_finalized(upload(1)).await.unwrap();
@@ -1564,6 +1748,13 @@ mod tests {
             })
             .await
             .expect("later data persists while publication is delayed");
+            let encoded_metrics = context.encode();
+            assert!(has_metric_value(&encoded_metrics, "chunk_commits_total", 3));
+            assert!(has_metric_value(
+                &encoded_metrics,
+                "finalization_to_publication_duration_count",
+                0
+            ));
             for height in 1..=3 {
                 assert!(target(&targets, height).await.is_none());
             }
@@ -1597,6 +1788,34 @@ mod tests {
             })
             .await
             .expect("publisher drains after the barrier succeeds");
+            let encoded_metrics = context.encode();
+            assert!(
+                has_metric_value(&encoded_metrics, "chunk_commits_total", 4),
+                "{encoded_metrics}"
+            );
+            for metric in [
+                "expansion_duration_count",
+                "staging_duration_count",
+                "prepare_duration_count",
+                "persist_duration_count",
+                "finalization_to_publication_duration_count",
+            ] {
+                assert!(has_metric_value(&encoded_metrics, metric, 4));
+            }
+
+            // Each recorded block already waited a minute before publisher admission.
+            let lag_sum = encoded_metrics
+                .lines()
+                .find(|line| {
+                    line.starts_with("publisher_finalization_to_publication_duration_sum ")
+                })
+                .expect("publication lag sum is exported")
+                .split_whitespace()
+                .last()
+                .unwrap()
+                .parse::<f64>()
+                .unwrap();
+            assert!(lag_sum >= 240.0, "queue waiting is included in {lag_sum}");
             store.shutdown().await;
         });
     }
@@ -1640,11 +1859,13 @@ mod tests {
                 PendingPublication {
                     height: 1,
                     block_digest: first_digest,
+                    finalized_ts_micros: 1,
                     published: first_tx,
                 },
                 PendingPublication {
                     height: 2,
                     block_digest: second_digest,
+                    finalized_ts_micros: 2,
                     published: second_tx,
                 },
             ]);
@@ -1787,7 +2008,7 @@ mod tests {
         use constantinople_primitives::{Nonce, Transaction, TransactionPublicKey};
         use std::num::NonZeroU64;
 
-        commonware_runtime::tokio::Runner::default().start(|_| async move {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
             let proposal_mib = std::env::var("CONSTANTINOPLE_TEST_PROPOSAL_MIB")
                 .map(|value| value.parse::<usize>().expect("proposal MiB is numeric"))
                 .unwrap_or(32);
@@ -1869,6 +2090,7 @@ mod tests {
                     persisted: None,
                     published: None,
                 },
+                &super::super::PublisherMetrics::new(&context.child("publisher")),
             )
             .expect("prepare full block data");
             let materialized_bytes: usize = batch

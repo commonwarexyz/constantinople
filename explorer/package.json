@@ -12,12 +12,16 @@
     "dependencies": {
         "@bufbuild/protobuf": "2.11.0",
         "@connectrpc/connect": "2.1.1",
-        "@exowarexyz/qmdb": "file:../../../exoware/exoware-monorepo-v9-prep/qmdb/ts",
-        "@exowarexyz/sdk": "file:../../../exoware/exoware-monorepo-v9-prep/sdk/ts",
-        "@exowarexyz/simplex": "file:../../../exoware/exoware-monorepo-v9-prep/simplex/ts",
-        "@exowarexyz/sql": "file:../../../exoware/exoware-monorepo-v9-prep/sql/ts",
+        "@exowarexyz/qmdb": "2026.9.0",
+        "@exowarexyz/sdk": "2026.9.0",
+        "@exowarexyz/simplex": "2026.9.0",
+        "@exowarexyz/sql": "2026.9.0",
         "react": "^19.2.0",
         "react-dom": "^19.2.0"
+    },
+    "overrides": {
+        "@connectrpc/connect": "$@connectrpc/connect",
+        "@connectrpc/connect-web": "2.1.1"
     },
     "devDependencies": {
         "@types/node": "^20.19.41",

@@ -854,7 +854,8 @@ async function sqlQuery(
     const sql = new SqlClient(trimTrailingSlash(sqlUrl));
     const result = await sql.query(
         query.replace(/\s+/g, ' ').trim(),
-        { signal, minSequenceNumber },
+        minSequenceNumber,
+        { signal },
     );
     assertEvaluatedSequence(result.sequenceNumber, minSequenceNumber, 'SQL query');
     return result;
