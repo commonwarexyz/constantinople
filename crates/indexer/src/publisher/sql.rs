@@ -60,7 +60,7 @@ pub(crate) struct TxActivityRow {
     pub nonce: u64,
 }
 
-/// Latest account row stored in `account_meta`.
+/// One `account_meta` row per account-state QMDB operation.
 pub(crate) struct AccountMetaRow {
     pub account: [u8; 32],
     pub balance: u64,

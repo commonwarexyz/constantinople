@@ -8,12 +8,15 @@ use axum::{
 };
 use exoware_simulator::{AppState, RocksStore, connect_stack};
 use std::{
+    ops::Range,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
     },
+    time::Duration,
 };
+use tokio::sync::{Notify, Semaphore};
 
 static STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -75,6 +78,103 @@ impl ObservedStore {
     }
 }
 
+#[derive(Clone)]
+struct IngestGateState {
+    ingests: Arc<AtomicUsize>,
+    gated_indices: Range<usize>,
+    ingest_arrived: Arc<Notify>,
+    first_ingest: Arc<Notify>,
+    later_ingest: Arc<Notify>,
+    release_ingest: Arc<Semaphore>,
+}
+
+pub(crate) struct GatedIngestStore {
+    pub url: String,
+    ingests: Arc<AtomicUsize>,
+    ingest_arrived: Arc<Notify>,
+    first_ingest: Arc<Notify>,
+    later_ingest: Arc<Notify>,
+    release_ingest: Arc<Semaphore>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl GatedIngestStore {
+    pub async fn open() -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_gating_ingest(0).await
+    }
+
+    pub async fn open_gating_ingest(
+        gated_index: usize,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::open_gating_ingests(gated_index..gated_index + 1).await
+    }
+
+    pub async fn open_gating_ingests(
+        gated_indices: Range<usize>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let directory = TestDirectory::new()?;
+        let engine = RocksStore::open_owned(directory, None).map_err(std::io::Error::other)?;
+        let connect = connect_stack(AppState::new(Arc::new(engine)));
+        let first_ingest = Arc::new(Notify::new());
+        let later_ingest = Arc::new(Notify::new());
+        let ingests = Arc::new(AtomicUsize::new(0));
+        let ingest_arrived = Arc::new(Notify::new());
+        let release_ingest = Arc::new(Semaphore::new(0));
+        let state = IngestGateState {
+            ingests: ingests.clone(),
+            gated_indices,
+            ingest_arrived: ingest_arrived.clone(),
+            first_ingest: first_ingest.clone(),
+            later_ingest: later_ingest.clone(),
+            release_ingest: release_ingest.clone(),
+        };
+        let app = Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .fallback_service(connect)
+            .layer(middleware::from_fn_with_state(state, gate_first_ingest));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let url = format!("http://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        Ok(Self {
+            url,
+            ingests,
+            ingest_arrived,
+            first_ingest,
+            later_ingest,
+            release_ingest,
+            server,
+        })
+    }
+
+    pub async fn wait_for_first_ingest(&self) {
+        self.first_ingest.notified().await;
+    }
+
+    pub async fn wait_for_ingests(&self, count: usize) {
+        while self.ingests.load(Ordering::SeqCst) < count {
+            self.ingest_arrived.notified().await;
+        }
+    }
+
+    pub async fn later_ingest_arrives_within(&self, duration: Duration) -> bool {
+        tokio::time::timeout(duration, self.later_ingest.notified())
+            .await
+            .is_ok()
+    }
+
+    pub fn release_first_ingest(&self) {
+        self.release_ingest.add_permits(1);
+    }
+
+    pub async fn shutdown(self) {
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+
 async fn observe_authorization(
     State(state): State<ObservationState>,
     request: Request,
@@ -89,6 +189,26 @@ async fn observe_authorization(
         .lock()
         .expect("request lock poisoned")
         .push(observation);
+    next.run(request).await
+}
+
+async fn gate_first_ingest(
+    State(state): State<IngestGateState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    if request.uri().path().starts_with("/log.ingest.v1.Service/") {
+        let index = state.ingests.fetch_add(1, Ordering::SeqCst);
+        state.ingest_arrived.notify_one();
+        if index == state.gated_indices.start {
+            state.first_ingest.notify_one();
+        } else if index > state.gated_indices.start {
+            state.later_ingest.notify_one();
+        }
+        if state.gated_indices.contains(&index) {
+            state.release_ingest.acquire().await.unwrap().forget();
+        }
+    }
     next.run(request).await
 }
 

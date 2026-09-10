@@ -2,14 +2,17 @@
 
 `constantinople-deploy` generates deployment artifacts for local and remote Constantinople clusters.
 
-At least four validators are required for erasure coding. Shard decoding uses a
-static 32 MiB limit, sized to accommodate shards from 32 MiB transaction proposals
-at the minimum validator count. The deployment script still proposes at most
-16 MiB of transaction bytes per block.
+`--worker-threads` and `--rayon-threads` set each node's async workers and engine
+Rayon pool. Use `--indexer-worker-threads` and `--indexer-rayon-threads` to override
+those counts for the indexer secondary in either deployment mode.
+`--indexer-publisher-rayon-threads` sizes its separate publication pool and defaults
+to `2`. The generated indexer YAML stores this as `indexer.publisher_rayon_threads`.
 
-`deploy.sh` accepts `--validators`, `--regions`, `--storage-size`,
-`--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
-Run `./deploy.sh --help` for defaults.
+`deploy.sh` configures the 32-vCPU indexer with 8 async workers, 12 engine Rayon
+threads, and 4 publisher Rayon threads. Other validator runtimes use 3 async
+workers and 13 engine Rayon threads. Chunk request encoding and compression use
+the runtime's shared blocking pool. These counts leave CPU headroom for that work
+but do not pin threads to particular cores.
 
 ## Local Deployment
 
@@ -76,9 +79,12 @@ The spammer continuously submits ring transfers through the generated relayer.
 Each relayer submitter receives transactions from its own independent set of
 accounts.
 
-`--spammer-submitters N` sets the number of concurrent submitters in both local
-and remote deployments. It defaults to the validator count and must be positive.
-Set it explicitly to keep offered load constant when changing the validator count.
+By default, the spammer selects and logs a fresh account seed whenever the
+process starts. A restarted spammer therefore creates new accounts whose
+nonces begin at zero. Pass `--spammer-seed-offset N` to the deployment
+generator, or `--seed-offset N` to the spammer binary, when a reproducible
+account set is required. Reusing an explicit seed after transactions have been
+accepted recreates the old accounts and is not restart-safe.
 
 Add `--spammer-accounts-jitter J` (default `0`, no jitter) to randomize each submitter's
 batch size as `accounts + rand(0..=floor(accounts * J))`, where `J` must be in `0..=1`.
@@ -99,14 +105,6 @@ locally per submitter. The spammer still submits only one batch at a time to eac
 `spammer_accounts * relayer_submitters`.
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
-
-By default, the spammer selects and logs a fresh account seed whenever the
-process starts. This avoids restarting at nonce zero for accounts used by a
-previous run. Pass `--spammer-seed-offset N` to the deployment generator or
-`--seed-offset N` to the spammer binary when a reproducible account set is
-required. In YAML, set `seed_offset` explicitly. Reusing a seed
-after transactions have been accepted recreates the old accounts and is not
-restart-safe.
 
 You can also run the spammer manually against an existing local cluster:
 
@@ -175,9 +173,7 @@ The printed `mprocs` command list grows by four entries:
 
 - `cargo run --release -p constantinople-indexer --features chain-indexer --bin chain-indexer -- --port 8090 --metrics-port 9097 --data-dir ./local/chain-indexer`
   runs the simulator-backed shared store. `--chain-indexer-port` overrides the Store port.
-  The metrics port follows the validator, secondary, and spammer metrics range
-  starting at `--base-metrics-port`. Direct invocations accept `--metrics-port`,
-  and YAML configs accept `metrics_port`. Both default to `9090` when omitted.
+  The metrics port is placed after the validator, secondary, and spammer metrics range.
 - `cargo run --release -p constantinople-indexer --bin metadata-indexer -- --store-url http://127.0.0.1:8090 --port 8091`
   — the metadata query/stream service. `--metadata-indexer-port` overrides the port.
 - `cargo run --release -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
@@ -437,16 +433,6 @@ Topology and defaults:
 - `metadata-indexer` listens on port `8091` by default.
 - `qmdb-indexer` listens on port `8092` by default.
 - Full indexer uploads are enabled on only the indexer secondary.
-
-QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
-writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
-mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
-Simplex certificates follow the same boundary: validators commit them through
-the shared Store URL, and clients read them from the Store rather than from
-`qmdb-indexer`.
-
-The deployer opens shared-service ports globally because `commonware-deployer`'s port list is
-deployment-wide rather than per-instance.
 
 ### External Store and Adapters
 

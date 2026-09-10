@@ -1,7 +1,4 @@
-use crate::{
-    ThresholdScheme,
-    types::{EngineBlock, EngineMarshalMailbox},
-};
+use crate::{ThresholdScheme, block::ApplicationBlock, types::EngineMarshalMailbox};
 use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
@@ -34,7 +31,7 @@ pub(crate) type TestHasher = Sha256;
 pub(crate) type TestPrivateKey = ed25519::PrivateKey;
 pub(crate) type TestPublicKey = ed25519::PublicKey;
 pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
-pub(crate) type TestBlock = EngineBlock<TestHasher, TestPublicKey>;
+pub(crate) type TestBlock = ApplicationBlock<TestHasher, TestPublicKey>;
 pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
 pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);

@@ -30,7 +30,10 @@ reset_options() {
     MAX_POOL_BYTES=
     STORAGE_SIZE=150
     GENERATE_ARGS=()
-    REMOTE_ARGS=()
+    # The indexer runs the validator binary, which is built for the validators'
+    # CPU model (see docker/docker-bake.hcl). Keep it on the same vendor.
+    # Intel NVMe types such as c8id trap on AMD-only instructions.
+    REMOTE_ARGS=(--indexer-instance-type c8a.8xlarge)
     BINARY_TARGETS=()
     EXPLORER_STORE_URL=
     EXPLORER_SQL_URL=
@@ -130,6 +133,9 @@ prepare_deployment() {
         --output-dir ./deploy
         --worker-threads 3
         --rayon-threads 13
+        --indexer-worker-threads 8
+        --indexer-rayon-threads 12
+        --indexer-publisher-rayon-threads 4
         --public-key-cache-size 5000000
         --max-propose-bytes 16777216
     )

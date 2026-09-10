@@ -70,6 +70,12 @@ prepare_case
 assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains --chain-indexer-instance-type "${REMOTE_ARGS[@]}"
+assert_pair --indexer-instance-type c8a.8xlarge "${REMOTE_ARGS[@]}"
+assert_pair --worker-threads 3 "${GENERATE_ARGS[@]}"
+assert_pair --rayon-threads 13 "${GENERATE_ARGS[@]}"
+assert_pair --indexer-worker-threads 8 "${GENERATE_ARGS[@]}"
+assert_pair --indexer-rayon-threads 12 "${GENERATE_ARGS[@]}"
+assert_pair --indexer-publisher-rayon-threads 4 "${GENERATE_ARGS[@]}"
 
 prepare_case --store-url https://store.example.com
 assert_pair --chain-indexer-url https://store.example.com "${REMOTE_ARGS[@]}"

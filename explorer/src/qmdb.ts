@@ -1,10 +1,14 @@
 import { fromHex, toArrayBuffer } from './codec.ts';
 import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath.ts';
+import type { PublishedProofTarget } from './proofTarget.ts';
+import {
+    BLOCK_META_HEIGHT,
+    containingTransactionHeight,
+    transactionHeightPredecessorQuery,
+} from './transactionHeight.ts';
 import {
     SqlClient,
-    type CellValue,
     type DecodedQueryResult,
-    type DecodedRow,
 } from '@exowarexyz/sql';
 import { Client, StoreKeyPrefix } from '@exowarexyz/sdk';
 import {
@@ -18,6 +22,7 @@ import {
     type VerifiedFixedKeylessAppendProof,
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
+import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
@@ -34,10 +39,6 @@ const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
-
-const BLOCK_META_TABLE = 'block_meta';
-const BLOCK_META_HEIGHT = 'height';
-const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
 
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
@@ -93,7 +94,9 @@ interface FinalizedTransactionTarget {
     readonly transactionsTip: bigint;
 }
 
-export interface LatestProofTarget extends FinalizedTransactionTarget {}
+export interface LatestProofTarget extends FinalizedTransactionTarget {
+    readonly sequenceNumber: bigint;
+}
 
 export type AccountActivityMode = 'all' | 'sent' | 'received';
 
@@ -127,6 +130,8 @@ export async function fetchAndVerifyTransactionProof({
     sqlUrl,
     simplexVerificationMaterial,
     digest,
+    publishedTarget,
+    finalizedHeight,
     signal,
     onFinalizationVerified,
 }: {
@@ -135,55 +140,123 @@ export async function fetchAndVerifyTransactionProof({
     sqlUrl: string;
     simplexVerificationMaterial: string;
     digest: string;
+    publishedTarget: PublishedProofTarget;
+    finalizedHeight?: bigint;
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
-    const metadata = await fetchTransactionProofMetadata(sqlUrl, digest, signal);
-    const target = await finalizedTransactionTarget(
-        storeUrl,
-        simplexVerificationMaterial,
-        metadata.height,
-        signal,
-    );
-    if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet in the selected block range`);
+    if (finalizedHeight !== undefined && finalizedHeight < 0n) {
+        throw new Error('finalized height must be non-negative');
     }
-    onFinalizationVerified?.(target);
-
-    const tip = transactionProofTip(target.transactionsTip);
-    let verification: VerifiedFixedKeylessAppendProof;
-    try {
-        verification = await fetchFixedKeylessAppendProof(
-            `${trimTrailingSlash(qmdbUrl)}/transactions`,
-            metadata.location,
-            tip,
-            target.transactionsRoot,
-            fromHex(digest),
-            signal,
+    if (finalizedHeight !== undefined && finalizedHeight > publishedTarget.height) {
+        throw new Error(
+            `transaction height ${finalizedHeight} is not yet covered by a provable finalization`,
         );
-    } catch (error) {
-        throw new Error(transactionProofErrorDetail(error, target, metadata));
     }
 
-    return {
-        location: metadata.location,
-        tip,
-        height: target.height,
-        view: target.view,
-        proofSizeBytes: verification.proofSizeBytes,
-    };
+    const controller = new AbortController();
+    signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    try {
+        // A reported height only avoids discovery reads. The certificate, location
+        // range, and QMDB proof still authenticate the transaction's inclusion.
+        const targetHeight = finalizedHeight ?? publishedTarget.height;
+        const [proofTarget, metadata] = await Promise.all([
+            targetHeight === publishedTarget.height
+                ? fetchLatestProofTarget({
+                    storeUrl,
+                    simplexVerificationMaterial,
+                    publishedTarget,
+                    signal,
+                })
+                : finalizedTransactionTarget(
+                    storeUrl,
+                    simplexVerificationMaterial,
+                    targetHeight,
+                    publishedTarget.sequenceNumber,
+                    signal,
+                ),
+            fetchTransactionProofMetadata(
+                sqlUrl,
+                digest,
+                publishedTarget.sequenceNumber,
+                signal,
+                finalizedHeight,
+            ),
+        ]);
+        if (finalizedHeight === undefined && metadata.location >= proofTarget.transactionsTip) {
+            throw new Error(
+                `transaction location ${metadata.location} is not yet covered by a provable finalization`,
+            );
+        }
+        const target = metadata.height === proofTarget.height
+            ? proofTarget
+            : await finalizedTransactionTarget(
+                storeUrl,
+                simplexVerificationMaterial,
+                metadata.height,
+                publishedTarget.sequenceNumber,
+                signal,
+            );
+        if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
+            throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
+        }
+        onFinalizationVerified?.(target);
+
+        const tip = transactionProofTip(target.transactionsTip);
+        let verification: VerifiedFixedKeylessAppendProof;
+        try {
+            verification = await fetchFixedKeylessAppendProof(
+                `${trimTrailingSlash(qmdbUrl)}/transactions`,
+                metadata.location,
+                tip,
+                target.transactionsRoot,
+                fromHex(digest),
+                publishedTarget.sequenceNumber,
+                signal,
+            );
+        } catch (error) {
+            throw new Error(transactionProofErrorDetail(error, target, metadata));
+        }
+
+        return {
+            location: metadata.location,
+            tip,
+            height: target.height,
+            view: target.view,
+            proofSizeBytes: verification.proofSizeBytes,
+        };
+    } finally {
+        controller.abort();
+    }
 }
 
+// The published target is committed atomically with the state and transaction
+// QMDB publication boundary. The certificate read authenticates its digest
+// and supplies the roots used for subsequent proofs.
 export async function fetchLatestProofTarget({
     storeUrl,
     simplexVerificationMaterial,
+    publishedTarget,
     signal,
 }: {
     storeUrl: string;
     simplexVerificationMaterial: string;
+    publishedTarget: PublishedProofTarget;
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
-    return latestProofTarget(storeUrl, simplexVerificationMaterial, signal);
+    const target = await finalizedTransactionTarget(
+        storeUrl,
+        simplexVerificationMaterial,
+        publishedTarget.height,
+        publishedTarget.sequenceNumber,
+        signal,
+    );
+    if (!bytesEqual(target.blockDigest, publishedTarget.blockDigest)) {
+        throw new Error(
+            `provable target digest does not match finalized certificate at height ${publishedTarget.height}`,
+        );
+    }
+    return { ...target, sequenceNumber: publishedTarget.sequenceNumber };
 }
 
 export async function fetchAccountTransactionsPage({
@@ -191,14 +264,28 @@ export async function fetchAccountTransactionsPage({
     account,
     cursor,
     mode = 'all',
+    minSequenceNumber,
+    maxHeight,
+    signal,
 }: {
     sqlUrl: string;
     account: string;
     cursor?: Uint8Array | null;
     mode?: AccountActivityMode;
+    minSequenceNumber: bigint;
+    maxHeight: bigint;
+    signal?: AbortSignal;
 }): Promise<AccountTransactionPage> {
     const accountBytes = parseAccountBytes(account);
-    const rows = await fetchAccountActivityRows(sqlUrl, accountBytes, cursor ?? null, mode);
+    const rows = await fetchAccountActivityRows(
+        sqlUrl,
+        accountBytes,
+        cursor ?? null,
+        mode,
+        minSequenceNumber,
+        maxHeight,
+        signal,
+    );
     const visible = rows.slice(0, ACCOUNT_PAGE_SIZE);
     const last = visible[visible.length - 1];
     return {
@@ -221,9 +308,18 @@ export async function fetchAndVerifyAccountProof({
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
     const accountBytes = parseAccountBytes(account);
-    const row = await fetchAccountProofRow(sqlUrl, accountBytes, signal);
     const stateEnd = target.stateTip;
-    if (row.location < target.stateStart || row.location >= stateEnd) {
+    // account_meta keeps one row per state operation, so the account's value
+    // at this certificate is its newest row below the certificate's state tip.
+    // Rows written after the target are simply not visible to this proof.
+    const row = await fetchAccountProofRow(
+        sqlUrl,
+        accountBytes,
+        stateEnd,
+        target.sequenceNumber,
+        signal,
+    );
+    if (row.location < target.stateStart) {
         throw new Error(`account location ${row.location} is outside finalized state range`);
     }
 
@@ -235,6 +331,7 @@ export async function fetchAndVerifyAccountProof({
         target.stateRoot,
         accountBytes,
         ACCOUNT_VALUE_BYTES,
+        target.sequenceNumber,
         signal,
     );
     const accountValue = decodeAccountValue(verification.value);
@@ -272,7 +369,18 @@ export async function fetchAndVerifyTransactionRowProof({
 }): Promise<VerifiedTransactionProof> {
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const location = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+    const location = await fetchVerifiedSqlTransactionMetadata(
+        sqlUrl,
+        digestBytes,
+        target.sequenceNumber,
+        signal,
+    );
+
+    if (location >= target.transactionsTip) {
+        throw new Error(
+            `transaction location ${location} is not yet covered by a provable finalization`,
+        );
+    }
     assertTransactionLocationBeforeTip(location, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
@@ -282,6 +390,7 @@ export async function fetchAndVerifyTransactionRowProof({
         tip,
         target.transactionsRoot,
         digestBytes,
+        target.sequenceNumber,
         signal,
     );
 
@@ -297,6 +406,7 @@ export async function fetchAndVerifyTransactionRowProof({
 async function fetchVerifiedSqlTransactionMetadata(
     sqlUrl: string,
     digest: Uint8Array,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<bigint> {
     const result = await sqlQuery(
@@ -307,15 +417,16 @@ async function fetchVerifiedSqlTransactionMetadata(
             WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
             LIMIT 1
         `,
+        minSequenceNumber,
         signal,
     );
-    const row = result.rows[0];
+    const row = firstTableRow(result.table);
     if (!row) {
         throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
     }
 
-    const location = expectBigint(row.values[TX_META_QMDB_LOCATION], TX_META_QMDB_LOCATION);
-    const signedTransaction = expectVariableBytes(row.values[TX_META_BODY], TX_META_BODY);
+    const location = expectBigint(columnValue(row, TX_META_QMDB_LOCATION), TX_META_QMDB_LOCATION);
+    const signedTransaction = expectVariableBytes(columnValue(row, TX_META_BODY), TX_META_BODY);
     if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
         throw new Error('SQL transaction body is truncated');
     }
@@ -330,13 +441,20 @@ async function fetchVerifiedSqlTransactionMetadata(
 async function fetchTransactionProofMetadata(
     sqlUrl: string,
     digest: string,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
+    finalizedHeight?: bigint,
 ): Promise<TransactionProofMetadata> {
     const digestBytes = fromHex(digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
     let location: bigint;
     try {
-        location = await fetchVerifiedSqlTransactionMetadata(sqlUrl, digestBytes, signal);
+        location = await fetchVerifiedSqlTransactionMetadata(
+            sqlUrl,
+            digestBytes,
+            minSequenceNumber,
+            signal,
+        );
     } catch (error) {
         const detail = error instanceof Error ? error.message : String(error);
         if (detail.includes('missing from raw transaction index')) {
@@ -344,23 +462,19 @@ async function fetchTransactionProofMetadata(
         }
         throw error;
     }
+    if (finalizedHeight !== undefined) return { height: finalizedHeight, location };
+
     const result = await sqlQuery(
         sqlUrl,
-        `
-            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}
-            FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${location.toString()}
-            ORDER BY ${BLOCK_META_HEIGHT} ASC
-            LIMIT 1
-        `,
+        transactionHeightPredecessorQuery(location),
+        minSequenceNumber,
         signal,
     );
-    const row = result.rows[0];
-    if (!row) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
-    }
+    const row = firstTableRow(result.table);
     return {
-        height: expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT),
+        height: containingTransactionHeight(
+            row ? expectBigint(columnValue(row, BLOCK_META_HEIGHT), BLOCK_META_HEIGHT) : null,
+        ),
         location,
     };
 }
@@ -387,20 +501,28 @@ async function fetchFixedKeylessAppendProof(
     tip: bigint,
     expectedRoot: Uint8Array,
     expectedValue: Uint8Array,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
 ) {
     const client = new QmdbOperationLogClient(serviceUrl);
-    return client.getFixedKeylessAppend(
+    const proof = await client.getFixedKeylessAppend(
         {
             tip,
             startLocation: location,
             maxLocations: 1,
+            minSequenceNumber,
         },
         expectedRoot,
         location,
         expectedValue,
         { signal },
     );
+    assertEvaluatedSequence(
+        proof.sequenceNumber,
+        minSequenceNumber,
+        'QMDB transaction proof',
+    );
+    return proof;
 }
 
 async function fetchFixedUnorderedUpdateProof(
@@ -410,14 +532,16 @@ async function fetchFixedUnorderedUpdateProof(
     expectedRoot: Uint8Array,
     expectedKey: Uint8Array,
     valueSize: number,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<VerifiedFixedUnorderedUpdateProof> {
     const client = new QmdbOperationLogClient(serviceUrl);
-    return client.getFixedUnorderedUpdate(
+    const proof = await client.getFixedUnorderedUpdate(
         {
             tip,
             startLocation: location,
             maxLocations: 1,
+            minSequenceNumber,
         },
         expectedRoot,
         location,
@@ -425,38 +549,39 @@ async function fetchFixedUnorderedUpdateProof(
         valueSize,
         { signal },
     );
+    assertEvaluatedSequence(proof.sequenceNumber, minSequenceNumber, 'QMDB account proof');
+    return proof;
 }
 
 function finalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
     height: bigint,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
     return fetchFinalizedTransactionTarget(
         storeUrl,
         simplexVerificationMaterial,
         height,
+        minSequenceNumber,
         signal,
     );
-}
-
-function latestProofTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    return fetchLatestFinalizedTarget(storeUrl, simplexVerificationMaterial, signal);
 }
 
 async function fetchFinalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
     height: bigint,
-    _signal?: AbortSignal,
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
-    const certificate = await simplex.getFinalizationByHeight(height.toString());
+    const certificate = await simplex.getFinalizationByHeight(
+        height.toString(),
+        minSequenceNumber,
+        { signal },
+    );
     if (!certificate) {
         throw new Error(`finalization missing at height ${height}`);
     }
@@ -465,19 +590,6 @@ async function fetchFinalizedTransactionTarget(
         throw new Error(`finalized certificate height ${target.height} does not match requested height ${height}`);
     }
     return target;
-}
-
-async function fetchLatestFinalizedTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
-    _signal?: AbortSignal,
-): Promise<LatestProofTarget> {
-    const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
-    const certificate = await simplex.latestFinalization();
-    if (!certificate) {
-        throw new Error('latest finalization missing');
-    }
-    return finalizedTargetFromCertificate(certificate);
 }
 
 async function verifiedSimplexClient(
@@ -631,7 +743,10 @@ async function fetchAccountActivityRows(
     account: Uint8Array,
     cursor: Uint8Array | null,
     mode: AccountActivityMode,
-): Promise<DecodedRow[]> {
+    minSequenceNumber: bigint,
+    maxHeight: bigint,
+    signal?: AbortSignal,
+): Promise<SqlRow[]> {
     const predicates = [
         `${TX_ACTIVITY_ACCOUNT} = ${fixedBinaryLiteral(account)}`,
     ];
@@ -642,6 +757,7 @@ async function fetchAccountActivityRows(
     if (cursor) {
         predicates.push(activityCursorPredicate(decodeActivityCursor(cursor)));
     }
+    predicates.push(`${TX_ACTIVITY_HEIGHT} <= ${maxHeight.toString()}`);
 
     const result = await sqlQuery(
         sqlUrl,
@@ -661,15 +777,17 @@ async function fetchAccountActivityRows(
                      ${TX_ACTIVITY_ROLE} DESC
             LIMIT ${ACCOUNT_PAGE_SIZE + 1}
         `,
+        minSequenceNumber,
+        signal,
     );
-    return result.rows;
+    return tableRows(result.table);
 }
 
-function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
-    const role = expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE);
-    const digest = expectBytes(row.values[TX_ACTIVITY_DIGEST], TX_ACTIVITY_DIGEST, DIGEST_BYTES);
+function decodeAccountActivityRow(row: SqlRow): AccountTransactionRow {
+    const role = expectBigint(columnValue(row, TX_ACTIVITY_ROLE), TX_ACTIVITY_ROLE);
+    const digest = expectBytes(columnValue(row, TX_ACTIVITY_DIGEST), TX_ACTIVITY_DIGEST, DIGEST_BYTES);
     const counterparty = expectBytes(
-        row.values[TX_ACTIVITY_COUNTERPARTY],
+        columnValue(row, TX_ACTIVITY_COUNTERPARTY),
         TX_ACTIVITY_COUNTERPARTY,
         ACCOUNT_KEY_BYTES,
     );
@@ -677,16 +795,18 @@ function decodeAccountActivityRow(row: DecodedRow): AccountTransactionRow {
         digest: toHex(digest),
         direction: role === TX_ACTIVITY_ROLE_RECEIVER ? 'received' : 'sent',
         counterparty: toHex(counterparty),
-        value: expectBigint(row.values[TX_ACTIVITY_VALUE], TX_ACTIVITY_VALUE),
-        nonce: expectBigint(row.values[TX_ACTIVITY_NONCE], TX_ACTIVITY_NONCE),
-        height: expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT),
-        blockIndex: expectSafeNumber(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX),
+        value: expectBigint(columnValue(row, TX_ACTIVITY_VALUE), TX_ACTIVITY_VALUE),
+        nonce: expectBigint(columnValue(row, TX_ACTIVITY_NONCE), TX_ACTIVITY_NONCE),
+        height: expectBigint(columnValue(row, TX_ACTIVITY_HEIGHT), TX_ACTIVITY_HEIGHT),
+        blockIndex: expectSafeNumber(columnValue(row, TX_ACTIVITY_INDEX), TX_ACTIVITY_INDEX),
     };
 }
 
 async function fetchAccountProofRow(
     sqlUrl: string,
     account: Uint8Array,
+    beforeLocation: bigint,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<AccountProofRow> {
     const result = await sqlQuery(
@@ -699,22 +819,25 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
+                AND ${ACCOUNT_META_QMDB_LOCATION} < ${beforeLocation.toString()}
+            ORDER BY ${ACCOUNT_META_QMDB_LOCATION} DESC
             LIMIT 1
         `,
+        minSequenceNumber,
         signal,
     );
-    const row = result.rows[0];
+    const row = firstTableRow(result.table);
     if (!row) {
         throw new Error(`account ${shortHex(toHex(account))} is not indexed`);
     }
     return {
-        balance: expectBigint(row.values[ACCOUNT_META_BALANCE], ACCOUNT_META_BALANCE),
-        nonce: expectBigint(row.values[ACCOUNT_META_NONCE_BASE], ACCOUNT_META_NONCE_BASE),
+        balance: expectBigint(columnValue(row, ACCOUNT_META_BALANCE), ACCOUNT_META_BALANCE),
+        nonce: expectBigint(columnValue(row, ACCOUNT_META_NONCE_BASE), ACCOUNT_META_NONCE_BASE),
         nonceBitmap: expectBigint(
-            row.values[ACCOUNT_META_NONCE_BITMAP],
+            columnValue(row, ACCOUNT_META_NONCE_BITMAP),
             ACCOUNT_META_NONCE_BITMAP,
         ),
-        location: expectBigint(row.values[ACCOUNT_META_QMDB_LOCATION], ACCOUNT_META_QMDB_LOCATION),
+        location: expectBigint(columnValue(row, ACCOUNT_META_QMDB_LOCATION), ACCOUNT_META_QMDB_LOCATION),
     };
 }
 
@@ -725,10 +848,27 @@ function shortHex(value: string): string {
 async function sqlQuery(
     sqlUrl: string,
     query: string,
+    minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<DecodedQueryResult> {
     const sql = new SqlClient(trimTrailingSlash(sqlUrl));
-    return sql.query(query.replace(/\s+/g, ' ').trim(), { signal });
+    const result = await sql.query(
+        query.replace(/\s+/g, ' ').trim(),
+        minSequenceNumber,
+        { signal },
+    );
+    assertEvaluatedSequence(result.sequenceNumber, minSequenceNumber, 'SQL query');
+    return result;
+}
+
+function assertEvaluatedSequence(
+    evaluated: bigint,
+    minimum: bigint,
+    operation: string,
+): void {
+    if (evaluated < minimum) {
+        throw new Error(`${operation} evaluated before the requested Store sequence`);
+    }
 }
 
 function fixedBinaryLiteral(bytes: Uint8Array): string {
@@ -762,11 +902,11 @@ function activityCursorPredicate(cursor: ActivityCursor): string {
     )`;
 }
 
-function encodeActivityCursor(row: DecodedRow): Uint8Array {
+function encodeActivityCursor(row: SqlRow): Uint8Array {
     const cursor = new Uint8Array(ACCOUNT_CURSOR_BYTES);
-    writeU64Be(cursor, 0, expectBigint(row.values[TX_ACTIVITY_HEIGHT], TX_ACTIVITY_HEIGHT));
-    writeU64Be(cursor, 8, expectBigint(row.values[TX_ACTIVITY_INDEX], TX_ACTIVITY_INDEX));
-    writeU64Be(cursor, 16, expectBigint(row.values[TX_ACTIVITY_ROLE], TX_ACTIVITY_ROLE));
+    writeU64Be(cursor, 0, expectBigint(columnValue(row, TX_ACTIVITY_HEIGHT), TX_ACTIVITY_HEIGHT));
+    writeU64Be(cursor, 8, expectBigint(columnValue(row, TX_ACTIVITY_INDEX), TX_ACTIVITY_INDEX));
+    writeU64Be(cursor, 16, expectBigint(columnValue(row, TX_ACTIVITY_ROLE), TX_ACTIVITY_ROLE));
     return cursor;
 }
 
@@ -781,14 +921,14 @@ function decodeActivityCursor(cursor: Uint8Array): ActivityCursor {
     };
 }
 
-function expectBigint(value: CellValue, column: string): bigint {
+function expectBigint(value: unknown, column: string): bigint {
     if (typeof value !== 'bigint') {
         throw new Error(`SQL column ${column} must be UInt64`);
     }
     return value;
 }
 
-function expectSafeNumber(value: CellValue | bigint, column: string): number {
+function expectSafeNumber(value: unknown, column: string): number {
     const bigint = expectBigint(value, column);
     if (bigint > BigInt(Number.MAX_SAFE_INTEGER)) {
         throw new Error(`SQL column ${column} exceeds Number.MAX_SAFE_INTEGER`);
@@ -796,7 +936,7 @@ function expectSafeNumber(value: CellValue | bigint, column: string): number {
     return Number(bigint);
 }
 
-function expectBytes(value: CellValue, column: string, length: number): Uint8Array {
+function expectBytes(value: unknown, column: string, length: number): Uint8Array {
     if (!(value instanceof Uint8Array)) {
         throw new Error(`SQL column ${column} must be FixedSizeBinary(${length})`);
     }
@@ -804,7 +944,7 @@ function expectBytes(value: CellValue, column: string, length: number): Uint8Arr
     return value;
 }
 
-function expectVariableBytes(value: CellValue, column: string): Uint8Array {
+function expectVariableBytes(value: unknown, column: string): Uint8Array {
     if (!(value instanceof Uint8Array)) {
         throw new Error(`SQL column ${column} must be Binary`);
     }

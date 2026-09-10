@@ -2,6 +2,7 @@ use super::{
     Application, Databases, StateSyncTarget, TransactionHistoryTarget, genesis_block,
     history::parent_transactions_inactivity_floor,
 };
+use commonware_codec::Encode as _;
 use commonware_consensus::{
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
@@ -9,9 +10,12 @@ use commonware_consensus::{
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
-    Digest as _, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
+    Digest, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
 };
-use commonware_glue::stateful::db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _};
+use commonware_glue::stateful::{
+    Application as StatefulApplication,
+    db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _},
+};
 use commonware_parallel::Sequential;
 use commonware_runtime::{
     Clock as _, Runner as _, Supervisor as _, buffer::paged::CacheRef, deterministic,
@@ -60,6 +64,7 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             metadata_partition: "verify-invalid-state-merkle-metadata".into(),
             items_per_blob: NZU64!(1024),
             write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
             strategy: Sequential,
             page_cache: cache.clone(),
         },
@@ -68,6 +73,7 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             items_per_blob: NZU64!(1024),
             page_cache: cache,
             write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1024)),
@@ -86,14 +92,18 @@ fn transaction_config(cache: CacheRef) -> keyless_fixed::CompactConfig<Sequentia
             codec_config: (),
             page_cache: cache,
             write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
         },
         commit_codec_config: (),
     }
 }
 
-fn sync_range_from_bounds(
-    bounds: &Bounds<mmr::Family, sha256::Digest>,
-) -> commonware_utils::range::NonEmptyRange<mmr::Location> {
+fn sync_range_from_bounds<D>(
+    bounds: &Bounds<mmr::Family, D>,
+) -> commonware_utils::range::NonEmptyRange<mmr::Location>
+where
+    D: Digest,
+{
     non_empty_range!(bounds.inactivity_floor, bounds.tip.size)
 }
 
@@ -259,6 +269,46 @@ fn verify_rejects_invalid_body() {
 }
 
 #[test]
+fn replay_rejects_invalid_body() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            recipient,
+            ..
+        } = verify_harness(&context).await;
+
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let header = unexecuted_child_header(&parent, &consensus_context);
+        let block = Block::<sha256::Digest, _, sha256::Sha256>::new(
+            header,
+            vec![
+                transfer(&sender, &recipient, 1),
+                transfer(&sender, &recipient, 2),
+            ],
+        )
+        .seal(&mut sha256::Sha256::default());
+
+        let result = StatefulApplication::apply(
+            &mut app,
+            (context.child("replay"), consensus_context),
+            &block,
+            dbs.new_batches().await,
+        )
+        .await;
+
+        assert!(result.is_none());
+    });
+}
+
+#[test]
 fn verify_rejects_missing_parent() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
@@ -358,6 +408,90 @@ fn propose_drops_inapplicable_and_refills() {
 }
 
 #[test]
+fn finalized_capture_preserves_both_authenticated_ranges() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            recipient,
+            ..
+        } = verify_harness(&context).await;
+        app.finalized_hook = Some(Arc::new(|_, _| Box::pin(async {})));
+        context.sleep(Duration::from_millis(10)).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let mut input = StaticTransactionSource::new(vec![vec![transfer(&sender, &recipient, 1)]]);
+        let parent_state_end = parent.header.state_range.end();
+        let parent_transaction_end = parent.header.transactions_range.end();
+        let proposed = app
+            .propose_child(
+                (context.child("propose"), consensus_context.clone()),
+                Arc::new(parent),
+                dbs.new_batches().await,
+                &mut input,
+            )
+            .await
+            .expect("proposal succeeds");
+        let artifacts = StatefulApplication::capture(
+            &mut app,
+            (context.child("capture"), consensus_context),
+            &proposed.block,
+            &proposed.merkleized,
+            dbs.readers(),
+        )
+        .await
+        .expect("hook enables finalized capture");
+        let hasher = commonware_storage::qmdb::hasher::<sha256::Sha256>();
+        let state = artifacts
+            .state
+            .operations
+            .iter()
+            .map(|operation| operation.encode())
+            .collect::<Vec<_>>();
+        let transactions = artifacts
+            .transactions
+            .operations
+            .iter()
+            .map(|operation| operation.encode())
+            .collect::<Vec<_>>();
+
+        assert_eq!(artifacts.state.start.as_u64(), parent_state_end);
+        assert_eq!(
+            artifacts.state.end.as_u64(),
+            proposed.block.header.state_range.end()
+        );
+        assert!(artifacts.state.proof.verify_proof_and_pinned_nodes(
+            &hasher,
+            &state,
+            artifacts.state.start,
+            &artifacts.state.pinned_nodes,
+            &artifacts.state.root,
+        ));
+        assert_eq!(
+            artifacts.transactions.start.as_u64(),
+            parent_transaction_end
+        );
+        assert_eq!(
+            artifacts.transactions.end.as_u64(),
+            proposed.block.header.transactions_range.end()
+        );
+        assert!(artifacts.transactions.proof.verify_proof_and_pinned_nodes(
+            &hasher,
+            &transactions,
+            artifacts.transactions.start,
+            &artifacts.transactions.pinned_nodes,
+            &artifacts.transactions.root,
+        ));
+    });
+}
+
+#[test]
 fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
@@ -387,6 +521,17 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             )
             .await
             .expect("empty proposal must succeed");
+
+        let replayed = StatefulApplication::apply(
+            &mut app,
+            (context.child("replay"), consensus_context.clone()),
+            &proposed.block,
+            dbs.new_batches().await,
+        )
+        .await
+        .expect("valid block replays");
+        assert_eq!(replayed.0.root(), proposed.block.header.state_root);
+        assert_eq!(replayed.1.root(), proposed.block.header.transactions_root);
 
         // The freshly proposed child verifies against the same parent.
         let accepted = app

@@ -52,6 +52,7 @@ futures.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+
 # Other
 tower = { workspace = true, features = ["util"] }
 

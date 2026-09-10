@@ -4842,7 +4842,7 @@
         "type": "prometheus",
         "uid": "PBFA97CFB590B2093"
       },
-      "description": "Allocations denied because a network size class hit max_per_class \u2014 the direct signal the network pool is too small. Any sustained non-zero rate warrants raising the cap for that class.",
+      "description": "Allocations denied because a network size class hit max_per_class. This is the direct signal the network pool is too small. Any sustained non-zero rate warrants raising the cap for that class.",
       "fieldConfig": {
         "defaults": {
           "color": {
@@ -5680,7 +5680,7 @@
     {
       "id": 75,
       "type": "timeseries",
-      "title": "Upload Delta",
+      "title": "Upload Lag Behind Chain Tip",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -5738,7 +5738,8 @@
                 "value": 80
               }
             ]
-          }
+          },
+          "unit": "none"
         },
         "overrides": []
       },
@@ -5751,10 +5752,21 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "indexer_finalized_queue_tip{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} - indexer_finalized_queue_floor{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
-          "legendFormat": "__auto",
+          "expr": "max(engine_marshal_finalized_height) - max(indexer_finalized_queue_tip{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
+          "legendFormat": "captured (hook)",
           "range": true,
           "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "max(engine_marshal_finalized_height) - max(indexer_finalized_queue_floor{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"})",
+          "legendFormat": "published (floor)",
+          "range": true,
+          "refId": "B"
         }
       ],
       "datasource": {
@@ -5763,22 +5775,23 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
         "legend": {
-          "showLegend": false,
+          "showLegend": true,
           "displayMode": "list",
           "placement": "bottom",
           "calcs": []
         }
-      }
+      },
+      "description": "Blocks between the chain's finalized tip and what the indexer has captured into the durable queue (hook) and published to the Store (acknowledged floor)."
     },
     {
       "id": 76,
       "type": "timeseries",
-      "title": "Upload vs Finalize Rate",
+      "title": "Upload Backlog and Admission",
       "gridPos": {
         "h": 8,
         "w": 8,
@@ -5849,8 +5862,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "max(rate(indexer_finalized_queue_floor{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
-          "legendFormat": "upload (floor)",
+          "expr": "indexer_finalized_queue_pending_uploads{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "pending",
           "range": true,
           "refId": "A"
         },
@@ -5860,10 +5873,21 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "max(rate(indexer_finalized_queue_tip{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
-          "legendFormat": "finalize (tip)",
+          "expr": "indexer_finalized_upload_budget_admitted{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "admitted",
           "range": true,
           "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "indexer_finalized_payloads_retained{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "payload blobs on disk",
+          "range": true,
+          "refId": "C"
         }
       ],
       "datasource": {
@@ -5872,7 +5896,7 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
@@ -5887,12 +5911,133 @@
     {
       "id": 77,
       "type": "timeseries",
-      "title": "Store Commit Latency (avg)",
+      "title": "Upload vs Finalize Rate",
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 16,
         "y": 201
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "ops"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "max(rate(indexer_finalized_queue_floor{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "legendFormat": "published (floor)",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "max(rate(indexer_finalized_queue_tip{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "legendFormat": "captured (tip)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "max(rate(engine_marshal_finalized_height[$__rate_interval]))",
+          "legendFormat": "chain",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 78,
+      "type": "timeseries",
+      "title": "Finalized Hook Stages p95",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 209
       },
       "fieldConfig": {
         "defaults": {
@@ -5959,8 +6104,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "rate(indexer_publisher_store_commit_duration_sum{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]) / rate(indexer_publisher_store_commit_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])",
-          "legendFormat": "qmdb+sql",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_capture_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "total",
           "range": true,
           "refId": "A"
         },
@@ -5970,8 +6115,8 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "rate(indexer_simplex_upload_store_commit_duration_sum{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]) / rate(indexer_simplex_upload_store_commit_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])",
-          "legendFormat": "simplex",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_capture_finalization_lookup_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "finalization lookup",
           "range": true,
           "refId": "B"
         },
@@ -5981,8 +6126,163 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "rate(ingest_duration_sum[$__rate_interval]) / rate(ingest_duration_count[$__rate_interval])",
-          "legendFormat": "store ingest (server)",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_capture_construct_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "construct + encode",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_payloads_write_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "payload write",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_payloads_sync_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "payload sync",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_capture_record_enqueue_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "record enqueue",
+          "range": true,
+          "refId": "F"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "description": "The hook runs on the stateful actor's critical path. Total must stay well under the block cadence."
+    },
+    {
+      "id": 79,
+      "type": "timeseries",
+      "title": "Record Enqueue Breakdown (avg)",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 209
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(indexer_finalized_capture_record_enqueue_duration_sum{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / sum(rate(indexer_finalized_capture_record_enqueue_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "legendFormat": "record enqueue",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(indexer_finalized_queue_journal_append_duration_sum{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / sum(rate(indexer_finalized_queue_journal_append_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "legendFormat": "journal append",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(indexer_finalized_queue_journal_commit_duration_sum{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / sum(rate(indexer_finalized_queue_journal_commit_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "legendFormat": "journal commit",
           "range": true,
           "refId": "C"
         }
@@ -5993,7 +6293,107 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "description": "The gap between record enqueue and journal append plus commit is time spent waiting for the shared queue lock."
+    },
+    {
+      "id": 80,
+      "type": "timeseries",
+      "title": "Payload Bytes on Disk",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 209
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "indexer_finalized_payloads_retained_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "payloads",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
@@ -6006,14 +6406,443 @@
       }
     },
     {
-      "id": 78,
+      "id": 81,
       "type": "timeseries",
-      "title": "Store Commits In Flight",
+      "title": "Consumer Stages p95",
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 0,
-        "y": 209
+        "y": 217
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_payloads_read_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "payload read",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_prepare_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "prepare (aggregate)",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_persist_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "persist (admission to durable)",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_publication_wait_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "publication wait",
+          "range": true,
+          "refId": "D"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_budget_reservation_held_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "reservation held",
+          "range": true,
+          "refId": "E"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_completion_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "ack",
+          "range": true,
+          "refId": "F"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_receipt_sync_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "receipt sync (per section)",
+          "range": true,
+          "refId": "G"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_queue_sync_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "queue sync (per section)",
+          "range": true,
+          "refId": "H"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_queue_read_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "queue record read",
+          "range": true,
+          "refId": "I"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_expansion_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "expansion",
+          "range": true,
+          "refId": "J"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_staging_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "staging",
+          "range": true,
+          "refId": "K"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 82,
+      "type": "timeseries",
+      "title": "Store Commit Latency p95",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 217
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_store_commit_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "qmdb+sql chunk",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_simplex_upload_store_commit_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "simplex",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(ingest_duration_bucket[$__rate_interval])))",
+          "legendFormat": "store ingest (server)",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 83,
+      "type": "timeseries",
+      "title": "Chunks per Block",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 217
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "sum(rate(indexer_publisher_chunk_commits_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / sum(rate(indexer_publisher_persist_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "legendFormat": "chunks per block",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 84,
+      "type": "timeseries",
+      "title": "Store Commits and Simplex Queue",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 225
       },
       "fieldConfig": {
         "defaults": {
@@ -6101,10 +6930,21 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
+          "expr": "indexer_simplex_upload_queue_depth{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "legendFormat": "simplex queued inputs",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
           "expr": "ingest_in_flight",
           "legendFormat": "store ingest (server)",
           "range": true,
-          "refId": "C"
+          "refId": "D"
         }
       ],
       "datasource": {
@@ -6113,7 +6953,7 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
@@ -6126,14 +6966,14 @@
       }
     },
     {
-      "id": 79,
+      "id": 85,
       "type": "timeseries",
       "title": "Store Commit Throughput",
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 8,
-        "y": 209
+        "y": 225
       },
       "fieldConfig": {
         "defaults": {
@@ -6234,7 +7074,7 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
@@ -6247,14 +7087,14 @@
       }
     },
     {
-      "id": 80,
+      "id": 86,
       "type": "timeseries",
       "title": "Store Commit Retries",
       "gridPos": {
         "h": 8,
         "w": 8,
         "x": 16,
-        "y": 209
+        "y": 225
       },
       "fieldConfig": {
         "defaults": {
@@ -6343,7 +7183,7 @@
       },
       "options": {
         "tooltip": {
-          "mode": "single",
+          "mode": "multi",
           "sort": "none",
           "hideZeros": false
         },
@@ -6354,6 +7194,492 @@
           "calcs": []
         }
       }
+    },
+    {
+      "id": 87,
+      "type": "timeseries",
+      "title": "Simplex Block Upload Latency",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 233
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(indexer_simplex_upload_block_persist_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "block persist p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_simplex_upload_block_persist_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "block persist p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(indexer_simplex_upload_block_persist_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "block persist p99",
+          "range": true,
+          "refId": "C"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_simplex_upload_input_queue_wait_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "input queue wait p95",
+          "range": true,
+          "refId": "D"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 88,
+      "type": "timeseries",
+      "title": "Simplex Body Bytes per Store Commit",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 8,
+        "y": 233
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "bytes"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(indexer_simplex_upload_body_bytes_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_simplex_upload_body_bytes_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(indexer_simplex_upload_body_bytes_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      }
+    },
+    {
+      "id": 89,
+      "type": "timeseries",
+      "title": "Observed Memory Amplification",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 233
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "none"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "runtime_process_rss{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} / clamp_min(indexer_finalized_upload_budget_admitted_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, 1)",
+          "legendFormat": "RSS / admitted encoded bytes",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "indexer_finalized_upload_budget_reserved_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} / clamp_min(indexer_finalized_upload_budget_admitted_bytes{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}, 1)",
+          "legendFormat": "configured amplification",
+          "range": true,
+          "refId": "B"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "description": "Process RSS divided by the encoded payload bytes of admitted uploads. Compare against the configured amplification to retune the admission budget."
+    },
+    {
+      "id": 90,
+      "type": "timeseries",
+      "title": "Finalization to Publication Latency",
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 0,
+        "y": 241
+      },
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "barAlignment": 0,
+            "barWidthFactor": 0.6,
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "gradientMode": "none",
+            "spanNulls": false,
+            "insertNulls": false,
+            "showPoints": "auto",
+            "pointSize": 5,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisPlacement": "auto",
+            "axisLabel": "",
+            "axisColorMode": "text",
+            "axisBorderShow": false,
+            "scaleDistribution": {
+              "type": "linear"
+            },
+            "axisCenteredZero": false,
+            "hideFrom": {
+              "tooltip": false,
+              "viz": false,
+              "legend": false
+            },
+            "thresholdsStyle": {
+              "mode": "off"
+            }
+          },
+          "color": {
+            "mode": "palette-classic"
+          },
+          "mappings": [],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "red",
+                "value": 80
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "transparent": true,
+      "pluginVersion": "11.5.2",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.50, sum by(le) (rate(indexer_publisher_finalization_to_publication_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "p50",
+          "range": true,
+          "refId": "A"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_publisher_finalization_to_publication_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "p95",
+          "range": true,
+          "refId": "B"
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "PBFA97CFB590B2093"
+          },
+          "editorMode": "code",
+          "expr": "histogram_quantile(0.99, sum by(le) (rate(indexer_publisher_finalization_to_publication_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
+          "legendFormat": "p99",
+          "range": true,
+          "refId": "C"
+        }
+      ],
+      "datasource": {
+        "type": "prometheus",
+        "uid": "PBFA97CFB590B2093"
+      },
+      "options": {
+        "tooltip": {
+          "mode": "multi",
+          "sort": "none",
+          "hideZeros": false
+        },
+        "legend": {
+          "showLegend": true,
+          "displayMode": "list",
+          "placement": "bottom",
+          "calcs": []
+        }
+      },
+      "description": "Duration from the recorded finalization timestamp in the durable queue to contiguous QMDB and SQL publication barrier completion. Includes queue waiting and replay. Does not measure Simplex or explorer visibility."
     }
   ],
   "preload": false,

@@ -49,7 +49,13 @@ import {
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
+    isRetryableSequenceConsistencyError,
+    retryAccountWork,
 } from './proofRetry';
+import {
+    subscribePublishedProofTargets,
+    type PublishedProofTarget,
+} from './proofTarget';
 import {
     clearSession,
     createWallet,
@@ -129,6 +135,11 @@ type AccountProofState =
       } & VerifiedAccountProof)
     | { readonly status: 'error'; readonly detail: string };
 
+interface AccountPage {
+    readonly account: string;
+    readonly rows: AccountTransactionRow[];
+}
+
 interface AccountTxWithProof {
     readonly row: AccountTransactionRow;
     readonly proof: TransactionProofState;
@@ -174,12 +185,15 @@ export default function App() {
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
     const [accountInput, setAccountInput] = useState(() => accountFromLocation());
+    const [publishedProofTarget, setPublishedProofTarget] =
+        useState<PublishedProofTarget | null>(null);
     const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
     const [accountProof, setAccountProof] = useState<AccountProofState>({
         status: 'waiting',
         detail: 'enter an account',
     });
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountPage, setAccountPage] = useState<AccountPage | null>(null);
     const [accountActivityError, setAccountActivityError] = useState('');
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
@@ -216,9 +230,13 @@ export default function App() {
     const reconciliationFailuresRef = useRef(new Map<string, number>());
     const reconciliationSequenceRef = useRef(0);
     const foregroundSubmissionsRef = useRef(new Set<string>());
+    const publishedProofTargetRef = useRef<PublishedProofTarget | null>(publishedProofTarget);
     activeHistoryKeyRef.current = historyKey;
     loadedHistoryKeyRef.current = loadedHistoryKey;
+    publishedProofTargetRef.current = publishedProofTarget;
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
+    const proofTargetReady = publishedProofTarget !== null;
+    const accountTargetReady = accountTarget !== null;
 
     const setLocalNonceState = (nextNonce: NonceState) => {
         nextNonceRef.current = nextNonce;
@@ -236,7 +254,8 @@ export default function App() {
         applyLocalNonceReservations();
     };
 
-    // Render delivered blocks immediately so the UI adds no buffering delay.
+    // Render delivered blocks immediately so the UI adds no buffering delay
+    // to publication or catch-up delivery.
     const applyObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
 
@@ -271,9 +290,9 @@ export default function App() {
 
         (async () => {
             try {
-                for await (const block of subscribeBlocks(indexerUrl, {
+                for await (const block of subscribeBlocks(indexerUrl, storeUrl, {
                     signal: controller.signal,
-                    onNetworkError: (message) =>
+                    onError: (message) =>
                         setStatus({ kind: 'error', message: `backend error: ${message}` }),
                     onReconnect: () => setStatus({ kind: 'connecting' }),
                 })) {
@@ -293,6 +312,35 @@ export default function App() {
             cancelled = true;
             controller.abort();
         };
+    }, []);
+
+    useEffect(() => {
+        const controller = new AbortController();
+
+        (async () => {
+            for await (const target of subscribePublishedProofTargets(storeUrl, {
+                signal: controller.signal,
+                onError: (message) =>
+                    setStatus({ kind: 'error', message: `proof target error: ${message}` }),
+            })) {
+                if (controller.signal.aborted) return;
+                setPublishedProofTarget((current) =>
+                    current &&
+                    (current.height >= target.height ||
+                        current.sequenceNumber > target.sequenceNumber)
+                        ? current
+                        : target,
+                );
+            }
+        })().catch((error) => {
+            if (controller.signal.aborted) return;
+            setStatus({
+                kind: 'error',
+                message: error instanceof Error ? error.message : String(error),
+            });
+        });
+
+        return () => controller.abort();
     }, []);
 
     useEffect(() => {
@@ -358,17 +406,30 @@ export default function App() {
             setAccountProof({ status: 'waiting', detail: 'enter an account' });
             return;
         }
+        if (!publishedProofTarget) {
+            setAccountTarget(null);
+            setAccountProof({ status: 'waiting', detail: 'waiting for provable state' });
+            return;
+        }
 
         const controller = new AbortController();
         setAccountTarget(null);
         setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
 
-        retryAccountPageStep(async () => {
+        retryAccountWork(async () => {
+            const published = publishedProofTargetRef.current;
+            if (!published) {
+                throw new Error('latest provable target is missing');
+            }
             const target = await fetchLatestProofTarget({
                 storeUrl,
                 simplexVerificationMaterial,
+                publishedTarget: published,
                 signal: controller.signal,
             });
+            controller.signal.throwIfAborted();
+            setAccountTarget(target);
+
             try {
                 const proof = await fetchAndVerifyAccountProof({
                     qmdbUrl,
@@ -385,12 +446,11 @@ export default function App() {
                 }
                 throw error;
             }
-        }, controller.signal)
+        }, controller.signal, isRetryableAccountProofError)
             .then(({ target, proof }) => {
                 if (controller.signal.aborted) return;
                 if (proof === null) {
                     setAccountProof({ status: 'missing', detail: 'not yet exists' });
-                    setAccountTarget(target);
                     return;
                 }
                 setAccountProof({
@@ -398,7 +458,6 @@ export default function App() {
                     detail: `verified at height ${target.height.toString()}`,
                     ...proof,
                 });
-                setAccountTarget(target);
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
@@ -409,73 +468,140 @@ export default function App() {
             });
 
         return () => controller.abort();
-    }, [lookupAccount]);
+    }, [lookupAccount, proofTargetReady]);
 
+    // Only a change of account, page, or mode replaces the listed rows. The
+    // proof target arrives later and must not clear rows already on screen.
     useEffect(() => {
         if (!lookupAccount) {
+            setAccountPage(null);
             setAccountTransactions([]);
             setAccountNextCursor(null);
             setAccountActivityError('');
             return;
         }
+        if (!publishedProofTarget) return;
 
         const controller = new AbortController();
+        setAccountPage(null);
         setAccountTransactions([]);
         setAccountNextCursor(null);
         setAccountActivityError('');
 
-        fetchAccountTransactionsPage({
-            sqlUrl: indexerUrl,
-            account: lookupAccount,
-            cursor: currentAccountCursor,
-            mode: accountActivityMode,
-        })
-            .then(async (page) => {
+        const minSequenceNumber = publishedProofTarget.sequenceNumber;
+
+        retryAccountWork(
+            () => fetchAccountTransactionsPage({
+                sqlUrl: indexerUrl,
+                account: lookupAccount,
+                cursor: currentAccountCursor,
+                mode: accountActivityMode,
+                minSequenceNumber,
+                maxHeight: publishedProofTarget.height,
+                signal: controller.signal,
+            }),
+            controller.signal,
+            isRetryableSequenceConsistencyError,
+        )
+            .then((page) => {
                 if (controller.signal.aborted) return;
                 setAccountNextCursor(page.nextCursor);
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
                     proof: { status: 'waiting', detail: 'waiting for latest finalization' },
                 })));
-                if (!accountTarget) return;
-
-                setAccountTransactions(page.rows.map((row) => ({
-                    row,
-                    proof: { status: 'fetching', detail: 'fetching transaction proof' },
-                })));
-                const results = await Promise.allSettled(
-                    page.rows.map((row) =>
-                        retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
-                            qmdbUrl,
-                            sqlUrl: indexerUrl,
-                            row,
-                            target: accountTarget,
-                            signal: controller.signal,
-                        }), controller.signal),
-                    ),
-                );
-                if (controller.signal.aborted) return;
-                setAccountTransactions((current) =>
-                    current.map((entry, index) => {
-                        const result = results[index];
-                        if (!result) return entry;
-                        if (result.status === 'fulfilled') {
-                            return { ...entry, proof: verifiedProofState(result.value) };
-                        }
-                        const detail = result.reason instanceof Error ? result.reason.message : String(result.reason);
-                        return { ...entry, proof: { status: 'error', detail } };
-                    }),
-                );
+                setAccountPage({ account: lookupAccount, rows: page.rows });
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
+                setAccountPage(null);
                 setAccountTransactions([]);
                 setAccountNextCursor(null);
                 setAccountActivityError(error instanceof Error ? error.message : String(error));
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode, proofTargetReady]);
+
+    // Each page keeps its certificate while row proofs run. Account-state
+    // retries must not restart independent transaction proofs.
+    useEffect(() => {
+        if (!accountPage || !accountTarget || accountPage.account !== lookupAccount) return;
+
+        const controller = new AbortController();
+        const rows = accountPage.rows;
+        const updateRow = (index: number, proof: TransactionProofState) => {
+            setAccountTransactions((current) =>
+                current.map((entry, position) =>
+                    position === index && entry.row.digest === rows[index]?.digest
+                        ? { ...entry, proof }
+                        : entry,
+                ),
+            );
+        };
+
+        rows.forEach((_row, index) => {
+            updateRow(index, { status: 'fetching', detail: 'fetching transaction proof' });
+        });
+
+        const newestHeight = rows.reduce(
+            (height, row) => row.height > height ? row.height : height,
+            0n,
+        );
+        let rowTarget = accountTarget;
+        let targetRefresh: Promise<LatestProofTarget> | undefined;
+
+        // A newer page can require a later certificate. Share that refresh
+        // across rows and retain it through retries without following the tip.
+        const rowProofTarget = (): Promise<LatestProofTarget> => {
+            const published = publishedProofTargetRef.current;
+            if (
+                newestHeight <= rowTarget.height ||
+                !published ||
+                published.height <= rowTarget.height
+            ) {
+                return Promise.resolve(rowTarget);
+            }
+            if (!targetRefresh) {
+                targetRefresh = fetchLatestProofTarget({
+                    storeUrl,
+                    simplexVerificationMaterial,
+                    publishedTarget: published,
+                    signal: controller.signal,
+                })
+                    .then((target) => {
+                        rowTarget = target;
+                        return target;
+                    })
+                    .finally(() => { targetRefresh = undefined; });
+            }
+            return targetRefresh;
+        };
+
+        rows.forEach((row, index) => {
+            retryAccountWork(async () => {
+                const target = await rowProofTarget();
+                return fetchAndVerifyTransactionRowProof({
+                    qmdbUrl,
+                    sqlUrl: indexerUrl,
+                    row,
+                    target,
+                    signal: controller.signal,
+                });
+            }, controller.signal, isRetryableAccountProofError)
+                .then((proof) => {
+                    if (controller.signal.aborted) return;
+                    updateRow(index, verifiedProofState(proof));
+                })
+                .catch((error) => {
+                    if (controller.signal.aborted) return;
+                    const detail = error instanceof Error ? error.message : String(error);
+                    updateRow(index, { status: 'error', detail });
+                });
+        });
+
+        return () => controller.abort();
+    }, [accountPage, accountTargetReady, lookupAccount]);
 
     useEffect(() => {
         const reconciliations = reconciliationsRef.current;
@@ -495,6 +621,8 @@ export default function App() {
 
     useEffect(() => {
         if (historyKey === null || loadedHistoryKey !== historyKey) return;
+        const publishedTarget = publishedProofTargetRef.current;
+        if (!publishedTarget) return;
 
         const reconciliations = reconciliationsRef.current;
         const trackedDigests = new Set(history.map((tx) => tx.digest));
@@ -557,6 +685,8 @@ export default function App() {
                 sqlUrl: indexerUrl,
                 simplexVerificationMaterial,
                 digest: tx.digest,
+                publishedTarget,
+                finalizedHeight: tx.finalizedHeight === null ? undefined : BigInt(tx.finalizedHeight),
                 signal: reconciliation.controller.signal,
                 onFinalizationVerified: (target) => {
                     if (
@@ -680,7 +810,7 @@ export default function App() {
                     }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
                 });
         }
-    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet]);
+    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet, proofTargetReady]);
 
     useEffect(() => {
         return () => {
@@ -1937,33 +2067,6 @@ function verifiedBlockCertificateState(certificate: {
         height: certificate.height.toString(),
         view: certificate.view.toString(),
     };
-}
-
-async function retryAccountPageStep<T>(
-    run: () => Promise<T>,
-    signal: AbortSignal,
-): Promise<T> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 12; attempt++) {
-        if (signal.aborted) {
-            throw new Error('account lookup cancelled');
-        }
-        try {
-            return await run();
-        } catch (error) {
-            lastError = error;
-            const detail = error instanceof Error ? error.message : String(error);
-            if (!isRetryableAccountProofError(detail)) {
-                throw error;
-            }
-            await sleep(350 + attempt * 150);
-        }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function shortHex(value: string): string {

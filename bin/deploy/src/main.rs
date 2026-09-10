@@ -19,12 +19,13 @@ use commonware_cryptography::{
 };
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
-use commonware_utils::{N3f1, NZU32, TryCollect};
+use commonware_utils::{N3f1, NZU32, NZUsize, TryCollect};
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -61,7 +62,8 @@ const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
-const INDEXER_UPLOAD_BUFFER: usize = 64;
+const INDEXER_UPLOAD_MAX_IN_FLIGHT: usize = 64;
+const INDEXER_UPLOAD_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
@@ -118,6 +120,15 @@ pub(crate) struct GenerateArgs {
     /// Rayon threads per validator for parallel verification.
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    /// Override Tokio worker threads for the indexer secondary.
+    #[arg(long)]
+    indexer_worker_threads: Option<NonZeroUsize>,
+    /// Override engine Rayon threads for the indexer secondary.
+    #[arg(long)]
+    indexer_rayon_threads: Option<NonZeroUsize>,
+    /// Rayon threads reserved for index publication.
+    #[arg(long, default_value_t = default_publisher_rayon_threads())]
+    indexer_publisher_rayon_threads: NonZeroUsize,
     /// Capacity of each node's decompressed public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
@@ -162,8 +173,10 @@ pub(crate) struct GenerateArgs {
     /// txs per batch.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
-    /// Concurrent spammer submitters. Defaults to the validator count.
-    /// Set explicitly to keep offered load independent of validator count.
+    /// Concurrent spammer submitters, each cycling its own account range with
+    /// one batch in flight (defaults to the validator count). Offered load is
+    /// roughly submitters x accounts per finalization round trip, so set this
+    /// explicitly to keep load constant when the validator count changes.
     #[arg(long = "spammer-submitters")]
     spammer_submitters: Option<usize>,
     /// Fully signed local batches to keep ready per spammer submitter.
@@ -220,6 +233,9 @@ pub(crate) struct RemoteArgs {
     /// EC2 instance type for validators.
     #[arg(long)]
     instance_type: String,
+    /// EC2 instance type for the indexer secondary. Defaults to --instance-type.
+    #[arg(long)]
+    indexer_instance_type: Option<String>,
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
@@ -461,8 +477,13 @@ pub(crate) struct IndexerConfig {
     /// Store writer credential used by the indexer secondary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Number of blocks buffered before upload.
-    pub upload_buffer: usize,
+    /// Rayon threads reserved for index publication.
+    #[serde(default = "default_publisher_rayon_threads")]
+    pub publisher_rayon_threads: NonZeroUsize,
+    /// Caps concurrent uploads after byte admission.
+    pub upload_max_in_flight: usize,
+    /// Bounds estimated memory held across upload stages.
+    pub upload_budget_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -564,6 +585,10 @@ const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
 }
 
+const fn default_publisher_rayon_threads() -> NonZeroUsize {
+    NZUsize!(2)
+}
+
 fn main() {
     init_tracing();
     let cli = Cli::parse();
@@ -632,11 +657,30 @@ pub(crate) fn total_secondaries(args: &GenerateArgs) -> u32 {
     secondary_roles(args).len() as u32
 }
 
+pub(crate) fn secondary_runtime_threads(
+    args: &GenerateArgs,
+    role: SecondaryRole,
+) -> (usize, usize) {
+    match role {
+        SecondaryRole::Indexer => (
+            args.indexer_worker_threads
+                .map_or(args.worker_threads, NonZeroUsize::get),
+            args.indexer_rayon_threads
+                .map_or(args.rayon_threads, NonZeroUsize::get),
+        ),
+        SecondaryRole::Relayer => (args.worker_threads, args.rayon_threads),
+    }
+}
+
 pub(crate) const fn indexer_enabled(args: &GenerateArgs) -> bool {
     args.indexer
 }
 
 pub(crate) fn validate_generate_args(args: &GenerateArgs) {
+    assert!(
+        !args.indexer || args.startup != StartupModeConfig::StateSync,
+        "--indexer cannot be combined with --startup state-sync"
+    );
     assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
@@ -918,7 +962,7 @@ mod tests {
     #[test]
     fn generated_indexer_api_keys_default_and_omit() {
         let indexer: IndexerConfig = serde_yaml::from_str(
-            "chain_indexer_url: https://store.example.com\nupload_buffer: 64\n",
+            "chain_indexer_url: https://store.example.com\nupload_max_in_flight: 64\nupload_budget_bytes: 1024\n",
         )
         .expect("indexer config without an API key should parse");
         let metadata: AdapterConfig =
@@ -1101,6 +1145,31 @@ mod tests {
     }
 
     #[test]
+    fn indexer_thread_flags_require_positive_counts() {
+        for flag in [
+            "--indexer-worker-threads",
+            "--indexer-rayon-threads",
+            "--indexer-publisher-rayon-threads",
+        ] {
+            for value in ["0", "4"] {
+                let result = Cli::try_parse_from([
+                    "constantinople-deploy",
+                    "generate",
+                    "--validators",
+                    "4",
+                    "--output-dir",
+                    "out",
+                    "--indexer",
+                    flag,
+                    value,
+                    "local",
+                ]);
+                assert_eq!(result.is_ok(), value != "0", "{flag} {value}");
+            }
+        }
+    }
+
+    #[test]
     #[should_panic(expected = "--validators must be at least 4")]
     fn rejects_validator_count_below_coding_minimum() {
         let cli = Cli::try_parse_from([
@@ -1122,8 +1191,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "--spammer-submitters must be at least 1")]
-    fn rejects_zero_spammer_submitters() {
+    #[should_panic(expected = "--indexer cannot be combined with --startup state-sync")]
+    fn rejects_indexer_with_state_sync() {
         let cli = Cli::try_parse_from([
             "constantinople-deploy",
             "generate",
@@ -1131,8 +1200,9 @@ mod tests {
             "4",
             "--output-dir",
             "out",
-            "--spammer-submitters",
-            "0",
+            "--indexer",
+            "--startup",
+            "state-sync",
             "local",
         ])
         .expect("local invocation should parse");

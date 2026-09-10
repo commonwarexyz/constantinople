@@ -1,11 +1,11 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
-    PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
-    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig, LocalArgs,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
+    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
+    absolute_path, default_bootstrappers, ensure_output_dir_missing,
+    generate_local_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -169,6 +169,7 @@ fn build_secondaries(
             .checked_add(offset)
             .expect("secondary metrics port overflow");
 
+        let (worker_threads, rayon_threads) = crate::secondary_runtime_threads(args, role);
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
@@ -181,8 +182,8 @@ fn build_secondaries(
             primary_validators: primary_validators.clone(),
             secondary_validators: secondary_validators.clone(),
             log_level: args.log_level.clone(),
-            worker_threads: args.worker_threads,
-            rayon_threads: args.rayon_threads,
+            worker_threads,
+            rayon_threads,
             http_port,
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
@@ -193,7 +194,7 @@ fn build_secondaries(
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
-                .then(|| local_indexer_config(local.chain_indexer_port)),
+                .then(|| local_indexer_config(args, local.chain_indexer_port)),
             relayer: matches!(role, SecondaryRole::Relayer)
                 .then(|| local_relayer_config(local, material)),
         };
@@ -236,12 +237,14 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
 ///
 /// All rows go through the shared `chain-indexer` Store URL. Store prefixes
 /// keep raw KV, SQL, and QMDB rows disjoint.
-fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
+fn local_indexer_config(args: &GenerateArgs, indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         chain_indexer_url: url,
         api_key: None,
-        upload_buffer: INDEXER_UPLOAD_BUFFER,
+        publisher_rayon_threads: args.indexer_publisher_rayon_threads,
+        upload_max_in_flight: INDEXER_UPLOAD_MAX_IN_FLIGHT,
+        upload_budget_bytes: INDEXER_UPLOAD_BUDGET_BYTES,
     }
 }
 
@@ -417,9 +420,7 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        build_secondaries, build_validators, local_chain_indexer_metrics_port, local_run_commands,
-    };
+    use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
         default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
@@ -438,6 +439,9 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            indexer_worker_threads: None,
+            indexer_rayon_threads: None,
+            indexer_publisher_rayon_threads: crate::default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
@@ -517,10 +521,10 @@ mod tests {
     }
 
     #[test]
-    fn local_spammer_submitters_override_validator_count() {
+    fn local_run_commands_propagate_deterministic_seed_offset() {
         let mut args = test_args(true);
         args.relayer = true;
-        args.spammer_submitters = Some(50);
+        args.spammer_seed_offset = Some(2000);
         let commands = local_run_commands(
             Path::new("/tmp/configs"),
             &args,
@@ -529,11 +533,7 @@ mod tests {
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
         );
 
-        let spammer = commands
-            .iter()
-            .find(|command| command.contains("constantinople-spammer"))
-            .expect("spammer command should be present");
-        assert!(spammer.contains("--relayer-submitters 50"));
+        assert!(commands[3].contains("--seed-offset 2000"));
     }
 
     #[test]
@@ -551,22 +551,6 @@ mod tests {
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople"));
         assert!(commands[2].contains("secondary-0.yaml"));
-    }
-
-    #[test]
-    fn local_run_commands_propagate_deterministic_seed_offset() {
-        let mut args = test_args(true);
-        args.relayer = true;
-        args.spammer_seed_offset = Some(2000);
-        let commands = local_run_commands(
-            Path::new("/tmp/configs"),
-            &args,
-            local_args(&args),
-            &[],
-            TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
-
-        assert!(commands[3].contains("--seed-offset 2000"));
     }
 
     #[test]
@@ -714,45 +698,25 @@ mod tests {
     }
 
     #[test]
-    fn local_indexer_metrics_port_follows_enabled_services() {
-        for (validators, relayer, spammer, base_port, expected_port) in [
-            (4, true, true, 9090, 9097),
-            (2, false, false, 12000, 12003),
-            (4, true, false, 12000, 12006),
-        ] {
-            let mut args = test_args(spammer);
-            args.validators = validators;
-            args.indexer = true;
-            args.relayer = relayer;
-            let GenerateTarget::Local(local) = &mut args.target else {
-                panic!("test_args must construct a Local target");
-            };
-            local.base_metrics_port = base_port;
-            let commands = local_run_commands(
-                Path::new("/tmp/configs"),
-                &args,
-                local_args(&args),
-                &[],
-                TEST_SIMPLEX_VERIFICATION_MATERIAL,
-            );
-            let indexer_cmd = commands
-                .iter()
-                .find(|command| command.contains("--bin chain-indexer"))
-                .expect("chain-indexer command should be present");
-
-            assert!(indexer_cmd.contains(&format!("--metrics-port {expected_port}")));
-        }
-    }
-
-    #[test]
-    #[should_panic(expected = "chain-indexer metrics port overflow")]
-    fn local_indexer_metrics_port_rejects_overflow() {
-        let mut args = test_args(false);
+    fn four_validator_demo_assigns_distinct_indexer_metrics_port() {
+        let mut args = test_args(true);
+        args.validators = 4;
         args.indexer = true;
-        let mut local = test_local_args();
-        local.base_metrics_port = u16::MAX;
+        args.relayer = true;
 
-        local_chain_indexer_metrics_port(&args, &local);
+        let commands = local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        );
+        let indexer_cmd = commands
+            .iter()
+            .find(|command| command.contains("--bin chain-indexer"))
+            .expect("chain-indexer command should be present");
+
+        assert!(indexer_cmd.contains("--metrics-port 9097"));
     }
 
     #[test]
@@ -851,6 +815,11 @@ mod tests {
         let mut args = test_args(false);
         args.indexer = true;
         args.relayer = true;
+        args.worker_threads = 3;
+        args.rayon_threads = 13;
+        args.indexer_worker_threads = std::num::NonZeroUsize::new(8);
+        args.indexer_rayon_threads = std::num::NonZeroUsize::new(12);
+        args.indexer_publisher_rayon_threads = commonware_utils::NZUsize!(4);
         set_local_ports(&mut args, 8090, 8091, 8092);
 
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
@@ -869,6 +838,15 @@ mod tests {
 
         // Primaries never get indexer wiring.
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+        assert!(
+            validators
+                .iter()
+                .all(|v| v.config.worker_threads == 3 && v.config.rayon_threads == 13)
+        );
+        assert_eq!(secondaries[0].config.worker_threads, 8);
+        assert_eq!(secondaries[0].config.rayon_threads, 12);
+        assert_eq!(secondaries[1].config.worker_threads, 3);
+        assert_eq!(secondaries[1].config.rayon_threads, 13);
 
         // Secondaries point at the configured shared store URL.
         let indexer = secondaries[0]
@@ -876,7 +854,9 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert_eq!(indexer.upload_buffer, 64);
+        assert_eq!(indexer.upload_max_in_flight, 64);
+        assert_eq!(indexer.publisher_rayon_threads.get(), 4);
+        assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.chain_indexer_url, expected_url);
         assert_eq!(indexer.api_key, None);

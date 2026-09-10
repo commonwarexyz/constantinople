@@ -1,4 +1,4 @@
-//! Block row encoding shared by the combined publisher.
+//! Deterministic SQL rows for finalized blocks and their transactions.
 
 use crate::publisher::{
     SqlRow,
@@ -17,9 +17,8 @@ use constantinople_primitives::{
 use std::array::TryFromSliceError;
 use tracing::warn;
 
-/// Encoded block rows split by index surface.
-pub(crate) struct IndexedBlockRows<D: Digest> {
-    /// SQL rows for block metadata, transaction metadata, and account activity.
+pub(crate) struct BlockRows<D: Digest> {
+    /// SQL rows for the block, its transactions, and their account activity.
     pub sql: Vec<SqlRow>,
     /// Transaction digests in append order.
     pub transaction_digests: Vec<D>,
@@ -35,45 +34,61 @@ struct IndexedTransaction<D: Digest> {
     nonce: u64,
 }
 
-/// Build every row for a finalized block, partitioned by destination store.
-#[cfg(test)]
-pub(crate) fn encode_indexed_block_rows<H, P>(
+fn block_meta_row<H, P>(
     block: &EngineBlock<H, P>,
-) -> IndexedBlockRows<H::Digest>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    let finalized_ts_micros = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0);
-    encode_indexed_block_rows_at(block, finalized_ts_micros)
-}
-
-pub(crate) fn encode_indexed_block_rows_at<H, P>(
-    block: &EngineBlock<H, P>,
+    tx_count: u64,
     finalized_ts_micros: i64,
-) -> IndexedBlockRows<H::Digest>
+) -> SqlRow
 where
     H: Hasher,
     P: PublicKey,
 {
-    let block_digest = block.seal();
-    let height = block.header.height;
-    let body_len = block.body.len();
-    // SQL `block_meta.digest` is `FixedSizeBinary(32)` — copy it into a
+    // SQL `block_meta.digest` is `FixedSizeBinary(32)`. Copy it into a
     // `[u8; 32]` for the typed CellValue path.
     let mut block_digest_arr = [0u8; 32];
-    block_digest_arr.copy_from_slice(block_digest.as_ref());
+    block_digest_arr.copy_from_slice(block.seal().as_ref());
     let mut transactions_root = [0u8; 32];
     transactions_root.copy_from_slice(block.header.transactions_root.as_ref());
-    let indexed_txs = block
+
+    // `view` is currently 0.
+    // See `encode_block_meta_row` docs for why.
+    encode_block_meta_row(BlockMetaRow {
+        height: block.header.height,
+        digest: block_digest_arr,
+        tx_count,
+        transactions_root,
+        transactions_tip: block.header.transactions_range.end() - 1,
+        view: 0,
+        finalized_ts_micros,
+    })
+}
+
+fn indexed_transactions<H, P>(
+    block: &EngineBlock<H, P>,
+) -> impl Iterator<Item = IndexedTransaction<H::Digest>> + '_
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let height = block.header.height;
+    block
         .body
         .iter()
         .enumerate()
-        .filter_map(|(idx, lazy)| index_transaction::<H>(height, idx, lazy))
-        .collect::<Vec<_>>();
+        .filter_map(move |(idx, lazy)| index_transaction::<H>(height, idx, lazy))
+}
+
+pub(crate) fn encode_block_rows<H, P>(
+    block: &EngineBlock<H, P>,
+    finalized_ts_micros: i64,
+) -> BlockRows<H::Digest>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    let height = block.header.height;
+    let body_len = block.body.len();
+    let indexed_txs = indexed_transactions(block).collect::<Vec<_>>();
     let tx_count = u64::try_from(indexed_txs.len()).expect("transaction count fits u64");
     let append_start = block
         .header
@@ -82,9 +97,13 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
+    // Three rows per transaction. No per-transaction proof row is emitted
+    // because readers derive the finalized height from block_meta by
+    // transactions_tip, and every extra row per transaction lands in the bulk
+    // Store commit that bounds indexer throughput.
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
+    sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
-    // One tx_meta row plus sender/receiver tx_activity rows per transaction.
     let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
     for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
         transaction_digests.push(tx.digest);
@@ -124,22 +143,7 @@ where
         }
     }
 
-    // SQL: one block_meta row per finalized block.
-    // `view` is currently 0; see `encode_block_meta_row` docs for why.
-    sql.insert(
-        0,
-        encode_block_meta_row(BlockMetaRow {
-            height,
-            digest: block_digest_arr,
-            tx_count,
-            transactions_root,
-            transactions_tip: block.header.transactions_range.end() - 1,
-            view: 0,
-            finalized_ts_micros,
-        }),
-    );
-
-    IndexedBlockRows {
+    BlockRows {
         sql,
         transaction_digests,
     }
@@ -198,12 +202,9 @@ where
     let mut to = [0u8; AccountKey::SIZE];
     to.copy_from_slice(&transaction_bytes[to_start..to_end]);
 
-    let mut hasher = H::default();
-    hasher.update(transaction_bytes);
-    let (_, digest) = hasher.finalize();
     Some(IndexedTransaction {
         block_index,
-        digest,
+        digest: H::hash(&[transaction_bytes]),
         bytes: signed_bytes,
         sender,
         to,
@@ -219,11 +220,11 @@ fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::{TX_ACTIVITY_TABLE, TX_META_TABLE};
+    use crate::sql_schema::{BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
-        types::{Epoch, Round, View, coding::Commitment},
+        types::{Epoch, Round, View},
     };
     use commonware_cryptography::{
         Digest, Signer,
@@ -233,6 +234,7 @@ mod tests {
     };
     use commonware_math::algebra::Random;
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
+    use constantinople_engine::types::{EngineBlock, EngineCommitment};
     use constantinople_primitives::{
         Block, Header, LazySignedTransaction, Sealable, Sealed, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
@@ -258,14 +260,61 @@ mod tests {
             0,
         )
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
-        let block = Block::<Commitment, PublicKey, Sha256>::new(
-            test_header(consensus_key.public_key(), 1),
-            vec![transaction],
-        )
-        .seal(&mut Sha256::default());
+        let block = EngineBlock::from(
+            Block::<TestCommitment, PublicKey, Sha256>::new(
+                test_header(consensus_key.public_key(), 1),
+                vec![transaction],
+            )
+            .seal(&mut Sha256::default()),
+        );
 
-        let rows = encode_indexed_block_rows(&block);
+        let rows = encode_block_rows(&block, 1_000);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
+    }
+
+    #[test]
+    fn block_meta_row_counts_indexed_transactions() {
+        let mut rng = StdRng::from_seed([5; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let recipient =
+            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
+        let transaction = Transaction::<sha256::Digest>::new(
+            sender,
+            recipient,
+            NonZeroU64::new(1).expect("test value should be non-zero"),
+            0,
+        )
+        .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let mut zero_value_bytes = Vec::with_capacity(transaction.encode_size());
+        transaction.write(&mut zero_value_bytes);
+        let value_start = TransactionPublicKey::SIZE + AccountKey::SIZE;
+        zero_value_bytes[value_start..value_start + u64::SIZE].fill(0);
+        let mut encoded =
+            Vec::with_capacity(zero_value_bytes.len().encode_size() + zero_value_bytes.len());
+        zero_value_bytes.len().write(&mut encoded);
+        encoded.extend_from_slice(&zero_value_bytes);
+        let zero_value = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+            .expect("zero-value lazy transaction should decode");
+        let block = EngineBlock::from(Sealed::new_unchecked(
+            Block {
+                header: test_header(consensus_key.public_key(), 1),
+                body: vec![LazySignedTransaction::new(transaction), zero_value],
+            },
+            sha256::Digest::EMPTY,
+        ));
+
+        let rows = encode_block_rows(&block, 1_000);
+        let row = &rows.sql[0];
+        assert_eq!(row.table, BLOCK_META_TABLE);
+        assert!(matches!(row.values.first(), Some(CellValue::UInt64(7))));
+        assert!(matches!(row.values.get(2), Some(CellValue::UInt64(1))));
+        assert_eq!(rows.transaction_digests.len(), 1);
+        assert!(matches!(
+            row.values.get(6),
+            Some(CellValue::Timestamp(1_000))
+        ));
     }
 
     #[test]
@@ -296,15 +345,15 @@ mod tests {
         let lazy = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
             .expect("outer lazy transaction should decode");
 
-        let block = Sealed::new_unchecked(
+        let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), 1),
                 body: vec![lazy],
             },
             sha256::Digest::EMPTY,
-        );
+        ));
 
-        let rows = encode_indexed_block_rows(&block);
+        let rows = encode_block_rows(&block, 1_000);
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_tx_meta_body(&rows.sql, &transaction);
@@ -329,16 +378,28 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
+        assert_eq!(meta.values.len(), 3);
+        assert!(matches!(meta.values.get(1), Some(CellValue::UInt64(0))));
         let Some(CellValue::Binary(body)) = meta.values.get(2) else {
             panic!("tx_meta body should be binary");
         };
         assert_eq!(body.as_slice(), expected_body);
+
+        // Readers derive proof heights from block metadata.
+        assert!(
+            rows.iter().all(|row| {
+                row.table == crate::sql_schema::TX_META_TABLE
+                    || row.table == crate::sql_schema::TX_ACTIVITY_TABLE
+                    || row.table == crate::sql_schema::BLOCK_META_TABLE
+            }),
+            "block rows contain no per-transaction proof rows"
+        );
     }
 
     fn test_header(
         leader: PublicKey,
         tx_count: usize,
-    ) -> Header<Commitment, sha256::Digest, PublicKey> {
+    ) -> Header<TestCommitment, sha256::Digest, PublicKey> {
         let transactions_end = u64::try_from(tx_count).expect("tx count fits u64") + 1;
         Header {
             context: Context {
@@ -356,8 +417,10 @@ mod tests {
         }
     }
 
-    fn valid_commitment() -> Commitment {
-        Commitment::from((
+    type TestCommitment = EngineCommitment<Sha256, PublicKey>;
+
+    fn valid_commitment() -> TestCommitment {
+        TestCommitment::from((
             sha256::Digest::EMPTY,
             sha256::Digest::EMPTY,
             sha256::Digest::EMPTY,

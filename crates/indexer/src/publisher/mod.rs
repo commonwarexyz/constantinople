@@ -1,12 +1,13 @@
 //! Publisher components for finalized index uploads.
 //!
 //! The production validator path uses [`Publisher`] on the single owning
-//! secondary. It stages finalized-block data into one combined upload path:
+//! secondary. It persists finalized-block data before publishing an ordered
+//! completeness barrier.
 //!
 //! | Path             | Families / tables                                            |
 //! | ---------------- | ------------------------------------------------------------ |
 //! | `simplex`        | certified headers, full blocks by digest, certificates       |
-//! | `sql` (metadata) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`       |
+//! | `sql`            | `block_meta`, `tx_meta`, `tx_activity`, `account_meta`         |
 //! | `qmdb` (state)   | Account-state operation log                                  |
 //! | `qmdb` (tx hash) | Transaction-hash operation log                                |
 //!
@@ -25,7 +26,7 @@ use commonware_runtime::{
     Metrics,
     telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _},
 };
-use exoware_sdk::{StoreClient, StoreWriteBatch};
+use exoware_sdk::{ClientError, ErrorCode, StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
 pub use sql::SqlRow;
 use std::time::{Duration, Instant};
@@ -35,6 +36,17 @@ use tracing::warn;
 /// Commit latency buckets: 10ms to 60s.
 const COMMIT_DURATION_BUCKETS: [f64; 12] = [
     0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+// Preserve preparation latency differences below the first Store commit bucket.
+const PREPARE_DURATION_BUCKETS: [f64; 15] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+];
+
+// Queue recovery can leave finalized blocks waiting much longer than one commit.
+const FINALIZATION_TO_PUBLICATION_BUCKETS: [f64; 17] = [
+    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+    1800.0, 3600.0,
 ];
 
 /// Observability for store batch commits issued by the publishers.
@@ -66,6 +78,69 @@ impl StoreCommitMetrics {
     }
 }
 
+/// Metric families used by [`Publisher`].
+///
+/// The caller registers this once because publisher connects are retried on
+/// failure and must not re-register.
+#[derive(Clone)]
+pub struct PublisherMetrics {
+    /// Finalized-index data and publication commits.
+    pub(crate) commit: StoreCommitMetrics,
+    /// Data chunks belonging to successfully persisted blocks.
+    pub(crate) chunk_commits: Counter,
+    /// Row preparation for one block, from admission to staged rows.
+    pub(crate) prepare_duration: Histogram,
+    pub(crate) expansion_duration: Histogram,
+    pub(crate) staging_duration: Histogram,
+    /// One block's data path, from admission until its data is durable.
+    pub(crate) persist_duration: Histogram,
+    /// Wait from a block's data being durable until its barrier publishes.
+    pub(crate) publication_wait_duration: Histogram,
+    pub(crate) finalization_to_publication_duration: Histogram,
+}
+
+impl PublisherMetrics {
+    pub fn new(context: &impl Metrics) -> Self {
+        Self {
+            commit: StoreCommitMetrics::new(context),
+            chunk_commits: context.counter(
+                "chunk_commits",
+                "Data chunks in successfully persisted finalized blocks",
+            ),
+            prepare_duration: context.histogram(
+                "prepare_duration",
+                "Finalized block row preparation time (s)",
+                PREPARE_DURATION_BUCKETS,
+            ),
+            expansion_duration: context.histogram(
+                "expansion_duration",
+                "Finalized block metadata and authenticated range preparation time (s)",
+                PREPARE_DURATION_BUCKETS,
+            ),
+            staging_duration: context.histogram(
+                "staging_duration",
+                "Finalized block SQL preparation and Store row staging time (s)",
+                PREPARE_DURATION_BUCKETS,
+            ),
+            persist_duration: context.histogram(
+                "persist_duration",
+                "Finalized block time from admission to data durable (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            publication_wait_duration: context.histogram(
+                "publication_wait_duration",
+                "Finalized block wait from data durable to barrier published (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            finalization_to_publication_duration: context.histogram(
+                "finalization_to_publication_duration",
+                "Finalized block time from recorded finalization to barrier published (s)",
+                FINALIZATION_TO_PUBLICATION_BUCKETS,
+            ),
+        }
+    }
+}
+
 /// Commits `batch` through the physical Store client, retrying with capped
 /// exponential backoff until it lands. Rows are namespace-encoded when they
 /// are staged, so the commit is a raw write.
@@ -74,7 +149,7 @@ pub(crate) async fn commit_with_retry(
     batch: &StoreWriteBatch,
     what: &'static str,
     metrics: &StoreCommitMetrics,
-) -> u64 {
+) -> Result<u64, ClientError> {
     let start = Instant::now();
     metrics.in_flight.inc();
     let mut attempt = 0u32;
@@ -84,6 +159,11 @@ pub(crate) async fn commit_with_retry(
             Err(error) => {
                 attempt = attempt.saturating_add(1);
                 metrics.retries.inc();
+                if !is_retryable_store_error(&error) {
+                    metrics.in_flight.dec();
+                    metrics.duration.observe(start.elapsed().as_secs_f64());
+                    return Err(error);
+                }
                 warn!(
                     ?error,
                     attempt,
@@ -99,7 +179,27 @@ pub(crate) async fn commit_with_retry(
     metrics.commits.inc();
     metrics.rows.inc_by(batch.len() as u64);
     metrics.duration.observe(start.elapsed().as_secs_f64());
-    seq
+    Ok(seq)
+}
+
+fn is_retryable_store_error(error: &ClientError) -> bool {
+    match error {
+        ClientError::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
+        ClientError::Rpc(_) => matches!(
+            error.rpc_code(),
+            Some(
+                ErrorCode::Aborted
+                    | ErrorCode::DeadlineExceeded
+                    | ErrorCode::Internal
+                    | ErrorCode::ResourceExhausted
+                    | ErrorCode::Unavailable
+                    | ErrorCode::Unknown
+            )
+        ),
+        ClientError::Prefix(_)
+        | ClientError::InvalidKeyLength { .. }
+        | ClientError::WireFormat(_) => false,
+    }
 }
 
 fn retry_backoff(attempt: u32) -> Duration {
@@ -107,4 +207,26 @@ fn retry_backoff(attempt: u32) -> Duration {
     const MAX: Duration = Duration::from_secs(2);
     let factor = 1u32 << attempt.min(5);
     INITIAL.saturating_mul(factor).min(MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use exoware_sdk::ConnectError;
+
+    #[test]
+    fn store_retry_classification_fails_deterministic_rejections() {
+        let transient =
+            ClientError::Rpc(Box::new(ConnectError::new(ErrorCode::Unavailable, "retry")));
+        let rejected = ClientError::Rpc(Box::new(ConnectError::new(
+            ErrorCode::InvalidArgument,
+            "reject",
+        )));
+
+        assert!(is_retryable_store_error(&transient));
+        assert!(!is_retryable_store_error(&rejected));
+        assert!(!is_retryable_store_error(&ClientError::WireFormat(
+            "reject".to_string()
+        )));
+    }
 }

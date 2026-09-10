@@ -54,6 +54,7 @@ fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayo
             metadata_partition: "finalize-state-metadata".into(),
             items_per_blob: NZU64!(1 << 20),
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
             strategy,
             page_cache: cache.clone(),
         },
@@ -62,6 +63,7 @@ fn state_config(strategy: Rayon, cache: &CacheRef) -> FixedConfig<EightCap, Rayo
             items_per_blob: NZU64!(1 << 20),
             page_cache: cache.clone(),
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
         },
         translator: EightCap,
         init_cache_size: Some(NZUsize!(1 << 18)),
@@ -80,6 +82,7 @@ fn transaction_config(strategy: Rayon, cache: &CacheRef) -> keyless_fixed::Compa
             codec_config: (),
             page_cache: cache.clone(),
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
         },
         commit_codec_config: (),
     }
