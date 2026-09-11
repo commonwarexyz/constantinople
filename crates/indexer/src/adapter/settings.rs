@@ -1,3 +1,4 @@
+use super::Profile;
 use ahash::AHashMap;
 use clap::Args;
 use commonware_deployer::aws::Hosts;
@@ -13,14 +14,8 @@ use thiserror::Error;
 const STORE_URL_ENV: &str = "CONSTANTINOPLE_STORE_URL";
 const PORT_ENV: &str = "CONSTANTINOPLE_PORT";
 
-#[derive(Clone, Copy)]
-pub(crate) struct Profile {
-    pub(crate) name: &'static str,
-    pub(crate) default_port: u16,
-}
-
 #[derive(Args, Debug)]
-pub(crate) struct AdapterArgs {
+pub(super) struct AdapterArgs {
     /// URL of the exoware Store to read from.
     #[arg(long)]
     store_url: Option<String>,
@@ -46,28 +41,27 @@ struct DeployerConfig {
     port: u16,
     #[serde(default)]
     metrics_port: Option<u16>,
-    #[serde(rename = "chain_indexer_url")]
     store_url: String,
     #[serde(default)]
     api_key: Option<String>,
 }
 
-pub(crate) struct Settings {
-    pub(crate) store_url: String,
-    pub(crate) host: IpAddr,
-    pub(crate) port: u16,
-    pub(crate) metrics_port: Option<u16>,
-    pub(crate) api_key: Option<String>,
+pub(super) struct Settings {
+    pub(super) store_url: String,
+    pub(super) host: IpAddr,
+    pub(super) port: u16,
+    pub(super) metrics_port: Option<u16>,
+    pub(super) api_key: Option<String>,
 }
 
 #[derive(Debug, Default)]
-pub(crate) struct Environment {
+pub(super) struct Environment {
     store_url: Option<String>,
     port: Option<String>,
 }
 
 impl Environment {
-    pub(crate) fn read() -> Self {
+    pub(super) fn read() -> Self {
         Self {
             store_url: std::env::var(STORE_URL_ENV).ok(),
             port: std::env::var(PORT_ENV).ok(),
@@ -76,7 +70,7 @@ impl Environment {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum SettingsError {
+pub(super) enum SettingsError {
     #[error("deployer mode requires both --hosts and --config")]
     IncompleteDeployerMode,
     #[error("failed to read {adapter} config at {path}")]
@@ -173,7 +167,7 @@ fn load_deployer_settings(
     Ok(config)
 }
 
-pub(crate) fn load_settings(
+pub(super) fn load_settings(
     profile: Profile,
     args: AdapterArgs,
     environment: Environment,
@@ -222,7 +216,8 @@ pub(crate) fn load_settings(
 #[cfg(test)]
 mod tests {
     use super::{AdapterArgs, Environment, Profile, STORE_URL_ENV, SettingsError, load_settings};
-    use clap::Parser;
+    use crate::adapter::{Cli, command};
+    use clap::FromArgMatches;
     use std::{
         fs,
         path::PathBuf,
@@ -232,28 +227,27 @@ mod tests {
     const PROFILES: [Profile; 2] = [
         Profile {
             name: "metadata-indexer",
+            about: "SQL service over Constantinople metadata tables",
             default_port: 8091,
         },
         Profile {
             name: "qmdb-indexer",
+            about: "QMDB service over Constantinople state and transaction indexes",
             default_port: 8092,
         },
     ];
 
-    #[derive(Parser)]
-    struct TestCli {
-        #[command(flatten)]
-        adapter: AdapterArgs,
-    }
-
     static NEXT_TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
     fn parse(profile: Profile, args: &[String]) -> AdapterArgs {
-        TestCli::try_parse_from(
-            std::iter::once(profile.name.to_string()).chain(args.iter().cloned()),
-        )
-        .expect("adapter arguments should parse")
-        .adapter
+        let matches = command(profile)
+            .try_get_matches_from(
+                std::iter::once(profile.name.to_string()).chain(args.iter().cloned()),
+            )
+            .expect("adapter arguments should parse");
+        Cli::from_arg_matches(&matches)
+            .expect("adapter arguments should deserialize")
+            .adapter
     }
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
@@ -270,7 +264,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "port: {}\nmetrics_port: 9090\nchain_indexer_url: http://chain-indexer:8090\n{key}",
+                "port: {}\nmetrics_port: 9090\nstore_url: http://chain-indexer:8090\n{key}",
                 profile.default_port + 10_000
             ),
         )

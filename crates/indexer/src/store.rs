@@ -1,7 +1,6 @@
-pub use exoware_sdk::ClientBuildError as StoreClientBuildError;
+pub use exoware_sdk::{ClientBuildError as StoreClientBuildError, StoreClient};
 use exoware_sdk::{
-    ClientError, ConnectRequestCompression, StoreClient, StoreClientBuilder,
-    transport::BalancedHttp2Config,
+    ClientError, ConnectRequestCompression, StoreClientBuilder, transport::BalancedHttp2Config,
 };
 
 /// Failure from the adapter's startup readiness check.
@@ -24,7 +23,8 @@ pub fn store_client(
 }
 
 /// Balances uploads across connections and compresses large writer batches.
-pub(crate) fn writer_store_client(
+/// Writer RPCs use the SDK's 30-second deadline.
+pub fn writer_store_client(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<StoreClient, StoreClientBuildError> {
