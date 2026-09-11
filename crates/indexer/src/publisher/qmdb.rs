@@ -223,8 +223,6 @@ where
 /// QMDB upload failure.
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
-    #[error("failed to configure Store client due to {0}")]
-    ClientBuild(#[from] crate::StoreClientBuildError),
     #[error("failed to configure QMDB Store prefix: {0}")]
     Prefix(#[from] exoware_sdk::StoreKeyPrefixError),
     #[error("QMDB writer error: {0}")]
@@ -370,15 +368,13 @@ where
     #[commonware_macros::boxed]
     pub async fn connect<Cx>(
         context: Cx,
-        store_url: &str,
-        api_key: Option<&str>,
+        commit_client: StoreClient,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
     ) -> Result<Self, PublishError>
     where
         Cx: Spawner,
     {
-        let commit_client = crate::store::writer_store_client(store_url, api_key)?;
         let state_client = state_qmdb_client(&commit_client)?;
         let transaction_client = transactions_qmdb_client(&commit_client)?;
         let sql_writer = build_meta_schema(sql_meta_client(&commit_client)?)
@@ -1583,13 +1579,18 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_schema::{BLOCK_META_TABLE, TX_META_TABLE};
+    use crate::{
+        CertificateReporter,
+        sql_schema::{BLOCK_META_TABLE, TX_META_TABLE},
+    };
     use commonware_consensus::{
         simplex::types::Context as SimplexContext,
         types::{Round, View, coding::Commitment},
     };
     use commonware_cryptography::{
-        Digest as _, Digestible as _, Signer as _, ed25519,
+        Digest as _, Digestible as _, Signer as _,
+        bls12381::primitives::variant::MinSig,
+        ed25519,
         sha256::{Digest as Sha256Digest, Sha256},
     };
     use commonware_glue::stateful::db::{DatabaseSet, Unmerkleized as _};
@@ -1605,6 +1606,7 @@ mod tests {
     };
     use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
     use constantinople_application::consensus::Databases;
+    use constantinople_engine::ThresholdScheme;
     use constantinople_primitives::{
         Block, Header, Nonce, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, Transaction,
         TransactionPublicKey,
@@ -2035,8 +2037,7 @@ mod tests {
                 .expect("spawn simulator");
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
-                &url,
-                None,
+                crate::store::writer_store_client(&url, None).expect("writer client builds"),
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
             )
@@ -2055,29 +2056,53 @@ mod tests {
     }
 
     #[test]
-    fn publisher_sends_configured_credentials() {
+    fn shared_writer_client_authenticates_both_uploaders() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let store = crate::test_store::ObservedStore::open("writer-key")
                 .await
                 .expect("spawn observed Store");
+            let client = crate::store::writer_store_client(&store.url, Some("writer-key"))
+                .expect("writer client builds");
+            let (reporter, certificate_uploader) = CertificateReporter::<
+                Sha256,
+                ed25519::PublicKey,
+                ThresholdScheme<ed25519::PublicKey, MinSig>,
+            >::connect(
+                client.clone(),
+                2,
+                crate::publisher::StoreCommitMetrics::new(&context.child("simplex")),
+            );
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
-                &store.url,
-                Some("writer-key"),
+                client,
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
             )
             .await
             .expect("publisher connects");
 
+            let upload = test_queued_upload();
+            let block = upload.block();
             let completion = publisher
-                .enqueue_queued_finalized(test_queued_upload())
+                .enqueue_queued_finalized(upload)
                 .await
                 .expect("queued upload accepted");
             assert!(completion.wait().await);
 
+            let qmdb_requests = store.requests();
+            assert!(!qmdb_requests.is_empty());
+            reporter.publish_block(block).await;
+            drop(reporter);
+            certificate_uploader
+                .await
+                .expect("certificate uploader exits");
+
             let requests = store.requests();
-            assert!(!requests.is_empty());
+            assert!(
+                requests[qmdb_requests.len()..]
+                    .iter()
+                    .any(|request| request.path.starts_with("/log.ingest.v1.Service/"))
+            );
             assert!(requests.iter().all(|request| request.authorized));
             assert!(
                 requests
@@ -2106,8 +2131,7 @@ mod tests {
             let client = StoreClient::new(&url);
             let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
-                &url,
-                None,
+                crate::store::writer_store_client(&url, None).expect("writer client builds"),
                 2,
                 crate::publisher::StoreCommitMetrics::new(&context),
             )
@@ -2184,8 +2208,7 @@ mod tests {
                 commonware_cryptography::ed25519::PublicKey,
             >::connect(
                 context.child("qmdb_publisher"),
-                &url,
-                None,
+                crate::store::writer_store_client(&url, None).expect("writer client builds"),
                 1,
                 crate::publisher::StoreCommitMetrics::new(&context),
             )

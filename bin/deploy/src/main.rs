@@ -237,29 +237,28 @@ pub(crate) struct RemoteArgs {
     /// The URL is used verbatim by every store consumer. Providing it replaces
     /// the simulator-backed chain-indexer. No chain-indexer instance, binary,
     /// config, or port rule is generated.
-    #[arg(long = "chain-indexer-url", value_parser = parse_service_url)]
-    chain_indexer_url: Option<String>,
+    #[arg(long = "store-url", value_parser = parse_service_url)]
+    store_url: Option<String>,
     /// Origin of an already-running metadata indexer backed by the external store.
-    #[arg(long = "metadata-indexer-url", requires = "chain_indexer_url", value_parser = parse_service_url)]
+    #[arg(long = "metadata-indexer-url", requires = "store_url", value_parser = parse_service_url)]
     metadata_indexer_url: Option<String>,
     /// Origin of an already-running QMDB indexer backed by the external store.
-    #[arg(long = "qmdb-indexer-url", requires = "chain_indexer_url", value_parser = parse_service_url)]
+    #[arg(long = "qmdb-indexer-url", requires = "store_url", value_parser = parse_service_url)]
     qmdb_indexer_url: Option<String>,
     /// Store writer credential for the validator indexer secondary.
     #[arg(
         long = "store-api-key",
-        alias = "chain-indexer-api-key",
         env = "CONSTANTINOPLE_STORE_API_KEY",
         hide_env_values = true,
-        requires = "chain_indexer_url"
+        requires = "store_url"
     )]
-    chain_indexer_api_key: Option<String>,
+    store_api_key: Option<String>,
     /// Store read credential for locally deployed adapter services.
     #[arg(
         long = "adapter-store-api-key",
         env = "CONSTANTINOPLE_ADAPTER_STORE_API_KEY",
         hide_env_values = true,
-        requires = "chain_indexer_url"
+        requires = "store_url"
     )]
     adapter_store_api_key: Option<String>,
     /// Instance type for the shared chain-indexer instance.
@@ -372,10 +371,11 @@ pub(crate) struct RelayerLeaderConfig {
 fn parse_service_url(value: &str) -> Result<String, &'static str> {
     const ERROR: &str = "expected an absolute HTTP or HTTPS service base without credentials, a query, or a fragment";
 
-    // Match the JavaScript whitespace check in deploy.sh before URL parsing can strip it.
-    if value.chars().any(|character| {
-        (character.is_whitespace() && character != '\u{85}') || character == '\u{feff}'
-    }) {
+    // Do not let URL normalization hide whitespace or a pasted byte-order mark.
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character == '\u{feff}')
+    {
         return Err(ERROR);
     }
 
@@ -386,10 +386,8 @@ fn parse_service_url(value: &str) -> Result<String, &'static str> {
         || parsed
             .password()
             .is_some_and(|password| !password.is_empty())
-        || parsed.query().is_some_and(|query| !query.is_empty())
-        || parsed
-            .fragment()
-            .is_some_and(|fragment| !fragment.is_empty())
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
     {
         return Err(ERROR);
     }
@@ -493,12 +491,12 @@ pub(crate) struct ValidatorConfig {
 /// Indexer wiring serialized into a secondary validator's YAML.
 ///
 /// Mirrors the schema in `bin/validator/src/config.rs::IndexerConfig`. The
-/// shared `chain-indexer` store backs raw KV rows, SQL metadata rows, QMDB
+/// shared Store backs raw KV rows, SQL metadata rows, QMDB
 /// operation logs, and simplex artifacts.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
-    /// URL of the shared chain-indexer store.
-    pub chain_indexer_url: String,
+    /// URL of the Store receiving finalized uploads.
+    pub store_url: String,
     /// Store writer credential used by the indexer secondary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -525,8 +523,8 @@ pub(crate) struct AdapterConfig {
     pub metrics_port: Option<u16>,
     /// Port the adapter listens on.
     pub port: u16,
-    /// URL of the chain-indexer store to read from.
-    pub chain_indexer_url: String,
+    /// URL of the Store to read from.
+    pub store_url: String,
     /// Store read credential used by this adapter.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
@@ -838,6 +836,7 @@ mod tests {
     use commonware_formatting::hex;
     use std::{
         fs,
+        panic::{AssertUnwindSafe, catch_unwind},
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -848,7 +847,7 @@ mod tests {
     ) -> Result<Cli, clap::Error> {
         let command = Cli::command().mut_subcommand("generate", |command| {
             command.mut_subcommand("remote", |mut command| {
-                for name in ["chain_indexer_api_key", "adapter_store_api_key"] {
+                for name in ["store_api_key", "adapter_store_api_key"] {
                     command = command.mut_arg(name, |argument| argument.env(None::<&str>));
                 }
                 command
@@ -927,13 +926,13 @@ mod tests {
     fn remote_parses_adapter_origins_and_credentials() {
         let mut args = remote_cli_args();
         args.extend([
-            "--chain-indexer-url",
+            "--store-url",
             "https://store.example.com",
             "--metadata-indexer-url",
             "https://sql.example.com",
             "--qmdb-indexer-url",
             "https://qmdb.example.com",
-            "--chain-indexer-api-key",
+            "--store-api-key",
             "writer-key",
             "--adapter-store-api-key",
             "reader-key",
@@ -949,7 +948,7 @@ mod tests {
         };
 
         assert_eq!(
-            remote.chain_indexer_url.as_deref(),
+            remote.store_url.as_deref(),
             Some("https://store.example.com")
         );
         assert_eq!(
@@ -960,14 +959,14 @@ mod tests {
             remote.qmdb_indexer_url.as_deref(),
             Some("https://qmdb.example.com")
         );
-        assert_eq!(remote.chain_indexer_api_key.as_deref(), Some("writer-key"));
+        assert_eq!(remote.store_api_key.as_deref(), Some("writer-key"));
         assert_eq!(remote.adapter_store_api_key.as_deref(), Some("reader-key"));
     }
 
     #[test]
     fn remote_service_urls_reject_invalid_values() {
         for flag in [
-            "--chain-indexer-url",
+            "--store-url",
             "--metadata-indexer-url",
             "--qmdb-indexer-url",
         ] {
@@ -990,11 +989,15 @@ mod tests {
                 "https://service.example.com\n",
                 "https://service.example.com/\tpath",
                 "https://service.example.com/\u{a0}path",
+                "https://service.example.com/\u{85}path",
                 "https://service.example.com/\u{feff}path",
+                "https://service.example.com/base?",
+                "https://service.example.com/base#",
+                "https://service.example.com/base?#",
             ] {
                 let mut args = remote_cli_args();
-                if flag != "--chain-indexer-url" {
-                    args.extend(["--chain-indexer-url", "https://store.example.com"]);
+                if flag != "--store-url" {
+                    args.extend(["--store-url", "https://store.example.com"]);
                 }
                 args.extend([flag, value]);
 
@@ -1016,12 +1019,11 @@ mod tests {
             "http://127.0.0.1:8090/base",
             "https://[::1]:8090/base",
             "https://service.example.com/path%20with%20space",
-            "https://service.example.com/base?#",
-            "https://service.example.com/\u{85}path",
+            "https://service.example.com/path%3F%23",
         ] {
             let mut args = remote_cli_args();
             for flag in [
-                "--chain-indexer-url",
+                "--store-url",
                 "--metadata-indexer-url",
                 "--qmdb-indexer-url",
             ] {
@@ -1035,7 +1037,7 @@ mod tests {
                 panic!("expected remote target");
             };
 
-            assert_eq!(remote.chain_indexer_url.as_deref(), Some(value));
+            assert_eq!(remote.store_url.as_deref(), Some(value));
             assert_eq!(remote.metadata_indexer_url.as_deref(), Some(value));
             assert_eq!(remote.qmdb_indexer_url.as_deref(), Some(value));
         }
@@ -1046,7 +1048,7 @@ mod tests {
         let store_url = "HTTPS://Store.Example.COM:443/a/../base/%2f/";
         let mut args = remote_cli_args();
         args.insert(2, "--indexer");
-        args.extend(["--chain-indexer-url", store_url]);
+        args.extend(["--store-url", store_url]);
         let cli = parse_cli(args).expect("external Store should parse");
         let Command::Generate(mut generate) = cli.command else {
             panic!("expected generate command");
@@ -1070,7 +1072,7 @@ mod tests {
             let yaml = fs::read_to_string(generate.output_dir.join(filename))
                 .expect("read generated adapter config");
             let config: AdapterConfig = serde_yaml::from_str(&yaml).expect("decode adapter config");
-            assert_eq!(config.chain_indexer_url, store_url);
+            assert_eq!(config.store_url, store_url);
         }
         let yaml = fs::read_to_string(generate.output_dir.join(DEPLOYER_CONFIG_FILE))
             .expect("read generated deployment config");
@@ -1089,9 +1091,44 @@ mod tests {
             })
             .collect::<Vec<_>>();
         assert_eq!(indexers.len(), 1);
-        assert_eq!(indexers[0].chain_indexer_url, store_url);
+        assert_eq!(indexers[0].store_url, store_url);
 
         fs::remove_dir_all(root).expect("remove generated deployment");
+    }
+
+    #[test]
+    fn remote_store_url_requires_indexer() {
+        let mut args = remote_cli_args();
+        args.extend([
+            "--store-url",
+            "https://store.example.com",
+            "--store-api-key",
+            "writer-key",
+        ]);
+        let cli = parse_cli(args).expect("external Store should parse");
+        let Command::Generate(mut generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert!(!generate.indexer);
+        let root = unique_temp_dir("remote-store-requires-indexer");
+        fs::create_dir_all(&root).expect("create temporary directory");
+        let dashboard = root.join("dashboard.json");
+        fs::write(&dashboard, "{}").expect("write dashboard");
+        generate.output_dir = root.join("deployment");
+        let GenerateTarget::Remote(remote) = &mut generate.target else {
+            panic!("expected remote target");
+        };
+        remote.dashboard = dashboard;
+        let GenerateTarget::Remote(remote) = &generate.target else {
+            panic!("expected remote target");
+        };
+
+        let result = catch_unwind(AssertUnwindSafe(|| remote::generate(&generate, remote)));
+        let output_exists = generate.output_dir.exists();
+        fs::remove_dir_all(root).expect("remove temporary directory");
+
+        assert!(result.is_err(), "--store-url requires --indexer");
+        assert!(!output_exists, "invalid arguments must not write a bundle");
     }
 
     #[test]
@@ -1110,7 +1147,7 @@ mod tests {
 
     #[test]
     fn remote_store_credentials_each_require_external_store() {
-        for flag in ["--chain-indexer-api-key", "--adapter-store-api-key"] {
+        for flag in ["--store-api-key", "--adapter-store-api-key"] {
             let mut args = remote_cli_args();
             args.extend([flag, "secret-key"]);
             let error = parse_cli(args)
@@ -1146,7 +1183,7 @@ mod tests {
     fn child_deployment_credentials_from_environment() {
         let mut args = remote_cli_args();
         assert!(Cli::try_parse_from(args.clone()).is_err());
-        args.extend(["--chain-indexer-url", "https://store.example.com"]);
+        args.extend(["--store-url", "https://store.example.com"]);
         let cli = Cli::try_parse_from(args).expect("environment credentials parse");
         let Command::Generate(generate) = cli.command else {
             panic!("generate command")
@@ -1154,10 +1191,7 @@ mod tests {
         let GenerateTarget::Remote(remote) = generate.target else {
             panic!("remote target")
         };
-        assert_eq!(
-            remote.chain_indexer_api_key.as_deref(),
-            Some("environment-writer")
-        );
+        assert_eq!(remote.store_api_key.as_deref(), Some("environment-writer"));
         assert_eq!(
             remote.adapter_store_api_key.as_deref(),
             Some("environment-reader")
@@ -1165,7 +1199,7 @@ mod tests {
 
         let mut args = remote_cli_args();
         args.extend([
-            "--chain-indexer-url",
+            "--store-url",
             "https://store.example.com",
             "--store-api-key",
             "explicit-writer",
@@ -1177,23 +1211,19 @@ mod tests {
         let GenerateTarget::Remote(remote) = generate.target else {
             panic!("remote target")
         };
-        assert_eq!(
-            remote.chain_indexer_api_key.as_deref(),
-            Some("explicit-writer")
-        );
+        assert_eq!(remote.store_api_key.as_deref(), Some("explicit-writer"));
     }
 
     #[test]
     fn generated_indexer_api_keys_default_and_omit() {
-        let indexer: IndexerConfig = serde_yaml::from_str(
-            "chain_indexer_url: https://store.example.com\nupload_buffer: 64\n",
-        )
-        .expect("indexer config without an API key should parse");
+        let indexer: IndexerConfig =
+            serde_yaml::from_str("store_url: https://store.example.com\nupload_buffer: 64\n")
+                .expect("indexer config without an API key should parse");
         let metadata: AdapterConfig =
-            serde_yaml::from_str("port: 8091\nchain_indexer_url: https://store.example.com\n")
+            serde_yaml::from_str("port: 8091\nstore_url: https://store.example.com\n")
                 .expect("metadata config without an API key should parse");
         let qmdb: AdapterConfig =
-            serde_yaml::from_str("port: 8092\nchain_indexer_url: https://store.example.com\n")
+            serde_yaml::from_str("port: 8092\nstore_url: https://store.example.com\n")
                 .expect("QMDB config without an API key should parse");
 
         assert_eq!(indexer.api_key, None);

@@ -29,6 +29,10 @@ struct GeneratedValidator {
 
 pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     validate_generate_args(args);
+    assert!(
+        indexer_enabled(args) || remote.store_url.is_none(),
+        "--store-url requires --indexer"
+    );
     assert!(!remote.regions.is_empty(), "need at least one region");
     assert!(
         remote.regions.len() <= args.validators as usize,
@@ -228,13 +232,13 @@ fn build_secondaries(
 
 fn store_url(remote: &RemoteArgs) -> String {
     remote
-        .chain_indexer_url
+        .store_url
         .clone()
         .unwrap_or_else(|| format!("http://{CHAIN_INDEXER_HOST}:{}", remote.chain_indexer_port))
 }
 
 const fn local_chain_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
-    indexer_enabled(args) && remote.chain_indexer_url.is_none()
+    indexer_enabled(args) && remote.store_url.is_none()
 }
 
 const fn local_metadata_indexer(args: &GenerateArgs, remote: &RemoteArgs) -> bool {
@@ -264,8 +268,8 @@ fn expected_binary_files(args: &GenerateArgs, remote: &RemoteArgs) -> Vec<&'stat
 
 fn remote_indexer_config(remote: &RemoteArgs) -> IndexerConfig {
     IndexerConfig {
-        chain_indexer_url: store_url(remote),
-        api_key: remote.chain_indexer_api_key.clone(),
+        store_url: store_url(remote),
+        api_key: remote.store_api_key.clone(),
         upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
 }
@@ -320,7 +324,7 @@ fn metadata_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<A
     local_metadata_indexer(args, remote).then(|| AdapterConfig {
         metrics_port: Some(METRICS_PORT),
         port: remote.metadata_indexer_port,
-        chain_indexer_url: store_url(remote),
+        store_url: store_url(remote),
         api_key: remote.adapter_store_api_key.clone(),
     })
 }
@@ -329,7 +333,7 @@ fn qmdb_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<Adapt
     local_qmdb_indexer(args, remote).then(|| AdapterConfig {
         metrics_port: Some(METRICS_PORT),
         port: remote.qmdb_indexer_port,
-        chain_indexer_url: store_url(remote),
+        store_url: store_url(remote),
         api_key: remote.adapter_store_api_key.clone(),
     })
 }
@@ -573,10 +577,10 @@ mod tests {
             storage_size: 25,
             storage_iops: None,
             storage_throughput: None,
-            chain_indexer_url: None,
+            store_url: None,
             metadata_indexer_url: None,
             qmdb_indexer_url: None,
-            chain_indexer_api_key: None,
+            store_api_key: None,
             adapter_store_api_key: None,
             chain_indexer_instance_type: DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE.to_string(),
             chain_indexer_storage_size: DEFAULT_CHAIN_INDEXER_STORAGE_SIZE,
@@ -856,10 +860,10 @@ mod tests {
             args.relayer = true;
 
             let mut remote = remote_args();
-            remote.chain_indexer_url = Some(STORE_URL.to_string());
+            remote.store_url = Some(STORE_URL.to_string());
             remote.metadata_indexer_url = case.remote_metadata.then(|| METADATA_URL.to_string());
             remote.qmdb_indexer_url = case.remote_qmdb.then(|| QMDB_URL.to_string());
-            remote.chain_indexer_api_key = Some(WRITER_KEY.to_string());
+            remote.store_api_key = Some(WRITER_KEY.to_string());
             remote.adapter_store_api_key = Some(READER_KEY.to_string());
 
             let material =
@@ -872,7 +876,7 @@ mod tests {
                 .as_ref()
                 .expect("the owning secondary should have indexer wiring");
 
-            assert_eq!(indexer.chain_indexer_url, STORE_URL, "{}", case.name);
+            assert_eq!(indexer.store_url, STORE_URL, "{}", case.name);
             assert_eq!(
                 indexer.api_key.as_deref(),
                 Some(WRITER_KEY),
@@ -892,7 +896,7 @@ mod tests {
             assert_eq!(qmdb.is_some(), !case.remote_qmdb, "{}", case.name);
 
             if let Some(config) = &metadata {
-                assert_eq!(config.chain_indexer_url, STORE_URL, "{}", case.name);
+                assert_eq!(config.store_url, STORE_URL, "{}", case.name);
                 assert_eq!(
                     config.metrics_port,
                     Some(commonware_deployer::aws::METRICS_PORT)
@@ -900,7 +904,7 @@ mod tests {
                 assert_eq!(config.api_key.as_deref(), Some(READER_KEY), "{}", case.name);
             }
             if let Some(config) = &qmdb {
-                assert_eq!(config.chain_indexer_url, STORE_URL, "{}", case.name);
+                assert_eq!(config.store_url, STORE_URL, "{}", case.name);
                 assert_eq!(
                     config.metrics_port,
                     Some(commonware_deployer::aws::METRICS_PORT)
@@ -1073,7 +1077,7 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer wiring");
-        assert_eq!(indexer.chain_indexer_url, "http://chain-indexer:8090");
+        assert_eq!(indexer.store_url, "http://chain-indexer:8090");
         assert_eq!(indexer.upload_buffer, 64);
         assert!(
             secondaries[1].config.indexer.is_none(),

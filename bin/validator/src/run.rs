@@ -53,11 +53,12 @@ use constantinople_engine::{
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
-    CertificateReporter, Publisher, StoreClientBuildError,
+    CertificateReporter, Publisher, StoreClient, StoreClientBuildError,
     publisher::{
         StoreCommitMetrics,
         qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
     },
+    writer_store_client,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
@@ -158,6 +159,12 @@ struct FinalizedCursorStore {
     metadata: Mutex<Option<CursorMetadata>>,
 }
 
+impl FinalizedCursorStore {
+    async fn open(&self) -> Result<CursorMetadata, commonware_storage::metadata::Error> {
+        CursorMetadata::init(self.context.child("storage"), self.config.clone()).await
+    }
+}
+
 #[derive(Clone)]
 enum SimplexObserver {
     Indexer(EngineCertReporter),
@@ -185,27 +192,19 @@ struct IndexerHandle {
 /// Connects the indexer publisher only when finalized data is ready to upload.
 struct LazyPublisher {
     context: RuntimeContext,
-    store_url: String,
-    api_key: Option<String>,
+    store_client: StoreClient,
     buffer: usize,
     commit_metrics: StoreCommitMetrics,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
-    fn new(
-        context: RuntimeContext,
-        store_url: String,
-        api_key: Option<String>,
-        buffer: usize,
-    ) -> Self {
-        // Registered once here: `connect` is retried on failure and must not
-        // re-register.
+    fn new(context: RuntimeContext, store_client: StoreClient, buffer: usize) -> Self {
+        // Connection retries must reuse the registered metrics.
         let commit_metrics = StoreCommitMetrics::new(&context);
         Self {
             context,
-            store_url,
-            api_key,
+            store_client,
             buffer,
             commit_metrics,
             publisher: Mutex::new(None),
@@ -220,8 +219,7 @@ impl LazyPublisher {
 
             match EnginePublisher::connect(
                 self.context.child("publisher"),
-                &self.store_url,
-                self.api_key.as_deref(),
+                self.store_client.clone(),
                 self.buffer,
                 self.commit_metrics.clone(),
             )
@@ -235,7 +233,6 @@ impl LazyPublisher {
                 Err(error) => {
                     warn!(
                         error = %error,
-                        chain_indexer_url = %self.store_url,
                         "indexer publisher connection failed, retrying",
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -394,16 +391,14 @@ async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: Finalize
         // A failed sync consumes its handle. Reopen before retrying the same cursor.
         let mut current = match metadata.take() {
             Some(current) => current,
-            None => {
-                match Metadata::init(store.context.child("storage"), store.config.clone()).await {
-                    Ok(current) => current,
-                    Err(error) => {
-                        warn!(error = %error, "failed to reopen finalized index cursor, retrying");
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                        continue;
-                    }
+            None => match store.open().await {
+                Ok(current) => current,
+                Err(error) => {
+                    warn!(error = %error, "failed to reopen finalized index cursor, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
                 }
-            }
+            },
         };
         current.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         current.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
@@ -589,19 +584,18 @@ async fn maybe_build_indexer(
     }
 
     info!(
-        chain_indexer_url = %cfg.chain_indexer_url,
+        store_url = %cfg.store_url,
         "starting full indexer uploaders",
     );
+    let store_client = writer_store_client(&cfg.store_url, cfg.api_key.as_deref())?;
     let (cert_reporter, cert_join) = EngineCertReporter::connect(
-        &cfg.chain_indexer_url,
-        cfg.api_key.as_deref(),
+        store_client.clone(),
         cfg.upload_buffer,
         StoreCommitMetrics::new(&context.child("simplex_upload")),
-    )?;
+    );
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
-        cfg.chain_indexer_url,
-        cfg.api_key,
+        store_client,
         cfg.upload_buffer,
     ));
     let page_cache = CacheRef::from_pooler(
@@ -622,12 +616,16 @@ async fn maybe_build_indexer(
     )
     .await
     .expect("failed to initialize finalized index queue");
-    let metadata_context = context.child("finalized_cursor");
-    let metadata_config = MetadataConfig {
-        partition: format!("{partition_prefix}-finalized-index-cursor"),
-        codec_config: (),
+    let mut cursor_store = FinalizedCursorStore {
+        context: context.child("finalized_cursor"),
+        config: MetadataConfig {
+            partition: format!("{partition_prefix}-finalized-index-cursor"),
+            codec_config: (),
+        },
+        metadata: Mutex::new(None),
     };
-    let mut metadata = Metadata::init(metadata_context.child("storage"), metadata_config.clone())
+    let mut metadata = cursor_store
+        .open()
         .await
         .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
@@ -641,11 +639,8 @@ async fn maybe_build_indexer(
             .await
             .expect("failed to persist finalized index cursor");
     }
-    let metadata = Arc::new(FinalizedCursorStore {
-        context: metadata_context,
-        config: metadata_config,
-        metadata: Mutex::new(Some(metadata)),
-    });
+    *cursor_store.metadata.get_mut() = Some(metadata);
+    let metadata = Arc::new(cursor_store);
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         metadata,
@@ -1167,10 +1162,10 @@ mod tests {
     fn cancelled_upload_fails_supervision_without_acknowledgement() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (store, url) = exoware_simulator::open_temp().await.expect("Store starts");
+            let client = super::writer_store_client(&url, None).expect("writer client builds");
             let publisher = std::sync::Arc::new(super::LazyPublisher::new(
                 context.child("publisher"),
-                url.clone(),
-                None,
+                client.clone(),
                 1,
             ));
             let connected = publisher.publisher().await;
@@ -1179,12 +1174,10 @@ mod tests {
             store.abort();
             let _ = store.await;
             let (reporter, certificate_uploader) = super::EngineCertReporter::connect(
-                &url,
-                None,
+                client,
                 1,
                 super::StoreCommitMetrics::new(&context.child("certificates")),
-            )
-            .expect("reporter builds");
+            );
             let config = queue::Config {
                 partition: "cancelled-finalized-upload".to_string(),
                 items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
@@ -1260,7 +1253,7 @@ mod tests {
             commonware_runtime::tokio::Runner::new(commonware_runtime::tokio::Config::default());
         runner.start(|context| async move {
             let indexer = IndexerConfig {
-                chain_indexer_url: "http://127.0.0.1:1".to_string(),
+                store_url: "http://127.0.0.1:1".to_string(),
                 api_key: None,
                 upload_buffer: 1,
             };
@@ -1282,16 +1275,41 @@ mod tests {
     fn invalid_indexer_api_key_fails_secondary_startup() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let indexer = IndexerConfig {
-                chain_indexer_url: "http://127.0.0.1:1".to_string(),
+                store_url: "http://127.0.0.1:1".to_string(),
                 api_key: Some("invalid\nkey".to_string()),
                 upload_buffer: 1,
             };
-            let error = maybe_build_indexer(context, false, Some(indexer), "test")
-                .await
-                .err()
-                .expect("invalid API key should fail startup");
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                maybe_build_indexer(context, false, Some(indexer), "test"),
+            )
+            .await
+            .expect("invalid API key must not enter the connection retry loop")
+            .err()
+            .expect("invalid API key should fail startup");
 
             assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
+        });
+    }
+
+    #[test]
+    fn invalid_indexer_url_fails_secondary_startup() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let indexer = IndexerConfig {
+                store_url: "http://invalid host".to_string(),
+                api_key: None,
+                upload_buffer: 1,
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                maybe_build_indexer(context, false, Some(indexer), "test"),
+            )
+            .await
+            .expect("invalid URL must not enter the connection retry loop")
+            .err()
+            .expect("invalid URL should fail startup");
+
+            assert!(matches!(error, StoreClientBuildError::InvalidUrl { .. }));
         });
     }
 
@@ -1326,10 +1344,7 @@ mod tests {
             };
             super::persist_finalized_cursor(&store, second).await;
             drop(store.metadata.lock().await.take());
-            let reopened =
-                super::CursorMetadata::init(store.context.child("storage"), store.config)
-                    .await
-                    .expect("cursor should reopen");
+            let reopened = store.open().await.expect("cursor should reopen");
             assert_eq!(
                 FinalizedUploadCursor::from_metadata(&reopened),
                 Some(second)

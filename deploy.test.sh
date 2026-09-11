@@ -55,31 +55,19 @@ prepare_case() {
     prepare_deployment || return $?
 }
 
-assert_invalid_url() {
-    local option=$1
-    local value=$2
-    local arguments=(--store-url https://store.example.com "$option" "$value")
-    if [ "$option" = "--store-url" ]; then
-        arguments=("$option" "$value")
-    fi
-    if (prepare_case "${arguments[@]}") >/dev/null 2>&1; then
-        fail "invalid URL should fail for $option"
-    fi
-}
-
 prepare_case
 assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains --chain-indexer-instance-type "${REMOTE_ARGS[@]}"
 
 prepare_case --store-url https://store.example.com
-assert_pair --chain-indexer-url https://store.example.com "${REMOTE_ARGS[@]}"
+assert_pair --store-url https://store.example.com "${REMOTE_ARGS[@]}"
 assert_equal https://store.example.com "$EXPLORER_STORE_URL" "Store explorer origin"
 assert_contains metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_contains qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
 
 prepare_case --store-url https://store.example.com/base
-assert_pair --chain-indexer-url https://store.example.com/base "${REMOTE_ARGS[@]}"
+assert_pair --store-url https://store.example.com/base "${REMOTE_ARGS[@]}"
 assert_equal https://store.example.com/base "$EXPLORER_STORE_URL" "path-prefixed Store origin"
 
 prepare_case \
@@ -108,7 +96,7 @@ assert_equal writer-key "$STORE_API_KEY" "writer credential"
 assert_equal reader-key "$ADAPTER_STORE_API_KEY" "reader credential"
 assert_excludes writer-key "${REMOTE_ARGS[@]}"
 assert_excludes reader-key "${REMOTE_ARGS[@]}"
-assert_excludes --chain-indexer-api-key "${REMOTE_ARGS[@]}"
+assert_excludes --store-api-key "${REMOTE_ARGS[@]}"
 assert_excludes --adapter-store-api-key "${REMOTE_ARGS[@]}"
 assert_excludes metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_excludes qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
@@ -140,20 +128,6 @@ done
         fail "environment credentials require a Store origin"
     fi
 )
-
-for option in --store-url --sql-url --qmdb-url; do
-    for value in \
-        ftp://service.example.com \
-        https://#fragment \
-        http://?query \
-        https://user:password@service.example.com \
-        https://service.example.com/path?query \
-        https://service.example.com/path#fragment \
-        "https://service.example.com/path with space"
-    do
-        assert_invalid_url "$option" "$value"
-    done
-done
 
 for option in \
     --store-url \
@@ -198,5 +172,48 @@ done
 if (reset_options; parse_options --unknown value) >/dev/null 2>&1; then
     fail "unknown option should fail"
 fi
+
+(
+    deployment_test_dir=$(mktemp -d)
+    trap 'rm -rf "$deployment_test_dir"' EXIT
+    cd "$deployment_test_dir"
+    prepare_case --store-url https://store.example.com
+    mkdir deploy
+    touch deploy/existing
+
+    # A generator failure must preserve the active bundle, even after partial output.
+    cargo() {
+        local output_dir
+        while [ "$#" -gt 0 ]; do
+            if [ "$1" = "--output-dir" ]; then
+                output_dir=$2
+                break
+            fi
+            shift
+        done
+        mkdir -p "$output_dir"
+        touch "$output_dir/generated"
+        return "$generator_status"
+    }
+
+    generator_status=2
+    if generate_deployment <<< y; then
+        fail "generation failure should propagate"
+    fi
+    [ -f deploy/existing ] || fail "generation failure removed the existing bundle"
+
+    generator_status=0
+    if generate_deployment <<< n; then
+        fail "declining replacement should stop deployment"
+    fi
+    [ -f deploy/existing ] || fail "declining replacement removed the existing bundle"
+
+    generate_deployment <<< y
+    [ -f deploy/generated ] || fail "successful generation was not installed"
+    [ ! -f deploy/existing ] || fail "replacement retained the previous bundle"
+    for path in deploy.*; do
+        [ ! -e "$path" ] || fail "temporary deployment bundle was not cleaned up"
+    done
+)
 
 echo "deploy script tests passed"

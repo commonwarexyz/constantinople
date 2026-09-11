@@ -17,7 +17,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
-use exoware_sdk::StoreWriteBatch;
+use exoware_sdk::{StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -42,25 +42,23 @@ where
 {
     /// Build a reporter and background uploader.
     pub fn connect(
-        store_url: &str,
-        api_key: Option<&str>,
+        store_client: StoreClient,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
-    ) -> Result<(Self, JoinHandle<()>), crate::StoreClientBuildError>
+    ) -> (Self, JoinHandle<()>)
     where
         H: Hasher + Send + Sync + 'static,
         P: PublicKey + Send + Sync + 'static,
         S: Scheme + Send + Sync + 'static,
         S::Certificate: Send + Sync,
     {
-        let store_client = crate::store::writer_store_client(store_url, api_key)?;
         let client = SimplexClient::new(
             crate::namespaces::simplex_client(&store_client)
                 .expect("simplex namespace prefix must be valid"),
         );
         let (tx, rx) = mpsc::channel(buffer);
         let join = tokio::spawn(run_uploader::<H, P, S>(client, rx, commit_metrics));
-        Ok((Self { tx }, join))
+        (Self { tx }, join)
     }
 
     /// Queue a finalized block for digest-addressed block upload and later
@@ -471,12 +469,11 @@ mod tests {
                 .await
                 .expect("spawn observed Store");
             let (reporter, uploader) = TestReporter::connect(
-                &store.url,
-                Some("writer-key"),
+                crate::store::writer_store_client(&store.url, Some("writer-key"))
+                    .expect("writer client builds"),
                 1,
                 super::super::StoreCommitMetrics::new(&context.child("metrics")),
-            )
-            .expect("reporter connects");
+            );
 
             reporter.publish_block(test_block()).await;
             drop(reporter);

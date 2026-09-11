@@ -93,31 +93,6 @@ parse_options() {
     done
 }
 
-validate_http_url() {
-    local name=$1
-    local url=$2
-    if ! command -v node >/dev/null 2>&1; then
-        echo "node is required to validate deployment URLs" >&2
-        return 2
-    fi
-    if ! node -e '
-const value = process.argv[1];
-if (/\s/.test(value)) process.exit(1);
-const parsed = new URL(value);
-if (
-    !["http:", "https:"].includes(parsed.protocol) ||
-    !parsed.hostname ||
-    parsed.username ||
-    parsed.password ||
-    parsed.search ||
-    parsed.hash
-) process.exit(1);
-' "$url" >/dev/null 2>&1; then
-        echo "$name must be an absolute HTTP or HTTPS service base without credentials, a query, or a fragment" >&2
-        return 2
-    fi
-}
-
 prepare_deployment() {
     if { [ -n "$STORE_API_KEY" ] || [ -n "$ADAPTER_STORE_API_KEY" ]; } && [ -z "$STORE_URL" ]; then
         echo "Store credentials require --store-url" >&2
@@ -136,7 +111,6 @@ prepare_deployment() {
         --spammer-accounts "$SPAMMER_ACCOUNTS"
         --spammer-accounts-jitter 0.1
         --spammer-rayon-threads 14
-        --output-dir ./deploy
         --worker-threads 3
         --rayon-threads 13
         --public-key-cache-size 5000000
@@ -152,9 +126,8 @@ prepare_deployment() {
     fi
 
     if [ -n "$STORE_URL" ]; then
-        validate_http_url "external Store URL" "$STORE_URL" || return $?
         EXPLORER_STORE_URL=$STORE_URL
-        REMOTE_ARGS+=(--chain-indexer-url "$STORE_URL")
+        REMOTE_ARGS+=(--store-url "$STORE_URL")
     else
         REMOTE_ARGS+=(
             --chain-indexer-instance-type c8id.4xlarge
@@ -165,13 +138,11 @@ prepare_deployment() {
     fi
 
     if [ -n "$SQL_URL" ]; then
-        validate_http_url "external SQL URL" "$SQL_URL" || return $?
         EXPLORER_SQL_URL=$SQL_URL
         REMOTE_ARGS+=(--metadata-indexer-url "$SQL_URL")
     fi
 
     if [ -n "$QMDB_URL" ]; then
-        validate_http_url "external QMDB URL" "$QMDB_URL" || return $?
         EXPLORER_QMDB_URL=$QMDB_URL
         REMOTE_ARGS+=(--qmdb-indexer-url "$QMDB_URL")
     fi
@@ -185,6 +156,37 @@ prepare_deployment() {
     fi
 }
 
+generate_deployment() (
+    local bundle_dir
+    bundle_dir=$(mktemp -d ./deploy.XXXXXX) || return $?
+    trap 'rm -rf "$bundle_dir"' EXIT
+
+    # Keep the existing bundle until validation and generation both succeed.
+    unset CONSTANTINOPLE_STORE_API_KEY CONSTANTINOPLE_ADAPTER_STORE_API_KEY
+    if [ -n "$STORE_API_KEY" ]; then
+        export CONSTANTINOPLE_STORE_API_KEY="$STORE_API_KEY"
+    fi
+    if [ -n "$ADAPTER_STORE_API_KEY" ]; then
+        export CONSTANTINOPLE_ADAPTER_STORE_API_KEY="$ADAPTER_STORE_API_KEY"
+    fi
+    cargo run --bin constantinople-deploy -- generate "${GENERATE_ARGS[@]}" \
+        --output-dir "$bundle_dir/bundle" \
+        remote \
+        --http-cidr 0.0.0.0/0 --regions "$REGIONS" \
+        --instance-type c8a.4xlarge --storage-size "$STORAGE_SIZE" --storage-throughput 500 \
+        --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
+        "${REMOTE_ARGS[@]}" \
+        --dashboard ./dashboard.json --traces 1 || return $?
+
+    if [ -d ./deploy ]; then
+        local answer
+        read -r -p "./deploy exists - replace with the new bundle? [y/N] " answer
+        [ "$answer" = "y" ] || return 1
+        rm -rf ./deploy || return $?
+    fi
+    mv "$bundle_dir/bundle" ./deploy
+)
+
 main() {
     if [ "${1:-}" = "--help" ]; then
         usage
@@ -197,29 +199,7 @@ main() {
 
     cd "$(dirname "${BASH_SOURCE[0]}")"
 
-    # Generate the deployment bundle. The output directory must not exist.
-    if [ -d ./deploy ]; then
-        read -r -p "./deploy exists - remove and regenerate? [y/N] " answer
-        [ "$answer" = "y" ] || return 1
-        rm -rf ./deploy
-    fi
-
-    (
-        unset CONSTANTINOPLE_STORE_API_KEY CONSTANTINOPLE_ADAPTER_STORE_API_KEY
-        if [ -n "$STORE_API_KEY" ]; then
-            export CONSTANTINOPLE_STORE_API_KEY="$STORE_API_KEY"
-        fi
-        if [ -n "$ADAPTER_STORE_API_KEY" ]; then
-            export CONSTANTINOPLE_ADAPTER_STORE_API_KEY="$ADAPTER_STORE_API_KEY"
-        fi
-        cargo run --bin constantinople-deploy -- generate "${GENERATE_ARGS[@]}" \
-            remote \
-            --http-cidr 0.0.0.0/0 --regions "$REGIONS" \
-            --instance-type c8a.4xlarge --storage-size "$STORAGE_SIZE" --storage-throughput 500 \
-            --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
-            "${REMOTE_ARGS[@]}" \
-            --dashboard ./dashboard.json --traces 1
-    )
+    generate_deployment || return $?
 
     # Build only the binaries represented in the generated deployment.
     just "${BINARY_TARGETS[@]}"

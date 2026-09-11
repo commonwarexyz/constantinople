@@ -234,12 +234,12 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
 
 /// Build the full indexer wiring written into the owning secondary's YAML.
 ///
-/// All rows go through the shared `chain-indexer` Store URL. Store prefixes
+/// All rows go through the shared Store URL. Store prefixes
 /// keep raw KV, SQL, and QMDB rows disjoint.
 fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
-        chain_indexer_url: url,
+        store_url: url,
         api_key: None,
         upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
@@ -878,7 +878,7 @@ mod tests {
             .expect("secondary should have indexer config");
         assert_eq!(indexer.upload_buffer, 64);
         let expected_url = "http://127.0.0.1:8090".to_string();
-        assert_eq!(indexer.chain_indexer_url, expected_url);
+        assert_eq!(indexer.store_url, expected_url);
         assert_eq!(indexer.api_key, None);
         assert!(
             secondaries[1].config.indexer.is_none(),

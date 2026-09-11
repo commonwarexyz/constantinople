@@ -1,6 +1,7 @@
 #![doc = include_str!("../README.md")]
 #![cfg_attr(docsrs, feature(doc_cfg, doc_auto_cfg))]
 
+pub mod adapter;
 pub mod adapter_metrics;
 pub mod client;
 pub mod codec;
@@ -14,4 +15,7 @@ mod test_store;
 
 pub use client::{IndexerClient, ReadError};
 pub use publisher::{CertificateReporter, Publisher};
-pub use store::{StoreClientBuildError, StoreReadinessError, require_store_ready, store_client};
+pub use store::{
+    StoreClient, StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,
+    writer_store_client,
+};

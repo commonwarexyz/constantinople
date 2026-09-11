@@ -435,27 +435,25 @@ Topology and defaults:
 - `qmdb-indexer` listens on port `8092` by default.
 - Full indexer uploads are enabled on only the indexer secondary.
 
-QMDB rows are committed by validators through the shared `chain-indexer` Store URL, not by sending
-writes to `qmdb-indexer`. The QMDB facade only serves reads: account-state operation-log APIs are
-mounted under `/state`, and transaction-hash operation-log APIs are mounted under `/transactions`.
-Simplex certificates follow the same boundary: validators commit them through
-the shared Store URL, and clients read them from the Store rather than from
-`qmdb-indexer`.
+Validators commit QMDB rows and Simplex certificates through the shared Store
+URL. The QMDB facade serves account-state operation-log reads under `/state`
+and transaction-hash operation-log reads under `/transactions`. Clients read
+Simplex certificates from the Store.
 
 The deployer opens shared-service ports globally because `commonware-deployer`'s port list is
 deployment-wide rather than per-instance.
 
 ### External Store and Adapters
 
-Pass `--chain-indexer-url <url>` to use an external exoware Store instead of
-provisioning the simulator-backed `chain-indexer` host. The owning indexer
+Pass `--store-url <url>` with `--indexer` to use an external exoware Store instead
+of provisioning the simulator-backed `chain-indexer` host. The owning indexer
 secondary and every locally managed adapter receive this URL. No
 `chain-indexer` instance, binary, config, or port rule is generated.
 
 The metadata and QMDB adapters can be replaced independently. Each adapter
-origin requires `--chain-indexer-url`. The generator checks that dependency,
+origin requires `--store-url`. The generator checks that dependency,
 but it cannot verify service ownership. The operator must ensure every supplied
-adapter is backed by the same Store deployment as `--chain-indexer-url`.
+adapter is backed by the same Store deployment as `--store-url`.
 
 ```sh
 cargo run --bin constantinople-deploy -- generate \
@@ -467,7 +465,7 @@ cargo run --bin constantinople-deploy -- generate \
   --storage-size 75 \
   --monitoring-instance-type c8g.2xlarge \
   --monitoring-storage-size 100 \
-  --chain-indexer-url https://store.example.com \
+  --store-url https://store.example.com \
   --metadata-indexer-url https://sql.example.com \
   --qmdb-indexer-url https://qmdb.example.com \
   --regions us-east-1,us-west-2 \
@@ -488,7 +486,7 @@ external Store URL.
 | both adapter flags | none |
 
 The validator writer and local adapter readers use independent credentials.
-`--store-api-key` (also accepted as `--chain-indexer-api-key`) or
+`--store-api-key` or
 `CONSTANTINOPLE_STORE_API_KEY` is serialized only into the owning indexer
 secondary. It authenticates Simplex, SQL, and QMDB uploads plus writer
 recovery reads. A write-only credential is sufficient when Store reads are
@@ -532,8 +530,8 @@ remove their matching ports from that list.
 ### Deployment Script with External Services
 
 The repository deployment script accepts the public Store and adapter
-origins directly. Node is required for URL validation and the deployment shell
-tests. Credentials can be entered without putting them in shell history.
+origins directly. The Rust generator validates these URLs before writing the
+bundle. Credentials can be entered without putting them in shell history.
 
 ```sh
 read -rs -p "Store writer API key: " CONSTANTINOPLE_STORE_API_KEY
