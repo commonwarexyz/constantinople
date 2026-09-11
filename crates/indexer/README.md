@@ -64,8 +64,8 @@ the full body only when requested.
 - [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
   storage and SQL transaction lookup rows. Latest-finalized-height is derived
   from the Simplex finalization height index.
-- `[[bin]] chain-indexer` — thin wrapper around `exoware_simulator::server::run`
-  for local development and deployer-managed remote bundles.
+- `[[bin]] chain-indexer` requires `--features chain-indexer`. It wraps
+  `exoware_simulator::server::run` for local development and deployer-managed remote bundles.
 - `[[bin]] metadata-indexer` — thin wrapper that registers
   [`build_meta_schema`](src/sql_schema.rs) onto an
   [`exoware_sql::SqlServer`](https://docs.rs/exoware-sql/latest/exoware_sql/struct.SqlServer.html)

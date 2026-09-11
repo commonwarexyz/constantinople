@@ -9,6 +9,7 @@ usage() {
     echo "  --qmdb-url <url>                        default managed qmdb-indexer" >&2
     echo "  --store-api-key <key>                   validator Store writer credential" >&2
     echo "  --adapter-store-api-key <key>           local adapter Store read credential" >&2
+    echo "  Credentials may also use CONSTANTINOPLE_STORE_API_KEY and CONSTANTINOPLE_ADAPTER_STORE_API_KEY." >&2
     echo "  --validators <count>                    default 50" >&2
     echo "  --regions <comma-separated-regions>     default us-east-1,us-west-2" >&2
     echo "  --spammer-accounts <count>              default 4096" >&2
@@ -21,8 +22,8 @@ reset_options() {
     STORE_URL=
     SQL_URL=
     QMDB_URL=
-    STORE_API_KEY=
-    ADAPTER_STORE_API_KEY=
+    STORE_API_KEY=${CONSTANTINOPLE_STORE_API_KEY:-}
+    ADAPTER_STORE_API_KEY=${CONSTANTINOPLE_ADAPTER_STORE_API_KEY:-}
     VALIDATORS=50
     REGIONS=us-east-1,us-west-2
     SPAMMER_ACCOUNTS=4096
@@ -95,6 +96,10 @@ parse_options() {
 validate_http_url() {
     local name=$1
     local url=$2
+    if ! command -v node >/dev/null 2>&1; then
+        echo "node is required to validate deployment URLs" >&2
+        return 2
+    fi
     if ! node -e '
 const value = process.argv[1];
 if (/\s/.test(value)) process.exit(1);
@@ -114,6 +119,10 @@ if (
 }
 
 prepare_deployment() {
+    if { [ -n "$STORE_API_KEY" ] || [ -n "$ADAPTER_STORE_API_KEY" ]; } && [ -z "$STORE_URL" ]; then
+        echo "Store credentials require --store-url" >&2
+        return 2
+    fi
     if { [ -n "$SQL_URL" ] || [ -n "$QMDB_URL" ]; } && [ -z "$STORE_URL" ]; then
         echo "--sql-url and --qmdb-url require --store-url" >&2
         return 2
@@ -167,14 +176,6 @@ prepare_deployment() {
         REMOTE_ARGS+=(--qmdb-indexer-url "$QMDB_URL")
     fi
 
-    if [ -n "$STORE_API_KEY" ]; then
-        REMOTE_ARGS+=(--chain-indexer-api-key "$STORE_API_KEY")
-    fi
-
-    if [ -n "$ADAPTER_STORE_API_KEY" ]; then
-        REMOTE_ARGS+=(--adapter-store-api-key "$ADAPTER_STORE_API_KEY")
-    fi
-
     BINARY_TARGETS=(validator-amd-binary spammer-amd-binary)
     if [ -z "$SQL_URL" ]; then
         BINARY_TARGETS+=(metadata-indexer-amd-binary)
@@ -203,13 +204,22 @@ main() {
         rm -rf ./deploy
     fi
 
-    cargo run --bin constantinople-deploy -- generate "${GENERATE_ARGS[@]}" \
-        remote \
-        --http-cidr 0.0.0.0/0 --regions "$REGIONS" \
-        --instance-type c8a.4xlarge --storage-size "$STORAGE_SIZE" --storage-throughput 500 \
-        --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
-        "${REMOTE_ARGS[@]}" \
-        --dashboard ./dashboard.json --traces 1
+    (
+        unset CONSTANTINOPLE_STORE_API_KEY CONSTANTINOPLE_ADAPTER_STORE_API_KEY
+        if [ -n "$STORE_API_KEY" ]; then
+            export CONSTANTINOPLE_STORE_API_KEY="$STORE_API_KEY"
+        fi
+        if [ -n "$ADAPTER_STORE_API_KEY" ]; then
+            export CONSTANTINOPLE_ADAPTER_STORE_API_KEY="$ADAPTER_STORE_API_KEY"
+        fi
+        cargo run --bin constantinople-deploy -- generate "${GENERATE_ARGS[@]}" \
+            remote \
+            --http-cidr 0.0.0.0/0 --regions "$REGIONS" \
+            --instance-type c8a.4xlarge --storage-size "$STORAGE_SIZE" --storage-throughput 500 \
+            --monitoring-instance-type c8a.4xlarge --monitoring-storage-size 100 \
+            "${REMOTE_ARGS[@]}" \
+            --dashboard ./dashboard.json --traces 1
+    )
 
     # Build only the binaries represented in the generated deployment.
     just "${BINARY_TARGETS[@]}"

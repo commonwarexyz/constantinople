@@ -62,39 +62,58 @@ async fn health() -> &'static str {
     "ok"
 }
 
-fn build_app(client: &StoreClient) -> Result<Router, BoxError> {
-    let metrics = AdapterMetrics::new();
+fn build_app(
+    client: &StoreClient,
+    metrics: AdapterMetrics,
+    shared_metrics: bool,
+) -> Result<Router, BoxError> {
     let state = Arc::new(StateClient::new(state_qmdb_client(client)?, ()));
     let transactions = Arc::new(TransactionClient::new(
         transactions_qmdb_client(client)?,
         (),
     ));
 
-    Ok(Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/ready", get(health))
-        .route("/metrics", get(serve_metrics))
         .nest_service("/state", unordered_operation_log_connect_stack(state))
         .nest_service(
             "/transactions",
             keyless_operation_log_connect_stack(transactions),
-        )
-        .layer(tower_http::cors::CorsLayer::very_permissive())
+        );
+    if shared_metrics {
+        app = app.route("/metrics", get(serve_metrics));
+    }
+
+    Ok(app
         .layer(middleware::from_fn_with_state(
             metrics.clone(),
             track_requests,
         ))
+        .layer(tower_http::cors::CorsLayer::very_permissive())
         .with_state(metrics))
 }
 
 async fn run(settings: Settings) -> Result<(), BoxError> {
     let client = store_client(&settings.store_url, settings.api_key.as_deref())?;
     require_store_ready(&client).await?;
-    let app = build_app(&client)?;
+    let metrics = AdapterMetrics::new();
+    let app = build_app(&client, metrics.clone(), settings.metrics_port.is_none())?;
     let addr = SocketAddr::from((settings.host, settings.port));
     info!(%addr, store_url = settings.store_url, "constantinople QMDB server listening");
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    if let Some(port) = settings.metrics_port {
+        let metrics_listener =
+            tokio::net::TcpListener::bind(SocketAddr::from((settings.host, port))).await?;
+        let metrics_app = Router::new()
+            .route("/metrics", get(serve_metrics))
+            .with_state(metrics);
+        tokio::try_join!(async { axum::serve(listener, app).await }, async {
+            axum::serve(metrics_listener, metrics_app).await
+        },)?;
+    } else {
+        axum::serve(listener, app).await?;
+    }
     Ok(())
 }
 
@@ -125,7 +144,7 @@ async fn main() -> std::process::ExitCode {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, build_app, store_client};
+    use super::{AdapterMetrics, Cli, build_app, store_client};
     use axum::{
         body::{Body, to_bytes},
         http::{Method, Request, StatusCode, header::CONTENT_TYPE},
@@ -142,7 +161,7 @@ mod tests {
     #[tokio::test]
     async fn app_serves_operational_routes_and_preserves_qmdb_routes() {
         let client = store_client("http://127.0.0.1:1", None).expect("client should build");
-        let app = build_app(&client).expect("app should build");
+        let app = build_app(&client, AdapterMetrics::new(), true).expect("app should build");
 
         for path in ["/health", "/ready"] {
             let response = app
@@ -196,5 +215,56 @@ mod tests {
                 .expect("QMDB response");
             assert_ne!(response.status(), StatusCode::NOT_FOUND, "{path}");
         }
+    }
+    #[tokio::test]
+    async fn separate_metrics_and_cors_preserve_request_counts() {
+        let client = store_client("http://127.0.0.1:1", None).expect("client should build");
+        let metrics = AdapterMetrics::new();
+        let app = build_app(&client, metrics.clone(), false).expect("app should build");
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/query")
+                    .header("origin", "https://explorer.example.com")
+                    .header("access-control-request-method", "POST")
+                    .body(Body::empty())
+                    .expect("preflight request"),
+            )
+            .await
+            .expect("preflight response");
+        assert!(response.status().is_success());
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/metrics")
+                    .body(Body::empty())
+                    .expect("metrics request"),
+            )
+            .await
+            .expect("metrics response");
+        assert!(!response.status().is_success());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/missing")
+                    .body(Body::empty())
+                    .expect("missing request"),
+            )
+            .await
+            .expect("missing response");
+        drop(response);
+
+        let response = super::serve_metrics(axum::extract::State(metrics)).await;
+        let body = to_bytes(response.into_body(), 16 * 1024)
+            .await
+            .expect("metrics body");
+        let body = String::from_utf8(body.to_vec()).expect("metrics text");
+        assert!(body.contains("adapter_requests_total 1\n"), "{body}");
+        assert!(body.contains("adapter_requests_in_flight 0\n"), "{body}");
     }
 }

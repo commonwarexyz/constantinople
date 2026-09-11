@@ -180,9 +180,7 @@ impl<D: Digest> Transaction<D> {
     /// [`Digest`]: Digest
     pub fn hash_slow<H: Hasher>(&self, hasher: &mut H) -> H::Digest {
         hasher.update(&self.encode());
-        let (next, digest) = core::mem::take(hasher).finalize();
-        *hasher = next;
-        digest
+        crate::finalize_in_place(hasher)
     }
 
     /// Seals and signs this transaction with a supported transaction signer.
