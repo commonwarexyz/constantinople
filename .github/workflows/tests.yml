@@ -38,6 +38,13 @@ jobs:
           rust-cache-save: ${{ matrix.partition == 1 }}
       - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@nextest
+      - uses: actions/setup-node@v4
+        if: matrix.partition == 1
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Test deployment script
+        if: matrix.partition == 1
+        run: just deploy-script-test
       - name: cargo test
         run: cargo nextest run --workspace --all --all-features --locked --partition hash:${{ matrix.partition }}/4
 

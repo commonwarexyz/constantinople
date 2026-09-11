@@ -546,6 +546,8 @@ where
         let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
             Reporters::from((marshal_mailbox, config.simplex_observer));
 
+        // Retain votes for late equivocation reports. The upstream wall-clock skip policy
+        // avoids waiting on silent leaders while a quorum remains active.
         let simplex = simplex::Engine::new(
             context.child("simplex"),
             simplex::Config {
@@ -555,7 +557,7 @@ where
                 automaton: application.clone(),
                 relay: application,
                 reporter: simplex_reporter,
-                track_historical_votes: false,
+                track_historical_votes: true,
                 strategy: config.strategy.clone(),
                 partition: format!("{}_simplex", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,

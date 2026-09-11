@@ -30,6 +30,9 @@ pub(crate) struct AdapterArgs {
     /// Listen port.
     #[arg(long)]
     port: Option<u16>,
+    /// Serve metrics on a separate port.
+    #[arg(long)]
+    metrics_port: Option<u16>,
     /// Path to the deployer-generated hosts file.
     #[arg(long, requires = "config")]
     hosts: Option<PathBuf>,
@@ -38,26 +41,22 @@ pub(crate) struct AdapterArgs {
     config: Option<PathBuf>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 struct DeployerConfig {
     port: u16,
-    chain_indexer_url: String,
+    #[serde(default)]
+    metrics_port: Option<u16>,
+    #[serde(rename = "chain_indexer_url")]
+    store_url: String,
     #[serde(default)]
     api_key: Option<String>,
 }
 
-#[derive(Debug)]
-struct DeployerSettings {
-    store_url: String,
-    port: u16,
-    api_key: Option<String>,
-}
-
-#[derive(Debug)]
 pub(crate) struct Settings {
     pub(crate) store_url: String,
     pub(crate) host: IpAddr,
     pub(crate) port: u16,
+    pub(crate) metrics_port: Option<u16>,
     pub(crate) api_key: Option<String>,
 }
 
@@ -153,8 +152,8 @@ fn load_deployer_settings(
     profile: Profile,
     hosts_path: &Path,
     config_path: &Path,
-) -> Result<DeployerSettings, SettingsError> {
-    let config = load_deployer_config(profile, config_path)?;
+) -> Result<DeployerConfig, SettingsError> {
+    let mut config = load_deployer_config(profile, config_path)?;
     let raw_hosts = fs::read_to_string(hosts_path).map_err(|source| SettingsError::ReadHosts {
         path: hosts_path.to_path_buf(),
         source,
@@ -170,11 +169,8 @@ fn load_deployer_settings(
         .map(|host| (host.name.as_str(), host.ip))
         .collect::<AHashMap<_, _>>();
 
-    Ok(DeployerSettings {
-        store_url: resolve_named_http_url(&config.chain_indexer_url, &hosts_by_name),
-        port: config.port,
-        api_key: config.api_key,
-    })
+    config.store_url = resolve_named_http_url(&config.store_url, &hosts_by_name);
+    Ok(config)
 }
 
 pub(crate) fn load_settings(
@@ -182,11 +178,20 @@ pub(crate) fn load_settings(
     args: AdapterArgs,
     environment: Environment,
 ) -> Result<Settings, SettingsError> {
-    let deployer = match (&args.hosts, &args.config) {
+    let mut deployer = match (&args.hosts, &args.config) {
         (Some(hosts), Some(config)) => Some(load_deployer_settings(profile, hosts, config)?),
         (None, None) => None,
         _ => return Err(SettingsError::IncompleteDeployerMode),
     };
+
+    // A YAML credential belongs to its configured destination.
+    let api_key = deployer
+        .as_mut()
+        .filter(|_| args.store_url.is_none())
+        .and_then(|settings| settings.api_key.take());
+    let metrics_port = args
+        .metrics_port
+        .or_else(|| deployer.as_ref().and_then(|settings| settings.metrics_port));
     let store_url = args
         .store_url
         .or_else(|| deployer.as_ref().map(|settings| settings.store_url.clone()))
@@ -204,12 +209,12 @@ pub(crate) fn load_settings(
             None => profile.default_port,
         },
     };
-    let api_key = deployer.and_then(|settings| settings.api_key);
 
     Ok(Settings {
         store_url,
         host: args.host,
         port,
+        metrics_port,
         api_key,
     })
 }
@@ -265,7 +270,7 @@ mod tests {
         fs::write(
             &config_path,
             format!(
-                "port: {}\nchain_indexer_url: http://chain-indexer:8090\n{key}",
+                "port: {}\nmetrics_port: 9090\nchain_indexer_url: http://chain-indexer:8090\n{key}",
                 profile.default_port + 10_000
             ),
         )
@@ -321,7 +326,8 @@ mod tests {
         for profile in PROFILES {
             let args = parse(profile, &[]);
             let error = load_settings(profile, args, Environment::default())
-                .expect_err("missing Store URL should fail");
+                .err()
+                .expect("missing Store URL should fail");
             assert!(matches!(error, SettingsError::MissingStoreUrl));
             assert!(error.to_string().contains(STORE_URL_ENV));
 
@@ -334,7 +340,8 @@ mod tests {
                     port: Some("invalid".to_string()),
                 },
             )
-            .expect_err("invalid environment port should fail");
+            .err()
+            .expect("invalid environment port should fail");
             assert!(matches!(
                 error,
                 SettingsError::InvalidEnvironmentPort { .. }
@@ -353,6 +360,8 @@ mod tests {
                     "http://cli:8090".to_string(),
                     "--port".to_string(),
                     (profile.default_port + 11_000).to_string(),
+                    "--metrics-port".to_string(),
+                    "9099".to_string(),
                     "--hosts".to_string(),
                     hosts_path.to_string_lossy().into_owned(),
                     "--config".to_string(),
@@ -371,7 +380,8 @@ mod tests {
 
             assert_eq!(settings.store_url, "http://cli:8090");
             assert_eq!(settings.port, profile.default_port + 11_000);
-            assert_eq!(settings.api_key.as_deref(), Some("yaml-read-key"));
+            assert_eq!(settings.metrics_port, Some(9099));
+            assert!(settings.api_key.is_none());
 
             let _ = fs::remove_file(config_path);
             let _ = fs::remove_file(hosts_path);
@@ -381,7 +391,7 @@ mod tests {
     #[test]
     fn deployer_values_beat_environment_and_resolve_hosts() {
         for profile in PROFILES {
-            let (config_path, hosts_path) = deployer_files(profile, None);
+            let (config_path, hosts_path) = deployer_files(profile, Some("yaml-read-key"));
             let args = parse(
                 profile,
                 &[
@@ -402,8 +412,9 @@ mod tests {
             .expect("settings should load");
 
             assert_eq!(settings.store_url, "http://203.0.113.9:8090");
+            assert_eq!(settings.metrics_port, Some(9090));
             assert_eq!(settings.port, profile.default_port + 10_000);
-            assert!(settings.api_key.is_none());
+            assert_eq!(settings.api_key.as_deref(), Some("yaml-read-key"));
 
             let _ = fs::remove_file(config_path);
             let _ = fs::remove_file(hosts_path);

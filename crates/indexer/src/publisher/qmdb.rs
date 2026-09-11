@@ -458,7 +458,7 @@ where
     pub async fn build_queued_finalized_upload<E, S>(
         state_writer_next: u64,
         transaction_writer_next: u64,
-        block: &EngineBlock<H, P>,
+        block: Arc<EngineBlock<H, P>>,
         databases: &DatabaseReaders<E, H, commonware_storage::translator::EightCap, S>,
     ) -> Result<QueuedFinalizedUpload<H, P>, PublishError>
     where
@@ -467,8 +467,7 @@ where
     {
         let state_end = block.header.state_range.end();
         validate_writer_range(state_writer_next, state_end, block.header.height)?;
-        transaction_upload_end(transaction_writer_next, block)?;
-        let block = Arc::new(block.clone());
+        transaction_upload_end(transaction_writer_next, &block)?;
         let state_delta =
             build_state_delta::<E, H, P, S>(state_writer_next, &block, &databases.0).await?;
 
@@ -1973,6 +1972,61 @@ mod tests {
         });
     }
 
+    #[tokio::test]
+    async fn queued_upload_admission_errors_preserve_cursors() {
+        for (state_next, transaction_next) in [(1, 0), (0, 1), (0, 0)] {
+            let (tx, rx) = tokio::sync::mpsc::channel(1);
+            drop(rx);
+            let publisher = Publisher::<Sha256, ed25519::PublicKey> {
+                state_next_location: tokio::sync::Mutex::new(state_next),
+                transaction_next_location: tokio::sync::Mutex::new(transaction_next),
+                prepare_tx: Some(tx),
+                prepare_join: None,
+                commit_join: None,
+                _marker: std::marker::PhantomData,
+            };
+            let upload = test_queued_upload();
+            let error = publisher
+                .enqueue_queued_finalized(upload)
+                .await
+                .err()
+                .expect("admission must fail");
+            assert_eq!(
+                publisher.next_locations().await,
+                (state_next, transaction_next)
+            );
+            if state_next == 0 && transaction_next == 0 {
+                assert!(matches!(error, PublishError::CommitterStopped { .. }));
+            } else {
+                assert!(matches!(error, PublishError::WriterOutOfSync { .. }));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_upload_moves_delta_to_preparer() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let publisher = Publisher::<Sha256, ed25519::PublicKey> {
+            state_next_location: tokio::sync::Mutex::new(0),
+            transaction_next_location: tokio::sync::Mutex::new(0),
+            prepare_tx: Some(tx),
+            prepare_join: None,
+            commit_join: None,
+            _marker: std::marker::PhantomData,
+        };
+        let upload = test_queued_upload();
+        let block = upload.block();
+        let delta = Arc::as_ptr(&upload.state_delta);
+        let _completion = publisher
+            .enqueue_queued_finalized(upload)
+            .await
+            .expect("admission succeeds");
+        let pending = rx.recv().await.expect("preparer receives upload");
+        assert_eq!(Arc::as_ptr(&pending.upload.state_delta), delta);
+        assert_eq!(Arc::strong_count(&pending.upload.state_delta), 1);
+        assert_eq!(pending.upload.height(), block.header.height);
+    }
+
     #[test]
     fn queued_upload_completes_through_publisher() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
@@ -2277,14 +2331,19 @@ mod tests {
         E: BufferPooler + Storage + Clock + Metrics + Spawner + Send + Sync + 'static,
     {
         let (state_next, transaction_next) = publisher.next_locations().await;
+        let block = Arc::new(block.clone());
         let upload = Publisher::build_queued_finalized_upload(
             state_next,
             transaction_next,
-            block,
+            block.clone(),
             &databases.readers(),
         )
         .await
         .expect("queued upload builds");
+        assert!(
+            Arc::ptr_eq(&block, &upload.block),
+            "queued upload must retain the shared block"
+        );
         let state_start = upload.state_start();
         let transaction_start = upload.transaction_start();
         let completion = publisher

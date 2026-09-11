@@ -88,8 +88,10 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
     if indexer_enabled(args) {
         info!(
             store_url = %store_url(remote),
-            metadata_indexer_port = remote.metadata_indexer_port,
-            qmdb_indexer_port = remote.qmdb_indexer_port,
+            metadata_indexer_url = ?remote.metadata_indexer_url,
+            metadata_indexer_port = ?local_metadata_indexer(args, remote).then_some(remote.metadata_indexer_port),
+            qmdb_indexer_url = ?remote.qmdb_indexer_url,
+            qmdb_indexer_port = ?local_qmdb_indexer(args, remote).then_some(remote.qmdb_indexer_port),
             "configured shared remote indexer services"
         );
     }
@@ -316,6 +318,7 @@ fn chain_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<Chai
 
 fn metadata_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<AdapterConfig> {
     local_metadata_indexer(args, remote).then(|| AdapterConfig {
+        metrics_port: Some(METRICS_PORT),
         port: remote.metadata_indexer_port,
         chain_indexer_url: store_url(remote),
         api_key: remote.adapter_store_api_key.clone(),
@@ -324,6 +327,7 @@ fn metadata_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<A
 
 fn qmdb_indexer_config(args: &GenerateArgs, remote: &RemoteArgs) -> Option<AdapterConfig> {
     local_qmdb_indexer(args, remote).then(|| AdapterConfig {
+        metrics_port: Some(METRICS_PORT),
         port: remote.qmdb_indexer_port,
         chain_indexer_url: store_url(remote),
         api_key: remote.adapter_store_api_key.clone(),
@@ -340,9 +344,6 @@ fn build_deployer_config(
 ) -> aws::Config {
     let regions = &remote.regions;
     let indexer_enabled = indexer_enabled(args);
-    let has_local_exoware_services = local_chain_indexer(args, remote)
-        || local_metadata_indexer(args, remote)
-        || local_qmdb_indexer(args, remote);
     let shared_indexer_region = regions[0].clone();
     let mut instances: Vec<aws::InstanceConfig> = validators
         .iter()
@@ -373,8 +374,8 @@ fn build_deployer_config(
             name: secondary.public_key_hex.clone(),
             region,
             availability_zone_group: (secondary.config.indexer.is_some()
-                && has_local_exoware_services)
-                .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
+                && local_chain_indexer(args, remote))
+            .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
             instance_type: remote.instance_type.clone(),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
@@ -892,10 +893,18 @@ mod tests {
 
             if let Some(config) = &metadata {
                 assert_eq!(config.chain_indexer_url, STORE_URL, "{}", case.name);
+                assert_eq!(
+                    config.metrics_port,
+                    Some(commonware_deployer::aws::METRICS_PORT)
+                );
                 assert_eq!(config.api_key.as_deref(), Some(READER_KEY), "{}", case.name);
             }
             if let Some(config) = &qmdb {
                 assert_eq!(config.chain_indexer_url, STORE_URL, "{}", case.name);
+                assert_eq!(
+                    config.metrics_port,
+                    Some(commonware_deployer::aws::METRICS_PORT)
+                );
                 assert_eq!(config.api_key.as_deref(), Some(READER_KEY), "{}", case.name);
             }
 
@@ -944,8 +953,7 @@ mod tests {
                 .expect("indexer secondary should be provisioned");
             assert_eq!(
                 indexer_instance.availability_zone_group.as_deref(),
-                (!case.remote_metadata || !case.remote_qmdb)
-                    .then_some(EXOWARE_AVAILABILITY_ZONE_GROUP),
+                None,
                 "{}",
                 case.name
             );

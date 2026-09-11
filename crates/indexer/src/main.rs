@@ -426,7 +426,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operational_routes_report_managed_store_readiness() {
+    async fn operational_routes_return_static_ok() {
         for path in ["/health", "/ready"] {
             let response = operational_routes()
                 .oneshot(

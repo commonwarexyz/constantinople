@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+unset CONSTANTINOPLE_STORE_API_KEY CONSTANTINOPLE_ADAPTER_STORE_API_KEY
 cd "$(dirname "${BASH_SOURCE[0]}")"
 source ./deploy.sh
 
@@ -103,8 +104,12 @@ prepare_case \
     --qmdb-url https://qmdb.example.com \
     --store-api-key writer-key \
     --adapter-store-api-key reader-key
-assert_pair --chain-indexer-api-key writer-key "${REMOTE_ARGS[@]}"
-assert_pair --adapter-store-api-key reader-key "${REMOTE_ARGS[@]}"
+assert_equal writer-key "$STORE_API_KEY" "writer credential"
+assert_equal reader-key "$ADAPTER_STORE_API_KEY" "reader credential"
+assert_excludes writer-key "${REMOTE_ARGS[@]}"
+assert_excludes reader-key "${REMOTE_ARGS[@]}"
+assert_excludes --chain-indexer-api-key "${REMOTE_ARGS[@]}"
+assert_excludes --adapter-store-api-key "${REMOTE_ARGS[@]}"
 assert_excludes metadata-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_excludes qmdb-indexer-amd-binary "${BINARY_TARGETS[@]}"
 assert_equal 2 "${#BINARY_TARGETS[@]}" "remote adapter binary count"
@@ -116,6 +121,25 @@ fi
 if (prepare_case --qmdb-url https://qmdb.example.com) >/dev/null 2>&1; then
     fail "QMDB origin without Store origin should fail"
 fi
+
+for option in --store-api-key --adapter-store-api-key; do
+    if (prepare_case "$option" secret-key) >/dev/null 2>&1; then
+        fail "Store credentials without a Store origin should fail"
+    fi
+done
+
+(
+    export CONSTANTINOPLE_STORE_API_KEY=environment-writer
+    export CONSTANTINOPLE_ADAPTER_STORE_API_KEY=environment-reader
+    prepare_case --store-url https://store.example.com
+    assert_equal environment-writer "$STORE_API_KEY" "environment writer"
+    assert_equal environment-reader "$ADAPTER_STORE_API_KEY" "environment reader"
+    assert_excludes environment-writer "${REMOTE_ARGS[@]}"
+    assert_excludes environment-reader "${REMOTE_ARGS[@]}"
+    if (prepare_case) >/dev/null 2>&1; then
+        fail "environment credentials require a Store origin"
+    fi
+)
 
 for option in --store-url --sql-url --qmdb-url; do
     for value in \

@@ -146,8 +146,7 @@ mod test {
 
         fn seal<H: Hasher<Digest = Self::SealDigest>>(self, hasher: &mut H) -> Sealed<Self, H> {
             hasher.update(&self.0);
-            let (next, digest) = core::mem::take(hasher).finalize();
-            *hasher = next;
+            let digest = crate::finalize_in_place(hasher);
             Sealed::new_unchecked(self, digest)
         }
     }

@@ -156,7 +156,7 @@ impl HttpBody for TrackedBody {
         context: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let poll = Pin::new(&mut self.inner).poll_frame(context);
-        if poll.is_ready() && matches!(poll, Poll::Ready(None)) {
+        if matches!(poll, Poll::Ready(None)) {
             self.guard.take();
         }
         poll

@@ -48,9 +48,7 @@ where
     /// Hashes the encoded header to produce a digest.
     pub fn hash_slow<H: Hasher<Digest = D>>(&self, hasher: &mut H) -> D {
         hasher.update(self.encode().as_ref());
-        let (next, digest) = core::mem::take(hasher).finalize();
-        *hasher = next;
-        digest
+        crate::finalize_in_place(hasher)
     }
 }
 

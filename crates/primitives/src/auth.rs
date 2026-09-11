@@ -358,7 +358,7 @@ impl From<ed25519::Signature> for TransactionSignature {
 /// Verifies mixed transaction signatures with separate scheme groups.
 pub struct TransactionBatchVerifier {
     ed25519: ed25519::Batch,
-    ed25519_len: usize,
+    has_ed25519: bool,
     secp256r1: Vec<Secp256r1Item>,
 }
 
@@ -376,7 +376,7 @@ impl TransactionBatchVerifier {
     pub fn new(capacity: usize) -> Self {
         Self {
             ed25519: ed25519::Batch::new(capacity),
-            ed25519_len: 0,
+            has_ed25519: false,
             secp256r1: Vec::new(),
         }
     }
@@ -400,9 +400,7 @@ impl TransactionBatchVerifier {
                 TransactionSignature::Ed25519 { signature, .. },
             ) => {
                 let added = self.ed25519.add(namespace, message, key, signature);
-                if added {
-                    self.ed25519_len += 1;
-                }
+                self.has_ed25519 |= added;
                 added
             }
             (
@@ -431,10 +429,12 @@ impl TransactionBatchVerifier {
     pub fn verify<R: CryptoRng>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
         let Self {
             ed25519,
-            ed25519_len,
+            has_ed25519,
             secp256r1,
         } = self;
-        if ed25519_len > 0 && !ed25519.verify(rng, strategy) {
+
+        // The upstream empty-batch rejection must not reject secp256r1-only blocks.
+        if has_ed25519 && !ed25519.verify(rng, strategy) {
             return false;
         }
 

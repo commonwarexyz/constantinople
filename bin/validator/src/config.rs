@@ -606,7 +606,8 @@ mod tests {
             .expect("clock should be after epoch")
             .as_nanos();
         let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("{prefix}-{unique}-{counter}{suffix}"))
+        let process = std::process::id();
+        std::env::temp_dir().join(format!("{prefix}-{process}-{unique}-{counter}{suffix}"))
     }
 
     /// Test fixture: a validator cluster with `primary_count` primaries and

@@ -126,12 +126,21 @@ where
 
     async fn finalized(
         &mut self,
-        _context: (E, Self::Context),
+        context: (E, Self::Context),
         block: &Self::Block,
         databases: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
         if let Some(hook) = &self.finalized_hook {
-            hook(block, &databases).await;
+            // Proof construction must not occupy an async worker or outlive the pre-prune hook.
+            let hook = hook.clone();
+            let block = Arc::new(block.clone());
+            context
+                .0
+                .child("finalized_hook")
+                .shared(true)
+                .spawn(move |_| async move { hook(block, &databases).await })
+                .await
+                .expect("finalized hook task failed");
         }
     }
 }

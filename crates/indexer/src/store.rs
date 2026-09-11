@@ -223,6 +223,10 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "{case} must execute exactly one child test"
+        );
     }
 
     #[test]
@@ -239,8 +243,8 @@ mod tests {
         assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
     }
 
-    #[tokio::test]
-    async fn writer_client_builds_in_runtime() {
+    #[test]
+    fn writer_client_builds() {
         writer_store_client("https://store.example.com", Some("write-key"))
             .expect("writer client should build");
     }

@@ -488,24 +488,42 @@ external Store URL.
 | both adapter flags | none |
 
 The validator writer and local adapter readers use independent credentials.
-`--chain-indexer-api-key` is serialized only into the owning indexer
+`--store-api-key` (also accepted as `--chain-indexer-api-key`) or
+`CONSTANTINOPLE_STORE_API_KEY` is serialized only into the owning indexer
 secondary. It authenticates Simplex, SQL, and QMDB uploads plus writer
 recovery reads. A write-only credential is sufficient when Store reads are
 open. When Store reads require authentication, this credential must have both
 read and write scopes. Supporting separate writer read and write credentials
-is deferred. `--adapter-store-api-key` is serialized only into locally managed
-adapter configs. Remote adapters receive neither value. An omitted key
+is deferred. `--adapter-store-api-key` or
+`CONSTANTINOPLE_ADAPTER_STORE_API_KEY` is serialized only into locally managed
+adapter configs. Both credentials require an explicit external Store URL. Remote adapters receive neither value. An omitted key
 preserves the SDK `EXOWARE_API_KEY` fallback.
 
 The adapter binaries also support environment-only startup through
 `CONSTANTINOPLE_STORE_URL` and `CONSTANTINOPLE_PORT`. Runtime values resolve
 from an explicit CLI value, then deployer YAML, then the environment, then a
 compiled default or missing-value error. A deployer YAML API key takes
-precedence over `EXOWARE_API_KEY`.
+precedence over `EXOWARE_API_KEY`. Overriding the Store URL through the CLI
+drops the YAML credential. The SDK environment fallback still applies.
+
+Writers use four HTTP/2 connections per origin and compress requests with Zstd.
+External HTTPS proxies must negotiate h2 through ALPN. Plain HTTP must support
+prior-knowledge h2c. Adapter reads may still use HTTP/1.1.
+
+Balanced writer RPCs use the SDK's 30-second deadline as the timeout and retry
+threshold. Failed commits retry the same batch. A Store that consistently takes
+longer will stall publication until requests complete within that deadline.
 
 Each adapter probes Store readiness once before binding. After startup,
-`/health` and `/ready` return static success. `/metrics` shares the service
-port and excludes health, readiness, and metrics requests from its counters.
+`/health` and `/ready` return static success. These routes indicate completed
+startup and do not track subsequent Store outages.
+
+`--metrics-port` or YAML `metrics_port` moves `/metrics` to a separate listener.
+Commonware remote bundles set it to 9090 for the monitoring host's Prometheus
+scrapes and omit metrics from the public router. When unset, metrics share the
+service port for deployments that scrape it there. That shared endpoint has the
+service's permissive CORS policy. Health, readiness, metrics, and CORS preflight
+requests are excluded from adapter request counters.
 
 The deployer opens local shared-service ports globally because
 `commonware-deployer` owns one deployment-wide port list. Remote adapter flags
@@ -514,20 +532,24 @@ remove their matching ports from that list.
 ### Deployment Script with External Services
 
 The repository deployment script accepts the public Store and adapter
-origins directly.
+origins directly. Node is required for URL validation and the deployment shell
+tests. Credentials can be entered without putting them in shell history.
 
 ```sh
+read -rs -p "Store writer API key: " CONSTANTINOPLE_STORE_API_KEY
+export CONSTANTINOPLE_STORE_API_KEY
 ./deploy.sh \
   --store-url https://store.example.com \
-  --store-api-key writer-key \
   --sql-url https://sql.example.com \
   --qmdb-url https://qmdb.example.com
 ```
 
-`--sql-url` and `--qmdb-url` each require `--store-url`. The script forwards
-the Store key only as `--chain-indexer-api-key`. It forwards
-`--adapter-store-api-key` only to the deployer generator, which writes it only
-for adapters that remain local.
+`--sql-url` and `--qmdb-url` each require `--store-url`, as do credentials.
+The script passes credentials to the generator through its environment.
+`CONSTANTINOPLE_ADAPTER_STORE_API_KEY` supplies the separate local-adapter key.
+Explicit credential flags remain accepted, but their values are visible in the
+invoking process arguments. Prefer environment inputs. Generated YAML contains
+the credentials needed by each service.
 
 Remote adapter origins are exported verbatim to `VITE_SQL_URL` and
 `VITE_QMDB_URL`. A missing adapter origin is constructed from its generated
