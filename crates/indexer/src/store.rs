@@ -33,7 +33,7 @@ pub(crate) fn writer_store_client(
 ) -> Result<StoreClient, StoreClientBuildError> {
     store_client_builder(url, api_key)
         .balanced_http2_transport(BalancedHttp2Config::default())
-        .connect_request_compression(ConnectRequestCompression::Zstd)
+        .connect_request_compression(ConnectRequestCompression::Zstd { level: -1 })
         .build()
 }
 

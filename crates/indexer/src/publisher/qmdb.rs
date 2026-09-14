@@ -71,13 +71,10 @@ const STATE_OPERATION_CODEC_VERSION: u16 = 1;
 const TRANSACTION_OPERATION_CODEC_VERSION: u16 = 1;
 const MAX_BUFFERED_UPLOADS: usize = 64;
 
-// A 32 MiB proposal can expand beyond the Store's 256 MiB request limit.
-// Reserve 32 bytes per row for protobuf tags and lengths and leave room for
-// the request envelope and compression overhead.
+// Leave transport headroom and bound each request's encoding allocations.
 const DATA_REQUEST_BYTES: usize = 128 * 1024 * 1024;
-const ROW_WIRE_OVERHEAD: usize = 32;
 
-// The protobuf decoder separately limits repeated-entry allocations to 32 MiB.
+// Limit serial per-row Store work independently of request bytes.
 const DATA_REQUEST_ROWS: usize = 250_000;
 
 // Bound request encoding and compression allocations while other blocks upload.
@@ -569,6 +566,8 @@ pub enum PublishError {
     Qmdb(#[from] QmdbError),
     #[error("Store client error due to {0}")]
     Store(#[from] ClientError),
+    #[error("failed to split finalized index data due to {0}")]
+    Split(#[from] exoware_sdk::SplitError),
     #[error("failed to configure SQL metadata schema due to {0}")]
     SqlSchema(String),
     #[error("failed to stage SQL metadata rows due to {0}")]
@@ -938,7 +937,6 @@ fn spawn_data_commit<Cx, H, P, S>(
     // Supervise preparation and data commits without holding a blocking
     // thread while waiting for their completion.
     let commit = context.spawn(move |context| async move {
-        let prepare_store = store.clone();
         let prepare_metrics = metrics.clone();
         let prepare = context
             .child("prepare")
@@ -952,7 +950,7 @@ fn spawn_data_commit<Cx, H, P, S>(
                     upload,
                     &prepare_metrics,
                 )?;
-                let batches = data_batches(batch, &prepare_store, DATA_REQUEST_BYTES)?;
+                let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES)?;
                 Ok::<_, PublishError>((batches, state, transactions))
             });
         let (batches, state, transactions) = prepare
@@ -1008,44 +1006,6 @@ async fn commit_chunks<Cx: Spawner>(
     Ok(())
 }
 
-fn data_batches(
-    batch: StoreWriteBatch,
-    store: &StoreClient,
-    max_bytes: usize,
-) -> Result<Vec<StoreWriteBatch>, ClientError> {
-    let row_bytes = |(key, value): &(Key, Bytes)| key.len() + value.len() + ROW_WIRE_OVERHEAD;
-    if batch.len() <= DATA_REQUEST_ROWS
-        && batch.entries().iter().map(row_bytes).sum::<usize>() <= max_bytes
-    {
-        return Ok(vec![batch]);
-    }
-
-    // Entries already contain physical keys. An empty prefix preserves them
-    // when staging smaller requests without copying the value buffers.
-    let physical = PrefixedStoreClient::empty(store.clone());
-    let mut batches = Vec::new();
-    let mut current = StoreWriteBatch::new();
-    let mut bytes = 0;
-    for entry @ (key, value) in batch.entries() {
-        let size = row_bytes(entry);
-        if size > max_bytes {
-            return Err(ClientError::WireFormat(
-                "finalized index row exceeds request budget".to_string(),
-            ));
-        }
-        if bytes + size > max_bytes || current.len() == DATA_REQUEST_ROWS {
-            batches.push(std::mem::take(&mut current));
-            bytes = 0;
-        }
-        current.push(&physical, key, value.clone())?;
-        bytes += size;
-    }
-    if !current.is_empty() {
-        batches.push(current);
-    }
-    Ok(batches)
-}
-
 fn prepare_data_batch<H, P, S>(
     state_client: PrefixedStoreClient,
     transaction_client: PrefixedStoreClient,
@@ -1061,12 +1021,6 @@ where
     S: Strategy,
 {
     let expansion_started = Instant::now();
-    let metadata_rows = encode_metadata_rows::<H, P>(
-        &upload.block,
-        upload.finalized_ts_micros,
-        &upload.state,
-        &upload.transactions,
-    )?;
     let state = prepare_authenticated_range::<QmdbFamily, H, StateOperation, S>(
         &as_authenticated_range(&upload.state),
         &upload.block.header.state_root,
@@ -1078,6 +1032,12 @@ where
         &upload.block.header.transactions_root,
         &(),
         &strategy,
+    )?;
+    let metadata_rows = encode_metadata_rows::<H, P>(
+        &upload.block,
+        upload.finalized_ts_micros,
+        &upload.state,
+        &upload.transactions,
     )?;
     metrics
         .expansion_duration
@@ -1103,7 +1063,8 @@ fn as_authenticated_range<D: Digest>(
 ) -> AuthenticatedOperationRange<'_, D, QmdbFamily> {
     AuthenticatedOperationRange {
         start_location: Location::new(range.start),
-        proof: &range.proof,
+        end_location: Location::new(range.end),
+        inactive_peaks: range.proof.inactive_peaks,
         pinned_nodes: &range.pinned_nodes,
         encoded_operations: &range.operations,
     }
@@ -1573,7 +1534,7 @@ mod tests {
                     .unwrap();
             }
             let expected = batch.entries().to_vec();
-            let batches = data_batches(batch, &physical, 8 + 1024 + ROW_WIRE_OVERHEAD).unwrap();
+            let batches = batch.split(1, DATA_REQUEST_BYTES).unwrap();
             assert_eq!(batches.len(), count);
             let mut commit = context.spawn(move |context| async move {
                 commit_chunks(context, &physical, &metrics, batches).await
@@ -1955,6 +1916,60 @@ mod tests {
     }
 
     #[test]
+    fn data_preparation_authenticates_before_metadata_decoding() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = StoreClient::new("http://localhost:1");
+            let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
+            let metrics = super::super::PublisherMetrics::new(&context);
+            let state_operations = encode_operations(&[
+                StateOperation::CommitFloor(None, Location::new(0)),
+                StateOperation::CommitFloor(None, Location::new(1)),
+            ]);
+            let transaction_operations = encode_operations(&[
+                TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
+                TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
+            ]);
+
+            for corrupt_state in [true, false] {
+                let mut state = queued_range(&state_operations, 1, 2);
+                let mut transactions = queued_range(&transaction_operations, 1, 2);
+                let block = test_block(1, &state, &transactions);
+
+                // Invalid bytes must fail authentication before metadata tries to decode them.
+                let range = if corrupt_state {
+                    &mut state
+                } else {
+                    &mut transactions
+                };
+                range.operations[0].clear();
+
+                let error = prepare_data_batch(
+                    state_qmdb_client(&store).unwrap(),
+                    transactions_qmdb_client(&store).unwrap(),
+                    schema.clone(),
+                    Sequential,
+                    PendingUpload {
+                        height: 1,
+                        block,
+                        finalized_ts_micros: 1,
+                        state,
+                        transactions,
+                        persisted: None,
+                        published: None,
+                    },
+                    &metrics,
+                )
+                .unwrap_err();
+
+                assert!(matches!(
+                    error,
+                    PublishError::Qmdb(QmdbError::ProofVerification { .. })
+                ));
+            }
+        });
+    }
+
+    #[test]
     fn data_requests_preserve_rows_and_respect_byte_budget() {
         let store = StoreClient::new("http://localhost:1");
         let client = state_qmdb_client(&store).unwrap();
@@ -1966,8 +1981,11 @@ mod tests {
                 .unwrap();
         }
         let expected = batch.entries().to_vec();
-        let row_size = expected[0].0.len() + 64 + ROW_WIRE_OVERHEAD;
-        let requests = data_batches(batch.clone(), &store, row_size * 2).unwrap();
+        let row_size = batch.encoded_len() / batch.len();
+        let requests = batch
+            .clone()
+            .split(DATA_REQUEST_ROWS, row_size * 2)
+            .unwrap();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0].len(), 2);
         assert_eq!(requests[1].len(), 1);
@@ -1979,24 +1997,33 @@ mod tests {
             expected.iter().collect::<Vec<_>>()
         );
         assert_eq!(
-            data_batches(batch.clone(), &store, row_size * 3)
+            batch
+                .clone()
+                .split(DATA_REQUEST_ROWS, row_size * 3)
                 .unwrap()
                 .len(),
             1
         );
-        assert!(data_batches(batch, &store, row_size - 1).is_err());
+        assert_eq!(
+            batch.split(DATA_REQUEST_ROWS, row_size - 1).unwrap_err(),
+            exoware_sdk::SplitError::EntryTooLarge {
+                index: 0,
+                encoded_bytes: row_size,
+                max_encoded_bytes: row_size - 1,
+            }
+        );
     }
 
     #[test]
-    fn data_requests_bound_decoder_entry_allocations() {
+    fn data_requests_bound_rows_independently_of_bytes() {
         let store = StoreClient::new("http://localhost:1");
-        let client = PrefixedStoreClient::empty(store.clone());
+        let client = PrefixedStoreClient::empty(store);
         let key = Key::from(vec![0; 32]);
         let mut batch = StoreWriteBatch::new();
         for _ in 0..=DATA_REQUEST_ROWS {
             batch.push(&client, &key, Bytes::new()).unwrap();
         }
-        let batches = data_batches(batch, &store, DATA_REQUEST_BYTES).unwrap();
+        let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES).unwrap();
         assert_eq!(batches.len(), 2);
         assert_eq!(batches[0].len(), DATA_REQUEST_ROWS);
         assert_eq!(batches[1].len(), 1);
@@ -2102,7 +2129,7 @@ mod tests {
                 "proposal_bytes={body_bytes} rows={} materialized_bytes={materialized_bytes}",
                 batch.len()
             );
-            let batches = data_batches(batch, &physical, DATA_REQUEST_BYTES).unwrap();
+            let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES).unwrap();
             eprintln!("data_requests={}", batches.len());
             if proposal_mib == 32 {
                 assert!(batches.len() > 1);
