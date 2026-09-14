@@ -118,17 +118,7 @@ where
         self.try_submit_in_lane(SubmissionLane::Foreground, batch_id, digests, transactions)
     }
 
-    /// Blocking batch submission through the background lane.
-    pub(super) fn try_submit_background(
-        &self,
-        batch_id: String,
-        digests: Vec<H::Digest>,
-        transactions: Vec<VerifiedTransaction<H>>,
-    ) -> Option<oneshot::Receiver<TxStatus>> {
-        self.try_submit_in_lane(SubmissionLane::Background, batch_id, digests, transactions)
-    }
-
-    fn try_submit_in_lane(
+    pub(super) fn try_submit_in_lane(
         &self,
         lane: SubmissionLane,
         batch_id: String,

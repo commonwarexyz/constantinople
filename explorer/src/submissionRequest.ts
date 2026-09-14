@@ -1,3 +1,5 @@
+// Allow a margin over the relayer's ten-second finality wait. Upload and
+// decoding can exhaust it first, so timeout still means uncertain delivery.
 export const SUBMISSION_TIMEOUT_MS = 12_000;
 
 export function boundedSubmissionSignal(

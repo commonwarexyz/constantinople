@@ -120,7 +120,7 @@ impl<D: Display> StoredBatchStatus<D> {
 
 /// Mempool actor configuration.
 pub struct Config<St: Strategy> {
-    /// Maximum total bytes the pool will hold.
+    /// Maximum total bytes the pool will hold. Must exceed `max_propose_bytes`.
     pub max_pool_bytes: usize,
     /// Maximum encoded signed transaction bytes per proposal and admitted batch.
     /// Callers must reserve block framing from their encoded-block budget
@@ -673,6 +673,10 @@ where
         receiver: ActorReceiver<C, P, H>,
         account_reader: AccountReaderCell,
     ) -> Self {
+        assert!(
+            config.max_pool_bytes > config.max_propose_bytes,
+            "pool must leave capacity for background submissions"
+        );
         Self {
             context: ContextCell::new(context),
             mailbox,
@@ -811,16 +815,12 @@ where
                             transactions,
                             total_bytes,
                         };
-                        match lane {
-                            SubmissionLane::Foreground => {
-                                foreground_pool.bytes += total_bytes;
-                                foreground_pool.entries.push_back(entry);
-                            }
-                            SubmissionLane::Background => {
-                                background_pool.bytes += total_bytes;
-                                background_pool.entries.push_back(entry);
-                            }
-                        }
+                        let pool = match lane {
+                            SubmissionLane::Foreground => &mut foreground_pool,
+                            SubmissionLane::Background => &mut background_pool,
+                        };
+                        pool.bytes += total_bytes;
+                        pool.entries.push_back(entry);
                     }
                 }
                 Message::QueryStatus { batch_id, response } => {
@@ -923,6 +923,34 @@ mod tests {
         sync::{Arc, OnceLock},
     };
     use tokio::sync::{mpsc, oneshot};
+
+    #[test]
+    #[should_panic(expected = "pool must leave capacity for background submissions")]
+    fn background_requires_capacity_beyond_foreground_reserve() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (mailbox, receiver) =
+                Mailbox::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::channel(1);
+            let config = Config {
+                max_pool_bytes: 1_000,
+                max_propose_bytes: 1_000,
+                namespace: TRANSACTION_NAMESPACE,
+                drop_grace_blocks: 2,
+                strategy: Sequential,
+                public_key_cache: PublicKeyCache::new(
+                    context.child("public_key_cache"),
+                    NZUsize!(16),
+                ),
+            };
+
+            let _actor = Actor::new(
+                context,
+                config,
+                mailbox,
+                receiver,
+                Arc::new(OnceLock::new()),
+            );
+        });
+    }
 
     #[test]
     fn terminal_batch_statuses_preserve_ingest_truth() {

@@ -72,10 +72,6 @@ export function reserveNonces(state: NonceState, nonces: Iterable<bigint>): Nonc
     return reserved;
 }
 
-export function nonceStatesEqual(left: NonceState, right: NonceState): boolean {
-    return left.base === right.base && left.bitmap === right.bitmap;
-}
-
 function consumeBaseNonce(state: NonceState): NonceState | null {
     let advance = 1n;
     while (advance <= NONCE_BITMAP_CAPACITY) {
