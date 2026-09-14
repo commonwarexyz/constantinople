@@ -20,6 +20,7 @@ use constantinople_primitives::{Account, Nonce, SignedTransaction, TransactionPu
 use futures::{StreamExt, stream::FuturesUnordered};
 use serde::Serialize;
 use std::{
+    cmp::Reverse,
     net::SocketAddr,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -34,7 +35,9 @@ const TARGET_LEADER_HEADER: &str = "x-constantinople-relayer-target-leader";
 const LEADER_FANOUT_HEADER: &str = "x-constantinople-relayer-leader-fanout";
 const SINGLE_TRANSACTION_FANOUT: usize = 4;
 const BATCH_FANOUT: usize = 2;
-const LEADER_REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
+const LEADER_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+// The Explorer allows twelve seconds including upload and decoding. Either
+// deadline leaves uncertain delivery to digest reconciliation.
 const CLIENT_RESPONSE_TIMEOUT: Duration = Duration::from_secs(10);
 const LEADER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -121,7 +124,7 @@ struct AppState<St: Strategy> {
     max_batch_bytes: usize,
     account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     view_clock: ViewClock,
-    blocking_http: reqwest::Client,
+    http: reqwest::Client,
     client_response_timeout: Duration,
     leader_response_timeout: Duration,
     strategy: St,
@@ -150,10 +153,10 @@ pub async fn serve<St: Strategy>(config: ServerConfig<St>) {
         max_batch_bytes: config.max_batch_bytes,
         account_reader: config.account_reader,
         view_clock: config.view_clock,
-        blocking_http: reqwest::Client::builder()
-            .connect_timeout(LEADER_REQUEST_TIMEOUT)
+        http: reqwest::Client::builder()
+            .connect_timeout(LEADER_CONNECT_TIMEOUT)
             .build()
-            .expect("relayer blocking HTTP client configuration is valid"),
+            .expect("relayer HTTP client configuration is valid"),
         client_response_timeout: CLIENT_RESPONSE_TIMEOUT,
         leader_response_timeout: LEADER_RESPONSE_TIMEOUT,
         strategy: config.strategy,
@@ -238,7 +241,7 @@ async fn submit_to_pinned_leader<St: Strategy>(
     let Some(leader) = leader_by_id(&state.leaders, target).cloned() else {
         return (StatusCode::BAD_REQUEST, String::new());
     };
-    submit_to_blocking_leader(&state.blocking_http, &leader, body).await
+    submit_background_to_leader(&state.http, &leader, body).await
 }
 
 async fn submit_to_public_leaders<St: Strategy>(
@@ -250,10 +253,9 @@ async fn submit_to_public_leaders<St: Strategy>(
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     }
 
-    let views = state.view_clock.current_view.subscribe();
-    let view = *views.borrow();
+    let view = *state.view_clock.current_view.borrow();
     let targets = next_leaders(&state.leaders, view, fanout);
-    let http = state.blocking_http.clone();
+    let http = state.http.clone();
     let leader_response_timeout = state.leader_response_timeout;
     let (response_tx, response_rx) = oneshot::channel();
 
@@ -291,8 +293,9 @@ async fn forward_to_targets(
         })
         .collect::<FuturesUnordered<_>>();
     let mut response_tx = Some(response_tx);
-    let mut partial = None;
-    let mut deterministic = None;
+    let mut partial: Option<(u64, Reverse<u64>, u64)> = None;
+    let mut rejection = None;
+    let mut rejected = 0;
     let mut dropped = 0;
 
     while let Some(result) = sends.next().await {
@@ -300,33 +303,36 @@ async fn forward_to_targets(
             LeaderResponse::Terminal(status @ TxStatus::Finalized { .. }) => {
                 send_once(&mut response_tx, status_response(status));
             }
-            LeaderResponse::Terminal(status @ TxStatus::PartiallyFinalized { .. }) => {
-                partial = Some(preferred_partial(partial, status));
+            LeaderResponse::Terminal(TxStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            }) => {
+                let candidate = (included, Reverse(filtered), height);
+                partial = Some(partial.map_or(candidate, |current| current.max(candidate)));
             }
             LeaderResponse::Terminal(TxStatus::Dropped) => dropped += 1,
             LeaderResponse::Deterministic(status) => {
-                deterministic = Some(status);
-                send_once(&mut response_tx, (status, String::new()));
+                rejection = Some(status);
+                rejected += 1;
             }
             LeaderResponse::Ambiguous => {}
         }
     }
 
-    let response = partial.map_or_else(
-        || {
-            deterministic.map_or_else(
-                || {
-                    if dropped == target_count {
-                        status_response(TxStatus::Dropped)
-                    } else {
-                        (StatusCode::ACCEPTED, String::new())
-                    }
-                },
-                |status| (status, String::new()),
-            )
-        },
-        status_response,
-    );
+    // One leader's rejection cannot rule out acceptance by another copy.
+    let response = match (partial, rejection) {
+        (Some((included, Reverse(filtered), height)), _) => {
+            status_response(TxStatus::PartiallyFinalized {
+                height,
+                included,
+                filtered,
+            })
+        }
+        (None, Some(status)) if rejected == target_count => (status, String::new()),
+        _ if dropped == target_count => status_response(TxStatus::Dropped),
+        _ => (StatusCode::ACCEPTED, String::new()),
+    };
     send_once(&mut response_tx, response);
 }
 
@@ -341,42 +347,6 @@ fn status_response(status: TxStatus) -> RelayResponse {
         |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
         |body| (StatusCode::OK, body),
     )
-}
-
-fn preferred_partial(current: Option<TxStatus>, candidate: TxStatus) -> TxStatus {
-    let Some(current) = current else {
-        return candidate;
-    };
-    let TxStatus::PartiallyFinalized {
-        height: current_height,
-        included: current_included,
-        filtered: current_filtered,
-    } = current
-    else {
-        unreachable!("partial aggregation stores only partial results")
-    };
-    let TxStatus::PartiallyFinalized {
-        height: candidate_height,
-        included: candidate_included,
-        filtered: candidate_filtered,
-    } = candidate
-    else {
-        unreachable!("partial aggregation receives only partial results")
-    };
-
-    if (
-        candidate_included,
-        std::cmp::Reverse(candidate_filtered),
-        candidate_height,
-    ) > (
-        current_included,
-        std::cmp::Reverse(current_filtered),
-        current_height,
-    ) {
-        candidate
-    } else {
-        current
-    }
 }
 
 async fn account<St: Strategy>(
@@ -482,7 +452,7 @@ async fn forward_to_leader(http: &reqwest::Client, leader: &Leader, body: Bytes)
     )
 }
 
-async fn submit_to_blocking_leader(
+async fn submit_background_to_leader(
     http: &reqwest::Client,
     leader: &Leader,
     body: Bytes,
@@ -671,9 +641,9 @@ mod tests {
             max_batch_bytes: DEFAULT_MAX_BATCH_BYTES,
             account_reader: Arc::new(OnceLock::new()),
             view_clock,
-            blocking_http: reqwest::Client::builder()
+            http: reqwest::Client::builder()
                 .build()
-                .expect("test blocking HTTP client configuration is valid"),
+                .expect("test HTTP client configuration is valid"),
             client_response_timeout,
             leader_response_timeout,
             strategy: commonware_parallel::Sequential,
@@ -1011,7 +981,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unpinned_preserves_deterministic_validator_rejection() {
+    async fn unpinned_rejection_does_not_resolve_an_uncertain_copy() {
         let rejected = Router::new().route(
             "/transactions",
             post(|| async { (StatusCode::BAD_REQUEST, String::new()) }),
@@ -1031,7 +1001,137 @@ mod tests {
 
         let response = submit_transactions(State(state), HeaderMap::new(), body).await;
 
-        assert_eq!(response, (StatusCode::BAD_REQUEST, String::new()));
+        assert_eq!(response, (StatusCode::ACCEPTED, String::new()));
+    }
+
+    #[tokio::test]
+    async fn unpinned_size_rejection_cannot_beat_finality() {
+        let rejected = Router::new()
+            .route(
+                "/transactions",
+                post(|_: Bytes| async { status_response(TxStatus::Dropped) }),
+            )
+            .layer(DefaultBodyLimit::max(1));
+        let finalized = terminal_router(
+            TxStatus::Finalized { height: 11 },
+            Duration::from_millis(30),
+            None,
+        );
+        let leaders = vec![
+            mock_leader("00", spawn_mock_leader(rejected).await),
+            mock_leader("01", spawn_mock_leader(finalized).await),
+        ];
+        let state = test_state(
+            leaders,
+            Duration::from_millis(200),
+            Duration::from_millis(400),
+        );
+        let body: Bytes = vec![signed_transfer(1, 0)].encode();
+
+        let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+        assert_eq!(
+            response,
+            status_response(TxStatus::Finalized { height: 11 })
+        );
+    }
+
+    #[tokio::test]
+    async fn unpinned_unanimous_rejection_is_terminal() {
+        for status in [StatusCode::BAD_REQUEST, StatusCode::PAYLOAD_TOO_LARGE] {
+            let rejected = || {
+                Router::new().route(
+                    "/transactions",
+                    post(move || async move { (status, String::new()) }),
+                )
+            };
+            let leaders = vec![
+                mock_leader("00", spawn_mock_leader(rejected()).await),
+                mock_leader("01", spawn_mock_leader(rejected()).await),
+            ];
+            let state = test_state(
+                leaders,
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            );
+            let body = vec![signed_transfer(1, 0)].encode();
+
+            let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+            assert_eq!(response, (status, String::new()));
+        }
+    }
+
+    #[tokio::test]
+    async fn unpinned_dropped_and_uncertain_remains_pending() {
+        for status in [StatusCode::OK, StatusCode::SERVICE_UNAVAILABLE] {
+            let uncertain = Router::new().route(
+                "/transactions",
+                post(move || async move { (status, "not a terminal status") }),
+            );
+            let leaders = vec![
+                mock_leader(
+                    "00",
+                    spawn_mock_leader(terminal_router(TxStatus::Dropped, Duration::ZERO, None))
+                        .await,
+                ),
+                mock_leader("01", spawn_mock_leader(uncertain).await),
+            ];
+            let state = test_state(
+                leaders,
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            );
+            let body = vec![signed_transfer(1, 0)].encode();
+
+            let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+            assert_eq!(response, (StatusCode::ACCEPTED, String::new()));
+        }
+    }
+
+    #[tokio::test]
+    async fn unpinned_partial_prefers_more_included_in_either_order() {
+        let preferred = TxStatus::PartiallyFinalized {
+            height: 7,
+            included: 3,
+            filtered: 1,
+        };
+        let other = TxStatus::PartiallyFinalized {
+            height: 9,
+            included: 2,
+            filtered: 2,
+        };
+        for outcomes in [[preferred, other], [other, preferred]] {
+            let leaders = vec![
+                mock_leader(
+                    "00",
+                    spawn_mock_leader(terminal_router(outcomes[0], Duration::ZERO, None)).await,
+                ),
+                mock_leader(
+                    "01",
+                    spawn_mock_leader(terminal_router(
+                        outcomes[1],
+                        Duration::from_millis(30),
+                        None,
+                    ))
+                    .await,
+                ),
+            ];
+            let state = test_state(
+                leaders,
+                Duration::from_millis(200),
+                Duration::from_millis(400),
+            );
+            let body = (0..4)
+                .map(|nonce| signed_transfer(1, nonce))
+                .collect::<Vec<_>>()
+                .encode();
+
+            let response = submit_transactions(State(state), HeaderMap::new(), body).await;
+
+            assert_eq!(response, status_response(preferred));
+        }
     }
 
     #[tokio::test]

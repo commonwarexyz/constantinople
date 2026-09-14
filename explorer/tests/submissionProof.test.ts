@@ -36,7 +36,7 @@ test('submission proofs discover a height through existing SQL tables and bind t
         assert.match(sql, /FROM block_meta/);
         assert.match(sql, /WHERE transactions_tip > 4/);
         assert.match(sql, /ORDER BY height ASC/);
-        return queryResult({ height: HEIGHT, transactions_tip: 7n });
+        return queryResult({ height: HEIGHT, transactions_tip: 7n, tx_count: 3n });
     });
     t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
         reads.push('certificate');
@@ -99,12 +99,14 @@ test('submission proofs reject SQL transaction bytes that do not match the reque
 test('out of order block publication retries without reporting the wrong finalization', async (t) => {
     const { body, digest } = await transaction();
     const containing = await finalizedCertificate(HEIGHT);
-    const later = await finalizedCertificate(HEIGHT + 1n, 8n, 12n);
+    const later = await finalizedCertificate(HEIGHT + 1n, 4n, 12n);
     let blockPublished = false;
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         sql.includes('FROM tx_meta')
             ? queryResult({ qmdb_location: LOCATION, body })
-            : queryResult({ height: blockPublished ? HEIGHT : HEIGHT + 1n }),
+            : queryResult(blockPublished
+                ? { height: HEIGHT, transactions_tip: 7n, tx_count: 3n }
+                : { height: HEIGHT + 1n, transactions_tip: 11n, tx_count: 3n }),
     );
     t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) =>
         height === HEIGHT.toString() ? containing : later,

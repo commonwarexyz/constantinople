@@ -9,8 +9,9 @@ use commonware_runtime::{
     Metrics as RuntimeMetrics,
     telemetry::metrics::{Counter, MetricsExt as _},
 };
+use commonware_utils::sys_rng;
 use constantinople_mempool::webserver::{SubmitError, TxStatus};
-use rand::{RngExt as _, rand_core::UnwrapErr, rngs::SysRng};
+use rand::RngExt as _;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
@@ -201,7 +202,7 @@ fn retry_backoff(failures: u32) -> Duration {
     let base = INITIAL_SUBMIT_ERROR_BACKOFF
         .saturating_mul(1 << exponent)
         .min(MAX_SUBMIT_ERROR_BACKOFF);
-    let mut rng = UnwrapErr(SysRng);
+    let mut rng = sys_rng();
     let jitter_percent = rng.random_range(75..=125);
     base.mul_f64(f64::from(jitter_percent) / 100.0)
 }

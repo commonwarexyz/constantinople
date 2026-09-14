@@ -41,6 +41,7 @@ import {
 import {
     consumeNonce,
     emptyNonceState,
+    mergeNonceStates,
     nextAvailableNonce,
     reserveNonces,
     type NonceState,
@@ -73,6 +74,7 @@ import {
     normalizeSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
+    selectReconciliations,
     shouldReconcileTransaction,
     type BlockCertificateState,
     type SubmittedTransaction,
@@ -142,6 +144,11 @@ interface ObservedRateWindow {
 interface TransactionReconciliation {
     readonly controller: AbortController;
     timer: number | null;
+}
+
+function disposeReconciliation(reconciliation: TransactionReconciliation) {
+    reconciliation.controller.abort();
+    if (reconciliation.timer !== null) window.clearTimeout(reconciliation.timer);
 }
 
 const MAX_CONCURRENT_RECONCILIATIONS = 3;
@@ -232,7 +239,7 @@ export default function App() {
     };
 
     const setCommittedNonceState = (nextNonce: NonceState) => {
-        committedNonceRef.current = nextNonce;
+        committedNonceRef.current = mergeNonceStates(committedNonceRef.current, nextNonce);
         applyLocalNonceReservations();
     };
 
@@ -481,10 +488,7 @@ export default function App() {
         const reconciliations = reconciliationsRef.current;
         return () => {
             for (const reconciliation of reconciliations.values()) {
-                reconciliation.controller.abort();
-                if (reconciliation.timer !== null) {
-                    window.clearTimeout(reconciliation.timer);
-                }
+                disposeReconciliation(reconciliation);
             }
             reconciliations.clear();
             reconciliationOrderRef.current.clear();
@@ -500,10 +504,7 @@ export default function App() {
         const trackedDigests = new Set(history.map((tx) => tx.digest));
         for (const [digest, reconciliation] of reconciliations) {
             if (trackedDigests.has(digest)) continue;
-            reconciliation.controller.abort();
-            if (reconciliation.timer !== null) {
-                window.clearTimeout(reconciliation.timer);
-            }
+            disposeReconciliation(reconciliation);
             reconciliations.delete(digest);
         }
         for (const digest of reconciliationOrderRef.current.keys()) {
@@ -526,17 +527,12 @@ export default function App() {
             reconciliationSequenceRef.current,
         );
 
-        const available = MAX_CONCURRENT_RECONCILIATIONS - reconciliations.size;
-        if (available <= 0) return;
-
-        const transactions = eligible
-            .filter((tx) => !reconciliations.has(tx.digest))
-            .sort(
-                (left, right) =>
-                    (reconciliationOrderRef.current.get(left.digest) ?? 0) -
-                    (reconciliationOrderRef.current.get(right.digest) ?? 0),
-            )
-            .slice(0, available);
+        const transactions = selectReconciliations(
+            eligible,
+            reconciliations,
+            reconciliationOrderRef.current,
+            MAX_CONCURRENT_RECONCILIATIONS,
+        );
 
         for (const tx of transactions) {
             const reconciliation: TransactionReconciliation = {
@@ -850,10 +846,7 @@ export default function App() {
 
     const clearSubmittedTransactionHistory = () => {
         for (const reconciliation of reconciliationsRef.current.values()) {
-            reconciliation.controller.abort();
-            if (reconciliation.timer !== null) {
-                window.clearTimeout(reconciliation.timer);
-            }
+            disposeReconciliation(reconciliation);
         }
         reconciliationsRef.current.clear();
         reconciliationOrderRef.current.clear();
@@ -881,10 +874,7 @@ export default function App() {
     const cancelReconciliation = (digest: string) => {
         const reconciliation = reconciliationsRef.current.get(digest);
         if (reconciliation) {
-            reconciliation.controller.abort();
-            if (reconciliation.timer !== null) {
-                window.clearTimeout(reconciliation.timer);
-            }
+            disposeReconciliation(reconciliation);
             reconciliationsRef.current.delete(digest);
         }
         reconciliationOrderRef.current.delete(digest);

@@ -52,6 +52,15 @@ export const WAITING_FINALIZATION_PROOF = {
     detail: 'queued for finalized metadata',
 } satisfies TransactionProofState;
 
+const REJECTED_STATE = {
+    status: 'rejected',
+    finalizationObservedInMs: null,
+    proofObservedInMs: null,
+    finalizedHeight: null,
+    certificate: { status: 'unavailable', detail: 'transaction rejected' },
+    proof: { status: 'unavailable', detail: 'transaction rejected' },
+} as const;
+
 export function prependTransaction(
     transaction: SubmittedTransaction,
     current: SubmittedTransaction[],
@@ -67,14 +76,7 @@ export function markSubmissionReconciling(
     detail: string,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) =>
-        tx.status === 'reconciling'
-            ? {
-                  ...tx,
-                  detail,
-              }
-            : tx,
-    );
+    return updateReconciling(digest, current, (tx) => ({ ...tx, detail }));
 }
 
 export function markValidatorFinalizationObserved(
@@ -83,8 +85,7 @@ export function markValidatorFinalizationObserved(
     observedAt: number,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) => {
-        if (tx.status !== 'reconciling') return tx;
+    return updateReconciling(digest, current, (tx) => {
         const observedInMs = Math.max(0, observedAt - tx.submittedAt);
         return {
             ...tx,
@@ -105,13 +106,8 @@ export function markSubmissionRejected(
             ? tx
             : {
                   ...tx,
-                  status: 'rejected',
+                  ...REJECTED_STATE,
                   detail,
-                  finalizationObservedInMs: null,
-                  proofObservedInMs: null,
-                  finalizedHeight: null,
-                  certificate: { status: 'unavailable', detail: 'transaction rejected' },
-                  proof: { status: 'unavailable', detail: 'transaction rejected' },
               },
     );
 }
@@ -120,18 +116,7 @@ export function markReconciliationFetching(
     digest: string,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) =>
-        tx.status === 'reconciling'
-            ? {
-                  ...tx,
-                  certificate:
-                      tx.certificate.status === 'verified'
-                          ? tx.certificate
-                          : { status: 'fetching', detail: 'fetching finalized metadata' },
-                  proof: { status: 'fetching', detail: 'fetching finalized metadata' },
-              }
-            : tx,
-    );
+    return markProofState(digest, current, { status: 'fetching', detail: 'fetching finalized metadata' });
 }
 
 export function markReconciliationCertificate(
@@ -141,8 +126,8 @@ export function markReconciliationCertificate(
     observedAt: number,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) => {
-        if (tx.status !== 'reconciling' || certificate.status !== 'verified') return tx;
+    return updateReconciling(digest, current, (tx) => {
+        if (certificate.status !== 'verified') return tx;
         return {
             ...tx,
             finalizedHeight: height,
@@ -159,18 +144,7 @@ export function markReconciliationWaiting(
     detail: string,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) =>
-        tx.status === 'reconciling'
-            ? {
-                  ...tx,
-                  certificate:
-                      tx.certificate.status === 'verified'
-                          ? tx.certificate
-                          : { status: 'waiting', detail },
-                  proof: { status: 'waiting', detail },
-              }
-            : tx,
-    );
+    return markProofState(digest, current, { status: 'waiting', detail });
 }
 
 export function markReconciliationError(
@@ -178,19 +152,7 @@ export function markReconciliationError(
     detail: string,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) =>
-        tx.status === 'reconciling'
-            ? {
-                  ...tx,
-                  detail: 'finalized proof verification failed',
-                  certificate:
-                      tx.certificate.status === 'verified'
-                          ? tx.certificate
-                          : { status: 'error', detail },
-                  proof: { status: 'error', detail },
-              }
-            : tx,
-    );
+    return markProofState(digest, current, { status: 'error', detail });
 }
 
 export function markTransactionFinalized(
@@ -201,8 +163,8 @@ export function markTransactionFinalized(
     proofObservedAt: number,
     current: SubmittedTransaction[],
 ): SubmittedTransaction[] {
-    return updateTransaction(digest, current, (tx) => {
-        if (tx.status !== 'reconciling' || proof.status !== 'verified') return tx;
+    return updateReconciling(digest, current, (tx) => {
+        if (proof.status !== 'verified') return tx;
         return {
             ...tx,
             status: 'finalized',
@@ -256,6 +218,22 @@ export function reconciliationRetryDelay(
     return Math.min(maximum, Math.round(base * (0.75 + random() * 0.5)));
 }
 
+export function selectReconciliations(
+    eligible: readonly SubmittedTransaction[],
+    reconciliations: ReadonlyMap<string, { readonly timer: number | null }>,
+    order: ReadonlyMap<string, number>,
+    limit: number,
+): SubmittedTransaction[] {
+    const active = [...reconciliations.values()].filter((job) => job.timer === null).length;
+    const available = limit - active;
+    if (available <= 0) return [];
+
+    return eligible
+        .filter((tx) => !reconciliations.has(tx.digest))
+        .sort((left, right) => (order.get(left.digest) ?? 0) - (order.get(right.digest) ?? 0))
+        .slice(0, available);
+}
+
 export function normalizeSubmittedTransaction(value: unknown): SubmittedTransaction | null {
     if (typeof value !== 'object' || value === null) return null;
 
@@ -264,7 +242,7 @@ export function normalizeSubmittedTransaction(value: unknown): SubmittedTransact
         typeof transaction.sender !== 'string' ||
         !isAccountKeyHex(transaction.sender) ||
         typeof transaction.digest !== 'string' ||
-        !isDigestHex(transaction.digest) ||
+        !isAccountKeyHex(transaction.digest) ||
         typeof transaction.to !== 'string' ||
         !isAccountKeyHex(transaction.to) ||
         typeof transaction.value !== 'string' ||
@@ -277,10 +255,9 @@ export function normalizeSubmittedTransaction(value: unknown): SubmittedTransact
         return null;
     }
 
-    if (transaction.reconciliationVersion === 2) {
-        return normalizeCurrentTransaction(transaction);
+    if (transaction.reconciliationVersion === 1 || transaction.reconciliationVersion === 2) {
+        return normalizeVersionedTransaction(transaction);
     }
-    if (transaction.reconciliationVersion === 1) return migrateVersionOneTransaction(transaction);
     return migrateLegacyTransaction(transaction);
 }
 
@@ -288,69 +265,36 @@ export function isAccountKeyHex(value: string): boolean {
     return /^[0-9a-f]{64}$/.test(value);
 }
 
-function normalizeCurrentTransaction(
+function normalizeVersionedTransaction(
     transaction: Record<string, unknown>,
 ): SubmittedTransaction | null {
     if (!isSubmittedTransactionStatus(transaction.status)) return null;
-
     const status = transaction.status;
-    const finalizedHeight = safeOptionalNumber(transaction.finalizedHeight);
-    const finalizationObservedInMs = safeOptionalNumber(transaction.finalizationObservedInMs);
-    const proofObservedInMs = safeOptionalNumber(transaction.proofObservedInMs);
-    const certificate = normalizeBlockCertificate(transaction.certificate, finalizedHeight);
-    const proof = normalizeTransactionProof(transaction.proof);
+    if (status === 'rejected') return baseTransaction(transaction, REJECTED_STATE);
 
-    if (status === 'rejected') {
-        return baseTransaction(transaction, {
-            status,
-            finalizedHeight: null,
-            finalizationObservedInMs: null,
-            proofObservedInMs: null,
-            certificate: { status: 'unavailable', detail: 'transaction rejected' },
-            proof: { status: 'unavailable', detail: 'transaction rejected' },
-        });
-    }
+    const finalizedHeight = safeOptionalNumber(transaction.finalizedHeight);
+    const currentVersion = transaction.reconciliationVersion === 2;
+    const finalizationObservedInMs = currentVersion
+        ? safeOptionalNumber(transaction.finalizationObservedInMs)
+        : null;
+    const proofObservedInMs = safeOptionalNumber(
+        currentVersion ? transaction.proofObservedInMs : transaction.finalizedInMs,
+    );
+    let certificate = normalizeBlockCertificate(transaction.certificate, finalizedHeight);
+    let proof = normalizeTransactionProof(transaction.proof);
     if (status === 'finalized' && proof.status !== 'verified') return null;
+
+    // Backend or verifier repairs must allow unresolved rows to retry on reload.
+    if (status === 'reconciling' && proof.status === 'error') {
+        proof = WAITING_FINALIZATION_PROOF;
+        if (certificate.status !== 'verified') certificate = defaultBlockCertificate(finalizedHeight);
+    }
 
     return baseTransaction(transaction, {
         status,
         finalizedHeight,
-        finalizationObservedInMs:
-            finalizedHeight === null ? null : finalizationObservedInMs,
+        finalizationObservedInMs: finalizedHeight === null ? null : finalizationObservedInMs,
         proofObservedInMs: status === 'finalized' ? proofObservedInMs : null,
-        certificate,
-        proof,
-    });
-}
-
-function migrateVersionOneTransaction(
-    transaction: Record<string, unknown>,
-): SubmittedTransaction | null {
-    if (!isSubmittedTransactionStatus(transaction.status)) return null;
-
-    const status = transaction.status;
-    const finalizedHeight = safeOptionalNumber(transaction.finalizedHeight);
-    const certificate = normalizeBlockCertificate(transaction.certificate, finalizedHeight);
-    const proof = normalizeTransactionProof(transaction.proof);
-
-    if (status === 'rejected') {
-        return baseTransaction(transaction, {
-            status,
-            finalizedHeight: null,
-            finalizationObservedInMs: null,
-            proofObservedInMs: null,
-            certificate: { status: 'unavailable', detail: 'transaction rejected' },
-            proof: { status: 'unavailable', detail: 'transaction rejected' },
-        });
-    }
-    if (status === 'finalized' && proof.status !== 'verified') return null;
-
-    return baseTransaction(transaction, {
-        status,
-        finalizedHeight,
-        finalizationObservedInMs: null,
-        proofObservedInMs:
-            status === 'finalized' ? safeOptionalNumber(transaction.finalizedInMs) : null,
         certificate,
         proof,
     });
@@ -469,6 +413,27 @@ function normalizeTransactionProof(value: unknown): TransactionProofState {
     return WAITING_FINALIZATION_PROOF;
 }
 
+function markProofState(
+    digest: string,
+    current: SubmittedTransaction[],
+    proof: { status: 'fetching' | 'waiting' | 'error'; detail: string },
+): SubmittedTransaction[] {
+    return updateReconciling(digest, current, (tx) => ({
+        ...tx,
+        detail: proof.status === 'error' ? 'finalized proof verification failed' : tx.detail,
+        certificate: tx.certificate.status === 'verified' ? tx.certificate : proof,
+        proof,
+    }));
+}
+
+function updateReconciling(
+    digest: string,
+    current: SubmittedTransaction[],
+    update: (transaction: SubmittedTransaction) => SubmittedTransaction,
+): SubmittedTransaction[] {
+    return updateTransaction(digest, current, (tx) => tx.status === 'reconciling' ? update(tx) : tx);
+}
+
 function updateTransaction(
     digest: string,
     current: SubmittedTransaction[],
@@ -490,10 +455,6 @@ function compactHistory(current: SubmittedTransaction[]): SubmittedTransaction[]
 
 function isSubmittedTransactionStatus(value: unknown): value is SubmittedTransactionStatus {
     return value === 'reconciling' || value === 'finalized' || value === 'rejected';
-}
-
-function isDigestHex(value: string): boolean {
-    return /^[0-9a-f]{64}$/.test(value);
 }
 
 function isU64Decimal(value: string): boolean {

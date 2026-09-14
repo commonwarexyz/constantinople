@@ -4,6 +4,9 @@ import test from 'node:test';
 import {
     assignReconciliationOrder,
     markReconciliationCertificate,
+    markReconciliationError,
+    markReconciliationFetching,
+    markReconciliationWaiting,
     markSubmissionReconciling,
     markSubmissionRejected,
     markTransactionFinalized,
@@ -11,6 +14,7 @@ import {
     normalizeSubmittedTransaction,
     prependTransaction,
     reconciliationRetryDelay,
+    selectReconciliations,
     shouldReconcileTransaction,
     type SubmittedTransaction,
 } from '../src/submissionHistory.ts';
@@ -348,4 +352,60 @@ test('history bounds terminal rows without expiring reconciliation', () => {
     const resolved = markSubmissionRejected(oldReconciling.digest, 'rejected', next);
     assert.equal(resolved.filter((tx) => tx.status === 'reconciling').length, 1);
     assert.equal(resolved.filter((tx) => tx.status !== 'reconciling').length, 100);
+});
+
+test('sleeping retries leave capacity for queued proofs without retrying early', () => {
+    const transactions = Array.from({ length: 5 }, (_, index) => ({
+        ...reconcilingTransaction(),
+        digest: index.toString(16).padStart(64, '0'),
+    }));
+    const order = new Map(transactions.map((tx, index) => [tx.digest, index]));
+    const handles = new Map<string, { timer: number | null }>(
+        transactions.slice(0, 3).map((tx) => [tx.digest, { timer: 1 }]),
+    );
+
+    assert.deepEqual(selectReconciliations(transactions, handles, order, 3), transactions.slice(3));
+
+    handles.get(transactions[0].digest)!.timer = null;
+    handles.get(transactions[1].digest)!.timer = null;
+    assert.deepEqual(selectReconciliations(transactions, handles, order, 3), [transactions[3]]);
+
+    handles.get(transactions[2].digest)!.timer = null;
+    assert.deepEqual(selectReconciliations(transactions, handles, order, 3), []);
+
+    handles.delete(transactions[2].digest);
+    order.set(transactions[2].digest, 5);
+    assert.deepEqual(selectReconciliations(transactions, handles, order, 3), [transactions[3]]);
+});
+
+test('reloaded proof errors retry corrected backend data', () => {
+    for (const reconciliationVersion of [1, 2]) {
+        const transaction = normalizeSubmittedTransaction({
+            ...reconcilingTransaction(),
+            reconciliationVersion,
+            certificate: { status: 'error', detail: 'SQL transaction body does not match transaction digest' },
+            proof: { status: 'error', detail: 'SQL transaction body does not match transaction digest' },
+        });
+
+        assert.equal(transaction?.status, 'reconciling');
+        assert.equal(transaction?.certificate.status, 'waiting');
+        assert.equal(transaction?.proof.status, 'waiting');
+        assert.equal(shouldReconcileTransaction(transaction!, sender), true);
+    }
+});
+
+test('proof retries and reload retain a verified certificate', () => {
+    const certificate = {
+        status: 'verified', detail: 'verified at height 7', height: '7', view: '9',
+    } as const;
+    const initial = { ...reconcilingTransaction(), certificate, finalizedHeight: 7 };
+    const fetching = markReconciliationFetching(digest, [initial])[0];
+    const waiting = markReconciliationWaiting(digest, 'retry scheduled', [fetching])[0];
+    const failed = markReconciliationError(digest, 'invalid proof', [waiting])[0];
+
+    for (const tx of [fetching, waiting, failed]) assert.deepEqual(tx.certificate, certificate);
+    const restored = normalizeSubmittedTransaction(failed)!;
+    assert.deepEqual(restored.certificate, certificate);
+    assert.equal(restored.proof.status, 'waiting');
+    assert.equal(shouldReconcileTransaction(restored, sender), true);
 });

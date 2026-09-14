@@ -142,13 +142,23 @@ the optional indexer secondary and follows consensus directly. It forwards singl
 user submissions to up to four upcoming leaders and larger batches to up to two.
 It waits up to ten seconds for a terminal result before returning an empty HTTP 202.
 Forwarding continues after that response, with a thirty-second timeout per leader.
+Each copy shares its validator's ingress verification capacity with background
+traffic. Copies can remain queued or tracked after another leader finalizes the
+transaction. Resolution can wait for a later proposal and its expiry window.
+This spends additional verification and
+tracking work to reach upcoming leaders promptly. The public relayer is intended
+for interactive traffic and has no global limit on outstanding forwarding tasks.
 
 When `--spammer` is set, the generated spammer command uses `--relayer-url`,
 `--relayer-submitters <validators>`, and `--relayer-targets <primary-keys>`.
 Each relayed submitter pins an exact primary validator target and uses its
-background queue. Each stream waits for a terminal result before generating its
+background queue. Each stream waits for a terminal result before submitting its
 next batch. Transient failures retry the same encoded batch with backoff, so a
 lost response does not advance the stream's nonces prematurely.
+Pinned requests have a connection timeout but no finalization deadline. A stream
+waits while its leader is stalled or foreground traffic keeps its batch queued.
+Size the spammer below the background queue's drain rate. Capacity drops advance
+to the next batch immediately and still incur ingress verification work.
 
 ### Local Deployment with Indexer + Explorer
 

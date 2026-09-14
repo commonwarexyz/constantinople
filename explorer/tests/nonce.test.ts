@@ -36,6 +36,14 @@ test('restored reservations preserve gaps above the committed base', () => {
     assert.equal(nextAvailableNonce(reserved), 5n);
 });
 
+test('older account refreshes cannot undo committed nonce observations', () => {
+    const committed = mergeNonceStates(nonceState(6n, 0n), nonceState(5n, 0n));
+    assert.equal(nextAvailableNonce(reserveNonces(committed, [])), 6n);
+
+    const withBitmap = mergeNonceStates(nonceState(5n, 1n), nonceState(5n, 0n));
+    assert.equal(nextAvailableNonce(reserveNonces(withBitmap, [5n])), 7n);
+});
+
 test('restored reservations consume contiguous submitted nonces in order', () => {
     const committed = nonceState(5n, 0n);
 

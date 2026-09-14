@@ -120,7 +120,7 @@ impl<D: Display> StoredBatchStatus<D> {
 
 /// Mempool actor configuration.
 pub struct Config<St: Strategy> {
-    /// Maximum total bytes the pool will hold.
+    /// Maximum total bytes the pool will hold. Must exceed `max_propose_bytes`.
     pub max_pool_bytes: usize,
     /// Maximum bytes returned in a single `propose` call, and the
     /// maximum accepted batch size for submissions.
@@ -672,6 +672,10 @@ where
         receiver: ActorReceiver<C, P, H>,
         account_reader: AccountReaderCell,
     ) -> Self {
+        assert!(
+            config.max_pool_bytes > config.max_propose_bytes,
+            "pool must leave capacity for background submissions"
+        );
         Self {
             context: ContextCell::new(context),
             mailbox,
@@ -811,16 +815,12 @@ where
                             transactions,
                             total_bytes,
                         };
-                        match lane {
-                            SubmissionLane::Foreground => {
-                                foreground_pool.bytes += total_bytes;
-                                foreground_pool.entries.push_back(entry);
-                            }
-                            SubmissionLane::Background => {
-                                background_pool.bytes += total_bytes;
-                                background_pool.entries.push_back(entry);
-                            }
-                        }
+                        let pool = match lane {
+                            SubmissionLane::Foreground => &mut foreground_pool,
+                            SubmissionLane::Background => &mut background_pool,
+                        };
+                        pool.bytes += total_bytes;
+                        pool.entries.push_back(entry);
                     }
                 }
                 Message::QueryStatus { batch_id, response } => {
@@ -901,18 +901,54 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DigestOutcome, IngestStatus, PoolEntry, PoolLane, ProposedBatch, StoredBatchStatus,
-        SubmissionLane, TxStatus, batch_status_from_outcomes, can_admit_submission,
-        ingest_status_from_batch, new_transactions, pop_lane_proposal, pop_proposal,
-        resolve_proposed_batches, status_for_finalized_block,
+        Actor, Config, DigestOutcome, IngestStatus, Mailbox, PoolEntry, PoolLane, ProposedBatch,
+        StoredBatchStatus, SubmissionLane, TxStatus, batch_status_from_outcomes,
+        can_admit_submission, ingest_status_from_batch, new_transactions, pop_lane_proposal,
+        pop_proposal, resolve_proposed_batches, status_for_finalized_block,
     };
     use ahash::{AHashMap, AHashSet};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
-    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_utils::NZUsize;
+    use constantinople_primitives::{
+        PublicKeyCache, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+    };
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, OnceLock},
+    };
+
+    #[test]
+    #[should_panic(expected = "pool must leave capacity for background submissions")]
+    fn background_requires_capacity_beyond_foreground_reserve() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (mailbox, receiver) =
+                Mailbox::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::channel(1);
+            let config = Config {
+                max_pool_bytes: 1_000,
+                max_propose_bytes: 1_000,
+                namespace: TRANSACTION_NAMESPACE,
+                drop_grace_blocks: 2,
+                strategy: Sequential,
+                public_key_cache: PublicKeyCache::new(
+                    context.child("public_key_cache"),
+                    NZUsize!(16),
+                ),
+            };
+
+            let _actor = Actor::new(
+                context,
+                config,
+                mailbox,
+                receiver,
+                Arc::new(OnceLock::new()),
+            );
+        });
+    }
 
     #[test]
     fn terminal_batch_statuses_preserve_ingest_truth() {

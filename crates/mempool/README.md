@@ -5,7 +5,9 @@ Transaction sourcing for Constantinople validators.
 The webserver mempool keeps separate foreground and background queues. Background
 traffic can fill the pool up to its configured limit minus one maximum proposal.
 That reservation lets interactive submissions enter under sustained background
-load. Proposals take foreground transactions first, then fill remaining space
+load. Queued foreground transactions consume the reservation. The pool limit
+must exceed the proposal limit so background submissions have capacity.
+Proposals take foreground transactions first, then fill remaining space
 from the background queue. Each queue preserves arrival order.
 
 | Endpoint | Queue | Response |
