@@ -648,7 +648,7 @@ fn spawn_upload<Cx: Spawner>(
         let seq = super::commit_with_retry(
             client.store_client().client(),
             &batch,
-            "simplex upload",
+            super::CommitKind::Simplex,
             &commit_metrics,
         )
         .await

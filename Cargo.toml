@@ -76,6 +76,7 @@ exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c77
 datafusion = "55"
 
 # Other
+cpu-time = "1.0.0"
 axum = "0.8"
 p256 = { version = "0.14.0", default-features = false, features = ["ecdsa"] }
 clap = { version = "4", default-features = false }

@@ -45,6 +45,7 @@ exoware-sql.workspace = true
 datafusion.workspace = true
 
 # Other
+cpu-time.workspace = true
 ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true

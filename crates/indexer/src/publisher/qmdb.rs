@@ -40,6 +40,7 @@ use constantinople_application::consensus::{
 };
 use constantinople_engine::types::{EngineBlock, EngineFinalization};
 use constantinople_primitives::{Account, AccountKey, BlockCfg};
+use cpu_time::ThreadTime;
 use exoware_qmdb::{
     AuthenticatedOperationRange, QmdbError, prepare_authenticated_range, stage_authenticated_range,
     stage_watermark,
@@ -57,7 +58,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
-use tracing::debug;
+use tracing::{debug, warn};
 
 const QUEUE_MAGIC: u32 = 0x4351_5545;
 const QUEUE_FORMAT_VERSION: u16 = 1;
@@ -615,6 +616,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
+    enqueued_at: Instant,
     height: u64,
     block: EngineBlock<H, P>,
     finalized_ts_micros: i64,
@@ -750,6 +752,7 @@ where
         V: Variant,
         EngineFinalization<P, V, H>: Clone,
     {
+        let enqueued_at = Instant::now();
         let height = upload.height();
         let mut admission = self.admission.lock().await;
         if let Some(expected) = *admission {
@@ -786,6 +789,7 @@ where
         let (persisted_tx, persisted) = oneshot::channel();
         let (published_tx, published) = oneshot::channel();
         let pending = PendingUpload {
+            enqueued_at,
             height,
             block: upload.block,
             finalized_ts_micros: upload.finalized_ts_micros,
@@ -942,27 +946,52 @@ fn spawn_data_commit<Cx, H, P, S>(
             .child("prepare")
             .shared(true)
             .spawn(move |_| async move {
-                let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
-                    state_client,
-                    transaction_client,
-                    sql_schema,
-                    strategy,
-                    upload,
-                    &prepare_metrics,
-                )?;
-                let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES)?;
-                Ok::<_, PublishError>((batches, state, transactions))
+                let started = Instant::now();
+                prepare_metrics
+                    .prepare_wait_duration
+                    .observe(started.duration_since(upload.enqueued_at).as_secs_f64());
+                prepare_metrics
+                    .transactions_per_block
+                    .observe(upload.block.body.len() as f64);
+
+                // Keep both CPU-clock reads on this thread without an intervening await.
+                let cpu_started = ThreadTime::try_now();
+                let prepared = (|| {
+                    let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
+                        state_client,
+                        transaction_client,
+                        sql_schema,
+                        strategy,
+                        upload,
+                        &prepare_metrics,
+                    )?;
+                    let chunking_started = Instant::now();
+                    let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES);
+                    prepare_metrics
+                        .chunking_duration
+                        .observe(chunking_started.elapsed().as_secs_f64());
+                    Ok::<_, PublishError>((batches?, state, transactions))
+                })();
+                let cpu_elapsed = cpu_started.and_then(|started| started.try_elapsed());
+                prepare_metrics
+                    .prepare_duration
+                    .observe(started.elapsed().as_secs_f64());
+                match cpu_elapsed {
+                    Ok(elapsed) => prepare_metrics
+                        .prepare_cpu_duration
+                        .observe(elapsed.as_secs_f64()),
+                    Err(error) => warn!(?error, "failed to measure preparation thread CPU time"),
+                }
+                prepared
             });
         let (batches, state, transactions) = prepare
             .await
             .expect("finalized index preparation task failed")?;
-        metrics
-            .prepare_duration
-            .observe(admitted_at.elapsed().as_secs_f64());
         let chunks = batches.len() as u64;
         commit_chunks(context.child("commit"), &store, &metrics.commit, batches).await?;
         let persisted_at = Instant::now();
         metrics.chunk_commits.inc_by(chunks);
+        metrics.chunks_per_block.observe(chunks as f64);
         metrics
             .persist_duration
             .observe(admitted_at.elapsed().as_secs_f64());
@@ -995,7 +1024,8 @@ async fn commit_chunks<Cx: Spawner>(
                 .child("chunk")
                 .shared(true)
                 .spawn(move |_| async move {
-                    super::commit_with_retry(&store, &batch, "finalized index data", &metrics).await
+                    super::commit_with_retry(&store, &batch, super::CommitKind::Chunk, &metrics)
+                        .await
                 })
         })
         .buffer_unordered(MAX_CONCURRENT_CHUNKS);
@@ -1211,7 +1241,7 @@ where
     let metrics = metrics.commit.clone();
     Some(Box::pin(async move {
         let sequence =
-            super::commit_with_retry(&store, &batch, "contiguous publication barrier", &metrics)
+            super::commit_with_retry(&store, &batch, super::CommitKind::Barrier, &metrics)
                 .await
                 .expect("contiguous publication barrier was rejected");
         (ready, sequence)
@@ -1757,25 +1787,36 @@ mod tests {
             for metric in [
                 "expansion_duration_count",
                 "staging_duration_count",
+                "prepare_wait_duration_count",
                 "prepare_duration_count",
+                "prepare_cpu_duration_count",
+                "chunking_duration_count",
+                "chunks_per_block_count",
+                "transactions_per_block_count",
                 "persist_duration_count",
                 "finalization_to_publication_duration_count",
             ] {
                 assert!(has_metric_value(&encoded_metrics, metric, 4));
             }
+            let metric_sum = |name: &str| {
+                encoded_metrics
+                    .lines()
+                    .find_map(|line| line.strip_prefix(name)?.strip_prefix(' '))
+                    .unwrap_or_else(|| panic!("missing metric {name}"))
+                    .parse::<f64>()
+                    .expect("numeric metric sum")
+            };
+            assert_eq!(metric_sum("publisher_chunks_per_block_sum"), 4.0);
+
+            // The fourth upload cannot begin preparation while the barrier is held.
+            let wait_sum = metric_sum("publisher_prepare_wait_duration_sum");
+            assert!(
+                wait_sum >= 0.05,
+                "publisher queue waiting is included in {wait_sum}"
+            );
 
             // Each recorded block already waited a minute before publisher admission.
-            let lag_sum = encoded_metrics
-                .lines()
-                .find(|line| {
-                    line.starts_with("publisher_finalization_to_publication_duration_sum ")
-                })
-                .expect("publication lag sum is exported")
-                .split_whitespace()
-                .last()
-                .unwrap()
-                .parse::<f64>()
-                .unwrap();
+            let lag_sum = metric_sum("publisher_finalization_to_publication_duration_sum");
             assert!(lag_sum >= 240.0, "queue waiting is included in {lag_sum}");
             store.shutdown().await;
         });
@@ -1949,6 +1990,7 @@ mod tests {
                     schema.clone(),
                     Sequential,
                     PendingUpload {
+                        enqueued_at: Instant::now(),
                         height: 1,
                         block,
                         finalized_ts_micros: 1,
@@ -2109,6 +2151,7 @@ mod tests {
                 schema,
                 Sequential,
                 PendingUpload {
+                    enqueued_at: Instant::now(),
                     height: 1,
                     block,
                     finalized_ts_micros: 1,

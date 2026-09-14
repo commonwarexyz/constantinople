@@ -23,8 +23,9 @@ use tracing::warn;
 
 const CLEANUP_CAPACITY: usize = 64;
 
-const DURATION_BUCKETS: [f64; 12] = [
-    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0,
+const DURATION_BUCKETS: [f64; 27] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.0625, 0.08, 0.1, 0.125, 0.16, 0.2, 0.25, 0.315, 0.4,
+    0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
 /// Length and checksum of a durable payload.
@@ -73,6 +74,8 @@ impl From<Error> for PayloadReadError {
 struct PayloadMetrics {
     retained: Gauge,
     retained_bytes: Gauge,
+    write_open_duration: Histogram,
+    read_open_duration: Histogram,
     write_duration: Histogram,
     sync_duration: Histogram,
     read_duration: Histogram,
@@ -83,6 +86,16 @@ impl PayloadMetrics {
         Self {
             retained: context.gauge("retained", "Finalized payload blobs on disk"),
             retained_bytes: context.gauge("retained_bytes", "Finalized payload bytes on disk"),
+            write_open_duration: context.histogram(
+                "write_open_duration",
+                "Finalized payload blob open time for writes (s)",
+                DURATION_BUCKETS,
+            ),
+            read_open_duration: context.histogram(
+                "read_open_duration",
+                "Finalized payload blob open time for reads (s)",
+                DURATION_BUCKETS,
+            ),
             write_duration: context.histogram(
                 "write_duration",
                 "Finalized payload write time before sync (s)",
@@ -207,11 +220,17 @@ impl<E: Storage> PayloadStore<E> {
             len: payload.len() as u64,
             crc: Crc32::checksum(&payload),
         };
-        let (blob, existing) = self
+        let open_started = Instant::now();
+        let opened = self
             .inner
             .context
             .open(&self.inner.partition, &blob_name(height))
-            .await?;
+            .await;
+        self.inner
+            .metrics
+            .write_open_duration
+            .observe(open_started.elapsed().as_secs_f64());
+        let (blob, existing) = opened?;
         if existing != 0 {
             blob.resize(0).await?;
         }
@@ -242,11 +261,16 @@ impl<E: Storage> PayloadStore<E> {
         descriptor: PayloadDescriptor,
     ) -> Result<Bytes, PayloadReadError> {
         let started = Instant::now();
-        let (blob, actual) = self
+        let opened = self
             .inner
             .context
             .open(&self.inner.partition, &blob_name(height))
-            .await?;
+            .await;
+        self.inner
+            .metrics
+            .read_open_duration
+            .observe(started.elapsed().as_secs_f64());
+        let (blob, actual) = opened?;
         if actual != descriptor.len {
             return Err(PayloadReadError::Length {
                 expected: descriptor.len,
@@ -351,7 +375,7 @@ mod tests {
     };
     use bytes::Bytes;
     use commonware_runtime::{
-        BlobVersion, Error, Runner as _, Storage, Supervisor as _, deterministic,
+        BlobVersion, Error, Metrics as _, Runner as _, Storage, Supervisor as _, deterministic,
     };
     use std::{
         ops::RangeInclusive,
@@ -373,6 +397,7 @@ mod tests {
         started: Arc<Notify>,
         release: Arc<Semaphore>,
         attempts: Arc<AtomicUsize>,
+        gate_open: bool,
     }
 
     impl<E: Storage> Storage for GatedStorage<E> {
@@ -384,6 +409,10 @@ mod tests {
             name: &[u8],
             versions: RangeInclusive<BlobVersion>,
         ) -> Result<(Self::Blob, u64, BlobVersion), Error> {
+            if self.gate_open {
+                self.started.notify_one();
+                self.release.acquire().await.unwrap().forget();
+            }
             self.inner.open_versioned(partition, name, versions).await
         }
 
@@ -414,6 +443,7 @@ mod tests {
                         started: started.clone(),
                         release: release.clone(),
                         attempts: attempts.clone(),
+                        gate_open: false,
                     },
                     partition: PARTITION.into(),
                     metrics: PayloadMetrics::new(&context.child("payloads")),
@@ -456,6 +486,49 @@ mod tests {
             assert_eq!(store.heights().await.unwrap(), [count + 1].into());
             assert_eq!(store.inner.metrics.retained.get(), 1);
             assert_eq!(store.inner.metrics.retained_bytes.get(), 3);
+        });
+    }
+
+    #[test]
+    fn payload_open_timers_wait_for_storage_and_distinguish_read_from_write() {
+        deterministic::Runner::default().start(|context| async move {
+            let release = Arc::new(Semaphore::new(0));
+            let store = PayloadStore {
+                inner: Arc::new(Inner {
+                    context: GatedStorage {
+                        inner: context.child("storage"),
+                        started: Arc::new(Notify::new()),
+                        release: release.clone(),
+                        attempts: Arc::new(AtomicUsize::new(0)),
+                        gate_open: true,
+                    },
+                    partition: PARTITION.into(),
+                    metrics: PayloadMetrics::new(&context.child("payloads")),
+                }),
+            };
+            let mut write = Box::pin(store.write(1, Bytes::from_static(b"payload")));
+            assert!(futures::poll!(write.as_mut()).is_pending());
+            let encoded = context.encode();
+            assert!(encoded.contains("payloads_write_open_duration_count 0"));
+            assert!(encoded.contains("payloads_write_duration_count 0"));
+            release.add_permits(1);
+            let descriptor = write.await.unwrap();
+            let encoded = context.encode();
+            assert!(encoded.contains("payloads_write_open_duration_count 1"));
+            assert!(encoded.contains("payloads_write_duration_count 1"));
+            assert!(encoded.contains("payloads_read_open_duration_count 0"));
+
+            let mut read = Box::pin(store.read(1, descriptor));
+            assert!(futures::poll!(read.as_mut()).is_pending());
+            let encoded = context.encode();
+            assert!(encoded.contains("payloads_read_open_duration_count 0"));
+            assert!(encoded.contains("payloads_read_duration_count 0"));
+            release.add_permits(1);
+            assert_eq!(read.await.unwrap(), b"payload"[..]);
+            let encoded = context.encode();
+            assert!(encoded.contains("payloads_read_open_duration_count 1"));
+            assert!(encoded.contains("payloads_read_duration_count 1"));
+            assert!(encoded.contains("payloads_write_open_duration_count 1"));
         });
     }
 
@@ -526,6 +599,9 @@ mod tests {
                 store.read(10, descriptor).await,
                 Err(PayloadReadError::Length { actual: 0, .. })
             ));
+            let encoded = context.encode();
+            assert!(encoded.contains("finalized_payloads_read_open_duration_count 3"));
+            assert!(encoded.contains("finalized_payloads_read_duration_count 0"));
         });
     }
 

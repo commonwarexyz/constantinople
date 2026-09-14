@@ -24,7 +24,9 @@ pub mod sql;
 pub use certificate::CertificateReporter;
 use commonware_runtime::{
     Metrics,
-    telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _},
+    telemetry::metrics::{
+        Counter, EncodeLabelSet, Gauge, Histogram, MetricsExt as _, Registered, raw,
+    },
 };
 use exoware_sdk::{ClientError, ErrorCode, StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
@@ -34,23 +36,83 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::{sleep, timeout};
-use tracing::warn;
+use tracing::{Instrument as _, info_span, warn};
 
-/// Commit latency buckets: 10ms to 60s.
-const COMMIT_DURATION_BUCKETS: [f64; 12] = [
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
-];
-
-// Preserve preparation latency differences below the first Store commit bucket.
-const PREPARE_DURATION_BUCKETS: [f64; 15] = [
-    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+// Resolve the subsecond differences between preparation and Store commits.
+const COMMIT_DURATION_BUCKETS: [f64; 27] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.0625, 0.08, 0.1, 0.125, 0.16, 0.2, 0.25, 0.315, 0.4,
+    0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 
 // Queue recovery can leave finalized blocks waiting much longer than one commit.
-const FINALIZATION_TO_PUBLICATION_BUCKETS: [f64; 17] = [
-    0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0,
-    1800.0, 3600.0,
+const FINALIZATION_TO_PUBLICATION_BUCKETS: [f64; 32] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.0625, 0.08, 0.1, 0.125, 0.16, 0.2, 0.25, 0.315, 0.4,
+    0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1800.0,
+    3600.0,
 ];
+
+const ROW_COUNT_BUCKETS: [f64; 20] = [
+    1.0, 2.0, 4.0, 8.0, 16.0, 32.0, 64.0, 128.0, 256.0, 512.0, 1024.0, 4096.0, 16384.0, 65536.0,
+    131072.0, 250000.0, 500000.0, 1000000.0, 2000000.0, 4000000.0,
+];
+
+const ENCODED_BYTES_BUCKETS: [f64; 18] = [
+    256.0,
+    1024.0,
+    4096.0,
+    16384.0,
+    65536.0,
+    262144.0,
+    1048576.0,
+    2097152.0,
+    4194304.0,
+    8388608.0,
+    16777216.0,
+    33554432.0,
+    67108864.0,
+    100663296.0,
+    134217728.0,
+    268435456.0,
+    536870912.0,
+    1073741824.0,
+];
+
+const CHUNKS_PER_BLOCK_BUCKETS: [f64; 22] = [
+    1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0, 24.0,
+    32.0, 64.0, 128.0, 256.0, 512.0,
+];
+
+#[derive(Clone, Copy)]
+pub(crate) enum CommitKind {
+    Chunk,
+    Barrier,
+    Simplex,
+}
+
+impl CommitKind {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Chunk => "chunk",
+            Self::Barrier => "barrier",
+            Self::Simplex => "simplex",
+        }
+    }
+
+    const fn description(self) -> &'static str {
+        match self {
+            Self::Chunk => "finalized index data",
+            Self::Barrier => "contiguous publication barrier",
+            Self::Simplex => "simplex upload",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
+struct CommitLabels {
+    kind: &'static str,
+}
+
+type CommitHistogram = Registered<raw::Family<CommitLabels, raw::Histogram>>;
 
 /// Observability for store batch commits issued by the publishers.
 #[derive(Clone)]
@@ -59,7 +121,9 @@ pub struct StoreCommitMetrics {
     commits: Counter,
     rows: Counter,
     retries: Counter,
-    duration: Histogram,
+    duration: CommitHistogram,
+    batch_rows: CommitHistogram,
+    encoded_bytes: CommitHistogram,
 }
 
 impl StoreCommitMetrics {
@@ -72,10 +136,26 @@ impl StoreCommitMetrics {
                 "store_commit_retries",
                 "Store batch commit attempts that failed",
             ),
-            duration: context.histogram(
+            duration: context.register(
                 "store_commit_duration",
-                "Store batch commit latency (s)",
-                COMMIT_DURATION_BUCKETS,
+                "Store logical batch commit latency including retries and backoff (s)",
+                raw::Family::<CommitLabels, raw::Histogram>::new_with_constructor(|| {
+                    raw::Histogram::new(COMMIT_DURATION_BUCKETS)
+                }),
+            ),
+            batch_rows: context.register(
+                "store_commit_batch_rows",
+                "Rows per finished logical Store commit including failures",
+                raw::Family::<CommitLabels, raw::Histogram>::new_with_constructor(|| {
+                    raw::Histogram::new(ROW_COUNT_BUCKETS)
+                }),
+            ),
+            encoded_bytes: context.register(
+                "store_commit_encoded_bytes",
+                "Uncompressed protobuf bytes per finished logical Store commit including failures",
+                raw::Family::<CommitLabels, raw::Histogram>::new_with_constructor(|| {
+                    raw::Histogram::new(ENCODED_BYTES_BUCKETS)
+                }),
             ),
         }
     }
@@ -91,8 +171,12 @@ pub struct PublisherMetrics {
     pub(crate) commit: StoreCommitMetrics,
     /// Data chunks belonging to successfully persisted blocks.
     pub(crate) chunk_commits: Counter,
-    /// Row preparation for one block, from admission to staged rows.
     pub(crate) prepare_duration: Histogram,
+    pub(crate) prepare_wait_duration: Histogram,
+    pub(crate) prepare_cpu_duration: Histogram,
+    pub(crate) chunking_duration: Histogram,
+    pub(crate) chunks_per_block: Histogram,
+    pub(crate) transactions_per_block: Histogram,
     pub(crate) expansion_duration: Histogram,
     pub(crate) staging_duration: Histogram,
     /// One block's data path, from admission until its data is durable.
@@ -112,18 +196,43 @@ impl PublisherMetrics {
             ),
             prepare_duration: context.histogram(
                 "prepare_duration",
-                "Finalized block row preparation time (s)",
-                PREPARE_DURATION_BUCKETS,
+                "Finalized block preparation execution wall time including splitting and excluding scheduling (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            prepare_wait_duration: context.histogram(
+                "prepare_wait_duration",
+                "Publisher enqueue to start of preparation (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            prepare_cpu_duration: context.histogram(
+                "prepare_cpu_duration",
+                "Finalized block current preparation thread CPU time excluding Rayon workers (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            chunking_duration: context.histogram(
+                "chunking_duration",
+                "Finalized block Store batch splitting time (s)",
+                COMMIT_DURATION_BUCKETS,
+            ),
+            chunks_per_block: context.histogram(
+                "chunks_per_block",
+                "Store data chunks per persisted finalized block",
+                CHUNKS_PER_BLOCK_BUCKETS,
+            ),
+            transactions_per_block: context.histogram(
+                "transactions_per_block",
+                "Transactions per finalized block entering preparation",
+                ROW_COUNT_BUCKETS,
             ),
             expansion_duration: context.histogram(
                 "expansion_duration",
                 "Finalized block metadata and authenticated range preparation time (s)",
-                PREPARE_DURATION_BUCKETS,
+                COMMIT_DURATION_BUCKETS,
             ),
             staging_duration: context.histogram(
                 "staging_duration",
                 "Finalized block SQL preparation and Store row staging time (s)",
-                PREPARE_DURATION_BUCKETS,
+                COMMIT_DURATION_BUCKETS,
             ),
             persist_duration: context.histogram(
                 "persist_duration",
@@ -152,30 +261,55 @@ const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
 pub(crate) async fn commit_with_retry(
     client: &StoreClient,
     batch: &StoreWriteBatch,
-    what: &'static str,
+    kind: CommitKind,
     metrics: &StoreCommitMetrics,
 ) -> Result<u64, ClientError> {
-    let start = Instant::now();
-    metrics.in_flight.inc();
-    let result = bounded_commit_retry(
-        || async {
-            let result = batch.commit(client).await;
-            if result.is_err() {
-                metrics.retries.inc();
-            }
-            result
-        },
-        what,
-        batch.len(),
-    )
-    .await;
-    metrics.in_flight.dec();
-    metrics.duration.observe(start.elapsed().as_secs_f64());
-    if result.is_ok() {
-        metrics.commits.inc();
-        metrics.rows.inc_by(batch.len() as u64);
+    let rows = batch.len();
+    let encoded_bytes = batch.encoded_len();
+    async {
+        let start = Instant::now();
+        metrics.in_flight.inc();
+        let result = bounded_commit_retry(
+            || async {
+                let result = batch.commit(client).await;
+                if result.is_err() {
+                    metrics.retries.inc();
+                }
+                result
+            },
+            kind.description(),
+            rows,
+        )
+        .await;
+        metrics.in_flight.dec();
+
+        // Count each logical batch once so retries do not distort its size distribution.
+        let labels = CommitLabels { kind: kind.label() };
+        metrics
+            .duration
+            .get_or_create(&labels)
+            .observe(start.elapsed().as_secs_f64());
+        metrics
+            .batch_rows
+            .get_or_create(&labels)
+            .observe(rows as f64);
+        metrics
+            .encoded_bytes
+            .get_or_create(&labels)
+            .observe(encoded_bytes as f64);
+        if result.is_ok() {
+            metrics.commits.inc();
+            metrics.rows.inc_by(rows as u64);
+        }
+        result
     }
-    result
+    .instrument(info_span!(
+        "store_commit",
+        kind = kind.label(),
+        rows,
+        encoded_bytes
+    ))
+    .await
 }
 
 async fn bounded_commit_retry<F>(
@@ -256,7 +390,135 @@ fn retry_backoff(attempt: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use exoware_sdk::ConnectError;
+    use commonware_runtime::{Runner as _, telemetry::metrics::has_metric_value};
+    use exoware_sdk::{ConnectError, Key};
+
+    fn metric_sample(encoded: &str, name: &str, kind: CommitKind) -> f64 {
+        let sample = format!("{name}{{kind=\"{}\"}} ", kind.label());
+        encoded
+            .lines()
+            .find_map(|line| line.strip_prefix(&sample))
+            .unwrap_or_else(|| panic!("missing sample {sample} in {encoded}"))
+            .parse()
+            .expect("numeric metric sample")
+    }
+
+    fn commit_batch(client: &StoreClient) -> StoreWriteBatch {
+        let client = crate::namespaces::state_qmdb_client(client).expect("namespace builds");
+        let mut batch = StoreWriteBatch::new();
+        batch
+            .push(&client, &Key::from(vec![1; 8]), vec![7; 200])
+            .unwrap();
+        batch
+            .push(&client, &Key::from(vec![2; 8]), vec![9; 5])
+            .unwrap();
+        batch
+    }
+
+    fn assert_commit_samples(encoded: &str, kind: CommitKind, rows: usize, encoded_bytes: usize) {
+        for name in [
+            "store_commit_duration_count",
+            "store_commit_batch_rows_count",
+            "store_commit_encoded_bytes_count",
+        ] {
+            assert_eq!(metric_sample(encoded, name, kind), 1.0);
+        }
+        assert_eq!(
+            metric_sample(encoded, "store_commit_batch_rows_sum", kind),
+            rows as f64,
+        );
+        assert_eq!(
+            metric_sample(encoded, "store_commit_encoded_bytes_sum", kind),
+            encoded_bytes as f64,
+        );
+    }
+
+    #[test]
+    fn store_commit_metrics_distinguish_kinds_and_exact_encoded_bytes() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (server, url) = exoware_simulator::open_temp().await.expect("spawn Store");
+            let client = crate::store::writer_store_client(&url, None).expect("client builds");
+            let metrics = StoreCommitMetrics::new(&context);
+            let batch = commit_batch(&client);
+
+            // The larger value needs two-byte lengths for both its field and entry envelope.
+            let expected_bytes =
+                batch.entries()[0].0.len() + 200 + 8 + batch.entries()[1].0.len() + 5 + 6;
+            assert_eq!(batch.encoded_len(), expected_bytes);
+            for kind in [CommitKind::Chunk, CommitKind::Barrier, CommitKind::Simplex] {
+                commit_with_retry(&client, &batch, kind, &metrics)
+                    .await
+                    .expect("commit succeeds");
+                assert_commit_samples(&context.encode(), kind, 2, expected_bytes);
+            }
+
+            let encoded = context.encode();
+            assert!(has_metric_value(&encoded, "store_commits_total", 3));
+            assert!(has_metric_value(&encoded, "store_commit_rows_total", 6));
+            assert!(has_metric_value(&encoded, "store_commit_retries_total", 0));
+            assert!(has_metric_value(&encoded, "store_commits_in_flight", 0));
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn store_commit_metrics_record_failed_logical_batch_once_after_retry() {
+        use axum::{
+            Router,
+            http::{StatusCode, header::CONTENT_TYPE},
+        };
+        use std::sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let observed_attempts = attempts.clone();
+            let app = Router::new().fallback(move || {
+                let attempts = observed_attempts.clone();
+                async move {
+                    let (status, body) = if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            r#"{"code":"unavailable","message":"retry"}"#,
+                        )
+                    } else {
+                        (
+                            StatusCode::BAD_REQUEST,
+                            r#"{"code":"invalid_argument","message":"reject"}"#,
+                        )
+                    };
+                    (status, [(CONTENT_TYPE, "application/json")], body)
+                }
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = crate::store::store_client(&url, None).expect("client builds");
+            let metrics = StoreCommitMetrics::new(&context);
+            let batch = commit_batch(&client);
+            let error = commit_with_retry(&client, &batch, CommitKind::Chunk, &metrics)
+                .await
+                .expect_err("Store rejects commit");
+
+            assert_eq!(error.rpc_code(), Some(ErrorCode::InvalidArgument));
+            assert_eq!(attempts.load(Ordering::SeqCst), 2);
+            let encoded = context.encode();
+            assert_commit_samples(
+                &encoded,
+                CommitKind::Chunk,
+                batch.len(),
+                batch.encoded_len(),
+            );
+            assert!(metric_sample(&encoded, "store_commit_duration_sum", CommitKind::Chunk) >= 0.2);
+            assert!(has_metric_value(&encoded, "store_commits_total", 0));
+            assert!(has_metric_value(&encoded, "store_commit_rows_total", 0));
+            assert!(has_metric_value(&encoded, "store_commit_retries_total", 2));
+            assert!(has_metric_value(&encoded, "store_commits_in_flight", 0));
+            server.abort();
+        });
+    }
 
     #[test]
     fn store_retry_classification_fails_deterministic_rejections() {

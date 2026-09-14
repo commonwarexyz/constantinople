@@ -190,12 +190,32 @@ latency, publication wait, Store commit retries and concurrency, chunks per bloc
 and upload memory amplification. Payload cleanup metrics expose delayed deletion
 and disk reclamation costs.
 
-Preparation has separate expansion and staging timings with millisecond buckets.
-Expansion covers metadata rows and authenticated QMDB ranges. Staging covers SQL
-preparation and Store rows. The aggregate preparation duration also includes task
-scheduling and request splitting. These are elapsed stage times, not CPU usage.
-The chunk counter includes data chunks from successfully persisted blocks and
-excludes publication barriers.
+Preparation has separate queue wait, expansion, staging, and chunking timings.
+The wait starts when an upload enters the publisher and ends when preparation
+starts executing. Expansion covers metadata rows and authenticated QMDB ranges.
+Staging covers SQL preparation and Store rows. Preparation wall time includes
+request splitting and excludes scheduling. Its paired CPU histogram measures
+only the preparation thread, excluding Rayon workers. A failed CPU-clock read
+logs a warning and omits that CPU sample without interrupting publication.
+
+Preparation, commit, and finalization-to-publication histograms have roughly
+25-percent bucket spacing from 50 ms through 2.5 seconds. Longer buckets retain
+outage and recovery visibility. The chunks-per-block histogram and chunk counter
+include data chunks from successfully persisted blocks and exclude barriers.
+
+Store commit duration, batch rows, and encoded bytes share a `kind` label with
+`chunk`, `barrier`, and `simplex` values. Each records one sample per completed
+logical commit, including failures. Duration includes retry attempts and backoff.
+Encoded bytes measure the uncompressed protobuf request, including physical keys.
+Exact rows and bytes also appear on the commit span. They are observations rather
+than labels so distinct batch sizes do not create additional time series.
+
+Consumer admission metrics distinguish waiting for active-upload capacity from
+the per-record wait for the byte budget. Decode scheduling and execution have
+separate timers, followed by a predecessor-turn wait before publisher admission.
+Payload open timers distinguish the write path from the read path. The write
+timer starts before opening the blob, while the read timer includes its open and
+length lookup. Recovery-only length probes do not enter these open histograms.
 
 Finalization-to-publication latency starts at the finalization timestamp stored
 in the queue and ends when the contiguous QMDB and SQL publication barrier

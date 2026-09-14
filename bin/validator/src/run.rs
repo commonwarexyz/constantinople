@@ -107,8 +107,9 @@ const STORAGE_BUFFER_POOL_MAX_PER_CLASS: NonZeroU32 = NZU32!(128);
 const MAX_FINALIZED_QUEUE_UPLOADS: usize = 64;
 const FINALIZED_UPLOAD_AMPLIFICATION: u64 = 8;
 const FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES: u64 = 64 * 1024;
-const FINALIZED_UPLOAD_DURATION_BUCKETS: [f64; 14] = [
-    0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 15.0,
+const FINALIZED_UPLOAD_DURATION_BUCKETS: [f64; 27] = [
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.0625, 0.08, 0.1, 0.125, 0.16, 0.2, 0.25, 0.315, 0.4,
+    0.5, 0.63, 0.8, 1.0, 1.25, 1.6, 2.0, 2.5, 5.0, 10.0, 30.0, 60.0,
 ];
 const CAPTURE_RECEIPT_KEY: U64 = U64::new(0);
 const INITIAL_QMDB_END: u64 = 1;
@@ -471,6 +472,11 @@ impl Drop for UploadReservation {
 #[derive(Clone)]
 struct FinalizedUploadMetrics {
     queue_read: Histogram,
+    active_capacity_wait: Histogram,
+    admission_wait: Histogram,
+    decode_schedule_wait: Histogram,
+    decode: Histogram,
+    turn_wait: Histogram,
     completion: Histogram,
     receipt_sync: Histogram,
     queue_sync: Histogram,
@@ -482,6 +488,31 @@ impl FinalizedUploadMetrics {
             queue_read: context.histogram(
                 "queue_read_duration",
                 "Finalized queue record read time (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+            active_capacity_wait: context.histogram(
+                "active_capacity_wait_duration",
+                "Consumer wait for an upload task while at the active limit (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+            admission_wait: context.histogram(
+                "admission_wait_duration",
+                "Time from queue record read to byte budget admission (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+            decode_schedule_wait: context.histogram(
+                "decode_schedule_wait_duration",
+                "Payload decode wait for a blocking worker (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+            decode: context.histogram(
+                "decode_duration",
+                "Payload decode wall time inside the blocking worker (s)",
+                FINALIZED_UPLOAD_DURATION_BUCKETS,
+            ),
+            turn_wait: context.histogram(
+                "turn_wait_duration",
+                "Decoded upload wait for predecessor publisher admission (s)",
                 FINALIZED_UPLOAD_DURATION_BUCKETS,
             ),
             completion: context.histogram(
@@ -577,16 +608,43 @@ struct PendingQueuedUpload {
     position: u64,
     record: FinalizedQueueRecord,
     charge: UploadCharge,
+    admission_started: Instant,
+    metrics: FinalizedUploadMetrics,
 }
 
 impl PendingQueuedUpload {
-    fn new(position: u64, record: FinalizedQueueRecord, budget: &UploadBudget) -> Self {
+    fn new(
+        position: u64,
+        record: FinalizedQueueRecord,
+        budget: &UploadBudget,
+        metrics: &FinalizedUploadMetrics,
+    ) -> Self {
         let charge = budget.charge(record.payload.len);
         Self {
             position,
             record,
             charge,
+            admission_started: Instant::now(),
+            metrics: metrics.clone(),
         }
+    }
+
+    fn try_reserve(&self, budget: &UploadBudget) -> Option<UploadReservation> {
+        let reservation = budget.try_reserve(self.charge)?;
+        self.observe_admission();
+        Some(reservation)
+    }
+
+    async fn reserve(&self, budget: &UploadBudget) -> UploadReservation {
+        let reservation = budget.reserve(self.charge).await;
+        self.observe_admission();
+        reservation
+    }
+
+    fn observe_admission(&self) {
+        self.metrics
+            .admission_wait
+            .observe(self.admission_started.elapsed().as_secs_f64());
     }
 }
 
@@ -1081,7 +1139,7 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
             };
             next_ack.get_or_insert(position);
             retained_records.insert(position, record);
-            let pending = PendingQueuedUpload::new(position, record, &budget);
+            let pending = PendingQueuedUpload::new(position, record, &budget, &metrics);
             if let Some(pending) = try_admit_queued_upload(
                 &mut active,
                 publisher.clone(),
@@ -1097,13 +1155,14 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
             }
         }
 
-        let waiting_charge = waiting.as_ref().map(|pending| pending.charge);
         tokio::select! {
             reservation = async {
-                budget
-                    .reserve(waiting_charge.expect("waiting upload has an admission charge"))
+                waiting
+                    .as_ref()
+                    .expect("waiting upload exists")
+                    .reserve(&budget)
                     .await
-            }, if waiting_charge.is_some() && active.len() < max_active => {
+            }, if waiting.is_some() && active.len() < max_active => {
                 budget.clear_waiting();
                 let pending = waiting.take().expect("waiting upload exists");
                 start_queued_upload(
@@ -1118,10 +1177,8 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                 .await;
             }
             () = queue_ready.notified(), if waiting.is_none() && active.len() < max_active => {}
-            result = active.join_next(), if !active.is_empty() => {
-                let (position, height) = result
-                    .expect("active upload set is not empty")
-                    .expect("finalized index upload task panicked");
+            result = next_completed_upload(&mut active, max_active, &metrics), if !active.is_empty() => {
+                let (position, height) = result;
                 let replaced = completed.insert(position, height);
                 assert!(replaced.is_none(), "queue position completed more than once");
                 while let Some(position) = next_ack {
@@ -1155,6 +1212,23 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
     }
 }
 
+async fn next_completed_upload(
+    active: &mut JoinSet<(u64, u64)>,
+    max_active: usize,
+    metrics: &FinalizedUploadMetrics,
+) -> (u64, u64) {
+    let capacity_wait_started = (active.len() >= max_active).then(Instant::now);
+    let result = active.join_next().await;
+    if let Some(started) = capacity_wait_started {
+        metrics
+            .active_capacity_wait
+            .observe(started.elapsed().as_secs_f64());
+    }
+    result
+        .expect("active upload set is not empty")
+        .expect("finalized index upload task panicked")
+}
+
 async fn try_read_finalized_queue_entry(
     reader: &mut FinalizedQueueReader,
     metrics: &FinalizedUploadMetrics,
@@ -1176,7 +1250,7 @@ async fn try_admit_queued_upload(
     budget: &UploadBudget,
     pending: PendingQueuedUpload,
 ) -> Option<PendingQueuedUpload> {
-    let Some(reservation) = budget.try_reserve(pending.charge) else {
+    let Some(reservation) = pending.try_reserve(budget) else {
         budget.mark_waiting(pending.charge);
         return Some(pending);
     };
@@ -1307,6 +1381,7 @@ async fn start_queued_upload(
 ) {
     let position = pending.position;
     let record = pending.record;
+    let metrics = pending.metrics;
     let height = record.height();
     assert_eq!(
         height,
@@ -1323,9 +1398,7 @@ async fn start_queued_upload(
 
         // Decoding is CPU work over hundreds of thousands of operations, so it
         // runs on the blocking pool instead of a runtime worker.
-        let upload = tokio::task::spawn_blocking(move || decode_finalized_payload(height, bytes))
-            .await
-            .expect("finalized index payload decode task panicked");
+        let upload = decode_finalized_payload(height, bytes, &metrics).await;
         assert_eq!(
             LatestCaptureReceipt::from_upload(&upload),
             record.receipt,
@@ -1334,10 +1407,7 @@ async fn start_queued_upload(
         let block = Arc::new(upload.block().clone());
         let finalization = upload.finalization();
 
-        if let Some(turn) = turn {
-            turn.await
-                .expect("earlier finalized index upload exited before admitting its block");
-        }
+        wait_for_upload_turn(turn, &metrics).await;
         let engine_publisher = publisher.publisher().await;
         let mut completion = engine_publisher
             .enqueue_queued_finalized(upload)
@@ -1370,6 +1440,18 @@ async fn start_queued_upload(
         });
         (position, height)
     });
+}
+
+async fn wait_for_upload_turn(
+    turn: Option<oneshot::Receiver<()>>,
+    metrics: &FinalizedUploadMetrics,
+) {
+    let started = Instant::now();
+    if let Some(turn) = turn {
+        turn.await
+            .expect("earlier finalized index upload exited before admitting its block");
+    }
+    metrics.turn_wait.observe(started.elapsed().as_secs_f64());
 }
 
 /// Hold the admission reservation only until this block's own uploads are durable.
@@ -1414,10 +1496,26 @@ async fn read_finalized_payload(
         })
 }
 
-fn decode_finalized_payload(height: u64, bytes: Bytes) -> EngineQueuedUpload {
-    EngineQueuedUpload::decode_cfg(bytes, &QueuedFinalizedUploadCfg::default()).unwrap_or_else(
-        |error| panic!("failed to decode finalized index payload at height {height}. {error}"),
-    )
+async fn decode_finalized_payload(
+    height: u64,
+    bytes: Bytes,
+    metrics: &FinalizedUploadMetrics,
+) -> EngineQueuedUpload {
+    let metrics = metrics.clone();
+    let scheduled = Instant::now();
+    tokio::task::spawn_blocking(move || {
+        metrics
+            .decode_schedule_wait
+            .observe(scheduled.elapsed().as_secs_f64());
+        let started = Instant::now();
+        let upload = EngineQueuedUpload::decode_cfg(bytes, &QueuedFinalizedUploadCfg::default());
+        metrics.decode.observe(started.elapsed().as_secs_f64());
+        upload.unwrap_or_else(|error| {
+            panic!("failed to decode finalized index payload at height {height}. {error}")
+        })
+    })
+    .await
+    .expect("finalized index payload decode task panicked")
 }
 
 #[derive(Debug)]
@@ -2004,7 +2102,7 @@ mod tests {
     use crate::{config::IndexerConfig, finalized_payloads::PayloadDescriptor};
     use commonware_codec::{DecodeExt as _, Encode as _, FixedSize as _};
     use commonware_cryptography::sha256::Digest as Sha256Digest;
-    use commonware_runtime::{Runner as _, Spawner as _, Supervisor as _};
+    use commonware_runtime::{Metrics as _, Runner as _, Spawner as _, Supervisor as _};
     use commonware_utils::NZUsize;
     use std::{future::pending, time::Duration};
     use tokio::sync::oneshot;
@@ -2410,6 +2508,130 @@ mod tests {
         let queue = capture_receipt(7, 12, 13);
 
         let _ = recover_capture_receipt(Some(metadata), Some(queue));
+    }
+
+    #[test]
+    fn admission_timer_survives_a_cancelled_budget_wait() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let metrics = super::FinalizedUploadMetrics::new(&context.child("upload"));
+            let budget = UploadBudget::new(
+                &context.child("budget"),
+                FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
+            );
+            let occupied = budget.try_reserve(budget.charge(1)).unwrap();
+            let record = FinalizedQueueRecord {
+                receipt: capture_receipt(1, 1, 1),
+                state_start: 0,
+                transaction_start: 0,
+                payload: PayloadDescriptor { len: 1, crc: 0 },
+            };
+            let pending = super::PendingQueuedUpload::new(0, record, &budget, &metrics);
+            assert!(pending.try_reserve(&budget).is_none());
+            let mut reservation = Box::pin(pending.reserve(&budget));
+            assert!(futures::poll!(reservation.as_mut()).is_pending());
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_admission_wait_duration_count 0")
+            );
+            drop(reservation);
+
+            drop(occupied);
+            let reservation = pending.reserve(&budget).await;
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_admission_wait_duration_count 1")
+            );
+            assert!(context.encode().contains("upload_decode_duration_count 0"));
+            drop(reservation);
+        });
+    }
+
+    #[test]
+    fn active_capacity_timer_only_counts_waits_at_the_limit() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let metrics = super::FinalizedUploadMetrics::new(&context.child("upload"));
+            let mut active = tokio::task::JoinSet::new();
+            let (release, blocked) = oneshot::channel();
+            active.spawn(async move {
+                blocked.await.unwrap();
+                (0, 1)
+            });
+            let mut completion = Box::pin(super::next_completed_upload(&mut active, 1, &metrics));
+            assert!(futures::poll!(completion.as_mut()).is_pending());
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_active_capacity_wait_duration_count 0")
+            );
+            release.send(()).unwrap();
+            assert_eq!(completion.await, (0, 1));
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_active_capacity_wait_duration_count 1")
+            );
+
+            active.spawn(async { (1, 2) });
+            assert_eq!(
+                super::next_completed_upload(&mut active, 2, &metrics).await,
+                (1, 2)
+            );
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_active_capacity_wait_duration_count 1")
+            );
+        });
+    }
+
+    #[test]
+    fn turn_timer_observes_only_after_the_predecessor_releases() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let metrics = super::FinalizedUploadMetrics::new(&context.child("upload"));
+            let (release, turn) = oneshot::channel();
+            let mut waiting = Box::pin(super::wait_for_upload_turn(Some(turn), &metrics));
+            assert!(futures::poll!(waiting.as_mut()).is_pending());
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_turn_wait_duration_count 0")
+            );
+            release.send(()).unwrap();
+            waiting.await;
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_turn_wait_duration_count 1")
+            );
+
+            super::wait_for_upload_turn(None, &metrics).await;
+            assert!(
+                context
+                    .encode()
+                    .contains("upload_turn_wait_duration_count 2")
+            );
+        });
+    }
+
+    #[test]
+    fn failed_decode_records_worker_scheduling_and_decode_separately() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            // Retain the registration after the failing task releases its handles.
+            let metrics = super::FinalizedUploadMetrics::new(&context.child("upload"));
+            let decode_metrics = metrics.clone();
+            let result = tokio::spawn(async move {
+                super::decode_finalized_payload(1, bytes::Bytes::new(), &decode_metrics).await
+            })
+            .await;
+            assert!(result.err().expect("invalid payload must fail").is_panic());
+            let encoded = context.encode();
+            assert!(encoded.contains("upload_decode_schedule_wait_duration_count 1"));
+            assert!(encoded.contains("upload_decode_duration_count 1"));
+            assert!(encoded.contains("upload_turn_wait_duration_count 0"));
+            drop(metrics);
+        });
     }
 
     #[test]
