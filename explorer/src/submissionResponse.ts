@@ -15,7 +15,7 @@ export type SingleTransactionOutcome =
     | { readonly kind: 'dropped' }
     | { readonly kind: 'ambiguous'; readonly detail: string };
 
-export type SubmissionResponseKind = 'status' | 'pending' | 'rejected' | 'ambiguous';
+type SubmissionResponseKind = 'status' | 'pending' | 'rejected' | 'ambiguous';
 
 export class TransactionSubmissionError extends Error {
     readonly kind: Extract<SubmissionResponseKind, 'rejected' | 'ambiguous'>;

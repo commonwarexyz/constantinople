@@ -37,6 +37,7 @@ const ACCOUNT_CURSOR_BYTES = 24;
 
 const BLOCK_META_TABLE = 'block_meta';
 const BLOCK_META_HEIGHT = 'height';
+const BLOCK_META_TX_COUNT = 'tx_count';
 const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
 
 const TX_META_TABLE = 'tx_meta';
@@ -347,7 +348,7 @@ async function fetchTransactionProofMetadata(
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}
+            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}, ${BLOCK_META_TX_COUNT}
             FROM ${BLOCK_META_TABLE}
             WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${location.toString()}
             ORDER BY ${BLOCK_META_HEIGHT} ASC
@@ -358,6 +359,14 @@ async function fetchTransactionProofMetadata(
     const row = result.rows[0];
     if (!row) {
         throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
+    }
+
+    // The tip is the trailing commit location. A later certified range can
+    // retain this transaction without identifying its original block.
+    const tip = expectBigint(row.values[BLOCK_META_TRANSACTIONS_TIP], BLOCK_META_TRANSACTIONS_TIP);
+    const count = expectBigint(row.values[BLOCK_META_TX_COUNT], BLOCK_META_TX_COUNT);
+    if (location < tip - count) {
+        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet in the selected block range`);
     }
     return {
         height: expectBigint(row.values[BLOCK_META_HEIGHT], BLOCK_META_HEIGHT),

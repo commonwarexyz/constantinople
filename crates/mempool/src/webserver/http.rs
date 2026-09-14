@@ -3,6 +3,7 @@
 use super::{
     Mailbox,
     actor::{AccountReaderCell, IngestStatus},
+    mailbox::SubmissionLane,
 };
 use axum::{
     Router,
@@ -149,25 +150,7 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let batch = match verify_body::<P, H, _>(&state, body).await {
-        Ok(batch) => batch,
-        Err(status) => return (status, String::new()),
-    };
-
-    // Phase 3: Submit to actor and await result.
-    let Some(result_rx) = state.mailbox.try_submit(
-        batch.batch_id,
-        batch.digests,
-        batch.transactions,
-        batch.total_bytes,
-    ) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
-    };
-
-    result_rx.await.map_or_else(
-        |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-        |status| ok_json(&status),
-    )
+    submit_in_lane(state, body, SubmissionLane::Foreground).await
 }
 
 /// Accepts a verified transaction batch without waiting for finalization.
@@ -218,12 +201,27 @@ where
     H: Hasher,
     St: Strategy,
 {
+    submit_in_lane(state, body, SubmissionLane::Background).await
+}
+
+async fn submit_in_lane<C, P, H, St>(
+    state: SharedState<C, P, H, St>,
+    body: Bytes,
+    lane: SubmissionLane,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
     let batch = match verify_body::<P, H, _>(&state, body).await {
         Ok(batch) => batch,
         Err(status) => return (status, String::new()),
     };
 
-    let Some(result_rx) = state.mailbox.try_submit_background(
+    let Some(result_rx) = state.mailbox.try_submit_in_lane(
+        lane,
         batch.batch_id,
         batch.digests,
         batch.transactions,

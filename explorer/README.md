@@ -30,6 +30,10 @@ a terminal status or an empty HTTP 202 from the relayer. A pending response or
 an ambiguous delivery failure keeps the nonce reserved while the explorer
 reconciles the transaction by digest. Submission history survives reloads so
 those reservations and proof retries can continue.
+The explorer does not yet identify transactions replaced by another digest.
+Account nonce advancement and missing SQL metadata do not prove rejection, so
+unresolved submissions keep their reservations. Reload retries proof errors after
+backend or verifier repairs.
 
 Reconciliation looks up `tx_meta.qmdb_location` and the raw transaction bytes,
 checks that the bytes hash to the submitted digest, and finds the containing
