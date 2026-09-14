@@ -67,12 +67,12 @@ commonware-consensus = "2026.9.0"
 commonware-cryptography = { version = "2026.9.0", default-features = false }
 
 # Exoware
-exoware-sdk = "2026.9.0"
-exoware-server = "2026.9.0"
-exoware-qmdb = "2026.9.0"
-exoware-simplex = "2026.9.0"
-exoware-simulator = "2026.9.0"
-exoware-sql = "2026.9.0"
+exoware-sdk = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c7742f4af6c1d2b4bc722fe92cfd4a8c01" }
+exoware-server = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c7742f4af6c1d2b4bc722fe92cfd4a8c01" }
+exoware-qmdb = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c7742f4af6c1d2b4bc722fe92cfd4a8c01" }
+exoware-simplex = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c7742f4af6c1d2b4bc722fe92cfd4a8c01" }
+exoware-simulator = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c7742f4af6c1d2b4bc722fe92cfd4a8c01" }
+exoware-sql = { git = "https://github.com/exowarexyz/monorepo", rev = "455502c7742f4af6c1d2b4bc722fe92cfd4a8c01" }
 datafusion = "55"
 
 # Other

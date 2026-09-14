@@ -29,8 +29,11 @@ use commonware_runtime::{
 use exoware_sdk::{ClientError, ErrorCode, StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
 pub use sql::SqlRow;
-use std::time::{Duration, Instant};
-use tokio::time::sleep;
+use std::{
+    future::Future,
+    time::{Duration, Instant},
+};
+use tokio::time::{sleep, timeout};
 use tracing::warn;
 
 /// Commit latency buckets: 10ms to 60s.
@@ -141,9 +144,11 @@ impl PublisherMetrics {
     }
 }
 
-/// Commits `batch` through the physical Store client, retrying with capped
-/// exponential backoff until it lands. Rows are namespace-encoded when they
-/// are staged, so the commit is a raw write.
+// Persistent failures must release the worker so supervision can recover it.
+const COMMIT_MAX_ATTEMPTS: u32 = 8;
+const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Retries transient Store failures within a fixed attempt and time budget.
 pub(crate) async fn commit_with_retry(
     client: &StoreClient,
     batch: &StoreWriteBatch,
@@ -152,37 +157,76 @@ pub(crate) async fn commit_with_retry(
 ) -> Result<u64, ClientError> {
     let start = Instant::now();
     metrics.in_flight.inc();
-    let mut attempt = 0u32;
-    let seq = loop {
-        match batch.commit(client).await {
-            Ok(seq) => break seq,
-            Err(error) => {
-                attempt = attempt.saturating_add(1);
+    let result = bounded_commit_retry(
+        || async {
+            let result = batch.commit(client).await;
+            if result.is_err() {
                 metrics.retries.inc();
-                if !is_retryable_store_error(&error) {
-                    metrics.in_flight.dec();
-                    metrics.duration.observe(start.elapsed().as_secs_f64());
-                    return Err(error);
+            }
+            result
+        },
+        what,
+        batch.len(),
+    )
+    .await;
+    metrics.in_flight.dec();
+    metrics.duration.observe(start.elapsed().as_secs_f64());
+    if result.is_ok() {
+        metrics.commits.inc();
+        metrics.rows.inc_by(batch.len() as u64);
+    }
+    result
+}
+
+async fn bounded_commit_retry<F>(
+    mut commit: impl FnMut() -> F,
+    what: &'static str,
+    rows: usize,
+) -> Result<u64, ClientError>
+where
+    F: Future<Output = Result<u64, ClientError>>,
+{
+    timeout(COMMIT_TIMEOUT, async {
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            match commit().await {
+                Ok(seq) => return Ok(seq),
+                Err(error) => {
+                    if !is_retryable_store_error(&error) || attempt == COMMIT_MAX_ATTEMPTS {
+                        warn!(
+                            ?error,
+                            put_too_large = ?error.put_too_large(),
+                            attempt,
+                            rows,
+                            what,
+                            "store batch commit failed, stopping"
+                        );
+                        return Err(error);
+                    }
+                    warn!(
+                        ?error,
+                        attempt, rows, what, "store batch commit failed, retrying"
+                    );
+                    sleep(retry_backoff(attempt)).await;
                 }
-                warn!(
-                    ?error,
-                    attempt,
-                    rows = batch.len(),
-                    what,
-                    "store batch commit failed, retrying"
-                );
-                sleep(retry_backoff(attempt)).await;
             }
         }
-    };
-    metrics.in_flight.dec();
-    metrics.commits.inc();
-    metrics.rows.inc_by(batch.len() as u64);
-    metrics.duration.observe(start.elapsed().as_secs_f64());
-    Ok(seq)
+    })
+    .await
+    .unwrap_or_else(|_| {
+        warn!(rows, what, "store batch commit retry deadline expired");
+        Err(ClientError::Rpc(Box::new(
+            exoware_sdk::ConnectError::deadline_exceeded("Store commit retry budget expired"),
+        )))
+    })
 }
 
 fn is_retryable_store_error(error: &ClientError) -> bool {
+    if error.put_too_large().is_some() {
+        return false;
+    }
+
     match error {
         ClientError::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
         ClientError::Rpc(_) => matches!(
@@ -228,5 +272,204 @@ mod tests {
         assert!(!is_retryable_store_error(&ClientError::WireFormat(
             "reject".to_string()
         )));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_recovers_from_transient_failure() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let sequence = bounded_commit_retry(
+            || {
+                attempts += 1;
+                std::future::ready(if attempts == 1 {
+                    Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
+                        "busy",
+                    ))))
+                } else {
+                    Ok(17)
+                })
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect("transient failure should recover");
+
+        assert_eq!(attempts, 2);
+        assert_eq!(sequence, 17);
+        assert_eq!(start.elapsed(), Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_stops_on_nonretryable_error() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = bounded_commit_retry(
+            || {
+                attempts += 1;
+                std::future::ready(Err(ClientError::WireFormat("reject".to_string())))
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect_err("deterministic failure must stop");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert!(matches!(error, ClientError::WireFormat(message) if message == "reject"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_stops_after_attempt_budget() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = bounded_commit_retry(
+            || {
+                attempts += 1;
+                std::future::ready(Err(ClientError::Rpc(Box::new(
+                    ConnectError::resource_exhausted(format!("busy attempt {attempts}")),
+                ))))
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect_err("persistent overload must stop");
+
+        assert_eq!(attempts, 8);
+        assert_eq!(start.elapsed(), Duration::from_secs(9));
+        assert_eq!(error.rpc_code(), Some(ErrorCode::ResourceExhausted));
+        assert_eq!(
+            error.rpc_error().unwrap().message.as_deref(),
+            Some("busy attempt 8")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_deadline_cancels_stalled_commit() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = bounded_commit_retry(
+            || {
+                attempts += 1;
+                std::future::pending()
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect_err("stalled commit must time out");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+        assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_deadline_bounds_all_attempts() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = bounded_commit_retry(
+            || {
+                attempts += 1;
+                async {
+                    sleep(Duration::from_secs(25)).await;
+                    Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
+                        "busy",
+                    ))))
+                }
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect_err("retries must share the deadline");
+
+        assert_eq!(attempts, 3);
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+        assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_deadline_bounds_backoff() {
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = bounded_commit_retry(
+            || {
+                attempts += 1;
+                async {
+                    sleep(Duration::from_millis(59_900)).await;
+                    Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
+                        "busy",
+                    ))))
+                }
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect_err("backoff must share the deadline");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(start.elapsed(), Duration::from_secs(60));
+        assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_retry_preserves_put_too_large_without_retrying() {
+        use exoware_sdk::{
+            google::rpc::ErrorInfo,
+            limits::{INGEST_ERROR_DOMAIN, PUT_TOO_LARGE_REASON, PutTooLarge},
+            with_error_info_detail,
+        };
+
+        let info = ErrorInfo {
+            domain: INGEST_ERROR_DOMAIN.to_string(),
+            reason: PUT_TOO_LARGE_REASON.to_string(),
+            metadata: [
+                ("entries", "2000001"),
+                ("max_entries", "2000000"),
+                ("extra", "preserve me"),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect(),
+            ..Default::default()
+        };
+        let start = tokio::time::Instant::now();
+        let mut attempts = 0;
+        let error = bounded_commit_retry(
+            || {
+                attempts += 1;
+                std::future::ready(Err(ClientError::Rpc(Box::new(with_error_info_detail(
+                    ConnectError::invalid_argument("too large"),
+                    info.clone(),
+                )))))
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect_err("oversized batch must fail immediately");
+
+        assert_eq!(attempts, 1);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+        assert_eq!(error.rpc_code(), Some(ErrorCode::InvalidArgument));
+        assert_eq!(
+            error.rpc_error().unwrap().message.as_deref(),
+            Some("too large")
+        );
+        assert_eq!(
+            error.put_too_large(),
+            Some(PutTooLarge {
+                entries: 2_000_001,
+                max_entries: 2_000_000,
+            })
+        );
+        assert_eq!(
+            error.decoded_rpc_error().unwrap().unwrap().error_info,
+            Some(info)
+        );
     }
 }
