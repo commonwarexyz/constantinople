@@ -89,13 +89,19 @@ be uploading, so publication must continue to wait for the fully durable
 contiguous prefix. Node rows are retained without a pruning policy.
 
 Each block stages its SQL rows and both QMDB ranges together. Data requests
-use a 128 MiB budget that includes conservative protobuf overhead and a
-250,000-row cap for the decoder's separate 32 MiB entry-allocation limit. A 32 MiB
-proposal produced more than 257 MiB of raw rows in the simulator, exceeding
-the Store's 256 MiB limit. Small batches remain one request. Larger batches
-commit with at most four chunk requests in flight per block. The limit includes
-request encoding, compression, and retries. Every part must finish before
-publication.
+use a 24 MiB encoded-byte budget and a 250,000-row cap. The SDK accounts for
+physical keys and exact protobuf framing. The byte budget splits SQL-heavy
+chunks to reduce encoding, compression, and transfer time. The row cap limits
+the Store's serial per-row work independently of bytes. These are publisher
+tuning budgets, not Store protocol limits.
+
+Small batches remain one request. Larger batches commit with up to ten chunk
+requests in flight per block so typical large blocks can upload their chunks
+in one wave. The limit covers request encoding, compression, and retries.
+Each active block has its own chunk slots. Upload admission still bounds active
+blocks and their memory budget. Every chunk must finish durably before the
+block can enter the contiguous publication prefix.
+
 Preparation retains the verified final locations for publication. The Exoware
 API stages presence rows with the immutable data. Visibility remains gated by
 the corresponding published watermark.
@@ -176,6 +182,12 @@ point queries covering cache misses. Proof inputs can load concurrently, and
 account-page rows share a certificate instead of refreshing it per row.
 
 ## Deployment and observability
+
+Deploy the increased chunk concurrency only after the SQL and QMDB facades
+use the SDK's raised response decode budgets and the Store enforces a
+2,000,000-entry sequence cap with whole-PUT carryover. Concurrent PUTs can
+coalesce into one Subscribe frame. The decoder updates and sequence cap must
+be live before the publisher starts using the additional chunk slots.
 
 Fresh deployments require empty queue partitions and fresh state QMDB,
 transaction QMDB, and publication-target namespaces. A single owning publisher
