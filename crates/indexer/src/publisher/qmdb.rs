@@ -75,14 +75,14 @@ const STATE_OPERATION_CODEC_VERSION: u16 = 1;
 const TRANSACTION_OPERATION_CODEC_VERSION: u16 = 1;
 const MAX_BUFFERED_UPLOADS: usize = 64;
 
-// Leave transport headroom and bound each request's encoding allocations.
-const DATA_REQUEST_BYTES: usize = 128 * 1024 * 1024;
+// Split byte-heavy SQL chunks to reduce encoding, compression, and transfer time.
+const DATA_REQUEST_BYTES: usize = 24 * 1024 * 1024;
 
 // Limit serial per-row Store work independently of request bytes.
 const DATA_REQUEST_ROWS: usize = 250_000;
 
-// Bound request encoding and compression allocations while other blocks upload.
-const MAX_CONCURRENT_CHUNKS: usize = 4;
+// Let a typical large block's chunks overlap without a second request wave.
+const MAX_CONCURRENT_CHUNKS: usize = 10;
 
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
