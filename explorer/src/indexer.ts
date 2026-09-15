@@ -2,6 +2,7 @@ import { type DecodedQueryResult, type DecodedSubscribeFrame, SqlClient } from '
 import {
     subscribePublishedProofTargets,
     waitForRetry,
+    withAbort,
     type PublishedProofTarget,
 } from './proofTarget.ts';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
@@ -23,6 +24,7 @@ export interface ObservedBlock {
 }
 
 export interface SubscribeBlocksOptions {
+    readonly targets?: AsyncIterable<PublishedProofTarget>;
     readonly signal?: AbortSignal;
     readonly reconnectDelayMs?: number;
     readonly onError?: (message: string) => void;
@@ -36,7 +38,7 @@ export async function* subscribeBlocks(
     storeUrl: string,
     options: SubscribeBlocksOptions = {},
 ): AsyncGenerator<ObservedBlock, void, void> {
-    const targets = subscribePublishedProofTargets(storeUrl, {
+    const targets = options.targets ?? subscribePublishedProofTargets(storeUrl, {
         signal: options.signal,
         reconnectDelayMs: options.reconnectDelayMs,
         onError: (message) => {
@@ -101,10 +103,13 @@ export async function* subscribeBlocksFromTargets(
                 } else {
                     let result: DecodedQueryResult;
                     try {
-                        result = await sql.query(
-                            blockMetadataQuery(target.height),
-                            target.sequenceNumber,
-                            { signal },
+                        result = await withAbort(
+                            () => sql.query(
+                                blockMetadataQuery(target.height),
+                                target.sequenceNumber,
+                                { signal },
+                            ),
+                            signal,
                         );
                     } catch (error) {
                         if (signal?.aborted) return;

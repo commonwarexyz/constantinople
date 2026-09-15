@@ -15,6 +15,10 @@ import {
     toHex,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
+import {
+    wakeCoveredReconciliations,
+    type TransactionReconciliation,
+} from './reconciliationQueue';
 import { type ObservedBlock, subscribeBlocks } from './indexer';
 import {
     fetchAccount,
@@ -28,6 +32,9 @@ import {
 } from './submissionResponse';
 import {
     fetchAccountTransactionsPage,
+    fetchAccountProofMetadata,
+    fetchTransactionRowMetadata,
+    prefetchFinalizedCertificate,
     fetchAndVerifyAccountProof,
     fetchAndVerifyTransactionProof,
     fetchAndVerifyTransactionRowProof,
@@ -37,6 +44,7 @@ import {
     type LatestProofTarget,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
+    type TransactionRowMetadata,
 } from './qmdb';
 import {
     consumeNonce,
@@ -54,7 +62,7 @@ import {
     retryAccountWork,
 } from './proofRetry';
 import {
-    subscribePublishedProofTargets,
+    createSharedProofTargets,
     type PublishedProofTarget,
 } from './proofTarget';
 import {
@@ -140,6 +148,8 @@ type AccountProofState =
 interface AccountPage {
     readonly account: string;
     readonly rows: AccountTransactionRow[];
+    readonly minSequenceNumber: bigint;
+    readonly metadata: Promise<ReadonlyMap<string, TransactionRowMetadata>>;
 }
 
 interface AccountTxWithProof {
@@ -150,11 +160,6 @@ interface AccountTxWithProof {
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
     readonly latestBlockAt: number | null;
-}
-
-interface TransactionReconciliation {
-    readonly controller: AbortController;
-    timer: number | null;
 }
 
 function disposeReconciliation(reconciliation: TransactionReconciliation) {
@@ -293,43 +298,36 @@ export default function App() {
 
     useEffect(() => {
         const controller = new AbortController();
-        let cancelled = false;
-
-        (async () => {
-            try {
-                for await (const block of subscribeBlocks(indexerUrl, storeUrl, {
-                    signal: controller.signal,
-                    onError: (message) =>
-                        setStatus({ kind: 'error', message: `backend error: ${message}` }),
-                    onReconnect: () => setStatus({ kind: 'connecting' }),
-                })) {
-                    if (cancelled) return;
-                    applyObservedBlocks([block]);
-                }
-            } catch (error) {
-                if (cancelled || controller.signal.aborted) return;
-                setStatus({
-                    kind: 'error',
-                    message: error instanceof Error ? error.message : String(error),
-                });
-            }
-        })();
-
-        return () => {
-            cancelled = true;
-            controller.abort();
+        const targets = createSharedProofTargets(storeUrl, {
+            signal: controller.signal,
+            onError: (message) =>
+                setStatus({ kind: 'error', message: `proof target error: ${message}` }),
+        });
+        const blockTargets = targets.subscribe({ signal: controller.signal });
+        const proofTargets = targets.subscribe({ signal: controller.signal });
+        const failed = (error: unknown) => {
+            if (controller.signal.aborted) return;
+            setStatus({
+                kind: 'error',
+                message: error instanceof Error ? error.message : String(error),
+            });
         };
-    }, []);
-
-    useEffect(() => {
-        const controller = new AbortController();
 
         (async () => {
-            for await (const target of subscribePublishedProofTargets(storeUrl, {
+            for await (const block of subscribeBlocks(indexerUrl, storeUrl, {
+                targets: blockTargets,
                 signal: controller.signal,
                 onError: (message) =>
-                    setStatus({ kind: 'error', message: `proof target error: ${message}` }),
+                    setStatus({ kind: 'error', message: `backend error: ${message}` }),
+                onReconnect: () => setStatus({ kind: 'connecting' }),
             })) {
+                if (controller.signal.aborted) return;
+                applyObservedBlocks([block]);
+            }
+        })().catch(failed);
+
+        (async () => {
+            for await (const target of proofTargets) {
                 if (controller.signal.aborted) return;
                 setPublishedProofTarget((current) =>
                     current &&
@@ -339,15 +337,12 @@ export default function App() {
                         : target,
                 );
             }
-        })().catch((error) => {
-            if (controller.signal.aborted) return;
-            setStatus({
-                kind: 'error',
-                message: error instanceof Error ? error.message : String(error),
-            });
-        });
+        })().catch(failed);
 
-        return () => controller.abort();
+        return () => {
+            controller.abort();
+            targets.close();
+        };
     }, []);
 
     useEffect(() => {
@@ -424,34 +419,65 @@ export default function App() {
         setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
 
         retryAccountWork(async () => {
-            const published = publishedProofTargetRef.current;
-            if (!published) {
-                throw new Error('latest provable target is missing');
-            }
-            const target = await fetchLatestProofTarget({
-                storeUrl,
-                simplexVerificationMaterial,
-                publishedTarget: published,
-                signal: controller.signal,
-            });
-            controller.signal.throwIfAborted();
-            setAccountTarget(target);
-
+            const attempt = new AbortController();
+            const signal = AbortSignal.any([controller.signal, attempt.signal]);
             try {
-                const proof = await fetchAndVerifyAccountProof({
-                    qmdbUrl,
+                const published = publishedProofTargetRef.current;
+                if (!published) {
+                    throw new Error('latest provable target is missing');
+                }
+                const targetPromise = fetchLatestProofTarget({
+                    storeUrl,
+                    simplexVerificationMaterial,
+                    publishedTarget: published,
+                    signal,
+                }).then((target) => {
+                    signal.throwIfAborted();
+                    setAccountTarget(target);
+                    return target;
+                });
+                const metadataPromise = fetchAccountProofMetadata({
                     sqlUrl: indexerUrl,
                     account: lookupAccount,
-                    target,
-                    signal: controller.signal,
+                    minSequenceNumber: published.sequenceNumber,
+                    signal,
                 });
-                return { target, proof };
-            } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
-                if (isMissingAccountProofError(detail)) {
-                    return { target, proof: null };
+
+                // A missing account must not prevent independent transaction proofs.
+                const [target, metadataResult] = await Promise.all([
+                    targetPromise,
+                    metadataPromise.then(
+                        (metadata) => ({ metadata }),
+                        (error: unknown) => ({ error }),
+                    ),
+                ]);
+                if ('error' in metadataResult) {
+                    const { error } = metadataResult;
+                    const detail = error instanceof Error ? error.message : String(error);
+                    if (isMissingAccountProofError(detail)) return { target, proof: null };
+                    throw error;
                 }
-                throw error;
+                const { metadata } = metadataResult;
+
+                try {
+                    const proof = await fetchAndVerifyAccountProof({
+                        qmdbUrl,
+                        sqlUrl: indexerUrl,
+                        account: lookupAccount,
+                        target,
+                        metadata,
+                        signal,
+                    });
+                    return { target, proof };
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    if (isMissingAccountProofError(detail)) {
+                        return { target, proof: null };
+                    }
+                    throw error;
+                }
+            } finally {
+                attempt.abort();
             }
         }, controller.signal, isRetryableAccountProofError)
             .then(({ target, proof }) => {
@@ -517,7 +543,20 @@ export default function App() {
                     row,
                     proof: { status: 'waiting', detail: 'waiting for latest finalization' },
                 })));
-                setAccountPage({ account: lookupAccount, rows: page.rows });
+                const metadata = retryAccountWork(
+                    () => fetchTransactionRowMetadata({
+                        sqlUrl: indexerUrl,
+                        rows: page.rows,
+                        minSequenceNumber,
+                        signal: controller.signal,
+                    }),
+                    controller.signal,
+                    isRetryableAccountProofError,
+                );
+
+                // The certificate may still be loading when this request fails.
+                void metadata.catch(() => {});
+                setAccountPage({ account: lookupAccount, rows: page.rows, minSequenceNumber, metadata });
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
@@ -557,6 +596,24 @@ export default function App() {
         );
         let rowTarget = accountTarget;
         let targetRefresh: Promise<LatestProofTarget> | undefined;
+        let metadataFloor = accountPage.minSequenceNumber;
+        let metadataPromise = accountPage.metadata;
+        const rowMetadata = (target: LatestProofTarget) => {
+            if (target.sequenceNumber > metadataFloor) {
+                metadataFloor = target.sequenceNumber;
+                metadataPromise = retryAccountWork(
+                    () => fetchTransactionRowMetadata({
+                        sqlUrl: indexerUrl,
+                        rows,
+                        minSequenceNumber: target.sequenceNumber,
+                        signal: controller.signal,
+                    }),
+                    controller.signal,
+                    isRetryableAccountProofError,
+                );
+            }
+            return metadataPromise;
+        };
 
         // A newer page can require a later certificate. Share that refresh
         // across rows and retain it through retries without following the tip.
@@ -588,11 +645,13 @@ export default function App() {
         rows.forEach((row, index) => {
             retryAccountWork(async () => {
                 const target = await rowProofTarget();
+                const metadata = await rowMetadata(target);
                 return fetchAndVerifyTransactionRowProof({
                     qmdbUrl,
                     sqlUrl: indexerUrl,
                     row,
                     target,
+                    metadata: metadata.get(row.digest),
                     signal: controller.signal,
                 });
             }, controller.signal, isRetryableAccountProofError)
@@ -622,6 +681,26 @@ export default function App() {
             reconciliationSequenceRef.current = 0;
         };
     }, [historyKey]);
+
+    const wakeReconciliations = (height: bigint) => {
+        wakeCoveredReconciliations(
+            reconciliationsRef.current,
+            height,
+            (timer) => window.clearTimeout(timer),
+            (digest) => {
+                reconciliationSequenceRef.current += 1;
+                reconciliationOrderRef.current.set(digest, reconciliationSequenceRef.current);
+                setHistory((current) =>
+                    markReconciliationWaiting(digest, WAITING_FINALIZATION_PROOF.detail, current),
+                );
+            },
+        );
+    };
+
+    useEffect(() => {
+        if (historyKey === null || loadedHistoryKey !== historyKey || !publishedProofTarget) return;
+        wakeReconciliations(publishedProofTarget.height);
+    }, [publishedProofTarget, historyKey, loadedHistoryKey]);
 
     useEffect(() => {
         if (historyKey === null || loadedHistoryKey !== historyKey) return;
@@ -666,6 +745,7 @@ export default function App() {
             const reconciliation: TransactionReconciliation = {
                 controller: new AbortController(),
                 timer: null,
+                waitingForHeight: null,
             };
             reconciliations.set(tx.digest, reconciliation);
             const releaseReconciliation = () => {
@@ -777,6 +857,14 @@ export default function App() {
                     const failures =
                         (reconciliationFailuresRef.current.get(tx.digest) ?? 0) + 1;
                     reconciliationFailuresRef.current.set(tx.digest, failures);
+
+                    // Only publication coverage waits can be resolved by a new target.
+                    // Missing old transactions and transport failures retain their backoff.
+                    reconciliation.waitingForHeight =
+                        tx.finalizedHeight !== null &&
+                        BigInt(tx.finalizedHeight) > publishedTarget.height
+                            ? BigInt(tx.finalizedHeight)
+                            : null;
                     const waitingDetail = 'reconciliation retry scheduled';
                     setHistory((current) =>
                         markReconciliationWaiting(tx.digest, waitingDetail, current),
@@ -804,6 +892,8 @@ export default function App() {
                             ),
                         );
                     }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
+                    const latest = publishedProofTargetRef.current;
+                    if (latest) wakeReconciliations(latest.height);
                 });
         }
     }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet, proofTargetReady]);
@@ -1103,6 +1193,14 @@ export default function App() {
             if (outcome.kind === 'ambiguous') {
                 throw new TransactionSubmissionError('ambiguous', outcome.detail);
             }
+
+            // This warms only the verified certificate cache. Reconciliation still
+            // ties the digest to the block before showing its certificate as verified.
+            void prefetchFinalizedCertificate({
+                storeUrl,
+                simplexVerificationMaterial,
+                height: BigInt(outcome.height),
+            }).catch(() => {});
 
             const observedAt = Date.now();
             updateSubmittedHistory(

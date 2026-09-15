@@ -81,6 +81,13 @@ The operation encodings, proof leaf count, pins, terminal commit, frozen codec
 identities, and adjacent range boundaries must agree. Unsupported formats or
 invalid artifacts fail the supervised indexer and remain unacknowledged.
 
+Each publisher starts by emitting supplied pins, including after a restart in
+the middle of the operation log. Once an upload's data requests are all durable,
+admission records that later uploads can omit supplied pins. Those nodes come
+from earlier admitted ranges in the same history. Some predecessors may still
+be uploading, so publication must continue to wait for the fully durable
+contiguous prefix. Node rows are retained without a pruning policy.
+
 Each block stages its SQL rows and both QMDB ranges together. Data requests
 use a 128 MiB budget that includes conservative protobuf overhead and a
 250,000-row cap for the decoder's separate 32 MiB entry-allocation limit. A 32 MiB

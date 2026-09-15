@@ -8,7 +8,7 @@ use axum::{Router, middleware, routing::get};
 use clap::{CommandFactory, FromArgMatches, Parser};
 use exoware_sdk::StoreClient;
 use settings::{AdapterArgs, Environment, Settings, load_settings};
-use std::{net::SocketAddr, process::ExitCode};
+use std::{net::SocketAddr, process::ExitCode, time::Duration};
 use tracing::info;
 
 mod settings;
@@ -59,7 +59,7 @@ fn build_app(routes: Router, metrics: AdapterMetrics, shared_metrics: bool) -> R
 
     // CORS must be outermost so preflight requests bypass request accounting.
     app.layer(middleware::from_fn_with_state(metrics, track_requests))
-        .layer(tower_http::cors::CorsLayer::very_permissive())
+        .layer(tower_http::cors::CorsLayer::very_permissive().max_age(Duration::from_secs(3600)))
 }
 
 async fn serve(
@@ -209,6 +209,45 @@ mod tests {
         drop(response);
         let output = metrics_text(app).await;
         assert!(output.contains("adapter_requests_total 1\n"), "{output}");
+    }
+
+    #[tokio::test]
+    async fn preflight_responses_can_be_cached() {
+        let app = build_app(Router::new(), AdapterMetrics::new(), true);
+        for path in [
+            "/transactions/qmdb.v1.OperationLogService/GetOperationRange",
+            "/sql.v1.Service/Query",
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(Method::OPTIONS)
+                        .uri(path)
+                        .header("origin", "https://explorer.example")
+                        .header("access-control-request-method", "POST")
+                        .header(
+                            "access-control-request-headers",
+                            "content-type,connect-protocol-version",
+                        )
+                        .body(Body::empty())
+                        .expect("preflight request"),
+                )
+                .await
+                .expect("preflight response");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()["access-control-max-age"], "3600");
+            assert_eq!(
+                response.headers()["access-control-allow-origin"],
+                "https://explorer.example"
+            );
+            assert_eq!(response.headers()["access-control-allow-methods"], "POST");
+            assert_eq!(
+                response.headers()["access-control-allow-headers"],
+                "content-type,connect-protocol-version"
+            );
+        }
     }
 
     #[tokio::test]
