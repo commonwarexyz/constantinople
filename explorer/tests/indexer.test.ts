@@ -7,7 +7,7 @@ import {
     subscribeBlocksFromTargets,
     type BlockMetadataSqlClient,
 } from '../src/indexer.ts';
-import type { PublishedProofTarget } from '../src/proofTarget.ts';
+import { createSharedProofTargetsFromStore, type PublishedProofTarget, type PublishedProofTargetStore } from '../src/proofTarget.ts';
 
 test('block subscription queries SQL after the target and keeps its sequence floor', async () => {
     const events: string[] = [];
@@ -327,3 +327,43 @@ async function* targets(target: PublishedProofTarget, events?: string[]) {
 function digest(seed: number): Uint8Array {
     return new Uint8Array(32).fill(seed);
 }
+
+
+test('a blocked SQL read cannot delay proof listeners on the shared target source', async () => {
+    const controller = new AbortController();
+    let sqlStarted!: () => void;
+    const sqlPending = new Promise<void>((resolve) => { sqlStarted = resolve; });
+    let publish!: () => void;
+    const publication = new Promise<void>((resolve) => { publish = resolve; });
+    const key = (height: bigint) => {
+        const bytes = new Uint8Array(8);
+        new DataView(bytes.buffer).setBigUint64(0, height);
+        return bytes;
+    };
+    const store = {
+        async query() {
+            return { sequenceNumber: 10n, results: [{ key: key(1n), value: digest(1) }] };
+        },
+        async *subscribe(_request: unknown, options: { signal?: AbortSignal } = {}) {
+            await publication;
+            yield { sequenceNumber: 20n, entries: [{ key: key(2n), value: digest(2) }] };
+            await new Promise<void>((resolve) => {
+                if (options.signal?.aborted) resolve();
+                else options.signal?.addEventListener('abort', () => resolve(), { once: true });
+            });
+        },
+    } as PublishedProofTargetStore;
+    const shared = createSharedProofTargetsFromStore(store, { signal: controller.signal });
+    const proof = shared.subscribe();
+    const blocks = subscribeBlocksFromTargets(sqlClient(() => {
+        sqlStarted();
+        return new Promise<never>(() => {});
+    }), shared.subscribe(), { signal: controller.signal });
+    const pendingBlock = blocks.next();
+    assert.equal((await proof.next()).value?.height, 1n);
+    await sqlPending;
+    publish();
+    assert.equal((await proof.next()).value?.height, 2n);
+    controller.abort();
+    assert.deepEqual(await pendingBlock, { done: true, value: undefined });
+});

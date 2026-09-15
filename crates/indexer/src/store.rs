@@ -1,8 +1,9 @@
 pub use exoware_sdk::ClientBuildError as StoreClientBuildError;
 use exoware_sdk::{
-    ClientError, ConnectRequestCompression, StoreClient, StoreClientBuilder,
+    ClientError, ConnectRequestCompression, RetryConfig, StoreClient, StoreClientBuilder,
     transport::BalancedHttp2Config,
 };
+use std::time::Duration;
 
 /// Failure from the adapter's startup readiness check.
 #[derive(Debug, thiserror::Error)]
@@ -20,7 +21,11 @@ pub fn store_client(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<StoreClient, StoreClientBuildError> {
-    store_client_builder(url, api_key).build()
+    // A lagging Store should be checked again promptly without increasing the
+    // SDK's read attempt budget. This also caps other retryable read errors.
+    store_client_builder(url, api_key)
+        .retry_config(RetryConfig::standard().with_max_backoff(Duration::from_millis(100)))
+        .build()
 }
 
 /// Gives uploads path diversity so one slow connection does not serialize the
@@ -76,12 +81,12 @@ mod tests {
         extract::{ConnectInfo, State},
         http::{
             HeaderMap, StatusCode,
-            header::{AUTHORIZATION, CONTENT_ENCODING},
+            header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
         },
         routing::get,
     };
     use bytes::Bytes;
-    use exoware_sdk::{API_KEY_ENV, PrefixedStoreClient, StoreClient};
+    use exoware_sdk::{API_KEY_ENV, ErrorCode, PrefixedStoreClient, StoreClient};
     use std::{
         collections::HashSet,
         net::SocketAddr,
@@ -92,7 +97,107 @@ mod tests {
         },
         time::Duration,
     };
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time::Instant};
+
+    async fn read_retry_case(
+        failures: usize,
+        status: StatusCode,
+        error_body: &'static str,
+    ) -> (
+        Result<Option<Bytes>, exoware_sdk::ClientError>,
+        Vec<Instant>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/store.query.v1.Service/Get",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let requests = observed.clone();
+                async move {
+                    assert_eq!(headers[CONTENT_TYPE], "application/proto");
+
+                    // These protobuf fields pin key="key" and the Store sequence
+                    // floor at 42 on every physical attempt.
+                    assert_eq!(body.as_ref(), b"\x0a\x03key\x10\x2a");
+                    let mut requests = requests.lock().expect("request lock poisoned");
+                    requests.push(Instant::now());
+                    if requests.len() <= failures {
+                        (
+                            status,
+                            [(CONTENT_TYPE, "application/json")],
+                            error_body.as_bytes(),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/proto")],
+                            b"\x0a\x05value".as_slice(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("retry listener should bind");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = PrefixedStoreClient::empty(store_client(&url, None).unwrap());
+        let result = client
+            .query()
+            .get_with_min_sequence_number(&Bytes::from_static(b"key"), 42)
+            .await;
+        server.abort();
+        let requests = requests.lock().expect("request lock poisoned").clone();
+        (result, requests)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_retries_preserve_floor_and_cap_server_hint_on_the_wire() {
+        // RetryInfo encodes a one-second hint. Both retries must use the cap.
+        let (result, requests) = read_retry_case(
+            2,
+            StatusCode::CONFLICT,
+            r#"{"code":"aborted","message":"Store is behind","details":[{"type":"google.rpc.RetryInfo","value":"CgIIAQ=="}]}"#,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Some(Bytes::from_static(b"value")));
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            assert_eq!(pair[1] - pair[0], Duration::from_millis(100));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_retry_budget_is_bounded_on_the_wire() {
+        let (result, requests) = read_retry_case(
+            usize::MAX,
+            StatusCode::CONFLICT,
+            r#"{"code":"aborted","message":"Store is behind"}"#,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().rpc_code(), Some(ErrorCode::Aborted));
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2] - requests[0], Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_does_not_retry_nonretryable_errors_on_the_wire() {
+        let (result, requests) = read_retry_case(
+            usize::MAX,
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"invalid_argument","message":"invalid query"}"#,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().rpc_code(),
+            Some(ErrorCode::InvalidArgument)
+        );
+        assert_eq!(requests.len(), 1);
+    }
 
     async fn readiness(
         State((status, requests)): State<(StatusCode, Arc<AtomicUsize>)>,

@@ -124,6 +124,95 @@ export interface VerifiedAccountProof {
     readonly proofSizeBytes: number;
 }
 
+export interface TransactionRowMetadata {
+    readonly digest: string;
+    readonly location: bigint;
+    readonly sqlUrl: string;
+    readonly sequenceNumber: bigint;
+}
+
+export interface AccountProofMetadata extends AccountProofRow {
+    readonly account: string;
+    readonly sqlUrl: string;
+    readonly sequenceNumber: bigint;
+}
+
+export async function prefetchFinalizedCertificate({
+    storeUrl,
+    simplexVerificationMaterial,
+    height,
+    signal,
+}: {
+    storeUrl: string;
+    simplexVerificationMaterial: string;
+    height: bigint;
+    signal?: AbortSignal;
+}): Promise<void> {
+    await finalizedTransactionTarget(storeUrl, simplexVerificationMaterial, height, 0n, signal);
+}
+
+export function fetchAccountProofMetadata({
+    sqlUrl,
+    account,
+    minSequenceNumber,
+    signal,
+}: {
+    sqlUrl: string;
+    account: string;
+    minSequenceNumber: bigint;
+    signal?: AbortSignal;
+}): Promise<AccountProofMetadata> {
+    return fetchAccountProofRow(sqlUrl, parseAccountBytes(account), undefined, minSequenceNumber, signal);
+}
+
+export async function fetchTransactionRowMetadata({
+    sqlUrl,
+    rows,
+    minSequenceNumber,
+    signal,
+}: {
+    sqlUrl: string;
+    rows: readonly AccountTransactionRow[];
+    minSequenceNumber: bigint;
+    signal?: AbortSignal;
+}): Promise<ReadonlyMap<string, TransactionRowMetadata>> {
+    const digests = new Map(rows.map(({ digest }) => {
+        const bytes = fromHex(digest);
+        assertByteLength(bytes, DIGEST_BYTES, 'transaction digest');
+        return [toHex(bytes), bytes];
+    }));
+    if (digests.size === 0) return new Map();
+
+    const result = await sqlQuery(
+        sqlUrl,
+        `SELECT ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
+         FROM ${TX_META_TABLE}
+         WHERE ${TX_META_DIGEST} IN (${[...digests.values()].map(fixedBinaryLiteral).join(', ')})`,
+        minSequenceNumber,
+        signal,
+    );
+    const metadata = new Map<string, TransactionRowMetadata>();
+    await Promise.all(tableRows(result.table).map(async (row) => {
+        const digest = expectVariableBytes(columnValue(row, TX_META_DIGEST), TX_META_DIGEST);
+        const hex = toHex(digest);
+        if (!digests.has(hex)) throw new Error('SQL transaction metadata contains an unexpected digest');
+        const location = await verifiedTransactionLocation(row, digest);
+        if (metadata.has(hex)) throw new Error('SQL transaction metadata contains a duplicate digest');
+        metadata.set(hex, {
+            digest: hex,
+            location,
+            sqlUrl: trimTrailingSlash(sqlUrl),
+            sequenceNumber: result.sequenceNumber,
+        });
+    }));
+    for (const digest of digests.keys()) {
+        if (!metadata.has(digest)) {
+            throw new Error(`tx digest ${shortHex(digest)} missing from raw transaction index`);
+        }
+    }
+    return metadata;
+}
+
 export async function fetchAndVerifyTransactionProof({
     qmdbUrl,
     storeUrl,
@@ -299,27 +388,35 @@ export async function fetchAndVerifyAccountProof({
     sqlUrl,
     account,
     target,
+    metadata,
     signal,
 }: {
     qmdbUrl: string;
     sqlUrl: string;
     account: string;
     target: LatestProofTarget;
+    metadata?: AccountProofMetadata;
     signal?: AbortSignal;
 }): Promise<VerifiedAccountProof> {
     const accountBytes = parseAccountBytes(account);
     const stateEnd = target.stateTip;
-    // account_meta keeps one row per state operation, so the account's value
-    // at this certificate is its newest row below the certificate's state tip.
-    // Rows written after the target are simply not visible to this proof.
-    const row = await fetchAccountProofRow(
-        sqlUrl,
-        accountBytes,
-        stateEnd,
-        target.sequenceNumber,
-        signal,
-    );
-    if (row.location < target.stateStart) {
+
+    // Floor raises can move an idle account past this certificate's tip.
+    // Reuse speculative SQL only while its location and read floor still fit.
+    const row = metadata &&
+        metadata.account === toHex(accountBytes) &&
+        metadata.sqlUrl === trimTrailingSlash(sqlUrl) &&
+        metadata.sequenceNumber >= target.sequenceNumber &&
+        metadata.location >= target.stateStart && metadata.location < stateEnd
+        ? metadata
+        : await fetchAccountProofRow(
+            sqlUrl,
+            accountBytes,
+            stateEnd,
+            target.sequenceNumber,
+            signal,
+        );
+    if (row.location < target.stateStart || row.location >= stateEnd) {
         throw new Error(`account location ${row.location} is outside finalized state range`);
     }
 
@@ -359,22 +456,29 @@ export async function fetchAndVerifyTransactionRowProof({
     sqlUrl,
     row,
     target,
+    metadata,
     signal,
 }: {
     qmdbUrl: string;
     sqlUrl: string;
     row: AccountTransactionRow;
     target: LatestProofTarget;
+    metadata?: TransactionRowMetadata;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const location = await fetchVerifiedSqlTransactionMetadata(
-        sqlUrl,
-        digestBytes,
-        target.sequenceNumber,
-        signal,
-    );
+    const location = metadata &&
+        metadata.digest === toHex(digestBytes) &&
+        metadata.sqlUrl === trimTrailingSlash(sqlUrl) &&
+        metadata.sequenceNumber >= target.sequenceNumber
+        ? metadata.location
+        : await fetchVerifiedSqlTransactionMetadata(
+            sqlUrl,
+            digestBytes,
+            target.sequenceNumber,
+            signal,
+        );
 
     if (location >= target.transactionsTip) {
         throw new Error(
@@ -425,6 +529,10 @@ async function fetchVerifiedSqlTransactionMetadata(
         throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
     }
 
+    return verifiedTransactionLocation(row, digest);
+}
+
+async function verifiedTransactionLocation(row: SqlRow, digest: Uint8Array): Promise<bigint> {
     const location = expectBigint(columnValue(row, TX_META_QMDB_LOCATION), TX_META_QMDB_LOCATION);
     const signedTransaction = expectVariableBytes(columnValue(row, TX_META_BODY), TX_META_BODY);
     if (signedTransaction.length < TRANSACTION_BODY_BYTES) {
@@ -553,20 +661,92 @@ async function fetchFixedUnorderedUpdateProof(
     return proof;
 }
 
-function finalizedTransactionTarget(
+const FINALIZED_TARGET_CACHE_SIZE = 128;
+const finalizedTargets = new Map<string, FinalizedTransactionTarget>();
+const pendingFinalizedTargets = new Map<string, PendingFinalizedTarget>();
+
+interface PendingFinalizedTarget {
+    readonly controller: AbortController;
+    readonly promise: Promise<FinalizedTransactionTarget>;
+    callers: number;
+}
+
+async function finalizedTransactionTarget(
     storeUrl: string,
     simplexVerificationMaterial: string,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
-    return fetchFinalizedTransactionTarget(
-        storeUrl,
-        simplexVerificationMaterial,
-        height,
-        minSequenceNumber,
-        signal,
-    );
+    signal?.throwIfAborted();
+    if (height < 0n) throw new Error('finalized height must be non-negative');
+    const key = JSON.stringify([trimTrailingSlash(storeUrl), simplexVerificationMaterial, height.toString()]);
+    const cached = finalizedTargets.get(key);
+    if (cached) {
+        finalizedTargets.delete(key);
+        finalizedTargets.set(key, cached);
+        return copyFinalizedTarget(cached);
+    }
+
+    let pending = pendingFinalizedTargets.get(key);
+    if (!pending) {
+        const controller = new AbortController();
+        const promise = fetchFinalizedTransactionTarget(
+            storeUrl,
+            simplexVerificationMaterial,
+            height,
+            minSequenceNumber,
+            controller.signal,
+        ).then((target) => {
+            // A verified certificate is immutable across publication barriers.
+            // SQL and QMDB reads still use each caller's covering sequence floor.
+            controller.signal.throwIfAborted();
+            finalizedTargets.set(key, target);
+            if (finalizedTargets.size > FINALIZED_TARGET_CACHE_SIZE) {
+                finalizedTargets.delete(finalizedTargets.keys().next().value!);
+            }
+            return target;
+        }).finally(() => {
+            if (pendingFinalizedTargets.get(key)?.controller === controller) {
+                pendingFinalizedTargets.delete(key);
+            }
+        });
+        pending = { controller, promise, callers: 0 };
+        pendingFinalizedTargets.set(key, pending);
+    }
+    const shared = pending;
+    shared.callers++;
+
+    // Each waiter owns only its subscription. Stop the shared request when
+    // its last caller leaves so a cancelled page does not retain network work.
+    const target = await new Promise<FinalizedTransactionTarget>((resolve, reject) => {
+        let settled = false;
+        const finish = (error: unknown, value?: FinalizedTransactionTarget) => {
+            if (settled) return;
+            settled = true;
+            signal?.removeEventListener('abort', abort);
+            shared.callers--;
+            if (shared.callers === 0 && pendingFinalizedTargets.get(key) === shared) {
+                pendingFinalizedTargets.delete(key);
+                shared.controller.abort();
+            }
+            if (value) resolve(value);
+            else reject(error);
+        };
+        const abort = () => finish(signal!.reason);
+        signal?.addEventListener('abort', abort, { once: true });
+        shared.promise.then((value) => finish(undefined, value), (error) => finish(error));
+    });
+    return copyFinalizedTarget(target);
+}
+
+function copyFinalizedTarget(target: FinalizedTransactionTarget): FinalizedTransactionTarget {
+    return {
+        ...target,
+        blockDigest: target.blockDigest.slice(),
+        stateRoot: target.stateRoot.slice(),
+        transactionsRoot: target.transactionsRoot.slice(),
+    };
 }
 
 async function fetchFinalizedTransactionTarget(
@@ -577,6 +757,7 @@ async function fetchFinalizedTransactionTarget(
     signal?: AbortSignal,
 ): Promise<FinalizedTransactionTarget> {
     const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
+    signal?.throwIfAborted();
     const certificate = await simplex.getFinalizationByHeight(
         height.toString(),
         minSequenceNumber,
@@ -805,10 +986,10 @@ function decodeAccountActivityRow(row: SqlRow): AccountTransactionRow {
 async function fetchAccountProofRow(
     sqlUrl: string,
     account: Uint8Array,
-    beforeLocation: bigint,
+    beforeLocation: bigint | undefined,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<AccountProofRow> {
+): Promise<AccountProofMetadata> {
     const result = await sqlQuery(
         sqlUrl,
         `
@@ -819,7 +1000,7 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
             WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
-                AND ${ACCOUNT_META_QMDB_LOCATION} < ${beforeLocation.toString()}
+                ${beforeLocation === undefined ? '' : `AND ${ACCOUNT_META_QMDB_LOCATION} < ${beforeLocation.toString()}`}
             ORDER BY ${ACCOUNT_META_QMDB_LOCATION} DESC
             LIMIT 1
         `,
@@ -831,6 +1012,9 @@ async function fetchAccountProofRow(
         throw new Error(`account ${shortHex(toHex(account))} is not indexed`);
     }
     return {
+        account: toHex(account),
+        sqlUrl: trimTrailingSlash(sqlUrl),
+        sequenceNumber: result.sequenceNumber,
         balance: expectBigint(columnValue(row, ACCOUNT_META_BALANCE), ACCOUNT_META_BALANCE),
         nonce: expectBigint(columnValue(row, ACCOUNT_META_NONCE_BASE), ACCOUNT_META_NONCE_BASE),
         nonceBitmap: expectBigint(

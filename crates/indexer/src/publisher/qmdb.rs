@@ -23,7 +23,7 @@ use commonware_cryptography::{
 use commonware_parallel::{Sequential, Strategy};
 use commonware_runtime::Spawner;
 use commonware_storage::{
-    merkle::{Location, Proof, mmr},
+    merkle::{Family as _, Location, Proof, mmr},
     qmdb::{
         any::{
             operation::Operation as AnyOperation,
@@ -42,16 +42,19 @@ use constantinople_engine::types::{EngineBlock, EngineFinalization};
 use constantinople_primitives::{Account, AccountKey, BlockCfg};
 use cpu_time::ThreadTime;
 use exoware_qmdb::{
-    AuthenticatedOperationRange, QmdbError, prepare_authenticated_range, stage_authenticated_range,
-    stage_watermark,
+    AuthenticatedOperationRange, QmdbError, prepare_authenticated_range,
+    stage_authenticated_range_with_existing_nodes, stage_watermark,
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, KvSchema};
 use futures::{StreamExt as _, future::BoxFuture, stream};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     marker::PhantomData,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{
@@ -607,6 +610,7 @@ where
 {
     tx: Option<mpsc::Sender<PendingUpload<H, P>>>,
     admission: Mutex<Option<Admission>>,
+    has_durable_range: Arc<AtomicBool>,
     join: Option<JoinHandle<()>>,
     _marker: PhantomData<P>,
 }
@@ -622,6 +626,8 @@ where
     finalized_ts_micros: i64,
     state: QueuedAuthenticatedRange<H::Digest>,
     transactions: QueuedAuthenticatedRange<H::Digest>,
+    omit_pinned_nodes: bool,
+    has_durable_range: Arc<AtomicBool>,
     persisted: Option<oneshot::Sender<()>>,
     published: Option<oneshot::Sender<PublicationReceipt<H::Digest>>>,
 }
@@ -739,6 +745,7 @@ where
         Ok(Self {
             tx: Some(tx),
             admission: Mutex::new(None),
+            has_durable_range: Arc::new(AtomicBool::new(false)),
             join: Some(join),
             _marker: PhantomData,
         })
@@ -788,6 +795,10 @@ where
         };
         let (persisted_tx, persisted) = oneshot::channel();
         let (published_tx, published) = oneshot::channel();
+
+        // Seed the prefix in this process before reusing earlier ranges' nodes.
+        // Contiguous publication waits for any still-pending predecessor rows.
+        let omit_pinned_nodes = self.has_durable_range.load(Ordering::Relaxed);
         let pending = PendingUpload {
             enqueued_at,
             height,
@@ -795,6 +806,8 @@ where
             finalized_ts_micros: upload.finalized_ts_micros,
             state: upload.state,
             transactions: upload.transactions,
+            omit_pinned_nodes,
+            has_durable_range: self.has_durable_range.clone(),
             persisted: Some(persisted_tx),
             published: Some(published_tx),
         };
@@ -936,6 +949,7 @@ fn spawn_data_commit<Cx, H, P, S>(
         .take()
         .expect("pending upload persistence signal must be present");
     let height = upload.height;
+    let has_durable_range = upload.has_durable_range.clone();
     let admitted_at = Instant::now();
 
     // Supervise preparation and data commits without holding a blocking
@@ -989,6 +1003,7 @@ fn spawn_data_commit<Cx, H, P, S>(
             .expect("finalized index preparation task failed")?;
         let chunks = batches.len() as u64;
         commit_chunks(context.child("commit"), &store, &metrics.commit, batches).await?;
+        has_durable_range.store(true, Ordering::Relaxed);
         let persisted_at = Instant::now();
         metrics.chunk_commits.inc_by(chunks);
         metrics.chunks_per_block.observe(chunks as f64);
@@ -1080,8 +1095,28 @@ where
     sql_writer.stage_flush(&sql, &mut batch)?;
     let state_end = state.latest_location();
     let transaction_end = transactions.latest_location();
-    stage_authenticated_range(&state_client, state, &mut batch)?;
-    stage_authenticated_range(&transaction_client, transactions, &mut batch)?;
+    let existing_state_nodes = if upload.omit_pinned_nodes {
+        QmdbFamily::nodes_to_pin(state.start_location()).collect()
+    } else {
+        BTreeSet::new()
+    };
+    let existing_transaction_nodes = if upload.omit_pinned_nodes {
+        QmdbFamily::nodes_to_pin(transactions.start_location()).collect()
+    } else {
+        BTreeSet::new()
+    };
+    stage_authenticated_range_with_existing_nodes(
+        &state_client,
+        state,
+        &existing_state_nodes,
+        &mut batch,
+    )?;
+    stage_authenticated_range_with_existing_nodes(
+        &transaction_client,
+        transactions,
+        &existing_transaction_nodes,
+        &mut batch,
+    )?;
     metrics
         .staging_duration
         .observe(staging_started.elapsed().as_secs_f64());
@@ -1308,11 +1343,11 @@ mod tests {
     use commonware_runtime::{
         Metrics as _, Runner as _, Supervisor as _, telemetry::metrics::has_metric_value,
     };
-    use commonware_storage::merkle::{Family as _, mem::Mem};
+    use commonware_storage::merkle::mem::Mem;
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
     use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
-    use exoware_qmdb::{KeylessClient, UnorderedClient};
+    use exoware_qmdb::{KeylessClient, UnorderedClient, stage_authenticated_range};
     use rand::{SeedableRng, rngs::StdRng};
 
     type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
@@ -1957,6 +1992,193 @@ mod tests {
     }
 
     #[test]
+    fn pin_omission_preserves_every_other_prepared_row() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = StoreClient::new("http://localhost:1");
+            let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
+            let metrics = super::super::PublisherMetrics::new(&context);
+            let state_operations = encode_operations(
+                &(0..=16)
+                    .map(|location| StateOperation::CommitFloor(None, Location::new(location)))
+                    .collect::<Vec<_>>(),
+            );
+            let transaction_operations = encode_operations(
+                &(0..=16)
+                    .map(|location| {
+                        TransactionOperation::<Sha256>::Commit(None, Location::new(location))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+
+            for start in 1..=16 {
+                let state = queued_range(&state_operations, start, start + 1);
+                let transactions = queued_range(&transaction_operations, start, start + 1);
+                let expected_removed = state.pinned_nodes.len() + transactions.pinned_nodes.len();
+                let prepare = |omit_pinned_nodes| {
+                    prepare_data_batch(
+                        state_qmdb_client(&store).unwrap(),
+                        transactions_qmdb_client(&store).unwrap(),
+                        schema.clone(),
+                        Sequential,
+                        PendingUpload {
+                            enqueued_at: Instant::now(),
+                            height: start,
+                            block: test_block(start, &state, &transactions),
+                            finalized_ts_micros: 1,
+                            state: state.clone(),
+                            transactions: transactions.clone(),
+                            omit_pinned_nodes,
+                            has_durable_range: Arc::new(AtomicBool::new(false)),
+                            persisted: None,
+                            published: None,
+                        },
+                        &metrics,
+                    )
+                    .expect("prepare data")
+                };
+                let (full, state_end, transaction_end) = prepare(false);
+                let (trimmed, trimmed_state_end, trimmed_transaction_end) = prepare(true);
+                let full: BTreeMap<_, _> = full.entries().iter().cloned().collect();
+                let trimmed: BTreeMap<_, _> = trimmed.entries().iter().cloned().collect();
+                assert_eq!(state_end, trimmed_state_end);
+                assert_eq!(transaction_end, trimmed_transaction_end);
+                assert_eq!(full.len() - trimmed.len(), expected_removed);
+                for (key, value) in &trimmed {
+                    assert_eq!(full.get(key), Some(value));
+                }
+                for (key, value) in full.iter().filter(|(key, _)| !trimmed.contains_key(*key)) {
+                    let pins = match key[0] {
+                        crate::namespaces::STATE_QMDB_PREFIX_VALUE => &state.pinned_nodes,
+                        crate::namespaces::TRANSACTIONS_QMDB_PREFIX_VALUE => {
+                            &transactions.pinned_nodes
+                        }
+                        _ => panic!("only QMDB pins may be removed"),
+                    };
+                    assert!(pins.iter().any(|pin| pin.as_ref() == value.as_ref()));
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn omitted_pins_wait_for_predecessors_and_reset_after_restart() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::GatedIngestStore::open_gating_ingest(2)
+                .await
+                .expect("open Store");
+            let physical = writer_store_client(&store.url, None).unwrap();
+            let targets = publication_target_client(&physical).unwrap();
+            let publisher = Publisher::connect(
+                context.child("publisher_task"),
+                &store.url,
+                None,
+                3,
+                super::super::PublisherMetrics::new(&context.child("publisher")),
+            )
+            .await
+            .unwrap();
+            let state_operations = encode_operations(
+                &(0..=10)
+                    .map(|location| StateOperation::CommitFloor(None, Location::new(location)))
+                    .collect::<Vec<_>>(),
+            );
+            let transaction_operations = encode_operations(
+                &(0..=10)
+                    .map(|location| {
+                        TransactionOperation::<Sha256>::Commit(None, Location::new(location))
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            let upload = |height| {
+                let start = height + 6;
+                queued_upload(
+                    height,
+                    queued_range(&state_operations, start, start + 1),
+                    queued_range(&transaction_operations, start, start + 1),
+                )
+            };
+
+            assert!(!publisher.has_durable_range.load(Ordering::Relaxed));
+            let mut first = publisher.enqueue_queued_finalized(upload(1)).await.unwrap();
+            first.persisted().await.unwrap();
+            assert!(publisher.has_durable_range.load(Ordering::Relaxed));
+            first.published().await.unwrap();
+
+            let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
+            store.wait_for_first_ingest().await;
+            let mut third = publisher.enqueue_queued_finalized(upload(3)).await.unwrap();
+            third.persisted().await.unwrap();
+            assert!(target(&targets, 2).await.is_none());
+            assert!(target(&targets, 3).await.is_none());
+            store.release_first_ingest();
+            second.published().await.unwrap();
+            third.published().await.unwrap();
+
+            let state = UnorderedClient::<
+                QmdbFamily,
+                Sha256,
+                AccountKey,
+                AccountValue,
+                StateEncoding,
+            >::new(state_qmdb_client(&physical).unwrap(), ());
+            let transactions = KeylessClient::<
+                QmdbFamily,
+                Sha256,
+                Sha256Digest,
+                TransactionEncoding<Sha256>,
+            >::new(transactions_qmdb_client(&physical).unwrap(), ());
+            let expected = upload(3);
+            let state_proof =
+                Box::pin(state.operation_range_checkpoint(Location::new(9), Location::new(9), 1))
+                    .await
+                    .unwrap();
+            let transaction_proof = Box::pin(transactions.operation_range_checkpoint(
+                Location::new(9),
+                Location::new(9),
+                1,
+            ))
+            .await
+            .unwrap();
+            assert_eq!(state_proof.root, expected.block.header.state_root);
+            assert_eq!(
+                transaction_proof.root,
+                expected.block.header.transactions_root
+            );
+            assert!(state_proof.verify::<Sha256>());
+            assert!(transaction_proof.verify::<Sha256>());
+            publisher.shutdown().await;
+
+            let restarted = Publisher::connect(
+                context.child("restarted_task"),
+                &store.url,
+                None,
+                1,
+                super::super::PublisherMetrics::new(&context.child("restarted")),
+            )
+            .await
+            .unwrap();
+            assert!(!restarted.has_durable_range.load(Ordering::Relaxed));
+            restarted
+                .enqueue_queued_finalized(upload(4))
+                .await
+                .unwrap()
+                .published()
+                .await
+                .unwrap();
+            let proof = Box::pin(transactions.operation_range_checkpoint(
+                Location::new(10),
+                Location::new(10),
+                1,
+            ))
+            .await
+            .unwrap();
+            assert!(proof.verify::<Sha256>());
+            restarted.shutdown().await;
+            store.shutdown().await;
+        });
+    }
+
+    #[test]
     fn data_preparation_authenticates_before_metadata_decoding() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let store = StoreClient::new("http://localhost:1");
@@ -1996,6 +2218,8 @@ mod tests {
                         finalized_ts_micros: 1,
                         state,
                         transactions,
+                        omit_pinned_nodes: false,
+                        has_durable_range: Arc::new(AtomicBool::new(false)),
                         persisted: None,
                         published: None,
                     },
@@ -2157,6 +2381,8 @@ mod tests {
                     finalized_ts_micros: 1,
                     state,
                     transactions,
+                    omit_pinned_nodes: false,
+                    has_durable_range: Arc::new(AtomicBool::new(false)),
                     persisted: None,
                     published: None,
                 },

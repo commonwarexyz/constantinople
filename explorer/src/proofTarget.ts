@@ -16,6 +16,8 @@ const PROVABLE_TARGET_STORE_PREFIX = new Uint8Array([0x04]);
 const PROVABLE_TARGET_HEIGHT_BYTES = 8;
 const BLOCK_DIGEST_BYTES = 32;
 const NETWORK_RECONNECT_DELAY_MS = 5_000;
+const BOOTSTRAP_HEIGHT_SLACK = 8n;
+const MAX_QUEUED_TARGETS = 4096;
 const TARGET_KEY_REGEX = `(?s-u)^.{${PROVABLE_TARGET_HEIGHT_BYTES}}$`;
 const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
 const STORE_STREAM_ERROR_DOMAIN = 'log.stream';
@@ -31,6 +33,164 @@ export interface SubscribeProofTargetsOptions {
     readonly signal?: AbortSignal;
     readonly reconnectDelayMs?: number;
     readonly onError?: (message: string) => void;
+    readonly lastKnownHeight?: bigint;
+}
+
+export interface SharedProofTargets {
+    subscribe(options?: { signal?: AbortSignal }): AsyncIterableIterator<PublishedProofTarget>;
+    close(): void;
+}
+
+export function createSharedProofTargets(
+    storeUrl: string,
+    options: SubscribeProofTargetsOptions = {},
+): SharedProofTargets {
+    const storageKey = `constantinople:proof-target-height:v1:${storeUrl.replace(/\/+$/, '')}`;
+    let storedHeight: bigint | undefined;
+
+    // Storage is only a read hint. Browser privacy settings must not stop the feed.
+    try {
+        const value = globalThis.localStorage?.getItem(storageKey);
+        if (value && /^\d{1,20}$/.test(value)) {
+            const height = BigInt(value);
+            if (height <= 0xffff_ffff_ffff_ffffn) storedHeight = height;
+        }
+    } catch {
+        storedHeight = undefined;
+    }
+
+    return shareProofTargets(createProofTargetStore(storeUrl), {
+        ...options,
+        lastKnownHeight: options.lastKnownHeight ?? storedHeight,
+    }, (target) => {
+        try {
+            globalThis.localStorage?.setItem(storageKey, target.height.toString());
+        } catch {
+            // A full or disabled store only makes the next bootstrap scan wider.
+        }
+    });
+}
+
+export function createSharedProofTargetsFromStore(
+    store: PublishedProofTargetStore,
+    options: SubscribeProofTargetsOptions = {},
+): SharedProofTargets {
+    return shareProofTargets(store, options);
+}
+
+function shareProofTargets(
+    store: PublishedProofTargetStore,
+    options: SubscribeProofTargetsOptions,
+    onTarget?: (target: PublishedProofTarget) => void,
+): SharedProofTargets {
+    const controller = new AbortController();
+    const listeners = new Set<{
+        push(target: PublishedProofTarget): void;
+        finish(error?: unknown): void;
+    }>();
+    let started = false;
+    let closed = false;
+    let failure: unknown;
+    let latest: PublishedProofTarget | undefined;
+
+    const finish = (error?: unknown) => {
+        if (closed) return;
+        closed = true;
+        failure = error;
+        controller.abort();
+        options.signal?.removeEventListener('abort', close);
+        for (const listener of listeners) listener.finish(error);
+        listeners.clear();
+    };
+    const close = () => finish();
+    options.signal?.addEventListener('abort', close, { once: true });
+    if (options.signal?.aborted) close();
+
+    const run = async () => {
+        try {
+            for await (const target of subscribePublishedProofTargetsFromStore(store, {
+                ...options,
+                signal: controller.signal,
+            })) {
+                if (closed) return;
+                latest = target;
+                for (const listener of listeners) listener.push(target);
+                onTarget?.(target);
+            }
+            finish();
+        } catch (error) {
+            finish(error);
+        }
+    };
+
+    return {
+        close,
+        subscribe({ signal } = {}) {
+            const queue: PublishedProofTarget[] = [];
+            const pending: Array<{
+                resolve(value: IteratorResult<PublishedProofTarget>): void;
+                reject(error: unknown): void;
+            }> = [];
+            let stopped = false;
+            let error: unknown;
+            const stop = (reason?: unknown) => {
+                if (stopped) return;
+                stopped = true;
+                error = reason;
+                queue.length = 0;
+                signal?.removeEventListener('abort', abort);
+                listeners.delete(listener);
+                for (const waiter of pending.splice(0)) {
+                    if (error !== undefined) waiter.reject(error);
+                    else waiter.resolve({ done: true, value: undefined });
+                }
+            };
+            const abort = () => stop();
+            const listener = {
+                push(target: PublishedProofTarget) {
+                    // Bound outages without silently losing blocks for a slow consumer.
+                    if (queue.length >= MAX_QUEUED_TARGETS) {
+                        stop(new Error(`proof target consumer exceeded ${MAX_QUEUED_TARGETS} queued targets`));
+                        return;
+                    }
+                    const copy = { ...target, blockDigest: target.blockDigest.slice() };
+                    const waiter = pending.shift();
+                    if (waiter) waiter.resolve({ done: false, value: copy });
+                    else queue.push(copy);
+                },
+                finish: stop,
+            };
+            signal?.addEventListener('abort', abort, { once: true });
+            if (closed || signal?.aborted) stop(signal?.aborted ? undefined : failure);
+            else {
+                listeners.add(listener);
+                if (latest) listener.push(latest);
+
+                // Pump independently so a consumer waiting on SQL cannot delay proofs.
+                if (!started) {
+                    started = true;
+                    void run();
+                }
+            }
+
+            return {
+                [Symbol.asyncIterator]() { return this; },
+                next() {
+                    if (error !== undefined) return Promise.reject(error);
+                    if (stopped) return Promise.resolve({ done: true as const, value: undefined });
+                    const target = queue.shift();
+                    if (target) return Promise.resolve({ done: false as const, value: target });
+                    return new Promise<IteratorResult<PublishedProofTarget>>((resolve, reject) => {
+                        pending.push({ resolve, reject });
+                    });
+                },
+                return() {
+                    stop();
+                    return Promise.resolve({ done: true as const, value: undefined });
+                },
+            };
+        },
+    };
 }
 
 interface SequencedQueryResult extends QueryResult {
@@ -94,7 +254,11 @@ export async function* subscribePublishedProofTargetsFromStore(
     while (!signal?.aborted) {
         try {
             if (nextSequence === undefined) {
-                const bootstrap = await fetchLatestFromStore(store, signal);
+                const bootstrap = await fetchLatestFromStore(
+                    store,
+                    signal,
+                    latestHeight ?? options.lastKnownHeight,
+                );
                 nextSequence = bootstrap.sequenceNumber + 1n;
                 if (bootstrap.target && isNewer(bootstrap.target, latestHeight)) {
                     latestHeight = bootstrap.target.height;
@@ -154,11 +318,18 @@ function createProofTargetStore(storeUrl: string): StoreClient {
 async function fetchLatestFromStore(
     store: PublishedProofTargetStore,
     signal?: AbortSignal,
+    lastKnownHeight?: bigint,
 ): Promise<{ target: PublishedProofTarget | null; sequenceNumber: bigint }> {
-    const result = (await withAbort(
+    const lowerHeight = lastKnownHeight !== undefined && lastKnownHeight <= 0xffff_ffff_ffff_ffffn &&
+        lastKnownHeight > BOOTSTRAP_HEIGHT_SLACK
+        ? lastKnownHeight - BOOTSTRAP_HEIGHT_SLACK
+        : 0n;
+    const start = new Uint8Array(PROVABLE_TARGET_HEIGHT_BYTES);
+    new DataView(start.buffer).setBigUint64(0, lowerHeight);
+    let result = (await withAbort(
         () =>
             store.query(
-                undefined,
+                start,
                 undefined,
                 1,
                 1,
@@ -168,6 +339,26 @@ async function fetchLatestFromStore(
             ),
         signal,
     )) as SequencedQueryResult;
+    if (result.sequenceNumber === undefined) {
+        throw new Error('Store query did not return its evaluated sequence');
+    }
+
+    // A hint can belong to an older deployment. Retry once across the prefix
+    // so an empty narrowed range cannot hide its current publication target.
+    if (result.results.length === 0 && lowerHeight > 0n) {
+        result = (await withAbort(
+            () => store.query(
+                new Uint8Array(PROVABLE_TARGET_HEIGHT_BYTES),
+                undefined,
+                1,
+                1,
+                TraversalMode.REVERSE,
+                result.sequenceNumber,
+                { signal },
+            ),
+            signal,
+        )) as SequencedQueryResult;
+    }
 
     if (result.sequenceNumber === undefined) {
         throw new Error('Store query did not return its evaluated sequence');
@@ -233,7 +424,7 @@ function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
-function withAbort<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+export function withAbort<T>(operation: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     if (!signal) return operation();
     if (signal.aborted) return Promise.reject(signal.reason);
 

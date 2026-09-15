@@ -21,7 +21,7 @@ use exoware_qmdb::{
     unordered_operation_log_connect_stack,
 };
 use exoware_sdk::StoreClient;
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tracing::info;
 
 mod adapter_settings;
@@ -79,7 +79,7 @@ fn build_app(client: &StoreClient) -> Result<Router, BoxError> {
             "/transactions",
             keyless_operation_log_connect_stack(transactions),
         )
-        .layer(tower_http::cors::CorsLayer::very_permissive())
+        .layer(tower_http::cors::CorsLayer::very_permissive().max_age(Duration::from_secs(3600)))
         .layer(middleware::from_fn_with_state(
             metrics.clone(),
             track_requests,
@@ -132,6 +132,40 @@ mod tests {
     };
     use clap::Parser;
     use tower::ServiceExt;
+
+    #[tokio::test]
+    async fn preflight_responses_can_be_cached() {
+        let client = store_client("http://127.0.0.1:1", None).expect("client should build");
+        let response = build_app(&client)
+            .expect("app should build")
+            .oneshot(
+                Request::builder()
+                    .method(Method::OPTIONS)
+                    .uri("/transactions/qmdb.v1.OperationLogService/GetOperationRange")
+                    .header("origin", "https://explorer.example")
+                    .header("access-control-request-method", "POST")
+                    .header(
+                        "access-control-request-headers",
+                        "content-type,connect-protocol-version",
+                    )
+                    .body(Body::empty())
+                    .expect("preflight request"),
+            )
+            .await
+            .expect("preflight response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["access-control-max-age"], "3600");
+        assert_eq!(
+            response.headers()["access-control-allow-origin"],
+            "https://explorer.example"
+        );
+        assert_eq!(response.headers()["access-control-allow-methods"], "POST");
+        assert_eq!(
+            response.headers()["access-control-allow-headers"],
+            "content-type,connect-protocol-version"
+        );
+    }
 
     #[test]
     fn rejects_incomplete_deployer_pair() {
