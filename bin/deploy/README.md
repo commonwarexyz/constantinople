@@ -87,6 +87,14 @@ locally per submitter. The spammer still submits only one batch at a time to eac
 Add `--spammer-rayon-threads N` (default `2`) to set the spammer's parallel
 signing thread count in generated local commands and remote `spammer.yaml`.
 
+By default, the spammer selects and logs a fresh account seed whenever the
+process starts. This avoids restarting at nonce zero for accounts used by a
+previous run. Pass `--spammer-seed-offset N` to the deployment generator or
+`--seed-offset N` to the spammer binary when a reproducible account set is
+required. In YAML, set `seed_offset` explicitly. Reusing a seed
+after transactions have been accepted recreates the old accounts and is not
+restart-safe.
+
 You can also run the spammer manually against an existing local cluster:
 
 ```sh
