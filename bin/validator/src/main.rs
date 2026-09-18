@@ -1,5 +1,8 @@
 //! Constantinople validator binary.
 
+// Nested upload futures exceed the default trait solver depth.
+#![recursion_limit = "256"]
+
 mod cli;
 mod config;
 mod relayer;
