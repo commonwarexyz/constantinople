@@ -1099,7 +1099,7 @@ mod tests {
             panic!("expected remote target");
         };
 
-        remote::generate(&generate, remote);
+        remote::generate(&generate, remote).expect("generate remote deployment");
 
         for filename in [METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_CONFIG_FILE] {
             let yaml = fs::read_to_string(generate.output_dir.join(filename))
