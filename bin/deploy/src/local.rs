@@ -778,7 +778,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert!(commands[3].contains("--seed-offset 2000"));
     }
