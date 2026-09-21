@@ -1573,6 +1573,7 @@ dependencies = [
  "commonware-math",
  "commonware-utils",
  "constantinople-primitives",
+ "http",
  "mimalloc",
  "rand 0.10.2",
  "serde",
