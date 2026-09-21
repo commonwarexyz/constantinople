@@ -3,6 +3,7 @@
 use super::{
     Mailbox,
     actor::{AccountReaderCell, IngestStatus},
+    mailbox::SubmissionLane,
 };
 use axum::{
     Router,
@@ -39,7 +40,7 @@ const MIN_BATCH_LENGTH_PREFIX_BYTES: usize = 1;
 const MIN_U64_VARINT_BYTES: usize = 1;
 
 /// Maximum ingress batches admitted to CPU verification concurrently, shared
-/// across both POST endpoints.
+/// across all POST endpoints.
 ///
 /// Ingress decode and verification run on the strategy's worker pool, which
 /// consensus execution and block verification also share. Admitting one
@@ -88,6 +89,10 @@ where
 
     Router::new()
         .route("/transactions", post(submit_batch::<C, P, H, St>))
+        .route(
+            "/transactions/background",
+            post(submit_background_batch::<C, P, H, St>),
+        )
         .route("/transactions/ingest", post(ingest_batch::<C, P, H, St>))
         .route("/transactions/{batch_id}", get(fetch_status::<C, P, H, St>))
         .route("/account/{public_key}", get(fetch_account::<C, P, H, St>))
@@ -145,25 +150,7 @@ where
     H: Hasher,
     St: Strategy,
 {
-    let batch = match verify_body::<P, H, _>(&state, body).await {
-        Ok(batch) => batch,
-        Err(status) => return (status, String::new()),
-    };
-
-    // Phase 3: Submit to actor and await result.
-    let Some(result_rx) = state.mailbox.try_submit(
-        batch.batch_id,
-        batch.digests,
-        batch.transactions,
-        batch.total_bytes,
-    ) else {
-        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
-    };
-
-    result_rx.await.map_or_else(
-        |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
-        |status| ok_json(&status),
-    )
+    submit_in_lane(state, body, SubmissionLane::Foreground).await
 }
 
 /// Accepts a verified transaction batch without waiting for finalization.
@@ -201,6 +188,52 @@ where
         Ok(IngestStatus::Dropped) => (StatusCode::SERVICE_UNAVAILABLE, String::new()),
         Err(_) => (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
     }
+}
+
+/// Accepts a batch through the background lane and waits for its outcome.
+async fn submit_background_batch<C, P, H, St>(
+    State(state): State<SharedState<C, P, H, St>>,
+    body: Bytes,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    submit_in_lane(state, body, SubmissionLane::Background).await
+}
+
+async fn submit_in_lane<C, P, H, St>(
+    state: SharedState<C, P, H, St>,
+    body: Bytes,
+    lane: SubmissionLane,
+) -> (StatusCode, String)
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+    St: Strategy,
+{
+    let batch = match verify_body::<P, H, _>(&state, body).await {
+        Ok(batch) => batch,
+        Err(status) => return (status, String::new()),
+    };
+
+    let Some(result_rx) = state.mailbox.try_submit_in_lane(
+        lane,
+        batch.batch_id,
+        batch.digests,
+        batch.transactions,
+        batch.total_bytes,
+    ) else {
+        return (StatusCode::SERVICE_UNAVAILABLE, String::new());
+    };
+
+    result_rx.await.map_or_else(
+        |_| (StatusCode::INTERNAL_SERVER_ERROR, String::new()),
+        |status| ok_json(&status),
+    )
 }
 
 struct VerifiedBatch<H>
@@ -249,7 +282,7 @@ where
     let public_key_cache = state.public_key_cache.clone();
     let verified = state.strategy.spawn(move |strategy| {
         let _permit = permit;
-        let batch_id = H::hash(&[&body]).to_string();
+        let batch_id = H::hash(&[body.as_ref()]).to_string();
 
         let decode = info_span!(
             parent: &parent,
@@ -402,25 +435,40 @@ impl From<Nonce> for NonceResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router};
+    use super::{
+        super::{
+            TxStatus,
+            mailbox::{Message, SubmissionLane},
+        },
+        AppState, MAX_CONCURRENT_INGRESS, PublicKeyCache, Semaphore, router,
+    };
     use axum::{
         body::Body,
         http::{Method, Request, StatusCode, header},
     };
     use commonware_codec::Encode;
-    use commonware_cryptography::{ed25519, sha256};
+    use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_parallel::Sequential;
     use commonware_runtime::{Metrics, Runner as _};
     use commonware_utils::NZUsize;
+    use constantinople_primitives::{Transaction, TransactionPublicKey};
+    use core::num::NonZeroU64;
     use std::sync::Arc;
     use tokio::sync::mpsc;
     use tower::ServiceExt;
 
-    fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
-        let (sender, _receiver) = mpsc::channel(1);
+    const HTTP_TEST_NAMESPACE: &[u8] = b"mempool-http-test";
+
+    type TestMessage = Message<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+
+    fn test_router_with_receiver(
+        context: impl Metrics,
+        max_batch_bytes: usize,
+    ) -> (axum::Router, mpsc::Receiver<TestMessage>) {
+        let (sender, receiver) = mpsc::channel(1);
         let state = Arc::new(AppState {
             mailbox: super::super::mailbox::Mailbox::new(sender),
-            namespace: b"mempool-http-test",
+            namespace: HTTP_TEST_NAMESPACE,
             max_batch_bytes,
             strategy: Sequential,
             public_key_cache: PublicKeyCache::new(context, NZUsize!(16)),
@@ -428,7 +476,27 @@ mod tests {
             ingress_permits: Arc::new(Semaphore::new(MAX_CONCURRENT_INGRESS)),
         });
 
-        router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state)
+        (
+            router::<sha256::Digest, ed25519::PublicKey, sha256::Sha256, Sequential>(state),
+            receiver,
+        )
+    }
+
+    fn test_router(context: impl Metrics, max_batch_bytes: usize) -> axum::Router {
+        test_router_with_receiver(context, max_batch_bytes).0
+    }
+
+    fn signed_body() -> bytes::Bytes {
+        let signer = ed25519::PrivateKey::from_seed(1);
+        let recipient = ed25519::PrivateKey::from_seed(2).public_key();
+        let transaction = Transaction::new(
+            TransactionPublicKey::ed25519(signer.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            NonZeroU64::new(1).expect("non-zero"),
+            0,
+        )
+        .seal_and_sign(&signer, HTTP_TEST_NAMESPACE, &mut sha256::Sha256::default());
+        vec![transaction].encode()
     }
 
     #[test]
@@ -461,6 +529,43 @@ mod tests {
             let response = app.oneshot(request).await.expect("router should respond");
 
             assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
+    }
+
+    #[test]
+    fn background_endpoint_routes_blocking_submission() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (app, mut receiver) = test_router_with_receiver(context, 4 * 1024 * 1024);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions/background")
+                .body(Body::from(signed_body()))
+                .expect("request should build");
+            let request_task =
+                tokio::spawn(
+                    async move { app.oneshot(request).await.expect("router should respond") },
+                );
+
+            let message = receiver.recv().await.expect("submission should arrive");
+            match message {
+                Message::Submit {
+                    lane,
+                    result,
+                    ingest_result,
+                    ..
+                } => {
+                    assert_eq!(lane, SubmissionLane::Background);
+                    assert!(ingest_result.is_none());
+                    result
+                        .expect("blocking submission should have a waiter")
+                        .send(TxStatus::Finalized { height: 7 })
+                        .expect("handler should await the result");
+                }
+                _ => panic!("expected submission"),
+            }
+
+            let response = request_task.await.expect("request task should finish");
+            assert_eq!(response.status(), StatusCode::OK);
         });
     }
 

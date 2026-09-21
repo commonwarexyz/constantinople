@@ -25,11 +25,23 @@ histogram showing tx-count-per-block over the last ~80 blocks so the
 operator can see throughput scale at a glance. The histogram's y-axis
 is auto-scaled to the peak in the visible window.
 
-When the signed-in account submits transactions, the explorer uses the account
-activity digest to look up `tx_meta.qmdb_location` plus the raw signed
-transaction bytes, verifies the SQL bytes hash to that digest, fetches a
-transaction operation-log proof from `qmdb-indexer` under `/transactions`, and
-shows a checkmark after browser-side QMDB and Simplex verification succeeds.
+When the signed-in account submits a transaction, the explorer accepts either
+a terminal status or an empty HTTP 202 from the relayer. A pending response or
+an ambiguous delivery failure keeps the nonce reserved while the explorer
+reconciles the transaction by digest. Submission history survives reloads so
+those reservations and proof retries can continue.
+The explorer does not yet identify transactions replaced by another digest.
+Account nonce advancement and missing SQL metadata do not prove rejection, so
+unresolved submissions keep their reservations. Reload retries proof errors after
+backend or verifier repairs.
+
+Reconciliation looks up `tx_meta.qmdb_location` and the raw transaction bytes,
+checks that the bytes hash to the submitted digest, and finds the containing
+height through `block_meta`. It verifies the Simplex certificate and header,
+then verifies a QMDB transaction proof against the certified root. SQL rows
+that arrive out of order remain retryable until the containing block is
+available. The UI records finalization observation and successful proof
+verification separately.
 
 ### Why SQL?
 
@@ -84,15 +96,17 @@ metadata service (`metadata-indexer` bin from `constantinople-indexer`), the
 QMDB facade (`qmdb-indexer` bin), and this dev server to the printed mprocs command list (see
 [`bin/deploy/src/local.rs`](../bin/deploy/src/local.rs)).
 
-## Build
+## Verification
+
+Run from the repository root:
 
 ```sh
-npm run build
+just explorer-test
+just explorer-build
 ```
 
-Outputs a static bundle to `dist/`. The explorer lives outside the cargo
-workspace and is **not** exercised by `just test`; ship-time verification
-is just `npm run build`.
+The build outputs a static bundle to `explorer/dist/`. The Explorer tests run
+separately from the Rust workspace's `just test` recipe.
 
 ## Styling: why we don't depend on www-sacred directly
 

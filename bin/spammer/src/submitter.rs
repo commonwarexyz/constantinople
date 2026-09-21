@@ -1,7 +1,7 @@
 //! Async submission engine.
 //!
 //! Each relayer stream submits one batch at a time and advances to the next
-//! pre-signed batch after finalization, drop, or submit failure.
+//! pre-signed batch after finalization or drop.
 
 use crate::signer::Tx;
 use commonware_codec::Encode;
@@ -9,7 +9,9 @@ use commonware_runtime::{
     Metrics as RuntimeMetrics,
     telemetry::metrics::{Counter, MetricsExt as _},
 };
-use constantinople_mempool::webserver::SubmitError;
+use commonware_utils::sys_rng;
+use constantinople_mempool::webserver::{SubmitError, TxStatus};
+use rand::RngExt as _;
 use std::{sync::Arc, time::Duration};
 use tracing::{debug, info, warn};
 
@@ -91,7 +93,8 @@ impl Stats {
     }
 }
 
-const SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+const INITIAL_SUBMIT_ERROR_BACKOFF: Duration = Duration::from_millis(500);
+const MAX_SUBMIT_ERROR_BACKOFF: Duration = Duration::from_secs(5);
 
 /// Submits batches through a relayer and records each batch outcome.
 pub struct RelayerSubmitter {
@@ -99,87 +102,75 @@ pub struct RelayerSubmitter {
     http: reqwest::Client,
     stats: Arc<Stats>,
     target_leader: Option<String>,
-    leader_fanout: usize,
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum RelayerBatchStatus {
-    Finalized {
-        height: u64,
-    },
-    PartiallyFinalized {
-        height: u64,
-        included: u64,
-        filtered: u64,
-    },
-    Dropped,
 }
 
 impl RelayerSubmitter {
-    pub fn new(
-        url: String,
-        stats: Arc<Stats>,
-        _target_offset: usize,
-        target_leader: Option<String>,
-    ) -> Self {
+    pub fn new(url: String, stats: Arc<Stats>, target_leader: Option<String>) -> Self {
         Self {
             url: url.trim_end_matches('/').to_string(),
             http: reqwest::Client::new(),
             stats,
             target_leader,
-            leader_fanout: 1,
         }
     }
 
-    /// Submits a signed batch once. Failed or dropped batches are abandoned so
-    /// the next outer loop iteration uses a fresh nonce set.
+    /// Submits one signed batch until its final outcome is known.
     pub async fn submit(&self, batch: Vec<Tx>) {
         let count = batch.len() as u64;
         let body = batch.encode();
         self.stats.record_submitted(count);
-        match self.submit_encoded(body).await {
-            Ok(RelayerBatchStatus::Finalized { height }) => {
-                self.stats.record_finalized(count);
-                debug!(height, count, "relayed batch finalized");
-            }
-            Ok(RelayerBatchStatus::PartiallyFinalized {
-                height,
-                included,
-                filtered,
-            }) => {
-                self.stats.record_finalized(included);
-                self.stats.record_filtered(filtered);
-                info!(
+
+        let mut failures = 0;
+        loop {
+            match self.submit_encoded(body.clone()).await {
+                Ok(TxStatus::Finalized { height }) => {
+                    self.stats.record_finalized(count);
+                    debug!(height, count, "relayed batch finalized");
+                    return;
+                }
+                Ok(TxStatus::PartiallyFinalized {
                     height,
-                    included, filtered, "relayed batch partially finalized, advancing"
-                );
-            }
-            Ok(RelayerBatchStatus::Dropped) => {
-                self.stats.record_dropped(count);
-                debug!(count, "relayed batch dropped, advancing");
-            }
-            Err(error) => {
-                self.stats.record_error();
-                warn!(
-                    error = %error,
-                    backoff_ms = SUBMIT_ERROR_BACKOFF.as_millis(),
-                    "relayer submit error, advancing"
-                );
-                tokio::time::sleep(SUBMIT_ERROR_BACKOFF).await;
+                    included,
+                    filtered,
+                }) => {
+                    self.stats.record_finalized(included);
+                    self.stats.record_filtered(filtered);
+                    info!(
+                        height,
+                        included, filtered, "relayed batch partially finalized, advancing"
+                    );
+                    return;
+                }
+                Ok(TxStatus::Dropped) => {
+                    self.stats.record_dropped(count);
+                    debug!(count, "relayed batch dropped, advancing");
+                    return;
+                }
+                Err(error) if is_deterministic(&error) => {
+                    self.stats.record_error();
+                    warn!(error = %error, "relayer rejected batch, advancing");
+                    return;
+                }
+                Err(error) => {
+                    self.stats.record_error();
+                    failures += 1;
+                    let backoff = retry_backoff(failures);
+                    warn!(
+                        error = %error,
+                        backoff_ms = backoff.as_millis(),
+                        "relayer submit error, retrying same batch"
+                    );
+                    tokio::time::sleep(backoff).await;
+                }
             }
         }
     }
 
-    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<RelayerBatchStatus, SubmitError> {
+    async fn submit_encoded(&self, body: bytes::Bytes) -> Result<TxStatus, SubmitError> {
         let mut request = self
             .http
             .post(format!("{}/transactions", self.url))
-            .header("content-type", "application/octet-stream")
-            .header(
-                "x-constantinople-relayer-leader-fanout",
-                self.leader_fanout.to_string(),
-            );
+            .header("content-type", "application/octet-stream");
         if let Some(target_leader) = &self.target_leader {
             request = request.header("x-constantinople-relayer-target-leader", target_leader);
         }
@@ -199,6 +190,23 @@ impl RelayerSubmitter {
     }
 }
 
+const fn is_deterministic(error: &SubmitError) -> bool {
+    matches!(
+        error,
+        SubmitError::BadRequest | SubmitError::PayloadTooLarge
+    )
+}
+
+fn retry_backoff(failures: u32) -> Duration {
+    let exponent = failures.saturating_sub(1).min(6);
+    let base = INITIAL_SUBMIT_ERROR_BACKOFF
+        .saturating_mul(1 << exponent)
+        .min(MAX_SUBMIT_ERROR_BACKOFF);
+    let mut rng = sys_rng();
+    let jitter_percent = rng.random_range(75..=125);
+    base.mul_f64(f64::from(jitter_percent) / 100.0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{RelayerSubmitter, Stats};
@@ -213,10 +221,7 @@ mod tests {
     };
     use std::{
         num::NonZeroU64,
-        sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
-        },
+        sync::{Arc, Mutex},
         time::Duration,
     };
     use tokio::{
@@ -225,54 +230,93 @@ mod tests {
     };
 
     #[tokio::test]
-    async fn dropped_batch_advances_without_retrying() {
+    async fn finalized_batch_advances_without_retrying() {
         let stats = test_stats();
-        let (url, requests) =
-            spawn_response_server(vec![json_response(r#"{"status":"dropped"}"#)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let response = json_response(r#"{"status":"finalized","height":7}"#);
+        let (url, requests) = spawn_response_server(vec![response]).await;
+        let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
         let batch = test_batch();
         let count = batch.len() as u64;
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
             .await
-            .expect("dropped batch should not be retried");
+            .expect("finalized batch should complete");
 
-        assert_eq!(stats.totals().dropped, count);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(stats.totals().finalized, count);
+        assert_eq!(stats.totals().errors, 0);
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
     }
 
     #[tokio::test]
-    async fn submit_error_advances_without_retrying() {
+    async fn transient_error_retries_same_batch() {
         let stats = test_stats();
+        let finalized = json_response(r#"{"status":"finalized","height":7}"#);
         let (url, requests) =
-            spawn_response_server(vec![empty_response("503 Service Unavailable")]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+            spawn_response_server(vec![empty_response("503 Service Unavailable"), finalized]).await;
+        let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
+        let count = test_batch().len() as u64;
+
+        tokio::time::timeout(Duration::from_secs(2), submitter.submit(test_batch()))
+            .await
+            .expect("transient error should be retried");
+
+        assert_eq!(stats.totals().errors, 1);
+        assert_eq!(stats.totals().finalized, count);
+        let requests = requests.lock().expect("requests lock");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(requests[0], requests[1]);
+    }
+
+    #[tokio::test]
+    async fn deterministic_error_advances_without_retrying() {
+        let stats = test_stats();
+        let (url, requests) = spawn_response_server(vec![empty_response("400 Bad Request")]).await;
+        let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
 
         tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
-            .expect("submit error should not be retried");
+            .expect("deterministic error should complete");
 
-        assert_eq!(stats.totals().errors, 1);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        let totals = stats.totals();
+        assert_eq!(totals.finalized, 0);
+        assert_eq!(totals.errors, 1);
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
     }
 
     #[tokio::test]
-    async fn partially_finalized_batch_does_not_resubmit_filtered_transactions() {
+    async fn partial_finalization_records_each_outcome() {
         let stats = test_stats();
-        let batch = test_batch();
-        let body =
-            r#"{"status":"partially_finalized","height":7,"included":1,"filtered":1}"#.to_string();
-        let (url, requests) = spawn_response_server(vec![json_response(&body)]).await;
-        let submitter = RelayerSubmitter::new(url, stats.clone(), 0, None);
+        let response = json_response(
+            r#"{"status":"partially_finalized","height":7,"included":3,"filtered":1}"#,
+        );
+        let (url, requests) = spawn_response_server(vec![response]).await;
+        let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
 
-        tokio::time::timeout(Duration::from_secs(1), submitter.submit(batch))
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
             .await
-            .expect("filtered transactions should not be retried");
+            .expect("partial finalization should complete");
 
         let totals = stats.totals();
-        assert_eq!(totals.finalized, 1);
+        assert_eq!(totals.finalized, 3);
         assert_eq!(totals.filtered, 1);
-        assert_eq!(requests.load(Ordering::Relaxed), 1);
+        assert_eq!(totals.dropped, 0);
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_batch_advances_without_retrying() {
+        let stats = test_stats();
+        let response = json_response(r#"{"status":"dropped"}"#);
+        let (url, requests) = spawn_response_server(vec![response]).await;
+        let submitter = RelayerSubmitter::new(url, stats.clone(), Some("aa".to_string()));
+        let count = test_batch().len() as u64;
+
+        tokio::time::timeout(Duration::from_secs(1), submitter.submit(test_batch()))
+            .await
+            .expect("dropped batch should complete");
+
+        assert_eq!(stats.totals().dropped, count);
+        assert_eq!(requests.lock().expect("requests lock").len(), 1);
     }
 
     #[derive(Clone, Default)]
@@ -319,13 +363,13 @@ mod tests {
         sign_batch(&Sequential, &accounts, value, &mut nonces, &mut cursor, 4)
     }
 
-    async fn spawn_response_server(responses: Vec<String>) -> (String, Arc<AtomicUsize>) {
+    async fn spawn_response_server(responses: Vec<String>) -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test server should bind");
         let addr = listener.local_addr().expect("test server has local addr");
-        let requests = Arc::new(AtomicUsize::new(0));
-        let request_count = requests.clone();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let captured = requests.clone();
 
         tokio::spawn(async move {
             for response in responses {
@@ -333,8 +377,8 @@ mod tests {
                     .accept()
                     .await
                     .expect("test server should accept request");
-                request_count.fetch_add(1, Ordering::Relaxed);
-                read_headers(&mut stream).await;
+                let body = read_request_body(&mut stream).await;
+                captured.lock().expect("requests lock").push(body);
                 stream
                     .write_all(response.as_bytes())
                     .await
@@ -345,22 +389,40 @@ mod tests {
         (format!("http://{addr}"), requests)
     }
 
-    async fn read_headers(stream: &mut tokio::net::TcpStream) {
+    async fn read_request_body(stream: &mut tokio::net::TcpStream) -> Vec<u8> {
         let mut request = Vec::new();
         let mut buffer = [0; 1024];
-        loop {
+        let header_end = loop {
             let read = stream
                 .read(&mut buffer)
                 .await
                 .expect("test server should read request");
             if read == 0 {
-                return;
+                panic!("request ended before headers completed");
             }
             request.extend_from_slice(&buffer[..read]);
-            if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                return;
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
             }
+        };
+        let headers =
+            std::str::from_utf8(&request[..header_end]).expect("request headers are utf8");
+        let content_length = headers
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+            .and_then(|(_, value)| value.trim().parse::<usize>().ok())
+            .expect("request has content length");
+        let request_end = header_end + content_length;
+        while request.len() < request_end {
+            let read = stream
+                .read(&mut buffer)
+                .await
+                .expect("test server should read request body");
+            assert!(read > 0, "request ended before body completed");
+            request.extend_from_slice(&buffer[..read]);
         }
+        request[header_end..request_end].to_vec()
     }
 
     fn json_response(body: &str) -> String {
