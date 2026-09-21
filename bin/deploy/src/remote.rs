@@ -8,8 +8,9 @@ use crate::{
     RelayerLeaderConfig, RemoteArgs, SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS,
     SecondaryRole, SpammerConfig, VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path,
     default_bootstrappers, ensure_output_dir_missing, generate_deployer_tag,
-    generate_remote_cluster_material, indexer_enabled, secondary_roles, total_secondaries,
-    validate_generate_args, write_simplex_verification_material, write_yaml_config,
+    generate_remote_cluster_material, indexer_enabled, ports::Ports, secondary_roles,
+    total_secondaries, validate_generate_args, write_simplex_verification_material,
+    write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -27,8 +28,9 @@ struct GeneratedValidator {
     config: ValidatorConfig,
 }
 
-pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
+pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) -> Result<(), String> {
     validate_generate_args(args);
+    validate_ports(args, remote)?;
     assert!(args.validators >= 1, "need at least one validator");
     assert!(!remote.regions.is_empty(), "need at least one region");
     assert!(
@@ -126,6 +128,27 @@ pub(super) fn generate(args: &GenerateArgs, remote: &RemoteArgs) {
         command = %format!("cd {} && deployer aws create --config {}", output_dir.display(), DEPLOYER_CONFIG_FILE),
         "create remote deployment after building binaries"
     );
+
+    Ok(())
+}
+
+fn validate_ports(args: &GenerateArgs, remote: &RemoteArgs) -> Result<(), String> {
+    // Ingress rules apply to every binary host. Reusing service ports can expose
+    // restricted listeners on other hosts or produce duplicate ingress rules.
+    let mut ports = Ports::default();
+    ports.insert("SSH", 22)?;
+    ports.insert("Promtail", 9080)?;
+    ports.insert("application metrics", METRICS_PORT)?;
+    ports.insert("Node Exporter", 9100)?;
+    ports.insert("validator P2P", remote.listen_port)?;
+    ports.insert("validator HTTP", remote.http_port)?;
+    if indexer_enabled(args) {
+        ports.insert("chain-indexer", remote.chain_indexer_port)?;
+        ports.insert("metadata-indexer", remote.metadata_indexer_port)?;
+        ports.insert("qmdb-indexer", remote.qmdb_indexer_port)?;
+    }
+
+    Ok(())
 }
 
 fn build_validators(
@@ -485,7 +508,10 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, port_configs, remote_spammer_config,
+        validate_ports,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
@@ -559,6 +585,94 @@ mod tests {
             spammer_instance_type: None,
             spammer_storage_size: 25,
         }
+    }
+
+    #[test]
+    fn remote_ports_accept_default_configuration() {
+        let mut args = generate_args();
+        let remote = remote_args();
+        validate_ports(&args, &remote).unwrap();
+
+        args.indexer = true;
+        args.relayer = true;
+        args.spammer = true;
+        validate_ports(&args, &remote).unwrap();
+    }
+
+    #[test]
+    fn remote_ports_reject_reserved_and_zero_ports() {
+        let mut args = generate_args();
+        args.indexer = true;
+        for port in [0, 22, 9080, super::METRICS_PORT, 9100] {
+            for service in 0..5 {
+                let mut remote = remote_args();
+                let ports = [
+                    &mut remote.listen_port,
+                    &mut remote.http_port,
+                    &mut remote.chain_indexer_port,
+                    &mut remote.metadata_indexer_port,
+                    &mut remote.qmdb_indexer_port,
+                ];
+                *ports[service] = port;
+                let error = validate_ports(&args, &remote)
+                    .expect_err(&format!("service {service} must reject port {port}"));
+                let expected = if port == 0 {
+                    "nonzero".to_string()
+                } else {
+                    format!("port {port} collision")
+                };
+                assert!(error.contains(&expected), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_ports_reject_overlapping_ingress_roles() {
+        let mut args = generate_args();
+        args.indexer = true;
+        for first in 0..5 {
+            for second in first + 1..5 {
+                let mut remote = remote_args();
+                remote.http_cidrs.clear();
+                let ports = [
+                    &mut remote.listen_port,
+                    &mut remote.http_port,
+                    &mut remote.chain_indexer_port,
+                    &mut remote.metadata_indexer_port,
+                    &mut remote.qmdb_indexer_port,
+                ];
+                *ports[second] = *ports[first];
+                let error = validate_ports(&args, &remote).expect_err(&format!(
+                    "services {first} and {second} must use distinct ports"
+                ));
+                assert!(error.contains("collision"), "{error}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_ports_ignore_disabled_indexer_services() {
+        let args = generate_args();
+        let mut remote = remote_args();
+        remote.chain_indexer_port = super::METRICS_PORT;
+        remote.metadata_indexer_port = remote.http_port;
+        remote.qmdb_indexer_port = 0;
+        validate_ports(&args, &remote).unwrap();
+    }
+
+    #[test]
+    fn remote_ports_allow_separate_monitoring_and_binary_hosts() {
+        let mut args = generate_args();
+        args.validators = 100;
+        args.indexer = true;
+        args.relayer = true;
+        args.spammer = true;
+        let mut remote = remote_args();
+        remote.listen_port = 3000;
+        remote.chain_indexer_port = 3100;
+        remote.metadata_indexer_port = 4040;
+        remote.qmdb_indexer_port = 4318;
+        validate_ports(&args, &remote).unwrap();
     }
 
     fn validator(index: u32) -> super::GeneratedValidator {
