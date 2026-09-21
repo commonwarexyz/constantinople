@@ -14,6 +14,7 @@ use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
+use constantinople_primitives::proposal::{MAXIMUM_BLOCK_SIZE, max_transaction_bytes};
 use serde::Deserialize;
 use std::{net::SocketAddr, path::Path};
 
@@ -115,7 +116,7 @@ pub struct ValidatorConfig {
     /// Prometheus metrics port.
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
-    /// Maximum bytes proposed per block.
+    /// Maximum encoded block bytes, including framing. At most 16 MiB.
     #[serde(default = "default_max_propose_bytes")]
     pub max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
@@ -231,7 +232,7 @@ pub struct LoadedConfig {
     pub http_listen: SocketAddr,
     /// Prometheus metrics bind address.
     pub metrics_listen: SocketAddr,
-    /// Maximum bytes proposed per block.
+    /// Maximum encoded block bytes, including framing. At most 16 MiB.
     pub max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
     pub max_pool_bytes: usize,
@@ -331,6 +332,16 @@ fn decode_with_network(
     let signer = decode_private_key(&config.private_key);
     let public_key = signer.public_key();
     let dkg_output = decode_dkg_output(&config.dkg_output, config.num_validators);
+    assert!(
+        config.max_propose_bytes <= MAXIMUM_BLOCK_SIZE,
+        "max_propose_bytes {} exceeds encoded block limit {MAXIMUM_BLOCK_SIZE}",
+        config.max_propose_bytes,
+    );
+    assert!(
+        max_transaction_bytes(config.max_propose_bytes).is_some(),
+        "max_propose_bytes {} is too small for an encoded empty block",
+        config.max_propose_bytes,
+    );
     let share = decode_share_opt(&config.dkg_share);
     if share.is_some() && config.relayer.is_some() {
         panic!("relayer config is only valid on secondary validators");
@@ -706,6 +717,72 @@ mod tests {
             public_key: name.clone(),
             name,
         }
+    }
+
+    fn decode_proposal_config(cluster: &Cluster, budget: usize) -> super::LoadedConfig {
+        let mut config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        config.max_propose_bytes = budget;
+        super::decode_with_network(
+            config,
+            "127.0.0.1:9000".parse().unwrap(),
+            cluster.primary_keys.clone(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            false,
+        )
+    }
+
+    #[test]
+    fn accepts_maximum_proposal_budget_independent_of_dkg_count() {
+        for validators in [4, 7] {
+            let cluster = Cluster::new(validators, 0);
+            let loaded = decode_proposal_config(&cluster, super::MAXIMUM_BLOCK_SIZE);
+            assert_eq!(loaded.max_propose_bytes, super::MAXIMUM_BLOCK_SIZE);
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_proposal_budgets_independent_of_dkg_count() {
+        let maximum = super::MAXIMUM_BLOCK_SIZE;
+        for validators in [4, 7] {
+            let cluster = Cluster::new(validators, 0);
+            for budget in [maximum + 1, usize::MAX] {
+                let Err(error) =
+                    std::panic::catch_unwind(|| decode_proposal_config(&cluster, budget))
+                else {
+                    panic!("oversized proposal budget should fail");
+                };
+                let message = error.downcast_ref::<String>().expect("panic message");
+                assert_eq!(
+                    message,
+                    &format!("max_propose_bytes {budget} exceeds encoded block limit {maximum}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validates_minimum_encoded_block_budget() {
+        let cluster = Cluster::new(4, 0);
+        let minimum = (0..=super::MAXIMUM_BLOCK_SIZE)
+            .find(|&budget| super::max_transaction_bytes(budget).is_some())
+            .expect("empty block fits within the consensus limit");
+        for budget in [0, 1, minimum - 1] {
+            let Err(error) = std::panic::catch_unwind(|| decode_proposal_config(&cluster, budget))
+            else {
+                panic!("budget below empty block size should fail");
+            };
+            let message = error.downcast_ref::<String>().expect("panic message");
+            assert_eq!(
+                message,
+                &format!("max_propose_bytes {budget} is too small for an encoded empty block"),
+            );
+        }
+        assert_eq!(
+            decode_proposal_config(&cluster, minimum).max_propose_bytes,
+            minimum
+        );
     }
 
     #[test]

@@ -2,10 +2,17 @@
 
 `constantinople-deploy` generates deployment artifacts for local and remote Constantinople clusters.
 
-At least four validators are required for erasure coding. Shard decoding uses a
-static 32 MiB limit, sized to accommodate shards from 32 MiB transaction proposals
-at the minimum validator count. The deployment script still proposes at most
-16 MiB of transaction bytes per block.
+At least four validators are required for erasure coding. The consensus maximum
+is 16 MiB for a complete encoded block, independent of validator count.
+`--max-propose-bytes` sets the local encoded block budget, including framing.
+It defaults to 8 MiB. Deployment generation and validator startup reject budgets
+above 16 MiB or too small for an empty block with the largest supported header.
+The deployment script sets this budget to 16 MiB. Transaction selection and
+submission admission reserve space for block encoding overhead.
+
+Shard decoding derives its raw shard limit from the shared 16 MiB block cap and
+the agreed validator count. A smaller local proposal budget does not restrict
+receiving valid peer blocks. Network messages remain capped at 32 MiB.
 
 `deploy.sh` accepts `--validators`, `--regions`, `--storage-size`,
 `--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.

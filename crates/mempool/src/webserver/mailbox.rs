@@ -34,7 +34,6 @@ where
         batch_id: String,
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
-        total_bytes: usize,
         result: Option<oneshot::Sender<TxStatus>>,
         ingest_result: Option<oneshot::Sender<IngestStatus>>,
     },
@@ -43,9 +42,9 @@ where
         batch_id: String,
         response: oneshot::Sender<Option<StoredBatchStatus<H::Digest>>>,
     },
-    /// Consensus requests transactions for the next proposal. `filled` is
-    /// the encoded size the proposal already holds; the served batch stays
-    /// within the remaining budget (strictly, once the block is non-empty).
+    /// Consensus requests transactions for the next proposal. `filled` counts
+    /// encoded signed transaction bytes already selected. The served batch
+    /// stays within the remaining transaction budget.
     Propose {
         height: u64,
         filled: usize,
@@ -108,7 +107,6 @@ where
         batch_id: String,
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
-        total_bytes: usize,
     ) -> Option<oneshot::Receiver<TxStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
@@ -116,7 +114,6 @@ where
                 batch_id,
                 digests,
                 transactions,
-                total_bytes,
                 result: Some(result_tx),
                 ingest_result: None,
             })
@@ -133,7 +130,6 @@ where
         batch_id: String,
         digests: Vec<H::Digest>,
         transactions: Vec<VerifiedTransaction<H>>,
-        total_bytes: usize,
     ) -> Option<oneshot::Receiver<IngestStatus>> {
         let (result_tx, result_rx) = oneshot::channel();
         self.sender
@@ -141,7 +137,6 @@ where
                 batch_id,
                 digests,
                 transactions,
-                total_bytes,
                 result: None,
                 ingest_result: Some(result_tx),
             })

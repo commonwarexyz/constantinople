@@ -61,7 +61,10 @@ use constantinople_indexer::{
     },
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
-use constantinople_primitives::PublicKeyCache;
+use constantinople_primitives::{
+    PublicKeyCache,
+    proposal::{MAXIMUM_MESSAGE_SIZE, max_transaction_bytes},
+};
 use std::{
     future::Future,
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
@@ -701,6 +704,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         relayer,
     } = config;
 
+    let transaction_budget = max_transaction_bytes(max_propose_bytes)
+        .expect("configured encoded block budget must be valid");
+
     let config_dir = config_path
         .parent()
         .expect("config file has no parent directory");
@@ -752,7 +758,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
-                32 * 1024 * 1024,
+                MAXIMUM_MESSAGE_SIZE,
             )
         } else {
             discovery::Config::local(
@@ -761,7 +767,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
-                32 * 1024 * 1024,
+                MAXIMUM_MESSAGE_SIZE,
             )
         };
 
@@ -827,7 +833,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             context.child("mempool"),
             webserver::Config {
                 max_pool_bytes,
-                max_propose_bytes,
+                max_propose_bytes: transaction_budget,
                 namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
                 drop_grace_blocks: mempool_drop_grace_blocks,
                 strategy: strategy.clone(),
@@ -857,7 +863,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 account_reader: account_reader.clone(),
                 view_clock,
                 strategy: strategy.clone(),
-                max_batch_bytes: max_propose_bytes,
+                max_batch_bytes: transaction_budget,
             }))
         } else {
             info!("secondary node: skipping mempool webserver");
