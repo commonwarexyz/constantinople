@@ -1572,6 +1572,7 @@ dependencies = [
  "commonware-formatting",
  "commonware-math",
  "commonware-utils",
+ "http",
  "mimalloc",
  "rand 0.10.2",
  "serde",

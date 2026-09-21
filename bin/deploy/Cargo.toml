@@ -23,6 +23,7 @@ commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
 clap = { workspace = true, features = ["derive", "env", "std"] }
+http.workspace = true
 mimalloc.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tracing.workspace = true

@@ -379,6 +379,12 @@ fn parse_service_url(value: &str) -> Result<String, &'static str> {
         return Err(ERROR);
     }
 
+    // Match the Store client's parser so invalid endpoints fail before deployment.
+    let uri = value.parse::<http::Uri>().map_err(|_| ERROR)?;
+    if uri.authority().is_none() || !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(ERROR);
+    }
+
     let parsed = Url::parse(value).map_err(|_| ERROR)?;
     if !matches!(parsed.scheme(), "http" | "https")
         || parsed.host_str().is_none()
@@ -973,6 +979,10 @@ mod tests {
             for value in [
                 "",
                 "service.example.com",
+                "https:store.example.com",
+                "https:/store.example.com",
+                "https:///store.example.com",
+                "https://store.example.com\\path",
                 "/service",
                 "ftp://service.example.com",
                 "https://#fragment",
