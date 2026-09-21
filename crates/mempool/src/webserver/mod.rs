@@ -32,7 +32,8 @@ pub enum SubmitError {
     /// One or more transactions failed to decode or had an invalid signature.
     #[display("bad request")]
     BadRequest,
-    /// The batch exceeds the server's `max_propose_bytes` limit.
+    /// The batch exceeds the transaction byte budget derived from the server's
+    /// encoded-block limit.
     #[display("payload too large")]
     PayloadTooLarge,
     /// The server's pool is full.

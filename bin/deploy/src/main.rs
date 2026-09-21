@@ -16,6 +16,7 @@ use commonware_cryptography::{
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
 use commonware_utils::{N3f1, NZU32, TryCollect};
+use constantinople_primitives::proposal::{MAXIMUM_BLOCK_SIZE, max_transaction_bytes};
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -117,8 +118,8 @@ pub(crate) struct GenerateArgs {
     /// Capacity of each node's decompressed public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
-    /// Maximum bytes proposed per block (also the maximum accepted
-    /// submission batch size).
+    /// Maximum encoded block bytes, including framing. At most 16 MiB.
+    /// Submission budgets reserve space for block encoding overhead.
     #[arg(long = "max-propose-bytes", default_value_t = default_max_propose_bytes())]
     max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
@@ -158,6 +159,10 @@ pub(crate) struct GenerateArgs {
     /// txs per batch.
     #[arg(long, default_value_t = 0.0, value_parser = parse_accounts_jitter)]
     spammer_accounts_jitter: f64,
+    /// Concurrent spammer submitters. Defaults to the validator count.
+    /// Set explicitly to keep offered load independent of validator count.
+    #[arg(long = "spammer-submitters")]
+    spammer_submitters: Option<usize>,
     /// Fully signed local batches to keep ready per spammer submitter.
     #[arg(long, default_value_t = DEFAULT_SPAMMER_PRESIGNED_BATCHES)]
     spammer_presigned_batches: usize,
@@ -395,7 +400,7 @@ pub(crate) struct ValidatorConfig {
     http_port: u16,
     /// Prometheus metrics port.
     metrics_port: u16,
-    /// Maximum bytes proposed per block.
+    /// Maximum encoded block bytes, including framing. At most 16 MiB.
     max_propose_bytes: usize,
     /// Maximum mempool size in bytes.
     max_pool_bytes: usize,
@@ -616,6 +621,22 @@ pub(crate) fn validate_generate_args(args: &GenerateArgs) {
     assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
+    );
+    assert!(args.validators >= 4, "--validators must be at least 4");
+    u16::try_from(args.validators).expect("--validators must be at most 65535");
+    assert!(
+        args.max_propose_bytes <= MAXIMUM_BLOCK_SIZE,
+        "--max-propose-bytes {} exceeds encoded block limit {MAXIMUM_BLOCK_SIZE}",
+        args.max_propose_bytes,
+    );
+    assert!(
+        max_transaction_bytes(args.max_propose_bytes).is_some(),
+        "--max-propose-bytes {} is too small for an encoded empty block",
+        args.max_propose_bytes,
+    );
+    assert!(
+        args.spammer_submitters != Some(0),
+        "--spammer-submitters must be at least 1"
     );
 }
 
@@ -965,6 +986,120 @@ mod tests {
         };
         let generate = *generate;
         assert_eq!(generate.spammer_rayon_threads, 6);
+    }
+
+    #[test]
+    #[should_panic(expected = "--validators must be at least 4")]
+    fn rejects_validator_count_below_coding_minimum() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "3",
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
+    }
+
+    fn proposal_args(validators: u32, budget: usize) -> super::GenerateArgs {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            &validators.to_string(),
+            "--output-dir",
+            "out",
+            "--max-propose-bytes",
+            &budget.to_string(),
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        *generate
+    }
+
+    #[test]
+    fn accepts_maximum_proposal_budget_independent_of_validator_count() {
+        for validators in [4, 7, u32::from(u16::MAX)] {
+            let args = proposal_args(validators, super::MAXIMUM_BLOCK_SIZE);
+            super::validate_generate_args(&args);
+        }
+    }
+
+    #[test]
+    fn rejects_oversized_proposal_budgets_independent_of_validator_count() {
+        let maximum = super::MAXIMUM_BLOCK_SIZE;
+        for validators in [4, 7] {
+            for budget in [maximum + 1, usize::MAX] {
+                let args = proposal_args(validators, budget);
+                let error = std::panic::catch_unwind(|| super::validate_generate_args(&args))
+                    .expect_err("oversized proposal budget should fail");
+                let message = error.downcast_ref::<String>().expect("panic message");
+                assert_eq!(
+                    message,
+                    &format!("--max-propose-bytes {budget} exceeds encoded block limit {maximum}"),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn validates_minimum_encoded_block_budget() {
+        let minimum = (0..=super::MAXIMUM_BLOCK_SIZE)
+            .find(|&budget| super::max_transaction_bytes(budget).is_some())
+            .expect("empty block fits within the consensus limit");
+        for budget in [0, 1, minimum - 1] {
+            let args = proposal_args(4, budget);
+            let error = std::panic::catch_unwind(|| super::validate_generate_args(&args))
+                .expect_err("budget below empty block size should fail");
+            let message = error.downcast_ref::<String>().expect("panic message");
+            assert_eq!(
+                message,
+                &format!("--max-propose-bytes {budget} is too small for an encoded empty block"),
+            );
+        }
+        super::validate_generate_args(&proposal_args(4, minimum));
+    }
+
+    #[test]
+    #[should_panic(expected = "--validators must be at most 65535")]
+    fn rejects_validator_count_above_coding_maximum() {
+        let args = proposal_args(u32::from(u16::MAX) + 1, 0);
+        super::validate_generate_args(&args);
+    }
+
+    #[test]
+    #[should_panic(expected = "--spammer-submitters must be at least 1")]
+    fn rejects_zero_spammer_submitters() {
+        let cli = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--spammer-submitters",
+            "0",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
     }
 
     #[test]

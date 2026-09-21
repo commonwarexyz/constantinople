@@ -20,12 +20,10 @@ where
     /// pre-builds call this before the round is entered, so implementations
     /// must not assume the round is live.
     ///
-    /// `filled` is the encoded size of the transactions the proposal already
-    /// holds: the implementation serves at most its proposal budget minus
-    /// `filled`. A refill for a partially built block (`filled > 0`) must
-    /// never overshoot that headroom; an initial selection (`filled == 0`)
-    /// may overshoot by one entry so an oversized head entry cannot wedge
-    /// the queue.
+    /// `filled` is the sum of encoded signed transaction sizes already in the
+    /// proposal. The implementation must stay within its transaction byte
+    /// budget minus `filled`, including for an empty proposal. This budget
+    /// excludes block framing, which callers must reserve separately.
     fn propose(
         &mut self,
         parent: &Header<C, H::Digest, P>,
