@@ -42,7 +42,7 @@ where
 {
     /// Build a reporter and background uploader.
     pub fn connect(
-        store_url: &str,
+        store_client: StoreClient,
         buffer: usize,
         commit_metrics: super::StoreCommitMetrics,
     ) -> (Self, JoinHandle<()>)
@@ -53,7 +53,7 @@ where
         S::Certificate: Send + Sync,
     {
         let client = SimplexClient::new(
-            crate::namespaces::simplex_client(&StoreClient::new(store_url))
+            crate::namespaces::simplex_client(&store_client)
                 .expect("simplex namespace prefix must be valid"),
         );
         let (tx, rx) = mpsc::channel(buffer);
@@ -320,7 +320,7 @@ where
 }
 
 /// A finalized header tagged with the marshal commitment certified by Simplex.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CertifiedHeader<H, P>
 where
     H: Hasher,
@@ -328,6 +328,19 @@ where
 {
     commitment: Commitment,
     header: EngineHeader<H, P>,
+}
+
+impl<H, P> Clone for CertifiedHeader<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn clone(&self) -> Self {
+        Self {
+            commitment: self.commitment,
+            header: self.header.clone(),
+        }
+    }
 }
 
 impl<H, P> CertifiedHeader<H, P>
@@ -422,5 +435,83 @@ where
             ));
         }
         Ok(Self { commitment, header })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use commonware_consensus::{
+        simplex::types::Context as SimplexContext,
+        types::{Round, View},
+    };
+    use commonware_cryptography::{
+        Digest as _, Signer as _,
+        bls12381::primitives::variant::MinSig,
+        ed25519,
+        sha256::{Digest as Sha256Digest, Sha256},
+    };
+    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_utils::non_empty_range;
+    use constantinople_engine::ThresholdScheme;
+    use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
+
+    type TestReporter = CertificateReporter<
+        Sha256,
+        ed25519::PublicKey,
+        ThresholdScheme<ed25519::PublicKey, MinSig>,
+    >;
+
+    #[test]
+    fn reporter_sends_configured_credentials() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = crate::test_store::ObservedStore::open("writer-key")
+                .await
+                .expect("spawn observed Store");
+            let (reporter, uploader) = TestReporter::connect(
+                crate::store::writer_store_client(&store.url, Some("writer-key"))
+                    .expect("writer client builds"),
+                1,
+                super::super::StoreCommitMetrics::new(&context.child("metrics")),
+            );
+
+            reporter.publish_block(test_block()).await;
+            drop(reporter);
+            uploader.await.expect("uploader exits cleanly");
+
+            let requests = store.requests();
+            assert!(!requests.is_empty());
+            assert!(requests.iter().all(|request| request.authorized));
+            assert!(
+                requests
+                    .iter()
+                    .any(|request| request.path.starts_with("/log.ingest.v1.Service/")),
+                "Simplex upload should reach Store ingest. Observed RPCs were {requests:?}",
+            );
+
+            store.shutdown().await;
+        });
+    }
+
+    fn test_block() -> Arc<EngineBlock<Sha256, ed25519::PublicKey>> {
+        let leader = ed25519::PrivateKey::from_seed(1).public_key();
+        let header = Header {
+            context: SimplexContext {
+                round: Round::zero(),
+                leader,
+                parent: (View::zero(), Commitment::EMPTY),
+            },
+            parent: Sha256Digest::EMPTY,
+            height: 1,
+            timestamp: 0,
+            state_root: Sha256Digest::EMPTY,
+            state_range: non_empty_range!(0, 2),
+            transactions_root: Sha256Digest::EMPTY,
+            transactions_range: non_empty_range!(0, 2),
+        };
+        Arc::new(
+            Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+                .seal(&mut Sha256::default()),
+        )
     }
 }

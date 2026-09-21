@@ -48,9 +48,9 @@ mod tests;
 mod time;
 
 pub use db::{
-    Databases, StateBatch, StateDatabase, StateStaged, StateSyncTarget, StateUpdates,
-    TransactionDatabase, TransactionHistoryDb, TransactionHistoryOperation,
-    TransactionHistoryTarget,
+    DatabaseReaders, Databases, StateBatch, StateDatabase, StateReader, StateStaged,
+    StateSyncTarget, StateUpdates, TransactionDatabase, TransactionHistoryDb,
+    TransactionHistoryOperation, TransactionHistoryTarget,
 };
 pub use execution::{compute, prepare_signed};
 pub use genesis::{genesis_block, genesis_block_with_parent};
@@ -58,8 +58,8 @@ pub use genesis::{genesis_block, genesis_block_with_parent};
 type FinalizedHookFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 pub type FinalizedHookFn<E, C, H, P, St> = Arc<
     dyn for<'a> Fn(
-            &'a SealedBlock<C, P, H>,
-            &'a Databases<E, H, commonware_storage::translator::EightCap, St>,
+            Arc<SealedBlock<C, P, H>>,
+            &'a DatabaseReaders<E, H, commonware_storage::translator::EightCap, St>,
         ) -> FinalizedHookFuture<'a>
         + Send
         + Sync,

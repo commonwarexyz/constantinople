@@ -22,7 +22,10 @@ use commonware_consensus::{
         resolver::p2p as marshal_resolver,
     },
     simplex::{
-        self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
+        self,
+        config::{Floor as SimplexFloor, ForwardPolicy, SkipBudget, SkipPolicy},
+        elector::Config as Elector,
+        types::Finalization,
     },
     types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
 };
@@ -215,7 +218,7 @@ where
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>>,
+    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
@@ -266,7 +269,7 @@ where
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>>,
+    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
@@ -331,7 +334,7 @@ where
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("state_resolver"),
-                qmdb_resolver::standard::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -348,7 +351,7 @@ where
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("transaction_resolver"),
-                qmdb_resolver::compact::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
@@ -359,6 +362,7 @@ where
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
+                    max_serve_ops: NZU64!(4096),
                 },
             );
         let n_participants = u16::try_from(config.output.players().len())
@@ -443,7 +447,7 @@ where
         );
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
-        let (marshal, marshal_mailbox, _) = MarshalActor::init(
+        let (marshal, marshal_mailbox, marshal_floor) = MarshalActor::init(
             context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
@@ -453,7 +457,7 @@ where
                 start: marshal_start,
                 partition_prefix: format!("{}_marshal", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
-                view_retention_timeout: ACTIVITY_TIMEOUT,
+                view_retention: ACTIVITY_TIMEOUT,
                 prunable_items_per_section,
                 page_cache: page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
@@ -509,8 +513,8 @@ where
                     ),
                     transaction_db_config,
                 ),
-                input_provider: config.input,
-                marshal: marshal_mailbox.clone(),
+                provider: config.input,
+                marshal: (marshal_mailbox.clone(), marshal_floor),
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
@@ -542,6 +546,8 @@ where
         let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
             Reporters::from((marshal_mailbox, config.simplex_observer));
 
+        // Retain votes for late equivocation reports. The upstream wall-clock skip policy
+        // avoids waiting on silent leaders while a quorum remains active.
         let simplex = simplex::Engine::new(
             context.child("simplex"),
             simplex::Config {
@@ -551,6 +557,7 @@ where
                 automaton: application.clone(),
                 relay: application,
                 reporter: simplex_reporter,
+                track_historical_votes: true,
                 strategy: config.strategy.clone(),
                 partition: format!("{}_simplex", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
@@ -563,10 +570,12 @@ where
                 certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
                 fetch_timeout: Duration::from_secs(4),
-                activity_timeout: ACTIVITY_TIMEOUT,
-                skip_timeout: ViewDelta::new(10),
-                fetch_concurrent: NZUsize!(32),
-                forwarding: simplex::ForwardingPolicy::Disabled,
+                view_retention: ACTIVITY_TIMEOUT,
+                skip: SkipPolicy::Enabled {
+                    timeout: Duration::from_secs(11),
+                    budget: SkipBudget::Participants,
+                },
+                forward: ForwardPolicy::Disabled,
             },
         );
 
@@ -701,7 +710,7 @@ where
         ),
         TransactionHistoryTarget {
             root: block.header.transactions_root,
-            leaf_count: mmr::Location::new(block.header.transactions_range.end()),
+            size: mmr::Location::new(block.header.transactions_range.end()),
         },
     )
 }
@@ -799,6 +808,8 @@ where
         },
         translator: EightCap,
         init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_buffer: NZUsize!(1 << 21),
+        init_concurrency: (),
     }
 }
 
