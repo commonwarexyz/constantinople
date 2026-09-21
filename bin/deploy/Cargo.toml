@@ -32,6 +32,9 @@ serde_yaml.workspace = true
 tracing-subscriber.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+tempfile.workspace = true
+
 [[bin]]
 name = "constantinople-deploy"
 path = "src/main.rs"

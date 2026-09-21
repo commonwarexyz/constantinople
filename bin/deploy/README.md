@@ -188,6 +188,10 @@ The printed `mprocs` command list grows by four entries:
   Add `VITE_VERIFY_CERTIFICATES=false` to disable block-list certificate
   verification during streaming-performance experiments.
 
+The generated metadata and QMDB commands require `curl`. They poll Store's
+`/ready` endpoint before starting each adapter. Failed probes are retried after
+one second. Each probe has a one-second timeout.
+
 Validators do not upload QMDB data to `qmdb-indexer` directly. The indexer
 secondary writes QMDB rows into the shared `chain-indexer` store using reserved
 Store prefixes. `qmdb-indexer` reads those rows from the same store and exposes

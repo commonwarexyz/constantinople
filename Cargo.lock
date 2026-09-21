@@ -1577,6 +1577,7 @@ dependencies = [
  "rand 0.10.2",
  "serde",
  "serde_yaml",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
  "url",
