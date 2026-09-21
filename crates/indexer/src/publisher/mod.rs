@@ -122,6 +122,7 @@ pub struct StoreCommitMetrics {
     rows: Counter,
     retries: Counter,
     duration: CommitHistogram,
+    put_attempt_duration: CommitHistogram,
     batch_rows: CommitHistogram,
     encoded_bytes: CommitHistogram,
 }
@@ -138,7 +139,14 @@ impl StoreCommitMetrics {
             ),
             duration: context.register(
                 "store_commit_duration",
-                "Store logical batch commit latency including retries and backoff (s)",
+                "Store logical batch commit latency including request encoding, compression, all attempts and retry backoff, including failures (s)",
+                raw::Family::<CommitLabels, raw::Histogram>::new_with_constructor(|| {
+                    raw::Histogram::new(COMMIT_DURATION_BUCKETS)
+                }),
+            ),
+            put_attempt_duration: context.register(
+                "store_put_attempt_duration",
+                "Store client Put attempt latency including request encoding, compression, transport and response handling, including errors and cancellation but excluding retry backoff (s)",
                 raw::Family::<CommitLabels, raw::Histogram>::new_with_constructor(|| {
                     raw::Histogram::new(COMMIT_DURATION_BUCKETS)
                 }),
@@ -158,6 +166,18 @@ impl StoreCommitMetrics {
                 }),
             ),
         }
+    }
+}
+
+// Observe cancelled attempts too so the retry deadline cannot hide stalled requests.
+struct PutAttemptTimer {
+    histogram: raw::Histogram,
+    start: Instant,
+}
+
+impl Drop for PutAttemptTimer {
+    fn drop(&mut self) {
+        self.histogram.observe(self.start.elapsed().as_secs_f64());
     }
 }
 
@@ -266,12 +286,19 @@ pub(crate) async fn commit_with_retry(
 ) -> Result<u64, ClientError> {
     let rows = batch.len();
     let encoded_bytes = batch.encoded_len();
+    let labels = CommitLabels { kind: kind.label() };
     async {
         let start = Instant::now();
         metrics.in_flight.inc();
         let result = bounded_commit_retry(
             || async {
-                let result = batch.commit(client).await;
+                let result = {
+                    let _timer = PutAttemptTimer {
+                        histogram: metrics.put_attempt_duration.get_or_create(&labels).clone(),
+                        start: Instant::now(),
+                    };
+                    batch.commit(client).await
+                };
                 if result.is_err() {
                     metrics.retries.inc();
                 }
@@ -284,7 +311,6 @@ pub(crate) async fn commit_with_retry(
         metrics.in_flight.dec();
 
         // Count each logical batch once so retries do not distort its size distribution.
-        let labels = CommitLabels { kind: kind.label() };
         metrics
             .duration
             .get_or_create(&labels)
@@ -450,6 +476,10 @@ mod tests {
                     .await
                     .expect("commit succeeds");
                 assert_commit_samples(&context.encode(), kind, 2, expected_bytes);
+                assert_eq!(
+                    metric_sample(&context.encode(), "store_put_attempt_duration_count", kind),
+                    1.0,
+                );
             }
 
             let encoded = context.encode();
@@ -478,6 +508,7 @@ mod tests {
             let app = Router::new().fallback(move || {
                 let attempts = observed_attempts.clone();
                 async move {
+                    sleep(Duration::from_millis(10)).await;
                     let (status, body) = if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
                         (
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -511,11 +542,67 @@ mod tests {
                 batch.len(),
                 batch.encoded_len(),
             );
-            assert!(metric_sample(&encoded, "store_commit_duration_sum", CommitKind::Chunk) >= 0.2);
+            let logical_duration =
+                metric_sample(&encoded, "store_commit_duration_sum", CommitKind::Chunk);
+            let attempt_duration = metric_sample(
+                &encoded,
+                "store_put_attempt_duration_sum",
+                CommitKind::Chunk,
+            );
+            assert_eq!(
+                metric_sample(
+                    &encoded,
+                    "store_put_attempt_duration_count",
+                    CommitKind::Chunk
+                ),
+                2.0,
+            );
+            assert!(attempt_duration >= 0.02);
+            assert!(logical_duration - attempt_duration >= 0.2);
             assert!(has_metric_value(&encoded, "store_commits_total", 0));
             assert!(has_metric_value(&encoded, "store_commit_rows_total", 0));
             assert!(has_metric_value(&encoded, "store_commit_retries_total", 2));
             assert!(has_metric_value(&encoded, "store_commits_in_flight", 0));
+            server.abort();
+        });
+    }
+
+    #[test]
+    fn store_put_attempt_metrics_record_cancellation() {
+        use axum::{Router, http::StatusCode};
+
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let app = Router::new().fallback(std::future::pending::<StatusCode>);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            let client = crate::store::store_client(&url, None).expect("client builds");
+            let metrics = StoreCommitMetrics::new(&context);
+            let batch = commit_batch(&client);
+
+            timeout(
+                Duration::from_millis(25),
+                commit_with_retry(&client, &batch, CommitKind::Chunk, &metrics),
+            )
+            .await
+            .expect_err("stalled commit is cancelled");
+
+            let encoded = context.encode();
+            assert_eq!(
+                metric_sample(
+                    &encoded,
+                    "store_put_attempt_duration_count",
+                    CommitKind::Chunk
+                ),
+                1.0,
+            );
+            assert!(
+                metric_sample(
+                    &encoded,
+                    "store_put_attempt_duration_sum",
+                    CommitKind::Chunk
+                ) >= 0.025
+            );
             server.abort();
         });
     }
