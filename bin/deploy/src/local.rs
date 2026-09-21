@@ -3,9 +3,9 @@ use crate::{
     INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
     PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
     RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, ports::Ports,
+    secondary_roles, total_secondaries, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -15,15 +15,18 @@ use std::{
 };
 use tracing::info;
 
+const EXPLORER_PORT: u16 = 5173;
+
 struct GeneratedValidator {
     config_file: PathBuf,
     config: ValidatorConfig,
     peer: PeerEntry,
 }
 
-pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
+pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) -> Result<(), String> {
     validate_generate_args(args);
     assert!(args.validators >= 1, "need at least one validator");
+    validate_ports(args, local)?;
 
     let output_dir = absolute_path(&args.output_dir);
     ensure_output_dir_missing(&output_dir);
@@ -58,7 +61,43 @@ pub(super) fn generate(args: &GenerateArgs, local: &LocalArgs) {
         local,
         &material.primary_hex(),
         &material.simplex_verification_material_hex(),
-    );
+    )
+}
+
+fn validate_ports(args: &GenerateArgs, local: &LocalArgs) -> Result<(), String> {
+    let nodes = args
+        .validators
+        .checked_add(total_secondaries(args))
+        .ok_or("local node count overflow")?;
+    let mut ports = Ports::default();
+    ports.insert_range("node P2P", local.base_port, nodes)?;
+
+    // Indexer secondaries do not bind HTTP, but their serialized port must
+    // still fit in u16.
+    let last_http_port = local
+        .base_http_port
+        .checked_add(local_node_span(args)? - 1)
+        .ok_or("node HTTP port range overflow")?;
+    ports.insert_range("node HTTP", local.base_http_port, args.validators)?;
+    if args.relayer {
+        ports.insert("relayer HTTP", last_http_port)?;
+    }
+
+    ports.insert_range("node metrics", local.base_metrics_port, nodes)?;
+    if args.spammer {
+        ports.insert("spammer metrics", local_spammer_metrics_port(args, local)?)?;
+    }
+    if indexer_enabled(args) {
+        ports.insert("chain-indexer Store", local.chain_indexer_port)?;
+        ports.insert("metadata-indexer", local.metadata_indexer_port)?;
+        ports.insert("qmdb-indexer", local.qmdb_indexer_port)?;
+        ports.insert(
+            "chain-indexer metrics",
+            local_chain_indexer_metrics_port(args, local)?,
+        )?;
+        ports.insert("explorer", EXPLORER_PORT)?;
+    }
+    Ok(())
 }
 
 fn build_validators(
@@ -251,14 +290,14 @@ fn print_local_run_commands(
     local: &LocalArgs,
     relayer_targets: &[String],
     simplex_verification_material: &str,
-) {
+) -> Result<(), String> {
     let commands = local_run_commands(
         output_dir,
         args,
         local,
         relayer_targets,
         simplex_verification_material,
-    );
+    )?;
     let mprocs = commands
         .iter()
         .map(|command| format!("\"{command}\""))
@@ -273,6 +312,7 @@ fn print_local_run_commands(
         "generated local deployment bundle"
     );
     info!(command = %format!("mprocs {mprocs}"), "start local deployment");
+    Ok(())
 }
 
 fn local_run_commands(
@@ -281,7 +321,7 @@ fn local_run_commands(
     local: &LocalArgs,
     relayer_targets: &[String],
     simplex_verification_material: &str,
-) -> Vec<String> {
+) -> Result<Vec<String>, String> {
     let peers_path = output_dir.join(PEERS_CONFIG_FILE);
     let mut commands: Vec<String> = (0..args.validators)
         .map(|index| {
@@ -306,7 +346,7 @@ fn local_run_commands(
 
     if indexer_enabled(args) {
         let data_dir = output_dir.join(CHAIN_INDEXER_DATA_DIR);
-        let metrics_port = local_chain_indexer_metrics_port(args, local);
+        let metrics_port = local_chain_indexer_metrics_port(args, local)?;
         let db_parallelism = local
             .chain_indexer_db_parallelism
             .map(|jobs| format!(" --db-parallelism {jobs}"))
@@ -342,7 +382,7 @@ fn local_run_commands(
             .map(|port| format!(" VITE_MEMPOOL_URL=http://127.0.0.1:{port}"))
             .unwrap_or_default();
         commands.push(format!(
-            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev",
+            "VITE_SQL_URL=http://127.0.0.1:{} VITE_QMDB_URL=http://127.0.0.1:{} VITE_STORE_URL=http://127.0.0.1:{} VITE_SIMPLEX_VERIFICATION_MATERIAL={}{} npm --prefix explorer run dev -- --port {EXPLORER_PORT} --strictPort",
             local.metadata_indexer_port,
             local.qmdb_indexer_port,
             local.chain_indexer_port,
@@ -366,10 +406,7 @@ fn local_run_commands(
 
         // Place the spammer's metrics port past the primary and secondary ranges
         // so it does not collide with any validator on the loopback host.
-        let metrics_port = local
-            .base_metrics_port
-            .checked_add(args.validators as u16 + total_secondaries as u16)
-            .expect("spammer metrics port overflow");
+        let metrics_port = local_spammer_metrics_port(args, local)?;
         commands.push(format!(
             "cargo run --release --bin constantinople-spammer -- \
              {network_source} \
@@ -388,22 +425,32 @@ fn local_run_commands(
         ));
     }
 
-    commands
+    Ok(commands)
 }
 
-fn local_chain_indexer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> u16 {
-    let validator_span = u16::try_from(args.validators).expect("validator count exceeds u16");
-    let secondary_span =
-        u16::try_from(total_secondaries(args)).expect("secondary count exceeds u16");
-    let spammer_span = u16::from(args.spammer);
-    let offset = validator_span
-        .checked_add(secondary_span)
-        .and_then(|offset| offset.checked_add(spammer_span))
-        .expect("local metrics port offset overflow");
+fn local_node_span(args: &GenerateArgs) -> Result<u16, String> {
+    let validator_span =
+        u16::try_from(args.validators).map_err(|_| "validator count exceeds u16")?;
+    validator_span
+        .checked_add(total_secondaries(args) as u16)
+        .ok_or_else(|| "local port offset overflow".to_string())
+}
+
+fn local_spammer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> Result<u16, String> {
+    local
+        .base_metrics_port
+        .checked_add(local_node_span(args)?)
+        .ok_or_else(|| "spammer metrics port overflow".to_string())
+}
+
+fn local_chain_indexer_metrics_port(args: &GenerateArgs, local: &LocalArgs) -> Result<u16, String> {
+    let offset = local_node_span(args)?
+        .checked_add(u16::from(args.spammer))
+        .ok_or("local metrics port offset overflow")?;
     local
         .base_metrics_port
         .checked_add(offset)
-        .expect("chain-indexer metrics port overflow")
+        .ok_or_else(|| "chain-indexer metrics port overflow".to_string())
 }
 
 fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
@@ -416,7 +463,7 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_secondaries, build_validators, local_chain_indexer_metrics_port, local_run_commands,
+        EXPLORER_PORT, build_secondaries, build_validators, local_run_commands, validate_ports,
     };
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
@@ -465,6 +512,193 @@ mod tests {
         }
     }
 
+    fn assert_ports_rejected(args: &GenerateArgs, local: &LocalArgs, expected: &str) {
+        let message = validate_ports(args, local).expect_err("invalid ports should be rejected");
+        assert!(message.contains(expected), "{message}");
+    }
+
+    #[test]
+    fn local_ports_accept_enabled_service_combinations() {
+        for (indexer, relayer, spammer) in [
+            (false, false, false),
+            (false, true, false),
+            (false, true, true),
+            (true, false, false),
+            (true, true, false),
+            (true, true, true),
+        ] {
+            let mut args = test_args(spammer);
+            args.indexer = indexer;
+            args.relayer = relayer;
+            validate_ports(&args, &test_local_args()).unwrap();
+        }
+    }
+
+    #[test]
+    fn local_ports_ignore_disabled_services() {
+        let args = test_args(false);
+        let mut local = test_local_args();
+        local.chain_indexer_port = 0;
+        local.metadata_indexer_port = 0;
+        local.qmdb_indexer_port = 0;
+        local.base_http_port = EXPLORER_PORT;
+        validate_ports(&args, &local).unwrap();
+    }
+
+    #[test]
+    fn local_ports_allow_unused_indexer_http_slot() {
+        let mut args = test_args(false);
+        args.validators = 4;
+        args.indexer = true;
+        let mut local = test_local_args();
+        local.base_metrics_port = 12000;
+        local.chain_indexer_port = 8084;
+        validate_ports(&args, &local).unwrap();
+
+        args.relayer = true;
+        validate_ports(&args, &local).unwrap();
+
+        local.chain_indexer_port = 8083;
+        assert_ports_rejected(&args, &local, "collision");
+        local.chain_indexer_port = 8085;
+        assert_ports_rejected(&args, &local, "collision");
+    }
+
+    #[test]
+    fn local_ports_reject_overlapping_node_ranges() {
+        let args = test_args(false);
+        for (p2p, http, metrics) in [(9000, 9001, 9090), (9000, 9091, 9090), (9000, 8080, 9001)] {
+            let mut local = test_local_args();
+            local.base_port = p2p;
+            local.base_http_port = http;
+            local.base_metrics_port = metrics;
+            assert_ports_rejected(&args, &local, "collision");
+        }
+    }
+
+    #[test]
+    fn local_ports_include_secondary_ranges() {
+        let mut args = test_args(false);
+        let mut local = test_local_args();
+        local.base_http_port = local.base_port + args.validators as u16;
+        validate_ports(&args, &local).unwrap();
+
+        args.indexer = true;
+        assert_ports_rejected(&args, &local, "node P2P 2 and node HTTP 0");
+        args.indexer = false;
+        args.relayer = true;
+        assert_ports_rejected(&args, &local, "node P2P 2 and node HTTP 0");
+    }
+
+    #[test]
+    fn local_ports_check_each_indexer_service_against_all_listeners() {
+        let mut args = test_args(true);
+        args.indexer = true;
+        args.relayer = true;
+        for service in 0..3 {
+            for port in [
+                9000,
+                9003,
+                8080,
+                8083,
+                9090,
+                9093,
+                9094,
+                9095,
+                EXPLORER_PORT,
+            ] {
+                let mut local = test_local_args();
+                match service {
+                    0 => local.chain_indexer_port = port,
+                    1 => local.metadata_indexer_port = port,
+                    _ => local.qmdb_indexer_port = port,
+                }
+                assert_ports_rejected(&args, &local, &format!("port {port} collision"));
+            }
+        }
+        for (chain, metadata, qmdb) in [(8090, 8090, 8092), (8090, 8091, 8090), (8090, 8091, 8091)]
+        {
+            let mut local = test_local_args();
+            local.chain_indexer_port = chain;
+            local.metadata_indexer_port = metadata;
+            local.qmdb_indexer_port = qmdb;
+            assert_ports_rejected(&args, &local, "collision");
+        }
+    }
+
+    #[test]
+    fn local_ports_check_extra_metrics_against_node_ranges_and_explorer() {
+        for spammer in [false, true] {
+            let mut args = test_args(spammer);
+            args.indexer = !spammer;
+            args.relayer = spammer;
+            for (p2p, http, metrics) in [
+                (9000, 8080, 8997),
+                (9000, 8080, 8077),
+                (9000, 8080, EXPLORER_PORT - 3),
+            ] {
+                let mut local = test_local_args();
+                local.base_port = p2p;
+                local.base_http_port = http;
+                local.base_metrics_port = metrics;
+                if spammer && metrics == EXPLORER_PORT - 3 {
+                    validate_ports(&args, &local).unwrap();
+                } else {
+                    assert_ports_rejected(&args, &local, "collision");
+                }
+            }
+        }
+
+        let mut args = test_args(true);
+        args.indexer = true;
+        args.relayer = true;
+        let mut local = test_local_args();
+        local.base_metrics_port = EXPLORER_PORT - 4;
+        assert_ports_rejected(&args, &local, "spammer metrics and explorer");
+    }
+
+    #[test]
+    fn local_ports_reject_overflow_and_zero() {
+        let mut args = test_args(false);
+        for service in 0..3 {
+            for port in [0, u16::MAX] {
+                let mut local = test_local_args();
+                match service {
+                    0 => local.base_port = port,
+                    1 => local.base_http_port = port,
+                    _ => local.base_metrics_port = port,
+                }
+                assert_ports_rejected(
+                    &args,
+                    &local,
+                    if port == 0 { "nonzero" } else { "overflow" },
+                );
+            }
+        }
+        let mut local = test_local_args();
+        local.base_http_port = u16::MAX - 1;
+        validate_ports(&args, &local).unwrap();
+        args.indexer = true;
+        assert_ports_rejected(&args, &local, "node HTTP port range overflow");
+
+        args.indexer = false;
+        let mut local = test_local_args();
+        local.base_metrics_port = u16::MAX - 1;
+        validate_ports(&args, &local).unwrap();
+        args.indexer = true;
+        local.base_metrics_port = u16::MAX - 2;
+        assert_ports_rejected(&args, &local, "chain-indexer metrics port overflow");
+        args.indexer = false;
+        args.relayer = true;
+        args.spammer = true;
+        assert_ports_rejected(&args, &local, "spammer metrics port overflow");
+        args.validators = u32::from(u16::MAX) + 1;
+        assert_ports_rejected(&args, &test_local_args(), "overflow");
+        args.validators = u32::MAX;
+        args.indexer = true;
+        assert_ports_rejected(&args, &test_local_args(), "overflow");
+    }
+
     /// Borrow the [`LocalArgs`] embedded in a [`GenerateArgs`] built by
     /// [`test_args`], avoiding duplicate construction in every test.
     fn local_args(args: &GenerateArgs) -> &LocalArgs {
@@ -483,7 +717,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert_eq!(commands.len(), 2);
         assert!(commands.iter().all(|command| !command.contains("spammer")));
@@ -499,7 +734,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert_eq!(commands.len(), 4);
         assert!(commands[2].contains("secondary-0.yaml"));
@@ -523,7 +759,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert_eq!(commands.len(), 3);
         assert!(commands[2].contains("constantinople"));
@@ -557,7 +794,8 @@ mod tests {
             local_args(&args),
             &targets,
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert_eq!(commands.len(), 4);
         assert!(commands[2].contains("secondary-0.yaml"));
@@ -580,7 +818,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert!(commands[3].contains("--accounts-jitter 0.25"));
     }
@@ -596,7 +835,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert!(commands[3].contains("--presigned-batches 32"));
     }
@@ -612,7 +852,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert!(commands[3].contains("--rayon-threads 6"));
     }
@@ -628,7 +869,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert_eq!(commands.len(), 8);
         assert!(commands[2].contains("secondary-0.yaml"));
@@ -646,7 +888,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert!(
             commands.iter().all(|command| !command.contains("sleep ")),
@@ -676,7 +919,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         // 2 validators + 1 indexer secondary + 1 relayer secondary + store/sql/qmdb + explorer.
         assert_eq!(commands.len(), 8);
@@ -710,7 +954,8 @@ mod tests {
                 local_args(&args),
                 &[],
                 TEST_SIMPLEX_VERIFICATION_MATERIAL,
-            );
+            )
+            .unwrap();
             let indexer_cmd = commands
                 .iter()
                 .find(|command| command.contains("--bin chain-indexer"))
@@ -718,17 +963,6 @@ mod tests {
 
             assert!(indexer_cmd.contains(&format!("--metrics-port {expected_port}")));
         }
-    }
-
-    #[test]
-    #[should_panic(expected = "chain-indexer metrics port overflow")]
-    fn local_indexer_metrics_port_rejects_overflow() {
-        let mut args = test_args(false);
-        args.indexer = true;
-        let mut local = test_local_args();
-        local.base_metrics_port = u16::MAX;
-
-        local_chain_indexer_metrics_port(&args, &local);
     }
 
     #[test]
@@ -743,7 +977,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         let metadata_cmd = commands
             .iter()
@@ -766,7 +1001,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         let qmdb_cmd = commands
             .iter()
@@ -788,7 +1024,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         let explorer_cmd = commands
             .iter()
@@ -800,6 +1037,7 @@ mod tests {
         assert!(explorer_cmd.contains("VITE_SIMPLEX_VERIFICATION_MATERIAL=abcdef"));
         assert!(!explorer_cmd.contains("VITE_INDEXER_URL"));
         assert!(explorer_cmd.contains("run dev"));
+        assert!(explorer_cmd.contains("-- --port 5173 --strictPort"));
     }
 
     #[test]
@@ -812,7 +1050,8 @@ mod tests {
             local_args(&args),
             &[],
             TEST_SIMPLEX_VERIFICATION_MATERIAL,
-        );
+        )
+        .unwrap();
 
         assert!(
             commands

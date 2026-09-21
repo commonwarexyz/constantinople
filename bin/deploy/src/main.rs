@@ -1,6 +1,7 @@
 //! Deployment generator for Constantinople.
 
 mod local;
+mod ports;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
@@ -22,6 +23,7 @@ use std::{
     collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
+    process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
 };
 use tracing::Level;
@@ -540,11 +542,11 @@ const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
 }
 
-fn main() {
+fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
 
-    match &cli.command {
+    let result = match &cli.command {
         Command::Generate(args) => match &args.target {
             GenerateTarget::Local(local_args) => local::generate(args, local_args),
             GenerateTarget::Remote(remote_args) => remote::generate(args, remote_args),
@@ -554,6 +556,15 @@ fn main() {
                 "{}",
                 simplex_verification_material_from_config(&args.config)
             );
+            Ok(())
+        }
+    };
+
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("error: {error}");
+            ExitCode::FAILURE
         }
     }
 }

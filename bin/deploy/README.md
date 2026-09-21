@@ -167,7 +167,7 @@ The printed `mprocs` command list grows by four entries:
 - `cargo run --release -p constantinople-indexer --bin qmdb-indexer -- --store-url http://127.0.0.1:8090 --port 8092`
   — the QMDB query facade over the same shared store. `--qmdb-indexer-port`
   overrides the port.
-- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev`
+- `VITE_SQL_URL=http://127.0.0.1:8091 VITE_QMDB_URL=http://127.0.0.1:8092 VITE_STORE_URL=http://127.0.0.1:8090 VITE_SIMPLEX_VERIFICATION_MATERIAL=<simplex-committee-identity> npm --prefix explorer run dev -- --port 5173 --strictPort`
   — the [React explorer](../../explorer/README.md), which subscribes to the
   metadata service, streams new finalized blocks live, and verifies
   submitted-transaction proofs against `qmdb-indexer` and Simplex finalization
@@ -221,6 +221,11 @@ cargo run --bin constantinople-deploy -- simplex-verification-material \
 
 `generate remote` writes the deployment bundle, but it does not build the deployable binaries. Use
 `--output-dir ./deploy` if you want to use the bundled `just` targets unchanged.
+
+Enabled service ports must be distinct and cannot use ports 22, 9080, 9090, or 9100,
+which are reserved for SSH, Promtail, application metrics, and Node Exporter.
+All application hosts share ingress rules, so reusing ports across services can
+expose restricted HTTP or metrics endpoints on other hosts.
 
 Generate the remote bundle:
 
