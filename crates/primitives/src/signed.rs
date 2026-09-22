@@ -11,7 +11,7 @@ use crate::{
     PublicKeyCache, Sealable, Sealed, SignedTransaction, Transaction, TransactionBatchVerifier,
     TransactionSignature,
 };
-use bytes::{Buf, BufMut, Bytes};
+use bytes::{Buf as _, BufMut, Bytes};
 use commonware_codec::{
     DecodeExt, Encode, EncodeSize, Error, FixedSize, RangeCfg, Read, ReadExt, Write,
     types::lazy::Lazy,
@@ -22,7 +22,7 @@ use rand::CryptoRng;
 use std::sync::{Arc, OnceLock};
 
 /// A [`Sealed`] object with an attached signature over its seal.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Signed<T, H, Sig>
 where
     H: Hasher,
@@ -30,6 +30,15 @@ where
 {
     inner: Sealed<T, H>,
     signature: Lazy<Sig>,
+}
+
+impl<T: Clone, H: Hasher, Sig: Signature> Clone for Signed<T, H, Sig> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            signature: self.signature.clone(),
+        }
+    }
 }
 
 impl<T, H, Sig> PartialEq for Signed<T, H, Sig>
@@ -151,7 +160,7 @@ where
 {
     type Cfg = <T as Read>::Cfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let inner = Sealed::<T, H>::read_cfg(buf, cfg)?;
         let signature = Lazy::<Sig>::read(buf)?;
         Ok(Self { inner, signature })
@@ -167,7 +176,7 @@ where
 {
     fn arbitrary(u: &mut arbitrary::Unstructured<'a>) -> arbitrary::Result<Self> {
         Ok(Self {
-            inner: u.arbitrary::<T>()?.seal(&mut H::new()),
+            inner: u.arbitrary::<T>()?.seal(&mut H::default()),
             signature: Lazy::new(u.arbitrary()?),
         })
     }
@@ -195,13 +204,21 @@ pub trait Signable: Sealable {
 impl<T: Sealable> Signable for T {}
 
 /// A lazily decoded signed transaction.
-#[derive(Clone)]
 pub struct LazySignedTransaction<H>
 where
     H: Hasher,
 {
     pending: Option<Bytes>,
     value: Arc<OnceLock<Option<SignedTransaction<H>>>>,
+}
+
+impl<H: Hasher> Clone for LazySignedTransaction<H> {
+    fn clone(&self) -> Self {
+        Self {
+            pending: self.pending.clone(),
+            value: self.value.clone(),
+        }
+    }
 }
 
 impl<H> LazySignedTransaction<H>
@@ -272,7 +289,7 @@ where
 {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, _: &Self::Cfg) -> Result<Self, Error> {
         let len = usize::read_cfg(buf, &RangeCfg::new(0..=Self::MAX_ENCODED_SIZE))?;
         if len < Transaction::<H::Digest>::SIZE + TransactionSignature::MIN_SIZE {
             return Err(Error::EndOfBuffer);
@@ -509,7 +526,7 @@ mod test {
         TransactionBatchVerifier, TransactionPublicKey, signed::Signable,
     };
     use commonware_codec::{
-        DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
+        Copying, DecodeExt as _, EncodeSize as _, FixedSize as _, ReadExt as _, Write as _,
     };
     use commonware_cryptography::{
         Hasher, Signer, Verifier, ed25519, secp256r1::standard as secp256r1, sha256,
@@ -533,7 +550,9 @@ mod test {
             hasher: &mut H,
         ) -> crate::Sealed<Self, H> {
             hasher.update(&self.0);
-            Sealed::new_unchecked(self, hasher.finalize())
+            let (reset, digest) = core::mem::take(hasher).finalize();
+            *hasher = reset;
+            Sealed::new_unchecked(self, digest)
         }
     }
 
@@ -642,7 +661,7 @@ mod test {
         transaction.len().write(&mut encoded);
         encoded.extend_from_slice(&transaction);
 
-        let lazy = LazySignedTransaction::<sha256::Sha256>::read(&mut &encoded[..])
+        let lazy = LazySignedTransaction::<sha256::Sha256>::read(&mut Copying(&encoded))
             .expect("outer transaction should decode");
         assert!(
             lazy.get().is_some(),
@@ -676,7 +695,7 @@ mod test {
         transaction.len().write(&mut encoded);
         encoded.extend_from_slice(&transaction);
 
-        let lazy = LazySignedTransaction::<sha256::Sha256>::read(&mut &encoded[..])
+        let lazy = LazySignedTransaction::<sha256::Sha256>::read(&mut Copying(&encoded))
             .expect("outer transaction should decode");
 
         assert_eq!(lazy.encoded_signed_transaction().as_ref(), transaction);
@@ -699,7 +718,7 @@ mod test {
                 candidate[1] = first;
                 candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                TransactionPublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(Copying(&candidate))
                     .is_err()
                     .then_some(candidate)
             })

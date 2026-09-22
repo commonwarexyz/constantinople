@@ -11,7 +11,7 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Copying, Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
@@ -247,9 +247,10 @@ where
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
-    let verified = state.strategy.spawn(move |strategy| {
+    let work_len = body.len();
+    let verified = state.strategy.spawn(work_len, move |strategy| {
         let _permit = permit;
-        let batch_id = H::hash(&body).to_string();
+        let batch_id = H::hash(&[body.as_ref()]).to_string();
 
         let decode = info_span!(
             parent: &parent,
@@ -259,7 +260,7 @@ where
         )
         .entered();
         let cfg = (RangeCfg::new(1..=max_transactions), ());
-        let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
+        let signed = Vec::<SignedTransaction<H>>::decode_cfg(body, &cfg)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
         decode.record("txs", signed.len().traced());
         drop(decode);
@@ -324,9 +325,10 @@ where
     // formatting, so it runs on the strategy's pool; every other status is
     // constant-size.
     if status.has_digest_lists() {
+        let work_len = status.wire_work_len();
         return state
             .strategy
-            .spawn(move |_| ok_json(&status.to_wire()))
+            .spawn(work_len, move |_| ok_json(&status.to_wire()))
             .await;
     }
     ok_json(&status.to_wire())
@@ -355,7 +357,7 @@ where
     if bytes.len() != TransactionPublicKey::SIZE {
         return (StatusCode::BAD_REQUEST, String::new());
     }
-    let public_key = match TransactionPublicKey::decode(bytes.as_slice()) {
+    let public_key = match TransactionPublicKey::decode(Copying(&bytes)) {
         Ok(public_key) => public_key,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
     };

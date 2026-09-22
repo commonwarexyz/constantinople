@@ -2,7 +2,7 @@
 
 use commonware_cryptography::Hasher;
 use commonware_glue::stateful::db::{
-    DatabaseSet, Unmerkleized,
+    DatabaseSet, Shared, Unmerkleized,
     any::{AnyStaged, AnyUnmerkleized},
 };
 use commonware_parallel::Strategy;
@@ -18,17 +18,16 @@ use commonware_storage::{
             value::FixedEncoding,
         },
         keyless::fixed as keyless_fixed,
-        sync::{Target as AnyTarget, compact::Target as CompactTarget},
+        sync::{CompactTarget, Target as AnyTarget},
     },
     translator::EightCap,
 };
-use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_primitives::{Account, AccountKey};
-use std::{future::Future, sync::Arc};
+use std::future::Future;
 
 /// Shared QMDB handle for the application state database.
 pub type StateDatabase<E, H, T, S> =
-    Arc<TracedAsyncRwLock<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>>;
+    Shared<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>;
 
 pub type TransactionHistoryDb<E, H, S> =
     keyless_fixed::CompactDb<mmr::Family, E, <H as Hasher>::Digest, H, S>;
@@ -40,10 +39,13 @@ pub type StateSyncTarget<D> = AnyTarget<mmr::Family, D>;
 pub type TransactionHistoryTarget<D> = CompactTarget<mmr::Family, D>;
 
 /// Shared QMDB handle for the append-only transaction history database.
-pub type TransactionDatabase<E, H, S> = Arc<TracedAsyncRwLock<TransactionHistoryDb<E, H, S>>>;
+pub type TransactionDatabase<E, H, S> = Shared<TransactionHistoryDb<E, H, S>>;
 
 /// The backing databases owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
+
+/// Read-only handles passed to capture and finalized observers.
+pub type DatabaseReaders<E, H, T, S> = <Databases<E, H, T, S> as DatabaseSet<E>>::Readers;
 
 /// Unmerkleized application state batch, staged by the executor before writes.
 pub type StateBatch<E, H, T, S> = AnyUnmerkleized<
@@ -82,7 +84,7 @@ pub(super) type StateMerkleized<E, H, T, S> = <StateBatch<E, H, T, S> as Unmerkl
 pub(super) type TransactionMerkleized<E, H, S> =
     <TransactionBatch<E, H, S> as Unmerkleized>::Merkleized;
 
-pub(super) type MerkleizedDatabases<E, H, S> = (
+pub type MerkleizedDatabases<E, H, S> = (
     StateMerkleized<E, H, EightCap, S>,
     TransactionMerkleized<E, H, S>,
 );
@@ -151,6 +153,7 @@ mod tests {
                 metadata_partition: "state-order-test-merkle-metadata".into(),
                 items_per_blob: NZU64!(1024),
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
                 strategy: Sequential,
                 page_cache: cache.clone(),
             },
@@ -159,9 +162,12 @@ mod tests {
                 items_per_blob: NZU64!(1024),
                 page_cache: cache,
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
             },
             translator: EightCap,
-            init_cache_size: Some(NZUsize!(1024)),
+            init_cache: Some(NZUsize!(1024)),
+            init_buffer: commonware_utils::NZUsize!(1024 * 1024),
+            init_concurrency: (),
         }
     }
 
@@ -185,7 +191,8 @@ mod tests {
             seed = seed.write(c, Some(account(300)));
             seed = seed.write(a, Some(account(100)));
             let seed = seed.merkleize().await.expect("seed state");
-            db.finalize(seed).await;
+            db.apply(seed).await;
+            assert!(db.finalize().await.durable().await);
 
             // The same final key->value set must produce the same root
             // regardless of staged read order or update-entry order.

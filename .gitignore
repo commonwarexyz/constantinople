@@ -4,8 +4,11 @@
 
 # Deployment artifacts
 /local
+/local-handoff-*
+/handoff-comparison*.json
 /deploy
 
 # Dust
 mprocs.log
 .DS_Store
+__pycache__/

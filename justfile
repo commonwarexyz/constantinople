@@ -41,3 +41,19 @@ docs-check *args='':
 # Check for unused dependencies
 udeps:
   cargo +nightly udeps --all-targets
+
+# Test the handoff metrics comparison tool
+test-handoff-comparison:
+  python3 -m unittest discover -s scripts -p 'test_compare_handoffs.py'
+
+# Test AWS handoff experiment orchestration without contacting AWS
+test-aws-handoffs:
+  python3 -m unittest discover -s scripts -p 'test_run_aws_handoffs.py'
+
+# Run sequential handoff experiments on an existing deployment
+run-aws-handoffs *args:
+  python3 scripts/run_aws_handoffs.py "$@"
+
+# Compare timing metrics from running handoff-mode chains
+compare-handoffs *args:
+  python3 scripts/compare_handoffs.py "$@"

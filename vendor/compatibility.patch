@@ -1,0 +1,792 @@
+--- a/vendor/exoware-sdk/src/kv_codec.rs
++++ b/vendor/exoware-sdk/src/kv_codec.rs
+@@ -1,8 +1,8 @@
+ use std::cmp::Ordering;
+ 
+-use bytes::{Buf, BufMut, Bytes};
++use bytes::{BufMut, Bytes};
+ use commonware_codec::{
+-    EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
++    Buf, Copying, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
+ };
+ 
+ use crate::keys::{read_bit_be, read_bits_to_bytes, write_bit_be, Key};
+@@ -299,7 +299,7 @@
+ }
+ 
+ pub fn decode_stored_row(value: &[u8]) -> Result<StoredRow, CodecError> {
+-    StoredRow::read_cfg(&mut &*value, &())
++    StoredRow::read_cfg(&mut Copying(value), &())
+ }
+ 
+ /// Read a typed field. Key fields do not require a decoded stored row.
+--- a/vendor/exoware-sdk/src/prune_policy.rs
++++ b/vendor/exoware-sdk/src/prune_policy.rs
+@@ -1,7 +1,8 @@
+ use anyhow::{ensure, Context};
+-use bytes::{Buf, BufMut};
++use bytes::BufMut;
+ use commonware_codec::{
+-    Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt, Write,
++    Buf, Copying, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read, ReadExt,
++    Write,
+ };
+ use std::collections::HashSet;
+ 
+@@ -351,7 +352,7 @@
+             policies: Vec::new(),
+         });
+     }
+-    let document = PrunePolicyDocument::read_cfg(&mut &*raw, &())
++    let document = PrunePolicyDocument::read_cfg(&mut Copying(raw), &())
+         .context("failed to decode prune policy document")?;
+     validate_policy_document(&document)?;
+     Ok(document)
+--- a/vendor/exoware-sdk/src/retention.rs
++++ b/vendor/exoware-sdk/src/retention.rs
+@@ -5,8 +5,8 @@
+ //! rule can be persisted next to the log) and its validation.
+ 
+ use anyhow::ensure;
+-use bytes::{Buf, BufMut};
+-use commonware_codec::{EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
++use bytes::BufMut;
++use commonware_codec::{Buf, EncodeSize, Error as CodecError, FixedSize, Read, ReadExt, Write};
+ 
+ /// A sequence-log retention rule. Interpreted directly over sequence numbers;
+ /// the stream service tracks the live frontier and evicts continuously.
+--- a/vendor/exoware-sdk/src/selector.rs
++++ b/vendor/exoware-sdk/src/selector.rs
+@@ -5,8 +5,8 @@
+ //! proto message and one regex compiler handles validation everywhere.
+ 
+ use anyhow::{ensure, Context};
+-use bytes::{Buf, BufMut, Bytes};
+-use commonware_codec::{EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
++use bytes::{BufMut, Bytes};
++use commonware_codec::{Buf, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
+ use regex::bytes::Regex;
+ 
+ use crate::keys::MAX_KEY_LEN;
+--- a/vendor/exoware-qmdb/src/auth.rs
++++ b/vendor/exoware-qmdb/src/auth.rs
+@@ -126,7 +126,7 @@
+             "missing authenticated operation row at location {location}"
+         )));
+     };
+-    Op::decode_cfg(bytes.as_ref(), cfg).map_err(|e| {
++    Op::decode_cfg(commonware_codec::Copying(bytes.as_ref()), cfg).map_err(|e| {
+         QmdbError::CorruptData(format!(
+             "failed to decode authenticated operation at location {location}: {e}"
+         ))
+--- a/vendor/exoware-qmdb/src/authenticated_range.rs
++++ b/vendor/exoware-qmdb/src/authenticated_range.rs
+@@ -228,7 +228,11 @@
+         let location = start.checked_add(offset as u64).ok_or_else(|| {
+             QmdbError::CorruptData("authenticated operation location overflow".into())
+         })?;
+-        let operation = Op::decode_cfg(encoded.as_slice(), operation_cfg).map_err(|error| {
++        let operation = Op::decode_cfg(
++            commonware_codec::Copying(encoded.as_slice()),
++            operation_cfg,
++        )
++        .map_err(|error| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode authenticated operation at {location}: {error}"
+             ))
+@@ -340,7 +344,8 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
+-    use bytes::{Buf, BufMut};
++    use bytes::BufMut;
++    use commonware_codec::Buf;
+     use commonware_codec::{FixedSize, Read, Write};
+     use commonware_cryptography::{sha256::Digest as Sha256Digest, Sha256};
+     use commonware_parallel::{Rayon, Sequential};
+--- a/vendor/exoware-qmdb/src/codec.rs
++++ b/vendor/exoware-qmdb/src/codec.rs
+@@ -56,7 +56,8 @@
+     bytes: &[u8],
+     label: impl std::fmt::Display,
+ ) -> Result<D, QmdbError> {
+-    D::decode(bytes).map_err(|e| QmdbError::CorruptData(format!("{label} decode error: {e}")))
++    D::decode(commonware_codec::Copying(bytes))
++        .map_err(|e| QmdbError::CorruptData(format!("{label} decode error: {e}")))
+ }
+ 
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -80,7 +81,7 @@
+     type Cfg = ();
+ 
+     fn read_cfg(
+-        buf: &mut impl ::bytes::Buf,
++        buf: &mut impl commonware_codec::Buf,
+         _: &Self::Cfg,
+     ) -> Result<Self, commonware_codec::Error> {
+         let (root, pruned_chunks) = <(D, u64) as commonware_codec::Read>::read_cfg(buf, &((), ()))?;
+@@ -95,7 +96,7 @@
+     bytes: &[u8],
+     label: impl std::fmt::Display,
+ ) -> Result<CurrentBoundaryMetadata<D>, QmdbError> {
+-    CurrentBoundaryMetadata::<D>::decode(bytes)
++    CurrentBoundaryMetadata::<D>::decode(commonware_codec::Copying(bytes))
+         .map_err(|e| QmdbError::CorruptData(format!("{label} decode error: {e}")))
+ }
+ 
+--- a/vendor/exoware-qmdb/src/connect.rs
++++ b/vendor/exoware-qmdb/src/connect.rs
+@@ -891,7 +891,13 @@
+     V: commonware_codec::Codec + Clone + AsRef<[u8]> + Send + Sync + 'static,
+     E: ValueEncoding<Value = V> + Send + Sync + 'static,
+     ordered::Operation<F, K, E>: Encode + commonware_codec::Decode,
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, H::Digest, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F,
++        K,
++        E,
++        H::Digest,
++        N,
++    >: Encode,
+ {
+     fn get(
+         &self,
+@@ -954,7 +960,7 @@
+         let client = self.client.clone();
+         let key_cfg = self.key_cfg.clone();
+         async move {
+-            let key = K::decode_cfg(request.key, &key_cfg).map_err(|error| {
++            let key = K::decode_cfg(commonware_codec::Copying(request.key), &key_cfg).map_err(|error| {
+                 ConnectError::invalid_argument(format!("invalid QMDB key: {error}"))
+             })?;
+             let tip = Location::new(request.tip);
+@@ -978,7 +984,7 @@
+             let keys = request
+                 .keys
+                 .iter()
+-                .map(|key| K::decode_cfg(*key, &key_cfg))
++                .map(|key| K::decode_cfg(commonware_codec::Copying(*key), &key_cfg))
+                 .collect::<Result<Vec<_>, _>>()
+                 .map_err(|error| {
+                     ConnectError::invalid_argument(format!("invalid QMDB key: {error}"))
+@@ -1000,7 +1006,13 @@
+     V: commonware_codec::Codec + Clone + AsRef<[u8]> + Send + Sync + 'static,
+     E: ValueEncoding<Value = V> + Send + Sync + 'static,
+     ordered::Operation<F, K, E>: Encode + commonware_codec::Decode,
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, H::Digest, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F,
++        K,
++        E,
++        H::Digest,
++        N,
++    >: Encode,
+ {
+     fn get_range(
+         &self,
+@@ -1161,7 +1173,13 @@
+ ) -> ConnectRpcService<impl ::connectrpc::Dispatcher>
+ where
+     ordered::Operation<F, K, E>: Encode + commonware_codec::Decode,
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, H::Digest, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F,
++        K,
++        E,
++        H::Digest,
++        N,
++    >: Encode,
+ {
+     wrap_stack(Chain(
+         KeyLookupServiceServer::new(OrderedConnect::new(client.clone())),
+--- a/vendor/exoware-qmdb/src/connect_client.rs
++++ b/vendor/exoware-qmdb/src/connect_client.rs
+@@ -24,8 +24,8 @@
+             ordered, unordered,
+             value::{ValueEncoding, VariableEncoding},
+         },
+-        current::ordered::ExclusionProof,
+-        current::proof::{OperationProof, OpsRootWitness, RangeProof},
++        current::ordered::proof::constant::ExclusionProof,
++        current::proof::{OpsRootWitness, RangeProof, constant::OperationProof},
+         operation::{Key as QmdbKey, Operation},
+         sync::{
+             FeedbackTx, Request as SyncRequest, Response as SyncResponse, Source,
+@@ -159,7 +159,10 @@
+         expected_root: &H::Digest,
+     ) -> Result<VerifiedKeyValue<H::Digest, ordered::Operation<F, K, E>, F>, QmdbError> {
+         let requested_key = request.key.clone();
+-        let decoded_requested_key = K::decode_cfg(requested_key.as_slice(), self.key_cfg.as_ref())
++        let decoded_requested_key = K::decode_cfg(
++            commonware_codec::Copying(requested_key.as_slice()),
++            self.key_cfg.as_ref(),
++        )
+             .map_err(|err| {
+                 QmdbError::CorruptData(format!("failed to decode requested QMDB key: {err}"))
+             })?;
+@@ -222,7 +225,7 @@
+             .zip(requested_keys.iter())
+             .map(|(result, requested_key)| {
+                 let decoded_requested_key = K::decode_cfg(
+-                    requested_key.as_slice(),
++                    commonware_codec::Copying(requested_key.as_slice()),
+                     self.key_cfg.as_ref(),
+                 )
+                 .map_err(|err| {
+@@ -546,7 +549,10 @@
+             QmdbError::CorruptData("qmdb subscribe response missing proof".to_string())
+         })?;
+         let max_digests = proof_digest_cap::<H::Digest>(&proof.proof);
+-        let merkle_proof = Proof::<F, H::Digest>::decode_cfg(proof.proof.as_ref(), &max_digests)
++        let merkle_proof = Proof::<F, H::Digest>::decode_cfg(
++            commonware_codec::Copying(proof.proof.as_ref()),
++            &max_digests,
++        )
+             .map_err(|err| {
+                 QmdbError::CorruptData(format!("failed to decode historical multi proof: {err}"))
+             })?;
+@@ -814,7 +820,10 @@
+         request: SyncRequest<F>,
+     ) -> Result<SyncResponse<F, Op, H::Digest>, QmdbError> {
+         let max_digests = proof_digest_cap::<H::Digest>(&proto.proof);
+-        let proof = Proof::<F, H::Digest>::decode_cfg(proto.proof.as_ref(), &max_digests).map_err(
++        let proof = Proof::<F, H::Digest>::decode_cfg(
++            commonware_codec::Copying(proto.proof.as_ref()),
++            &max_digests,
++        ).map_err(
+             |err| {
+                 QmdbError::CorruptData(format!(
+                     "failed to decode sync operation range proof: {err}"
+@@ -825,7 +834,7 @@
+             .encoded_operations
+             .iter()
+             .map(|bytes| {
+-                Op::decode_cfg(bytes.as_ref(), self.op_cfg.as_ref()).map_err(|err| {
++                Op::decode_cfg(commonware_codec::Copying(bytes.as_ref()), self.op_cfg.as_ref()).map_err(|err| {
+                     QmdbError::CorruptData(format!("failed to decode sync operation: {err}"))
+                 })
+             })
+@@ -906,7 +915,7 @@
+     H: Hasher,
+ {
+     let ops_root = decode_digest::<H::Digest>(ops_root, "current sync ops root")?;
+-    let witness = OpsRootWitness::<F, H::Digest>::decode(ops_root_witness).map_err(|err| {
++    let witness = OpsRootWitness::<F, H::Digest>::decode(commonware_codec::Copying(ops_root_witness)).map_err(|err| {
+         QmdbError::CorruptData(format!(
+             "failed to decode current sync ops-root witness: {err}"
+         ))
+@@ -943,7 +952,7 @@
+         }
+         return Ok(ops_root);
+     }
+-    let witness = OpsRootWitness::<F, H::Digest>::decode(ops_root_witness).map_err(|err| {
++    let witness = OpsRootWitness::<F, H::Digest>::decode(commonware_codec::Copying(ops_root_witness)).map_err(|err| {
+         QmdbError::CorruptData(format!(
+             "failed to decode historical ops-root witness: {err}"
+         ))
+@@ -972,7 +981,10 @@
+         .operations
+         .iter()
+         .map(|op| {
+-            let decoded = Op::decode_cfg(op.encoded_operation.as_ref(), op_cfg).map_err(|err| {
++            let decoded = Op::decode_cfg(
++                commonware_codec::Copying(op.encoded_operation.as_ref()),
++                op_cfg,
++            ).map_err(|err| {
+                 QmdbError::CorruptData(format!(
+                     "failed to decode multi-proof operation at {}: {err}",
+                     op.location
+@@ -1012,7 +1024,10 @@
+         historical_target_root::<F, H>(&proto.ops_root, &proto.ops_root_witness, root)?;
+     let max_digests = proof_digest_cap::<H::Digest>(&proto.proof);
+     let proof =
+-        Proof::<F, H::Digest>::decode_cfg(proto.proof.as_ref(), &max_digests).map_err(|err| {
++        Proof::<F, H::Digest>::decode_cfg(
++            commonware_codec::Copying(proto.proof.as_ref()),
++            &max_digests,
++        ).map_err(|err| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode historical operation range proof: {err}"
+             ))
+@@ -1029,7 +1044,7 @@
+         .encoded_operations
+         .iter()
+         .map(|bytes| {
+-            let decoded = Op::decode_cfg(bytes.as_ref(), op_cfg).map_err(|err| {
++            let decoded = Op::decode_cfg(commonware_codec::Copying(bytes.as_ref()), op_cfg).map_err(|err| {
+                 QmdbError::CorruptData(format!("failed to decode operation range entry: {err}"))
+             })?;
+             Ok(decoded)
+@@ -1074,7 +1089,10 @@
+         ));
+     }
+     let max_digests = proof_digest_cap::<H::Digest>(&proto.proof);
+-    let proof = RangeProof::<F, H::Digest>::decode_cfg(proto.proof.as_ref(), &max_digests)
++    let proof = RangeProof::<F, H::Digest>::decode_cfg(
++        commonware_codec::Copying(proto.proof.as_ref()),
++        &max_digests,
++    )
+         .map_err(|err| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode current operation range proof: {err}"
+@@ -1092,7 +1110,7 @@
+         .encoded_operations
+         .iter()
+         .map(|bytes| {
+-            let decoded = Op::decode_cfg(bytes.as_ref(), op_cfg).map_err(|err| {
++            let decoded = Op::decode_cfg(commonware_codec::Copying(bytes.as_ref()), op_cfg).map_err(|err| {
+                 QmdbError::CorruptData(format!(
+                     "failed to decode current operation range entry: {err}"
+                 ))
+@@ -1105,7 +1123,7 @@
+         .iter()
+         .enumerate()
+         .map(|(index, bytes)| {
+-            <[u8; N]>::decode(bytes.as_ref()).map_err(|e| {
++            <[u8; N]>::decode(commonware_codec::Copying(bytes.as_ref())).map_err(|e| {
+                 QmdbError::CorruptData(format!(
+                     "current operation range chunk {index} decode error: {e}"
+                 ))
+@@ -1131,7 +1149,10 @@
+     H::Digest: DecodeExt<()>,
+     Op: commonware_codec::Codec + Clone + Operation<F>,
+ {
+-    let operation = Op::decode_cfg(proto.encoded_operation.as_ref(), op_cfg).map_err(|err| {
++    let operation = Op::decode_cfg(
++        commonware_codec::Copying(proto.encoded_operation.as_ref()),
++        op_cfg,
++    ).map_err(|err| {
+         QmdbError::CorruptData(format!(
+             "failed to decode current key-value operation: {err}",
+         ))
+@@ -1142,7 +1163,10 @@
+         ));
+     }
+     let max_digests = proof_digest_cap::<H::Digest>(&proto.proof);
+-    let proof = OperationProof::<F, H::Digest, N>::decode_cfg(proto.proof.as_ref(), &max_digests)
++    let proof = OperationProof::<F, H::Digest, N>::decode_cfg(
++        commonware_codec::Copying(proto.proof.as_ref()),
++        &max_digests,
++    )
+         .map_err(|err| {
+         QmdbError::CorruptData(format!("failed to decode current key-value proof: {err}"))
+     })?;
+@@ -1208,7 +1232,7 @@
+ {
+     let max_digests = proof_digest_cap::<H::Digest>(&proto.proof);
+     let proof = ExclusionProof::<F, K, E, H::Digest, N>::decode_cfg(
+-        proto.proof.as_ref(),
++        commonware_codec::Copying(proto.proof.as_ref()),
+         &(max_digests, update_cfg.clone(), value_cfg.clone()),
+     )
+     .map_err(|err| {
+@@ -1216,7 +1240,7 @@
+             "failed to decode current key-exclusion proof: {err}"
+         ))
+     })?;
+-    let requested_key = K::decode_cfg(requested_key, key_cfg).map_err(|err| {
++    let requested_key = K::decode_cfg(commonware_codec::Copying(requested_key), key_cfg).map_err(|err| {
+         QmdbError::CorruptData(format!("failed to decode requested exclusion key: {err}"))
+     })?;
+     if !verify_ordered_exclusion_proof::<F, H, K, E, N>(&requested_key, &proof, root) {
+@@ -1256,12 +1280,12 @@
+ {
+     let encoded_start_key = start_key;
+     let encoded_end_key = end_key;
+-    let start_key = K::decode_cfg(encoded_start_key, key_cfg).map_err(|err| {
++    let start_key = K::decode_cfg(commonware_codec::Copying(encoded_start_key), key_cfg).map_err(|err| {
+         QmdbError::CorruptData(format!("failed to decode range start key: {err}"))
+     })?;
+     let end_key = encoded_end_key
+         .map(|key| {
+-            K::decode_cfg(key, key_cfg).map_err(|err| {
++            K::decode_cfg(commonware_codec::Copying(key), key_cfg).map_err(|err| {
+                 QmdbError::CorruptData(format!("failed to decode range end key: {err}"))
+             })
+         })
+--- a/vendor/exoware-qmdb/src/immutable.rs
++++ b/vendor/exoware-qmdb/src/immutable.rs
+@@ -87,7 +87,10 @@
+     where
+         V: AsRef<[u8]>,
+     {
+-        let op = immutable::Operation::<F, K, E>::decode_cfg(bytes, &self.operation_cfg).map_err(
++        let op = immutable::Operation::<F, K, E>::decode_cfg(
++            commonware_codec::Copying(bytes),
++            &self.operation_cfg,
++        ).map_err(
+             |e| {
+                 QmdbError::CorruptData(format!(
+                     "failed to decode immutable operation at location {location}: {e}"
+@@ -264,7 +267,10 @@
+             .enumerate()
+             .map(|(offset, bytes)| {
+                 let location = checkpoint.start_location + offset as u64;
+-                immutable::Operation::<F, K, E>::decode_cfg(bytes.as_slice(), &self.operation_cfg)
++                immutable::Operation::<F, K, E>::decode_cfg(
++                    commonware_codec::Copying(bytes.as_slice()),
++                    &self.operation_cfg,
++                )
+                     .map_err(|e| {
+                         QmdbError::CorruptData(format!(
+                             "failed to decode authenticated operation at location {location}: {e}"
+--- a/vendor/exoware-qmdb/src/keyless.rs
++++ b/vendor/exoware-qmdb/src/keyless.rs
+@@ -97,7 +97,7 @@
+     where
+         V: AsRef<[u8]>,
+     {
+-        let op = keyless::Operation::<F, E>::decode_cfg(bytes, &self.op_cfg).map_err(|e| {
++        let op = keyless::Operation::<F, E>::decode_cfg(commonware_codec::Copying(bytes), &self.op_cfg).map_err(|e| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode keyless operation at location {location}: {e}"
+             ))
+@@ -253,7 +253,10 @@
+             .enumerate()
+             .map(|(offset, bytes)| {
+                 let location = checkpoint.start_location + offset as u64;
+-                keyless::Operation::<F, E>::decode_cfg(bytes.as_slice(), &self.op_cfg).map_err(
++                keyless::Operation::<F, E>::decode_cfg(
++                    commonware_codec::Copying(bytes.as_slice()),
++                    &self.op_cfg,
++                ).map_err(
+                     |e| {
+                         QmdbError::CorruptData(format!(
+                             "failed to decode authenticated operation at location {location}: {e}"
+--- a/vendor/exoware-qmdb/src/ordered.rs
++++ b/vendor/exoware-qmdb/src/ordered.rs
+@@ -11,8 +11,8 @@
+             value::{ValueEncoding, VariableEncoding},
+         },
+         current::{
+-            ordered::ExclusionProof,
+-            proof::{OperationProof, OpsRootWitness, RangeProof},
++            ordered::proof::constant::ExclusionProof,
++            proof::{OpsRootWitness, RangeProof, constant::OperationProof},
+         },
+         operation::{Key as QmdbKey, Operation as _},
+     },
+@@ -143,7 +143,7 @@
+     }
+ 
+     pub(crate) fn decode_key(&self, encoded_key: &[u8]) -> Result<K, commonware_codec::Error> {
+-        K::decode_cfg(encoded_key, &self.key_cfg)
++        K::decode_cfg(commonware_codec::Copying(encoded_key), &self.key_cfg)
+     }
+ 
+     pub async fn writer_location_watermark(&self) -> Result<Option<Location<F>>, QmdbError> {
+@@ -186,7 +186,7 @@
+         location: Location<F>,
+         bytes: &[u8],
+     ) -> Result<ordered::Operation<F, K, E>, QmdbError> {
+-        ordered::Operation::<F, K, E>::decode_cfg(bytes, &self.op_cfg).map_err(|e| {
++        ordered::Operation::<F, K, E>::decode_cfg(commonware_codec::Copying(bytes), &self.op_cfg).map_err(|e| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode qmdb operation at location {location}: {e}"
+             ))
+@@ -658,7 +658,10 @@
+                 )));
+             };
+             let operation =
+-                ordered::Operation::<F, K, E>::decode_cfg(encoded.as_ref(), &self.op_cfg).map_err(
++                ordered::Operation::<F, K, E>::decode_cfg(
++                    commonware_codec::Copying(encoded.as_ref()),
++                    &self.op_cfg,
++                ).map_err(
+                     |e| {
+                         QmdbError::CorruptData(format!(
+                             "failed to decode qmdb operation at location {location}: {e}"
+@@ -888,7 +891,7 @@
+         let Some(bytes) = session.get(&encode_ops_root_witness_key(location)).await? else {
+             return Ok(None);
+         };
+-        OpsRootWitness::<F, H::Digest>::decode(bytes.as_ref())
++        OpsRootWitness::<F, H::Digest>::decode(commonware_codec::Copying(bytes.as_ref()))
+             .map(Some)
+             .map_err(|e| {
+                 QmdbError::CorruptData(format!(
+@@ -1049,7 +1052,7 @@
+             .range_with_mode(&start, &end, 1, RangeMode::Reverse)
+             .await?;
+         let mut chunk = match rows.into_iter().next() {
+-            Some((_, bytes)) => <[u8; N]>::decode(bytes.as_ref()).map_err(|e| {
++            Some((_, bytes)) => <[u8; N]>::decode(commonware_codec::Copying(bytes.as_ref())).map_err(|e| {
+                 QmdbError::CorruptData(format!("bitmap chunk {chunk_index} decode error: {e}"))
+             })?,
+             None => {
+@@ -1087,7 +1090,10 @@
+             .core()
+             .load_operation_bytes_at(session, location)
+             .await?;
+-        ordered::Operation::<F, K, E>::decode_cfg(bytes.as_slice(), &self.op_cfg).map_err(|e| {
++        ordered::Operation::<F, K, E>::decode_cfg(
++            commonware_codec::Copying(bytes.as_slice()),
++            &self.op_cfg,
++        ).map_err(|e| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode qmdb operation at location {location}: {e}"
+             ))
+@@ -1108,7 +1114,10 @@
+             .enumerate()
+             .map(|(offset, bytes)| {
+                 let location = start_location + offset as u64;
+-                ordered::Operation::<F, K, E>::decode_cfg(bytes.as_slice(), &self.op_cfg).map_err(
++                ordered::Operation::<F, K, E>::decode_cfg(
++                    commonware_codec::Copying(bytes.as_slice()),
++                    &self.op_cfg,
++                ).map_err(
+                     |e| {
+                         QmdbError::CorruptData(format!(
+                             "failed to decode qmdb operation at location {location}: {e}"
+--- a/vendor/exoware-qmdb/src/proof.rs
++++ b/vendor/exoware-qmdb/src/proof.rs
+@@ -12,8 +12,8 @@
+             value::{ValueEncoding, VariableEncoding},
+         },
+         current::{
+-            ordered::ExclusionProof,
+-            proof::{OperationProof, OpsRootWitness, RangeProof},
++            ordered::proof::constant::ExclusionProof,
++            proof::{OpsRootWitness, RangeProof, constant::OperationProof},
+         },
+         operation::{Key as QmdbKey, Operation},
+         verify::verify_multi_proof,
+@@ -312,25 +312,6 @@
+     pub operation: Op,
+ }
+ 
+-type OrderedVerifierDb<F, K, E, H, const N: usize> =
+-    commonware_storage::qmdb::current::ordered::db::Db<
+-        F,
+-        commonware_runtime::deterministic::Context,
+-        commonware_storage::journal::contiguous::variable::Journal<
+-            commonware_runtime::deterministic::Context,
+-            ordered::Operation<F, K, E>,
+-        >,
+-        K,
+-        E,
+-        commonware_storage::index::ordered::Index<
+-            commonware_storage::translator::TwoCap,
+-            Location<F>,
+-        >,
+-        H,
+-        N,
+-        commonware_parallel::Sequential,
+-    >;
+-
+ pub(crate) fn verify_ordered_exclusion_proof<F, H, K, E, const N: usize>(
+     key: &K,
+     proof: &ExclusionProof<F, K, E, H::Digest, N>,
+@@ -343,7 +324,7 @@
+     E: ValueEncoding,
+     ordered::Operation<F, K, E>: Codec,
+ {
+-    OrderedVerifierDb::<F, K, E, H, N>::verify_exclusion_proof(key, proof, root)
++    proof.verify::<H>(key, root)
+ }
+ 
+ impl<D: Digest, Op, const N: usize, F: Graftable> RawKeyValueProof<D, Op, N, F>
+--- a/vendor/exoware-qmdb/src/proto.rs
++++ b/vendor/exoware-qmdb/src/proto.rs
+@@ -316,7 +316,9 @@
+     proof: &RawKeyExclusionProof<D, K, V, N, F, E>,
+ ) -> usize
+ where
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, D, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F, K, E, D, N,
++    >: Encode,
+ {
+     let proof_len = key_exclusion_proof_len(&proof.proof);
+     message_field_len(2, proof_len)
+@@ -333,7 +335,9 @@
+     buf: &mut impl BufMut,
+     proof: &RawKeyExclusionProof<D, K, V, N, F, E>,
+ ) where
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, D, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F, K, E, D, N,
++    >: Encode,
+ {
+     let proof_len = key_exclusion_proof_len(&proof.proof);
+     write_message_field(buf, 2, proof_len);
+@@ -363,7 +367,9 @@
+ ) -> PreEncoded<GetManyResponse>
+ where
+     ordered::Operation<F, K, E>: Encode,
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, D, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F, K, E, D, N,
++    >: Encode,
+ {
+     let result_lens = proofs
+         .iter()
+@@ -428,7 +434,9 @@
+ ) -> PreEncoded<GetRangeResponse>
+ where
+     ordered::Operation<F, K, E>: Encode,
+-    commonware_storage::qmdb::current::ordered::ExclusionProof<F, K, E, D, N>: Encode,
++    commonware_storage::qmdb::current::ordered::proof::constant::ExclusionProof<
++        F, K, E, D, N,
++    >: Encode,
+ {
+     let entry_lens = proof
+         .entries
+--- a/vendor/exoware-qmdb/src/storage.rs
++++ b/vendor/exoware-qmdb/src/storage.rs
+@@ -61,7 +61,7 @@
+                 "exoware-qmdb node digest has invalid length",
+             ));
+         }
+-        D::decode(bytes)
++        D::decode(commonware_codec::Copying(bytes))
+             .map_err(|_| merkle::Error::DataCorrupted("exoware-qmdb node digest decode failed"))
+     }
+ 
+@@ -213,7 +213,7 @@
+                         "exoware-qmdb current grafted node has invalid length",
+                     ));
+                 }
+-                return H::Digest::decode(bytes.as_ref()).map(Some).map_err(|_| {
++                return H::Digest::decode(commonware_codec::Copying(bytes.as_ref())).map(Some).map_err(|_| {
+                     merkle::Error::DataCorrupted("exoware-qmdb current grafted node decode failed")
+                 });
+             }
+@@ -762,7 +762,8 @@
+     #[tokio::test]
+     async fn batches_nodes_in_order_and_tracks_the_observed_sequence() {
+         let positions = [0, 3, 8].map(Position::<mmr::Family>::new);
+-        let digests = [1, 2, 3].map(|byte| Digest::decode(&[byte; 32][..]).unwrap());
++        let digests = [1, 2, 3]
++            .map(|byte| Digest::decode(commonware_codec::Copying(&[byte; 32])).unwrap());
+         let store = NodeQueries {
+             sequence: Some(40),
+             rows: positions
+--- a/vendor/exoware-qmdb/src/unordered.rs
++++ b/vendor/exoware-qmdb/src/unordered.rs
+@@ -9,7 +9,7 @@
+         unordered,
+         value::{ValueEncoding, VariableEncoding},
+     },
+-    current::proof::{OperationProof, OpsRootWitness, RangeProof},
++    current::proof::{OpsRootWitness, RangeProof, constant::OperationProof},
+     operation::{Key as QmdbKey, Operation as _},
+ };
+ use exoware_sdk::keys::Key;
+@@ -138,7 +138,7 @@
+     where
+         V: AsRef<[u8]>,
+     {
+-        let op = unordered::Operation::<F, K, E>::decode_cfg(bytes, &self.op_cfg).map_err(|e| {
++        let op = unordered::Operation::<F, K, E>::decode_cfg(commonware_codec::Copying(bytes), &self.op_cfg).map_err(|e| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode unordered operation at location {location}: {e}"
+             ))
+@@ -286,7 +286,10 @@
+         let mut operations = Vec::with_capacity(checkpoint.encoded_operations.len());
+         for (offset, value) in checkpoint.encoded_operations.iter().enumerate() {
+             let location = checkpoint.start_location + offset as u64;
+-            let op = unordered::Operation::<F, K, E>::decode_cfg(value.as_slice(), &self.op_cfg)
++            let op = unordered::Operation::<F, K, E>::decode_cfg(
++                commonware_codec::Copying(value.as_slice()),
++                &self.op_cfg,
++            )
+                 .map_err(|e| {
+                     QmdbError::CorruptData(format!(
+                         "failed to decode unordered operation at location {location}: {e}"
+@@ -523,7 +526,7 @@
+         let Some(bytes) = session.get(&encode_ops_root_witness_key(location)).await? else {
+             return Ok(None);
+         };
+-        OpsRootWitness::<F, H::Digest>::decode(bytes.as_ref())
++        OpsRootWitness::<F, H::Digest>::decode(commonware_codec::Copying(bytes.as_ref()))
+             .map(Some)
+             .map_err(|e| {
+                 QmdbError::CorruptData(format!(
+@@ -684,7 +687,7 @@
+             .range_with_mode(&start, &end, 1, RangeMode::Reverse)
+             .await?;
+         let mut chunk = match rows.into_iter().next() {
+-            Some((_, bytes)) => <[u8; N]>::decode(bytes.as_ref()).map_err(|e| {
++            Some((_, bytes)) => <[u8; N]>::decode(commonware_codec::Copying(bytes.as_ref())).map_err(|e| {
+                 QmdbError::CorruptData(format!("bitmap chunk {chunk_index} decode error: {e}"))
+             })?,
+             None => {
+@@ -722,7 +725,10 @@
+             .core()
+             .load_operation_bytes_at(session, location)
+             .await?;
+-        unordered::Operation::<F, K, E>::decode_cfg(bytes.as_slice(), &self.op_cfg).map_err(|e| {
++        unordered::Operation::<F, K, E>::decode_cfg(
++            commonware_codec::Copying(bytes.as_slice()),
++            &self.op_cfg,
++        ).map_err(|e| {
+             QmdbError::CorruptData(format!(
+                 "failed to decode unordered operation at location {location}: {e}"
+             ))
+@@ -743,7 +749,10 @@
+             .enumerate()
+             .map(|(offset, bytes)| {
+                 let location = start_location + offset as u64;
+-                unordered::Operation::<F, K, E>::decode_cfg(bytes.as_slice(), &self.op_cfg).map_err(
++                unordered::Operation::<F, K, E>::decode_cfg(
++                    commonware_codec::Copying(bytes.as_slice()),
++                    &self.op_cfg,
++                ).map_err(
+                     |e| {
+                         QmdbError::CorruptData(format!(
+                             "failed to decode unordered operation at location {location}: {e}"
+--- a/vendor/exoware-simplex/src/bin/simplex.rs
++++ b/vendor/exoware-simplex/src/bin/simplex.rs
+@@ -1,6 +1,6 @@
+-use bytes::{Buf, BufMut, Bytes, BytesMut};
++use bytes::{BufMut, Bytes, BytesMut};
+ use clap::{Parser, Subcommand};
+-use commonware_codec::{Encode, EncodeSize, Error, Read, ReadExt, Write};
++use commonware_codec::{Buf, Encode, EncodeSize, Error, Read, ReadExt, Write};
+ use commonware_consensus::{
+     simplex::{
+         scheme::bls12381_threshold::vrf as threshold_vrf,
+--- a/vendor/exoware-simplex/src/types.rs
++++ b/vendor/exoware-simplex/src/types.rs
+@@ -1,5 +1,5 @@
+-use bytes::{Buf, BufMut, Bytes, BytesMut};
+-use commonware_codec::{Decode, EncodeSize, Error, Read, Write};
++use bytes::{Buf as _, BufMut, Bytes, BytesMut};
++use commonware_codec::{Buf, Decode, EncodeSize, Error, Read, Write};
+ use commonware_consensus::{simplex::types, Block};
+ use commonware_cryptography::{certificate, Digest};
+ 
+--- a/vendor/exoware-simplex/tests/e2e.rs
++++ b/vendor/exoware-simplex/tests/e2e.rs
+@@ -1,8 +1,8 @@
+ use std::{sync::Arc, time::Duration};
+ 
+-use bytes::{Buf, BufMut, Bytes, BytesMut};
++use bytes::{BufMut, Bytes, BytesMut};
+ use commonware_actor::Feedback;
+-use commonware_codec::{Decode, Encode, EncodeSize, Error, Read, ReadExt, Write};
++use commonware_codec::{Buf, Decode, Encode, EncodeSize, Error, Read, ReadExt, Write};
+ use commonware_consensus::{
+     marshal::{core::Actor, standard::Standard, Config as MarshalConfig, Start, Update},
+     simplex::types::{Finalization, Finalize, Notarization, Notarize, Proposal},
+--- a/vendor/exoware-simulator/src/rocks.rs
++++ b/vendor/exoware-simulator/src/rocks.rs
+@@ -36,7 +36,7 @@
+ 
+ use buffa::{Message, MessageView};
+ use bytes::Bytes;
+-use commonware_codec::{DecodeExt, Encode};
++use commonware_codec::{Copying, DecodeExt, Encode};
+ use exoware_sdk::common::kv::v1::Entry;
+ use exoware_sdk::keys::Prefix;
+ use exoware_sdk::log::stream::v1::{
+@@ -846,7 +846,7 @@
+         .map_err(|e| e.to_string())?
+     {
+         Some(bytes) => {
+-            let policy = RetentionPolicy::decode(bytes.as_slice())
++            let policy = RetentionPolicy::decode(Copying(bytes.as_slice()))
+                 .map_err(|e| format!("corrupt retention rule meta row: {e}"))?;
+             validate_retention_policy(&policy)
+                 .map_err(|e| format!("corrupt retention rule meta row: {e}"))?;

@@ -1,0 +1,303 @@
+{
+  "workload": "empty blocks; no spammer, relayer, or indexer",
+  "validators": 7,
+  "regions": [
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-southeast-1"
+  ],
+  "instance_type": "c8g.xlarge",
+  "warmup_seconds": 120,
+  "measurement_seconds": 600,
+  "repetitions": 3,
+  "binary_sha256": "5472e62f65fd2abfad90d021a5e4b049ddfe887e9371f5542cf5be401db9f06b",
+  "commonware_commit": "8d5a87ecf49130dab67fb1a062d4413fd8663995",
+  "modes": {
+    "baseline": {
+      "blocks_per_second": {
+        "median": 8.115858693329601,
+        "mean": 8.187248692893348,
+        "min": 8.041385736274833,
+        "max": 8.404501649075613
+      },
+      "mean_finalized_interval_ms": {
+        "median": 123.21555090922134,
+        "mean": 122.18536039111078,
+        "min": 118.98385433834582,
+        "max": 124.35667592576517
+      },
+      "notarization_mean_ms": {
+        "median": 142.99179408218887,
+        "mean": 140.09401375417693,
+        "min": 133.6586811782746,
+        "max": 143.63156600206733
+      },
+      "finalization_mean_ms": {
+        "median": 174.7046088450819,
+        "mean": 171.63330052755308,
+        "min": 164.02006115631178,
+        "max": 176.17523158126556
+      },
+      "handoff_event_totals": {
+        "Deferred": 14771.0,
+        "Requested": 14771.0
+      },
+      "handoff_abandoned_totals": {
+        "AncestrySuperseded": 0.0
+      },
+      "pooled_cadence": {
+        "measurement_seconds": 1804.0251730400005,
+        "finalized_blocks": 14770.0,
+        "blocks_per_second": 8.187247174112745,
+        "mean_finalized_interval_ms": 122.14117623832095
+      },
+      "notarization_latency_from_view_entry_pooled": {
+        "samples": 14770.0,
+        "mean_seconds": 0.14000770634759643,
+        "p50_bucket_upper_bound_seconds": 0.16,
+        "p95_bucket_upper_bound_seconds": 0.2
+      },
+      "finalization_latency_from_view_entry_pooled": {
+        "samples": 14770.0,
+        "mean_seconds": 0.1715300812576168,
+        "p50_bucket_upper_bound_seconds": 0.17,
+        "p95_bucket_upper_bound_seconds": 0.26
+      }
+    },
+    "build_only": {
+      "blocks_per_second": {
+        "median": 8.466996867154943,
+        "mean": 8.313448153635637,
+        "min": 7.999852225199905,
+        "max": 8.473495368552062
+      },
+      "mean_finalized_interval_ms": {
+        "median": 118.10563009408756,
+        "mean": 120.37433050871807,
+        "min": 118.01505240816323,
+        "max": 125.00230902390344
+      },
+      "notarization_mean_ms": {
+        "median": 134.74516474534036,
+        "mean": 138.02871918404745,
+        "min": 133.8598288516991,
+        "max": 145.4811639551029
+      },
+      "finalization_mean_ms": {
+        "median": 164.88014745570612,
+        "mean": 168.4851236399026,
+        "min": 163.47201092897785,
+        "max": 177.10321253502383
+      },
+      "handoff_event_totals": {
+        "CandidateReturned": 14999.0,
+        "Held": 14995.0,
+        "PublishedAfterCertification": 14999.0,
+        "Requested": 14999.0
+      },
+      "handoff_abandoned_totals": {
+        "AncestrySuperseded": 0.0
+      },
+      "pooled_cadence": {
+        "measurement_seconds": 1804.066578594999,
+        "finalized_blocks": 14998.0,
+        "blocks_per_second": 8.313440411761517,
+        "mean_finalized_interval_ms": 120.28714352547
+      },
+      "notarization_latency_from_view_entry_pooled": {
+        "samples": 14999.0,
+        "mean_seconds": 0.13788828409753984,
+        "p50_bucket_upper_bound_seconds": 0.15,
+        "p95_bucket_upper_bound_seconds": 0.21
+      },
+      "finalization_latency_from_view_entry_pooled": {
+        "samples": 14999.0,
+        "mean_seconds": 0.16832223654296952,
+        "p50_bucket_upper_bound_seconds": 0.16,
+        "p95_bucket_upper_bound_seconds": 0.26
+      }
+    },
+    "build_and_broadcast": {
+      "blocks_per_second": {
+        "median": 10.5247041339528,
+        "mean": 10.609704179878747,
+        "min": 10.411453596181818,
+        "max": 10.892954809501623
+      },
+      "mean_finalized_interval_ms": {
+        "median": 95.01454741839154,
+        "mean": 94.28835690285155,
+        "min": 91.8024555768585,
+        "max": 96.04806771330459
+      },
+      "notarization_mean_ms": {
+        "median": 110.1576237259084,
+        "mean": 109.33876212057896,
+        "min": 103.95468967832055,
+        "max": 113.90397295750796
+      },
+      "finalization_mean_ms": {
+        "median": 146.26237204250944,
+        "mean": 144.5904780900745,
+        "min": 138.2126502527859,
+        "max": 149.2964119749282
+      },
+      "handoff_event_totals": {
+        "CandidateReturned": 19139.0,
+        "PublishedAfterCertification": 4.0,
+        "PublishedBeforeCertification": 19135.0,
+        "Requested": 19138.0
+      },
+      "handoff_abandoned_totals": {
+        "AncestrySuperseded": 0.0
+      },
+      "pooled_cadence": {
+        "measurement_seconds": 1804.1019090480004,
+        "finalized_blocks": 19141.0,
+        "blocks_per_second": 10.609711072308793,
+        "mean_finalized_interval_ms": 94.25327355143412
+      },
+      "notarization_latency_from_view_entry_pooled": {
+        "samples": 19140.0,
+        "mean_seconds": 0.10926018005705325,
+        "p50_bucket_upper_bound_seconds": 0.1,
+        "p95_bucket_upper_bound_seconds": 0.2
+      },
+      "finalization_latency_from_view_entry_pooled": {
+        "samples": 19141.0,
+        "mean_seconds": 0.1444999474362886,
+        "p50_bucket_upper_bound_seconds": 0.15,
+        "p95_bucket_upper_bound_seconds": 0.25
+      }
+    }
+  },
+  "runs": [
+    {
+      "round": 1,
+      "mode": "baseline",
+      "collection_started_at_utc": "2026-09-21T22:02:58.903328+00:00",
+      "collection_finished_at_utc": "2026-09-21T22:15:11.311988+00:00",
+      "blocks_per_second": 8.404501649075613,
+      "mean_finalized_interval_ms": 118.98385433834582,
+      "notarization_mean_ms": 133.6586811782746,
+      "finalization_mean_ms": 164.02006115631178,
+      "measurement_seconds": 601.3443998259999,
+      "finalized_blocks": 5054.0,
+      "min_node_finalized_progress": 5054.0,
+      "max_node_finalized_progress": 5055.0
+    },
+    {
+      "round": 1,
+      "mode": "build_only",
+      "collection_started_at_utc": "2026-09-21T22:25:31.455419+00:00",
+      "collection_finished_at_utc": "2026-09-21T22:37:43.772976+00:00",
+      "blocks_per_second": 8.473495368552062,
+      "mean_finalized_interval_ms": 118.01505240816323,
+      "notarization_mean_ms": 134.74516474534036,
+      "finalization_mean_ms": 163.47201092897785,
+      "measurement_seconds": 601.4047070719998,
+      "finalized_blocks": 5096.0,
+      "min_node_finalized_progress": 5096.0,
+      "max_node_finalized_progress": 5097.0
+    },
+    {
+      "round": 1,
+      "mode": "build_and_broadcast",
+      "collection_started_at_utc": "2026-09-21T22:39:10.531690+00:00",
+      "collection_finished_at_utc": "2026-09-21T22:51:22.553636+00:00",
+      "blocks_per_second": 10.892954809501623,
+      "mean_finalized_interval_ms": 91.8024555768585,
+      "notarization_mean_ms": 103.95468967832055,
+      "finalization_mean_ms": 138.2126502527859,
+      "measurement_seconds": 601.3978864840001,
+      "finalized_blocks": 6551.0,
+      "min_node_finalized_progress": 6550.0,
+      "max_node_finalized_progress": 6551.0
+    },
+    {
+      "round": 2,
+      "mode": "build_only",
+      "collection_started_at_utc": "2026-09-21T22:52:34.195619+00:00",
+      "collection_finished_at_utc": "2026-09-21T23:04:46.308523+00:00",
+      "blocks_per_second": 8.466996867154943,
+      "mean_finalized_interval_ms": 118.10563009408756,
+      "notarization_mean_ms": 133.8598288516991,
+      "finalization_mean_ms": 164.88014745570612,
+      "measurement_seconds": 601.2757628089998,
+      "finalized_blocks": 5091.0,
+      "min_node_finalized_progress": 5091.0,
+      "max_node_finalized_progress": 5093.0
+    },
+    {
+      "round": 2,
+      "mode": "build_and_broadcast",
+      "collection_started_at_utc": "2026-09-21T23:06:07.349924+00:00",
+      "collection_finished_at_utc": "2026-09-21T23:18:19.281716+00:00",
+      "blocks_per_second": 10.5247041339528,
+      "mean_finalized_interval_ms": 95.01454741839154,
+      "notarization_mean_ms": 110.1576237259084,
+      "finalization_mean_ms": 146.26237204250944,
+      "measurement_seconds": 601.3470706110002,
+      "finalized_blocks": 6329.0,
+      "min_node_finalized_progress": 6328.0,
+      "max_node_finalized_progress": 6329.0
+    },
+    {
+      "round": 2,
+      "mode": "baseline",
+      "collection_started_at_utc": "2026-09-21T23:19:40.261143+00:00",
+      "collection_finished_at_utc": "2026-09-21T23:31:52.264903+00:00",
+      "blocks_per_second": 8.041385736274833,
+      "mean_finalized_interval_ms": 124.35667592576517,
+      "notarization_mean_ms": 143.63156600206733,
+      "finalization_mean_ms": 176.17523158126556,
+      "measurement_seconds": 601.3888847770004,
+      "finalized_blocks": 4836.0,
+      "min_node_finalized_progress": 4835.0,
+      "max_node_finalized_progress": 4837.0
+    },
+    {
+      "round": 3,
+      "mode": "build_and_broadcast",
+      "collection_started_at_utc": "2026-09-21T23:33:02.637555+00:00",
+      "collection_finished_at_utc": "2026-09-21T23:45:14.687307+00:00",
+      "blocks_per_second": 10.411453596181818,
+      "mean_finalized_interval_ms": 96.04806771330459,
+      "notarization_mean_ms": 113.90397295750796,
+      "finalization_mean_ms": 149.2964119749282,
+      "measurement_seconds": 601.3569519530001,
+      "finalized_blocks": 6261.0,
+      "min_node_finalized_progress": 6260.0,
+      "max_node_finalized_progress": 6261.0
+    },
+    {
+      "round": 3,
+      "mode": "baseline",
+      "collection_started_at_utc": "2026-09-21T23:46:32.545574+00:00",
+      "collection_finished_at_utc": "2026-09-21T23:58:45.016586+00:00",
+      "blocks_per_second": 8.115858693329601,
+      "mean_finalized_interval_ms": 123.21555090922134,
+      "notarization_mean_ms": 142.99179408218887,
+      "finalization_mean_ms": 174.7046088450819,
+      "measurement_seconds": 601.2918884370001,
+      "finalized_blocks": 4880.0,
+      "min_node_finalized_progress": 4879.0,
+      "max_node_finalized_progress": 4880.0
+    },
+    {
+      "round": 3,
+      "mode": "build_only",
+      "collection_started_at_utc": "2026-09-22T00:00:03.091092+00:00",
+      "collection_finished_at_utc": "2026-09-22T00:12:15.084935+00:00",
+      "blocks_per_second": 7.999852225199905,
+      "mean_finalized_interval_ms": 125.00230902390344,
+      "notarization_mean_ms": 145.4811639551029,
+      "finalization_mean_ms": 177.10321253502383,
+      "measurement_seconds": 601.3861087139994,
+      "finalized_blocks": 4811.0,
+      "min_node_finalized_progress": 4811.0,
+      "max_node_finalized_progress": 4812.0
+    }
+  ]
+}

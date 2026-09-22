@@ -76,11 +76,12 @@ the full body only when requested.
 
 ## Back-pressure model
 
-The finalized hook runs after finalized database application and before prune.
-It writes a durable finalized upload queue entry before returning to consensus.
-That entry is deliberately the pre-prune boundary: it contains the finalized
-block, finalized timestamp, QMDB writer start cursors, and the account-state delta
-that must be read while the local QMDB can still prove the finalized range.
+The finalized hook captures owned upload data from the winning batches and
+database readers before database application. Its post-application task writes
+a durable finalized upload queue entry before acknowledging finalization.
+The entry contains the finalized block, finalized timestamp, QMDB writer start
+cursors, and the account-state delta captured before database advancement or
+pruning can discard the data needed to authenticate the finalized range.
 The writer end cursors are derived from the block header and start cursors.
 
 The background uploader derives the rest from that durable entry: SQL rows,

@@ -28,6 +28,17 @@ When secondary roles are enabled, this also writes `secondary-0.yaml`,
 
 It also prints an `mprocs` command that starts the whole local cluster.
 
+Use `--handoff-mode` on `generate` to select Simplex proposal handoff behavior
+for every validator in the cluster:
+
+- `baseline` builds after parent certification (the default).
+- `build-only` prepares early but broadcasts after parent certification.
+- `build-and-broadcast` prepares early and permits broadcast before parent
+  certification. This mode trusts outgoing leaders not to equivocate.
+
+Generated YAML stores these values as `baseline`, `build_only`, and
+`build_and_broadcast`, respectively.
+
 Run a single validator directly:
 
 ```sh

@@ -1,0 +1,108 @@
+{
+  "workload": "empty blocks with 50ms synthetic async proposal-build delay",
+  "validators": 7,
+  "regions": [
+    "us-east-1",
+    "us-west-2",
+    "eu-west-1",
+    "ap-southeast-1"
+  ],
+  "instance_type": "c8g.xlarge",
+  "rounds": 1,
+  "warmup_seconds": 120,
+  "measurement_seconds": 600,
+  "binary_sha256": "35f05fe851340c296c7364fe5b53d434724d033760ab4ee6615f15eabfa5c59e",
+  "runs": [
+    {
+      "mode": "baseline",
+      "blocks_per_second": 5.931872140290791,
+      "block_interval_ms": 168.58084199215025,
+      "notarization_ms": 183.4346790252312,
+      "finalization_ms": 214.49159573843582,
+      "construction_ms": 0.06685245610098174,
+      "synthetic_delay_ms": 51.02277703281911,
+      "build_samples": 3565.0,
+      "delay_samples": 3565.0,
+      "measurement_seconds": 601.327863386,
+      "min_validator_height_progress": 3566.0,
+      "max_validator_height_progress": 3567.0,
+      "collection_started_at_utc": "2026-09-22T01:23:03.655507+00:00",
+      "collection_finished_at_utc": "2026-09-22T01:35:16.465976+00:00",
+      "throughput_gain_percent": 0.0,
+      "interval_reduction_percent": 0.0
+    },
+    {
+      "mode": "build_only",
+      "blocks_per_second": 7.146664378891586,
+      "block_interval_ms": 139.92541792694277,
+      "notarization_ms": 154.5451394441601,
+      "finalization_ms": 185.53003088110748,
+      "construction_ms": 0.06538761261051651,
+      "synthetic_delay_ms": 51.0613229001861,
+      "build_samples": 4298.0,
+      "delay_samples": 4298.0,
+      "measurement_seconds": 601.39944625,
+      "min_validator_height_progress": 4298.0,
+      "max_validator_height_progress": 4298.0,
+      "collection_started_at_utc": "2026-09-22T01:38:26.295227+00:00",
+      "collection_finished_at_utc": "2026-09-22T01:50:39.090384+00:00",
+      "throughput_gain_percent": 20.479069842885124,
+      "interval_reduction_percent": 16.998031168062255
+    },
+    {
+      "mode": "build_and_broadcast",
+      "blocks_per_second": 7.486076975360504,
+      "block_interval_ms": 133.5813141237228,
+      "notarization_ms": 147.2175001201423,
+      "finalization_ms": 179.2605149224961,
+      "construction_ms": 0.06602512886025326,
+      "synthetic_delay_ms": 51.0232450910909,
+      "build_samples": 4501.0,
+      "delay_samples": 4501.0,
+      "measurement_seconds": 601.3830761849999,
+      "min_validator_height_progress": 4502.0,
+      "max_validator_height_progress": 4503.0,
+      "collection_started_at_utc": "2026-09-22T01:53:04.963799+00:00",
+      "collection_finished_at_utc": "2026-09-22T02:05:17.826469+00:00",
+      "throughput_gain_percent": 26.200915972432327,
+      "interval_reduction_percent": 20.761272428605604
+    }
+  ],
+  "events": [
+    {
+      "mode": "baseline",
+      "handoff_events": {
+        "Deferred": 3566.0,
+        "Requested": 3566.0
+      },
+      "abandoned": {
+        "AncestrySuperseded": 0.0
+      }
+    },
+    {
+      "mode": "build_and_broadcast",
+      "handoff_events": {
+        "CandidateReturned": 4501.0,
+        "PublishedAfterCertification": 2695.0,
+        "PublishedBeforeCertification": 1806.0,
+        "Requested": 4501.0
+      },
+      "abandoned": {
+        "AncestrySuperseded": 0.0
+      }
+    },
+    {
+      "mode": "build_only",
+      "handoff_events": {
+        "CandidateReturned": 4298.0,
+        "Held": 1750.0,
+        "PublishedAfterCertification": 4298.0,
+        "Requested": 4298.0
+      },
+      "abandoned": {
+        "AncestrySuperseded": 0.0
+      }
+    }
+  ],
+  "commonware_commit": "8d5a87ecf49130dab67fb1a062d4413fd8663995"
+}

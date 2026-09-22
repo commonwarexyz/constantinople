@@ -232,17 +232,18 @@ async fn submit_transactions<St: Strategy>(
         return submit_to_pinned_leader(&state, body, &target).await;
     }
 
-    // Decoding seal-hashes every transaction, so it runs on the strategy's
-    // pool with the owned permit riding in the job to bound concurrent
-    // decode CPU. Single-threaded: the wire format has no per-transaction
-    // framing to split on.
+    // Decoding seal-hashes every transaction, so it runs through the strategy
+    // with the owned permit riding in the job to bound concurrent decode CPU.
+    // Single-threaded: the wire format has no per-transaction framing to split
+    // on.
     let Ok(permit) = state.decode_permits.clone().acquire_owned().await else {
         return (StatusCode::INTERNAL_SERVER_ERROR, String::new());
     };
     let max_batch_bytes = state.max_batch_bytes;
+    let body_len = body.len();
     let decoded = state
         .strategy
-        .spawn(move |_: St| {
+        .spawn(body_len, move |_: St| {
             let _permit = permit;
             decode_batch(&body, max_batch_bytes).map(|batch| {
                 let id = batch_id(&body);
@@ -309,9 +310,10 @@ async fn submit_with_retries<St: Strategy>(
         } else {
             let batch = Arc::clone(&batch);
             let pending = pending.clone();
+            let pending_len = pending.len();
             state
                 .strategy
-                .spawn(move |_: St| {
+                .spawn(pending_len, move |_: St| {
                     let body = encode_pending(&batch, &pending);
                     let id = batch_id(&body);
                     (body, id)
@@ -461,10 +463,11 @@ async fn merge_statuses<St: Strategy>(
                 *height = (*height).max(finalized_height);
                 if digest_index.is_none() {
                     let batch = Arc::clone(batch);
+                    let transaction_count = batch.transactions.len();
                     *digest_index = Some(
                         state
                             .strategy
-                            .spawn(move |_: St| build_digest_index(&batch))
+                            .spawn(transaction_count, move |_: St| build_digest_index(&batch))
                             .await,
                     );
                 }
@@ -534,7 +537,7 @@ async fn account<St: Strategy>(
     if bytes.len() != TransactionPublicKey::SIZE {
         return (StatusCode::BAD_REQUEST, String::new());
     }
-    let public_key = match TransactionPublicKey::decode(bytes.as_slice()) {
+    let public_key = match TransactionPublicKey::decode(bytes) {
         Ok(public_key) => public_key,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
     };
@@ -679,7 +682,7 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<DecodedBatch, St
         return Err(StatusCode::BAD_REQUEST);
     };
     let cfg = (RangeCfg::new(1..=max_transactions), ());
-    let transactions = Vec::<SignedTransaction<sha256::Sha256>>::decode_cfg(body.as_ref(), &cfg)
+    let transactions = Vec::<SignedTransaction<sha256::Sha256>>::decode_cfg(body.clone(), &cfg)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let total_bytes = transactions
         .iter()
@@ -722,7 +725,7 @@ const fn min_signed_transaction_bytes() -> usize {
 }
 
 fn batch_id(body: &Bytes) -> String {
-    sha256::Sha256::hash(body).to_string()
+    sha256::Sha256::hash(&[body]).to_string()
 }
 
 fn requested_target_leader(headers: &HeaderMap) -> Option<String> {

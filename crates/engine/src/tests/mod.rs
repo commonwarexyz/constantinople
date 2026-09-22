@@ -3,20 +3,23 @@
 mod common;
 mod properties;
 
+type Commitment = crate::types::EngineCommitment<TestHasher, TestPublicKey>;
+
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
-    MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
 };
 use common::{
-    HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
-    TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState, validator_fixture,
+    HeightMonitorReporter, RestartBarrier, StartCounts, TEST_QUOTA, TRANSACTION_NAMESPACE,
+    TestHasher, TestPrivateKey, TestPublicKey, TestReporter, TestScheme, ValidatorState,
+    validator_fixture,
 };
 use commonware_consensus::{
-    Heightable,
+    HandoffPolicy, HandoffPublication, Heightable,
     marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
-    types::{Epoch, coding::Commitment},
+    types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
     Signer,
@@ -52,7 +55,15 @@ use properties::{
     BlockAgreementAtHeight, FinalizedHeightAtLeast, LateJoinerStateSyncHandoff,
     RestartPreservesProcessedHeight, RestartRecoveryComplete, StateSyncReadyAtHeight,
 };
-use std::{collections::BTreeMap, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{
+    collections::BTreeMap,
+    num::NonZeroU64,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 use tracing::{info, warn};
 
 const NUM_VALIDATORS: u32 = 4;
@@ -63,7 +74,7 @@ const fn default_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
-        success_rate: 1.0,
+        success_rate: commonware_utils::Probability::new(1, 1).unwrap(),
     }
 }
 
@@ -71,7 +82,7 @@ const fn lossy_link() -> Link {
     Link {
         latency: Duration::from_millis(200),
         jitter: Duration::from_millis(150),
-        success_rate: 0.7,
+        success_rate: commonware_utils::Probability::new(7, 10).unwrap(),
     }
 }
 
@@ -81,6 +92,8 @@ struct TestEngineDefinition {
     output: Output<MinSig, TestPublicKey>,
     shares: BTreeMap<TestPublicKey, Option<Share>>,
     enable_state_sync: bool,
+    crash_during_sync: Option<Arc<AtomicBool>>,
+    starts: Option<StartCounts>,
     /// When `true`, every node re-tracks peer set 0 during `init` as
     /// `TrackedPeers::new(primary, secondary)` — primary = nodes with a DKG
     /// share, secondary = nodes without. Exercises the p2p discovery secondary
@@ -92,6 +105,7 @@ struct TestEngineDefinition {
     restart_barrier: Option<RestartBarrier>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
+    handoff_policy: HandoffPolicy,
 }
 
 impl TestEngineDefinition {
@@ -103,12 +117,15 @@ impl TestEngineDefinition {
             output,
             shares,
             enable_state_sync: false,
+            crash_during_sync: None,
+            starts: None,
             use_discovery_split: false,
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
             genesis_commitments: Arc::new(Mutex::new(BTreeMap::new())),
             restart_barrier: None,
             prunable_items_per_section: NZU64!(4_096),
             retained_marshal_blocks: 16,
+            handoff_policy: HandoffPolicy::AwaitCertification,
         }
     }
 
@@ -140,6 +157,11 @@ impl TestEngineDefinition {
 
     const fn with_state_sync(mut self) -> Self {
         self.enable_state_sync = true;
+        self
+    }
+
+    const fn with_handoff_policy(mut self, handoff_policy: HandoffPolicy) -> Self {
+        self.handoff_policy = handoff_policy;
         self
     }
 
@@ -201,8 +223,14 @@ impl EngineDefinition for TestEngineDefinition {
         let genesis_commitments = self.genesis_commitments.clone();
         let prunable_items_per_section = self.prunable_items_per_section;
         let retained_marshal_blocks = self.retained_marshal_blocks;
+        let handoff_policy = self.handoff_policy;
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
+        let check_sync_at_crash = uses_state_sync
+            && self
+                .crash_during_sync
+                .as_ref()
+                .is_some_and(|started| !started.swap(true, Ordering::SeqCst));
         let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
         let is_restart = restart_barrier
             .as_ref()
@@ -328,19 +356,20 @@ impl EngineDefinition for TestEngineDefinition {
                     startup,
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),
-                        apply_batch_size: 64,
+                        apply_batch_size: NZU64!(64),
                         max_outstanding_requests: 8,
                         update_channel_size: NZUsize!(256),
                         max_retained_roots: 32,
                     },
                     prune_config: Some(PruneConfig {
-                        max_pending_acks: MAX_PENDING_ACKS,
                         maintenance_interval: NZUsize!(16),
                         retained_marshal_blocks,
                         retained_qmdb_blocks: 0,
                     }),
                     genesis_leader,
                     transaction_namespace: TRANSACTION_NAMESPACE,
+                    handoff_policy,
+                    proposal_build_delay: Duration::ZERO,
                     block_codec: Default::default(),
                     prunable_items_per_section,
                     probe: probe_mailbox.clone(),
@@ -361,6 +390,16 @@ impl EngineDefinition for TestEngineDefinition {
             let selected_sync_floor = engine.startup_sync_floor();
             let marshal = engine.marshal_mailbox();
             let restart_marshal = marshal.clone();
+            let sync_incomplete = check_sync_at_crash.then(|| Arc::new(AtomicBool::new(true)));
+            if let Some(incomplete) = sync_incomplete.clone() {
+                let initialized = engine.subscribe_databases_detached();
+                context
+                    .child("observe_sync_completion")
+                    .spawn(move |_| async move {
+                        let _ = initialized.await;
+                        incomplete.store(false, Ordering::SeqCst);
+                    });
+            }
             let engine_handle = engine.start(channels, Some(reporter));
             let startup_sync_height = if let Some(finalization) = selected_sync_floor {
                 let block = marshal
@@ -381,6 +420,7 @@ impl EngineDefinition for TestEngineDefinition {
                 .send(ValidatorState {
                     marshal,
                     startup_sync_height,
+                    sync_incomplete,
                 })
                 .is_err()
             {
@@ -414,6 +454,12 @@ impl EngineDefinition for TestEngineDefinition {
         let state = state_receiver
             .await
             .expect("validator failed to initialize");
+        if let Some(starts) = &self.starts {
+            *starts
+                .lock()
+                .entry(self.signers[index].public_key())
+                .or_default() += 1;
+        }
         (handle, state)
     }
 
@@ -428,6 +474,16 @@ fn run_finalize(engine: TestEngineDefinition) {
         .seeds(0..2)
         .exit_condition(FinalizedHeightAtLeast::new(100))
         .property(BlockAgreementAtHeight::new(100))
+        .run()
+        .unwrap();
+}
+
+fn run_handoff_policy_liveness(engine: TestEngineDefinition) {
+    PlanBuilder::new(engine)
+        .link(default_link())
+        .seed(0)
+        .exit_condition(FinalizedHeightAtLeast::new(20))
+        .property(BlockAgreementAtHeight::new(20))
         .run()
         .unwrap();
 }
@@ -498,10 +554,14 @@ fn run_restart_with_archived_finalizations() {
 }
 
 fn run_delayed_start(engine: TestEngineDefinition) {
+    let delayed = engine.participants()[0].clone();
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
-        .crash(Crash::Delay { count: 1, after: 5 })
+        .crash(Crash::DelayRound {
+            participants: vec![delayed],
+            round: Round::new(Epoch::zero(), View::new(5)),
+        })
         .exit_condition(FinalizedHeightAtLeast::new(20))
         .property(BlockAgreementAtHeight::new(20))
         .run()
@@ -509,13 +569,14 @@ fn run_delayed_start(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync(engine: TestEngineDefinition) {
+    let delayed = engine.participants()[0].clone();
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
+        .crash(Crash::DelayRound {
+            participants: vec![delayed],
+            round: Round::new(Epoch::zero(), View::new(80)),
         })
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
@@ -525,14 +586,15 @@ fn run_state_sync(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_deterministic(engine: TestEngineDefinition) {
+    let delayed = engine.participants()[0].clone();
     let seeds = 0..2;
     let first = PlanBuilder::new(engine.clone())
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
+        .crash(Crash::DelayRound {
+            participants: vec![delayed.clone()],
+            round: Round::new(Epoch::zero(), View::new(80)),
         })
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
@@ -543,9 +605,9 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(seeds.clone())
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
+        .crash(Crash::DelayRound {
+            participants: vec![delayed],
+            round: Round::new(Epoch::zero(), View::new(80)),
         })
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
@@ -562,13 +624,14 @@ fn run_state_sync_deterministic(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
+    let delayed = engine.participants()[0].clone();
     PlanBuilder::new(engine)
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
+        .crash(Crash::DelayRound {
+            participants: vec![delayed],
+            round: Round::new(Epoch::zero(), View::new(80)),
         })
         .crash(Crash::Random {
             frequency: Duration::from_secs(3),
@@ -583,13 +646,14 @@ fn run_state_sync_random_crashes(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_lossy(engine: TestEngineDefinition) {
+    let delayed = engine.participants()[0].clone();
     PlanBuilder::new(engine)
         .link(lossy_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)
         .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
+        .crash(Crash::DelayRound {
+            participants: vec![delayed],
+            round: Round::new(Epoch::zero(), View::new(80)),
         })
         .exit_condition(StateSyncReadyAtHeight::new(150))
         .property(LateJoinerStateSyncHandoff)
@@ -623,10 +687,14 @@ fn run_random_crashes(engine: TestEngineDefinition) {
         .unwrap();
 }
 
-fn run_many_crashes(engine: TestEngineDefinition) {
+fn run_many_crashes(mut engine: TestEngineDefinition) {
+    // The exit and agreement checks retrieve one exact historical block on
+    // every validator. Keep it available while repeated crashes let peers lag.
+    engine.retained_marshal_blocks = 1_000_000;
     PlanBuilder::new(engine)
         .link(default_link())
         .seeds(0..2)
+        .timeout(Duration::from_secs(90))
         .crash(Crash::Random {
             frequency: Duration::from_secs(2),
             downtime: Duration::from_millis(500),
@@ -663,42 +731,79 @@ fn run_total_shutdown(engine: TestEngineDefinition) {
         .unwrap();
 }
 
-fn run_state_sync_crash_during_sync(engine: TestEngineDefinition) {
+fn run_state_sync_crash_during_sync(mut engine: TestEngineDefinition) {
     let delayed = engine.participants().first().cloned().unwrap();
 
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .max_message_size(MAX_PROBE_MESSAGE_SIZE)
-        .seeds(0..2)
-        .crash(Crash::Delay {
-            count: 1,
-            after: 80,
-        })
-        .crash(Crash::Schedule(
-            Schedule::new()
-                .at(Duration::from_millis(9_000), Action::Crash(delayed.clone()))
-                .at(Duration::from_millis(11_000), Action::Restart(delayed)),
-        ))
-        .exit_condition(StateSyncReadyAtHeight::new(180))
-        .property(LateJoinerStateSyncHandoff)
-        .property(BlockAgreementAtHeight::at_least(180, 3))
-        .run()
-        .unwrap();
+    for seed in 0..2 {
+        engine.crash_during_sync = Some(Arc::new(AtomicBool::new(false)));
+        PlanBuilder::new(engine.clone())
+            .link(default_link())
+            .max_message_size(MAX_PROBE_MESSAGE_SIZE)
+            .seeds(seed..seed + 1)
+            .crash(Crash::DelayRound {
+                participants: vec![delayed.clone()],
+                round: Round::new(Epoch::zero(), View::new(80)),
+            })
+            // Crash the late joiner as soon as its selected sync floor is available.
+            // ValidatorState asserts that QMDB initialization is still incomplete
+            // when the simulator queries this crash trigger.
+            .crash(Crash::ProcessedHeight {
+                participant: delayed.clone(),
+                heights: 0..=u64::MAX,
+                downtime: Duration::from_millis(300),
+            })
+            .exit_condition(StateSyncReadyAtHeight::new(180))
+            .property(LateJoinerStateSyncHandoff)
+            .property(BlockAgreementAtHeight::at_least(180, 3))
+            .run()
+            .unwrap();
+    }
 }
 
-fn run_rapid_crashes(engine: TestEngineDefinition) {
-    PlanBuilder::new(engine)
-        .link(default_link())
-        .seeds(0..2)
-        .crash(Crash::Random {
-            frequency: Duration::from_millis(750),
-            downtime: Duration::from_millis(250),
-            count: 1,
-        })
-        .exit_condition(FinalizedHeightAtLeast::new(40))
-        .property(BlockAgreementAtHeight::new(40))
-        .run()
-        .unwrap();
+fn run_rapid_crashes(mut engine: TestEngineDefinition) {
+    // The exit and agreement checks retrieve one exact historical block on
+    // every validator. Keep it available while repeated crashes let peers lag.
+    engine.retained_marshal_blocks = 1_000_000;
+    let participants = engine.participants();
+    let crashes = participants.len() * 2;
+    let mut schedule = Schedule::new();
+    for cycle in 0..crashes {
+        let participant = participants[cycle % participants.len()].clone();
+        let crash_at = Duration::from_millis(750 * (cycle as u64 + 1));
+        schedule = schedule
+            .at(crash_at, Action::Crash(participant.clone()))
+            .at(
+                crash_at + Duration::from_millis(250),
+                Action::Restart(participant),
+            );
+    }
+
+    // Two outages per validator preserve rapid repeated faults, then leave an
+    // uninterrupted recovery window. Completed starts gate exit so reaching
+    // height 40 early cannot bypass the final crash or restart.
+    for seed in 0..2 {
+        let starts = Arc::new(Mutex::new(BTreeMap::new()));
+        engine.starts = Some(starts.clone());
+        let results = PlanBuilder::new(engine.clone())
+            .link(default_link())
+            .seed(seed)
+            .timeout(Duration::from_secs(90))
+            .crash(Crash::Schedule(schedule.clone()))
+            .exit_condition(FinalizedHeightAtLeast::after_starts(40, starts, 3))
+            .property(BlockAgreementAtHeight::new(40))
+            .run()
+            .unwrap();
+        let result = &results[0];
+        assert_eq!(
+            result.crashes, crashes as u64,
+            "every scheduled crash must occur"
+        );
+        assert_eq!(
+            result.scheduled_actions,
+            (crashes * 2) as u64,
+            "every crash and restart must be scheduled"
+        );
+    }
 }
 
 fn run_network_partition(engine: TestEngineDefinition) {
@@ -708,7 +813,7 @@ fn run_network_partition(engine: TestEngineDefinition) {
     let dead_link = Link {
         latency: Duration::from_secs(1),
         jitter: Duration::ZERO,
-        success_rate: 0.0,
+        success_rate: commonware_utils::Probability::new(0, 1).unwrap(),
     };
     let mut schedule = Schedule::new();
     for peer in &participants[1..] {
@@ -760,6 +865,20 @@ fn run_secondaries_sync(engine: TestEngineDefinition) {
 #[test_traced("DEBUG")]
 fn all_validators_finalize_and_commit() {
     run_finalize(TestEngineDefinition::new(NUM_VALIDATORS));
+}
+
+#[test_group("slow")]
+#[test_traced("DEBUG")]
+fn all_handoff_policies_preserve_liveness() {
+    for policy in [
+        HandoffPolicy::AwaitCertification,
+        HandoffPolicy::Prepare(HandoffPublication::AfterCertification),
+        HandoffPolicy::Prepare(HandoffPublication::AllowBeforeCertification),
+    ] {
+        run_handoff_policy_liveness(
+            TestEngineDefinition::new(NUM_VALIDATORS).with_handoff_policy(policy),
+        );
+    }
 }
 
 #[test_group("slow")]

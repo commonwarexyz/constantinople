@@ -6,7 +6,7 @@ use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
     marshal::{self, Identifier},
-    types::{Height, View},
+    types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{
     Digestible, Signer,
@@ -29,6 +29,8 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
 };
+
+pub(crate) type StartCounts = Arc<Mutex<BTreeMap<TestPublicKey, usize>>>;
 
 pub(crate) type TestHasher = Sha256;
 pub(crate) type TestPrivateKey = ed25519::PrivateKey;
@@ -169,7 +171,7 @@ where
             let monitor = self.monitor.clone();
             let update = FinalizationUpdate {
                 pk: self.public_key.clone(),
-                view: View::new(height.get()),
+                round: Round::new(Epoch::zero(), View::new(height.get())),
                 block_digest: digest.as_ref().to_vec(),
             };
             let _ = monitor.try_send(update);
@@ -183,6 +185,7 @@ where
 pub(crate) struct ValidatorState {
     pub(crate) marshal: TestMarshalMailbox,
     pub(crate) startup_sync_height: Option<u64>,
+    pub(crate) sync_incomplete: Option<Arc<AtomicBool>>,
 }
 
 impl PartialEq for ValidatorState {
@@ -211,7 +214,22 @@ impl ValidatorState {
 
 impl ProcessedHeight for ValidatorState {
     async fn processed_height(&self) -> u64 {
-        self.processed_height().await
+        let height = self.processed_height().await;
+        if let Some(incomplete) = &self.sync_incomplete {
+            assert!(
+                incomplete.load(Ordering::SeqCst),
+                "crash must occur before QMDB initialization completes"
+            );
+            let floor = self
+                .startup_sync_height
+                .expect("crash target must have selected a sync floor");
+            assert!(floor > 0, "crash target must sync beyond genesis");
+            assert!(
+                height <= floor,
+                "crash must precede application replay past the sync floor"
+            );
+        }
+        height
     }
 }
 
@@ -226,8 +244,12 @@ pub(crate) fn validator_fixture(validators: u32) -> Fixture {
         .unwrap();
 
     let mut rng = test_rng();
-    let (output, shares) = deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
-        .expect("fixture deal should succeed");
+    let (output, shares) = deal::<MinSig, _, N3f1>(
+        &mut rng,
+        commonware_cryptography::bls12381::primitives::sharing::Mode::NonZeroCounter,
+        participants,
+    )
+    .expect("fixture deal should succeed");
     let shares = shares
         .into_iter()
         .map(|(public_key, share)| (public_key, Some(share)))

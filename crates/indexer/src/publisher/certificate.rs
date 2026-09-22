@@ -7,17 +7,16 @@
 //! verification does not fetch the full body.
 
 use ahash::AHashMap;
-use bytes::Buf;
 use commonware_actor::Feedback;
-use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
+use commonware_codec::{Buf, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::{
     Block, Heightable, Reporter,
     simplex::{self, types::Activity},
-    types::{Height, coding::Commitment},
+    types::Height,
 };
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
-use constantinople_engine::types::{EngineBlock, EngineHeader};
-use exoware_sdk::{StoreClient, StoreWriteBatch};
+use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
+use exoware_sdk::{StoreBatchUpload as _, StoreClient, StoreWriteBatch};
 use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use std::sync::Arc;
 use tokio::{sync::mpsc, task::JoinHandle};
@@ -91,10 +90,10 @@ where
     P: PublicKey + Send + Sync + 'static,
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
-    simplex::types::Notarization<S, Commitment>: Send,
-    simplex::types::Finalization<S, Commitment>: Send,
+    simplex::types::Notarization<S, EngineCommitment<H, P>>: Send,
+    simplex::types::Finalization<S, EngineCommitment<H, P>>: Send,
 {
-    type Activity = Activity<S, Commitment>;
+    type Activity = Activity<S, EngineCommitment<H, P>>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
         match activity {
@@ -132,8 +131,8 @@ where
     S: Scheme,
 {
     Block(Arc<EngineBlock<H, P>>),
-    Notarization(simplex::types::Notarization<S, Commitment>),
-    Finalization(simplex::types::Finalization<S, Commitment>),
+    Notarization(simplex::types::Notarization<S, EngineCommitment<H, P>>),
+    Finalization(simplex::types::Finalization<S, EngineCommitment<H, P>>),
 }
 
 struct PendingBlockCertificates<H, P, S>
@@ -143,8 +142,8 @@ where
     S: Scheme,
 {
     block: Option<Arc<EngineBlock<H, P>>>,
-    notarization: Option<simplex::types::Notarization<S, Commitment>>,
-    finalization: Option<simplex::types::Finalization<S, Commitment>>,
+    notarization: Option<simplex::types::Notarization<S, EngineCommitment<H, P>>>,
+    finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
 }
 
 impl<H, P, S> Default for PendingBlockCertificates<H, P, S>
@@ -220,7 +219,7 @@ async fn run_uploader<H, P, S>(
         }
         let mut batch = StoreWriteBatch::new();
         client
-            .stage_upload(&prepared, &mut batch)
+            .stage_upload(&mut prepared, &mut batch)
             .expect("prepared simplex upload must stage");
         let seq = super::commit_with_retry(
             client.store_client().client(),
@@ -252,10 +251,10 @@ where
         match self {
             Self::Block(block) => block.seal().as_ref().to_vec(),
             Self::Notarization(notarization) => {
-                block_digest_key::<H>(&notarization.proposal.payload)
+                block_digest_key::<H, P>(&notarization.proposal.payload)
             }
             Self::Finalization(finalization) => {
-                block_digest_key::<H>(&finalization.proposal.payload)
+                block_digest_key::<H, P>(&finalization.proposal.payload)
             }
         }
     }
@@ -269,11 +268,12 @@ where
     }
 }
 
-fn block_digest_key<H>(commitment: &Commitment) -> Vec<u8>
+fn block_digest_key<H, P>(commitment: &EngineCommitment<H, P>) -> Vec<u8>
 where
     H: Hasher,
+    P: PublicKey,
 {
-    commitment.block::<H::Digest>().as_ref().to_vec()
+    commitment.block().as_ref().to_vec()
 }
 
 /// Stages the entry's ready certificates into `prepared`, returning whether a
@@ -320,14 +320,23 @@ where
 }
 
 /// A finalized header tagged with the marshal commitment certified by Simplex.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct CertifiedHeader<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
-    commitment: Commitment,
+    commitment: EngineCommitment<H, P>,
     header: EngineHeader<H, P>,
+}
+
+impl<H: Hasher, P: PublicKey> Clone for CertifiedHeader<H, P> {
+    fn clone(&self) -> Self {
+        Self {
+            commitment: self.commitment,
+            header: self.header.clone(),
+        }
+    }
 }
 
 impl<H, P> CertifiedHeader<H, P>
@@ -335,8 +344,8 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    fn new(commitment: Commitment, block: &EngineBlock<H, P>) -> Self {
-        debug_assert_eq!(commitment.block::<H::Digest>(), *block.seal());
+    fn new(commitment: EngineCommitment<H, P>, block: &EngineBlock<H, P>) -> Self {
+        debug_assert_eq!(commitment.block(), *block.seal());
         let header = EngineHeader::<H, P>::new_unchecked(block.header.clone(), *block.seal());
         Self { commitment, header }
     }
@@ -348,7 +357,7 @@ where
 
     /// Return the certified block digest embedded in the marshal commitment.
     pub fn block_digest(&self) -> H::Digest {
-        self.commitment.block::<H::Digest>()
+        self.commitment.block()
     }
 }
 
@@ -367,7 +376,7 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    type Digest = Commitment;
+    type Digest = EngineCommitment<H, P>;
 
     fn digest(&self) -> Self::Digest {
         self.commitment
@@ -413,9 +422,9 @@ where
     type Cfg = ();
 
     fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        let commitment = Commitment::read(buf)?;
+        let commitment = EngineCommitment::<H, P>::read(buf)?;
         let header = EngineHeader::<H, P>::read(buf)?;
-        if commitment.block::<H::Digest>() != *header.seal() {
+        if commitment.block() != *header.seal() {
             return Err(CodecError::Invalid(
                 "CertifiedHeader",
                 "commitment block digest does not match header",

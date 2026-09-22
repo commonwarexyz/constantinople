@@ -48,7 +48,9 @@ where
     /// Hashes the encoded header to produce a digest.
     pub fn hash_slow<H: Hasher<Digest = D>>(&self, hasher: &mut H) -> D {
         hasher.update(self.encode().as_ref());
-        hasher.finalize()
+        let (reset, digest) = core::mem::take(hasher).finalize();
+        *hasher = reset;
+        digest
     }
 }
 
@@ -113,7 +115,10 @@ where
 {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(
+        buf: &mut impl commonware_codec::Buf,
+        _cfg: &Self::Cfg,
+    ) -> Result<Self, CodecError> {
         Ok(Self {
             context: Context::read(buf)?,
             parent: D::read(buf)?,
@@ -164,7 +169,7 @@ impl Default for BlockCfg {
 }
 
 /// A block containing signed transactions and required epoch-consensus metadata.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Block<C, P, H>
 where
     C: Digest,
@@ -180,6 +185,20 @@ where
     /// caller's thread. Materialization is typically driven in parallel at
     /// verify time via a [`commonware_parallel::Strategy`].
     pub body: Vec<LazySignedTransaction<H>>,
+}
+
+impl<C, P, H> Clone for Block<C, P, H>
+where
+    C: Digest,
+    P: PublicKey,
+    H: Hasher,
+{
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+            body: self.body.clone(),
+        }
+    }
 }
 
 /// A sealed canonical block.
@@ -269,7 +288,7 @@ where
 {
     type Cfg = BlockCfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
             header: Header::read_cfg(buf, &())?,
@@ -369,7 +388,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_codec::Decode;
+    use commonware_codec::{Copying, Decode};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View},
@@ -410,7 +429,7 @@ mod tests {
         header.write(&mut buf);
 
         let decoded = Header::<sha256::Digest, sha256::Digest, ed25519::PublicKey>::decode_cfg(
-            &mut &buf[..],
+            Copying(&buf),
             &(),
         )
         .expect("decoding should succeed");
@@ -436,7 +455,7 @@ mod tests {
         block.write(&mut buf);
 
         let decoded = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::decode_cfg(
-            &mut &buf[..],
+            Copying(&buf),
             &BlockCfg::default(),
         )
         .expect("decoding should succeed");
@@ -479,7 +498,7 @@ mod tests {
         );
 
         let encoded = block.encode();
-        let mut reader = encoded.as_ref();
+        let mut reader = Copying(encoded.as_ref());
         let _decoded =
             <Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
                 &mut reader,
@@ -487,6 +506,6 @@ mod tests {
             )
             .expect("block should decode");
 
-        assert!(reader.is_empty(), "block decoder left trailing bytes");
+        assert!(reader.0.is_empty(), "block decoder left trailing bytes");
     }
 }

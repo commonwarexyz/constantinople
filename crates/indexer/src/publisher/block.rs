@@ -198,11 +198,9 @@ where
     let mut to = [0u8; AccountKey::SIZE];
     to.copy_from_slice(&transaction_bytes[to_start..to_end]);
 
-    let mut hasher = H::new();
-    hasher.update(transaction_bytes);
     Some(IndexedTransaction {
         block_index,
-        digest: hasher.finalize(),
+        digest: H::hash(&[transaction_bytes]),
         bytes: signed_bytes,
         sender,
         to,
@@ -222,7 +220,7 @@ mod tests {
     use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
-        types::{Epoch, Round, View, coding::Commitment},
+        types::{Epoch, Round, View},
     };
     use commonware_cryptography::{
         Digest, Signer,
@@ -239,6 +237,8 @@ mod tests {
     use core::num::NonZeroU64;
     use exoware_sql::CellValue;
     use rand::{SeedableRng, rngs::StdRng};
+
+    type Commitment = constantinople_engine::types::EngineCommitment<Sha256, PublicKey>;
 
     #[test]
     fn r1_sender_history_uses_account_key() {
@@ -263,7 +263,7 @@ mod tests {
         )
         .seal(&mut Sha256::default());
 
-        let rows = encode_indexed_block_rows(&block);
+        let rows = encode_indexed_block_rows(&block.into());
         assert_activity_sender(&rows.sql, sender_account.as_ref());
     }
 
@@ -292,7 +292,7 @@ mod tests {
         let mut encoded = Vec::with_capacity(transaction.len().encode_size() + transaction.len());
         transaction.len().write(&mut encoded);
         encoded.extend_from_slice(&transaction);
-        let lazy = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+        let lazy = LazySignedTransaction::<Sha256>::read(&mut bytes::Bytes::from(encoded))
             .expect("outer lazy transaction should decode");
 
         let block = Sealed::new_unchecked(
@@ -303,7 +303,7 @@ mod tests {
             sha256::Digest::EMPTY,
         );
 
-        let rows = encode_indexed_block_rows(&block);
+        let rows = encode_indexed_block_rows(&block.into());
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_tx_meta_body(&rows.sql, &transaction);
@@ -376,7 +376,7 @@ mod tests {
                 candidate[1] = first;
                 candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                TransactionPublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(commonware_codec::Copying(&candidate))
                     .is_err()
                     .then_some(candidate)
             })

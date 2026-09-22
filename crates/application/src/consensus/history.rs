@@ -14,7 +14,7 @@ where
 {
     TransactionHistoryTarget {
         root,
-        leaf_count: mmr::Location::new(range.end()),
+        size: mmr::Location::new(range.end()),
     }
 }
 

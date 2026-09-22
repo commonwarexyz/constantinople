@@ -16,10 +16,10 @@ use bytes::Bytes;
 use commonware_codec::{FixedSize as _, Read};
 use commonware_consensus::{
     Heightable,
-    types::{Height, View, coding::Commitment},
+    types::{Epoch, Height, Round, View},
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
-use constantinople_engine::types::{EngineBlock, EngineHeader};
+use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
 use datafusion::{
     arrow::array::{Array, BinaryArray},
@@ -27,6 +27,14 @@ use datafusion::{
 };
 use exoware_sdk::{ClientError, StoreClient};
 use exoware_simplex::{Finalized, Notarized, SimplexClient, SimplexError};
+
+/// Decoder configuration for a finalized engine header and its certificate.
+pub type FinalizedHeaderCfg<H, P, S> =
+    <Finalized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>> as Read>::Cfg;
+
+/// Decoder configuration for a notarized engine header and its certificate.
+pub type NotarizedHeaderCfg<H, P, S> =
+    <Notarized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>> as Read>::Cfg;
 
 /// Errors returned when reading typed artifacts back out of the store.
 #[derive(Debug, thiserror::Error)]
@@ -154,7 +162,7 @@ impl IndexerClient {
     pub async fn certified_header_by_height<H, P, S>(
         &self,
         height: u64,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cfg: &FinalizedHeaderCfg<H, P, S>,
     ) -> Result<Option<CertifiedHeader<H, P>>, ReadError>
     where
         H: Hasher,
@@ -164,7 +172,7 @@ impl IndexerClient {
     {
         Ok(self
             .blocks
-            .get_finalized_by_height::<CertifiedHeader<H, P>, S, Commitment>(
+            .get_finalized_by_height::<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>(
                 Height::new(height),
                 cfg,
             )
@@ -176,7 +184,7 @@ impl IndexerClient {
     pub async fn digest_by_height<H, P, S>(
         &self,
         height: u64,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cfg: &FinalizedHeaderCfg<H, P, S>,
     ) -> Result<Option<H::Digest>, ReadError>
     where
         H: Hasher,
@@ -195,7 +203,7 @@ impl IndexerClient {
         &self,
         height: u64,
         block_cfg: &BlockCfg,
-        cert_cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cert_cfg: &FinalizedHeaderCfg<H, P, S>,
     ) -> Result<Option<EngineBlock<H, P>>, ReadError>
     where
         H: Hasher,
@@ -213,7 +221,7 @@ impl IndexerClient {
     /// height index without fetching the block body.
     pub async fn latest_certified_header<H, P, S>(
         &self,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cfg: &FinalizedHeaderCfg<H, P, S>,
     ) -> Result<Option<CertifiedHeader<H, P>>, ReadError>
     where
         H: Hasher,
@@ -223,7 +231,7 @@ impl IndexerClient {
     {
         Ok(self
             .blocks
-            .latest_finalized::<CertifiedHeader<H, P>, S, Commitment>(cfg)
+            .latest_finalized::<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>(cfg)
             .await?
             .map(|finalized| finalized.header))
     }
@@ -231,7 +239,7 @@ impl IndexerClient {
     /// Latest finalized height from the certified Simplex finalization index.
     pub async fn latest_height<H, P, S>(
         &self,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cfg: &FinalizedHeaderCfg<H, P, S>,
     ) -> Result<Option<u64>, ReadError>
     where
         H: Hasher,
@@ -250,7 +258,7 @@ impl IndexerClient {
     pub async fn latest_block<H, P, S>(
         &self,
         block_cfg: &BlockCfg,
-        cert_cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
+        cert_cfg: &FinalizedHeaderCfg<H, P, S>,
     ) -> Result<Option<EngineBlock<H, P>>, ReadError>
     where
         H: Hasher,
@@ -320,7 +328,7 @@ impl IndexerClient {
     pub async fn finalization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
         Ok(self
             .blocks
-            .get_finalized_by_view_raw(View::new(view))
+            .get_finalized_by_round_raw(Round::new(Epoch::zero(), View::new(view)))
             .await?)
     }
 
@@ -328,8 +336,8 @@ impl IndexerClient {
     pub async fn finalization_by_view<H, P, S>(
         &self,
         view: u64,
-        cfg: &<Finalized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<Finalized<CertifiedHeader<H, P>, S, Commitment>>, ReadError>
+        cfg: &FinalizedHeaderCfg<H, P, S>,
+    ) -> Result<Option<Finalized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>>, ReadError>
     where
         H: Hasher,
         P: PublicKey,
@@ -338,21 +346,27 @@ impl IndexerClient {
     {
         Ok(self
             .blocks
-            .get_finalized_by_view::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
+            .get_finalized_by_round::<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>(
+                Round::new(Epoch::zero(), View::new(view)),
+                cfg,
+            )
             .await?)
     }
 
     /// Fetch the encoded Simplex notarization artifact for `view`.
     pub async fn notarization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
-        Ok(self.blocks.get_notarized_raw(View::new(view)).await?)
+        Ok(self
+            .blocks
+            .get_notarized_by_round_raw(Round::new(Epoch::zero(), View::new(view)))
+            .await?)
     }
 
     /// Decode the Simplex notarization artifact for `view`.
     pub async fn notarization_by_view<H, P, S>(
         &self,
         view: u64,
-        cfg: &<Notarized<CertifiedHeader<H, P>, S, Commitment> as Read>::Cfg,
-    ) -> Result<Option<Notarized<CertifiedHeader<H, P>, S, Commitment>>, ReadError>
+        cfg: &NotarizedHeaderCfg<H, P, S>,
+    ) -> Result<Option<Notarized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>>, ReadError>
     where
         H: Hasher,
         P: PublicKey,
@@ -361,7 +375,10 @@ impl IndexerClient {
     {
         Ok(self
             .blocks
-            .get_notarized::<CertifiedHeader<H, P>, S, Commitment>(View::new(view), cfg)
+            .get_notarized_by_round::<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>(
+                Round::new(Epoch::zero(), View::new(view)),
+                cfg,
+            )
             .await?)
     }
 }
@@ -388,9 +405,7 @@ where
         )));
     }
 
-    let mut hasher = H::new();
-    hasher.update(&bytes[..body_len]);
-    let actual = hasher.finalize();
+    let actual = H::hash(&[&bytes[..body_len]]);
     if actual.as_ref() != digest.as_ref() {
         return Err(ReadError::SqlRow(
             "tx_meta.body_hex transaction body does not match tx_digest".to_string(),
@@ -429,8 +444,6 @@ mod tests {
 
     fn digest_transaction_body(bytes: &[u8]) -> sha256::Digest {
         let body_len = Transaction::<sha256::Digest>::SIZE.min(bytes.len());
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes[..body_len]);
-        hasher.finalize()
+        Sha256::hash(&[&bytes[..body_len]])
     }
 }

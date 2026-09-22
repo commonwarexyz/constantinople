@@ -99,6 +99,8 @@ fn build_validators(
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: hex(&share.encode()),
             startup: args.startup,
+            handoff_mode: args.handoff_mode,
+            proposal_build_delay_ms: args.proposal_build_delay_ms,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
@@ -175,6 +177,8 @@ fn build_secondaries(
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: String::new(),
             startup: args.startup,
+            handoff_mode: args.handoff_mode,
+            proposal_build_delay_ms: args.proposal_build_delay_ms,
             listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("secondary-{index}"),
@@ -400,9 +404,9 @@ fn relayer_http_port(args: &GenerateArgs, local: &LocalArgs) -> Option<u16> {
 mod tests {
     use super::{build_secondaries, build_validators, local_run_commands};
     use crate::{
-        GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
-        default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries,
+        GenerateArgs, GenerateTarget, HandoffModeConfig, LocalArgs, StartupModeConfig,
+        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
+        default_public_key_cache_size, generate_local_cluster_material, total_secondaries,
     };
     use std::path::{Path, PathBuf};
 
@@ -423,6 +427,8 @@ mod tests {
             state_page_cache_bytes: default_page_cache_bytes(),
             other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            handoff_mode: HandoffModeConfig::Baseline,
+            proposal_build_delay_ms: 0,
             spammer,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -821,5 +827,35 @@ mod tests {
     #[test]
     fn startup_mode_defaults_to_marshal_sync() {
         assert_eq!(StartupModeConfig::default(), StartupModeConfig::MarshalSync);
+    }
+
+    #[test]
+    fn handoff_mode_propagates_to_local_validators_and_secondaries() {
+        for mode in [
+            HandoffModeConfig::Baseline,
+            HandoffModeConfig::BuildOnly,
+            HandoffModeConfig::BuildAndBroadcast,
+        ] {
+            let mut args = test_args(false);
+            args.indexer = true;
+            args.handoff_mode = mode;
+            let material =
+                generate_local_cluster_material(args.validators, total_secondaries(&args));
+            let validators = build_validators(
+                &args,
+                local_args(&args),
+                Path::new("/tmp/configs"),
+                &material,
+            );
+            let secondaries = build_secondaries(
+                &args,
+                local_args(&args),
+                Path::new("/tmp/configs"),
+                &material,
+            );
+
+            assert!(validators.iter().all(|v| v.config.handoff_mode == mode));
+            assert!(secondaries.iter().all(|v| v.config.handoff_mode == mode));
+        }
     }
 }

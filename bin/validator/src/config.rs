@@ -1,7 +1,7 @@
 //! YAML-serializable validator configuration.
 
 use ahash::AHashMap;
-use commonware_codec::{Encode, Read as CodecRead, ReadExt};
+use commonware_codec::{Copying, Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -76,6 +76,19 @@ pub enum StartupModeConfig {
     StateSync,
 }
 
+/// Simplex proposal handoff behavior.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HandoffModeConfig {
+    /// Build the next proposal only after its parent is certified.
+    #[default]
+    Baseline,
+    /// Build early, but wait for parent certification before broadcasting.
+    BuildOnly,
+    /// Build and permit broadcast before parent certification.
+    BuildAndBroadcast,
+}
+
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ValidatorConfig {
     /// Hex-encoded ed25519 private key.
@@ -88,6 +101,13 @@ pub struct ValidatorConfig {
     /// Startup sync mode.
     #[serde(default)]
     pub startup: StartupModeConfig,
+    /// Simplex proposal handoff behavior.
+    #[serde(default)]
+    pub handoff_mode: HandoffModeConfig,
+    /// Synthetic delay added to every proposal build, in milliseconds.
+    /// This benchmarking knob defaults to zero for production deployments.
+    #[serde(default)]
+    pub proposal_build_delay_ms: u64,
     /// p2p listen port.
     pub listen_port: u16,
     /// Hex-encoded ed25519 public key of the genesis leader.
@@ -221,6 +241,10 @@ pub struct LoadedConfig {
     pub decoded: DecodedConfig,
     /// Startup sync mode.
     pub startup: StartupModeConfig,
+    /// Simplex proposal handoff behavior.
+    pub handoff_mode: HandoffModeConfig,
+    /// Synthetic proposal-build delay in milliseconds.
+    pub proposal_build_delay_ms: u64,
     /// Logging verbosity.
     pub log_level: String,
     /// Tokio worker threads.
@@ -260,7 +284,7 @@ fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
 
 fn decode_private_key(hex_str: &str) -> ed25519::PrivateKey {
     let bytes = decode_hex("private_key", hex_str);
-    ed25519::PrivateKey::read(&mut &bytes[..]).expect("failed to decode private key")
+    ed25519::PrivateKey::read(&mut Copying(&bytes)).expect("failed to decode private key")
 }
 
 fn decode_dkg_output(
@@ -269,7 +293,7 @@ fn decode_dkg_output(
 ) -> dkg::Output<MinSig, ed25519::PublicKey> {
     let bytes = decode_hex("dkg_output", hex_str);
     dkg::Output::read_cfg(
-        &mut &bytes[..],
+        &mut Copying(&bytes),
         &(NZU32!(num_validators), ModeVersion::v0()),
     )
     .expect("failed to decode DKG output")
@@ -282,12 +306,12 @@ fn decode_share_opt(hex_str: &str) -> Option<Share> {
         return None;
     }
     let bytes = decode_hex("dkg_share", hex_str);
-    Some(Share::read(&mut &bytes[..]).expect("failed to decode DKG share"))
+    Some(Share::read(&mut Copying(&bytes)).expect("failed to decode DKG share"))
 }
 
 fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
     let bytes = decode_hex(field_name, hex_str);
-    ed25519::PublicKey::read(&mut &bytes[..]).expect("failed to decode public key")
+    ed25519::PublicKey::read(&mut Copying(&bytes)).expect("failed to decode public key")
 }
 
 fn load_validator_config(path: &Path) -> ValidatorConfig {
@@ -364,6 +388,8 @@ fn decode_with_network(
             partition_prefix: config.partition_prefix,
         },
         startup: config.startup,
+        handoff_mode: config.handoff_mode,
+        proposal_build_delay_ms: config.proposal_build_delay_ms,
         log_level: config.log_level,
         worker_threads: config.worker_threads,
         rayon_threads: config.rayon_threads,
@@ -530,17 +556,17 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 #[cfg(test)]
 mod tests {
     use super::{
-        IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        HandoffModeConfig, IndexerConfig, NamedBootstrapperEntry, StartupModeConfig,
+        ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, default_upload_buffer,
+        load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
         Signer,
         bls12381::{
             dkg::feldman_desmedt as dkg,
-            primitives::{group::Share, variant::MinSig},
+            primitives::{group::Share, sharing::Mode, variant::MinSig},
         },
         ed25519,
     };
@@ -598,7 +624,7 @@ mod tests {
             let participants = primary_keys.clone().into_iter().try_collect().unwrap();
             let mut rng = commonware_utils::test_rng();
             let (dkg_output, raw_shares) =
-                dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+                dkg::deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
                     .expect("DKG deal failed");
             let shares = raw_shares.into_iter().collect();
 
@@ -640,6 +666,8 @@ mod tests {
                 dkg_output: self.dkg_output_hex.clone(),
                 dkg_share: hex(&share.encode()),
                 startup,
+                handoff_mode: HandoffModeConfig::Baseline,
+                proposal_build_delay_ms: 0,
                 listen_port: 9000,
                 genesis_leader: hex(&self.primary_keys[0].encode()),
                 partition_prefix: format!("validator-{index}"),
@@ -676,6 +704,8 @@ mod tests {
                 dkg_output: self.dkg_output_hex.clone(),
                 dkg_share: String::new(),
                 startup,
+                handoff_mode: HandoffModeConfig::Baseline,
+                proposal_build_delay_ms: 0,
                 listen_port: 9000,
                 genesis_leader: hex(&self.primary_keys[0].encode()),
                 partition_prefix: format!("secondary-{index}"),
@@ -723,6 +753,8 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.handoff_mode = HandoffModeConfig::BuildOnly;
+        config.proposal_build_delay_ms = 50;
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -750,6 +782,8 @@ mod tests {
         assert!(!loaded.json_logs);
         assert!(!loaded.deployer_managed);
         assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
+        assert_eq!(loaded.handoff_mode, HandoffModeConfig::BuildOnly);
+        assert_eq!(loaded.proposal_build_delay_ms, 50);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
@@ -790,6 +824,8 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.handoff_mode = HandoffModeConfig::BuildAndBroadcast;
+        config.proposal_build_delay_ms = 50;
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -818,6 +854,8 @@ hosts:
         assert!(loaded.json_logs);
         assert!(loaded.deployer_managed);
         assert_eq!(loaded.startup, StartupModeConfig::MarshalSync);
+        assert_eq!(loaded.handoff_mode, HandoffModeConfig::BuildAndBroadcast);
+        assert_eq!(loaded.proposal_build_delay_ms, 50);
         assert_eq!(loaded.http_listen, "0.0.0.0:8080".parse().unwrap());
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
@@ -840,6 +878,26 @@ hosts:
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);
+    }
+
+    #[test]
+    fn experiment_knobs_default_when_omitted_from_yaml() {
+        let cluster = Cluster::new(1, 0);
+        let mut config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        config.handoff_mode = HandoffModeConfig::BuildAndBroadcast;
+        let yaml = serde_yaml::to_string(&config).expect("config should serialize");
+        let old_yaml = yaml
+            .lines()
+            .filter(|line| {
+                !line.starts_with("handoff_mode:") && !line.starts_with("proposal_build_delay_ms:")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let decoded: ValidatorConfig =
+            serde_yaml::from_str(&old_yaml).expect("old config should deserialize");
+        assert_eq!(decoded.handoff_mode, HandoffModeConfig::Baseline);
+        assert_eq!(decoded.proposal_build_delay_ms, 0);
     }
 
     #[test]

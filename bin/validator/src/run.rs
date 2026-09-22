@@ -2,16 +2,15 @@
 
 use crate::{
     config::{
-        IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
+        HandoffModeConfig, IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config,
+        load_local_config,
     },
     state_reader::StateDbReader,
 };
 use commonware_actor::Feedback;
 use commonware_codec::Encode;
 use commonware_consensus::{
-    Reporter,
-    simplex::elector::RoundRobin,
-    types::{Epoch, coding::Commitment},
+    HandoffPolicy, HandoffPublication, Reporter, simplex::elector::RoundRobin, types::Epoch,
 };
 use commonware_cryptography::{
     bls12381::primitives::variant::MinSig,
@@ -45,12 +44,13 @@ use commonware_storage::{
 use commonware_utils::{
     NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
 };
-use constantinople_application::consensus::{Databases, FinalizedHookFn};
+use constantinople_application::consensus::{
+    DatabaseReaders, FinalizedHookFn, FinalizedTask, MerkleizedDatabases,
+};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL,
-    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme,
-    VOTE_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
@@ -80,7 +80,6 @@ const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
 const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
-    max_pending_acks: MAX_PENDING_ACKS,
     maintenance_interval: NZUsize!(1024),
     retained_marshal_blocks: 1024,
     retained_qmdb_blocks: 32,
@@ -110,6 +109,18 @@ fn default_mempool_drop_grace_blocks(num_validators: usize) -> u64 {
         .expect("mempool drop grace block count overflowed")
 }
 
+const fn handoff_policy(mode: HandoffModeConfig) -> HandoffPolicy {
+    match mode {
+        HandoffModeConfig::Baseline => HandoffPolicy::AwaitCertification,
+        HandoffModeConfig::BuildOnly => {
+            HandoffPolicy::Prepare(HandoffPublication::AfterCertification)
+        }
+        HandoffModeConfig::BuildAndBroadcast => {
+            HandoffPolicy::Prepare(HandoffPublication::AllowBeforeCertification)
+        }
+    }
+}
+
 fn buffer_pool_configs(
     worker_threads: usize,
     max_blocking_threads: usize,
@@ -124,8 +135,11 @@ fn buffer_pool_configs(
 
     let network_cfg = BufferPoolConfig::for_network()
         .with_parallelism(network_parallelism)
-        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
-        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
+        .with_size_class_range(
+            NZUsize!(1024),
+            NETWORK_BUFFER_POOL_MAX_SIZE,
+            NETWORK_BUFFER_POOL_MAX_PER_CLASS,
+        );
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.
@@ -136,6 +150,20 @@ fn buffer_pool_configs(
     (network_cfg, storage_cfg)
 }
 
+/// Converts the nominal engine block into the shared execution block expected by the mempool.
+#[derive(Clone)]
+struct MempoolReporter(Mailbox<Commitment, PublicKey, Sha256>);
+impl Reporter for MempoolReporter {
+    type Activity = commonware_consensus::marshal::Update<EngineBlock<Sha256, PublicKey>>;
+    fn report(&mut self, activity: Self::Activity) -> commonware_actor::Feedback {
+        use commonware_consensus::marshal::Update;
+        self.0.report(match activity {
+            Update::Tip(round, height, digest) => Update::Tip(round, height, digest),
+            Update::Block(block, ack) => Update::Block(block.shared_execution(), ack),
+        })
+    }
+}
+
 /// Concrete type the engine sees in the `simplex_observer` slot.
 ///
 /// We always pin `O` to the indexer's certificate publisher so the engine type
@@ -144,7 +172,8 @@ fn buffer_pool_configs(
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
 type EnginePublisher = Publisher<Sha256, PublicKey>;
-type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
+type Commitment = constantinople_engine::types::EngineCommitment<Sha256, PublicKey>;
+
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
@@ -234,7 +263,7 @@ impl LazyPublisher {
 #[derive(Clone)]
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
-    metadata: Arc<Mutex<CursorMetadata>>,
+    metadata: Arc<Mutex<Option<CursorMetadata>>>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
     publisher: Arc<LazyPublisher>,
 }
@@ -297,20 +326,29 @@ fn recovered_finalized_upload_cursor(
 }
 
 impl FinalizedUploadProducer {
-    async fn enqueue(
-        self,
+    async fn capture(
+        &self,
         context: RuntimeContext,
         block: &EngineBlock<Sha256, PublicKey>,
-        databases: &EngineDatabases,
-    ) {
+        batches: &MerkleizedDatabases<RuntimeContext, Sha256, Rayon>,
+        readers: DatabaseReaders<RuntimeContext, Sha256, EightCap, Rayon>,
+    ) -> Option<EngineQueuedUpload> {
         loop {
             let mut cursor = self.cursor.lock().await;
+            // Queue durability can precede QMDB durability. A crash in that
+            // window replays blocks whose payloads are already safely queued.
+            if cursor.state_next >= block.header.state_range.end()
+                && cursor.transaction_next >= block.header.transactions_range.end()
+            {
+                return None;
+            }
             let upload = match EnginePublisher::build_queued_finalized_upload_with_context(
                 context.child("build"),
                 cursor.state_next,
                 cursor.transaction_next,
                 block,
-                databases,
+                batches,
+                &readers,
             )
             .await
             {
@@ -344,13 +382,20 @@ impl FinalizedUploadProducer {
                     continue;
                 }
             };
-            let next = FinalizedUploadCursor::from_upload(&upload);
-            match self.writer.enqueue(upload).await {
+            return Some(upload);
+        }
+    }
+
+    async fn enqueue(self, upload: EngineQueuedUpload) {
+        let mut cursor = self.cursor.lock().await;
+        let next = FinalizedUploadCursor::from_upload(&upload);
+        loop {
+            match self.writer.enqueue(upload.clone()).await {
                 Ok(position) => {
                     persist_finalized_cursor(&self.metadata, next).await;
                     *cursor = next;
                     info!(
-                        height = block.header.height,
+                        height = upload.height(),
                         position,
                         state_next = next.state_next,
                         transaction_next = next.transaction_next,
@@ -360,40 +405,33 @@ impl FinalizedUploadProducer {
                 }
                 Err(error) => {
                     warn!(
-                        height = block.header.height,
+                        height = upload.height(),
                         error = %error,
                         "failed to enqueue finalized index upload, retrying",
                     );
                 }
             }
-            drop(cursor);
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 }
 
 async fn persist_finalized_cursor(
-    metadata: &Arc<Mutex<CursorMetadata>>,
+    metadata: &Arc<Mutex<Option<CursorMetadata>>>,
     cursor: FinalizedUploadCursor,
 ) {
-    loop {
-        let mut metadata = metadata.lock().await;
-        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        match metadata.sync().await {
-            Ok(()) => return,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    state_next = cursor.state_next,
-                    transaction_next = cursor.transaction_next,
-                    "failed to persist finalized index cursor, retrying",
-                );
-            }
-        }
-        drop(metadata);
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
+    let mut slot = metadata.lock().await;
+    let mut metadata = slot
+        .take()
+        .expect("cursor metadata was lost; restart to recover");
+    metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+    metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+    *slot = Some(
+        metadata
+            .sync()
+            .await
+            .expect("failed to persist finalized index cursor"),
+    );
 }
 
 async fn scan_finalized_queue_cursor(
@@ -406,7 +444,10 @@ async fn scan_finalized_queue_cursor(
                 cursor = Some(FinalizedUploadCursor::from_upload(&upload));
             }
             Ok(None) => {
-                reader.reset().await;
+                reader
+                    .reset()
+                    .await
+                    .expect("failed to reset finalized index queue");
                 return cursor;
             }
             Err(error) => {
@@ -607,6 +648,7 @@ async fn maybe_build_indexer(
             codec_config: QueuedFinalizedUploadCfg::default(),
             page_cache,
             write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+            replay_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
         },
     )
     .await
@@ -626,12 +668,12 @@ async fn maybe_build_indexer(
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        metadata
+        metadata = metadata
             .sync()
             .await
             .expect("failed to persist finalized index cursor");
     }
-    let metadata = Arc::new(Mutex::new(metadata));
+    let metadata = Arc::new(Mutex::new(Some(metadata)));
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         metadata,
@@ -654,6 +696,8 @@ async fn maybe_build_indexer(
     })
 }
 
+// Capture before database application, then return an owned task to enqueue afterward.
+#[allow(clippy::async_yields_async)]
 fn indexer_finalized_hook(
     indexer: Option<&IndexerHandle>,
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
@@ -661,12 +705,18 @@ fn indexer_finalized_hook(
     let indexer = indexer?;
     let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
-    Some(Arc::new(move |block, databases| {
-        Box::pin(finalized_producer.clone().enqueue(
-            publisher.context.child("finalized_queue"),
-            block,
-            databases,
-        ))
+    Some(Arc::new(move |block, batches, readers| {
+        let producer = finalized_producer.clone();
+        let context = publisher.context.child("finalized_queue");
+        Box::pin(async move {
+            let block = EngineBlock::from(block.clone());
+            let upload = producer.capture(context, &block, batches, readers).await;
+            Box::pin(async move {
+                if let Some(upload) = upload {
+                    producer.enqueue(upload).await;
+                }
+            }) as FinalizedTask
+        })
     }))
 }
 
@@ -684,6 +734,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
     let LoadedConfig {
         decoded,
         startup,
+        handoff_mode,
+        proposal_build_delay_ms,
         log_level,
         worker_threads,
         rayon_threads,
@@ -726,7 +778,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             otel.map(|(endpoint, rate)| TracesConfig {
                 endpoint,
                 name: hex(&decoded.public_key.encode()),
-                rate,
+                rate: commonware_utils::Probability::try_from(rate)
+                    .expect("invalid telemetry sampling probability"),
             }),
         );
 
@@ -752,6 +805,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
+                NonZeroUsize::new(
+                    decoded.primary_participants.len() + decoded.secondary_participants.len(),
+                )
+                .expect("peer set must be nonempty"),
                 32 * 1024 * 1024,
             )
         } else {
@@ -761,6 +818,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
+                NonZeroUsize::new(
+                    decoded.primary_participants.len() + decoded.secondary_participants.len(),
+                )
+                .expect("peer set must be nonempty"),
                 32 * 1024 * 1024,
             )
         };
@@ -781,19 +842,20 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .unwrap();
         oracle.track(0, TrackedPeers::new(primary, secondary));
 
-        // TODO: Add reasonable RL
-        let quota = Quota::per_second(std::num::NonZeroU32::MAX);
-        let backlog = 1024;
+        // Discovery now derives channel queue capacity from the quota burst.
+        // Keep the existing high sustained rate without reserving billions of slots.
+        let quota =
+            Quota::per_second(std::num::NonZeroU32::MAX).allow_burst(commonware_utils::NZU32!(128));
         let channels = Channels {
-            votes: network.register(VOTE_CHANNEL, quota, backlog),
-            certificates: network.register(CERTIFICATE_CHANNEL, quota, backlog),
-            resolver: network.register(RESOLVER_CHANNEL, quota, backlog),
-            marshal: network.register(MARSHAL_CHANNEL, quota, backlog),
-            marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota, backlog),
-            state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
-            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
+            votes: network.register(VOTE_CHANNEL, quota),
+            certificates: network.register(CERTIFICATE_CHANNEL, quota),
+            resolver: network.register(RESOLVER_CHANNEL, quota),
+            marshal: network.register(MARSHAL_CHANNEL, quota),
+            marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota),
+            state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota),
+            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota),
         };
-        let probe_network = network.register(PROBE_CHANNEL, quota, backlog);
+        let probe_network = network.register(PROBE_CHANNEL, quota);
         let provider =
             ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
                 &union(b"constantinople", b"_CONSENSUS"),
@@ -873,7 +935,19 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             StartupMode::MarshalSync => "marshal_sync",
             StartupMode::StateSync => "state_sync",
         };
-        info!(startup_mode, "requested validator startup mode");
+        let handoff_mode_name = match handoff_mode {
+            HandoffModeConfig::Baseline => "baseline",
+            HandoffModeConfig::BuildOnly => "build_only",
+            HandoffModeConfig::BuildAndBroadcast => "build_and_broadcast",
+        };
+        info!(
+            startup_mode,
+            handoff_mode = handoff_mode_name,
+            proposal_build_delay_ms,
+            "requested validator startup modes"
+        );
+        let handoff_policy = handoff_policy(handoff_mode);
+        let proposal_build_delay = Duration::from_millis(proposal_build_delay_ms);
 
         // Build the indexer wiring up-front. This consumes `indexer` from the
         // loaded config and returns `None` for primaries or validators that
@@ -915,10 +989,12 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 strategy,
                 public_key_cache,
                 startup,
+                handoff_policy,
                 sync_config: production_sync_config(),
                 prune_config: Some(PRUNE_CONFIG),
                 genesis_leader: decoded.genesis_leader,
                 transaction_namespace: constantinople_primitives::TRANSACTION_NAMESPACE,
+                proposal_build_delay,
                 block_codec: Default::default(),
                 prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                 state_page_cache_bytes,
@@ -956,7 +1032,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         } else {
             None
         };
-        let engine_handle = engine.start(channels, reporter);
+        let engine_handle = engine.start(channels, reporter.map(MempoolReporter));
 
         wait_for_critical_task_exit(
             Some(probe_handle),
@@ -992,7 +1068,7 @@ async fn wait_for_critical_task_exit<E, M, N>(
 const fn production_sync_config() -> SyncEngineConfig {
     SyncEngineConfig {
         fetch_batch_size: NZU64!(1024),
-        apply_batch_size: STATE_SYNC_APPLY_BATCH_SIZE,
+        apply_batch_size: NZU64!(STATE_SYNC_APPLY_BATCH_SIZE as u64),
         max_outstanding_requests: 8,
         update_channel_size: NZUsize!(256),
         max_retained_roots: 32,
@@ -1002,18 +1078,20 @@ const fn production_sync_config() -> SyncEngineConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
-        FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, default_mempool_drop_grace_blocks,
+        Commitment, EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION,
+        FINALIZED_QUEUE_PAGE_CACHE_CAPACITY, FINALIZED_QUEUE_PAGE_SIZE,
+        FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader, FinalizedQueueWriter,
+        FinalizedUploadCursor, default_mempool_drop_grace_blocks, handoff_policy,
         maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
         wait_for_critical_task_exit,
     };
-    use crate::config::IndexerConfig;
+    use crate::config::{HandoffModeConfig, IndexerConfig};
     use commonware_codec::{FixedSize as _, Read as _, Write as _};
     use commonware_consensus::{
+        HandoffPolicy, HandoffPublication,
         marshal::coding::types::coding_config_for_participants,
         simplex::types::Context as SimplexContext,
-        types::{Round, View, coding::Commitment},
+        types::{Round, View},
     };
     use commonware_cryptography::{
         Digest as _, Signer as _,
@@ -1041,6 +1119,22 @@ mod tests {
         assert_eq!(default_mempool_drop_grace_blocks(1), 2);
         assert_eq!(default_mempool_drop_grace_blocks(4), 8);
         assert_eq!(default_mempool_drop_grace_blocks(50), 100);
+    }
+
+    #[test]
+    fn handoff_modes_map_to_consensus_policies() {
+        assert_eq!(
+            handoff_policy(HandoffModeConfig::Baseline),
+            HandoffPolicy::AwaitCertification
+        );
+        assert_eq!(
+            handoff_policy(HandoffModeConfig::BuildOnly),
+            HandoffPolicy::Prepare(HandoffPublication::AfterCertification)
+        );
+        assert_eq!(
+            handoff_policy(HandoffModeConfig::BuildAndBroadcast),
+            HandoffPolicy::Prepare(HandoffPublication::AllowBeforeCertification)
+        );
     }
 
     #[tokio::test]
@@ -1165,6 +1259,7 @@ mod tests {
                         codec_config: super::QueuedFinalizedUploadCfg::default(),
                         page_cache,
                         write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+                        replay_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
                     },
                 )
                 .await

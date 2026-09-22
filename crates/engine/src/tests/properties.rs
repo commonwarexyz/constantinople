@@ -1,4 +1,4 @@
-use crate::tests::common::{RestartBarrier, ValidatorState};
+use crate::tests::common::{RestartBarrier, StartCounts, ValidatorState};
 use commonware_cryptography::PublicKey;
 use commonware_glue::simulate::{
     exit::ExitCondition, property::Property, tracker::ProgressTracker,
@@ -80,9 +80,10 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState> for BlockAgre
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(crate) struct FinalizedHeightAtLeast {
     height: u64,
+    starts: Option<(StartCounts, usize)>,
 }
 
 #[derive(Clone)]
@@ -177,7 +178,17 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState>
 
 impl FinalizedHeightAtLeast {
     pub(crate) const fn new(height: u64) -> Self {
-        Self { height }
+        Self {
+            height,
+            starts: None,
+        }
+    }
+
+    pub(crate) const fn after_starts(height: u64, starts: StartCounts, minimum: usize) -> Self {
+        Self {
+            height,
+            starts: Some((starts, minimum)),
+        }
     }
 }
 
@@ -197,6 +208,12 @@ impl<P: PublicKey> ExitCondition<P, ValidatorState> for FinalizedHeightAtLeast {
         target_count: usize,
     ) -> Pin<Box<dyn Future<Output = Result<bool, String>> + Send + 'a>> {
         Box::pin(async move {
+            if let Some((starts, minimum)) = &self.starts {
+                let starts = starts.lock();
+                if starts.values().filter(|count| **count >= *minimum).count() < target_count {
+                    return Ok(false);
+                }
+            }
             let mut reached = 0usize;
             for state in states {
                 if state.digest_at_height(self.height).await.is_some() {
