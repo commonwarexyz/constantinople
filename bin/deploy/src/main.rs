@@ -4,12 +4,16 @@ mod local;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
-use commonware_codec::{Encode, Read as CodecRead};
+use commonware_codec::{Copying, Encode, Read as CodecRead};
 use commonware_cryptography::{
     Signer,
     bls12381::{
         dkg::feldman_desmedt as dkg,
-        primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
+        primitives::{
+            group::Share,
+            sharing::{Mode, ModeVersion},
+            variant::MinSig,
+        },
     },
     ed25519,
 };
@@ -68,6 +72,19 @@ pub(crate) enum StartupModeConfig {
     #[default]
     MarshalSync,
     StateSync,
+}
+
+/// Simplex proposal handoff behavior generated for every validator.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum HandoffModeConfig {
+    /// Build the next proposal only after its parent is certified.
+    #[default]
+    Baseline,
+    /// Build early, but wait for parent certification before broadcasting.
+    BuildOnly,
+    /// Build and permit broadcast before parent certification.
+    BuildAndBroadcast,
 }
 
 #[derive(Debug, Parser)]
@@ -136,6 +153,12 @@ pub(crate) struct GenerateArgs {
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
+    /// Simplex proposal handoff behavior.
+    #[arg(long, value_enum, default_value_t = HandoffModeConfig::Baseline)]
+    handoff_mode: HandoffModeConfig,
+    /// Synthetic proposal-build delay in milliseconds (benchmarking only).
+    #[arg(long, default_value_t = 0)]
+    proposal_build_delay_ms: u64,
 
     /// Include a spammer instance in the deployment.
     #[arg(long, default_value_t = false)]
@@ -370,6 +393,12 @@ pub(crate) struct ValidatorConfig {
     dkg_share: String,
     /// Startup sync mode.
     startup: StartupModeConfig,
+    /// Simplex proposal handoff behavior.
+    #[serde(default)]
+    handoff_mode: HandoffModeConfig,
+    /// Synthetic proposal-build delay in milliseconds.
+    #[serde(default)]
+    proposal_build_delay_ms: u64,
     /// p2p listen port.
     listen_port: u16,
     /// Hex-encoded ed25519 public key of the genesis leader.
@@ -668,7 +697,7 @@ fn build_cluster_material(
     // primary count or `threshold_scheme` will panic at validator load.
     let participants = public_keys.clone().into_iter().try_collect().unwrap();
     let (dkg_output, raw_shares) =
-        dkg::deal::<MinSig, _, N3f1>(rng, Default::default(), participants)
+        dkg::deal::<MinSig, _, N3f1>(rng, Mode::NonZeroCounter, participants)
             .expect("DKG deal failed");
     let shares = raw_shares.into_iter().collect();
     let genesis_leader = hex(&public_keys[0].encode());
@@ -703,7 +732,7 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
         serde_yaml::from_str(&raw).expect("failed to parse validator config");
     let bytes = from_hex(&config.dkg_output).expect("bad dkg_output hex");
     let dkg_output = dkg::Output::<MinSig, ed25519::PublicKey>::read_cfg(
-        &mut &bytes[..],
+        &mut Copying(&bytes),
         &(NZU32!(config.num_validators), ModeVersion::v0()),
     )
     .expect("failed to decode dkg_output");
@@ -754,10 +783,61 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
+        Cli, Command, GenerateTarget, HandoffModeConfig, SIMPLEX_VERIFICATION_MATERIAL_FILE,
         generate_local_cluster_material, simplex_verification_material_from_config,
         write_simplex_verification_material,
     };
+
+    #[test]
+    fn parses_handoff_mode_and_defaults_to_baseline() {
+        let explicit = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--handoff-mode",
+            "build-and-broadcast",
+            "--proposal-build-delay-ms",
+            "50",
+            "local",
+        ])
+        .expect("handoff mode should parse");
+        let Command::Generate(explicit) = explicit.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(explicit.handoff_mode, HandoffModeConfig::BuildAndBroadcast);
+        assert_eq!(explicit.proposal_build_delay_ms, 50);
+
+        let defaulted = Cli::try_parse_from([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "local",
+        ])
+        .expect("default handoff mode should parse");
+        let Command::Generate(defaulted) = defaulted.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(defaulted.handoff_mode, HandoffModeConfig::Baseline);
+        assert_eq!(defaulted.proposal_build_delay_ms, 0);
+        assert_eq!(
+            serde_yaml::to_string(&HandoffModeConfig::BuildOnly)
+                .expect("handoff mode should serialize")
+                .trim(),
+            "build_only"
+        );
+        assert_eq!(
+            serde_yaml::to_string(&HandoffModeConfig::BuildAndBroadcast)
+                .expect("handoff mode should serialize")
+                .trim(),
+            "build_and_broadcast"
+        );
+    }
     use clap::Parser;
     use commonware_codec::Encode;
     use commonware_formatting::hex;

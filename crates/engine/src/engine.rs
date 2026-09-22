@@ -14,7 +14,7 @@
 use crate::types::*;
 use commonware_coding::CodecConfig;
 use commonware_consensus::{
-    Reporter, Reporters,
+    HandoffPolicy, Reporter, Reporters,
     marshal::{
         self, Update,
         coding::{Marshaled, MarshaledConfig, shards, types::coding_config_for_participants},
@@ -24,7 +24,7 @@ use commonware_consensus::{
     simplex::{
         self, config::Floor as SimplexFloor, elector::Config as Elector, types::Finalization,
     },
-    types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
@@ -57,7 +57,7 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
-    Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{BlockCfg, PublicKeyCache};
@@ -87,7 +87,6 @@ const SHARD_BACKGROUND_CHANNEL_CAPACITY: NonZero<usize> = NZUsize!(1024);
 const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
-const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
 
@@ -150,14 +149,14 @@ pub enum StartupMode {
 
 pub struct Config<E, C, M, B, V, St, I, H, O>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
+    E: BufferPooler + Storage + Clock + Metrics + Spawner,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     V: Variant,
     St: Strategy,
     H: Hasher,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     pub signer: C,
     pub manager: M,
@@ -174,6 +173,11 @@ where
     pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
     pub transaction_namespace: &'static [u8],
+    pub handoff_policy: HandoffPolicy,
+    /// Synthetic asynchronous delay injected into every proposal build.
+    ///
+    /// This is a benchmarking knob and should remain zero in production.
+    pub proposal_build_delay: Duration,
     pub block_codec: BlockCfg,
     pub prunable_items_per_section: NonZero<u64>,
     /// Capacity in bytes of the state QMDB page cache.
@@ -193,9 +197,9 @@ where
     /// [`commonware_consensus::Reporters`] so primaries that pass `None`
     /// behave exactly as before.
     pub simplex_observer: Option<O>,
-    /// Optional hook that observes finalized blocks after local database
-    /// application and before state pruning.
-    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, St>>,
+    /// Optional hook that captures finalized data before local database application
+    /// and runs its returned task after application.
+    pub finalized_hook: Option<EngineFinalizedHook<E, H, C::PublicKey, St>>,
 }
 
 /// Fully assembled validator engine.
@@ -207,11 +211,11 @@ where
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>>,
+    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     context: ContextCell<E>,
     signer: C,
@@ -235,7 +239,7 @@ where
             EightCap,
             E,
             H::Digest,
-            Finalization<ThresholdScheme<C::PublicKey, V>, Commitment>,
+            Finalization<ThresholdScheme<C::PublicKey, V>, EngineCommitment<H, C::PublicKey>>,
         >,
         PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
         FixedEpocher,
@@ -244,9 +248,9 @@ where
     #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
     #[cfg(all(test, feature = "test-utils"))]
-    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V>>,
+    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V, H>>,
     #[cfg(all(test, feature = "test-utils"))]
-    genesis_commitment: Commitment,
+    genesis_commitment: EngineCommitment<H, C::PublicKey>,
     simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
 }
 
@@ -258,11 +262,11 @@ where
     B: Blocker<PublicKey = C::PublicKey>,
     H: Hasher,
     V: Variant,
-    L: Elector<ThresholdScheme<C::PublicKey, V>>,
+    L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     #[cfg(all(test, feature = "test-utils"))]
     pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
@@ -270,12 +274,12 @@ where
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V>> {
+    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V, H>> {
         self.startup_sync_floor.clone()
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) const fn genesis_commitment(&self) -> Commitment {
+    pub(crate) const fn genesis_commitment(&self) -> EngineCommitment<H, C::PublicKey> {
         self.genesis_commitment
     }
 
@@ -323,13 +327,12 @@ where
         let (state_resolver, state_sync_resolver) =
             StateResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("state_resolver"),
-                qmdb_resolver::standard::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    initial: STATE_SYNC_INITIAL,
                     timeout: STATE_SYNC_TIMEOUT,
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
@@ -340,23 +343,23 @@ where
         let (transaction_resolver, transaction_sync_resolver) =
             TransactionResolverActor::<_, C::PublicKey, _, _, H, St>::new(
                 context.child("transaction_resolver"),
-                qmdb_resolver::compact::Config {
+                qmdb_resolver::Config {
                     peer_provider: config.manager.clone(),
                     blocker: config.blocker.clone(),
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    initial: STATE_SYNC_INITIAL,
                     timeout: STATE_SYNC_TIMEOUT,
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
                     priority_responses: false,
+                    max_serve_ops: NZU64!(4096),
                 },
             );
         let n_participants = u16::try_from(config.output.players().len())
             .expect("participant count must fit in u16");
         let coding_config = coding_config_for_participants(n_participants);
-        let genesis_parent = Commitment::from((
+        let genesis_parent = EngineCommitment::<H, C::PublicKey>::from((
             H::Digest::EMPTY,
             H::Digest::EMPTY,
             H::Digest::EMPTY,
@@ -410,17 +413,23 @@ where
 
         // The canonical genesis is a pure function of configuration: the leader, the
         // participant-derived coding config, and the canonical empty-database roots.
-        let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
-            &mut H::default(),
-            config.genesis_leader.clone(),
-            (commonware_consensus::types::View::zero(), genesis_parent),
-            0,
-            <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
-            <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+        let genesis_block = EngineBlock::from(
+            constantinople_application::consensus::genesis_block_with_parent(
+                &mut H::default(),
+                config.genesis_leader.clone(),
+                (commonware_consensus::types::View::zero(), genesis_parent),
+                0,
+                <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+                <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
+            ),
         );
-        let coded_genesis = EngineCodedBlock::new(genesis_block, coding_config, &config.strategy);
+        let coded_genesis = std::sync::Arc::new(EngineCodedBlock::new(
+            genesis_block,
+            coding_config,
+            &config.strategy,
+        ));
         let application_genesis =
-            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(coded_genesis.clone());
+            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_shared(coded_genesis.clone());
         let (application_state_target, application_transactions_target) =
             block_targets(&application_genesis);
 
@@ -435,7 +444,7 @@ where
         );
         let marshal_start = startup_plan.marshal_start(coded_genesis);
 
-        let (marshal, marshal_mailbox, _) = MarshalActor::init(
+        let (marshal, marshal_mailbox, marshal_floor) = MarshalActor::init(
             context.child("marshal"),
             finalizations_by_height,
             finalized_blocks,
@@ -445,7 +454,7 @@ where
                 start: marshal_start,
                 partition_prefix: format!("{}_marshal", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
-                view_retention_timeout: ACTIVITY_TIMEOUT,
+                view_retention: ACTIVITY_TIMEOUT,
                 prunable_items_per_section,
                 page_cache: page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
@@ -488,11 +497,13 @@ where
             application_state_target,
             application_transactions_target,
             config.finalized_hook,
-        );
+        )
+        .with_handoff_policy(config.handoff_policy)
+        .with_proposal_build_delay(config.proposal_build_delay);
         let (stateful, stateful_mailbox) = Stateful::init(
             context.child("stateful"),
             StatefulConfig {
-                application,
+                application: App(application),
                 db_config: (
                     state_db_config(
                         &config.partition_prefix,
@@ -501,8 +512,8 @@ where
                     ),
                     transaction_db_config,
                 ),
-                input_provider: config.input,
-                marshal: marshal_mailbox.clone(),
+                provider: config.input,
+                marshal: (marshal_mailbox.clone(), marshal_floor),
                 mailbox_size: MAILBOX_SIZE,
                 plan: startup_plan,
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
@@ -543,6 +554,7 @@ where
                 automaton: application.clone(),
                 relay: application,
                 reporter: simplex_reporter,
+                track_historical_votes: false,
                 strategy: config.strategy.clone(),
                 partition: format!("{}_simplex", config.partition_prefix),
                 mailbox_size: MAILBOX_SIZE,
@@ -555,10 +567,12 @@ where
                 certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
                 fetch_timeout: Duration::from_secs(4),
-                activity_timeout: ACTIVITY_TIMEOUT,
-                skip_timeout: ViewDelta::new(10),
-                fetch_concurrent: NZUsize!(32),
-                forwarding: simplex::ForwardingPolicy::Disabled,
+                view_retention: ACTIVITY_TIMEOUT,
+                skip: simplex::SkipPolicy::Enabled {
+                    timeout: Duration::from_secs(20),
+                    budget: simplex::SkipBudget::Fixed(NZU64!(10)),
+                },
+                forward: simplex::ForwardPolicy::Disabled,
             },
         );
 
@@ -612,7 +626,6 @@ where
                 peer_provider: self.manager.clone(),
                 blocker: self.blocker.clone(),
                 mailbox_size: MAILBOX_SIZE,
-                initial: STATE_SYNC_INITIAL,
                 timeout: STATE_SYNC_TIMEOUT,
                 fetch_retry_timeout: STATE_SYNC_RETRY,
                 priority_requests: false,
@@ -693,7 +706,7 @@ where
         ),
         TransactionHistoryTarget {
             root: block.header.transactions_root,
-            leaf_count: mmr::Location::new(block.header.transactions_range.end()),
+            size: mmr::Location::new(block.header.transactions_range.end()),
         },
     )
 }
@@ -703,7 +716,12 @@ async fn init_finalizations_archive<E, H, P, V>(
     page_cache: &CacheRef,
     partition_prefix: &str,
     items_per_section: NonZero<u64>,
-) -> PrunableArchive<EightCap, E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
+) -> PrunableArchive<
+    EightCap,
+    E,
+    H::Digest,
+    Finalization<ThresholdScheme<P, V>, EngineCommitment<H, P>>,
+>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
@@ -714,6 +732,7 @@ where
     let archive = prunable::Archive::init(
         context.child("finalizations_by_height"),
         prunable::Config {
+            metadata_partition: format!("{partition_prefix}-archive-metadata"),
             translator: EightCap,
             key_partition: format!("{partition_prefix}-finalizations-by-height-key"),
             key_page_cache: page_cache.clone(),
@@ -748,6 +767,7 @@ where
     let archive = prunable::Archive::init(
         context.child("finalized_blocks"),
         prunable::Config {
+            metadata_partition: format!("{partition_prefix}-blocks-archive-metadata"),
             translator: EightCap,
             key_partition: format!("{partition_prefix}-finalized-blocks-key"),
             key_page_cache: page_cache.clone(),
@@ -780,6 +800,7 @@ where
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
+            replay_buffer: DB_WRITE_BUFFER,
             strategy,
             page_cache: page_cache.clone(),
         },
@@ -788,9 +809,12 @@ where
             items_per_blob: ITEMS_PER_BLOB,
             page_cache: page_cache.clone(),
             write_buffer: DB_WRITE_BUFFER,
+            replay_buffer: DB_WRITE_BUFFER,
         },
         translator: EightCap,
-        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_cache: Some(STATE_INIT_CACHE_SIZE),
+        init_buffer: commonware_utils::NZUsize!(1024 * 1024),
+        init_concurrency: (),
     }
 }
 
@@ -811,6 +835,7 @@ where
             codec_config: (),
             page_cache: page_cache.clone(),
             write_buffer: DB_WRITE_BUFFER,
+            replay_buffer: DB_WRITE_BUFFER,
         },
         commit_codec_config: (),
     }

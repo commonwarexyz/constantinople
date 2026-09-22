@@ -78,7 +78,7 @@ impl Write for TransactionPublicKey {
 impl Read for TransactionPublicKey {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, _: &Self::Cfg) -> Result<Self, Error> {
         if buf.remaining() < Self::SIZE {
             return Err(Error::EndOfBuffer);
         }
@@ -245,7 +245,7 @@ impl Write for TransactionSignature {
 impl Read for TransactionSignature {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, _: &Self::Cfg) -> Result<Self, Error> {
         if buf.remaining() < 1 + SIGNATURE_BYTES {
             return Err(Error::EndOfBuffer);
         }
@@ -358,6 +358,7 @@ impl From<ed25519::Signature> for TransactionSignature {
 /// Verifies mixed transaction signatures with separate scheme groups.
 pub struct TransactionBatchVerifier {
     ed25519: ed25519::Batch,
+    has_ed25519: bool,
     secp256r1: Vec<Secp256r1Item>,
 }
 
@@ -375,6 +376,7 @@ impl TransactionBatchVerifier {
     pub fn new(capacity: usize) -> Self {
         Self {
             ed25519: ed25519::Batch::new(capacity),
+            has_ed25519: false,
             secp256r1: Vec::new(),
         }
     }
@@ -396,7 +398,11 @@ impl TransactionBatchVerifier {
             (
                 DecompressedPublicKey::Ed25519(key),
                 TransactionSignature::Ed25519 { signature, .. },
-            ) => self.ed25519.add(namespace, message, key, signature),
+            ) => {
+                let added = self.ed25519.add(namespace, message, key, signature);
+                self.has_ed25519 |= added;
+                added
+            }
             (
                 DecompressedPublicKey::Secp256r1(verifying_key),
                 TransactionSignature::Secp256r1 {
@@ -421,7 +427,9 @@ impl TransactionBatchVerifier {
 
     /// Verifies every queued signature.
     pub fn verify<R: CryptoRng>(self, rng: &mut R, strategy: &impl Strategy) -> bool {
-        if !self.ed25519.verify(rng, strategy) {
+        // Commonware rejects empty signature batches. A transaction batch may
+        // contain only WebAuthn signatures, so verify only populated groups.
+        if self.has_ed25519 && !self.ed25519.verify(rng, strategy) {
             return false;
         }
 
@@ -485,7 +493,7 @@ fn verify_webauthn_assertion(
         return false;
     }
 
-    let client_data_hash = sha256::Sha256::hash(client_data_json);
+    let client_data_hash = sha256::Sha256::hash(&[client_data_json]);
     let mut payload =
         Vec::with_capacity(authenticator_data.len() + client_data_hash.as_ref().len());
     payload.extend_from_slice(authenticator_data);
@@ -530,7 +538,7 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::PublicKeyCache;
-    use commonware_codec::{DecodeExt as _, Encode as _};
+    use commonware_codec::{Copying, DecodeExt as _, Encode as _};
     use commonware_cryptography::{Hasher, Signer as _, sha256};
     use commonware_formatting::from_hex;
     use commonware_math::algebra::Random as _;
@@ -551,7 +559,7 @@ mod tests {
         let encoded = key.encode();
 
         assert_eq!(encoded[0], SECP256R1_SCHEME);
-        assert_eq!(TransactionPublicKey::decode(encoded.as_ref()).unwrap(), key);
+        assert_eq!(TransactionPublicKey::decode(encoded).unwrap(), key);
     }
 
     #[test]
@@ -561,10 +569,7 @@ mod tests {
         let encoded = signature.encode();
 
         assert_eq!(encoded[0], ED25519_SCHEME);
-        assert_eq!(
-            TransactionSignature::decode(encoded.as_ref()).unwrap(),
-            signature
-        );
+        assert_eq!(TransactionSignature::decode(encoded).unwrap(), signature);
     }
 
     #[test]
@@ -572,8 +577,8 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let ed25519 = ed25519::PrivateKey::random(test_rng());
-            let ed_message = sha256::Sha256::hash(b"ed25519").to_vec();
-            let r1_message = sha256::Sha256::hash(b"secp256r1").to_vec();
+            let ed_message = sha256::Sha256::hash(&[b"ed25519".as_ref()]).to_vec();
+            let r1_message = sha256::Sha256::hash(&[b"secp256r1".as_ref()]).to_vec();
             let (r1_public_key, r1_signature) = webauthn_signature(&r1_message);
 
             let ed_public_key = TransactionPublicKey::ed25519(ed25519.public_key());
@@ -602,7 +607,7 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
             let ed25519 = ed25519::PrivateKey::random(test_rng());
-            let message = sha256::Sha256::hash(b"message").to_vec();
+            let message = sha256::Sha256::hash(&[b"message".as_ref()]).to_vec();
             let (_, signature) = webauthn_signature(&message);
 
             let public_key = TransactionPublicKey::ed25519(ed25519.public_key());
@@ -619,8 +624,8 @@ mod tests {
     fn webauthn_signature_rejects_wrong_challenge() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let message = sha256::Sha256::hash(b"message").to_vec();
-            let wrong_message = sha256::Sha256::hash(b"wrong").to_vec();
+            let message = sha256::Sha256::hash(&[b"message".as_ref()]).to_vec();
+            let wrong_message = sha256::Sha256::hash(&[b"wrong".as_ref()]).to_vec();
             let (public_key, signature) = webauthn_signature(&wrong_message);
             let key = &cache
                 .decompress(&[&public_key], &Sequential)
@@ -636,7 +641,7 @@ mod tests {
     fn webauthn_signature_rejects_missing_user_verification() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let message = sha256::Sha256::hash(b"message").to_vec();
+            let message = sha256::Sha256::hash(&[b"message".as_ref()]).to_vec();
             let (public_key, mut signature) = webauthn_signature(&message);
             let TransactionSignature::Secp256r1 {
                 signature: inner,
@@ -664,9 +669,7 @@ mod tests {
     #[test]
     fn webauthn_verifier_checks_raw_browser_signature_payload() {
         let public_key = secp256r1::PublicKey::decode(
-            from_hex("03e424dc61d4bb3cb7ef4344a7f8957a0c5134e16f7a67c074f82e6e12f49abf3c")
-                .unwrap()
-                .as_slice(),
+            from_hex("03e424dc61d4bb3cb7ef4344a7f8957a0c5134e16f7a67c074f82e6e12f49abf3c").unwrap(),
         )
         .unwrap();
         let verifying_key = VerifyingKey::from_sec1_bytes(public_key.as_ref()).unwrap();
@@ -675,8 +678,7 @@ mod tests {
                 "bf96b99aa49c705c910be33142017c642ff540c76349b9dab72f981fd9347f4f\
                  17c55095819089c2e03b9cd415abdf12444e323075d98f31920b9e0f57ec871c",
             )
-            .unwrap()
-            .as_slice(),
+            .unwrap(),
         )
         .unwrap();
         let message = from_hex(
@@ -694,7 +696,7 @@ mod tests {
     fn webauthn_verification_populates_and_reuses_cache() {
         deterministic::Runner::default().start(|context| async move {
             let cache = PublicKeyCache::new(context, NZUsize!(16));
-            let message = sha256::Sha256::hash(b"secp256r1").to_vec();
+            let message = sha256::Sha256::hash(&[b"secp256r1".as_ref()]).to_vec();
             let (public_key, signature) = webauthn_signature(&message);
 
             let key = &cache
@@ -725,7 +727,7 @@ mod tests {
             base64_url_no_pad(challenge)
         )
         .into_bytes();
-        let client_data_hash = sha256::Sha256::hash(&client_data_json);
+        let client_data_hash = sha256::Sha256::hash(&[client_data_json.as_slice()]);
         let mut payload =
             Vec::with_capacity(authenticator_data.len() + client_data_hash.as_ref().len());
         payload.extend_from_slice(&authenticator_data);
@@ -733,12 +735,15 @@ mod tests {
 
         let signer = SigningKey::generate_from_rng(&mut test_rng());
         let public_key = TransactionPublicKey::secp256r1(
-            secp256r1::PublicKey::decode(signer.verifying_key().to_sec1_point(true).as_bytes())
-                .unwrap(),
+            secp256r1::PublicKey::decode(Copying(
+                signer.verifying_key().to_sec1_point(true).as_bytes(),
+            ))
+            .unwrap(),
         );
         let raw_signature: p256::ecdsa::Signature = signer.sign(&payload);
         let raw_signature = raw_signature.normalize_s();
-        let signature = secp256r1::Signature::decode(raw_signature.to_bytes().as_slice()).unwrap();
+        let signature =
+            secp256r1::Signature::decode(Copying(raw_signature.to_bytes().as_slice())).unwrap();
         let signature =
             TransactionSignature::secp256r1(signature, authenticator_data, client_data_json)
                 .unwrap();

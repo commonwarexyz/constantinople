@@ -5,7 +5,7 @@
 //! same `Cfg` that was used to encode (e.g. [`constantinople_primitives::BlockCfg`]).
 
 use bytes::Bytes;
-use commonware_codec::{Encode, Error as CodecError, Read};
+use commonware_codec::{Copying, Encode, Error as CodecError, Read};
 
 /// Encode a value with the canonical `commonware-codec` representation.
 pub fn to_bytes<T: Encode>(value: &T) -> Bytes {
@@ -14,6 +14,6 @@ pub fn to_bytes<T: Encode>(value: &T) -> Bytes {
 
 /// Decode a value using its required codec config.
 pub fn from_bytes<T: Read>(bytes: &[u8], cfg: &T::Cfg) -> Result<T, CodecError> {
-    let mut buf = bytes;
+    let mut buf = Copying(bytes);
     T::read_cfg(&mut buf, cfg)
 }

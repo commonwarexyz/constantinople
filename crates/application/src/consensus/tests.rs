@@ -3,6 +3,7 @@ use super::{
     history::parent_transactions_inactivity_floor,
 };
 use commonware_consensus::{
+    HandoffPolicy, HandoffPublication,
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
     },
@@ -21,7 +22,7 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::{full::Config as MmrConfig, mmr},
-    qmdb::{any::FixedConfig, batch_chain::Bounds, keyless::fixed as keyless_fixed},
+    qmdb::{any::FixedConfig, chain::Bounds, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
@@ -53,6 +54,41 @@ fn empty_state_target() -> StateSyncTarget<sha256::Digest> {
     )
 }
 
+#[test]
+fn handoff_policy_defaults_and_survives_clone() {
+    deterministic::Runner::default().start(|context| async move {
+        let harness = verify_harness(&context).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: harness.leader.public_key(),
+            parent: (View::zero(), *harness.parent.seal()),
+        };
+
+        assert_eq!(
+            <TestApp as commonware_glue::stateful::Application<_>>::handoff_policy(
+                &harness.app,
+                &consensus_context,
+            ),
+            HandoffPolicy::AwaitCertification,
+        );
+
+        for policy in [
+            HandoffPolicy::Prepare(HandoffPublication::AfterCertification),
+            HandoffPolicy::Prepare(HandoffPublication::AllowBeforeCertification),
+        ] {
+            let app = harness.app.clone().with_handoff_policy(policy);
+            let cloned = app.clone();
+            assert_eq!(
+                <TestApp as commonware_glue::stateful::Application<_>>::handoff_policy(
+                    &cloned,
+                    &consensus_context,
+                ),
+                policy,
+            );
+        }
+    });
+}
+
 fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
     FixedConfig {
         merkle_config: MmrConfig {
@@ -60,6 +96,7 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             metadata_partition: "verify-invalid-state-merkle-metadata".into(),
             items_per_blob: NZU64!(1024),
             write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
             strategy: Sequential,
             page_cache: cache.clone(),
         },
@@ -68,9 +105,12 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             items_per_blob: NZU64!(1024),
             page_cache: cache,
             write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
         },
         translator: EightCap,
-        init_cache_size: Some(NZUsize!(1024)),
+        init_cache: Some(NZUsize!(1024)),
+        init_buffer: commonware_utils::NZUsize!(1024 * 1024),
+        init_concurrency: (),
     }
 }
 
@@ -84,18 +124,16 @@ fn transaction_config(cache: CacheRef) -> keyless_fixed::CompactConfig<Sequentia
             codec_config: (),
             page_cache: cache,
             write_buffer: NZUsize!(4096),
+            replay_buffer: NZUsize!(4096),
         },
         commit_codec_config: (),
     }
 }
 
 fn sync_range_from_bounds(
-    bounds: &Bounds<mmr::Family>,
+    bounds: &Bounds<mmr::Family, sha256::Digest>,
 ) -> commonware_utils::range::NonEmptyRange<mmr::Location> {
-    non_empty_range!(
-        bounds.inactivity_floor,
-        mmr::Location::new(bounds.total_size)
-    )
+    non_empty_range!(bounds.inactivity_floor, bounds.tip.size)
 }
 
 type TestBlock = SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
@@ -148,11 +186,12 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
         .await
         .expect("genesis transactions");
     let state_target = StateSyncTarget::new(state.root(), sync_range_from_bounds(state.bounds()));
-    let transaction_target = TransactionHistoryTarget::new(
-        transactions.root(),
-        mmr::Location::new(transactions.bounds().total_size),
-    );
-    dbs.finalize((state, transactions)).await;
+    let transaction_target = TransactionHistoryTarget {
+        root: transactions.root(),
+        size: transactions.bounds().tip.size,
+    };
+    dbs.apply((state, transactions)).await;
+    assert!(dbs.finalize().await.durable().await);
 
     let parent = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -244,6 +283,18 @@ fn verify_rejects_invalid_body() {
             ],
         )
         .seal(&mut sha256::Sha256::default());
+
+        // Lazy replay now also receives uncertified ancestors. Invalid
+        // execution must reject that ancestry, rather than panic the actor.
+        assert!(
+            app.apply_certified(
+                (context.child("replay"), consensus_context.clone()),
+                &block,
+                dbs.new_batches().await,
+            )
+            .await
+            .is_none()
+        );
 
         let result = app
             .verify_child(
@@ -358,6 +409,79 @@ fn propose_drops_inapplicable_and_refills() {
 }
 
 #[test]
+fn synthetic_proposal_build_delay_uses_runtime_clock() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = verify_harness(&context).await;
+        let mut app = app.with_proposal_build_delay(Duration::from_millis(50));
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let mut input = StaticTransactionSource::new(Vec::new());
+        let started = context.current();
+
+        let proposed = app
+            .propose_child(
+                (context.child("delayed_propose"), consensus_context),
+                Arc::new(parent),
+                dbs.new_batches().await,
+                &mut input,
+            )
+            .await;
+
+        assert!(proposed.is_some());
+        assert!(
+            context.current().duration_since(started).unwrap() >= Duration::from_millis(50),
+            "proposal must await the configured runtime delay"
+        );
+    });
+}
+
+#[test]
+fn synthetic_proposal_build_delay_is_cancellable() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = verify_harness(&context).await;
+        let mut app = app.with_proposal_build_delay(Duration::from_millis(50));
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+        let mut input = StaticTransactionSource::new(Vec::new());
+
+        let proposal = app.propose_child(
+            (context.child("cancelled_propose"), consensus_context),
+            Arc::new(parent),
+            dbs.new_batches().await,
+            &mut input,
+        );
+        let timeout = context.sleep(Duration::from_millis(25));
+        futures::pin_mut!(proposal, timeout);
+
+        assert!(
+            matches!(
+                futures::future::select(proposal, timeout).await,
+                futures::future::Either::Right(_)
+            ),
+            "runtime timeout must win and dropping the proposal cancels its async delay"
+        );
+    });
+}
+
+#[test]
 fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
@@ -387,6 +511,35 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             )
             .await
             .expect("empty proposal must succeed");
+
+        assert!(
+            app.apply_certified(
+                (context.child("replay_valid"), consensus_context.clone()),
+                &proposed.block,
+                dbs.new_batches().await,
+            )
+            .await
+            .is_some()
+        );
+        // A well-formed body with the parent's stale commitments is still
+        // unexecutable as an ancestor: replay must validate both QMDB targets.
+        let wrong_commitment = Block::<sha256::Digest, _, sha256::Sha256>::new(
+            unexecuted_child_header(&parent, &consensus_context),
+            Vec::new(),
+        )
+        .seal(&mut sha256::Sha256::default());
+        assert!(
+            app.apply_certified(
+                (
+                    context.child("replay_wrong_commitment"),
+                    consensus_context.clone()
+                ),
+                &wrong_commitment,
+                dbs.new_batches().await,
+            )
+            .await
+            .is_none()
+        );
 
         // The freshly proposed child verifies against the same parent.
         let accepted = app
@@ -427,7 +580,7 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
     let recipient = ed25519::PrivateKey::from_seed(8);
     let genesis_target = TransactionHistoryTarget {
         root: sha256::Digest::EMPTY,
-        leaf_count: commonware_storage::mmr::Location::new(1),
+        size: commonware_storage::mmr::Location::new(1),
     };
     let mut header = genesis_block::<sha256::Digest, _, sha256::Sha256>(
         &mut sha256::Sha256::default(),
@@ -471,8 +624,8 @@ fn parent_inactivity_floor_skips_the_parent_commit() {
 fn genesis_block_uses_the_initialized_transaction_target() {
     let leader = ed25519::PrivateKey::from_seed(11).public_key();
     let target = TransactionHistoryTarget {
-        root: sha256::Sha256::hash(b"genesis"),
-        leaf_count: commonware_storage::mmr::Location::new(1),
+        root: sha256::Sha256::hash(&[b"genesis"]),
+        size: commonware_storage::mmr::Location::new(1),
     };
 
     let block = genesis_block::<sha256::Digest, _, sha256::Sha256>(

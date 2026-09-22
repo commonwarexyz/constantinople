@@ -153,6 +153,8 @@ fn build_validators(
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: hex(&share.encode()),
             startup: args.startup,
+            handoff_mode: args.handoff_mode,
+            proposal_build_delay_ms: args.proposal_build_delay_ms,
             listen_port: remote.listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("validator-{index}"),
@@ -209,6 +211,8 @@ fn build_secondaries(
             dkg_output: hex(&material.dkg_output.encode()),
             dkg_share: String::new(),
             startup: args.startup,
+            handoff_mode: args.handoff_mode,
+            proposal_build_delay_ms: args.proposal_build_delay_ms,
             listen_port: remote.listen_port,
             genesis_leader: material.genesis_leader.clone(),
             partition_prefix: format!("secondary-{index}"),
@@ -485,16 +489,19 @@ fn port_configs(remote: &RemoteArgs, indexer_enabled: bool) -> Vec<aws::PortConf
 
 #[cfg(test)]
 mod tests {
-    use super::{build_deployer_config, build_secondaries, port_configs, remote_spammer_config};
+    use super::{
+        build_deployer_config, build_secondaries, build_validators, port_configs,
+        remote_spammer_config,
+    };
     use crate::{
         CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_STORAGE_CLASS,
         DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE, DEFAULT_CHAIN_INDEXER_STORAGE_IOPS,
         DEFAULT_CHAIN_INDEXER_STORAGE_SIZE, EXOWARE_AVAILABILITY_ZONE_GROUP, GenerateArgs,
-        GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
-        RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, generate_local_cluster_material, total_secondaries,
-        validate_generate_args,
+        GenerateTarget, HandoffModeConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
+        QMDB_INDEXER_BINARY_FILE, RemoteArgs, STORAGE_CLASS, StartupModeConfig,
+        VALIDATOR_BINARY_FILE, ValidatorConfig, default_max_pool_bytes, default_max_propose_bytes,
+        default_page_cache_bytes, default_public_key_cache_size, generate_local_cluster_material,
+        total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -515,6 +522,8 @@ mod tests {
             state_page_cache_bytes: default_page_cache_bytes(),
             other_page_cache_bytes: default_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
+            handoff_mode: HandoffModeConfig::Baseline,
+            proposal_build_delay_ms: 0,
             spammer: false,
             spammer_accounts: 10,
             spammer_value: 1,
@@ -571,6 +580,8 @@ mod tests {
                 dkg_output: "output".to_string(),
                 dkg_share: "share".to_string(),
                 startup: StartupModeConfig::MarshalSync,
+                handoff_mode: HandoffModeConfig::Baseline,
+                proposal_build_delay_ms: 0,
                 listen_port: 9000,
                 genesis_leader: "leader".to_string(),
                 partition_prefix: format!("validator-{index}"),
@@ -624,6 +635,27 @@ mod tests {
         assert_eq!(config.ports[0].port, 9000);
         assert_eq!(config.ports[1].port, 8080);
         assert_eq!(config.ports[1].cidr, "198.51.100.4/32");
+    }
+
+    #[test]
+    fn handoff_mode_propagates_to_remote_validators_and_secondaries() {
+        for mode in [
+            HandoffModeConfig::Baseline,
+            HandoffModeConfig::BuildOnly,
+            HandoffModeConfig::BuildAndBroadcast,
+        ] {
+            let mut args = generate_args();
+            args.indexer = true;
+            args.handoff_mode = mode;
+            let remote = remote_args();
+            let material =
+                generate_local_cluster_material(args.validators, total_secondaries(&args));
+            let validators = build_validators(&args, &remote, Path::new("/tmp"), &material);
+            let secondaries = build_secondaries(&args, &remote, Path::new("/tmp"), &material);
+
+            assert!(validators.iter().all(|v| v.config.handoff_mode == mode));
+            assert!(secondaries.iter().all(|v| v.config.handoff_mode == mode));
+        }
     }
 
     #[test]

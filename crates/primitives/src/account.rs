@@ -43,7 +43,7 @@ impl AccountKey {
                     .expect("ed25519 account-key slice has account-key length")
             }
             TransactionPublicKey::Secp256r1 { encoded } => {
-                Self::try_from(sha256::Sha256::hash(encoded).as_ref())
+                Self::try_from(sha256::Sha256::hash(&[encoded.as_ref()]).as_ref())
                     .expect("sha256 digest has account-key length")
             }
         }
@@ -57,7 +57,7 @@ impl AccountKey {
 
         match bytes[0] {
             ED25519_SCHEME => Self::try_from(&bytes[1..1 + Self::SIZE]).ok(),
-            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(bytes).as_ref()).ok(),
+            SECP256R1_SCHEME => Self::try_from(sha256::Sha256::hash(&[bytes]).as_ref()).ok(),
             _ => None,
         }
     }
@@ -84,7 +84,7 @@ impl Write for AccountKey {
 impl Read for AccountKey {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
         if buf.remaining() < Self::SIZE {
             return Err(CodecError::EndOfBuffer);
         }
@@ -172,7 +172,7 @@ impl Write for Nonce {
 impl Read for Nonce {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             base: u64::read(buf)?,
             bitmap: u64::read(buf)?,
@@ -215,7 +215,7 @@ impl Write for Account {
 impl Read for Account {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl commonware_codec::Buf, _: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             balance: u64::read(buf)?,
             nonce: Nonce::read(buf)?,
@@ -269,7 +269,7 @@ fn consume_current_nonce(base: u64, bitmap: u64) -> Option<Nonce> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_codec::{DecodeExt, FixedSize};
+    use commonware_codec::{Copying, DecodeExt, FixedSize};
     use commonware_cryptography::{
         Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,
     };
@@ -279,7 +279,7 @@ mod tests {
         let mut raw = vec![0u8; AccountKey::SIZE];
         raw[0] = 1;
 
-        let key = AccountKey::decode(&mut &raw[..]).expect("account keys are raw bytes");
+        let key = AccountKey::decode(Copying(&raw)).expect("account keys are raw bytes");
 
         assert_eq!(key.as_ref(), raw.as_slice());
     }
@@ -303,7 +303,7 @@ mod tests {
 
         assert_eq!(
             key.as_ref(),
-            sha256::Sha256::hash(public_key.as_ref()).as_ref()
+            sha256::Sha256::hash(&[public_key.as_ref()]).as_ref()
         );
     }
 
@@ -318,7 +318,7 @@ mod tests {
         account.write(&mut buf);
         assert_eq!(buf.len(), Account::SIZE);
 
-        let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
+        let decoded = Account::decode(Copying(&buf)).expect("decoding should succeed");
         assert_eq!(decoded, account);
     }
 

@@ -50,7 +50,7 @@ fn decode(c: &mut Criterion) {
         let cfg = (RangeCfg::new(1..=n), ());
         group.bench_with_input(BenchmarkId::from_parameter(n), &n, |bencher, _| {
             bencher.iter_with_large_drop(|| {
-                Vec::<SignedTransaction<TestHasher>>::decode_cfg(encoded.as_ref(), &cfg)
+                Vec::<SignedTransaction<TestHasher>>::decode_cfg(encoded.clone(), &cfg)
                     .expect("bench batch must decode")
             });
         });

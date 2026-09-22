@@ -55,7 +55,7 @@ impl Fixture {
 }
 
 fn key(index: u64) -> AccountKey {
-    AccountKey::try_from(Sha256::hash(&index.to_le_bytes()).as_ref()).expect("32-byte key")
+    AccountKey::try_from(Sha256::hash(&[&index.to_le_bytes()]).as_ref()).expect("32-byte key")
 }
 
 fn signed_key(index: u64) -> AccountKey {
@@ -110,6 +110,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             metadata_partition: "bench-state-metadata".into(),
             items_per_blob: NZU64!(1 << 20),
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
             strategy,
             page_cache: cache.clone(),
         },
@@ -118,9 +119,12 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             items_per_blob: NZU64!(1 << 20),
             page_cache: cache,
             write_buffer: NZUsize!(1 << 20),
+            replay_buffer: NZUsize!(1 << 20),
         },
         translator: EightCap,
-        init_cache_size: Some(NZUsize!(1 << 18)),
+        init_cache: Some(NZUsize!(1 << 18)),
+        init_buffer: commonware_utils::NZUsize!(1024 * 1024),
+        init_concurrency: (),
     }
 }
 
@@ -447,7 +451,8 @@ fn main() {
             }
         }
         let merkleized = batch.merkleize().await.expect("seed merkleize");
-        db.finalize(merkleized).await;
+        db.apply(merkleized).await;
+            assert!(db.finalize().await.durable().await);
 
         let fixture_filter = std::env::var("CONSTANTINOPLE_BENCH_FIXTURE").ok();
         let count_filter = std::env::var("CONSTANTINOPLE_BENCH_COUNT")

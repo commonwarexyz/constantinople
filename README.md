@@ -65,6 +65,10 @@ service details.
 
 See [`deploy/README.md`](./bin/deploy/README.md).
 
+To compare baseline consensus, optimistic building with delayed publication, and
+optimistic building with early publication, see the
+[handoff comparison workflow](./docs/handoff-comparison.md).
+
 ## Contributing
 
 See [`CONTRIBUTING.md`](./CONTRIBUTING.md).

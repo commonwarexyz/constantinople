@@ -113,6 +113,16 @@ impl<D: Display> StoredBatchStatus<D> {
     pub(super) const fn has_digest_lists(&self) -> bool {
         matches!(self, Self::PartiallyFinalized { .. })
     }
+
+    /// Number of digests formatted when converting this status to wire form.
+    pub(super) const fn wire_work_len(&self) -> usize {
+        match self {
+            Self::PartiallyFinalized {
+                included, filtered, ..
+            } => included.len().saturating_add(filtered.len()),
+            _ => 0,
+        }
+    }
 }
 
 /// Mempool actor configuration.
@@ -752,7 +762,8 @@ where
                     // the full-body decode is skipped otherwise; the block is
                     // still released on the strategy's pool off this loop.
                     if proposed.is_empty() {
-                        drop(strategy.spawn(move |_: St| drop(block)));
+                        let work_len = block.body.len();
+                        drop(strategy.spawn(work_len, move |_: St| drop(block)));
                         acknowledgement.acknowledge();
                         continue;
                     }
@@ -763,8 +774,9 @@ where
                     // application has not already materialized, so it runs on
                     // the strategy's pool (which also releases the block
                     // there).
+                    let work_len = block.body.len();
                     let finalized: AHashSet<H::Digest> = strategy
-                        .spawn(move |_: St| {
+                        .spawn(work_len, move |_: St| {
                             block
                                 .body
                                 .iter()

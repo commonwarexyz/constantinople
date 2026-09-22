@@ -1,21 +1,30 @@
 //! Constantinople transaction type and transaction wrappers.
 
 use crate::{AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSignature};
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 use commonware_codec::{
-    Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
+    Buf, Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
 };
 use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
 
 /// A signed transaction accepted by the canonical block format.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct SignedTransaction<H>
 where
     H: Hasher,
 {
     inner: Sealed<Transaction<H::Digest>, H>,
     signature: TransactionSignature,
+}
+
+impl<H: Hasher> Clone for SignedTransaction<H> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            signature: self.signature.clone(),
+        }
+    }
 }
 
 impl<H> PartialEq for SignedTransaction<H>
@@ -171,7 +180,9 @@ impl<D: Digest> Transaction<D> {
     /// [`Digest`]: Digest
     pub fn hash_slow<H: Hasher>(&self, hasher: &mut H) -> H::Digest {
         hasher.update(&self.encode());
-        hasher.finalize()
+        let (reset, digest) = core::mem::take(hasher).finalize();
+        *hasher = reset;
+        digest
     }
 
     /// Seals and signs this transaction with a supported transaction signer.
@@ -255,7 +266,7 @@ mod test {
     use super::*;
     use crate::Sealable;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
-    use commonware_codec::{DecodeExt, EncodeSize};
+    use commonware_codec::{Copying, DecodeExt, EncodeSize};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use core::num::NonZeroU64;
@@ -274,7 +285,7 @@ mod test {
         let mut encoded = Vec::with_capacity(reference_tx.encode_size());
         reference_tx.write(&mut encoded);
 
-        let decoded = Transaction::<sha256::Digest>::decode(&mut &encoded[..])
+        let decoded = Transaction::<sha256::Digest>::decode(Copying(&encoded))
             .expect("decoding should succeed");
 
         assert_eq!(
@@ -318,7 +329,7 @@ mod test {
         tx.write(&mut buf);
 
         let decoded =
-            Transaction::<sha256::Digest>::decode(&mut &buf[..]).expect("decoding should succeed");
+            Transaction::<sha256::Digest>::decode(Copying(&buf)).expect("decoding should succeed");
         assert_eq!(decoded, tx);
     }
 
@@ -353,7 +364,7 @@ mod test {
         0u64.write(&mut buf);
         tx.nonce.write(&mut buf);
 
-        let result = Transaction::<sha256::Digest>::decode(&mut &buf[..]);
+        let result = Transaction::<sha256::Digest>::decode(Copying(&buf));
         assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 
@@ -367,7 +378,7 @@ mod test {
                 candidate[1] = first;
                 candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                TransactionPublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(Copying(&candidate))
                     .is_err()
                     .then_some(candidate)
             })
@@ -379,7 +390,7 @@ mod test {
         1u64.write(&mut buf);
         9u64.write(&mut buf);
 
-        let decoded = Transaction::<sha256::Digest>::decode(&mut &buf[..])
+        let decoded = Transaction::<sha256::Digest>::decode(Copying(&buf))
             .expect("decoding should defer sender validation");
 
         assert!(decoded.sender().is_none());

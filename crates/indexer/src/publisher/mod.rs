@@ -19,6 +19,7 @@ pub(crate) mod block;
 pub mod certificate;
 pub mod qmdb;
 pub mod sql;
+mod writer;
 
 pub use certificate::CertificateReporter;
 use commonware_runtime::{

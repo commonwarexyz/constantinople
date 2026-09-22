@@ -128,8 +128,7 @@ mod tests {
             // Decode as the server would.
             let max_transactions = body.len() / 118; // conservative min tx size
             let cfg = (RangeCfg::new(1..=max_transactions), ());
-            let decoded =
-                Vec::<Tx>::decode_cfg(&mut &body[..], &cfg).expect("decode should succeed");
+            let decoded = Vec::<Tx>::decode_cfg(body, &cfg).expect("decode should succeed");
             assert_eq!(decoded.len(), txs.len());
 
             // Verify signatures as the server would (using Sha256, same as the validator).

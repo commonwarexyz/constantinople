@@ -2,7 +2,7 @@
 version = "2026.7.0"
 edition = "2024"
 license = "MIT"
-rust-version = "1.88"
+rust-version = "1.95"
 authors = ["commonware"]
 homepage = "https://commonware.xyz"
 repository = "https://github.com/commonwarexyz/constantinople"
@@ -12,6 +12,7 @@ exclude = ["**/target"]
 
 [workspace]
 resolver = "2"
+exclude = ["vendor/exoware-sdk", "vendor/exoware-qmdb", "vendor/exoware-simplex", "vendor/exoware-simulator"]
 members = [
   "crates/application",
   "crates/engine",
@@ -47,32 +48,32 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
-commonware-actor = "2026.7.0"
-commonware-p2p = "2026.7.0"
-commonware-glue = "2026.7.0"
-commonware-math = "2026.7.0"
-commonware-codec = "2026.7.0"
-commonware-formatting = "2026.7.0"
-commonware-utils = "2026.7.0"
-commonware-coding = "2026.7.0"
-commonware-macros = "2026.7.0"
-commonware-runtime = "2026.7.0"
-commonware-storage = "2026.7.0"
-commonware-deployer = "2026.7.0"
-commonware-parallel = "2026.7.0"
-commonware-resolver = "2026.7.0"
-commonware-broadcast = "2026.7.0"
-commonware-consensus = "2026.7.0"
-commonware-cryptography = { version = "2026.7.0", default-features = false }
+commonware-actor = "=2026.9.0"
+commonware-p2p = "=2026.9.0"
+commonware-glue = "=2026.9.0"
+commonware-math = "=2026.9.0"
+commonware-codec = "=2026.9.0"
+commonware-formatting = "=2026.9.0"
+commonware-utils = "=2026.9.0"
+commonware-coding = "=2026.9.0"
+commonware-macros = "=2026.9.0"
+commonware-runtime = "=2026.9.0"
+commonware-storage = "=2026.9.0"
+commonware-deployer = "=2026.9.0"
+commonware-parallel = "=2026.9.0"
+commonware-resolver = "=2026.9.0"
+commonware-broadcast = "=2026.9.0"
+commonware-consensus = "=2026.9.0"
+commonware-cryptography = { version = "=2026.9.0", default-features = false }
 
 # Exoware
-exoware-sdk = "2026.7.1"
-exoware-server = "2026.7.1"
-exoware-qmdb = "2026.7.1"
-exoware-simplex = "2026.7.1"
-exoware-simulator = "2026.7.1"
-exoware-sql = "2026.7.1"
-datafusion = "52"
+exoware-sdk = "=2026.9.0"
+exoware-server = "=2026.9.0"
+exoware-qmdb = "=2026.9.0"
+exoware-simplex = "=2026.9.0"
+exoware-simulator = "=2026.9.0"
+exoware-sql = "=2026.9.0"
+datafusion = "55"
 
 # Other
 axum = "0.8"
@@ -102,3 +103,35 @@ tracing-subscriber = "0.3"
 [profile.samply]
 inherits = "release"
 debug = true
+
+# Exoware codec compatibility patches are documented in vendor/README.md.
+# Pin direct and transitive Commonware dependencies to PR #4739.
+[patch.crates-io]
+exoware-sdk = { path = "vendor/exoware-sdk" }
+exoware-qmdb = { path = "vendor/exoware-qmdb" }
+exoware-simplex = { path = "vendor/exoware-simplex" }
+exoware-simulator = { path = "vendor/exoware-simulator" }
+commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-broadcast = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-codec = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-codec-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-coding = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-conformance = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-conformance-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-consensus = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-cryptography = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-deployer = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-formatting = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-glue = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-invariants = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-macros-impl = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-math = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-parallel = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-resolver = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-runtime = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-runtime-macros = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-storage = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-stream = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }
+commonware-utils = { git = "https://github.com/commonwarexyz/monorepo", rev = "8d5a87ecf49130dab67fb1a062d4413fd8663995" }

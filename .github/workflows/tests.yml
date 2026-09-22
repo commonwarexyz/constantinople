@@ -40,6 +40,12 @@ jobs:
       - uses: taiki-e/install-action@nextest
       - name: cargo test
         run: cargo nextest run --workspace --all --all-features --locked --partition hash:${{ matrix.partition }}/4
+      - name: Test handoff comparison tool
+        if: matrix.partition == 1
+        run: just test-handoff-comparison
+      - name: Test AWS handoff orchestration
+        if: matrix.partition == 1
+        run: just test-aws-handoffs
 
   test-gate:
     name: Test

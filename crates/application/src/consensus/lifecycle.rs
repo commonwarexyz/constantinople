@@ -29,7 +29,7 @@ use tracing::{Instrument as _, info, info_span, warn};
 
 impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
 where
-    E: BufferPooler + Storage + Metrics + Clock,
+    E: BufferPooler + Storage + Metrics + Clock + Spawner,
     C: Digest,
     H: Hasher,
     P: PublicKey,
@@ -64,6 +64,30 @@ where
     {
         let parent_digest = parent.digest();
         let parent_height = parent.header.height;
+        info!(
+            epoch = context.round.epoch().get(),
+            view = context.round.view().get(),
+            parent_height,
+            height = parent_height + 1,
+            configured_delay_seconds = self.proposal_build_delay.as_secs_f64(),
+            "application.propose.start"
+        );
+
+        // The parent is available before this shared proposal path is entered,
+        // so every handoff policy receives the same synthetic build delay. The
+        // runtime sleep yields asynchronously and is cancelled when this
+        // proposal future is dropped.
+        let delay_started = runtime.current();
+        if !self.proposal_build_delay.is_zero() {
+            runtime.sleep(self.proposal_build_delay).await;
+        }
+        let injected_delay = runtime
+            .current()
+            .duration_since(delay_started)
+            .unwrap_or_default();
+        self.proposal_build_delay_duration
+            .observe(injected_delay.as_secs_f64());
+        let build_started = runtime.current();
 
         // Select from the mempool, then execute the selection best effort
         // against the parent's state: anything inapplicable there fails its
@@ -91,10 +115,10 @@ where
         // decoded transactions) is released on the strategy's pool so the
         // drop stays off the propose path.
         let drop_span = info_span!("application.propose.drop_parent");
-        drop(
-            self.strategy
-                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
-        );
+        let parent_transaction_count = parent.body.len();
+        drop(self.strategy.spawn(parent_transaction_count, move |_: St| {
+            drop_span.in_scope(|| drop(parent))
+        }));
 
         self.proposed_transactions
             .inc_by(execution.block.transaction_count as u64);
@@ -110,6 +134,12 @@ where
             transactions_range: execution.block.transactions_range.clone(),
         };
         let block = Block::new(header, execution.body).seal(&mut H::default());
+        let build_duration = runtime
+            .current()
+            .duration_since(build_started)
+            .unwrap_or_default();
+        self.proposal_build_duration
+            .observe(build_duration.as_secs_f64());
 
         info!(
             epoch = block.header.context.round.epoch().get(),
@@ -117,6 +147,8 @@ where
             height = block.header.height,
             txs = execution.block.transaction_count,
             timestamp = block.header.timestamp,
+            build_duration_seconds = build_duration.as_secs_f64(),
+            injected_delay_seconds = injected_delay.as_secs_f64(),
             "application.propose.complete"
         );
 
@@ -205,10 +237,10 @@ where
         // decoded transactions) is released on the strategy's pool so the
         // drop stays off the verify path.
         let drop_span = info_span!("application.verify.drop_parent");
-        drop(
-            self.strategy
-                .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
-        );
+        let parent_transaction_count = parent.body.len();
+        drop(self.strategy.spawn(parent_transaction_count, move |_: St| {
+            drop_span.in_scope(|| drop(parent))
+        }));
 
         let execution = match result {
             Ok(((), execution, ())) => execution,
@@ -234,7 +266,7 @@ where
         Some(execution.into_merkleized())
     }
 
-    /// Applies a certified block to speculative batches.
+    /// Replays a block into speculative batches, rejecting invalid execution.
     #[doc(hidden)]
     #[boxed]
     #[tracing::instrument(
@@ -247,7 +279,7 @@ where
         (_, _): (E, Context<C, P>),
         block: &SealedBlock<C, P, H>,
         batches: <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Unmerkleized,
-    ) -> <<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized
+    ) -> Option<<<Self as CApplication<E>>::Databases as DatabaseSet<E>>::Merkleized>
     where
         E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
         S: Scheme<PublicKey = P>,
@@ -257,13 +289,16 @@ where
         let strategy = self.strategy.clone();
         let body = block.body.clone();
         let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
+        let transaction_count = body.len();
         let (body, digests) = strategy
-            .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, &body)))
+            .spawn(transaction_count, move |s| {
+                prepare_span.in_scope(|| prepare_lazy(&s, &body))
+            })
             .await
-            .unwrap_or_else(|reason| panic!("certified block contained {reason}"));
+            .ok()?;
 
         let (state_batch, transaction_batch) = batches;
-        apply_prepared_body::<E, H, St>(
+        let execution = apply_prepared_body::<E, H, St>(
             state_batch,
             transaction_batch,
             mmr::Location::new(block.header.transactions_range.start()),
@@ -272,6 +307,15 @@ where
             strategy,
         )
         .await
-        .unwrap_or_else(|reason| panic!("certified block contained {reason}"))
+        .ok()?;
+        // Replay can be requested for an uncertified ancestor. Reject a bad
+        // commitment instead of handing it to Stateful as executable state.
+        if !<Self as CApplication<E>>::Databases::matches_sync_targets(
+            &execution,
+            &<Self as CApplication<E>>::sync_targets(block),
+        ) {
+            return None;
+        }
+        Some(execution)
     }
 }

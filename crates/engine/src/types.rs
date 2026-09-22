@@ -5,6 +5,8 @@
 //! engine and test modules.
 
 use crate::ThresholdScheme;
+/// A finalized block with its seal (commitment-based).
+pub use crate::block::EngineBlock;
 use commonware_actor::Feedback;
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
@@ -22,20 +24,22 @@ use commonware_consensus::{
 use commonware_cryptography::{
     Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
 };
-use commonware_glue::stateful::Stateful;
+use commonware_glue::stateful::{Stateful, db::Shared};
 use commonware_storage::{mmr, qmdb::any::unordered::fixed, translator::EightCap};
-use commonware_utils::sync::TracedAsyncRwLock;
 use constantinople_application::consensus::{
-    Application, TransactionHistoryDb, TransactionHistoryOperation,
+    FinalizedHookFn, TransactionHistoryDb, TransactionHistoryOperation,
 };
-use constantinople_primitives::{Account, AccountKey, Block, Header, Sealed};
-use std::{marker::PhantomData, sync::Arc};
+use constantinople_primitives::{Account, AccountKey, Header, Sealed};
+use std::marker::PhantomData;
 
-/// A finalized block with its seal (commitment-based).
-pub type EngineBlock<H, P> = Sealed<Block<Commitment, P, H>, H>;
+/// Typed coding commitment to the engine block.
+pub type EngineCommitment<H, P> = Commitment<EngineBlock<H, P>, ReedSolomon<H>, H>;
+
+/// Finalized-data capture hook for the engine's execution blocks.
+pub type EngineFinalizedHook<E, H, P, St> = FinalizedHookFn<E, EngineCommitment<H, P>, H, P, St>;
 
 /// The digestible execution header portion of an [`EngineBlock`].
-pub type EngineHeader<H, P> = Sealed<Header<Commitment, <H as Hasher>::Digest, P>, H>;
+pub type EngineHeader<H, P> = Sealed<Header<EngineCommitment<H, P>, <H as Hasher>::Digest, P>, H>;
 
 /// The erasure-coding variant used by the marshal for block availability.
 pub type EngineVariant<H, P> = Coding<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
@@ -51,43 +55,49 @@ pub type EngineProbeMailbox<H, P, V> =
     commonware_glue::stateful::probe::Mailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
 
 /// A finalization certificate over the engine's threshold scheme.
-pub type EngineFinalization<P, V> = Finalization<ThresholdScheme<P, V>, Commitment>;
+pub type EngineFinalization<P, V, H = commonware_cryptography::Sha256> =
+    Finalization<ThresholdScheme<P, V>, EngineCommitment<H, P>>;
 
 /// Simplex activity stream observed by the engine, used by the optional
 /// `simplex_observer` reporter slot in [`crate::Config`].
-pub type EngineActivity<P, V> = simplex::types::Activity<ThresholdScheme<P, V>, Commitment>;
+pub type EngineActivity<P, V, H = commonware_cryptography::Sha256> =
+    simplex::types::Activity<ThresholdScheme<P, V>, EngineCommitment<H, P>>;
 
 /// A no-op [`Reporter`] over [`EngineActivity`].
 ///
-/// Pass `None::<NoopActivityReporter<P, V>>` to [`crate::Config::simplex_observer`]
+/// Pass `None::<NoopActivityReporter<P, V, H>>` to [`crate::Config::simplex_observer`]
 /// when no external observer is wired in. The type parameter exists only to
 /// pin the activity type; the reporter never forwards anything.
-pub struct NoopActivityReporter<P, V>(PhantomData<fn() -> (P, V)>);
+#[allow(clippy::type_complexity)] // Track activity types without imposing their auto-trait bounds.
+pub struct NoopActivityReporter<P, V, H = commonware_cryptography::Sha256>(
+    PhantomData<fn() -> (P, V, H)>,
+);
 
-impl<P, V> Default for NoopActivityReporter<P, V> {
+impl<P, V, H> Default for NoopActivityReporter<P, V, H> {
     fn default() -> Self {
         Self(PhantomData)
     }
 }
 
-impl<P, V> Clone for NoopActivityReporter<P, V> {
+impl<P, V, H> Clone for NoopActivityReporter<P, V, H> {
     fn clone(&self) -> Self {
         Self::default()
     }
 }
 
-impl<P, V> std::fmt::Debug for NoopActivityReporter<P, V> {
+impl<P, V, H> std::fmt::Debug for NoopActivityReporter<P, V, H> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NoopActivityReporter").finish()
     }
 }
 
-impl<P, V> Reporter for NoopActivityReporter<P, V>
+impl<P, V, H> Reporter for NoopActivityReporter<P, V, H>
 where
     P: PublicKey,
     V: Variant,
+    H: Hasher,
 {
-    type Activity = EngineActivity<P, V>;
+    type Activity = EngineActivity<P, V, H>;
 
     fn report(&mut self, _: Self::Activity) -> Feedback {
         Feedback::Ok
@@ -98,44 +108,33 @@ pub(crate) type CodingBlock<H, P> = StoredCodedBlock<EngineBlock<H, P>, ReedSolo
 
 pub type StateDb<E, H, T> = fixed::Db<mmr::Family, E, AccountKey, Account, H, EightCap, T>;
 
-pub type StateSyncDb<E, H, T> = Arc<TracedAsyncRwLock<StateDb<E, H, T>>>;
+pub type StateSyncDb<E, H, T> = Shared<StateDb<E, H, T>>;
 
-pub(crate) type StateResolverMailbox<E, H, T> =
-    commonware_glue::stateful::db::p2p::standard::Mailbox<
-        StateDb<E, H, T>,
-        mmr::Family,
-        <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Op,
-        <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::resolver::Resolver>::Digest,
-    >;
+pub(crate) type StateResolverMailbox<E, H, T> = commonware_glue::stateful::db::p2p::Mailbox<
+    StateDb<E, H, T>,
+    mmr::Family,
+    <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::Source>::Op,
+    <StateSyncDb<E, H, T> as commonware_storage::qmdb::sync::Source>::Digest,
+>;
 
 pub(crate) type StateResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::p2p::standard::Actor<E, P, M, B, mmr::Family, StateDb<E, H, T>>;
+    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, StateDb<E, H, T>>;
 
 pub type TransactionDb<E, H, T> = TransactionHistoryDb<E, H, T>;
 
-pub type TransactionSyncDb<E, H, T> = Arc<TracedAsyncRwLock<TransactionDb<E, H, T>>>;
+pub type TransactionSyncDb<E, H, T> = Shared<TransactionDb<E, H, T>>;
 
-pub(crate) type TransactionResolverMailbox<E, H, T> =
-    commonware_glue::stateful::db::p2p::compact::Mailbox<
-        TransactionDb<E, H, T>,
-        mmr::Family,
-        TransactionHistoryOperation<H>,
-        H,
-    >;
+pub(crate) type TransactionResolverMailbox<E, H, T> = commonware_glue::stateful::db::p2p::Mailbox<
+    TransactionDb<E, H, T>,
+    mmr::Family,
+    TransactionHistoryOperation<H>,
+    <H as Hasher>::Digest,
+>;
 
 pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
-    commonware_glue::stateful::db::p2p::compact::Actor<
-        E,
-        P,
-        M,
-        B,
-        mmr::Family,
-        TransactionDb<E, H, T>,
-        H,
-    >;
+    commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, TransactionDb<E, H, T>>;
 
-pub(crate) type App<E, H, P, V, I, B, St> =
-    Application<E, H, Commitment, ThresholdScheme<P, V>, P, I, B, St>;
+pub(crate) use crate::application::App;
 
 pub(crate) type AppMailbox<E, H, P, V, I, B, St> =
     commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, St>>;
@@ -172,14 +171,14 @@ pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSol
 /// Reporter combinator that fans simplex activity to the marshal mailbox and
 /// an optional external observer (e.g. the indexer's certificate publisher).
 pub(crate) type SimplexReporter<H, P, V, O> =
-    Reporters<EngineActivity<P, V>, EngineMarshalMailbox<H, P, V>, O>;
+    Reporters<EngineActivity<P, V, H>, EngineMarshalMailbox<H, P, V>, O>;
 
 pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
     E,
     ThresholdScheme<P, V>,
     L,
     B,
-    Commitment,
+    EngineCommitment<H, P>,
     MarshaledApp<E, H, P, V, I, BV, St>,
     MarshaledApp<E, H, P, V, I, BV, St>,
     SimplexReporter<H, P, V, O>,

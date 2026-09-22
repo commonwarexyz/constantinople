@@ -28,7 +28,8 @@ where
     St: Strategy,
 {
     let span = info_span!("application.verify.signatures", txs = body.len().traced());
-    strategy.spawn(move |strategy| {
+    let transaction_count = body.len();
+    strategy.spawn(transaction_count, move |strategy| {
         span.in_scope(|| {
             let transactions = body.as_ref().as_slice();
             (preload_transaction_slice(transactions, &strategy)

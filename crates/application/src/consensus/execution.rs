@@ -102,7 +102,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
 };
-use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
+use commonware_storage::{merkle::Family, mmr, qmdb::chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
@@ -168,9 +168,12 @@ where
     S: Strategy,
 {
     let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
+    let transfer_count = transfers.len();
     let plan = {
         let transfers = Arc::clone(&transfers);
-        strategy.spawn(move |_: S| plan_span.in_scope(|| executor::execution_plan(&transfers)))
+        strategy.spawn(transfer_count, move |_: S| {
+            plan_span.in_scope(|| executor::execution_plan(&transfers))
+        })
     }
     .await;
     let Some(plan) = plan else {
@@ -181,8 +184,11 @@ where
         "application.execute.build",
         accounts = values.len().traced()
     );
+    let account_count = values.len();
     let updates = strategy
-        .spawn(move |_: S| build_span.in_scope(|| build_updates(plan, transfers, values)))
+        .spawn(account_count, move |_: S| {
+            build_span.in_scope(|| build_updates(plan, transfers, values))
+        })
         .await;
     (staged, updates)
 }
@@ -440,8 +446,9 @@ where
         );
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
+        let candidate_count = candidates.len();
         let (candidates_back, prepared, transfers, selector_back, missing) = strategy
-            .spawn({
+            .spawn(candidate_count, {
                 let accounts_span = accounts_span.clone();
                 let mut selector = selector;
                 move |s: S| {
@@ -504,8 +511,9 @@ where
             txs = transfers.len().traced(),
             dropped = tracing::field::Empty,
         );
+        let transfer_count = transfers.len();
         let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
-            .spawn({
+            .spawn(transfer_count, {
                 let span = select_span.clone();
                 let mut selector = selector;
                 let mut body = body;
@@ -552,7 +560,8 @@ where
                     .expect("transaction batch is owned until the first append"),
             };
             let apply_span = info_span!("application.execute.apply", txs = chunk.len().traced());
-            pending_append = Some(Box::pin(strategy.spawn(move |_: S| {
+            let digest_count = chunk.len();
+            pending_append = Some(Box::pin(strategy.spawn(digest_count, move |_: S| {
                 apply_span.in_scope(|| apply_transaction_digests(batch, &chunk))
             })));
         }
@@ -625,8 +634,11 @@ where
     S: Strategy,
 {
     let prepare_span = info_span!("application.execute.prepare", txs = body.len().traced());
+    let transaction_count = body.len();
     let (transfers, digests) = strategy
-        .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice())))
+        .spawn(transaction_count, move |s| {
+            prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice()))
+        })
         .await?;
 
     let transaction_count = transfers.len();
@@ -635,7 +647,8 @@ where
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let apply = strategy.spawn(move |_: S| {
+    let digest_count = digests.len();
+    let apply = strategy.spawn(digest_count, move |_: S| {
         apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
@@ -675,7 +688,8 @@ where
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let apply = strategy.spawn(move |_: S| {
+    let digest_count = digests.len();
+    let apply = strategy.spawn(digest_count, move |_: S| {
         apply_span.in_scope(|| {
             apply_transaction_digests(transaction_batch, &digests)
                 .with_inactivity_floor(transaction_floor)
@@ -760,25 +774,36 @@ where
     }
 }
 
-fn range_from_bounds<F>(bounds: &Bounds<F>) -> commonware_utils::range::NonEmptyRange<u64>
+fn range_from_bounds<F, D: commonware_cryptography::Digest>(
+    bounds: &Bounds<F, D>,
+) -> commonware_utils::range::NonEmptyRange<u64>
 where
     F: Family,
 {
-    non_empty_range!(*bounds.inactivity_floor, bounds.total_size)
+    non_empty_range!(*bounds.inactivity_floor, *bounds.tip.size)
 }
 
 #[cfg(test)]
 mod tests {
     use super::range_from_bounds;
-    use commonware_storage::{mmr, qmdb::batch_chain::Bounds};
+    use commonware_storage::{mmr, qmdb::chain::Bounds};
     use commonware_utils::non_empty_range;
 
     #[test]
     fn range_comes_from_qmdb_bounds() {
         let bounds = Bounds {
-            base_size: 7,
-            db_size: 9,
-            total_size: 15,
+            base: commonware_storage::qmdb::chain::Commitment {
+                size: mmr::Location::new(7),
+                root: commonware_cryptography::sha256::Digest::from([0; 32]),
+            },
+            db: commonware_storage::qmdb::chain::Commitment {
+                size: mmr::Location::new(9),
+                root: commonware_cryptography::sha256::Digest::from([0; 32]),
+            },
+            tip: commonware_storage::qmdb::chain::Commitment {
+                size: mmr::Location::new(15),
+                root: commonware_cryptography::sha256::Digest::from([0; 32]),
+            },
             ancestors: Vec::new(),
             inactivity_floor: mmr::Location::new(11),
         };
