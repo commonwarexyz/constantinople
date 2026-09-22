@@ -3,6 +3,7 @@ use commonware_codec::{Decode, Encode};
 use commonware_cryptography::{Hasher, PublicKey};
 use constantinople_engine::types::{EngineBlock, EngineHeader};
 use constantinople_primitives::{Block, BlockCfg, LazySignedTransaction, Sealed};
+use std::sync::Arc;
 
 pub(crate) fn encode_simplex_block_parts<H, P>(
     block: &EngineBlock<H, P>,
@@ -29,5 +30,11 @@ where
     let header = header.into_inner();
     let body_cfg = (cfg.max_transactions, ());
     let body = Vec::<LazySignedTransaction<H>>::decode_cfg(body, &body_cfg)?;
-    Ok(Sealed::new_unchecked(Block { header, body }, seal))
+    Ok(Sealed::new_unchecked(
+        Block {
+            header,
+            body: Arc::new(body),
+        },
+        seal,
+    ))
 }

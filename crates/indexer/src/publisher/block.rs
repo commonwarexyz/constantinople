@@ -239,6 +239,7 @@ mod tests {
     use core::num::NonZeroU64;
     use exoware_sql::CellValue;
     use rand::{SeedableRng, rngs::StdRng};
+    use std::sync::Arc;
 
     #[test]
     fn r1_sender_history_uses_account_key() {
@@ -298,7 +299,7 @@ mod tests {
         let block = Sealed::new_unchecked(
             Block {
                 header: test_header(consensus_key.public_key(), 1),
-                body: vec![lazy],
+                body: Arc::new(vec![lazy]),
             },
             sha256::Digest::EMPTY,
         );

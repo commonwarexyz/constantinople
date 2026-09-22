@@ -12,6 +12,7 @@ use commonware_consensus::{
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_utils::range::NonEmptyRange;
+use std::sync::Arc;
 
 /// A block header containing metadata, consensus context, and state commitment roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +180,12 @@ where
     /// decoding does not pay the per-transaction decode + seal-hash cost on the
     /// caller's thread. Materialization is typically driven in parallel at
     /// verify time via a [`commonware_parallel::Strategy`].
-    pub body: Vec<LazySignedTransaction<H>>,
+    ///
+    /// The body is shared through an `Arc` so readers that need an owned
+    /// handle (for example to hand the body to a thread pool) take one
+    /// reference count, and so the decoded values cached by one reader are
+    /// visible to every other holder of the same block.
+    pub body: Arc<Vec<LazySignedTransaction<H>>>,
 }
 
 /// A sealed canonical block.
@@ -198,7 +204,7 @@ where
         let body: Vec<SignedTransaction<H>> = u.arbitrary()?;
         Ok(Self {
             header: u.arbitrary()?,
-            body: body.into_iter().map(LazySignedTransaction::new).collect(),
+            body: Arc::new(body.into_iter().map(LazySignedTransaction::new).collect()),
         })
     }
 }
@@ -233,7 +239,7 @@ where
     pub fn new(header: Header<C, H::Digest, P>, body: Vec<SignedTransaction<H>>) -> Self {
         Self {
             header,
-            body: body.into_iter().map(LazySignedTransaction::new).collect(),
+            body: Arc::new(body.into_iter().map(LazySignedTransaction::new).collect()),
         }
     }
 }
@@ -273,7 +279,7 @@ where
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
             header: Header::read_cfg(buf, &())?,
-            body: Vec::read_cfg(buf, &tx_vec_cfg)?,
+            body: Arc::new(Vec::read_cfg(buf, &tx_vec_cfg)?),
         })
     }
 }
