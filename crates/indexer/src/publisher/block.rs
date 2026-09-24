@@ -15,7 +15,7 @@ use constantinople_primitives::{
     AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
 };
 use std::array::TryFromSliceError;
-use tracing::warn;
+use tracing::{info_span, warn};
 
 pub(crate) struct BlockRows<D: Digest> {
     /// SQL rows for the block, its transactions, and their account activity.
@@ -88,6 +88,12 @@ where
 {
     let height = block.header.height;
     let body_len = block.body.len();
+    let _entered = info_span!(
+        "indexer.qmdb.prepare.block_transactions",
+        height,
+        transactions = body_len
+    )
+    .entered();
     let indexed_txs = indexed_transactions(block).collect::<Vec<_>>();
     let tx_count = u64::try_from(indexed_txs.len()).expect("transaction count fits u64");
     let append_start = block

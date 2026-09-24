@@ -19,7 +19,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{Instrument as _, Span, info_span, warn};
 
 const CLEANUP_CAPACITY: usize = 64;
 
@@ -131,19 +131,22 @@ struct Inner<E: Storage> {
 }
 
 pub(crate) struct PayloadCleanup {
-    sender: mpsc::Sender<(u64, u64)>,
+    sender: mpsc::Sender<(u64, u64, Span, Span)>,
     pending: Gauge,
 }
 
 impl PayloadCleanup {
     pub(crate) async fn enqueue(&self, height: u64, len: u64) {
+        let parent = Span::current();
         let permit = self
             .sender
             .reserve()
+            .instrument(info_span!("indexer.cleanup.capacity_wait", height))
             .await
             .expect("payload cleanup task stopped");
         self.pending.inc();
-        permit.send((height, len));
+        let queued = info_span!("indexer.cleanup.queue_wait", height);
+        permit.send((height, len, parent, queued));
     }
 }
 
@@ -187,19 +190,35 @@ impl<E: Storage> PayloadStore<E> {
         };
         let payloads = self.clone();
         let task = context.spawn(move |context| async move {
-            while let Some((height, len)) = receiver.recv().await {
-                let started = Instant::now();
-                loop {
-                    match payloads.remove(height, len).await {
-                        Ok(()) => break,
-                        Err(error) => {
-                            warn!(error = %error, height, "failed to remove finalized index payload, retrying");
-                            context.sleep(Duration::from_secs(1)).await;
+            while let Some((height, len, parent, queued)) = receiver.recv().await {
+                drop(queued);
+                let remove = info_span!(parent: &parent, "indexer.cleanup.remove", height, bytes = len);
+                async {
+                    let started = Instant::now();
+                    let mut attempt = 0u64;
+                    loop {
+                        attempt += 1;
+                        match payloads
+                            .remove(height, len)
+                            .instrument(info_span!("indexer.cleanup.attempt", height, attempt))
+                            .await
+                        {
+                            Ok(()) => break,
+                            Err(error) => {
+                                warn!(error = %error, height, "failed to remove finalized index payload, retrying");
+                                context
+                                    .sleep(Duration::from_secs(1))
+                                    .instrument(info_span!("indexer.cleanup.retry_wait", height, attempt))
+                                    .await;
+                            }
                         }
                     }
+                    duration.observe(started.elapsed().as_secs_f64());
+                    pending.dec();
                 }
-                duration.observe(started.elapsed().as_secs_f64());
-                pending.dec();
+                .instrument(remove)
+                .await;
+                parent.in_scope(|| parent.record("outcome", "deleted"));
             }
         });
         (cleanup, task)
@@ -218,13 +237,15 @@ impl<E: Storage> PayloadStore<E> {
     ) -> Result<PayloadDescriptor, Error> {
         let descriptor = PayloadDescriptor {
             len: payload.len() as u64,
-            crc: Crc32::checksum(&payload),
+            crc: info_span!("indexer.payload.checksum", height, bytes = payload.len())
+                .in_scope(|| Crc32::checksum(&payload)),
         };
         let open_started = Instant::now();
         let opened = self
             .inner
             .context
             .open(&self.inner.partition, &blob_name(height))
+            .instrument(info_span!("indexer.payload.write_open", height))
             .await;
         self.inner
             .metrics
@@ -232,16 +253,26 @@ impl<E: Storage> PayloadStore<E> {
             .observe(open_started.elapsed().as_secs_f64());
         let (blob, existing) = opened?;
         if existing != 0 {
-            blob.resize(0).await?;
+            blob.resize(0)
+                .instrument(info_span!("indexer.payload.truncate", height))
+                .await?;
         }
         let write_started = Instant::now();
-        blob.write_at(0, payload, WriteOptions::default()).await?;
+        blob.write_at(0, payload, WriteOptions::default())
+            .instrument(info_span!(
+                "indexer.payload.write",
+                height,
+                bytes = descriptor.len
+            ))
+            .await?;
         self.inner
             .metrics
             .write_duration
             .observe(write_started.elapsed().as_secs_f64());
         let sync_started = Instant::now();
-        blob.sync().await?;
+        blob.sync()
+            .instrument(info_span!("indexer.payload.sync", height))
+            .await?;
         self.inner
             .metrics
             .sync_duration
@@ -265,6 +296,7 @@ impl<E: Storage> PayloadStore<E> {
             .inner
             .context
             .open(&self.inner.partition, &blob_name(height))
+            .instrument(info_span!("indexer.payload.read_open", height))
             .await;
         self.inner
             .metrics
@@ -280,11 +312,13 @@ impl<E: Storage> PayloadStore<E> {
         let len = usize::try_from(descriptor.len).expect("payload length fits usize");
         let bytes: Bytes = blob
             .read_at(0, len, ReadOptions::default())
+            .instrument(info_span!("indexer.payload.read", height, bytes = len))
             .await?
             .coalesce()
             .freeze()
             .into();
-        let crc = Crc32::checksum(&bytes);
+        let crc = info_span!("indexer.payload.checksum", height, bytes = len)
+            .in_scope(|| Crc32::checksum(&bytes));
         if crc != descriptor.crc {
             return Err(PayloadReadError::Checksum {
                 expected: descriptor.crc,
@@ -387,6 +421,94 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     const PARTITION: &str = "finalized-payloads-test";
+
+    #[test]
+    fn trace_lives_through_cleanup_wait_and_retries() {
+        use crate::indexer_tracing::{CaptureTraces, block_span, testing::Capture};
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tracing::Instrument as _;
+        use tracing_subscriber::prelude::*;
+
+        let captured = Capture::default();
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(captured.clone())
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("indexer-test")));
+        tracing::subscriber::with_default(subscriber, || {
+            deterministic::Runner::default().start(|context| async move {
+                let started = Arc::new(Notify::new());
+                let release = Arc::new(Semaphore::new(0));
+                let attempts = Arc::new(AtomicUsize::new(0));
+                let payloads = PayloadStore {
+                    inner: Arc::new(Inner {
+                        context: GatedStorage {
+                            inner: context.child("storage"),
+                            started: started.clone(),
+                            release: release.clone(),
+                            attempts: attempts.clone(),
+                            gate_open: false,
+                        },
+                        partition: PARTITION.into(),
+                        metrics: PayloadMetrics::new(&context.child("payloads")),
+                    }),
+                };
+                let payload = payloads
+                    .write(7, Bytes::from_static(b"payload"))
+                    .await
+                    .unwrap();
+                let traces = CaptureTraces::default();
+                let root = block_span(7, "finalization");
+                let root_id = root.id().unwrap().into_u64();
+                traces.register(7, root);
+                let (cleanup, task) = payloads.start_cleanup(context.child("cleanup"));
+                cleanup
+                    .enqueue(7, payload.len)
+                    .instrument(traces.take(7, false))
+                    .await;
+                started.notified().await;
+                let spans = captured.spans();
+                assert!(!spans[&root_id].closed);
+                let removal = spans
+                    .values()
+                    .find(|span| span.name == "indexer.cleanup.remove")
+                    .unwrap();
+                assert_eq!(removal.parent, Some(root_id));
+                assert!(!removal.closed);
+
+                release.add_permits(1);
+                started.notified().await;
+                assert_eq!(attempts.load(Ordering::SeqCst), 1);
+                assert!(!captured.spans()[&root_id].closed);
+                release.add_permits(1);
+                drop(cleanup);
+                task.await.unwrap();
+                assert_eq!(attempts.load(Ordering::SeqCst), 2);
+                let spans = captured.spans();
+                assert!(spans[&root_id].closed);
+                assert_eq!(spans[&root_id].fields["outcome"], "deleted");
+                let exported = exporter.get_finished_spans().unwrap();
+                let root = exported
+                    .iter()
+                    .find(|span| span.name == "indexer.block")
+                    .unwrap();
+                let removal = exported
+                    .iter()
+                    .find(|span| span.name == "indexer.cleanup.remove")
+                    .unwrap();
+                assert_eq!(
+                    root.span_context.trace_id(),
+                    removal.span_context.trace_id()
+                );
+                assert_eq!(removal.parent_span_id, root.span_context.span_id());
+                assert!(root.end_time >= removal.end_time);
+                assert!(payloads.heights().await.unwrap().is_empty());
+            });
+        });
+    }
 
     fn store(context: &deterministic::Context) -> PayloadStore<deterministic::Context> {
         PayloadStore::new(context.child("finalized_payloads"), PARTITION.into())

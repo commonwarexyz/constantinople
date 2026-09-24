@@ -3,6 +3,7 @@
 mod cli;
 mod config;
 mod finalized_payloads;
+mod indexer_tracing;
 mod relayer;
 mod run;
 mod state_reader;

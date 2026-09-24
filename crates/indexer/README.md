@@ -135,8 +135,59 @@ queue acknowledgements advance only through the contiguous completed prefix.
 This keeps SQL-row encoding off the finalized application path while making
 recovery independent from local database pruning.
 
+QMDB and SQL data requests are limited to 3.75 MiB (3,932,160 encoded bytes) and
+65,536 rows. Up to 64 chunks per block can upload concurrently. This permits one
+wave for blocks with at most 64 chunks, subject to shared runtime and Store
+capacity. The byte ceiling across those requests is 240 MiB per block. This
+excludes request overhead and other copies. Simplex full-block uploads use a
+separate request path.
+
 Remote Store commits retry indefinitely with a capped exponential backoff using
 the fully staged `StoreWriteBatch`, so a transient store outage stalls queued
 upload progress rather than dropping data.
 
 [`Exact`]: https://docs.rs/commonware-utils/latest/commonware_utils/acknowledgement/struct.Exact.html
+
+## Tracing finalized uploads
+
+The owning secondary exports these spans through the validator's existing
+OpenTelemetry pipeline. Set the deployer's `--traces` sampling rate above zero
+and keep the `info` log level enabled. `deploy.sh` configures `--traces 1`. In Grafana
+Explore, select Tempo and search by block height with
+[TraceQL](https://grafana.com/docs/tempo/latest/traceql/construct-traceql-queries/):
+
+```traceql
+{ span.height = 12345 }
+```
+
+Add `&& resource.service.name = "<secondary public key>"` inside the braces to
+restrict the search to one secondary. Heights are numeric span attributes.
+
+Each `indexer.block` trace starts at the finalized hook and remains open through
+durable queue pruning and successful payload deletion. Its fields include
+`height`, `block_digest`, queue `position`, `payload_bytes`, and `outcome`.
+Child spans expose these stages:
+
+| Stage | Spans and timing |
+| ----- | ---------------- |
+| Capture and enqueue | Receipt lock, artifact validation, payload encoding, checksum, file writes and sync, and durable queue enqueue. `indexer.queue.enqueue_to_read` includes enqueue persistence and time until the consumer reads the record. |
+| Admission | Memory admission, payload read and decode, and waiting for the ordered admission turn. |
+| QMDB and SQL preparation | `indexer.qmdb.prepare.*` separates authenticated state and transaction preparation, metadata construction, transaction and account rows, SQL encoding and staging, QMDB staging, and request chunking. Scheduling waits are separate spans. |
+| Simplex preparation | `indexer.simplex.*` separates queue waits, full body encoding, row preparation and staging, certificate gates, and persistence. |
+| Store uploads | Each `indexer.qmdb.chunk` records its index, chunk count, rows, and encoded bytes. Concurrent chunks appear as sibling spans. `store_commit` contains individual `store_put_attempt` spans and retry backoffs. Attempts include SDK request encoding, compression, and network time. |
+| Publication and deletion | Per-block waits cover publication, ordered acknowledgement, section pruning, cleanup capacity, and cleanup execution. Payload deletion attempts and retry delays remain within the block trace. |
+
+Grouped publication barriers and queue pruning cover multiple blocks. They carry
+height ranges and span links to the contributing block traces. Each block also
+has its own wait spans. Queue storage prunes complete sections of 16 records,
+so a block can wait for later blocks after its uploads finish.
+
+Durations measure wall time. They can include scheduling or parallel CPU work
+and are not CPU profiles. Completed child spans can appear before the root
+exports at deletion. Search by height to find these partial traces.
+
+Trace context is kept in memory without changing durable queue records. After a
+restart, replay starts a new trace with `origin = "replay"`. The enqueue context
+registry retains at most 4096 blocks. Older contexts close with
+`outcome = "context_evicted"`, and their eventual uploads start a new trace with
+`origin = "continuation"`. Search by height to correlate these traces.

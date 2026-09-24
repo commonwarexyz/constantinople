@@ -52,6 +52,9 @@ futures.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+opentelemetry = { workspace = true, features = ["trace"] }
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
+tracing-opentelemetry.workspace = true
 
 # Other
 tower = { workspace = true, features = ["util"] }

@@ -1805,6 +1805,8 @@ dependencies = [
  "constantinople-primitives",
  "futures",
  "mimalloc",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "reqwest",
  "serde",
  "serde_json",
@@ -1813,6 +1815,7 @@ dependencies = [
  "tower",
  "tower-http 0.6.11",
  "tracing",
+ "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 

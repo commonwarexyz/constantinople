@@ -26,7 +26,9 @@ use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
 use futures::{StreamExt, stream::FuturesUnordered};
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, warn};
+use tracing::{
+    Dispatch, Instrument as _, Span, debug, field, info_span, instrument::WithSubscriber as _, warn,
+};
 
 /// Cloneable reporter over Simplex activity.
 pub struct CertificateReporter<H, P, S>
@@ -282,7 +284,7 @@ where
 async fn enqueue_input<H, P, S>(
     tx: &mpsc::Sender<QueuedSimplexInput<H, P, S>>,
     metrics: &SimplexUploadMetrics,
-    input: QueuedSimplexInput<H, P, S>,
+    mut input: QueuedSimplexInput<H, P, S>,
 ) -> Result<(), CertificateUploaderStopped>
 where
     H: Hasher + Send + Sync + 'static,
@@ -290,8 +292,13 @@ where
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
 {
-    let permit = tx.reserve().await.map_err(|_| CertificateUploaderStopped)?;
+    let permit = tx
+        .reserve()
+        .instrument(input.trace.enqueue_wait_span())
+        .await
+        .map_err(|_| CertificateUploaderStopped)?;
     metrics.queue_depth.inc();
+    input.prepare_wait = Some(input.trace.prepare_wait_span());
     permit.send(input);
     Ok(())
 }
@@ -309,11 +316,15 @@ fn dispatch_input<H, P, S>(
     let tx = tx.clone();
     let metrics = metrics.clone();
     let input = QueuedSimplexInput::new(input);
-    tokio::spawn(async move {
-        if let Err(error) = enqueue_input(&tx, &metrics, input).await {
-            warn!("simplex certificate uploader stopped; dropping activity: {error}");
+    let dispatch = input.trace.dispatch.clone();
+    tokio::spawn(
+        async move {
+            if let Err(error) = enqueue_input(&tx, &metrics, input).await {
+                warn!("simplex certificate uploader stopped; dropping activity: {error}");
+            }
         }
-    });
+        .with_subscriber(dispatch),
+    );
 }
 
 struct QueuedSimplexInput<H, P, S>
@@ -323,6 +334,8 @@ where
     S: Scheme,
 {
     queued_at: Instant,
+    trace: SimplexTrace,
+    prepare_wait: Option<Span>,
     input: SimplexInput<H, P, S>,
 }
 
@@ -333,9 +346,166 @@ where
     S: Scheme,
 {
     fn new(input: SimplexInput<H, P, S>) -> Self {
+        let trace = SimplexTrace::new(&input);
         Self {
             queued_at: Instant::now(),
+            trace,
+            prepare_wait: None,
             input,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SimplexTrace {
+    parent: Span,
+    dispatch: Dispatch,
+    request_kind: &'static str,
+    height: Option<u64>,
+    body_bytes: Option<usize>,
+}
+
+impl SimplexTrace {
+    fn new<H, P, S>(input: &SimplexInput<H, P, S>) -> Self
+    where
+        H: Hasher,
+        P: PublicKey,
+        S: Scheme,
+    {
+        Self {
+            parent: Span::current(),
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
+            request_kind: input.request_kind(),
+            height: input.height(),
+            body_bytes: None,
+        }
+    }
+
+    const fn with_request_kind(mut self, request_kind: &'static str) -> Self {
+        self.request_kind = request_kind;
+        self
+    }
+
+    const fn with_height(mut self, height: u64) -> Self {
+        self.height = Some(height);
+        self
+    }
+
+    const fn with_body_bytes(mut self, body_bytes: usize) -> Self {
+        self.body_bytes = Some(body_bytes);
+        self
+    }
+
+    fn enqueue_wait_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.enqueue_wait",
+            request_kind = self.request_kind,
+            height = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn prepare_wait_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.prepare_wait",
+            request_kind = self.request_kind,
+            height = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn prepare_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.prepare",
+            request_kind = self.request_kind,
+            height = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn encode_body_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.encode_body",
+            request_kind = self.request_kind,
+            height = field::Empty,
+            body_bytes = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn prepare_rows_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.prepare_rows",
+            request_kind = self.request_kind,
+            height = field::Empty,
+            body_bytes = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn upload_wait_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.upload_wait",
+            request_kind = self.request_kind,
+            height = field::Empty,
+            body_bytes = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn gate_wait_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.certificate_gate_wait",
+            request_kind = self.request_kind,
+            height = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn stage_rows_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.stage_rows",
+            request_kind = self.request_kind,
+            height = field::Empty,
+            body_bytes = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn persist_span(&self) -> Span {
+        let span = info_span!(
+            parent: &self.parent,
+            "indexer.simplex.persist",
+            request_kind = self.request_kind,
+            height = field::Empty,
+            body_bytes = field::Empty,
+        );
+        self.record_fields(&span);
+        span
+    }
+
+    fn record_fields(&self, span: &Span) {
+        if let Some(height) = self.height {
+            span.record("height", height);
+        }
+        if let Some(body_bytes) = self.body_bytes {
+            span.record("body_bytes", body_bytes);
         }
     }
 }
@@ -390,6 +560,8 @@ where
 struct ReadyUpload {
     prepared: PreparedUpload,
     body_bytes: usize,
+    trace: SimplexTrace,
+    upload_wait: Span,
     kind: ReadyUploadKind,
 }
 
@@ -409,16 +581,20 @@ enum ReadyUploadKind {
 }
 
 impl ReadyUpload {
-    const fn block(
+    fn block(
         prepared: PreparedUpload,
         body_bytes: usize,
+        trace: SimplexTrace,
         persisted: watch::Sender<bool>,
         completion: oneshot::Sender<()>,
         queued_at: Instant,
     ) -> Self {
+        let upload_wait = trace.upload_wait_span();
         Self {
             prepared,
             body_bytes,
+            trace,
+            upload_wait,
             kind: ReadyUploadKind::Block {
                 persisted,
                 completion,
@@ -427,15 +603,19 @@ impl ReadyUpload {
         }
     }
 
-    const fn finalized_block(
+    fn finalized_block(
         prepared: PreparedUpload,
         body_bytes: usize,
+        trace: SimplexTrace,
         completion: oneshot::Sender<()>,
         queued_at: Instant,
     ) -> Self {
+        let upload_wait = trace.upload_wait_span();
         Self {
             prepared,
             body_bytes,
+            trace,
+            upload_wait,
             kind: ReadyUploadKind::FinalizedBlock {
                 completion,
                 queued_at,
@@ -443,10 +623,18 @@ impl ReadyUpload {
         }
     }
 
-    const fn certificate(prepared: PreparedUpload, block_persisted: watch::Receiver<bool>) -> Self {
+    fn certificate(
+        prepared: PreparedUpload,
+        trace: SimplexTrace,
+        block_persisted: watch::Receiver<bool>,
+    ) -> Self {
+        let trace = trace.with_body_bytes(0);
+        let upload_wait = trace.upload_wait_span();
         Self {
             prepared,
             body_bytes: 0,
+            trace,
+            upload_wait,
             kind: ReadyUploadKind::Certificate { block_persisted },
         }
     }
@@ -513,15 +701,23 @@ async fn run_uploader<Cx, H, P, S>(
             }
             input = rx.recv(), if rx_open && preparation.is_none() && uploads.len() < max_in_flight && !upload_waits_for_capacity => {
                 match input {
-                    Some(input) => {
+                    Some(mut input) => {
                         metrics.observe_dequeued(&input);
 
                         // Move pairing state through one preparation at a time to preserve input order.
                         let mut preparing_pending = std::mem::take(&mut pending);
                         let client = client.clone();
-                        preparation = Some(context.child("prepare").shared(true).spawn(move |_| async move {
-                            let ready = prepare_input(&client, &mut preparing_pending, input);
-                            (preparing_pending, ready)
+                        let dispatch = input.trace.dispatch.clone();
+                        preparation = Some(context.child("prepare").shared(true).spawn(move |_| {
+                            async move {
+                                drop(input.prepare_wait.take());
+                                let trace = input.trace.clone();
+                                let ready = trace.prepare_span().in_scope(|| {
+                                    prepare_input(&client, &mut preparing_pending, input)
+                                });
+                                (preparing_pending, ready)
+                            }
+                            .with_subscriber(dispatch)
                         }));
                     }
                     None => rx_open = false,
@@ -543,7 +739,13 @@ where
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send + Sync,
 {
-    let QueuedSimplexInput { queued_at, input } = queued;
+    let QueuedSimplexInput {
+        queued_at,
+        trace,
+        prepare_wait,
+        input,
+    } = queued;
+    drop(prepare_wait);
     let input = match input {
         SimplexInput::FinalizedBlock {
             block,
@@ -551,19 +753,25 @@ where
             completion,
         } => {
             let body_bytes = block.body.encode_size();
+            let trace = trace.with_body_bytes(body_bytes);
             let commitment = finalization.proposal.payload;
             let certified = CertifiedHeader::new(commitment, &block);
             let finalized = Finalized::new(finalization, certified)
                 .expect("validated finalization must match its certified header");
-            let (header, body) = crate::simplex_block::encode_simplex_block_parts(&block);
-            let mut prepared = client.prepare_block(&header, body);
-            prepared.extend(
-                client
-                    .prepare_finalized(&finalized)
-                    .expect("validated finalization upload must prepare"),
-            );
+            let (header, body) = trace
+                .encode_body_span()
+                .in_scope(|| crate::simplex_block::encode_simplex_block_parts(&block));
+            let prepared = trace.prepare_rows_span().in_scope(|| {
+                let mut prepared = client.prepare_block(&header, body);
+                prepared.extend(
+                    client
+                        .prepare_finalized(&finalized)
+                        .expect("validated finalization upload must prepare"),
+                );
+                prepared
+            });
             return vec![ReadyUpload::finalized_block(
-                prepared, body_bytes, completion, queued_at,
+                prepared, body_bytes, trace, completion, queued_at,
             )];
         }
         input => input,
@@ -574,11 +782,17 @@ where
     match input {
         SimplexInput::Block { block, completion } => {
             let body_bytes = block.body.encode_size();
-            let (header, body) = crate::simplex_block::encode_simplex_block_parts(&block);
+            let trace = trace.clone().with_body_bytes(body_bytes);
+            let (header, body) = trace
+                .encode_body_span()
+                .in_scope(|| crate::simplex_block::encode_simplex_block_parts(&block));
             let (block_persisted, block_persisted_rx) = watch::channel(false);
             ready.push(ReadyUpload::block(
-                client.prepare_block(&header, body),
+                trace
+                    .prepare_rows_span()
+                    .in_scope(|| client.prepare_block(&header, body)),
                 body_bytes,
+                trace,
                 block_persisted,
                 completion,
                 queued_at,
@@ -590,17 +804,34 @@ where
         SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
         SimplexInput::FinalizedBlock { .. } => unreachable!(),
     }
-    let (certificates, finalized) = prepare_ready_certificates(client, entry);
+    let certificate_trace = entry
+        .block
+        .as_ref()
+        .map(|block| trace.clone().with_height(block.height().get()))
+        .unwrap_or_else(|| trace.clone());
+    let has_certificates =
+        entry.block.is_some() && (entry.notarization.is_some() || entry.finalization.is_some());
+    let (certificates, finalized) = if has_certificates {
+        certificate_trace
+            .clone()
+            .with_request_kind("certificates")
+            .prepare_rows_span()
+            .in_scope(|| prepare_ready_certificates(client, entry))
+    } else {
+        (Vec::new(), false)
+    };
     if !certificates.is_empty() {
         let block_persisted = entry
             .block_persisted
             .as_ref()
             .expect("ready certificates have a block persistence gate");
-        ready.extend(
-            certificates
-                .into_iter()
-                .map(|prepared| ReadyUpload::certificate(prepared, block_persisted.clone())),
-        );
+        ready.extend(certificates.into_iter().map(|(prepared, request_kind)| {
+            ReadyUpload::certificate(
+                prepared,
+                certificate_trace.clone().with_request_kind(request_kind),
+                block_persisted.clone(),
+            )
+        }));
     }
     if finalized {
         pending.remove(&key);
@@ -619,6 +850,8 @@ fn spawn_upload<Cx: Spawner>(
     let ReadyUpload {
         mut prepared,
         body_bytes,
+        trace,
+        upload_wait,
         kind,
     } = upload;
     let (block_persisted, block_completion) = match kind {
@@ -637,40 +870,53 @@ fn spawn_upload<Cx: Spawner>(
     let client = client.clone();
     let commit_metrics = commit_metrics.clone();
     let metrics = metrics.clone();
-    uploads.push(context.shared(true).spawn(move |_| async move {
-        if let Some(mut block_persisted) = block_persisted {
-            wait_for_block_persistence(&mut block_persisted).await;
-        }
-        let mut batch = StoreWriteBatch::new();
-        client
-            .stage_upload(&mut prepared, &mut batch)
-            .expect("prepared simplex upload must stage");
-        let seq = super::commit_with_retry(
-            client.store_client().client(),
-            &batch,
-            super::CommitKind::Simplex,
-            &commit_metrics,
-        )
-        .await
-        .expect("Simplex Store commit was rejected");
-        let receipt = client.mark_upload_persisted(prepared, seq).await;
-        if let Some((persisted, completion, queued_at)) = block_completion {
-            if let Some(persisted) = persisted {
-                persisted.send_replace(true);
+    let dispatch = trace.dispatch.clone();
+    uploads.push(context.shared(true).spawn(move |_| {
+        async move {
+            drop(upload_wait);
+            if let Some(mut block_persisted) = block_persisted {
+                wait_for_block_persistence(&mut block_persisted)
+                    .instrument(trace.gate_wait_span())
+                    .await;
             }
-            metrics
-                .block_persist_duration
-                .observe(queued_at.elapsed().as_secs_f64());
-            let _ = completion.send(());
+            let mut batch = StoreWriteBatch::new();
+            trace.stage_rows_span().in_scope(|| {
+                client
+                    .stage_upload(&mut prepared, &mut batch)
+                    .expect("prepared simplex upload must stage");
+            });
+            let receipt = async {
+                let seq = super::commit_with_retry(
+                    client.store_client().client(),
+                    &batch,
+                    super::CommitKind::Simplex,
+                    &commit_metrics,
+                )
+                .await
+                .expect("Simplex Store commit was rejected");
+                client.mark_upload_persisted(prepared, seq).await
+            }
+            .instrument(trace.persist_span())
+            .await;
+            if let Some((persisted, completion, queued_at)) = block_completion {
+                if let Some(persisted) = persisted {
+                    persisted.send_replace(true);
+                }
+                metrics
+                    .block_persist_duration
+                    .observe(queued_at.elapsed().as_secs_f64());
+                let _ = completion.send(());
+            }
+            debug!(
+                headers = receipt.summary.headers,
+                blocks = receipt.summary.blocks,
+                notarizations = receipt.summary.notarizations,
+                finalizations = receipt.summary.finalizations,
+                store_sequence = receipt.store_sequence_number,
+                "indexer uploaded simplex data"
+            );
         }
-        debug!(
-            headers = receipt.summary.headers,
-            blocks = receipt.summary.blocks,
-            notarizations = receipt.summary.notarizations,
-            finalizations = receipt.summary.finalizations,
-            store_sequence = receipt.store_sequence_number,
-            "indexer uploaded simplex data"
-        );
+        .with_subscriber(dispatch)
     }));
 }
 
@@ -694,6 +940,24 @@ where
     P: PublicKey,
     S: Scheme,
 {
+    const fn request_kind(&self) -> &'static str {
+        match self {
+            Self::Block { .. } => "block",
+            Self::FinalizedBlock { .. } => "finalized_block",
+            Self::Notarization(_) => "notarization",
+            Self::Finalization(_) => "finalization",
+        }
+    }
+
+    fn height(&self) -> Option<u64> {
+        match self {
+            Self::Block { block, .. } | Self::FinalizedBlock { block, .. } => {
+                Some(block.height().get())
+            }
+            Self::Notarization(_) | Self::Finalization(_) => None,
+        }
+    }
+
     fn block_digest_key(&self) -> Vec<u8> {
         match self {
             Self::Block { block, .. } => block.seal().as_ref().to_vec(),
@@ -720,7 +984,7 @@ where
 fn prepare_ready_certificates<H, P, S>(
     client: &SimplexClient,
     entry: &mut PendingBlockCertificates<H, P, S>,
-) -> (Vec<PreparedUpload>, bool)
+) -> (Vec<(PreparedUpload, &'static str)>, bool)
 where
     H: Hasher + Send + Sync + 'static,
     P: PublicKey + Send + Sync + 'static,
@@ -736,11 +1000,12 @@ where
         let certified = CertifiedHeader::new(notarization.proposal.payload, block);
         let notarized =
             Notarized::new(notarization, certified).expect("notarization matches certified header");
-        prepared.push(
+        prepared.push((
             client
                 .prepare_notarized(&notarized)
                 .expect("notarization upload must prepare"),
-        );
+            "notarization",
+        ));
     }
 
     let mut staged_finalization = false;
@@ -749,11 +1014,12 @@ where
         let certified = CertifiedHeader::new(finalization.proposal.payload, block);
         let finalized =
             Finalized::new(finalization, certified).expect("finalization matches certified header");
-        prepared.push(
+        prepared.push((
             client
                 .prepare_finalized(&finalized)
                 .expect("finalization upload must prepare"),
-        );
+            "finalization",
+        ));
     }
     (prepared, staged_finalization)
 }

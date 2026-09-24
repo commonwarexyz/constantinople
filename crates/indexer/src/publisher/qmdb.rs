@@ -61,7 +61,7 @@ use tokio::{
     sync::{Mutex, mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
-use tracing::{debug, warn};
+use tracing::{Instrument as _, Span, debug, info_span, instrument::WithSubscriber as _, warn};
 
 const QUEUE_MAGIC: u32 = 0x4351_5545;
 const QUEUE_FORMAT_VERSION: u16 = 1;
@@ -76,13 +76,13 @@ const TRANSACTION_OPERATION_CODEC_VERSION: u16 = 1;
 const MAX_BUFFERED_UPLOADS: usize = 64;
 
 // Split byte-heavy SQL chunks to reduce encoding, compression, and transfer time.
-const DATA_REQUEST_BYTES: usize = 24 * 1024 * 1024;
+const DATA_REQUEST_BYTES: usize = 3_932_160;
 
 // Limit serial per-row Store work independently of request bytes.
-const DATA_REQUEST_ROWS: usize = 250_000;
+const DATA_REQUEST_ROWS: usize = 65_536;
 
 // Let a typical large block's chunks overlap without a second request wave.
-const MAX_CONCURRENT_CHUNKS: usize = 10;
+const MAX_CONCURRENT_CHUNKS: usize = 64;
 
 type QmdbFamily = mmr::Family;
 type AccountValue = FixedBytes<{ Account::SIZE }>;
@@ -620,6 +620,9 @@ where
     H: Hasher,
     P: PublicKey,
 {
+    span: Span,
+    queue_wait_span: Option<Span>,
+    scheduling_span: Option<Span>,
     enqueued_at: Instant,
     height: u64,
     block: EngineBlock<H, P>,
@@ -644,6 +647,7 @@ struct PersistedUpload {
     state: Location<QmdbFamily>,
     transactions: Location<QmdbFamily>,
     persisted_at: Instant,
+    publication_wait_span: Span,
 }
 
 struct WorkerClients {
@@ -739,9 +743,10 @@ where
         }
         let buffer = buffer.clamp(1, MAX_BUFFERED_UPLOADS);
         let (tx, rx) = mpsc::channel(buffer);
-        let join = tokio::spawn(run_publisher(
-            context, clients, strategy, metrics, rx, buffer,
-        ));
+        let join = tokio::spawn(
+            run_publisher(context, clients, strategy, metrics, rx, buffer)
+                .with_current_subscriber(),
+        );
         Ok(Self {
             tx: Some(tx),
             admission: Mutex::new(None),
@@ -761,68 +766,78 @@ where
     {
         let enqueued_at = Instant::now();
         let height = upload.height();
-        let mut admission = self.admission.lock().await;
-        if let Some(expected) = *admission {
-            if height != expected.next_height {
-                return Err(PublishError::HeightOutOfOrder {
-                    expected: expected.next_height,
-                    actual: height,
-                });
+        let span = Span::current();
+        let enqueue_span = info_span!(parent: &span, "indexer.qmdb.enqueue", height);
+        let queue_wait_span = info_span!(parent: &span, "indexer.qmdb.queue_wait", height);
+        async move {
+            let mut admission = self.admission.lock().await;
+            if let Some(expected) = *admission {
+                if height != expected.next_height {
+                    return Err(PublishError::HeightOutOfOrder {
+                        expected: expected.next_height,
+                        actual: height,
+                    });
+                }
+                if upload.state.start != expected.state_next {
+                    return Err(PublishError::RangeOutOfOrder {
+                        family: "state",
+                        expected: expected.state_next,
+                        actual: upload.state.start,
+                    });
+                }
+                if upload.transactions.start != expected.transaction_next {
+                    return Err(PublishError::RangeOutOfOrder {
+                        family: "transactions",
+                        expected: expected.transaction_next,
+                        actual: upload.transactions.start,
+                    });
+                }
             }
-            if upload.state.start != expected.state_next {
-                return Err(PublishError::RangeOutOfOrder {
-                    family: "state",
-                    expected: expected.state_next,
-                    actual: upload.state.start,
-                });
-            }
-            if upload.transactions.start != expected.transaction_next {
-                return Err(PublishError::RangeOutOfOrder {
-                    family: "transactions",
-                    expected: expected.transaction_next,
-                    actual: upload.transactions.start,
-                });
-            }
-        }
-        let next_admission = Admission {
-            next_height: height
-                .checked_add(1)
-                .ok_or(PublishError::InvalidQueuedUpload {
-                    reason: "finalized height overflows",
-                })?,
-            state_next: upload.state.end,
-            transaction_next: upload.transactions.end,
-        };
-        let (persisted_tx, persisted) = oneshot::channel();
-        let (published_tx, published) = oneshot::channel();
+            let next_admission = Admission {
+                next_height: height
+                    .checked_add(1)
+                    .ok_or(PublishError::InvalidQueuedUpload {
+                        reason: "finalized height overflows",
+                    })?,
+                state_next: upload.state.end,
+                transaction_next: upload.transactions.end,
+            };
+            let (persisted_tx, persisted) = oneshot::channel();
+            let (published_tx, published) = oneshot::channel();
 
-        // Seed the prefix in this process before reusing earlier ranges' nodes.
-        // Contiguous publication waits for any still-pending predecessor rows.
-        let omit_pinned_nodes = self.has_durable_range.load(Ordering::Relaxed);
-        let pending = PendingUpload {
-            enqueued_at,
-            height,
-            block: upload.block,
-            finalized_ts_micros: upload.finalized_ts_micros,
-            state: upload.state,
-            transactions: upload.transactions,
-            omit_pinned_nodes,
-            has_durable_range: self.has_durable_range.clone(),
-            persisted: Some(persisted_tx),
-            published: Some(published_tx),
-        };
-        self.tx
-            .as_ref()
-            .ok_or(PublishError::CommitterStopped { height })?
-            .send(pending)
-            .await
-            .map_err(|_| PublishError::CommitterStopped { height })?;
-        *admission = Some(next_admission);
-        Ok(UploadCompletion {
-            height,
-            persisted,
-            published,
-        })
+            // Seed the prefix in this process before reusing earlier ranges' nodes.
+            // Contiguous publication waits for any still-pending predecessor rows.
+            let omit_pinned_nodes = self.has_durable_range.load(Ordering::Relaxed);
+            let pending = PendingUpload {
+                span,
+                queue_wait_span: Some(queue_wait_span),
+                scheduling_span: None,
+                enqueued_at,
+                height,
+                block: upload.block,
+                finalized_ts_micros: upload.finalized_ts_micros,
+                state: upload.state,
+                transactions: upload.transactions,
+                omit_pinned_nodes,
+                has_durable_range: self.has_durable_range.clone(),
+                persisted: Some(persisted_tx),
+                published: Some(published_tx),
+            };
+            self.tx
+                .as_ref()
+                .ok_or(PublishError::CommitterStopped { height })?
+                .send(pending)
+                .await
+                .map_err(|_| PublishError::CommitterStopped { height })?;
+            *admission = Some(next_admission);
+            Ok(UploadCompletion {
+                height,
+                persisted,
+                published,
+            })
+        }
+        .instrument(enqueue_span)
+        .await
     }
 
     pub async fn shutdown(mut self) {
@@ -888,6 +903,12 @@ async fn run_publisher<Cx, H, P, S>(
             upload = rx.recv(), if !rx_closed && pending.len() < max_in_flight => {
                 match upload {
                     Some(mut upload) => {
+                        drop(upload.queue_wait_span.take());
+                        upload.scheduling_span = Some(info_span!(
+                            parent: &upload.span,
+                            "indexer.qmdb.schedule",
+                            height = upload.height
+                        ));
                         let publication = PendingPublication {
                             height: upload.height,
                             block_digest: *upload.block.seal(),
@@ -949,77 +970,124 @@ fn spawn_data_commit<Cx, H, P, S>(
         .take()
         .expect("pending upload persistence signal must be present");
     let height = upload.height;
+    let block_span = upload.span.clone();
+    let scheduling_span = upload.scheduling_span.take();
     let has_durable_range = upload.has_durable_range.clone();
     let admitted_at = Instant::now();
 
     // Supervise preparation and data commits without holding a blocking
     // thread while waiting for their completion.
-    let commit = context.spawn(move |context| async move {
-        let prepare_metrics = metrics.clone();
-        let prepare = context
-            .child("prepare")
-            .shared(true)
-            .spawn(move |_| async move {
-                let started = Instant::now();
-                prepare_metrics
-                    .prepare_wait_duration
-                    .observe(started.duration_since(upload.enqueued_at).as_secs_f64());
-                prepare_metrics
-                    .transactions_per_block
-                    .observe(upload.block.body.len() as f64);
-
-                // Keep both CPU-clock reads on this thread without an intervening await.
-                let cpu_started = ThreadTime::try_now();
-                let prepared = (|| {
-                    let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
-                        state_client,
-                        transaction_client,
-                        sql_schema,
-                        strategy,
-                        upload,
-                        &prepare_metrics,
-                    )?;
-                    let chunking_started = Instant::now();
-                    let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES);
+    let data_span = info_span!(parent: &block_span, "indexer.qmdb.persist", height);
+    let commit = context.spawn(move |context| {
+        async move {
+            drop(scheduling_span);
+            let prepare_metrics = metrics.clone();
+            let prepare_parent = Span::current();
+            let prepare_scheduling_span = info_span!(
+                parent: &prepare_parent,
+                "indexer.qmdb.prepare_schedule",
+                height
+            );
+            let prepare = context.child("prepare").shared(true).spawn(move |_| {
+                async move {
+                    drop(prepare_scheduling_span);
+                    let _prepare = info_span!(
+                        parent: &prepare_parent,
+                        "indexer.qmdb.prepare",
+                        height
+                    )
+                    .entered();
+                    let started = Instant::now();
                     prepare_metrics
-                        .chunking_duration
-                        .observe(chunking_started.elapsed().as_secs_f64());
-                    Ok::<_, PublishError>((batches?, state, transactions))
-                })();
-                let cpu_elapsed = cpu_started.and_then(|started| started.try_elapsed());
-                prepare_metrics
-                    .prepare_duration
-                    .observe(started.elapsed().as_secs_f64());
-                match cpu_elapsed {
-                    Ok(elapsed) => prepare_metrics
-                        .prepare_cpu_duration
-                        .observe(elapsed.as_secs_f64()),
-                    Err(error) => warn!(?error, "failed to measure preparation thread CPU time"),
-                }
-                prepared
-            });
-        let (batches, state, transactions) = prepare
-            .await
-            .expect("finalized index preparation task failed")?;
-        let chunks = batches.len() as u64;
-        commit_chunks(context.child("commit"), &store, &metrics.commit, batches).await?;
-        has_durable_range.store(true, Ordering::Relaxed);
-        let persisted_at = Instant::now();
-        metrics.chunk_commits.inc_by(chunks);
-        metrics.chunks_per_block.observe(chunks as f64);
-        metrics
-            .persist_duration
-            .observe(admitted_at.elapsed().as_secs_f64());
+                        .prepare_wait_duration
+                        .observe(started.duration_since(upload.enqueued_at).as_secs_f64());
+                    prepare_metrics
+                        .transactions_per_block
+                        .observe(upload.block.body.len() as f64);
 
-        // Publication still waits for the contiguous prefix in `publish_ready_prefix`.
-        // The signal only tells the caller that this block's own rows are durable.
-        let _ = persisted.send(());
-        Ok(PersistedUpload {
-            height,
-            state,
-            transactions,
-            persisted_at,
-        })
+                    // Keep both CPU-clock reads on this thread without an intervening await.
+                    let cpu_started = ThreadTime::try_now();
+                    let prepared = (|| {
+                        let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
+                            state_client,
+                            transaction_client,
+                            sql_schema,
+                            strategy,
+                            upload,
+                            &prepare_metrics,
+                        )?;
+                        let chunking_started = Instant::now();
+                        let split_span = info_span!(
+                            "indexer.qmdb.prepare.chunking",
+                            rows = batch.len(),
+                            encoded_bytes = batch.encoded_len(),
+                            chunks = tracing::field::Empty
+                        );
+                        let batches = split_span
+                            .in_scope(|| batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES));
+                        if let Ok(batches) = &batches {
+                            split_span.record("chunks", batches.len());
+                        }
+                        prepare_metrics
+                            .chunking_duration
+                            .observe(chunking_started.elapsed().as_secs_f64());
+                        Ok::<_, PublishError>((batches?, state, transactions))
+                    })();
+                    let cpu_elapsed = cpu_started.and_then(|started| started.try_elapsed());
+                    prepare_metrics
+                        .prepare_duration
+                        .observe(started.elapsed().as_secs_f64());
+                    match cpu_elapsed {
+                        Ok(elapsed) => prepare_metrics
+                            .prepare_cpu_duration
+                            .observe(elapsed.as_secs_f64()),
+                        Err(error) => {
+                            warn!(?error, "failed to measure preparation thread CPU time")
+                        }
+                    }
+                    prepared
+                }
+                .with_current_subscriber()
+            });
+            let (batches, state, transactions) = prepare
+                .await
+                .expect("finalized index preparation task failed")?;
+            let chunks = batches.len() as u64;
+            commit_chunks(
+                context.child("commit"),
+                &store,
+                &metrics.commit,
+                height,
+                batches,
+            )
+            .await?;
+            has_durable_range.store(true, Ordering::Relaxed);
+            let persisted_at = Instant::now();
+            metrics.chunk_commits.inc_by(chunks);
+            metrics.chunks_per_block.observe(chunks as f64);
+            metrics
+                .persist_duration
+                .observe(admitted_at.elapsed().as_secs_f64());
+
+            // Publication still waits for the contiguous prefix in `publish_ready_prefix`.
+            // The signal only tells the caller that this block's own rows are durable.
+            let publication_wait_span = info_span!(
+                parent: &block_span,
+                "indexer.qmdb.publication_wait",
+                height,
+                sequence = tracing::field::Empty
+            );
+            let _ = persisted.send(());
+            Ok(PersistedUpload {
+                height,
+                state,
+                transactions,
+                persisted_at,
+                publication_wait_span,
+            })
+        }
+        .instrument(data_span)
+        .with_current_subscriber()
     });
     commits.spawn(async move { commit.await.expect("finalized index data task failed") });
 }
@@ -1028,20 +1096,34 @@ async fn commit_chunks<Cx: Spawner>(
     context: Cx,
     store: &StoreClient,
     metrics: &super::StoreCommitMetrics,
+    height: u64,
     batches: Vec<StoreWriteBatch>,
 ) -> Result<(), ClientError> {
+    let chunk_count = batches.len();
+    let parent_span = Span::current();
     // Spawn lazily so the limit covers request encoding, compression, and retries.
     let mut commits = stream::iter(batches)
-        .map(|batch| {
+        .enumerate()
+        .map(|(chunk_index, batch)| {
             let store = store.clone();
             let metrics = metrics.clone();
-            context
-                .child("chunk")
-                .shared(true)
-                .spawn(move |_| async move {
+            let span = info_span!(
+                parent: &parent_span,
+                "indexer.qmdb.chunk",
+                height,
+                chunk_index,
+                chunk_count,
+                rows = batch.len(),
+                encoded_bytes = batch.encoded_len()
+            );
+            context.child("chunk").shared(true).spawn(move |_| {
+                async move {
                     super::commit_with_retry(&store, &batch, super::CommitKind::Chunk, &metrics)
                         .await
-                })
+                }
+                .instrument(span)
+                .with_current_subscriber()
+            })
         })
         .buffer_unordered(MAX_CONCURRENT_CHUNKS);
 
@@ -1066,18 +1148,30 @@ where
     S: Strategy,
 {
     let expansion_started = Instant::now();
-    let state = prepare_authenticated_range::<QmdbFamily, H, StateOperation, S>(
-        &as_authenticated_range(&upload.state),
-        &upload.block.header.state_root,
-        &(),
-        &strategy,
-    )?;
-    let transactions = prepare_authenticated_range::<QmdbFamily, H, TransactionOperation<H>, S>(
-        &as_authenticated_range(&upload.transactions),
-        &upload.block.header.transactions_root,
-        &(),
-        &strategy,
-    )?;
+    let state_span = info_span!(
+        "indexer.qmdb.prepare.state",
+        operations = upload.state.operations.len()
+    );
+    let state = state_span.in_scope(|| {
+        prepare_authenticated_range::<QmdbFamily, H, StateOperation, S>(
+            &as_authenticated_range(&upload.state),
+            &upload.block.header.state_root,
+            &(),
+            &strategy,
+        )
+    })?;
+    let transactions_span = info_span!(
+        "indexer.qmdb.prepare.transactions",
+        operations = upload.transactions.operations.len()
+    );
+    let transactions = transactions_span.in_scope(|| {
+        prepare_authenticated_range::<QmdbFamily, H, TransactionOperation<H>, S>(
+            &as_authenticated_range(&upload.transactions),
+            &upload.block.header.transactions_root,
+            &(),
+            &strategy,
+        )
+    })?;
     let metadata_rows = encode_metadata_rows::<H, P>(
         &upload.block,
         upload.finalized_ts_micros,
@@ -1090,31 +1184,36 @@ where
 
     let staging_started = Instant::now();
     let mut sql_writer = sql_schema.batch_writer();
-    let sql = prepare_sql(&mut sql_writer, metadata_rows)?;
+    let sql_rows = metadata_rows.len();
+    let sql = info_span!("indexer.qmdb.prepare.sql_encode", rows = sql_rows)
+        .in_scope(|| prepare_sql(&mut sql_writer, metadata_rows))?;
     let mut batch = StoreWriteBatch::new();
-    sql_writer.stage_flush(&sql, &mut batch)?;
+    info_span!("indexer.qmdb.prepare.sql_stage", rows = sql_rows)
+        .in_scope(|| sql_writer.stage_flush(&sql, &mut batch))?;
     let state_end = state.latest_location();
     let transaction_end = transactions.latest_location();
-    let existing_state_nodes = if upload.omit_pinned_nodes {
-        QmdbFamily::nodes_to_pin(state.start_location()).collect()
-    } else {
-        BTreeSet::new()
-    };
-    let existing_transaction_nodes = if upload.omit_pinned_nodes {
-        QmdbFamily::nodes_to_pin(transactions.start_location()).collect()
-    } else {
-        BTreeSet::new()
-    };
-    stage_authenticated_range(
-        &state_client,
-        state.without_pins_at(&existing_state_nodes),
-        &mut batch,
-    )?;
-    stage_authenticated_range(
-        &transaction_client,
-        transactions.without_pins_at(&existing_transaction_nodes),
-        &mut batch,
-    )?;
+    info_span!("indexer.qmdb.prepare.qmdb_stage").in_scope(|| {
+        let existing_state_nodes = if upload.omit_pinned_nodes {
+            QmdbFamily::nodes_to_pin(state.start_location()).collect()
+        } else {
+            BTreeSet::new()
+        };
+        let existing_transaction_nodes = if upload.omit_pinned_nodes {
+            QmdbFamily::nodes_to_pin(transactions.start_location()).collect()
+        } else {
+            BTreeSet::new()
+        };
+        stage_authenticated_range(
+            &state_client,
+            state.without_pins_at(&existing_state_nodes),
+            &mut batch,
+        )?;
+        stage_authenticated_range(
+            &transaction_client,
+            transactions.without_pins_at(&existing_transaction_nodes),
+            &mut batch,
+        )
+    })?;
     metrics
         .staging_duration
         .observe(staging_started.elapsed().as_secs_f64());
@@ -1144,10 +1243,16 @@ where
     H::Digest: Codec,
     P: PublicKey,
 {
+    let span = info_span!(
+        "indexer.qmdb.prepare.metadata",
+        rows = tracing::field::Empty
+    );
+    let _entered = span.enter();
     let block_rows = encode_block_rows(block, finalized_ts_micros);
     validate_transaction_metadata_ops::<H>(&block_rows.transaction_digests, transactions)?;
     let mut rows = block_rows.sql;
     rows.extend(account_rows(state)?);
+    span.record("rows", rows.len());
     Ok(rows)
 }
 
@@ -1182,6 +1287,12 @@ where
 fn account_rows<D: Digest>(
     range: &QueuedAuthenticatedRange<D>,
 ) -> Result<Vec<super::SqlRow>, PublishError> {
+    let span = info_span!(
+        "indexer.qmdb.prepare.account_rows",
+        operations = range.operations.len(),
+        rows = tracing::field::Empty
+    );
+    let _entered = span.enter();
     let mut rows = Vec::new();
     for (offset, encoded) in range.operations.iter().enumerate() {
         let operation = StateOperation::decode(encoded.as_slice()).map_err(|_| {
@@ -1209,6 +1320,7 @@ fn account_rows<D: Digest>(
             qmdb_location: location,
         }));
     }
+    span.record("rows", rows.len());
     Ok(rows)
 }
 
@@ -1259,6 +1371,30 @@ where
     let last_data = persisted
         .get(&last.height)
         .expect("ready publication data must remain present");
+    let first = pending
+        .front()
+        .expect("ready publication prefix is nonempty");
+    let parent_span = &persisted
+        .get(&first.height)
+        .expect("ready publication data must remain present")
+        .publication_wait_span;
+    let publication_span = info_span!(
+        parent: parent_span,
+        "indexer.qmdb.publication",
+        first_height = first.height,
+        last_height = last.height,
+        count = ready,
+        sequence = tracing::field::Empty
+    );
+    for publication in pending.iter().take(ready).skip(1) {
+        let contributing_span = &persisted
+            .get(&publication.height)
+            .expect("ready publication data must remain present")
+            .publication_wait_span;
+        if let Some(id) = contributing_span.id() {
+            publication_span.follows_from(id);
+        }
+    }
     let mut batch = StoreWriteBatch::new();
     stage_watermark(&clients.state, last_data.state, &mut batch)
         .expect("validated state range has a watermark");
@@ -1272,13 +1408,18 @@ where
     }
     let store = clients.store.clone();
     let metrics = metrics.commit.clone();
-    Some(Box::pin(async move {
-        let sequence =
-            super::commit_with_retry(&store, &batch, super::CommitKind::Barrier, &metrics)
-                .await
-                .expect("contiguous publication barrier was rejected");
-        (ready, sequence)
-    }))
+    let sequence_span = publication_span.clone();
+    Some(Box::pin(
+        async move {
+            let sequence =
+                super::commit_with_retry(&store, &batch, super::CommitKind::Barrier, &metrics)
+                    .await
+                    .expect("contiguous publication barrier was rejected");
+            sequence_span.record("sequence", sequence);
+            (ready, sequence)
+        }
+        .instrument(publication_span),
+    ))
 }
 
 fn complete_publication<D: Digest>(
@@ -1299,6 +1440,8 @@ fn complete_publication<D: Digest>(
         let data = persisted
             .remove(&publication.height)
             .expect("ready publication data must remain present");
+        data.publication_wait_span
+            .record("sequence", barrier_sequence);
         metrics
             .publication_wait_duration
             .observe(data.persisted_at.elapsed().as_secs_f64());
@@ -1308,10 +1451,12 @@ fn complete_publication<D: Digest>(
         metrics.finalization_to_publication_duration.observe(
             (published_at - publication.finalized_ts_micros as f64 / 1_000_000.0).max(0.0),
         );
-        debug!(
-            height = publication.height,
-            barrier_sequence, "published finalized index prefix"
-        );
+        data.publication_wait_span.in_scope(|| {
+            debug!(
+                height = publication.height,
+                barrier_sequence, "published finalized index prefix"
+            );
+        });
         let _ = publication.published.send(PublicationReceipt {
             height: publication.height,
             block_digest: publication.block_digest,
@@ -1345,12 +1490,107 @@ mod tests {
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
     use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
-    use exoware_qmdb::{KeylessClient, UnorderedClient, stage_authenticated_range};
+    use exoware_qmdb::{KeylessClient, UnorderedClient};
     use rand::{SeedableRng, rngs::StdRng};
+    use std::sync::Mutex as StdMutex;
+    use tracing::{
+        Id, Subscriber,
+        field::{Field, Visit},
+        span::{Attributes, Record},
+    };
+    use tracing_subscriber::{Layer, layer::Context, prelude::*, registry::LookupSpan};
 
     type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
     type TestFinalization =
         Finalization<ThresholdScheme<ed25519::PublicKey, MinSig>, TestCommitment>;
+
+    #[derive(Clone, Debug)]
+    struct CapturedSpan {
+        name: &'static str,
+        parent: Option<u64>,
+        fields: BTreeMap<String, String>,
+        follows_from: BTreeSet<u64>,
+    }
+
+    struct CapturedFields<'a>(&'a mut BTreeMap<String, String>);
+
+    impl Visit for CapturedFields<'_> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0.insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(Arc<StdMutex<BTreeMap<u64, CapturedSpan>>>);
+
+    impl TraceCapture {
+        fn spans(&self) -> BTreeMap<u64, CapturedSpan> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl<S> Layer<S> for TraceCapture
+    where
+        S: Subscriber + for<'a> LookupSpan<'a>,
+    {
+        fn on_new_span(&self, attributes: &Attributes<'_>, id: &Id, context: Context<'_, S>) {
+            let parent = attributes.parent().map(Id::into_u64).or_else(|| {
+                attributes
+                    .is_contextual()
+                    .then(|| context.current_span().id().map(Id::into_u64))
+                    .flatten()
+            });
+            let mut fields = BTreeMap::new();
+            attributes.record(&mut CapturedFields(&mut fields));
+            self.0.lock().unwrap().insert(
+                id.into_u64(),
+                CapturedSpan {
+                    name: attributes.metadata().name(),
+                    parent,
+                    fields,
+                    follows_from: BTreeSet::new(),
+                },
+            );
+        }
+
+        fn on_record(&self, id: &Id, values: &Record<'_>, _: Context<'_, S>) {
+            values.record(&mut CapturedFields(
+                &mut self
+                    .0
+                    .lock()
+                    .unwrap()
+                    .get_mut(&id.into_u64())
+                    .expect("recorded span exists")
+                    .fields,
+            ));
+        }
+
+        fn on_follows_from(&self, span: &Id, follows: &Id, _: Context<'_, S>) {
+            self.0
+                .lock()
+                .unwrap()
+                .get_mut(&span.into_u64())
+                .expect("recorded span exists")
+                .follows_from
+                .insert(follows.into_u64());
+        }
+    }
+
+    fn descends_from(spans: &BTreeMap<u64, CapturedSpan>, mut span: u64, ancestor: u64) -> bool {
+        loop {
+            if span == ancestor {
+                return true;
+            }
+            let Some(parent) = spans.get(&span).and_then(|captured| captured.parent) else {
+                return false;
+            };
+            span = parent;
+        }
+    }
 
     #[test]
     fn queue_codec_round_trips_exact_inputs() {
@@ -1713,7 +1953,7 @@ mod tests {
             let batches = batch.split(1, DATA_REQUEST_BYTES).unwrap();
             assert_eq!(batches.len(), count);
             let mut commit = context.spawn(move |context| async move {
-                commit_chunks(context, &physical, &metrics, batches).await
+                commit_chunks(context, &physical, &metrics, 1, batches).await
             });
 
             tokio::time::timeout(
@@ -1789,6 +2029,7 @@ mod tests {
                     context,
                     &physical,
                     &metrics,
+                    1,
                     vec![batch; MAX_CONCURRENT_CHUNKS + 1],
                 )
                 .await
@@ -1969,6 +2210,224 @@ mod tests {
     }
 
     #[test]
+    fn trace_context_survives_publisher_fanout_and_grouped_publication() {
+        use std::time::Duration;
+        use tracing_subscriber::filter::LevelFilter;
+
+        let _registration_guard =
+            tracing::Dispatch::new(tracing_subscriber::registry().with(LevelFilter::OFF));
+        let capture = TraceCapture::default();
+        let dispatch = tracing::Dispatch::new(tracing_subscriber::registry().with(capture.clone()));
+        let runtime_dispatch = dispatch.clone();
+        tracing::dispatcher::with_default(&dispatch, || {
+            tracing::callsite::rebuild_interest_cache();
+            commonware_runtime::tokio::Runner::new(
+                commonware_runtime::tokio::Config::default().with_worker_threads(1),
+            )
+            .start(move |context| {
+                async move {
+                    let store = crate::test_store::GatedIngestStore::open_gating_ingest(1)
+                        .await
+                        .expect("open Store");
+                    let physical =
+                        writer_store_client(&store.url, None).expect("build Store client");
+                    let client = PrefixedStoreClient::empty(physical.clone());
+                    let metrics = super::super::PublisherMetrics::new(&context.child("publisher"));
+                    let publisher = Publisher::connect(
+                        context.child("publisher_task"),
+                        &store.url,
+                        None,
+                        3,
+                        metrics.clone(),
+                    )
+                    .await
+                    .expect("connect publisher");
+                    let state_operations = encode_operations(
+                        &(0..=3)
+                            .map(|height| StateOperation::CommitFloor(None, Location::new(height)))
+                            .collect::<Vec<_>>(),
+                    );
+                    let transaction_operations = encode_operations(
+                        &(0..=3)
+                            .map(|height| {
+                                TransactionOperation::<Sha256>::Commit(None, Location::new(height))
+                            })
+                            .collect::<Vec<_>>(),
+                    );
+                    let upload = |height| {
+                        queued_upload(
+                            height,
+                            queued_range(&state_operations, height, height + 1),
+                            queued_range(&transaction_operations, height, height + 1),
+                        )
+                    };
+                    let root =
+                        |height| info_span!(parent: None, "indexer.block", height, origin = "test");
+                    let first_root = root(1);
+                    let second_root = root(2);
+                    let third_root = root(3);
+                    let second_root_id = second_root.id().unwrap().into_u64();
+                    let third_root_id = third_root.id().unwrap().into_u64();
+
+                    let mut first = publisher
+                        .enqueue_queued_finalized(upload(1))
+                        .instrument(first_root.clone())
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), store.wait_for_ingests(2))
+                        .await
+                        .expect("first publication barrier reaches Store");
+                    first.persisted().await.unwrap();
+
+                    let mut second = publisher
+                        .enqueue_queued_finalized(upload(2))
+                        .instrument(second_root.clone())
+                        .await
+                        .unwrap();
+                    let mut third = publisher
+                        .enqueue_queued_finalized(upload(3))
+                        .instrument(third_root.clone())
+                        .await
+                        .unwrap();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        second.persisted().await.unwrap();
+                        third.persisted().await.unwrap();
+                    })
+                    .await
+                    .expect("later blocks persist while the first barrier is held");
+
+                    store.release_first_ingest();
+                    let (_, second_receipt, third_receipt) =
+                        tokio::time::timeout(Duration::from_secs(5), async {
+                            (
+                                first.published().await.unwrap(),
+                                second.published().await.unwrap(),
+                                third.published().await.unwrap(),
+                            )
+                        })
+                        .await
+                        .expect("grouped publication completes");
+                    assert_eq!(
+                        second_receipt.store_sequence_number,
+                        third_receipt.store_sequence_number
+                    );
+
+                    let fanout_root = root(9);
+                    let fanout_root_id = fanout_root.id().unwrap().into_u64();
+                    let mut first_batch = StoreWriteBatch::new();
+                    first_batch
+                        .push(&client, &Key::from(vec![100]), Bytes::from_static(b"first"))
+                        .unwrap();
+                    let mut second_batch = StoreWriteBatch::new();
+                    second_batch
+                        .push(
+                            &client,
+                            &Key::from(vec![101]),
+                            Bytes::from_static(b"second"),
+                        )
+                        .unwrap();
+                    commit_chunks(
+                        context.child("trace_chunks"),
+                        &physical,
+                        &metrics.commit,
+                        9,
+                        vec![first_batch, second_batch],
+                    )
+                    .instrument(fanout_root.clone())
+                    .await
+                    .expect("chunk fanout commits");
+
+                    publisher.shutdown().await;
+                    store.shutdown().await;
+
+                    let spans = capture.spans();
+                    for (height, root_id) in [(2, second_root_id), (3, third_root_id)] {
+                        let height = height.to_string();
+                        let prepare = spans
+                            .iter()
+                            .find(|(_, span)| {
+                                span.name == "indexer.qmdb.prepare"
+                                    && span.fields.get("height").map(String::as_str)
+                                        == Some(height.as_str())
+                            })
+                            .map(|(id, _)| *id)
+                            .expect("block preparation span exists");
+                        assert!(descends_from(&spans, prepare, root_id));
+
+                        let chunk = spans
+                            .iter()
+                            .find(|(_, span)| {
+                                span.name == "indexer.qmdb.chunk"
+                                    && span.fields.get("height").map(String::as_str)
+                                        == Some(height.as_str())
+                            })
+                            .map(|(id, _)| *id)
+                            .expect("block chunk span exists");
+                        assert!(descends_from(&spans, chunk, root_id));
+                    }
+
+                    let second_wait = spans
+                        .iter()
+                        .find(|(_, span)| {
+                            span.name == "indexer.qmdb.publication_wait"
+                                && span.fields.get("height").map(String::as_str) == Some("2")
+                        })
+                        .map(|(id, _)| *id)
+                        .expect("second publication wait span exists");
+                    let third_wait = spans
+                        .iter()
+                        .find(|(_, span)| {
+                            span.name == "indexer.qmdb.publication_wait"
+                                && span.fields.get("height").map(String::as_str) == Some("3")
+                        })
+                        .map(|(id, _)| *id)
+                        .expect("third publication wait span exists");
+                    let publication = spans
+                        .values()
+                        .find(|span| {
+                            span.name == "indexer.qmdb.publication"
+                                && span.fields.get("first_height").map(String::as_str) == Some("2")
+                                && span.fields.get("last_height").map(String::as_str) == Some("3")
+                        })
+                        .expect("grouped publication span exists");
+                    assert_eq!(publication.parent, Some(second_wait));
+                    assert!(publication.follows_from.contains(&third_wait));
+                    let publication_sequence = second_receipt.store_sequence_number.to_string();
+                    assert_eq!(
+                        publication.fields.get("sequence").map(String::as_str),
+                        Some(publication_sequence.as_str())
+                    );
+
+                    let fanout_chunks = spans
+                        .values()
+                        .filter(|span| {
+                            span.name == "indexer.qmdb.chunk"
+                                && span.fields.get("height").map(String::as_str) == Some("9")
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(fanout_chunks.len(), 2);
+                    assert!(
+                        fanout_chunks
+                            .iter()
+                            .all(|span| span.parent == Some(fanout_root_id))
+                    );
+                    assert!(fanout_chunks.iter().all(|span| {
+                        span.fields.get("chunk_count").map(String::as_str) == Some("2")
+                    }));
+                    assert_eq!(
+                        fanout_chunks
+                            .iter()
+                            .map(|span| span.fields["chunk_index"].as_str())
+                            .collect::<BTreeSet<_>>(),
+                        BTreeSet::from(["0", "1"])
+                    );
+                }
+                .with_subscriber(runtime_dispatch)
+            });
+        });
+    }
+
+    #[test]
     fn publication_does_not_cross_an_out_of_order_gap() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let (store, url) = exoware_simulator::open_temp()
@@ -2132,6 +2591,9 @@ mod tests {
                         schema.clone(),
                         Sequential,
                         PendingUpload {
+                            span: Span::none(),
+                            queue_wait_span: None,
+                            scheduling_span: None,
                             enqueued_at: Instant::now(),
                             height: start,
                             block: test_block(start, &state, &transactions),
@@ -2323,6 +2785,9 @@ mod tests {
                     schema.clone(),
                     Sequential,
                     PendingUpload {
+                        span: Span::none(),
+                        queue_wait_span: None,
+                        scheduling_span: None,
                         enqueued_at: Instant::now(),
                         height: 1,
                         block,
@@ -2486,6 +2951,9 @@ mod tests {
                 schema,
                 Sequential,
                 PendingUpload {
+                    span: Span::none(),
+                    queue_wait_span: None,
+                    scheduling_span: None,
                     enqueued_at: Instant::now(),
                     height: 1,
                     block,
@@ -2778,6 +3246,7 @@ mod tests {
             state: state_end,
             transactions: transaction_end,
             persisted_at: Instant::now(),
+            publication_wait_span: Span::none(),
         }
     }
 

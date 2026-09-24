@@ -36,7 +36,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::time::{sleep, timeout};
-use tracing::{Instrument as _, info_span, warn};
+use tracing::{Instrument as _, field, info_span, warn};
 
 // Resolve the subsecond differences between preparation and Store commits.
 const COMMIT_DURATION_BUCKETS: [f64; 27] = [
@@ -291,18 +291,31 @@ pub(crate) async fn commit_with_retry(
         let start = Instant::now();
         metrics.in_flight.inc();
         let result = bounded_commit_retry(
-            || async {
-                let result = {
-                    let _timer = PutAttemptTimer {
-                        histogram: metrics.put_attempt_duration.get_or_create(&labels).clone(),
-                        start: Instant::now(),
+            |attempt| {
+                let labels = labels.clone();
+                async move {
+                    let attempt_span = info_span!(
+                        "store_put_attempt",
+                        attempt,
+                        sequence = field::Empty,
+                        error = field::Empty,
+                    );
+                    let result = {
+                        let _timer = PutAttemptTimer {
+                            histogram: metrics.put_attempt_duration.get_or_create(&labels).clone(),
+                            start: Instant::now(),
+                        };
+                        batch.commit(client).instrument(attempt_span.clone()).await
                     };
-                    batch.commit(client).await
-                };
-                if result.is_err() {
-                    metrics.retries.inc();
+                    match &result {
+                        Ok(sequence) => attempt_span.record("sequence", sequence),
+                        Err(error) => attempt_span.record("error", store_error_label(error)),
+                    };
+                    if result.is_err() {
+                        metrics.retries.inc();
+                    }
+                    result
                 }
-                result
             },
             kind.description(),
             rows,
@@ -339,7 +352,7 @@ pub(crate) async fn commit_with_retry(
 }
 
 async fn bounded_commit_retry<F>(
-    mut commit: impl FnMut() -> F,
+    mut commit: impl FnMut(u32) -> F,
     what: &'static str,
     rows: usize,
 ) -> Result<u64, ClientError>
@@ -350,7 +363,7 @@ where
         let mut attempt = 0;
         loop {
             attempt += 1;
-            match commit().await {
+            match commit(attempt).await {
                 Ok(seq) => return Ok(seq),
                 Err(error) => {
                     if !is_retryable_store_error(&error) || attempt == COMMIT_MAX_ATTEMPTS {
@@ -368,7 +381,14 @@ where
                         ?error,
                         attempt, rows, what, "store batch commit failed, retrying"
                     );
-                    sleep(retry_backoff(attempt)).await;
+                    let backoff = retry_backoff(attempt);
+                    sleep(backoff)
+                        .instrument(info_span!(
+                            "store_commit_backoff",
+                            attempt,
+                            backoff_ms = backoff.as_millis(),
+                        ))
+                        .await;
                 }
             }
         }
@@ -380,6 +400,23 @@ where
             exoware_sdk::ConnectError::deadline_exceeded("Store commit retry budget expired"),
         )))
     })
+}
+
+fn store_error_label(error: &ClientError) -> &'static str {
+    if error.put_too_large().is_some() {
+        return "put_too_large";
+    }
+
+    match error {
+        ClientError::Http(error) if error.is_connect() => "http_connect",
+        ClientError::Http(error) if error.is_timeout() => "http_timeout",
+        ClientError::Http(error) if error.is_request() => "http_request",
+        ClientError::Http(_) => "http",
+        ClientError::Rpc(error) => error.code.as_str(),
+        ClientError::Prefix(_) => "prefix",
+        ClientError::InvalidKeyLength { .. } => "invalid_key_length",
+        ClientError::WireFormat(_) => "wire_format",
+    }
 }
 
 fn is_retryable_store_error(error: &ClientError) -> bool {
@@ -628,7 +665,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let sequence = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 std::future::ready(if attempts == 1 {
                     Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
@@ -654,7 +691,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let error = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 std::future::ready(Err(ClientError::WireFormat("reject".to_string())))
             },
@@ -674,7 +711,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let error = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 std::future::ready(Err(ClientError::Rpc(Box::new(
                     ConnectError::resource_exhausted(format!("busy attempt {attempts}")),
@@ -700,7 +737,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let error = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 std::future::pending()
             },
@@ -720,7 +757,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let error = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 async {
                     sleep(Duration::from_secs(25)).await;
@@ -745,7 +782,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let error = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 async {
                     sleep(Duration::from_millis(59_900)).await;
@@ -789,7 +826,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
         let error = bounded_commit_retry(
-            || {
+            |_| {
                 attempts += 1;
                 std::future::ready(Err(ClientError::Rpc(Box::new(with_error_info_detail(
                     ConnectError::invalid_argument("too large"),

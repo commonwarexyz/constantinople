@@ -104,6 +104,9 @@ derive_more = { version = "2.1.1", default-features = false }
 prometheus-client = { version = "0.24.0", default-features = false }
 tracing-subscriber = "0.3"
 url = "2.5.8"
+opentelemetry = { version = "0.32", default-features = false }
+opentelemetry_sdk = { version = "0.32", default-features = false }
+tracing-opentelemetry = { version = "0.33", default-features = false }
 
 [profile.samply]
 inherits = "release"

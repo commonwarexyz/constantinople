@@ -5,6 +5,7 @@ use crate::{
         IndexerConfig, LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config,
     },
     finalized_payloads::{PayloadCleanup, PayloadDescriptor, PayloadStore},
+    indexer_tracing::{CaptureTraces, block_span},
     state_reader::StateDbReader,
 };
 use bytes::Bytes;
@@ -86,7 +87,7 @@ use tokio::{
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot},
     task::{JoinHandle, JoinSet},
 };
-use tracing::{Instrument as _, info, info_span, warn};
+use tracing::{Instrument as _, Span, info, info_span, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
@@ -605,6 +606,14 @@ struct FinalizedUploadConsumer {
     metrics: FinalizedUploadMetrics,
     queue_metrics: FinalizedQueueMetrics,
     payload_floor: u64,
+    traces: CaptureTraces,
+    replay_through: u64,
+}
+
+struct RetainedUpload {
+    record: FinalizedQueueRecord,
+    trace: Span,
+    wait: Option<Span>,
 }
 
 struct PendingQueuedUpload {
@@ -613,6 +622,8 @@ struct PendingQueuedUpload {
     charge: UploadCharge,
     admission_started: Instant,
     metrics: FinalizedUploadMetrics,
+    trace: Span,
+    admission_span: Span,
 }
 
 impl PendingQueuedUpload {
@@ -629,6 +640,12 @@ impl PendingQueuedUpload {
             charge,
             admission_started: Instant::now(),
             metrics: metrics.clone(),
+            trace: Span::current(),
+            admission_span: info_span!(
+                "indexer.queue.admission_wait",
+                height = record.height(),
+                bytes = record.payload.len
+            ),
         }
     }
 
@@ -776,6 +793,7 @@ struct FinalizedUploadProducer {
     queue_metrics: FinalizedQueueMetrics,
     capture_metrics: FinalizedCaptureMetrics,
     marshal: Arc<OnceLock<EngineMarshal>>,
+    traces: CaptureTraces,
 }
 
 impl FinalizedUploadProducer {
@@ -783,10 +801,17 @@ impl FinalizedUploadProducer {
         self,
         block: &EngineBlock<Sha256, PublicKey>,
         artifacts: constantinople_application::consensus::FinalizedArtifacts<Sha256>,
+        trace: Span,
     ) {
-        let mut current = self.receipt.lock().await;
+        let height = block.header.height;
+        let mut current = self
+            .receipt
+            .lock()
+            .instrument(info_span!("indexer.capture.receipt_lock", height))
+            .await;
         match capture_position(*current, block.header.height) {
             CapturePosition::Captured => {
+                trace.record("outcome", "already_captured");
                 if let Some(receipt) = *current
                     && receipt.height == block.header.height
                 {
@@ -800,11 +825,14 @@ impl FinalizedUploadProducer {
             CapturePosition::Next => {}
         }
 
-        validate_next_capture(*current, block, &artifacts);
+        info_span!("indexer.capture.validate", height)
+            .in_scope(|| validate_next_capture(*current, block, &artifacts));
         if requires_fresh_namespace_validation(*current) {
-            self.publisher.publisher().await;
+            self.publisher
+                .publisher()
+                .instrument(info_span!("indexer.publisher.connect", height))
+                .await;
         }
-        let height = block.header.height;
         let started = Instant::now();
         let marshal = self
             .marshal
@@ -825,19 +853,23 @@ impl FinalizedUploadProducer {
         let construct_started = Instant::now();
         let (record_header, encoded) = {
             let _span = info_span!("indexer.capture.construct", height).entered();
-            let upload = EngineCapturedUpload::from_finalized_artifacts(
-                block,
-                finalization,
-                current_time_micros(),
-                artifacts,
-            )
-            .expect("captured finalized artifacts must form a valid queue entry");
+            let upload = info_span!("indexer.capture.artifacts", height)
+                .in_scope(|| {
+                    EngineCapturedUpload::from_finalized_artifacts(
+                        block,
+                        finalization,
+                        current_time_micros(),
+                        artifacts,
+                    )
+                })
+                .expect("captured finalized artifacts must form a valid queue entry");
             let header = (
                 LatestCaptureReceipt::from_upload(&upload),
                 upload.state_start(),
                 upload.transaction_start(),
             );
-            (header, upload.encode())
+            let encoded = info_span!("indexer.capture.encode", height).in_scope(|| upload.encode());
+            (header, encoded)
         };
         let (receipt, state_start, transaction_start) = record_header;
         self.capture_metrics
@@ -862,6 +894,8 @@ impl FinalizedUploadProducer {
         };
 
         // Count the capture before the consumer can complete it.
+        trace.record("payload_bytes", payload.len);
+        self.traces.register(height, trace.clone());
         self.queue_metrics.pending_uploads.inc();
         let enqueue_started = Instant::now();
         let position = self
@@ -877,6 +911,7 @@ impl FinalizedUploadProducer {
         self.capture_metrics
             .record_enqueue
             .observe(enqueue_started.elapsed().as_secs_f64());
+        trace.record("position", position);
 
         // The queue tail is the receipt while any record exists. The consumer
         // persists a receipt only when a section prunes, so the hook pays for
@@ -1114,6 +1149,8 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
         metrics,
         queue_metrics,
         mut payload_floor,
+        traces,
+        replay_through,
     } = consumer;
     let mut active = JoinSet::new();
     let mut completed = BTreeMap::new();
@@ -1139,8 +1176,19 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                 break;
             };
             next_ack.get_or_insert(position);
-            retained_records.insert(position, record);
-            let pending = PendingQueuedUpload::new(position, record, &budget, &metrics);
+            let trace = traces.take(record.height(), record.height() <= replay_through);
+            trace.record("position", position);
+            trace.record("payload_bytes", record.payload.len);
+            let pending =
+                trace.in_scope(|| PendingQueuedUpload::new(position, record, &budget, &metrics));
+            retained_records.insert(
+                position,
+                RetainedUpload {
+                    record,
+                    trace,
+                    wait: None,
+                },
+            );
             if let Some(pending) = try_admit_queued_upload(
                 &mut active,
                 publisher.clone(),
@@ -1180,6 +1228,8 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
             () = queue_ready.notified(), if waiting.is_none() && active.len() < max_active => {}
             result = next_completed_upload(&mut active, max_active, &metrics), if !active.is_empty() => {
                 let (position, height) = result;
+                let retained = retained_records.get_mut(&position).expect("completed upload is retained");
+                retained.wait = Some(info_span!(parent: &retained.trace, "indexer.queue.ack_wait", height));
                 let replaced = completed.insert(position, height);
                 assert!(replaced.is_none(), "queue position completed more than once");
                 while let Some(position) = next_ack {
@@ -1187,7 +1237,12 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                         break;
                     };
                     let completion_started = Instant::now();
-                    ack_finalized_queue_entry(&reader, position, height).await;
+                    let retained = retained_records.get_mut(&position).expect("acknowledged upload is retained");
+                    drop(retained.wait.take());
+                    ack_finalized_queue_entry(&reader, position, height)
+                        .instrument(info_span!(parent: &retained.trace, "indexer.queue.ack", height, position))
+                        .await;
+                    retained.wait = Some(info_span!(parent: &retained.trace, "indexer.queue.prune_wait", height));
                     metrics
                         .completion
                         .observe(completion_started.elapsed().as_secs_f64());
@@ -1302,7 +1357,7 @@ async fn prune_finalized_queue(
     cleanup: &PayloadCleanup,
     receipt_store: &FinalizedReceiptStore,
     metrics: &FinalizedUploadMetrics,
-    retained: &mut BTreeMap<u64, FinalizedQueueRecord>,
+    retained: &mut BTreeMap<u64, RetainedUpload>,
     payload_floor: &mut u64,
 ) {
     let ack_floor = match reader.ack_floor().await {
@@ -1322,27 +1377,47 @@ async fn prune_finalized_queue(
     let receipt = retained
         .get(&last_pruned)
         .expect("every acknowledged record was read by the consumer")
+        .record
         .receipt;
 
+    let prune = info_span!(parent: None, "indexer.queue.prune", first_height = *payload_floor + 1, last_height = boundary, blocks = boundary - *payload_floor);
+    for (_, entry) in retained.range(*payload_floor..boundary) {
+        prune.follows_from(entry.trace.id());
+    }
     let receipt_started = Instant::now();
-    persist_capture_receipt(receipt_store, receipt).await;
+    persist_capture_receipt(receipt_store, receipt)
+        .instrument(
+            info_span!(parent: &prune, "indexer.queue.receipt_sync", height = receipt.height),
+        )
+        .await;
     metrics
         .receipt_sync
         .observe(receipt_started.elapsed().as_secs_f64());
 
     let sync_started = Instant::now();
-    loop {
-        match writer.sync().await {
-            Ok(()) => break,
-            Err(error) => {
-                warn!(error = %error, "failed to sync finalized index queue, retrying");
-                tokio::time::sleep(Duration::from_secs(1)).await;
+    async {
+        loop {
+            match writer.sync().await {
+                Ok(()) => break,
+                Err(error) => {
+                    warn!(error = %error, "failed to sync finalized index queue, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
             }
         }
     }
+    .instrument(info_span!(parent: &prune, "indexer.queue.sync", first_height = *payload_floor + 1, last_height = boundary))
+    .await;
     metrics
         .queue_sync
         .observe(sync_started.elapsed().as_secs_f64());
+
+    for (&position, entry) in retained.range_mut(*payload_floor..boundary) {
+        drop(entry.wait.take());
+        let pruned = info_span!(parent: &entry.trace, "indexer.queue.pruned", height = entry.record.height(), position);
+        pruned.follows_from(prune.id());
+    }
+    drop(prune);
 
     // Deletion may lag the durable prune. Startup removes any orphaned payloads.
     // Queue position `p` holds the block at height `p + 1`.
@@ -1351,10 +1426,13 @@ async fn prune_finalized_queue(
         let height = position
             .checked_add(1)
             .expect("finalized queue position must not overflow");
-        let len = retained
+        let entry = retained
             .remove(&position)
-            .map_or(0, |record| record.payload.len);
-        cleanup.enqueue(height, len).await;
+            .expect("pruned upload is retained");
+        cleanup
+            .enqueue(height, entry.record.payload.len)
+            .instrument(entry.trace)
+            .await;
         *payload_floor = height;
     }
 }
@@ -1383,6 +1461,8 @@ async fn start_queued_upload(
     let position = pending.position;
     let record = pending.record;
     let metrics = pending.metrics;
+    let trace = pending.trace;
+    drop(pending.admission_span);
     let height = record.height();
     assert_eq!(
         height,
@@ -1394,53 +1474,80 @@ async fn start_queued_upload(
     let (admitted_tx, admitted_rx) = oneshot::channel();
     let turn = admission_turn.replace(admitted_rx);
 
-    active.spawn(async move {
-        let bytes = read_finalized_payload(&payloads, height, record.payload).await;
+    let upload_span = info_span!(parent: &trace, "indexer.upload", height, position);
+    active.spawn(
+        async move {
+            let bytes = read_finalized_payload(&payloads, height, record.payload)
+                .instrument(info_span!(
+                    "indexer.payload.load",
+                    height,
+                    bytes = record.payload.len
+                ))
+                .await;
 
-        // Decoding is CPU work over hundreds of thousands of operations, so it
-        // runs on the blocking pool instead of a runtime worker.
-        let upload = decode_finalized_payload(height, bytes, &metrics).await;
-        assert_eq!(
-            LatestCaptureReceipt::from_upload(&upload),
-            record.receipt,
-            "finalized index payload at height {height} does not match its record"
-        );
-        let block = Arc::new(upload.block().clone());
-        let finalization = upload.finalization();
+            // Decoding is CPU work over hundreds of thousands of operations, so it
+            // runs on the blocking pool instead of a runtime worker.
+            let upload = decode_finalized_payload(height, bytes, &metrics).await;
+            trace.record(
+                "block_digest",
+                tracing::field::display(upload.block().seal()),
+            );
+            assert_eq!(
+                LatestCaptureReceipt::from_upload(&upload),
+                record.receipt,
+                "finalized index payload at height {height} does not match its record"
+            );
+            let block = Arc::new(upload.block().clone());
+            let finalization = upload.finalization();
 
-        wait_for_upload_turn(turn, &metrics).await;
-        let engine_publisher = publisher.publisher().await;
-        let mut completion = engine_publisher
-            .enqueue_queued_finalized(upload)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("failed to start finalized index upload at height {height}. {error}")
-            });
-        let _ = admitted_tx.send(());
+            wait_for_upload_turn(turn, &metrics)
+                .instrument(info_span!("indexer.queue.admission_turn", height))
+                .await;
+            let engine_publisher = publisher
+                .publisher()
+                .instrument(info_span!("indexer.publisher.connect", height))
+                .await;
+            let mut completion = engine_publisher
+                .enqueue_queued_finalized(upload)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to start finalized index upload at height {height}. {error}")
+                });
+            let _ = admitted_tx.send(());
 
-        let simplex_completion = cert_reporter
-            .publish_finalized_block(block, finalization)
-            .await
-            .unwrap_or_else(|error| match error {
-                PublishFinalizedBlockError::CommitmentBlockMismatch => {
-                    panic!("queued finalization does not match block at height {height}")
-                }
-                PublishFinalizedBlockError::UploaderStopped(error) => {
-                    panic!("failed to start finalized block upload at height {height}. {error}")
-                }
-            });
-        release_reservation_after_uploads(
-            height,
-            completion.persisted(),
-            simplex_completion.wait(),
-            reservation,
-        )
-        .await;
-        completion.published().await.unwrap_or_else(|error| {
-            panic!("finalized index publication failed at height {height}. {error}")
-        });
-        (position, height)
-    });
+            let simplex_completion = cert_reporter
+                .publish_finalized_block(block, finalization)
+                .await
+                .unwrap_or_else(|error| match error {
+                    PublishFinalizedBlockError::CommitmentBlockMismatch => {
+                        panic!("queued finalization does not match block at height {height}")
+                    }
+                    PublishFinalizedBlockError::UploaderStopped(error) => {
+                        panic!("failed to start finalized block upload at height {height}. {error}")
+                    }
+                });
+            release_reservation_after_uploads(
+                height,
+                completion
+                    .persisted()
+                    .instrument(info_span!("indexer.upload.metadata_wait", height)),
+                simplex_completion
+                    .wait()
+                    .instrument(info_span!("indexer.upload.simplex_wait", height)),
+                reservation,
+            )
+            .await;
+            completion
+                .published()
+                .instrument(info_span!("indexer.upload.publication_wait", height))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("finalized index publication failed at height {height}. {error}")
+                });
+            (position, height)
+        }
+        .instrument(upload_span),
+    );
 }
 
 async fn wait_for_upload_turn(
@@ -1504,7 +1611,13 @@ async fn decode_finalized_payload(
 ) -> EngineQueuedUpload {
     let metrics = metrics.clone();
     let scheduled = Instant::now();
+    let parent = Span::current();
+    let queued = info_span!(parent: &parent, "indexer.payload.decode_schedule", height);
     tokio::task::spawn_blocking(move || {
+        drop(queued);
+        let _span =
+            info_span!(parent: &parent, "indexer.payload.decode", height, bytes = bytes.len())
+                .entered();
         metrics
             .decode_schedule_wait
             .observe(scheduled.elapsed().as_secs_f64());
@@ -1685,6 +1798,7 @@ async fn maybe_build_indexer(
     });
     let queue_ready = Arc::new(Notify::new());
     let marshal = Arc::new(OnceLock::new());
+    let traces = CaptureTraces::default();
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         payloads: payloads.clone(),
@@ -1694,6 +1808,7 @@ async fn maybe_build_indexer(
         queue_metrics: queue_metrics.clone(),
         capture_metrics,
         marshal: marshal.clone(),
+        traces: traces.clone(),
     };
     let finalized_join = tokio::spawn(run_finalized_upload_consumer(FinalizedUploadConsumer {
         publisher,
@@ -1709,6 +1824,8 @@ async fn maybe_build_indexer(
         metrics: upload_metrics,
         queue_metrics,
         payload_floor,
+        traces,
+        replay_through: queue_tail.map_or(0, |receipt| receipt.height),
     }));
     Ok(Some(IndexerHandle {
         finalized_producer,
@@ -1725,9 +1842,16 @@ fn indexer_finalized_hook(indexer: Option<&IndexerHandle>) -> Option<ValidatorFi
     let indexer = indexer?;
     let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, artifacts| {
+        let height = block.header.height;
+        let trace = block_span(height, "finalization");
+        trace.record("block_digest", tracing::field::display(block.seal()));
+        let capture = info_span!(parent: &trace, "indexer.capture", height);
         let block = EngineBlock::from(block.clone());
         let finalized_producer = finalized_producer.clone();
-        Box::pin(async move { finalized_producer.enqueue(&block, artifacts).await })
+        Box::pin(
+            async move { finalized_producer.enqueue(&block, artifacts, trace).await }
+                .instrument(capture),
+        )
     }))
 }
 
@@ -2418,7 +2542,14 @@ mod tests {
                     payload,
                 };
                 assert_eq!(writer.append(record).await.unwrap(), height - 1);
-                retained.insert(height - 1, record);
+                retained.insert(
+                    height - 1,
+                    super::RetainedUpload {
+                        record,
+                        trace: tracing::Span::none(),
+                        wait: None,
+                    },
+                );
             }
             writer.sync().await.unwrap();
             for position in 0..section {
@@ -2484,7 +2615,13 @@ mod tests {
                 Some(capture_receipt(section, section + 1, section + 1))
             );
             let records = super::scan_finalized_queue_records(&mut reader).await;
-            assert_eq!(records, retained.into_iter().collect::<Vec<_>>());
+            assert_eq!(
+                records,
+                retained
+                    .into_iter()
+                    .map(|(position, entry)| (position, entry.record))
+                    .collect::<Vec<_>>()
+            );
             let payloads = crate::finalized_payloads::PayloadStore::new(
                 context.child("recovered_payloads"),
                 "cleanup-test-payloads".into(),
