@@ -395,7 +395,7 @@ impl IndexerClient {
         let sql = query_context_with_min_sequence(
             &self.sql,
             &self.sql_store,
-            target.store_sequence_number,
+            Some(target.store_sequence_number),
         );
         let batches = sql.sql(&query).await?.collect().await?;
         for batch in batches {

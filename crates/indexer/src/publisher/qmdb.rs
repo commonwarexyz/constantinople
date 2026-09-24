@@ -42,8 +42,8 @@ use constantinople_engine::types::{EngineBlock, EngineFinalization};
 use constantinople_primitives::{Account, AccountKey, BlockCfg};
 use cpu_time::ThreadTime;
 use exoware_qmdb::{
-    AuthenticatedOperationRange, QmdbError, prepare_authenticated_range,
-    stage_authenticated_range_with_existing_nodes, stage_watermark,
+    AuthenticatedOperationRange, QmdbError, prepare_authenticated_range, stage_authenticated_range,
+    stage_watermark,
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, KvSchema};
@@ -1105,16 +1105,14 @@ where
     } else {
         BTreeSet::new()
     };
-    stage_authenticated_range_with_existing_nodes(
+    stage_authenticated_range(
         &state_client,
-        state,
-        &existing_state_nodes,
+        state.without_pins_at(&existing_state_nodes),
         &mut batch,
     )?;
-    stage_authenticated_range_with_existing_nodes(
+    stage_authenticated_range(
         &transaction_client,
-        transactions,
-        &existing_transaction_nodes,
+        transactions.without_pins_at(&existing_transaction_nodes),
         &mut batch,
     )?;
     metrics
