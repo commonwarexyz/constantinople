@@ -844,17 +844,17 @@ export default function App() {
         setAccountNextCursor(null);
     };
 
+    // Preserve reservations until committed account state reflects finalization.
+    const canClearSubmittedTransaction = (transaction: SubmittedTransaction) =>
+        transaction.status === 'rejected' ||
+        (transaction.status === 'finalized' &&
+            consumeNonce(committedNonceRef.current, BigInt(transaction.nonce)) === null);
+
     const clearSubmittedTransactionHistory = () => {
-        for (const reconciliation of reconciliationsRef.current.values()) {
-            disposeReconciliation(reconciliation);
-        }
-        reconciliationsRef.current.clear();
-        reconciliationOrderRef.current.clear();
-        reconciliationFailuresRef.current.clear();
-        reconciliationSequenceRef.current = 0;
-        setHistory([]);
+        const retained = history.filter((transaction) => !canClearSubmittedTransaction(transaction));
+        setHistory(retained);
         if (historyKey !== null) {
-            const error = clearHistory(historyKey);
+            const error = writeHistory(historyKey, retained);
             if (error) setStorageError(error);
         }
     };
@@ -1117,7 +1117,7 @@ export default function App() {
                             nonce={nonce}
                             submitMessage={submitMessage}
                             isSubmitting={isSubmitting}
-                            canClearSubmittedTransactions={history.length > 0}
+                            canClearSubmittedTransactions={history.some(canClearSubmittedTransaction)}
                             spinner={spinner}
                             onCreateWallet={handleCreateWallet}
                             onSignIn={handleSignIn}
@@ -2023,15 +2023,6 @@ function readHistory(
 function writeHistory(key: string, history: SubmittedTransaction[]): string | null {
     try {
         window.localStorage.setItem(key, JSON.stringify(history));
-        return null;
-    } catch (error) {
-        return storageErrorMessage(error);
-    }
-}
-
-function clearHistory(key: string): string | null {
-    try {
-        window.localStorage.removeItem(key);
         return null;
     } catch (error) {
         return storageErrorMessage(error);
