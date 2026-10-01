@@ -119,8 +119,9 @@ impl<D: Display> StoredBatchStatus<D> {
 pub struct Config<St: Strategy> {
     /// Maximum total bytes the pool will hold.
     pub max_pool_bytes: usize,
-    /// Maximum bytes returned in a single `propose` call, and the
-    /// maximum accepted batch size for submissions.
+    /// Maximum encoded signed transaction bytes per proposal and admitted batch.
+    /// Callers must reserve block framing from their encoded-block budget
+    /// before setting this limit.
     pub max_propose_bytes: usize,
     /// Transaction signing namespace used for signature verification.
     pub namespace: &'static [u8],
@@ -373,11 +374,8 @@ where
 
 /// Pops pool entries for a proposal at `height`, recording each served batch.
 ///
-/// `filled` is the encoded size the proposal already holds, so the served
-/// batch stays within `max_propose_bytes - filled`. A refill for a non-empty
-/// block (`filled > 0`) never overshoots that headroom, so refills cannot
-/// inflate the block; an initial selection (`filled == 0`) may overshoot by
-/// one entry so an oversized head entry cannot wedge the pool.
+/// `filled` counts encoded signed transaction bytes already selected.
+/// Initial selections and refills both stay within the remaining budget.
 fn pop_proposal<H>(
     pool: &mut VecDeque<PoolEntry<H>>,
     pool_bytes: &mut usize,
@@ -390,12 +388,11 @@ where
     H: Hasher,
 {
     let budget = max_propose_bytes.saturating_sub(filled);
-    let strict = filled > 0;
     let mut batch_txs = Vec::new();
     let mut batch_bytes = 0;
 
     while let Some(entry) = pool.front() {
-        if batch_bytes + entry.total_bytes > budget && (strict || !batch_txs.is_empty()) {
+        if entry.total_bytes > budget - batch_bytes {
             break;
         }
         let entry = pool.pop_front().expect("front was Some");
@@ -664,7 +661,6 @@ where
                     batch_id,
                     digests,
                     transactions,
-                    total_bytes,
                     result,
                     ingest_result,
                 } => {
@@ -684,8 +680,10 @@ where
                     }
 
                     let transactions = new_transactions(transactions, &mut known_digests);
-                    let total_bytes = total_bytes_for(&transactions).min(total_bytes);
-                    if !transactions.is_empty() && pool_bytes + total_bytes > max_pool_bytes {
+                    let total_bytes = total_bytes_for(&transactions);
+                    if total_bytes > max_propose_bytes
+                        || total_bytes > max_pool_bytes.saturating_sub(pool_bytes)
+                    {
                         remove_known_digests(&transactions, &mut known_digests);
                         if let Some(result) = result {
                             let _ = result.send(TxStatus::Dropped);
@@ -806,17 +804,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        DigestOutcome, PoolEntry, ProposedBatch, StoredBatchStatus, TxStatus,
-        batch_status_from_outcomes, new_transactions, pop_proposal, resolve_proposed_batches,
-        status_for_finalized_block,
+        Actor, ActorReceiver, Config, DigestOutcome, IngestStatus, Mailbox, Message, PoolEntry,
+        ProposedBatch, StoredBatchStatus, TxStatus, batch_status_from_outcomes, new_transactions,
+        pop_proposal, resolve_proposed_batches, status_for_finalized_block, total_bytes_for,
     };
     use ahash::{AHashMap, AHashSet};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
-    use constantinople_primitives::{TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey};
+    use commonware_parallel::Sequential;
+    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_utils::NZUsize;
+    use constantinople_primitives::{
+        PublicKeyCache, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
+    };
     use core::num::NonZeroU64;
     use rand::{SeedableRng, rngs::StdRng};
-    use std::collections::VecDeque;
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, OnceLock},
+    };
+    use tokio::sync::{mpsc, oneshot};
 
     #[test]
     fn partial_finalization_reports_filtered_digests() {
@@ -1109,15 +1116,13 @@ mod tests {
         }
     }
 
-    /// A refill for a non-empty block never overshoots the remaining
-    /// headroom; an initial selection may overshoot by exactly one entry.
     #[test]
     fn pop_proposal_respects_remaining_headroom() {
         let mut pool = VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]);
         let mut pool_bytes = 900;
         let mut proposed = VecDeque::new();
 
-        // Refill headroom (1_000 - 500) below the head entry: nothing served.
+        // Insufficient headroom preserves the FIFO entry for a later proposal.
         let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 500, 1_000);
         assert!(txs.is_empty());
         assert_eq!(pool.len(), 2);
@@ -1125,7 +1130,7 @@ mod tests {
         assert!(proposed.is_empty());
 
         // Headroom covering only the head entry stops before the next.
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 1_000);
+        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 400, 1_000);
         assert_eq!(txs.len(), 2);
         assert_eq!(pool.len(), 1);
         assert_eq!(pool_bytes, 300);
@@ -1134,14 +1139,119 @@ mod tests {
         // A full block has no headroom and nothing is served.
         let mut pool = VecDeque::from([pool_entry(3, 1, 400)]);
         let mut pool_bytes = 400;
-        let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 300, 300);
-        assert!(txs.is_empty(), "no headroom left");
+        for filled in [300, 301, usize::MAX] {
+            let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, filled, 300);
+            assert!(txs.is_empty(), "no headroom left");
+        }
 
-        // An initial selection overshoots by one entry so an oversized head
-        // cannot wedge the pool.
+        // An empty proposal obeys the same strict budget.
         let txs = pop_proposal(&mut pool, &mut pool_bytes, &mut proposed, 5, 0, 300);
-        assert_eq!(txs.len(), 1);
-        assert!(pool.is_empty());
-        assert_eq!(pool_bytes, 0);
+        assert!(txs.is_empty());
+        assert_eq!(pool.len(), 1);
+        assert_eq!(pool_bytes, 400);
+    }
+
+    #[test]
+    fn pop_proposal_accepts_exact_transaction_budget() {
+        for filled in [0, 100] {
+            let mut pool = VecDeque::from([pool_entry(1, 2, 600), pool_entry(2, 1, 300)]);
+            let mut pool_bytes = 900;
+            let mut proposed = VecDeque::new();
+
+            let txs = pop_proposal(
+                &mut pool,
+                &mut pool_bytes,
+                &mut proposed,
+                5,
+                filled,
+                filled + 599,
+            );
+            assert!(txs.is_empty());
+            assert_eq!(pool_bytes, 900);
+            assert!(proposed.is_empty());
+
+            let txs = pop_proposal(
+                &mut pool,
+                &mut pool_bytes,
+                &mut proposed,
+                5,
+                filled,
+                filled + 900,
+            );
+            assert_eq!(txs.len(), 3);
+            assert!(pool.is_empty());
+            assert_eq!(pool_bytes, 0);
+            assert_eq!(proposed.len(), 2);
+        }
+    }
+
+    #[test]
+    fn actor_drops_oversized_batches_without_retaining_digests() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let transactions = pool_entry(1, 2, 0).transactions;
+            let digests: Vec<_> = transactions.iter().map(|tx| *tx.message_digest()).collect();
+            let max_propose_bytes = total_bytes_for(&transactions[..1]);
+            let (sender, rx) = mpsc::channel(8);
+            let mailbox = Mailbox::new(sender.clone());
+            let public_key_cache = PublicKeyCache::new(context.child("cache"), NZUsize!(16));
+            let actor = Actor::<_, sha256::Digest, ed25519::PublicKey, sha256::Sha256, _>::new(
+                context,
+                Config {
+                    max_pool_bytes: total_bytes_for(&transactions),
+                    max_propose_bytes,
+                    namespace: TRANSACTION_NAMESPACE,
+                    drop_grace_blocks: 3,
+                    strategy: Sequential,
+                    public_key_cache,
+                },
+                mailbox.clone(),
+                ActorReceiver { rx },
+                Arc::new(OnceLock::new()),
+            );
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let _handle = actor.start(listener);
+
+            let result = mailbox
+                .try_submit(
+                    "oversized-submit".into(),
+                    digests.clone(),
+                    transactions.clone(),
+                )
+                .unwrap();
+            assert_eq!(result.await.unwrap(), TxStatus::Dropped);
+
+            let result = mailbox
+                .try_ingest(
+                    "oversized-ingest".into(),
+                    digests.clone(),
+                    transactions.clone(),
+                )
+                .unwrap();
+            assert!(matches!(result.await.unwrap(), IngestStatus::Dropped));
+
+            // A rejected batch must leave its transactions eligible for admission.
+            let result = mailbox
+                .try_ingest(
+                    "fits".into(),
+                    vec![digests[0]],
+                    vec![transactions[0].clone()],
+                )
+                .unwrap();
+            assert!(matches!(result.await.unwrap(), IngestStatus::Accepted));
+
+            let (response, result) = oneshot::channel();
+            sender
+                .send(Message::Propose {
+                    height: 1,
+                    filled: 0,
+                    response,
+                })
+                .await
+                .unwrap();
+            let proposal = result.await.unwrap();
+            assert_eq!(proposal.len(), 1);
+            assert_eq!(*proposal[0].message_digest(), digests[0]);
+            assert_eq!(total_bytes_for(&proposal), max_propose_bytes);
+        });
     }
 }

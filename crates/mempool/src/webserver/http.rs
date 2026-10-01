@@ -133,7 +133,8 @@ fn ok_json<T: serde::Serialize>(value: &T) -> (StatusCode, String) {
 /// - `200 OK` with JSON status on finalization or drop.
 /// - `400 Bad Request` if the body is empty, any transaction fails to decode,
 ///   or any signature is invalid.
-/// - `413 Payload Too Large` if the batch exceeds `max_propose_bytes`.
+/// - `413 Payload Too Large` if the batch exceeds the transaction byte budget
+///   derived from the server's encoded-block limit.
 /// - `503 Service Unavailable` if the pool is full.
 async fn submit_batch<C, P, H, St>(
     State(state): State<SharedState<C, P, H, St>>,
@@ -151,12 +152,11 @@ where
     };
 
     // Phase 3: Submit to actor and await result.
-    let Some(result_rx) = state.mailbox.try_submit(
-        batch.batch_id,
-        batch.digests,
-        batch.transactions,
-        batch.total_bytes,
-    ) else {
+    let Some(result_rx) =
+        state
+            .mailbox
+            .try_submit(batch.batch_id, batch.digests, batch.transactions)
+    else {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
 
@@ -187,12 +187,11 @@ where
         Err(status) => return (status, String::new()),
     };
 
-    let Some(result_rx) = state.mailbox.try_ingest(
-        batch.batch_id,
-        batch.digests,
-        batch.transactions,
-        batch.total_bytes,
-    ) else {
+    let Some(result_rx) =
+        state
+            .mailbox
+            .try_ingest(batch.batch_id, batch.digests, batch.transactions)
+    else {
         return (StatusCode::SERVICE_UNAVAILABLE, String::new());
     };
 
@@ -210,7 +209,6 @@ where
     batch_id: String,
     transactions: Vec<VerifiedTransaction<H>>,
     digests: Vec<H::Digest>,
-    total_bytes: usize,
 }
 
 async fn verify_body<P, H, St>(
@@ -299,7 +297,6 @@ where
             batch_id,
             transactions,
             digests,
-            total_bytes,
         })
     });
     verified.await

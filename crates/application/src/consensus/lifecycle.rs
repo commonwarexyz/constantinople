@@ -9,6 +9,7 @@ use super::{
     history::parent_transactions_inactivity_floor,
     reject_verify, time,
 };
+use commonware_codec::EncodeSize as _;
 use commonware_consensus::simplex::types::Context;
 use commonware_cryptography::{Digest, Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
@@ -22,7 +23,9 @@ use commonware_runtime::{
 };
 use commonware_storage::mmr;
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{Block, Header, Sealable, SealedBlock};
+use constantinople_primitives::{
+    Block, Header, Sealable, SealedBlock, proposal::MAXIMUM_BLOCK_SIZE,
+};
 use rand::{CryptoRng, Rng};
 use std::{future::Future, sync::Arc};
 use tracing::{Instrument as _, info, info_span, warn};
@@ -96,9 +99,6 @@ where
                 .spawn(move |_: St| drop_span.in_scope(|| drop(parent))),
         );
 
-        self.proposed_transactions
-            .inc_by(execution.block.transaction_count as u64);
-
         let header = Header {
             context,
             parent: parent_digest,
@@ -109,7 +109,24 @@ where
             transactions_root: execution.block.transactions.root(),
             transactions_range: execution.block.transactions_range.clone(),
         };
-        let block = Block::new(header, execution.body).seal(&mut H::default());
+        let block = Block::new(header, execution.body);
+        let encoded_size = block.encode_size();
+
+        // A transaction source may exceed its budget. Trimming here would
+        // invalidate the execution commitments.
+        if encoded_size > MAXIMUM_BLOCK_SIZE {
+            warn!(
+                height = block.header.height,
+                encoded_size,
+                maximum_size = MAXIMUM_BLOCK_SIZE,
+                "application.propose.oversized"
+            );
+            return None;
+        }
+
+        let block = block.seal(&mut H::default());
+        self.proposed_transactions
+            .inc_by(execution.block.transaction_count as u64);
 
         info!(
             epoch = block.header.context.round.epoch().get(),
@@ -150,6 +167,18 @@ where
         I: TransactionSource<C, P, H> + Sync,
         St: Strategy,
     {
+        let encoded_size = block.encode_size();
+        if encoded_size > MAXIMUM_BLOCK_SIZE {
+            warn!(
+                height = block.header.height,
+                encoded_size,
+                maximum_size = MAXIMUM_BLOCK_SIZE,
+                reason = "oversized_block",
+                "application.verify.reject"
+            );
+            return None;
+        }
+
         // The glue actor retains its own references to the block, so the
         // header and lazy body are cloned out of the shared reference
         // (per-transaction refcount bumps) instead of moved.

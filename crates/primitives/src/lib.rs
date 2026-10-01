@@ -23,6 +23,8 @@ pub use cache::{DecompressedPublicKey, PublicKeyCache};
 mod block;
 pub use block::{Block, BlockCfg, Header, SealedBlock};
 
+pub mod proposal;
+
 mod transaction;
 pub use transaction::{SignedTransaction, Transaction, VerifiedTransaction};
 

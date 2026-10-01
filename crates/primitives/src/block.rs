@@ -5,7 +5,9 @@
 //! - [`Header`] - The execution header.
 //! - [`Block`] - Execution payload and required consensus metadata.
 
-use crate::{LazySignedTransaction, Sealable, Sealed, SignedTransaction};
+use crate::{
+    LazySignedTransaction, Sealable, Sealed, SignedTransaction, proposal::MAXIMUM_BLOCK_SIZE,
+};
 use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
@@ -270,10 +272,12 @@ where
     type Cfg = BlockCfg;
 
     fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+        // Limit this block without consuming trailing metadata from its enclosing message.
+        let mut buf = bytes::Buf::take(buf, MAXIMUM_BLOCK_SIZE);
         let tx_vec_cfg = (cfg.max_transactions, ());
         Ok(Self {
-            header: Header::read_cfg(buf, &())?,
-            body: Vec::read_cfg(buf, &tx_vec_cfg)?,
+            header: Header::read_cfg(&mut buf, &())?,
+            body: Vec::read_cfg(&mut buf, &tx_vec_cfg)?,
         })
     }
 }
@@ -369,7 +373,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_codec::Decode;
+    use commonware_codec::{Decode, FixedSize};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View},
@@ -441,6 +445,50 @@ mod tests {
         )
         .expect("decoding should succeed");
         assert_eq!(decoded, block);
+    }
+
+    fn encoded_block_with_size(size: usize) -> Vec<u8> {
+        let mut encoded = test_header().encode().to_vec();
+        let minimum_transaction =
+            crate::Transaction::<sha256::Digest>::SIZE + crate::TransactionSignature::MIN_SIZE;
+        let framed_transaction = minimum_transaction + minimum_transaction.encode_size();
+        let body_bytes = size - encoded.len();
+        let count = body_bytes / framed_transaction;
+        let count = (body_bytes - count.encode_size()) / framed_transaction;
+        count.write(&mut encoded);
+
+        // Deferred transaction bodies isolate the block framing check from signature validation.
+        for _ in 1..count {
+            minimum_transaction.write(&mut encoded);
+            encoded.resize(encoded.len() + minimum_transaction, 0);
+        }
+        let last_size = size - encoded.len() - minimum_transaction.encode_size();
+        assert!(
+            last_size
+                <= crate::Transaction::<sha256::Digest>::SIZE
+                    + crate::TransactionSignature::MAX_SIZE
+        );
+        last_size.write(&mut encoded);
+        encoded.resize(size, 0);
+        encoded
+    }
+
+    #[test]
+    fn block_codec_enforces_encoded_size_limit() {
+        type TestBlock = Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256>;
+
+        for size in [MAXIMUM_BLOCK_SIZE - 1, MAXIMUM_BLOCK_SIZE] {
+            let mut encoded = encoded_block_with_size(size);
+            encoded.extend_from_slice(&[1, 2, 3, 4]);
+            let mut reader = encoded.as_slice();
+            let block = TestBlock::read_cfg(&mut reader, &BlockCfg::default())
+                .expect("a block within the consensus limit should decode");
+            assert_eq!(block.encode_size(), size);
+            assert_eq!(reader, &[1, 2, 3, 4]);
+        }
+
+        let encoded = encoded_block_with_size(MAXIMUM_BLOCK_SIZE + 1);
+        assert!(TestBlock::decode_cfg(encoded.as_slice(), &BlockCfg::default()).is_err());
     }
 
     #[test]

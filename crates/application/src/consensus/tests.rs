@@ -2,6 +2,7 @@ use super::{
     Application, Databases, StateSyncTarget, TransactionHistoryTarget, genesis_block,
     history::parent_transactions_inactivity_floor,
 };
+use commonware_codec::{DecodeExt as _, Encode as _, EncodeSize as _, Write as _};
 use commonware_consensus::{
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
@@ -9,7 +10,8 @@ use commonware_consensus::{
     types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
-    Digest as _, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519, sha256,
+    Digest as _, Hasher as _, Signer as _, bls12381::primitives::variant::MinSig, ed25519,
+    secp256r1::standard as secp256r1, sha256,
 };
 use commonware_glue::stateful::db::{DatabaseSet as _, Merkleized as _, Unmerkleized as _};
 use commonware_parallel::Sequential;
@@ -27,8 +29,9 @@ use commonware_storage::{
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::{
-    Account, AccountKey, Block, Header, Nonce, PublicKeyCache, Sealable, SealedBlock,
-    SignedTransaction, Transaction, TransactionPublicKey,
+    Account, AccountKey, Block, Header, LazySignedTransaction, Nonce, PublicKeyCache, Sealable,
+    SealedBlock, SignedTransaction, Transaction, TransactionPublicKey, TransactionSignature,
+    proposal::MAXIMUM_BLOCK_SIZE,
 };
 use std::{num::NonZeroU64, sync::Arc, time::Duration};
 
@@ -215,6 +218,124 @@ fn unexecuted_child_header(
         transactions_root: parent.header.transactions_root,
         transactions_range: parent.header.transactions_range.clone(),
     }
+}
+
+fn sized_unverified_block(
+    header: Header<sha256::Digest, sha256::Digest, ed25519::PublicKey>,
+    encoded_size: usize,
+) -> TestBlock {
+    let lazy = |payload_size: usize| {
+        let mut encoded = Vec::new();
+        payload_size.write(&mut encoded);
+        encoded.resize(encoded.len() + payload_size, 0xff);
+        LazySignedTransaction::<sha256::Sha256>::decode(encoded.as_slice())
+            .expect("lazy framing should decode without materializing the invalid payload")
+    };
+    let transaction = lazy(256);
+    let count = (encoded_size - header.encode_size()) / transaction.encode_size();
+    let mut body = vec![transaction; count - 1];
+    let remaining = encoded_size
+        - header.encode_size()
+        - count.encode_size()
+        - body.iter().map(|tx| tx.encode_size()).sum::<usize>();
+    let payload_size = remaining - remaining.encode_size();
+    body.push(lazy(payload_size));
+    let block = Block { header, body }.seal(&mut sha256::Sha256::default());
+    assert_eq!(block.encode_size(), encoded_size);
+    assert_eq!(block.encode().len(), encoded_size);
+    block
+}
+
+#[test]
+fn verify_checks_block_size_before_fetching_parent() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            ..
+        } = verify_harness(&context).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+
+        // Returning no parent isolates the size gate from execution. The
+        // malformed lazy payloads make signature preparation inexpensive.
+        for encoded_size in [
+            MAXIMUM_BLOCK_SIZE - 1,
+            MAXIMUM_BLOCK_SIZE,
+            MAXIMUM_BLOCK_SIZE + 1,
+        ] {
+            let block = sized_unverified_block(
+                unexecuted_child_header(&parent, &consensus_context),
+                encoded_size,
+            );
+            let mut parent_polled = false;
+            let result = app
+                .verify_child(
+                    (context.child("verify_size"), consensus_context.clone()),
+                    Arc::new(block),
+                    async {
+                        parent_polled = true;
+                        None
+                    },
+                    dbs.new_batches().await,
+                )
+                .await;
+
+            assert!(result.is_none());
+            assert_eq!(parent_polled, encoded_size <= MAXIMUM_BLOCK_SIZE);
+        }
+    });
+}
+
+#[test]
+fn propose_rejects_oversized_transaction_source_output() {
+    deterministic::Runner::default().start(|context| async move {
+        let VerifyHarness {
+            mut app,
+            dbs,
+            parent,
+            leader,
+            sender,
+            recipient,
+            ..
+        } = verify_harness(&context).await;
+        let consensus_context = SimplexContext {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            leader: leader.public_key(),
+            parent: (View::zero(), *parent.seal()),
+        };
+
+        // A custom source can bypass admission. Inflate an unchecked
+        // signature so the final guard runs after executing just one transfer.
+        let signer = secp256r1::PrivateKey::from_seed(25);
+        let signature = TransactionSignature::Secp256r1 {
+            signature: signer.sign(TEST_TX_NS, b"unchecked source"),
+            authenticator_data: Vec::new(),
+            client_data_json: Vec::new(),
+            encoded: vec![0; MAXIMUM_BLOCK_SIZE],
+        };
+        let transaction = SignedTransaction::new_unchecked(
+            transfer(&sender, &recipient, 1).into_inner(),
+            signature,
+        );
+        assert!(transaction.encode_size() > MAXIMUM_BLOCK_SIZE);
+        let mut input = StaticTransactionSource::new(vec![vec![transaction]]);
+        let proposed = app
+            .propose_child(
+                (context.child("propose_size"), consensus_context),
+                Arc::new(parent),
+                dbs.new_batches().await,
+                &mut input,
+            )
+            .await;
+
+        assert!(proposed.is_none());
+    });
 }
 
 #[test]

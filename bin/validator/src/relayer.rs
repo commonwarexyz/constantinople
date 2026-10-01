@@ -106,8 +106,8 @@ pub struct ServerConfig<St: Strategy> {
     pub account_reader: Arc<OnceLock<Arc<dyn AccountReader>>>,
     pub view_clock: ViewClock,
     pub strategy: St,
-    /// Must match the validators' mempool `max_propose_bytes` so a batch
-    /// the relayer accepts is never rejected by a leader for size.
+    /// Signed-transaction byte budget derived from the encoded block limit.
+    /// Must match the validators' mempool budget so accepted batches fit a proposal.
     pub max_batch_bytes: usize,
 }
 
