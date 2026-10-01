@@ -15,7 +15,6 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   UDEPS_VERSION: 0.1.60
-  NODE_VERSION: 20
 
 jobs:
   test:
@@ -38,6 +37,9 @@ jobs:
           rust-cache-save: ${{ matrix.partition == 1 }}
       - uses: taiki-e/install-action@just
       - uses: taiki-e/install-action@nextest
+      - name: Test deployment script
+        if: matrix.partition == 1
+        run: just deploy-script-test
       - name: cargo test
         run: cargo nextest run --workspace --all --all-features --locked --partition hash:${{ matrix.partition }}/4
 

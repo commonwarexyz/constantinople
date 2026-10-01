@@ -9,7 +9,11 @@ use commonware_cryptography::{
     Signer,
     bls12381::{
         dkg::feldman_desmedt as dkg,
-        primitives::{group::Share, sharing::ModeVersion, variant::MinSig},
+        primitives::{
+            group::Share,
+            sharing::{Mode, ModeVersion},
+            variant::MinSig,
+        },
     },
     ed25519,
 };
@@ -26,6 +30,7 @@ use std::{
 };
 use tracing::Level;
 use tracing_subscriber::fmt;
+use url::Url;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -70,7 +75,7 @@ pub(crate) enum StartupModeConfig {
     StateSync,
 }
 
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(name = "constantinople-deploy")]
 struct Cli {
     /// Subcommand to run.
@@ -78,7 +83,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 enum Command {
     Generate(Box<GenerateArgs>),
     SimplexVerificationMaterial(SimplexVerificationMaterialArgs),
@@ -91,7 +96,7 @@ struct SimplexVerificationMaterialArgs {
     config: PathBuf,
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub(crate) struct GenerateArgs {
     /// Number of primary (voting) validators.
     #[arg(long)]
@@ -171,7 +176,7 @@ pub(crate) struct GenerateArgs {
     target: GenerateTarget,
 }
 
-#[derive(Debug, Subcommand)]
+#[derive(Subcommand)]
 #[expect(
     clippy::large_enum_variant,
     reason = "constructed once per invocation, so the size imbalance is harmless"
@@ -208,7 +213,7 @@ pub(crate) struct LocalArgs {
     qmdb_indexer_port: u16,
 }
 
-#[derive(Debug, Args)]
+#[derive(Args)]
 pub(crate) struct RemoteArgs {
     /// AWS regions to spread validators across (comma-separated).
     #[arg(long, value_delimiter = ',')]
@@ -228,6 +233,34 @@ pub(crate) struct RemoteArgs {
     /// consensus does.
     #[arg(long = "storage-throughput")]
     storage_throughput: Option<i32>,
+    /// Absolute HTTP or HTTPS URL of an external exoware store that supports reads and writes.
+    /// The URL is used verbatim by every store consumer. Providing it replaces
+    /// the simulator-backed chain-indexer. No chain-indexer instance, binary,
+    /// config, or port rule is generated.
+    #[arg(long = "store-url", value_parser = parse_service_url)]
+    store_url: Option<String>,
+    /// Origin of an already-running metadata indexer backed by the external store.
+    #[arg(long = "metadata-indexer-url", requires = "store_url", value_parser = parse_service_url)]
+    metadata_indexer_url: Option<String>,
+    /// Origin of an already-running QMDB indexer backed by the external store.
+    #[arg(long = "qmdb-indexer-url", requires = "store_url", value_parser = parse_service_url)]
+    qmdb_indexer_url: Option<String>,
+    /// Store writer credential for the validator indexer secondary.
+    #[arg(
+        long = "store-api-key",
+        env = "CONSTANTINOPLE_STORE_API_KEY",
+        hide_env_values = true,
+        requires = "store_url"
+    )]
+    store_api_key: Option<String>,
+    /// Store read credential for locally deployed adapter services.
+    #[arg(
+        long = "adapter-store-api-key",
+        env = "CONSTANTINOPLE_ADAPTER_STORE_API_KEY",
+        hide_env_values = true,
+        requires = "store_url"
+    )]
+    adapter_store_api_key: Option<String>,
     /// Instance type for the shared chain-indexer instance.
     #[arg(long = "chain-indexer-instance-type", default_value = DEFAULT_CHAIN_INDEXER_INSTANCE_TYPE)]
     chain_indexer_instance_type: String,
@@ -335,6 +368,40 @@ pub(crate) struct RelayerLeaderConfig {
     pub url: String,
 }
 
+fn parse_service_url(value: &str) -> Result<String, &'static str> {
+    const ERROR: &str = "expected an absolute HTTP or HTTPS service base without credentials, a query, or a fragment";
+
+    // Do not let URL normalization hide whitespace or a pasted byte-order mark.
+    if value
+        .chars()
+        .any(|character| character.is_whitespace() || character == '\u{feff}')
+    {
+        return Err(ERROR);
+    }
+
+    // Match the Store client's parser so invalid endpoints fail before deployment.
+    let uri = value.parse::<http::Uri>().map_err(|_| ERROR)?;
+    if uri.authority().is_none() || !matches!(uri.scheme_str(), Some("http" | "https")) {
+        return Err(ERROR);
+    }
+
+    let parsed = Url::parse(value).map_err(|_| ERROR)?;
+    if !matches!(parsed.scheme(), "http" | "https")
+        || parsed.host_str().is_none()
+        || !parsed.username().is_empty()
+        || parsed
+            .password()
+            .is_some_and(|password| !password.is_empty())
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+    {
+        return Err(ERROR);
+    }
+
+    // Consumers must receive the operator's base path without URL normalization.
+    Ok(value.to_owned())
+}
+
 fn parse_accounts_jitter(value: &str) -> Result<f64, String> {
     let parsed = value
         .parse::<f64>()
@@ -363,7 +430,7 @@ pub(crate) struct NamedBootstrapperEntry {
     name: String,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct ValidatorConfig {
     /// Hex-encoded ed25519 private key.
     private_key: String,
@@ -430,12 +497,15 @@ pub(crate) struct ValidatorConfig {
 /// Indexer wiring serialized into a secondary validator's YAML.
 ///
 /// Mirrors the schema in `bin/validator/src/config.rs::IndexerConfig`. The
-/// shared `chain-indexer` store backs raw KV rows, SQL metadata rows, QMDB
+/// shared Store backs raw KV rows, SQL metadata rows, QMDB
 /// operation logs, and simplex artifacts.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct IndexerConfig {
-    /// URL of the shared chain-indexer store.
-    pub chain_indexer_url: String,
+    /// URL of the Store receiving finalized uploads.
+    pub store_url: String,
+    /// Store writer credential used by the indexer secondary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Number of blocks buffered before upload.
     pub upload_buffer: usize,
 }
@@ -452,20 +522,18 @@ pub(crate) struct ChainIndexerConfig {
     pub db_parallelism: Option<i32>,
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct MetadataIndexerConfig {
-    /// Read-service port the metadata-indexer listens on.
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub(crate) struct AdapterConfig {
+    /// Optional separate metrics listener.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_port: Option<u16>,
+    /// Port the adapter listens on.
     pub port: u16,
-    /// URL of the chain-indexer store to read from.
-    pub chain_indexer_url: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct QmdbIndexerConfig {
-    /// Query facade port the qmdb-indexer listens on.
-    pub port: u16,
-    /// URL of the chain-indexer store to read from.
-    pub chain_indexer_url: String,
+    /// URL of the Store to read from.
+    pub store_url: String,
+    /// Store read credential used by this adapter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -677,7 +745,7 @@ fn build_cluster_material(
     // primary count or `threshold_scheme` will panic at validator load.
     let participants = public_keys.clone().into_iter().try_collect().unwrap();
     let (dkg_output, raw_shares) =
-        dkg::deal::<MinSig, _, N3f1>(rng, Default::default(), participants)
+        dkg::deal::<MinSig, _, N3f1>(rng, Mode::NonZeroCounter, participants)
             .expect("DKG deal failed");
     let shares = raw_shares.into_iter().collect();
     let genesis_leader = hex(&public_keys[0].encode());
@@ -763,22 +831,65 @@ pub(crate) fn generate_deployer_tag() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, GenerateTarget, SIMPLEX_VERIFICATION_MATERIAL_FILE,
-        generate_local_cluster_material, simplex_verification_material_from_config,
-        write_simplex_verification_material,
+        AdapterConfig, Cli, Command, DEPLOYER_CONFIG_FILE, GenerateTarget, IndexerConfig,
+        METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_CONFIG_FILE, SIMPLEX_VERIFICATION_MATERIAL_FILE,
+        VALIDATOR_BINARY_FILE, ValidatorConfig, generate_local_cluster_material, remote,
+        simplex_verification_material_from_config, write_simplex_verification_material,
     };
-    use clap::Parser;
+    use clap::{CommandFactory, FromArgMatches, Parser, error::ErrorKind};
     use commonware_codec::Encode;
+    use commonware_deployer::aws;
     use commonware_formatting::hex;
     use std::{
         fs,
+        panic::{AssertUnwindSafe, catch_unwind},
         path::PathBuf,
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    // Ordinary parser cases must not inherit the operator's deployment credentials.
+    fn parse_cli(
+        args: impl IntoIterator<Item = impl Into<std::ffi::OsString> + Clone>,
+    ) -> Result<Cli, clap::Error> {
+        let command = Cli::command().mut_subcommand("generate", |command| {
+            command.mut_subcommand("remote", |mut command| {
+                for name in ["store_api_key", "adapter_store_api_key"] {
+                    command = command.mut_arg(name, |argument| argument.env(None::<&str>));
+                }
+                command
+            })
+        });
+        let matches = command.try_get_matches_from(args)?;
+        Cli::from_arg_matches(&matches)
+    }
+
+    fn remote_cli_args() -> Vec<&'static str> {
+        vec![
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "remote",
+            "--regions",
+            "us-east-1,us-west-2",
+            "--instance-type",
+            "c8g.large",
+            "--storage-size",
+            "25",
+            "--monitoring-instance-type",
+            "c8g.2xlarge",
+            "--monitoring-storage-size",
+            "100",
+            "--dashboard",
+            "dashboard.json",
+        ]
+    }
+
     #[test]
     fn remote_parses_http_cidrs() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -818,8 +929,329 @@ mod tests {
     }
 
     #[test]
+    fn remote_parses_adapter_origins_and_credentials() {
+        let mut args = remote_cli_args();
+        args.extend([
+            "--store-url",
+            "https://store.example.com",
+            "--metadata-indexer-url",
+            "https://sql.example.com",
+            "--qmdb-indexer-url",
+            "https://qmdb.example.com",
+            "--store-api-key",
+            "writer-key",
+            "--adapter-store-api-key",
+            "reader-key",
+        ]);
+
+        let cli = parse_cli(args).expect("remote invocation should parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let generate = *generate;
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("expected remote target");
+        };
+
+        assert_eq!(
+            remote.store_url.as_deref(),
+            Some("https://store.example.com")
+        );
+        assert_eq!(
+            remote.metadata_indexer_url.as_deref(),
+            Some("https://sql.example.com")
+        );
+        assert_eq!(
+            remote.qmdb_indexer_url.as_deref(),
+            Some("https://qmdb.example.com")
+        );
+        assert_eq!(remote.store_api_key.as_deref(), Some("writer-key"));
+        assert_eq!(remote.adapter_store_api_key.as_deref(), Some("reader-key"));
+    }
+
+    #[test]
+    fn remote_service_urls_reject_invalid_values() {
+        for flag in [
+            "--store-url",
+            "--metadata-indexer-url",
+            "--qmdb-indexer-url",
+        ] {
+            for value in [
+                "",
+                "service.example.com",
+                "https:store.example.com",
+                "https:/store.example.com",
+                "https:///store.example.com",
+                "https://store.example.com\\path",
+                "/service",
+                "ftp://service.example.com",
+                "https://#fragment",
+                "http://?query",
+                "https://[invalid]",
+                "https://service.example.com:65536",
+                "https://user:password@service.example.com",
+                "https://user@service.example.com",
+                "https://:password@service.example.com",
+                "https://service.example.com/path?query",
+                "https://service.example.com/path#fragment",
+                "https://service.example.com/path with space",
+                " https://service.example.com",
+                "https://service.example.com\n",
+                "https://service.example.com/\tpath",
+                "https://service.example.com/\u{a0}path",
+                "https://service.example.com/\u{85}path",
+                "https://service.example.com/\u{feff}path",
+                "https://service.example.com/base?",
+                "https://service.example.com/base#",
+                "https://service.example.com/base?#",
+            ] {
+                let mut args = remote_cli_args();
+                if flag != "--store-url" {
+                    args.extend(["--store-url", "https://store.example.com"]);
+                }
+                args.extend([flag, value]);
+
+                let error = parse_cli(args)
+                    .err()
+                    .unwrap_or_else(|| panic!("{flag} accepted {value:?}"));
+                assert_eq!(error.kind(), ErrorKind::ValueValidation, "{flag} {value:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn remote_service_urls_preserve_accepted_values() {
+        for value in [
+            "http://localhost:8090",
+            "https://service.example.com",
+            "https://service.example.com/base/",
+            "HTTPS://Service.Example.COM:443/a/../base/%2f",
+            "http://127.0.0.1:8090/base",
+            "https://[::1]:8090/base",
+            "https://service.example.com/path%20with%20space",
+            "https://service.example.com/path%3F%23",
+        ] {
+            let mut args = remote_cli_args();
+            for flag in [
+                "--store-url",
+                "--metadata-indexer-url",
+                "--qmdb-indexer-url",
+            ] {
+                args.extend([flag, value]);
+            }
+            let cli = parse_cli(args).expect("service bases should parse");
+            let Command::Generate(generate) = cli.command else {
+                panic!("expected generate command");
+            };
+            let GenerateTarget::Remote(remote) = generate.target else {
+                panic!("expected remote target");
+            };
+
+            assert_eq!(remote.store_url.as_deref(), Some(value));
+            assert_eq!(remote.metadata_indexer_url.as_deref(), Some(value));
+            assert_eq!(remote.qmdb_indexer_url.as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn remote_generator_preserves_parsed_store_base() {
+        let store_url = "HTTPS://Store.Example.COM:443/a/../base/%2f/";
+        let mut args = remote_cli_args();
+        args.insert(2, "--indexer");
+        args.extend(["--store-url", store_url]);
+        let cli = parse_cli(args).expect("external Store should parse");
+        let Command::Generate(mut generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        let root = unique_temp_dir("remote-store-base");
+        fs::create_dir_all(&root).expect("create temporary directory");
+        let dashboard = root.join("dashboard.json");
+        fs::write(&dashboard, "{}").expect("write dashboard");
+        generate.output_dir = root.join("deployment");
+        let GenerateTarget::Remote(remote) = &mut generate.target else {
+            panic!("expected remote target");
+        };
+        remote.dashboard = dashboard;
+        let GenerateTarget::Remote(remote) = &generate.target else {
+            panic!("expected remote target");
+        };
+
+        remote::generate(&generate, remote);
+
+        for filename in [METADATA_INDEXER_CONFIG_FILE, QMDB_INDEXER_CONFIG_FILE] {
+            let yaml = fs::read_to_string(generate.output_dir.join(filename))
+                .expect("read generated adapter config");
+            let config: AdapterConfig = serde_yaml::from_str(&yaml).expect("decode adapter config");
+            assert_eq!(config.store_url, store_url);
+        }
+        let yaml = fs::read_to_string(generate.output_dir.join(DEPLOYER_CONFIG_FILE))
+            .expect("read generated deployment config");
+        let deployment: aws::Config =
+            serde_yaml::from_str(&yaml).expect("decode deployment config");
+        let indexers = deployment
+            .instances
+            .iter()
+            .filter(|instance| instance.binary == VALIDATOR_BINARY_FILE)
+            .filter_map(|instance| {
+                let yaml = fs::read_to_string(generate.output_dir.join(&instance.config))
+                    .expect("read generated validator config");
+                let config: ValidatorConfig =
+                    serde_yaml::from_str(&yaml).expect("decode validator config");
+                config.indexer
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(indexers.len(), 1);
+        assert_eq!(indexers[0].store_url, store_url);
+
+        fs::remove_dir_all(root).expect("remove generated deployment");
+    }
+
+    #[test]
+    fn remote_store_url_requires_indexer() {
+        let mut args = remote_cli_args();
+        args.extend([
+            "--store-url",
+            "https://store.example.com",
+            "--store-api-key",
+            "writer-key",
+        ]);
+        let cli = parse_cli(args).expect("external Store should parse");
+        let Command::Generate(mut generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert!(!generate.indexer);
+        let root = unique_temp_dir("remote-store-requires-indexer");
+        fs::create_dir_all(&root).expect("create temporary directory");
+        let dashboard = root.join("dashboard.json");
+        fs::write(&dashboard, "{}").expect("write dashboard");
+        generate.output_dir = root.join("deployment");
+        let GenerateTarget::Remote(remote) = &mut generate.target else {
+            panic!("expected remote target");
+        };
+        remote.dashboard = dashboard;
+        let GenerateTarget::Remote(remote) = &generate.target else {
+            panic!("expected remote target");
+        };
+
+        let result = catch_unwind(AssertUnwindSafe(|| remote::generate(&generate, remote)));
+        let output_exists = generate.output_dir.exists();
+        fs::remove_dir_all(root).expect("remove temporary directory");
+
+        assert!(result.is_err(), "--store-url requires --indexer");
+        assert!(!output_exists, "invalid arguments must not write a bundle");
+    }
+
+    #[test]
+    fn remote_adapter_origins_each_require_external_store() {
+        for flag in ["--metadata-indexer-url", "--qmdb-indexer-url"] {
+            let mut args = remote_cli_args();
+            args.extend([flag, "https://adapter.example.com"]);
+
+            let error = parse_cli(args)
+                .err()
+                .expect("remote adapter origin without an external store should fail");
+
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn remote_store_credentials_each_require_external_store() {
+        for flag in ["--store-api-key", "--adapter-store-api-key"] {
+            let mut args = remote_cli_args();
+            args.extend([flag, "secret-key"]);
+            let error = parse_cli(args)
+                .err()
+                .expect("Store credentials require an external Store");
+
+            assert_eq!(error.kind(), ErrorKind::MissingRequiredArgument);
+        }
+    }
+
+    #[test]
+    fn deployment_credentials_resolve_from_environment() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args([
+                "tests::child_deployment_credentials_from_environment",
+                "--exact",
+                "--ignored",
+            ])
+            .env("CONSTANTINOPLE_STORE_API_KEY", "environment-writer")
+            .env("CONSTANTINOPLE_ADAPTER_STORE_API_KEY", "environment-reader")
+            .output()
+            .expect("child test runs");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"));
+    }
+
+    #[test]
+    #[ignore = "run with isolated credentials by deployment_credentials_resolve_from_environment"]
+    fn child_deployment_credentials_from_environment() {
+        let mut args = remote_cli_args();
+        assert!(Cli::try_parse_from(args.clone()).is_err());
+        args.extend(["--store-url", "https://store.example.com"]);
+        let cli = Cli::try_parse_from(args).expect("environment credentials parse");
+        let Command::Generate(generate) = cli.command else {
+            panic!("generate command")
+        };
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("remote target")
+        };
+        assert_eq!(remote.store_api_key.as_deref(), Some("environment-writer"));
+        assert_eq!(
+            remote.adapter_store_api_key.as_deref(),
+            Some("environment-reader")
+        );
+
+        let mut args = remote_cli_args();
+        args.extend([
+            "--store-url",
+            "https://store.example.com",
+            "--store-api-key",
+            "explicit-writer",
+        ]);
+        let cli = Cli::try_parse_from(args).expect("explicit credential parses");
+        let Command::Generate(generate) = cli.command else {
+            panic!("generate command")
+        };
+        let GenerateTarget::Remote(remote) = generate.target else {
+            panic!("remote target")
+        };
+        assert_eq!(remote.store_api_key.as_deref(), Some("explicit-writer"));
+    }
+
+    #[test]
+    fn generated_indexer_api_keys_default_and_omit() {
+        let indexer: IndexerConfig =
+            serde_yaml::from_str("store_url: https://store.example.com\nupload_buffer: 64\n")
+                .expect("indexer config without an API key should parse");
+        let metadata: AdapterConfig =
+            serde_yaml::from_str("port: 8091\nstore_url: https://store.example.com\n")
+                .expect("metadata config without an API key should parse");
+        let qmdb: AdapterConfig =
+            serde_yaml::from_str("port: 8092\nstore_url: https://store.example.com\n")
+                .expect("QMDB config without an API key should parse");
+
+        assert_eq!(indexer.api_key, None);
+        assert_eq!(metadata.api_key, None);
+        assert_eq!(qmdb.api_key, None);
+
+        for raw in [
+            serde_yaml::to_string(&indexer).expect("indexer config should serialize"),
+            serde_yaml::to_string(&metadata).expect("metadata config should serialize"),
+            serde_yaml::to_string(&qmdb).expect("QMDB config should serialize"),
+        ] {
+            assert!(!raw.contains("api_key"));
+        }
+    }
+
+    #[test]
     fn remote_parses_traces_sampling_rate() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -858,7 +1290,7 @@ mod tests {
 
     #[test]
     fn rejects_traces_sampling_rate_above_one() {
-        let error = Cli::try_parse_from([
+        let error = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -883,14 +1315,15 @@ mod tests {
             "--traces",
             "1.5",
         ])
-        .expect_err("sampling rate above one should fail");
+        .err()
+        .expect("sampling rate above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
     }
 
     #[test]
     fn parses_fractional_spammer_accounts_jitter() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -912,7 +1345,7 @@ mod tests {
 
     #[test]
     fn parses_deterministic_spammer_seed_offset() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -934,7 +1367,7 @@ mod tests {
 
     #[test]
     fn parses_spammer_presigned_batches() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -956,7 +1389,7 @@ mod tests {
 
     #[test]
     fn parses_spammer_rayon_threads() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -979,7 +1412,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "--validators must be at least 4")]
     fn rejects_validator_count_below_coding_minimum() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -1000,7 +1433,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "--spammer-submitters must be at least 1")]
     fn rejects_zero_spammer_submitters() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -1022,7 +1455,7 @@ mod tests {
 
     #[test]
     fn rejects_spammer_accounts_jitter_above_one() {
-        let error = Cli::try_parse_from([
+        let error = parse_cli([
             "constantinople-deploy",
             "generate",
             "--validators",
@@ -1033,7 +1466,8 @@ mod tests {
             "1.1",
             "local",
         ])
-        .expect_err("jitter above one should fail");
+        .err()
+        .expect("jitter above one should fail");
 
         assert!(error.to_string().contains("invalid value"));
     }

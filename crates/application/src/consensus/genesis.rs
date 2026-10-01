@@ -58,7 +58,7 @@ where
         state_root: state_target.root,
         state_range: non_empty_range!(*state_target.range.start(), *state_target.range.end()),
         transactions_root: transactions_target.root,
-        transactions_range: non_empty_range!(0, *transactions_target.leaf_count),
+        transactions_range: non_empty_range!(0, *transactions_target.size),
     };
 
     Block::<C, P, H>::new(header, Vec::new()).seal(hasher)

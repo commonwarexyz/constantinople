@@ -234,12 +234,13 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
 
 /// Build the full indexer wiring written into the owning secondary's YAML.
 ///
-/// All rows go through the shared `chain-indexer` Store URL. Store prefixes
+/// All rows go through the shared Store URL. Store prefixes
 /// keep raw KV, SQL, and QMDB rows disjoint.
 fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
-        chain_indexer_url: url,
+        store_url: url,
+        api_key: None,
         upload_buffer: INDEXER_UPLOAD_BUFFER,
     }
 }
@@ -311,24 +312,30 @@ fn local_run_commands(
             .map(|jobs| format!(" --db-parallelism {jobs}"))
             .unwrap_or_default();
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
+            "cargo run --release -p constantinople-indexer --features chain-indexer --bin {} -- --port {} --metrics-port {} --data-dir {}{}",
             CHAIN_INDEXER_BINARY_FILE,
             local.chain_indexer_port,
             metrics_port,
             data_dir.display(),
             db_parallelism,
         ));
-        // `metadata-indexer`: exposes Constantinople's `block_meta` /
-        // `tx_meta` tables over `store.sql.v1.Service`. The explorer
+        // Adapters probe Store once at startup, but mprocs starts services together.
+        let wait_for_store = format!(
+            "until curl --fail --silent --output /dev/null --max-time 1 http://127.0.0.1:{}/ready; do sleep 1; done;",
+            local.chain_indexer_port,
+        );
+
+        // `metadata-indexer` exposes Constantinople's `block_meta` and
+        // `tx_meta` tables over `sql.v1.Service`. The explorer
         // subscribes to this service (not the raw store) for live block
         // metadata.
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
+            "{wait_for_store} cargo run --release -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             METADATA_INDEXER_BINARY_FILE, local.chain_indexer_port, local.metadata_indexer_port,
         ));
         commands.push(format!(
-            "cargo run --release -p constantinople-indexer --bin {} -- \
+            "{wait_for_store} cargo run --release -p constantinople-indexer --bin {} -- \
              --store-url http://127.0.0.1:{} --port {}",
             QMDB_INDEXER_BINARY_FILE, local.chain_indexer_port, local.qmdb_indexer_port,
         ));
@@ -424,7 +431,16 @@ mod tests {
         default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
         generate_local_cluster_material, total_secondaries,
     };
-    use std::path::{Path, PathBuf};
+    use std::{
+        fs,
+        io::{BufRead, BufReader, ErrorKind, Write},
+        net::{TcpListener, TcpStream},
+        path::{Path, PathBuf},
+        process::{Child, Command, Stdio},
+        thread,
+        time::{Duration, Instant},
+    };
+    use tempfile::TempDir;
 
     const TEST_SIMPLEX_VERIFICATION_MATERIAL: &str = "abcdef";
 
@@ -676,6 +692,155 @@ mod tests {
         );
     }
 
+    #[test]
+    fn local_adapters_wait_for_store_readiness() {
+        for binary in ["metadata-indexer", "qmdb-indexer"] {
+            let listener = readiness_listener();
+            let port = listener.local_addr().expect("Store address").port();
+            let command = local_adapter_command(binary, port);
+            let launcher = TestLauncher::spawn(&command);
+
+            let probe = accept_readiness_probe(&listener);
+            launcher.assert_not_started();
+            respond_to_probe(probe, "503 Service Unavailable");
+
+            let retry = accept_readiness_probe(&listener);
+            launcher.assert_not_started();
+            respond_to_probe(retry, "200 OK");
+
+            let arguments = launcher.finish();
+            assert!(
+                arguments.contains(&format!("--bin\n{binary}\n")),
+                "{arguments}"
+            );
+            assert!(
+                arguments.contains(&format!("--store-url\nhttp://127.0.0.1:{port}\n")),
+                "{arguments}"
+            );
+        }
+    }
+
+    fn local_adapter_command(binary: &str, store_port: u16) -> String {
+        let mut args = test_args(false);
+        args.indexer = true;
+        set_local_ports(&mut args, store_port, 8091, 8092);
+        local_run_commands(
+            Path::new("/tmp/configs"),
+            &args,
+            local_args(&args),
+            &[],
+            TEST_SIMPLEX_VERIFICATION_MATERIAL,
+        )
+        .into_iter()
+        .find(|command| command.contains(&format!("--bin {binary}")))
+        .expect("adapter command")
+    }
+
+    fn readiness_listener() -> TcpListener {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("Store listener");
+        listener
+            .set_nonblocking(true)
+            .expect("nonblocking listener");
+        listener
+    }
+
+    fn accept_readiness_probe(listener: &TcpListener) -> TcpStream {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (mut stream, _) = loop {
+            match listener.accept() {
+                Ok(connection) => break connection,
+                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "launcher did not probe Store readiness"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("Store accept failed: {error}"),
+            }
+        };
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .expect("probe timeout");
+        let mut request = BufReader::new(&mut stream);
+        let mut line = String::new();
+        request.read_line(&mut line).expect("request line");
+        assert_eq!(line, "GET /ready HTTP/1.1\r\n");
+        loop {
+            line.clear();
+            request.read_line(&mut line).expect("request header");
+            if line == "\r\n" || line.is_empty() {
+                break;
+            }
+        }
+        stream
+    }
+
+    fn respond_to_probe(mut stream: TcpStream, status: &str) {
+        write!(
+            stream,
+            "HTTP/1.1 {status}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .expect("readiness response");
+    }
+
+    struct TestLauncher {
+        child: Child,
+        directory: TempDir,
+    }
+
+    impl TestLauncher {
+        fn spawn(command: &str) -> Self {
+            let directory = tempfile::tempdir().expect("launcher directory");
+
+            // Record Cargo invocation without compiling or starting an adapter.
+            let child = Command::new("sh")
+                .args([
+                    "-c",
+                    &format!(
+                        "cargo() {{ printf '%s\\n' \"$@\" > \"$TEST_ADAPTER_CARGO_ARGS\"; }}; {command}"
+                    ),
+                ])
+                .env("TEST_ADAPTER_CARGO_ARGS", directory.path().join("cargo-args"))
+                .stdin(Stdio::null())
+                .spawn()
+                .expect("local launcher");
+            Self { child, directory }
+        }
+
+        fn assert_not_started(&self) {
+            assert!(
+                !self.directory.path().join("cargo-args").exists(),
+                "Cargo ran before Store was ready"
+            );
+        }
+
+        fn finish(mut self) -> String {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let status = loop {
+                if let Some(status) = self.child.try_wait().expect("launcher status") {
+                    break status;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "launcher did not exit after Store became ready"
+                );
+                thread::sleep(Duration::from_millis(10));
+            };
+            assert!(status.success(), "launcher failed: {status}");
+            fs::read_to_string(self.directory.path().join("cargo-args"))
+                .expect("Cargo should run after Store becomes ready")
+        }
+    }
+
+    impl Drop for TestLauncher {
+        fn drop(&mut self) {
+            // Failed assertions must not leave the polling shell running.
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+        }
+    }
+
     fn set_local_ports(args: &mut GenerateArgs, chain: u16, metadata: u16, qmdb: u16) {
         let GenerateTarget::Local(ref mut local) = args.target else {
             panic!("test_args must construct a Local target");
@@ -706,6 +871,7 @@ mod tests {
             .iter()
             .find(|c| c.contains("--bin chain-indexer"))
             .expect("chain-indexer command should be present");
+        assert!(indexer_cmd.contains("--features chain-indexer"));
         assert!(indexer_cmd.contains("--port 8090"));
         assert!(indexer_cmd.contains("--metrics-port 9094"));
         assert!(indexer_cmd.contains("--data-dir /tmp/configs/chain-indexer"));
@@ -876,7 +1042,8 @@ mod tests {
             .expect("secondary should have indexer config");
         assert_eq!(indexer.upload_buffer, 64);
         let expected_url = "http://127.0.0.1:8090".to_string();
-        assert_eq!(indexer.chain_indexer_url, expected_url);
+        assert_eq!(indexer.store_url, expected_url);
+        assert_eq!(indexer.api_key, None);
         assert!(
             secondaries[1].config.indexer.is_none(),
             "relayer secondary should not have indexer config"

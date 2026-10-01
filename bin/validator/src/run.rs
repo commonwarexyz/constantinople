@@ -45,20 +45,20 @@ use commonware_storage::{
 use commonware_utils::{
     NZDuration, NZU16, NZU32, NZU64, NZUsize, TryCollect, ordered::Set, sequence::U64, union,
 };
-use constantinople_application::consensus::{Databases, FinalizedHookFn};
+use constantinople_application::consensus::{DatabaseReaders, FinalizedHookFn};
 use constantinople_engine::{
     CERTIFICATE_CHANNEL, Channels, Config as EngineConfig, Engine, MARSHAL_CHANNEL,
-    MARSHAL_RESOLVER_CHANNEL, MAX_PENDING_ACKS, PROBE_CHANNEL, RESOLVER_CHANNEL,
-    STATE_RESOLVER_CHANNEL, StartupMode, TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme,
-    VOTE_CHANNEL,
+    MARSHAL_RESOLVER_CHANNEL, PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
+    TRANSACTION_RESOLVER_CHANNEL, ThresholdScheme, VOTE_CHANNEL,
     types::{EngineActivity, EngineBlock},
 };
 use constantinople_indexer::{
-    CertificateReporter, Publisher,
+    CertificateReporter, Publisher, StoreClient, StoreClientBuildError,
     publisher::{
         StoreCommitMetrics,
         qmdb::{PublishError, QueuedFinalizedUpload, QueuedFinalizedUploadCfg},
     },
+    writer_store_client,
 };
 use constantinople_mempool::webserver::{self, AccountReader, Mailbox};
 use constantinople_primitives::PublicKeyCache;
@@ -77,10 +77,10 @@ use tokio::{
 use tracing::{info, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
+const P2P_MESSAGES_PER_SECOND: NonZeroU32 = NZU32!(1024);
 
-const STATE_SYNC_APPLY_BATCH_SIZE: usize = 1024;
+const STATE_SYNC_APPLY_BATCH_SIZE: NonZeroU64 = NZU64!(1024);
 const PRUNE_CONFIG: PruneConfig = PruneConfig {
-    max_pending_acks: MAX_PENDING_ACKS,
     maintenance_interval: NZUsize!(1024),
     retained_marshal_blocks: 1024,
     retained_qmdb_blocks: 32,
@@ -123,9 +123,12 @@ fn buffer_pool_configs(
         NonZeroUsize::new(storage_parallelism).expect("storage buffer pool parallelism is zero");
 
     let network_cfg = BufferPoolConfig::for_network()
-        .with_parallelism(network_parallelism)
-        .with_max_size(NETWORK_BUFFER_POOL_MAX_SIZE)
-        .with_max_per_class(NETWORK_BUFFER_POOL_MAX_PER_CLASS);
+        .with_size_class_range(
+            NZUsize!(1024),
+            NETWORK_BUFFER_POOL_MAX_SIZE,
+            NETWORK_BUFFER_POOL_MAX_PER_CLASS,
+        )
+        .with_parallelism(network_parallelism);
     // Storage I/O can run on Tokio's blocking pool. Include those threads so
     // the pool's automatic TLS cache sizing does not strand scarce storage
     // buffers outside the global freelist under load.
@@ -144,11 +147,23 @@ fn buffer_pool_configs(
 type EngineCertReporter =
     CertificateReporter<Sha256, PublicKey, ThresholdScheme<PublicKey, MinSig>>;
 type EnginePublisher = Publisher<Sha256, PublicKey>;
-type EngineDatabases = Databases<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
+type EngineDatabases = DatabaseReaders<commonware_runtime::tokio::Context, Sha256, EightCap, Rayon>;
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey>;
 type FinalizedQueueWriter = queue::Writer<RuntimeContext, EngineQueuedUpload>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, EngineQueuedUpload>;
 type CursorMetadata = Metadata<RuntimeContext, U64, U64>;
+
+struct FinalizedCursorStore {
+    context: RuntimeContext,
+    config: MetadataConfig<()>,
+    metadata: Mutex<Option<CursorMetadata>>,
+}
+
+impl FinalizedCursorStore {
+    async fn open(&self) -> Result<CursorMetadata, commonware_storage::metadata::Error> {
+        CursorMetadata::init(self.context.child("storage"), self.config.clone()).await
+    }
+}
 
 #[derive(Clone)]
 enum SimplexObserver {
@@ -170,29 +185,26 @@ impl Reporter for SimplexObserver {
 /// Bundle of indexer state that needs to outlive engine startup.
 struct IndexerHandle {
     cert_reporter: EngineCertReporter,
-    publisher: Arc<LazyPublisher>,
     finalized_producer: FinalizedUploadProducer,
-    /// Kept alive so the uploader tasks are not aborted while the validator runs.
-    _uploaders: Vec<JoinHandle<()>>,
+    uploaders: Vec<JoinHandle<()>>,
 }
 
 /// Connects the indexer publisher only when finalized data is ready to upload.
 struct LazyPublisher {
     context: RuntimeContext,
-    store_url: String,
+    store_client: StoreClient,
     buffer: usize,
     commit_metrics: StoreCommitMetrics,
     publisher: Mutex<Option<Arc<EnginePublisher>>>,
 }
 
 impl LazyPublisher {
-    fn new(context: RuntimeContext, store_url: String, buffer: usize) -> Self {
-        // Registered once here: `connect` is retried on failure and must not
-        // re-register.
+    fn new(context: RuntimeContext, store_client: StoreClient, buffer: usize) -> Self {
+        // Connection retries must reuse the registered metrics.
         let commit_metrics = StoreCommitMetrics::new(&context);
         Self {
             context,
-            store_url,
+            store_client,
             buffer,
             commit_metrics,
             publisher: Mutex::new(None),
@@ -207,7 +219,7 @@ impl LazyPublisher {
 
             match EnginePublisher::connect(
                 self.context.child("publisher"),
-                &self.store_url,
+                self.store_client.clone(),
                 self.buffer,
                 self.commit_metrics.clone(),
             )
@@ -221,7 +233,6 @@ impl LazyPublisher {
                 Err(error) => {
                     warn!(
                         error = %error,
-                        chain_indexer_url = %self.store_url,
                         "indexer publisher connection failed, retrying",
                     );
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -234,7 +245,7 @@ impl LazyPublisher {
 #[derive(Clone)]
 struct FinalizedUploadProducer {
     writer: FinalizedQueueWriter,
-    metadata: Arc<Mutex<CursorMetadata>>,
+    metadata: Arc<FinalizedCursorStore>,
     cursor: Arc<Mutex<FinalizedUploadCursor>>,
     publisher: Arc<LazyPublisher>,
 }
@@ -246,6 +257,11 @@ struct FinalizedUploadCursor {
 }
 
 impl FinalizedUploadCursor {
+    fn covers(self, block: &EngineBlock<Sha256, PublicKey>) -> bool {
+        self.state_next >= block.header.state_range.end()
+            && self.transaction_next >= block.header.transactions_range.end()
+    }
+
     fn from_metadata(metadata: &CursorMetadata) -> Option<Self> {
         let state_next = metadata.get(&CURSOR_STATE_KEY).cloned().map(u64::from);
         let transaction_next = metadata
@@ -299,17 +315,20 @@ fn recovered_finalized_upload_cursor(
 impl FinalizedUploadProducer {
     async fn enqueue(
         self,
-        context: RuntimeContext,
-        block: &EngineBlock<Sha256, PublicKey>,
+        block: Arc<EngineBlock<Sha256, PublicKey>>,
         databases: &EngineDatabases,
     ) {
         loop {
             let mut cursor = self.cursor.lock().await;
-            let upload = match EnginePublisher::build_queued_finalized_upload_with_context(
-                context.child("build"),
+
+            // Capture can be durable before the database and marshal replay frontier.
+            if cursor.covers(&block) {
+                return;
+            }
+            let upload = match EnginePublisher::build_queued_finalized_upload(
                 cursor.state_next,
                 cursor.transaction_next,
-                block,
+                block.clone(),
                 databases,
             )
             .await
@@ -344,44 +363,50 @@ impl FinalizedUploadProducer {
                     continue;
                 }
             };
+
+            // A failed queue mutation consumes the shared handle. Restart to reopen it.
             let next = FinalizedUploadCursor::from_upload(&upload);
-            match self.writer.enqueue(upload).await {
-                Ok(position) => {
-                    persist_finalized_cursor(&self.metadata, next).await;
-                    *cursor = next;
-                    info!(
-                        height = block.header.height,
-                        position,
-                        state_next = next.state_next,
-                        transaction_next = next.transaction_next,
-                        "queued finalized index upload"
-                    );
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        height = block.header.height,
-                        error = %error,
-                        "failed to enqueue finalized index upload, retrying",
-                    );
-                }
-            }
-            drop(cursor);
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let position = self
+                .writer
+                .enqueue(upload)
+                .await
+                .expect("failed to enqueue finalized index upload");
+            persist_finalized_cursor(&self.metadata, next).await;
+            *cursor = next;
+            info!(
+                height = block.header.height,
+                position,
+                state_next = next.state_next,
+                transaction_next = next.transaction_next,
+                "queued finalized index upload"
+            );
+            return;
         }
     }
 }
 
-async fn persist_finalized_cursor(
-    metadata: &Arc<Mutex<CursorMetadata>>,
-    cursor: FinalizedUploadCursor,
-) {
+async fn persist_finalized_cursor(store: &FinalizedCursorStore, cursor: FinalizedUploadCursor) {
+    let mut metadata = store.metadata.lock().await;
     loop {
-        let mut metadata = metadata.lock().await;
-        metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
-        metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        match metadata.sync().await {
-            Ok(()) => return,
+        // A failed sync consumes its handle. Reopen before retrying the same cursor.
+        let mut current = match metadata.take() {
+            Some(current) => current,
+            None => match store.open().await {
+                Ok(current) => current,
+                Err(error) => {
+                    warn!(error = %error, "failed to reopen finalized index cursor, retrying");
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            },
+        };
+        current.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
+        current.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
+        match current.sync().await {
+            Ok(current) => {
+                *metadata = Some(current);
+                return;
+            }
             Err(error) => {
                 warn!(
                     error = %error,
@@ -391,7 +416,6 @@ async fn persist_finalized_cursor(
                 );
             }
         }
-        drop(metadata);
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -406,7 +430,10 @@ async fn scan_finalized_queue_cursor(
                 cursor = Some(FinalizedUploadCursor::from_upload(&upload));
             }
             Ok(None) => {
-                reader.reset().await;
+                reader
+                    .reset()
+                    .await
+                    .expect("failed to rewind finalized index queue");
                 return cursor;
             }
             Err(error) => {
@@ -508,20 +535,10 @@ async fn ack_finalized_queue_entry(
             }
         }
     }
-    loop {
-        match writer.sync().await {
-            Ok(()) => break,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    position,
-                    height,
-                    "failed to sync finalized index queue ack, retrying",
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
+    writer
+        .sync()
+        .await
+        .expect("failed to sync finalized index queue acknowledgement");
 }
 
 #[boxed]
@@ -533,37 +550,22 @@ async fn start_queued_upload(
     upload: EngineQueuedUpload,
 ) {
     let height = upload.height();
-    let completion = loop {
-        let engine_publisher = publisher.publisher().await;
-        match engine_publisher
-            .enqueue_queued_finalized(upload.clone())
-            .await
-        {
-            Ok(completion) => break completion,
-            Err(error) => {
-                warn!(
-                    height,
-                    position,
-                    error = %error,
-                    "failed to start finalized index upload, retrying",
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    };
+    let block = upload.block();
+
+    // Admission errors cannot recover against the same cached publisher.
+    let engine_publisher = publisher.publisher().await;
+    let completion = engine_publisher
+        .enqueue_queued_finalized(upload)
+        .await
+        .expect("failed to admit finalized index upload");
 
     active.spawn(async move {
-        if completion.wait().await {
-            cert_reporter.publish_block(upload.block()).await;
-            return (position, height);
-        }
-        warn!(
-            height,
-            position, "finalized index uploader stopped after accepting upload",
+        assert!(
+            completion.wait().await,
+            "finalized uploader stopped before persistence"
         );
-        loop {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+        cert_reporter.publish_block(block).await;
+        (position, height)
     });
 }
 
@@ -573,24 +575,27 @@ async fn maybe_build_indexer(
     is_primary: bool,
     indexer: Option<IndexerConfig>,
     partition_prefix: &str,
-) -> Option<IndexerHandle> {
-    let cfg = indexer?;
+) -> Result<Option<IndexerHandle>, StoreClientBuildError> {
+    let Some(cfg) = indexer else {
+        return Ok(None);
+    };
     if is_primary {
-        return None;
+        return Ok(None);
     }
 
     info!(
-        chain_indexer_url = %cfg.chain_indexer_url,
+        store_url = %cfg.store_url,
         "starting full indexer uploaders",
     );
+    let store_client = writer_store_client(&cfg.store_url, cfg.api_key.as_deref())?;
     let (cert_reporter, cert_join) = EngineCertReporter::connect(
-        &cfg.chain_indexer_url,
+        store_client.clone(),
         cfg.upload_buffer,
         StoreCommitMetrics::new(&context.child("simplex_upload")),
     );
     let publisher = Arc::new(LazyPublisher::new(
         context.child("publisher"),
-        cfg.chain_indexer_url,
+        store_client,
         cfg.upload_buffer,
     ));
     let page_cache = CacheRef::from_pooler(
@@ -611,27 +616,31 @@ async fn maybe_build_indexer(
     )
     .await
     .expect("failed to initialize finalized index queue");
-    let mut metadata = Metadata::init(
-        context.child("finalized_cursor"),
-        MetadataConfig {
+    let mut cursor_store = FinalizedCursorStore {
+        context: context.child("finalized_cursor"),
+        config: MetadataConfig {
             partition: format!("{partition_prefix}-finalized-index-cursor"),
             codec_config: (),
         },
-    )
-    .await
-    .expect("failed to initialize finalized index cursor");
+        metadata: Mutex::new(None),
+    };
+    let mut metadata = cursor_store
+        .open()
+        .await
+        .expect("failed to initialize finalized index cursor");
     let metadata_cursor = FinalizedUploadCursor::from_metadata(&metadata);
     let queue_cursor = scan_finalized_queue_cursor(&mut queue_reader).await;
     let cursor = recovered_finalized_upload_cursor(metadata_cursor, queue_cursor);
     if metadata_cursor != Some(cursor) {
         metadata.put(CURSOR_STATE_KEY, U64::new(cursor.state_next));
         metadata.put(CURSOR_TRANSACTION_KEY, U64::new(cursor.transaction_next));
-        metadata
+        metadata = metadata
             .sync()
             .await
             .expect("failed to persist finalized index cursor");
     }
-    let metadata = Arc::new(Mutex::new(metadata));
+    *cursor_store.metadata.get_mut() = Some(metadata);
+    let metadata = Arc::new(cursor_store);
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         metadata,
@@ -646,12 +655,11 @@ async fn maybe_build_indexer(
         queue_reader,
         max_active_uploads,
     ));
-    Some(IndexerHandle {
+    Ok(Some(IndexerHandle {
         cert_reporter,
-        publisher,
         finalized_producer,
-        _uploaders: vec![cert_join, finalized_join],
-    })
+        uploaders: vec![cert_join, finalized_join],
+    }))
 }
 
 fn indexer_finalized_hook(
@@ -659,14 +667,9 @@ fn indexer_finalized_hook(
 ) -> Option<FinalizedHookFn<commonware_runtime::tokio::Context, Commitment, Sha256, PublicKey, Rayon>>
 {
     let indexer = indexer?;
-    let publisher = indexer.publisher.clone();
     let finalized_producer = indexer.finalized_producer.clone();
     Some(Arc::new(move |block, databases| {
-        Box::pin(finalized_producer.clone().enqueue(
-            publisher.context.child("finalized_queue"),
-            block,
-            databases,
-        ))
+        Box::pin(finalized_producer.clone().enqueue(block, databases))
     }))
 }
 
@@ -726,7 +729,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             otel.map(|(endpoint, rate)| TracesConfig {
                 endpoint,
                 name: hex(&decoded.public_key.encode()),
-                rate,
+                rate: commonware_utils::Probability::try_from(rate)
+                    .expect("trace rate must be between zero and one"),
             }),
         );
 
@@ -745,6 +749,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 .expect("public_key_cache_size must be non-zero"),
         );
 
+        let max_peers_per_set = commonware_p2p::authenticated::peer_set_limit(
+            decoded
+                .primary_participants
+                .iter()
+                .chain(&decoded.secondary_participants),
+            &decoded.public_key,
+        );
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
                 decoded.signer.clone(),
@@ -752,6 +763,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
+                max_peers_per_set,
                 32 * 1024 * 1024,
             )
         } else {
@@ -761,6 +773,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
                 decoded.bootstrappers,
+                max_peers_per_set,
                 32 * 1024 * 1024,
             )
         };
@@ -781,19 +794,18 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             .unwrap();
         oracle.track(0, TrackedPeers::new(primary, secondary));
 
-        // TODO: Add reasonable RL
-        let quota = Quota::per_second(std::num::NonZeroU32::MAX);
-        let backlog = 1024;
+        // The burst size also bounds each retained peer's mailbox allocation.
+        let quota = Quota::per_second(P2P_MESSAGES_PER_SECOND);
         let channels = Channels {
-            votes: network.register(VOTE_CHANNEL, quota, backlog),
-            certificates: network.register(CERTIFICATE_CHANNEL, quota, backlog),
-            resolver: network.register(RESOLVER_CHANNEL, quota, backlog),
-            marshal: network.register(MARSHAL_CHANNEL, quota, backlog),
-            marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota, backlog),
-            state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota, backlog),
-            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota, backlog),
+            votes: network.register(VOTE_CHANNEL, quota),
+            certificates: network.register(CERTIFICATE_CHANNEL, quota),
+            resolver: network.register(RESOLVER_CHANNEL, quota),
+            marshal: network.register(MARSHAL_CHANNEL, quota),
+            marshal_resolver: network.register(MARSHAL_RESOLVER_CHANNEL, quota),
+            state_resolver: network.register(STATE_RESOLVER_CHANNEL, quota),
+            transaction_resolver: network.register(TRANSACTION_RESOLVER_CHANNEL, quota),
         };
-        let probe_network = network.register(PROBE_CHANNEL, quota, backlog);
+        let probe_network = network.register(PROBE_CHANNEL, quota);
         let provider =
             ConstantProvider::new(ThresholdScheme::<ed25519::PublicKey, MinSig>::verifier(
                 &union(b"constantinople", b"_CONSENSUS"),
@@ -885,7 +897,8 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             indexer,
             &indexer_partition_prefix,
         )
-        .await;
+        .await
+        .expect("failed to configure indexer Store client");
         let finalized_hook = indexer_finalized_hook(indexer_handle.as_ref());
 
         info!("initializing engine");
@@ -960,6 +973,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         wait_for_critical_task_exit(
             Some(probe_handle),
+            indexer_handle
+                .map(|handle| handle.uploaders)
+                .unwrap_or_default(),
             engine_handle,
             mempool_handle,
             network_handle,
@@ -972,6 +988,7 @@ type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 
 async fn wait_for_critical_task_exit<E, M, N>(
     probe_handle: Option<CriticalTask>,
+    uploaders: Vec<JoinHandle<()>>,
     engine_handle: E,
     mempool_handle: M,
     network_handle: N,
@@ -981,8 +998,16 @@ async fn wait_for_critical_task_exit<E, M, N>(
     N: Future,
 {
     let mut probe_handle = probe_handle.unwrap_or_else(|| Box::pin(std::future::pending()));
+    let uploader_exit = async move {
+        if uploaders.is_empty() {
+            std::future::pending::<()>().await;
+        }
+        let (result, index, _) = futures::future::select_all(uploaders).await;
+        panic!("indexer uploader {index} exited unexpectedly with {result:?}");
+    };
     tokio::select! {
         _ = probe_handle.as_mut() => tracing::warn!("probe exited"),
+        _ = uploader_exit => unreachable!("uploader exit panics"),
         _ = engine_handle => tracing::warn!("engine exited"),
         _ = mempool_handle => tracing::warn!("mempool exited"),
         _ = network_handle => tracing::warn!("network exited"),
@@ -1004,9 +1029,9 @@ mod tests {
     use super::{
         EngineQueuedUpload, FINALIZED_QUEUE_ITEMS_PER_SECTION, FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
         FINALIZED_QUEUE_PAGE_SIZE, FINALIZED_QUEUE_WRITE_BUFFER, FinalizedQueueReader,
-        FinalizedQueueWriter, FinalizedUploadCursor, default_mempool_drop_grace_blocks,
-        maybe_build_indexer, recovered_finalized_upload_cursor, scan_finalized_queue_cursor,
-        wait_for_critical_task_exit,
+        FinalizedQueueWriter, FinalizedUploadCursor, StoreClientBuildError,
+        default_mempool_drop_grace_blocks, maybe_build_indexer, recovered_finalized_upload_cursor,
+        scan_finalized_queue_cursor, wait_for_critical_task_exit,
     };
     use crate::config::IndexerConfig;
     use commonware_codec::{FixedSize as _, Read as _, Write as _};
@@ -1043,6 +1068,40 @@ mod tests {
         assert_eq!(default_mempool_drop_grace_blocks(50), 100);
     }
 
+    #[test]
+    fn p2p_channel_registration_has_bounded_capacity() {
+        let quota = commonware_runtime::Quota::per_second(super::P2P_MESSAGES_PER_SECOND);
+        let retained_peers = 4 * 5;
+        let capacity = retained_peers * u64::from(quota.burst_size().get());
+        assert!(capacity <= 65_536, "per-channel capacity is {capacity}");
+
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let signer = PrivateKey::from_seed(0);
+            let participants: Vec<_> = (0..5)
+                .map(|seed| PrivateKey::from_seed(seed).public_key())
+                .collect();
+            let max_peers = commonware_p2p::authenticated::peer_set_limit(
+                participants.iter(),
+                &signer.public_key(),
+            );
+            let listen = "127.0.0.1:0".parse().expect("listen address");
+            let config = commonware_p2p::authenticated::discovery::Config::local(
+                signer,
+                b"constantinople",
+                listen,
+                commonware_p2p::Ingress::Socket(listen),
+                Vec::new(),
+                max_peers,
+                32 * 1024 * 1024,
+            );
+            let (mut network, _) =
+                commonware_p2p::authenticated::discovery::Network::new(context, config);
+            for channel in constantinople_engine::CHANNELS {
+                let _ = network.register(channel, quota);
+            }
+        });
+    }
+
     #[tokio::test]
     async fn completed_setup_task_is_not_a_runtime_exit_condition() {
         let setup_task = tokio::spawn(async {});
@@ -1050,7 +1109,13 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_millis(10),
-            wait_for_critical_task_exit(None, pending::<()>(), pending::<()>(), pending::<()>()),
+            wait_for_critical_task_exit(
+                None,
+                Vec::new(),
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+            ),
         )
         .await;
 
@@ -1060,13 +1125,136 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn any_uploader_exit_is_fatal() {
+        for index in 0..2 {
+            for failure in 0..3 {
+                let mut uploaders =
+                    vec![tokio::spawn(pending::<()>()), tokio::spawn(pending::<()>())];
+                uploaders[index].abort();
+                uploaders[index] = tokio::spawn(async move {
+                    match failure {
+                        0 => {}
+                        1 => panic!("injected uploader failure"),
+                        _ => pending::<()>().await,
+                    }
+                });
+                if failure == 2 {
+                    uploaders[index].abort();
+                }
+                let supervisor = tokio::spawn(wait_for_critical_task_exit(
+                    None,
+                    uploaders,
+                    pending::<()>(),
+                    pending::<()>(),
+                    pending::<()>(),
+                ));
+                let error = tokio::time::timeout(Duration::from_secs(1), supervisor)
+                    .await
+                    .expect("uploader exit must reach supervision")
+                    .expect_err("uploader exit must fail the validator");
+                assert!(error.is_panic());
+            }
+        }
+    }
+
+    #[test]
+    fn cancelled_upload_fails_supervision_without_acknowledgement() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (store, url) = exoware_simulator::open_temp().await.expect("Store starts");
+            let client = super::writer_store_client(&url, None).expect("writer client builds");
+            let publisher = std::sync::Arc::new(super::LazyPublisher::new(
+                context.child("publisher"),
+                client.clone(),
+                1,
+            ));
+            let connected = publisher.publisher().await;
+
+            // Prevent persistence from completing before worker cancellation.
+            store.abort();
+            let _ = store.await;
+            let (reporter, certificate_uploader) = super::EngineCertReporter::connect(
+                client,
+                1,
+                super::StoreCommitMetrics::new(&context.child("certificates")),
+            );
+            let config = queue::Config {
+                partition: "cancelled-finalized-upload".to_string(),
+                items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+                compression: None,
+                codec_config: super::QueuedFinalizedUploadCfg::default(),
+                page_cache: commonware_runtime::buffer::paged::CacheRef::from_pooler(
+                    &context,
+                    FINALIZED_QUEUE_PAGE_SIZE,
+                    FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+                ),
+                write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+            };
+            let (writer, reader) = queue::shared::init(context.child("queue"), config.clone())
+                .await
+                .expect("queue opens");
+            writer
+                .enqueue(queued_upload(1, 0, 1, 0, 2))
+                .await
+                .expect("capture is durable");
+            let consumer = tokio::spawn(super::run_finalized_upload_consumer(
+                publisher.clone(),
+                reporter,
+                writer,
+                reader,
+                1,
+            ));
+            let supervisor = tokio::spawn(wait_for_critical_task_exit(
+                None,
+                vec![consumer],
+                pending::<()>(),
+                pending::<()>(),
+                pending::<()>(),
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while connected.next_locations().await != (1, 2) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("upload is admitted");
+
+            // Dropping the last Publisher aborts its workers and cancels completion.
+            drop(publisher.publisher.lock().await.take());
+            drop(connected);
+            let error = tokio::time::timeout(Duration::from_secs(2), supervisor)
+                .await
+                .expect("cancelled completion must reach supervision")
+                .expect_err("supervision must fail the validator");
+            assert!(error.is_panic());
+            tokio::time::timeout(Duration::from_secs(2), certificate_uploader)
+                .await
+                .expect("no certificate upload may be waiting on the stopped Store")
+                .expect("certificate uploader exits without publication");
+
+            let (_writer, mut reader) = queue::shared::init::<_, EngineQueuedUpload>(
+                context.child("reopened_queue"),
+                config,
+            )
+            .await
+            .expect("queue reopens");
+            let (_, upload) = reader
+                .try_recv()
+                .await
+                .expect("queue reads")
+                .expect("failed upload remains unacknowledged");
+            assert_eq!(upload.height(), 1);
+        });
+    }
+
     #[test]
     fn publisher_does_not_block_secondary_startup_on_connect_failure() {
         let runner =
             commonware_runtime::tokio::Runner::new(commonware_runtime::tokio::Config::default());
         runner.start(|context| async move {
             let indexer = IndexerConfig {
-                chain_indexer_url: "http://127.0.0.1:1".to_string(),
+                store_url: "http://127.0.0.1:1".to_string(),
+                api_key: None,
                 upload_buffer: 1,
             };
 
@@ -1076,9 +1264,91 @@ mod tests {
             )
             .await
             .expect("publisher connection should not block startup")
+            .expect("indexer Store client should build")
             .expect("secondary should keep indexer wiring");
 
-            assert_eq!(handle._uploaders.len(), 2);
+            assert_eq!(handle.uploaders.len(), 2);
+        });
+    }
+
+    #[test]
+    fn invalid_indexer_api_key_fails_secondary_startup() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let indexer = IndexerConfig {
+                store_url: "http://127.0.0.1:1".to_string(),
+                api_key: Some("invalid\nkey".to_string()),
+                upload_buffer: 1,
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                maybe_build_indexer(context, false, Some(indexer), "test"),
+            )
+            .await
+            .expect("invalid API key must not enter the connection retry loop")
+            .err()
+            .expect("invalid API key should fail startup");
+
+            assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
+        });
+    }
+
+    #[test]
+    fn invalid_indexer_url_fails_secondary_startup() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let indexer = IndexerConfig {
+                store_url: "http://invalid host".to_string(),
+                api_key: None,
+                upload_buffer: 1,
+            };
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                maybe_build_indexer(context, false, Some(indexer), "test"),
+            )
+            .await
+            .expect("invalid URL must not enter the connection retry loop")
+            .err()
+            .expect("invalid URL should fail startup");
+
+            assert!(matches!(error, StoreClientBuildError::InvalidUrl { .. }));
+        });
+    }
+
+    #[test]
+    fn finalized_cursor_reopens_and_persists_both_positions() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = super::FinalizedCursorStore {
+                context,
+                config: commonware_storage::metadata::Config {
+                    partition: "cursor-reopen-test".to_string(),
+                    codec_config: (),
+                },
+                metadata: tokio::sync::Mutex::new(None),
+            };
+            let first = FinalizedUploadCursor {
+                state_next: 7,
+                transaction_next: 9,
+            };
+            super::persist_finalized_cursor(&store, first).await;
+            let current = store
+                .metadata
+                .lock()
+                .await
+                .take()
+                .expect("cursor should exist");
+            assert_eq!(FinalizedUploadCursor::from_metadata(&current), Some(first));
+            drop(current);
+
+            let second = FinalizedUploadCursor {
+                state_next: 11,
+                transaction_next: 15,
+            };
+            super::persist_finalized_cursor(&store, second).await;
+            drop(store.metadata.lock().await.take());
+            let reopened = store.open().await.expect("cursor should reopen");
+            assert_eq!(
+                FinalizedUploadCursor::from_metadata(&reopened),
+                Some(second)
+            );
         });
     }
 
@@ -1134,6 +1404,34 @@ mod tests {
     }
 
     #[test]
+    fn recovered_capture_covers_replayed_prefix_only_when_both_frontiers_match() {
+        let first = queued_upload(1, 0, 2, 0, 2);
+        let second = queued_upload(2, 2, 5, 2, 3);
+        let next = queued_upload(3, 5, 7, 3, 4);
+        let cursor = recovered_finalized_upload_cursor(
+            Some(FinalizedUploadCursor::from_upload(&second)),
+            None,
+        );
+        assert!(cursor.covers(&first.block()));
+        assert!(cursor.covers(&second.block()));
+        assert!(!cursor.covers(&next.block()));
+        assert!(
+            !FinalizedUploadCursor {
+                state_next: 5,
+                transaction_next: 2
+            }
+            .covers(&second.block())
+        );
+        assert!(
+            !FinalizedUploadCursor {
+                state_next: 2,
+                transaction_next: 3
+            }
+            .covers(&second.block())
+        );
+    }
+
+    #[test]
     fn finalized_upload_cursor_ignores_partial_metadata_pairs() {
         assert_eq!(FinalizedUploadCursor::from_parts(None, None), None);
         assert_eq!(FinalizedUploadCursor::from_parts(Some(10), None), None);
@@ -1145,6 +1443,71 @@ mod tests {
                 transaction_next: 20,
             }),
         );
+    }
+
+    #[test]
+    fn failed_queue_mutations_require_reopening_shared_handles() {
+        for fail_enqueue in [true, false] {
+            commonware_runtime::deterministic::Runner::default().start(|context| async move {
+                let page_cache = commonware_runtime::buffer::paged::CacheRef::from_pooler(
+                    &context,
+                    FINALIZED_QUEUE_PAGE_SIZE,
+                    FINALIZED_QUEUE_PAGE_CACHE_CAPACITY,
+                );
+                let config = queue::Config {
+                    partition: "failed-finalized-queue".to_string(),
+                    items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+                    compression: None,
+                    codec_config: super::QueuedFinalizedUploadCfg::default(),
+                    page_cache,
+                    write_buffer: FINALIZED_QUEUE_WRITE_BUFFER,
+                };
+                let (writer, mut reader) =
+                    queue::shared::init(context.child("queue"), config.clone())
+                        .await
+                        .expect("queue opens");
+                writer
+                    .enqueue(queued_upload(1, 0, 2, 0, 2))
+                    .await
+                    .expect("first capture is durable");
+                let faults = context.storage_fault_config();
+                faults.write().sync_rate = Some(commonware_utils::probability!(1.0));
+                let result = if fail_enqueue {
+                    writer
+                        .enqueue(queued_upload(2, 2, 5, 2, 3))
+                        .await
+                        .map(|_| ())
+                } else {
+                    writer.sync().await
+                };
+                assert!(result.is_err());
+                faults.write().sync_rate = None;
+                assert!(matches!(
+                    writer.sync().await,
+                    Err(commonware_storage::queue::Error::Unavailable)
+                ));
+                assert!(matches!(
+                    reader.try_recv().await,
+                    Err(commonware_storage::queue::Error::Unavailable)
+                ));
+                drop(writer);
+                drop(reader);
+
+                let (writer, mut reader) = queue::shared::init::<_, EngineQueuedUpload>(
+                    context.child("reopened_queue"),
+                    config,
+                )
+                .await
+                .expect("queue reopens after storage recovers");
+                let (_, upload) = reader
+                    .try_recv()
+                    .await
+                    .expect("read succeeds")
+                    .expect("durable capture survives");
+                assert_eq!(upload.height(), 1);
+                writer.sync().await.expect("replacement handle works");
+            });
+        }
     }
 
     #[test]

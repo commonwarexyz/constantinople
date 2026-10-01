@@ -15,7 +15,7 @@ use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
 use commonware_utils::NZU32;
 use serde::Deserialize;
-use std::{net::SocketAddr, path::Path};
+use std::{fmt, net::SocketAddr, path::Path};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
@@ -51,21 +51,33 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
 
 /// Indexer wiring for a secondary validator.
 ///
-/// Primary (voting) validators ignore this section; secondaries with
+/// Primary (voting) validators ignore this section. Secondaries with
 /// indexer wiring upload finalized blocks, transactions, consensus
-/// certificates, and QMDB operation logs into the shared `chain-indexer`
-/// store.
+/// certificates, and QMDB operation logs into the shared Store.
 ///
 /// The latest-finalized-height cursor that earlier versions of the
 /// indexer wrote to a separate `META` KV family now lives in
 /// `block_meta`; consumers query `MAX(height) FROM block_meta`.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
-    /// URL of the shared chain-indexer store.
-    pub chain_indexer_url: String,
+    /// URL of the Store receiving finalized uploads.
+    pub store_url: String,
+    /// API key used by the writer Store clients.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key: Option<String>,
     /// Number of blocks buffered before upload.
     #[serde(default = "default_upload_buffer")]
     pub upload_buffer: usize,
+}
+
+impl fmt::Debug for IndexerConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexerConfig")
+            .field("store_url", &self.store_url)
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("upload_buffer", &self.upload_buffer)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -482,8 +494,7 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
         .collect::<AHashMap<_, _>>();
 
     if let Some(indexer) = config.indexer.as_mut() {
-        indexer.chain_indexer_url =
-            resolve_named_http_url(&indexer.chain_indexer_url, &hosts_by_name);
+        indexer.store_url = resolve_named_http_url(&indexer.store_url, &hosts_by_name);
     }
     if let Some(relayer) = config.relayer.as_mut() {
         for leader in &mut relayer.leaders {
@@ -540,7 +551,7 @@ mod tests {
         Signer,
         bls12381::{
             dkg::feldman_desmedt as dkg,
-            primitives::{group::Share, variant::MinSig},
+            primitives::{group::Share, sharing::Mode, variant::MinSig},
         },
         ed25519,
     };
@@ -557,13 +568,43 @@ mod tests {
 
     static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
+    #[test]
+    fn indexer_config_omits_absent_api_key() {
+        let config: IndexerConfig =
+            serde_yaml::from_str("store_url: http://chain-indexer:8090\nupload_buffer: 8\n")
+                .expect("indexer config should parse");
+        assert_eq!(config.api_key, None);
+        assert_eq!(config.upload_buffer, 8);
+
+        let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
+        assert!(encoded.contains("upload_buffer: 8"));
+        assert!(!encoded.contains("api_key"));
+    }
+
+    #[test]
+    fn indexer_config_serializes_key_without_debugging_it() {
+        let config = IndexerConfig {
+            store_url: "https://store.example.com".to_string(),
+            api_key: Some("writer-secret".to_string()),
+            upload_buffer: default_upload_buffer(),
+        };
+
+        let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
+        assert!(encoded.contains("api_key: writer-secret"));
+
+        let debug = format!("{config:?}");
+        assert!(!debug.contains("writer-secret"));
+        assert!(debug.contains("api_key_configured: true"));
+    }
+
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("clock should be after epoch")
             .as_nanos();
         let counter = TEMP_PATH_COUNTER.fetch_add(1, Ordering::Relaxed);
-        std::env::temp_dir().join(format!("{prefix}-{unique}-{counter}{suffix}"))
+        let process = std::process::id();
+        std::env::temp_dir().join(format!("{prefix}-{process}-{unique}-{counter}{suffix}"))
     }
 
     /// Test fixture: a validator cluster with `primary_count` primaries and
@@ -598,7 +639,7 @@ mod tests {
             let participants = primary_keys.clone().into_iter().try_collect().unwrap();
             let mut rng = commonware_utils::test_rng();
             let (dkg_output, raw_shares) =
-                dkg::deal::<MinSig, _, N3f1>(&mut rng, Default::default(), participants)
+                dkg::deal::<MinSig, _, N3f1>(&mut rng, Mode::NonZeroCounter, participants)
                     .expect("DKG deal failed");
             let shares = raw_shares.into_iter().collect();
 
@@ -1047,7 +1088,7 @@ hosts:
     }
 
     #[test]
-    fn deployer_config_resolves_named_chain_indexer_url() {
+    fn deployer_config_resolves_named_store_url() {
         let cluster = Cluster::new(2, 1);
         let self_key = &cluster.secondary_keys[0];
         let primary0_key = &cluster.primary_keys[0];
@@ -1064,7 +1105,8 @@ hosts:
             vec![bootstrapper_entry(primary0_key)],
         );
         config.indexer = Some(IndexerConfig {
-            chain_indexer_url: "http://chain-indexer:8090".to_string(),
+            store_url: "http://chain-indexer:8090".to_string(),
+            api_key: Some("writer-key".to_string()),
             upload_buffer: default_upload_buffer(),
         });
         fs::write(
@@ -1101,7 +1143,8 @@ hosts:
         let indexer = loaded
             .indexer
             .expect("secondary should keep indexer config");
-        assert_eq!(indexer.chain_indexer_url, "http://203.0.113.9:8090");
+        assert_eq!(indexer.store_url, "http://203.0.113.9:8090");
+        assert_eq!(indexer.api_key.as_deref(), Some("writer-key"));
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);

@@ -28,3 +28,10 @@ pub use transaction::{SignedTransaction, Transaction, VerifiedTransaction};
 
 /// Signing namespace for transaction signatures.
 pub const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-tx";
+
+// Finalization consumes the hasher and returns it reset for the next caller.
+fn finalize_in_place<H: commonware_cryptography::Hasher>(hasher: &mut H) -> H::Digest {
+    let (next, digest) = core::mem::take(hasher).finalize();
+    *hasher = next;
+    digest
+}
