@@ -52,6 +52,8 @@ futures.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
+exoware-simulator.workspace = true
+
 # Other
 tower = { workspace = true, features = ["util"] }
 
