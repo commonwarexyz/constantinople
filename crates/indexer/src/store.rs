@@ -1,7 +1,9 @@
 pub use exoware_sdk::{ClientBuildError as StoreClientBuildError, StoreClient};
 use exoware_sdk::{
-    ClientError, ConnectRequestCompression, StoreClientBuilder, transport::BalancedHttp2Config,
+    ClientError, ConnectRequestCompression, RetryConfig, StoreClientBuilder,
+    transport::BalancedHttp2Config,
 };
+use std::time::Duration;
 
 /// Failure from the adapter's startup readiness check.
 #[derive(Debug, thiserror::Error)]
@@ -19,7 +21,11 @@ pub fn store_client(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<StoreClient, StoreClientBuildError> {
-    store_client_builder(url, api_key).build()
+    // A lagging Store should be checked again promptly without increasing the
+    // SDK's read attempt budget. This also caps other retryable read errors.
+    store_client_builder(url, api_key)
+        .retry_config(RetryConfig::standard().with_max_backoff(Duration::from_millis(100)))
+        .build()
 }
 
 /// Balances uploads across connections and compresses large writer batches.
@@ -30,8 +36,19 @@ pub fn writer_store_client(
 ) -> Result<StoreClient, StoreClientBuildError> {
     store_client_builder(url, api_key)
         .balanced_http2_transport(BalancedHttp2Config::default())
-        .connect_request_compression(ConnectRequestCompression::Zstd)
+        .connect_request_compression(ConnectRequestCompression::Zstd { level: -1 })
         .build()
+}
+
+#[cfg(test)]
+pub(crate) fn writer_store_clients(
+    url: &str,
+    api_key: Option<&str>,
+) -> Result<(StoreClient, StoreClient), StoreClientBuildError> {
+    Ok((
+        writer_store_client(url, api_key)?,
+        writer_store_client(url, api_key)?,
+    ))
 }
 
 fn store_client_builder(url: &str, api_key: Option<&str>) -> StoreClientBuilder {
@@ -55,27 +72,130 @@ pub async fn require_store_ready(client: &StoreClient) -> Result<(), StoreReadin
 mod tests {
     use super::{
         StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,
-        writer_store_client,
+        writer_store_client, writer_store_clients,
     };
     use axum::{
         Router,
-        extract::State,
+        extract::{ConnectInfo, State},
         http::{
             HeaderMap, StatusCode,
-            header::{AUTHORIZATION, CONTENT_ENCODING},
+            header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
         },
         routing::get,
     };
     use bytes::Bytes;
-    use exoware_sdk::{API_KEY_ENV, PrefixedStoreClient};
+    use exoware_sdk::{API_KEY_ENV, ErrorCode, PrefixedStoreClient, StoreClient};
     use std::{
+        collections::HashSet,
+        net::SocketAddr,
         process::{Command, Output},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time::Instant};
+
+    async fn read_retry_case(
+        failures: usize,
+        status: StatusCode,
+        error_body: &'static str,
+    ) -> (
+        Result<Option<Bytes>, exoware_sdk::ClientError>,
+        Vec<Instant>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/store.query.v1.Service/Get",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let requests = observed.clone();
+                async move {
+                    assert_eq!(headers[CONTENT_TYPE], "application/proto");
+
+                    // These protobuf fields pin key="key" and the Store sequence
+                    // floor at 42 on every physical attempt.
+                    assert_eq!(body.as_ref(), b"\x0a\x03key\x10\x2a");
+                    let mut requests = requests.lock().expect("request lock poisoned");
+                    requests.push(Instant::now());
+                    if requests.len() <= failures {
+                        (
+                            status,
+                            [(CONTENT_TYPE, "application/json")],
+                            error_body.as_bytes(),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/proto")],
+                            b"\x0a\x05value".as_slice(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("retry listener should bind");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = PrefixedStoreClient::empty(store_client(&url, None).unwrap());
+        let result = client
+            .query()
+            .get_with_min_sequence_number(&Bytes::from_static(b"key"), 42)
+            .await;
+        server.abort();
+        let requests = requests.lock().expect("request lock poisoned").clone();
+        (result, requests)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_retries_preserve_floor_and_cap_server_hint_on_the_wire() {
+        // RetryInfo encodes a one-second hint. Both retries must use the cap.
+        let (result, requests) = read_retry_case(
+            2,
+            StatusCode::CONFLICT,
+            r#"{"code":"aborted","message":"Store is behind","details":[{"type":"google.rpc.RetryInfo","value":"CgIIAQ=="}]}"#,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Some(Bytes::from_static(b"value")));
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            assert_eq!(pair[1] - pair[0], Duration::from_millis(100));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_retry_budget_is_bounded_on_the_wire() {
+        let (result, requests) = read_retry_case(
+            usize::MAX,
+            StatusCode::CONFLICT,
+            r#"{"code":"aborted","message":"Store is behind"}"#,
+        )
+        .await;
+
+        assert_eq!(result.unwrap_err().rpc_code(), Some(ErrorCode::Aborted));
+        assert_eq!(requests.len(), 3);
+        assert_eq!(requests[2] - requests[0], Duration::from_millis(200));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_does_not_retry_nonretryable_errors_on_the_wire() {
+        let (result, requests) = read_retry_case(
+            usize::MAX,
+            StatusCode::BAD_REQUEST,
+            r#"{"code":"invalid_argument","message":"invalid query"}"#,
+        )
+        .await;
+
+        assert_eq!(
+            result.unwrap_err().rpc_code(),
+            Some(ErrorCode::InvalidArgument)
+        );
+        assert_eq!(requests.len(), 1);
+    }
 
     async fn readiness(
         State((status, requests)): State<(StatusCode, Arc<AtomicUsize>)>,
@@ -138,6 +258,29 @@ mod tests {
         StatusCode::UNAUTHORIZED
     }
 
+    async fn capture_connection(
+        ConnectInfo(address): ConnectInfo<SocketAddr>,
+        State(connections): State<Arc<Mutex<HashSet<SocketAddr>>>>,
+    ) -> StatusCode {
+        connections
+            .lock()
+            .expect("connection set lock poisoned")
+            .insert(address);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        StatusCode::UNAUTHORIZED
+    }
+
+    async fn send_concurrent_queries(client: StoreClient, marker: u8) {
+        let queries = (0..64).map(|index| {
+            let client = PrefixedStoreClient::empty(client.clone());
+            async move {
+                let key = Bytes::from(vec![marker, index]);
+                let _ = client.query().get(&key).await;
+            }
+        });
+        futures::future::join_all(queries).await;
+    }
+
     async fn content_encoding_sent() -> Option<String> {
         let (sender, mut receiver) = mpsc::unbounded_channel();
         let app = Router::new()
@@ -157,7 +300,6 @@ mod tests {
         let client = writer_store_client(&format!("http://{address}"), None)
             .expect("writer client should build");
         let client = PrefixedStoreClient::empty(client);
-
         // Stay above connectrpc's minimum-size compression policy (1 KiB) so
         // the header reflects a body that was actually compressed.
         let value = vec![0u8; 8192];
@@ -243,8 +385,8 @@ mod tests {
         assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
     }
 
-    #[test]
-    fn writer_client_builds() {
+    #[tokio::test]
+    async fn writer_client_builds_in_runtime() {
         writer_store_client("https://store.example.com", Some("write-key"))
             .expect("writer client should build");
     }
@@ -252,6 +394,41 @@ mod tests {
     #[tokio::test]
     async fn writer_client_compresses_put_bodies_on_the_wire() {
         assert_eq!(content_encoding_sent().await.as_deref(), Some("zstd"));
+    }
+
+    #[tokio::test]
+    async fn writer_client_pair_uses_independent_connection_pools() {
+        let connections = Arc::new(Mutex::new(HashSet::new()));
+        let app = Router::new()
+            .fallback(capture_connection)
+            .with_state(connections.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("connection listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("connection listener should have an address");
+        let task = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .expect("connection server should run");
+        });
+        let (bulk, metadata) = writer_store_clients(&format!("http://{address}"), None)
+            .expect("writer clients should build");
+
+        tokio::join!(
+            send_concurrent_queries(bulk, 0),
+            send_concurrent_queries(metadata, 1)
+        );
+        let connection_count = connections
+            .lock()
+            .expect("connection set lock poisoned")
+            .len();
+        task.abort();
+        assert!(connection_count > 4);
     }
 
     #[test]

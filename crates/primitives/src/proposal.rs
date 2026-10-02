@@ -3,7 +3,7 @@
 use crate::{Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
 use commonware_consensus::{
-    marshal::coding::types::coding_config_for_participants, types::coding::Commitment,
+    marshal::coding::types::coding_config_for_participants, types::coding::COMMITMENT_SIZE,
 };
 use commonware_cryptography::{ed25519, sha256};
 
@@ -47,7 +47,7 @@ fn maximum_header_size() -> usize {
     // Epoch and the two views use varints. The remaining header counters are fixed width.
     3 * UInt(u64::MAX).encode_size()
         + ed25519::PublicKey::SIZE
-        + Commitment::SIZE
+        + COMMITMENT_SIZE
         + 3 * sha256::Digest::SIZE
         + 6 * u64::SIZE
 }
@@ -56,17 +56,25 @@ fn maximum_header_size() -> usize {
 mod tests {
     use super::*;
     use crate::{
-        Block, Header, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, TransactionPublicKey,
+        Block, Header, Sealable, SealedBlock, SignedTransaction, TRANSACTION_NAMESPACE,
+        TransactionPublicKey,
     };
     use commonware_codec::Encode;
+    use commonware_coding::ReedSolomon;
     use commonware_consensus::{
         simplex::types::Context,
-        types::{Epoch, Round, View},
+        types::{Epoch, Round, View, coding::Commitment as CodingCommitment},
     };
     use commonware_cryptography::{Digest, Signer, secp256r1::standard as secp256r1};
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use std::num::NonZeroU64;
+
+    type Commitment = CodingCommitment<
+        SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>,
+        ReedSolomon<sha256::Sha256>,
+        sha256::Sha256,
+    >;
 
     fn maximum_header() -> Header<Commitment, sha256::Digest, ed25519::PublicKey> {
         Header {
