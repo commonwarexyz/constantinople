@@ -1,7 +1,7 @@
 //! Cache of decompressed transaction public keys for signature verification.
 
 use crate::TransactionPublicKey;
-use commonware_codec::{FixedSize as _, ReadExt as _};
+use commonware_codec::{Copying, FixedSize as _, ReadExt as _};
 use commonware_cryptography::{ed25519, secp256r1::standard as secp256r1};
 use commonware_parallel::Strategy;
 use commonware_runtime::{
@@ -11,7 +11,7 @@ use commonware_runtime::{
         traces::TracedExt as _,
     },
 };
-use commonware_utils::{cache::Clock, sync::RwLock};
+use commonware_utils::{cache::Cache, sync::RwLock};
 use core::num::NonZeroUsize;
 use p256::ecdsa::VerifyingKey;
 use std::{collections::HashMap, sync::Arc};
@@ -34,7 +34,7 @@ pub enum DecompressedPublicKey {
 /// [`DecompressedPublicKey`].
 #[derive(Clone)]
 pub struct PublicKeyCache {
-    inner: Arc<RwLock<Clock<TransactionPublicKey, DecompressedPublicKey>>>,
+    inner: Arc<RwLock<Cache<TransactionPublicKey, DecompressedPublicKey>>>,
     misses: Counter,
 }
 
@@ -42,7 +42,7 @@ impl PublicKeyCache {
     /// Creates a cache holding at most `capacity` decompressed keys.
     pub fn new(context: impl Metrics, capacity: NonZeroUsize) -> Self {
         Self {
-            inner: Arc::new(RwLock::new(Clock::new(capacity))),
+            inner: Arc::new(RwLock::new(Cache::new(capacity))),
             misses: context.counter("misses", "Decompressed public key cache misses"),
         }
     }
@@ -140,7 +140,7 @@ impl PublicKeyCache {
         match key {
             TransactionPublicKey::Ed25519 { .. } => {
                 let bytes = &key.as_ref()[1..1 + ed25519::PublicKey::SIZE];
-                let parsed = ed25519::PublicKey::read(&mut &bytes[..]).ok()?;
+                let parsed = ed25519::PublicKey::read(&mut Copying(bytes)).ok()?;
                 Some(DecompressedPublicKey::Ed25519(parsed))
             }
             TransactionPublicKey::Secp256r1 { .. } => {
@@ -218,9 +218,10 @@ mod tests {
             else {
                 panic!("ed25519 key should decompress to ed25519");
             };
-            let expected =
-                ed25519::PublicKey::read(&mut &key.as_ref()[1..1 + ed25519::PublicKey::SIZE])
-                    .unwrap();
+            let expected = ed25519::PublicKey::read(&mut Copying(
+                &key.as_ref()[1..1 + ed25519::PublicKey::SIZE],
+            ))
+            .unwrap();
             assert_eq!(decompressed, expected);
             assert_eq!(cache.len(), 1);
             assert!(cache.contains(&key));
@@ -305,9 +306,9 @@ mod tests {
             for byte in encoded.iter_mut().skip(1) {
                 *byte = 0xff;
             }
-            let key = TransactionPublicKey::read(&mut &encoded[..])
-                .expect("decode no longer validates the point");
             assert_eq!(encoded.len(), TransactionPublicKey::SIZE);
+            let key = TransactionPublicKey::read(&mut bytes::Bytes::from(encoded))
+                .expect("decode no longer validates the point");
 
             assert!(decompress_one(&cache, &key).is_none());
             assert!(cache.is_empty());

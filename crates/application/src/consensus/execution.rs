@@ -102,7 +102,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
 };
-use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
+use commonware_storage::{merkle::Family, mmr, qmdb::chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
@@ -787,7 +787,7 @@ mod tests {
     use commonware_cryptography::{Digest as _, sha256};
     use commonware_storage::{
         mmr,
-        qmdb::batch_chain::{Bounds, Commitment},
+        qmdb::chain::{Bounds, Commitment},
     };
     use commonware_utils::non_empty_range;
 

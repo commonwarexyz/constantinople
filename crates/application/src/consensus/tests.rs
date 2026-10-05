@@ -26,7 +26,7 @@ use commonware_storage::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
     merkle::{full::Config as MmrConfig, mmr},
-    qmdb::{any::FixedConfig, batch_chain::Bounds, keyless::fixed as keyless_fixed},
+    qmdb::{any::FixedConfig, chain::Bounds, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range};
@@ -78,7 +78,7 @@ fn state_config(cache: CacheRef) -> FixedConfig<EightCap, Sequential> {
             replay_buffer: NZUsize!(4096),
         },
         translator: EightCap,
-        init_cache_size: Some(NZUsize!(1024)),
+        init_cache: Some(NZUsize!(1024)),
         init_buffer: NZUsize!(1 << 21),
         init_concurrency: (),
     }
@@ -135,6 +135,7 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             state_config(cache.clone()),
             transaction_config(cache.clone()),
         ),
+        None,
     )
     .await;
 
@@ -237,7 +238,7 @@ fn sized_unverified_block(
         let mut encoded = Vec::new();
         payload_size.write(&mut encoded);
         encoded.resize(encoded.len() + payload_size, 0xff);
-        LazySignedTransaction::<sha256::Sha256>::decode(encoded.as_slice())
+        LazySignedTransaction::<sha256::Sha256>::decode(encoded)
             .expect("lazy framing should decode without materializing the invalid payload")
     };
     let transaction = lazy(256);
@@ -264,7 +265,7 @@ fn verify_checks_block_size_before_fetching_parent() {
             parent,
             leader,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
             leader: leader.public_key(),
@@ -312,7 +313,7 @@ fn propose_rejects_oversized_transaction_source_output() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
             leader: leader.public_key(),
@@ -358,7 +359,7 @@ fn verify_rejects_invalid_body() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -399,7 +400,7 @@ fn replay_rejects_invalid_body() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -439,7 +440,7 @@ fn verify_rejects_missing_parent() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         let consensus_context = SimplexContext {
             round: Round::new(Epoch::zero(), View::new(1)),
@@ -480,7 +481,7 @@ fn propose_drops_inapplicable_and_refills() {
             alt_sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         context.sleep(Duration::from_millis(10)).await;
 
@@ -538,7 +539,7 @@ fn finalized_capture_preserves_both_authenticated_ranges() {
             sender,
             recipient,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
         app.finalized_hook = Some(Arc::new(|_, _| Box::pin(async {})));
         context.sleep(Duration::from_millis(10)).await;
         let consensus_context = SimplexContext {
@@ -620,7 +621,7 @@ fn verify_accepts_proposed_child_and_rejects_stale_timestamp() {
             parent,
             leader,
             ..
-        } = verify_harness(&context).await;
+        } = Box::pin(verify_harness(&context)).await;
 
         // Advance past the genesis timestamp so the proposal's clock-derived
         // timestamp is strictly greater than the parent's.
@@ -810,7 +811,7 @@ impl commonware_consensus::Reporter for DelayedSource {
 #[test]
 fn build_timeout_bounds_refill_rounds() {
     deterministic::Runner::default().start(|context| async move {
-        let harness = verify_harness(&context).await;
+        let harness = Box::pin(verify_harness(&context)).await;
         let seed_keep = transfer(&harness.sender, &harness.recipient, 1);
         let seed_dup = transfer(&harness.sender, &harness.recipient, 2);
         let refill_one = transfer(&harness.alt_sender, &harness.recipient, 3);

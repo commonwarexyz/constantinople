@@ -7,9 +7,8 @@
 //! verification does not fetch the full body.
 
 use ahash::AHashMap;
-use bytes::Buf;
 use commonware_actor::Feedback;
-use commonware_codec::{EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
+use commonware_codec::{Buf, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
 use commonware_consensus::{
     Block, Heightable, Reporter,
     simplex::{self, types::Activity},
@@ -22,7 +21,7 @@ use commonware_runtime::{
 };
 use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
 use exoware_sdk::{StoreBatchUpload, StoreWriteBatch};
-use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexClient};
+use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexWriter};
 use futures::{StreamExt, stream::FuturesUnordered};
 use std::{collections::VecDeque, sync::Arc, time::Instant};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -172,7 +171,7 @@ where
             "Simplex upload concurrency must be positive"
         );
         let store_client = crate::store::writer_store_client(store_url, api_key)?;
-        let client = SimplexClient::new(
+        let client = SimplexWriter::new(
             crate::namespaces::simplex_client(&store_client)
                 .expect("simplex namespace prefix must be valid"),
         );
@@ -649,7 +648,7 @@ impl ReadyUpload {
 
 async fn run_uploader<Cx, H, P, S>(
     context: Cx,
-    client: SimplexClient,
+    client: SimplexWriter,
     mut rx: mpsc::Receiver<QueuedSimplexInput<H, P, S>>,
     max_in_flight: usize,
     commit_metrics: super::StoreCommitMetrics,
@@ -729,7 +728,7 @@ async fn run_uploader<Cx, H, P, S>(
 }
 
 fn prepare_input<H, P, S>(
-    client: &SimplexClient,
+    client: &SimplexWriter,
     pending: &mut AHashMap<Vec<u8>, PendingBlockCertificates<H, P, S>>,
     queued: QueuedSimplexInput<H, P, S>,
 ) -> Vec<ReadyUpload>
@@ -842,7 +841,7 @@ where
 fn spawn_upload<Cx: Spawner>(
     uploads: &mut FuturesUnordered<Handle<()>>,
     context: Cx,
-    client: &SimplexClient,
+    client: &SimplexWriter,
     commit_metrics: &super::StoreCommitMetrics,
     metrics: &SimplexUploadMetrics,
     upload: ReadyUpload,
@@ -982,7 +981,7 @@ where
 
 /// Prepares the entry's ready certificates and reports when the entry is complete.
 fn prepare_ready_certificates<H, P, S>(
-    client: &SimplexClient,
+    client: &SimplexWriter,
     entry: &mut PendingBlockCertificates<H, P, S>,
 ) -> (Vec<(PreparedUpload, &'static str)>, bool)
 where
@@ -1167,6 +1166,7 @@ mod tests {
     use constantinople_primitives::{
         Block, Header, Sealable, TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
+    use exoware_simplex::SimplexReader;
     use rand::{SeedableRng, rngs::StdRng};
     use std::{num::NonZeroU64, time::Duration};
 
@@ -1217,7 +1217,7 @@ mod tests {
                 ),
                 "{encoded_metrics}"
             );
-            let client = SimplexClient::new(
+            let client = SimplexReader::new(
                 crate::namespaces::simplex_client(
                     &crate::store_client(&url, None).expect("Store client builds"),
                 )
@@ -1278,7 +1278,7 @@ mod tests {
             store.release_first_ingest();
             wait.await.expect("finalized block upload completes");
 
-            let client = SimplexClient::new(
+            let client = SimplexReader::new(
                 crate::namespaces::simplex_client(
                     &crate::store_client(&store.url, None).expect("Store client builds"),
                 )
@@ -1421,7 +1421,7 @@ mod tests {
             let metrics_context = context.child("metrics");
             let metrics = SimplexUploadMetrics::new(&metrics_context);
             let commit_metrics = super::super::StoreCommitMetrics::new(&metrics_context);
-            let client = SimplexClient::new(
+            let client = SimplexWriter::new(
                 crate::namespaces::simplex_client(
                     &crate::store::writer_store_client(&url, None).expect("Store client builds"),
                 )
@@ -1488,7 +1488,7 @@ mod tests {
             let metrics_context = context.child("metrics");
             let metrics = SimplexUploadMetrics::new(&metrics_context);
             let commit_metrics = super::super::StoreCommitMetrics::new(&metrics_context);
-            let client = SimplexClient::new(
+            let client = SimplexWriter::new(
                 crate::namespaces::simplex_client(
                     &crate::store::writer_store_client(&store.url, None)
                         .expect("Store client builds"),
@@ -1568,7 +1568,7 @@ mod tests {
             let metrics_context = context.child("metrics");
             let metrics = SimplexUploadMetrics::new(&metrics_context);
             let commit_metrics = super::super::StoreCommitMetrics::new(&metrics_context);
-            let client = SimplexClient::new(
+            let client = SimplexWriter::new(
                 crate::namespaces::simplex_client(
                     &crate::store::writer_store_client(&store.url, None)
                         .expect("Store client builds"),

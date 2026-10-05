@@ -5,7 +5,7 @@ mod ports;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
-use commonware_codec::{Encode, Read as CodecRead};
+use commonware_codec::{Copying, Encode, Read as CodecRead};
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -845,7 +845,7 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
         serde_yaml::from_str(&raw).expect("failed to parse validator config");
     let bytes = from_hex(&config.dkg_output).expect("bad dkg_output hex");
     let dkg_output = dkg::Output::<MinSig, ed25519::PublicKey>::read_cfg(
-        &mut &bytes[..],
+        &mut Copying(&bytes),
         &(NZU32!(config.num_validators), ModeVersion::v0()),
     )
     .expect("failed to decode dkg_output");

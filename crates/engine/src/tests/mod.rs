@@ -253,7 +253,7 @@ impl EngineDefinition for TestEngineDefinition {
                     context: context.child("probe"),
                     provider,
                     strategy: Sequential,
-                    capacity: NZUsize!(32),
+                    mailbox_size: NZUsize!(32),
                     blocker: blocker.clone(),
                     minimum_epoch: Epoch::zero(),
                     retry_timeout: NZDuration!(Duration::from_millis(100)),
@@ -394,9 +394,9 @@ impl EngineDefinition for TestEngineDefinition {
 
             if is_restart {
                 let processed = restart_marshal
-                    .get_processed_height()
+                    .get_processed()
                     .await
-                    .map_or(0, |height| height.get());
+                    .map_or(0, |processed| processed.height().get());
                 let barrier = restart_barrier.expect("restart barrier must exist");
                 barrier.observe_processed(processed);
                 barrier.release();

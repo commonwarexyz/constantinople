@@ -1,8 +1,8 @@
 //! Transaction account keys and signatures.
 
 use crate::DecompressedPublicKey;
-use bytes::{Buf, BufMut};
-use commonware_codec::{EncodeSize, Error, FixedSize, Read, ReadExt as _, Write};
+use bytes::BufMut;
+use commonware_codec::{Buf, EncodeSize, Error, FixedSize, Read, ReadExt as _, Write};
 use commonware_cryptography::{
     BatchVerifier, Hasher as _, ed25519, secp256r1::standard as secp256r1, sha256,
 };
@@ -543,7 +543,7 @@ fn base64_url_no_pad(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
     use crate::PublicKeyCache;
-    use commonware_codec::{DecodeExt as _, Encode as _};
+    use commonware_codec::{Copying, DecodeExt as _, Encode as _};
     use commonware_cryptography::{Hasher, Signer as _, sha256};
     use commonware_formatting::from_hex;
     use commonware_math::algebra::Random as _;
@@ -564,7 +564,7 @@ mod tests {
         let encoded = key.encode();
 
         assert_eq!(encoded[0], SECP256R1_SCHEME);
-        assert_eq!(TransactionPublicKey::decode(encoded.as_ref()).unwrap(), key);
+        assert_eq!(TransactionPublicKey::decode(encoded).unwrap(), key);
     }
 
     #[test]
@@ -574,10 +574,7 @@ mod tests {
         let encoded = signature.encode();
 
         assert_eq!(encoded[0], ED25519_SCHEME);
-        assert_eq!(
-            TransactionSignature::decode(encoded.as_ref()).unwrap(),
-            signature
-        );
+        assert_eq!(TransactionSignature::decode(encoded).unwrap(), signature);
     }
 
     #[test]
@@ -677,9 +674,7 @@ mod tests {
     #[test]
     fn webauthn_verifier_checks_raw_browser_signature_payload() {
         let public_key = secp256r1::PublicKey::decode(
-            from_hex("03e424dc61d4bb3cb7ef4344a7f8957a0c5134e16f7a67c074f82e6e12f49abf3c")
-                .unwrap()
-                .as_slice(),
+            from_hex("03e424dc61d4bb3cb7ef4344a7f8957a0c5134e16f7a67c074f82e6e12f49abf3c").unwrap(),
         )
         .unwrap();
         let verifying_key = VerifyingKey::from_sec1_bytes(public_key.as_ref()).unwrap();
@@ -688,8 +683,7 @@ mod tests {
                 "bf96b99aa49c705c910be33142017c642ff540c76349b9dab72f981fd9347f4f\
                  17c55095819089c2e03b9cd415abdf12444e323075d98f31920b9e0f57ec871c",
             )
-            .unwrap()
-            .as_slice(),
+            .unwrap(),
         )
         .unwrap();
         let message = from_hex(
@@ -746,12 +740,15 @@ mod tests {
 
         let signer = SigningKey::generate_from_rng(&mut test_rng());
         let public_key = TransactionPublicKey::secp256r1(
-            secp256r1::PublicKey::decode(signer.verifying_key().to_sec1_point(true).as_bytes())
-                .unwrap(),
+            secp256r1::PublicKey::decode(Copying(
+                signer.verifying_key().to_sec1_point(true).as_bytes(),
+            ))
+            .unwrap(),
         );
         let raw_signature: p256::ecdsa::Signature = signer.sign(&payload);
         let raw_signature = raw_signature.normalize_s();
-        let signature = secp256r1::Signature::decode(raw_signature.to_bytes().as_slice()).unwrap();
+        let signature =
+            secp256r1::Signature::decode(Copying(raw_signature.to_bytes().as_slice())).unwrap();
         let signature =
             TransactionSignature::secp256r1(signature, authenticator_data, client_data_json)
                 .unwrap();

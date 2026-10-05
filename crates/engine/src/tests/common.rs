@@ -131,14 +131,14 @@ impl Reporter for TestReporter {
 #[derive(Clone)]
 pub(crate) struct HeightMonitorReporter<R> {
     inner: R,
-    monitor: mpsc::Sender<FinalizationUpdate<TestPublicKey>>,
+    monitor: mpsc::UnboundedSender<FinalizationUpdate<TestPublicKey>>,
     public_key: TestPublicKey,
 }
 
 impl<R> HeightMonitorReporter<R> {
     pub(crate) const fn new(
         public_key: TestPublicKey,
-        monitor: mpsc::Sender<FinalizationUpdate<TestPublicKey>>,
+        monitor: mpsc::UnboundedSender<FinalizationUpdate<TestPublicKey>>,
         inner: R,
     ) -> Self {
         Self {
@@ -162,14 +162,14 @@ where
     type Activity = marshal::Update<TestBlock>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        if let marshal::Update::Tip(round, _, digest) = &activity {
-            let monitor = self.monitor.clone();
+        if let marshal::Update::Tip(round, height, digest) = &activity {
             let update = FinalizationUpdate {
                 pk: self.public_key.clone(),
                 round: *round,
+                height: *height,
                 block_digest: digest.as_ref().to_vec(),
             };
-            let _ = monitor.try_send(update);
+            let _ = self.monitor.send(update);
         }
 
         self.inner.report(activity)
@@ -200,9 +200,9 @@ impl ValidatorState {
 
     pub(crate) async fn processed_height(&self) -> u64 {
         self.marshal
-            .get_processed_height()
+            .get_processed()
             .await
-            .map_or(0, |height| height.get())
+            .map_or(0, |processed| processed.height().get())
     }
 }
 

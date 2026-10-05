@@ -170,7 +170,7 @@ mod tests {
                 replay_buffer: NZUsize!(4096),
             },
             translator: EightCap,
-            init_cache_size: Some(NZUsize!(1024)),
+            init_cache: Some(NZUsize!(1024)),
             init_buffer: NZUsize!(1 << 21),
             init_concurrency: (),
         }
@@ -181,7 +181,8 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = CacheRef::from_pooler(&context, NZU16!(16), NZUsize!(4096));
             let db =
-                <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache)).await;
+                <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache), None)
+                    .await;
             let key = |byte| AccountKey::from([byte; AccountKey::SIZE]);
             let account = |balance| Account {
                 balance,

@@ -1,4 +1,4 @@
-use commonware_codec::{EncodeSize, Error, Read, Write};
+use commonware_codec::{Buf, EncodeSize, Error, Read, Write};
 use commonware_coding::ReedSolomon;
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable,
@@ -130,7 +130,7 @@ where
 {
     type Cfg = BlockCfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         InnerBlock::read_cfg(buf, cfg).map(Self::from)
     }
 }

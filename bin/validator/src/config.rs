@@ -1,7 +1,7 @@
 //! YAML-serializable validator configuration.
 
 use ahash::AHashMap;
-use commonware_codec::{Encode, Read as CodecRead, ReadExt};
+use commonware_codec::{Copying, Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -282,7 +282,7 @@ fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
 
 fn decode_private_key(hex_str: &str) -> ed25519::PrivateKey {
     let bytes = decode_hex("private_key", hex_str);
-    ed25519::PrivateKey::read(&mut &bytes[..]).expect("failed to decode private key")
+    ed25519::PrivateKey::read(&mut Copying(&bytes)).expect("failed to decode private key")
 }
 
 fn decode_dkg_output(
@@ -291,7 +291,7 @@ fn decode_dkg_output(
 ) -> dkg::Output<MinSig, ed25519::PublicKey> {
     let bytes = decode_hex("dkg_output", hex_str);
     dkg::Output::read_cfg(
-        &mut &bytes[..],
+        &mut Copying(&bytes),
         &(NZU32!(num_validators), ModeVersion::v0()),
     )
     .expect("failed to decode DKG output")
@@ -304,12 +304,12 @@ fn decode_share_opt(hex_str: &str) -> Option<Share> {
         return None;
     }
     let bytes = decode_hex("dkg_share", hex_str);
-    Some(Share::read(&mut &bytes[..]).expect("failed to decode DKG share"))
+    Some(Share::read(&mut Copying(&bytes)).expect("failed to decode DKG share"))
 }
 
 fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
     let bytes = decode_hex(field_name, hex_str);
-    ed25519::PublicKey::read(&mut &bytes[..]).expect("failed to decode public key")
+    ed25519::PublicKey::read(&mut Copying(&bytes)).expect("failed to decode public key")
 }
 
 fn load_validator_config(path: &Path) -> ValidatorConfig {

@@ -122,7 +122,7 @@ fn config(strategy: Rayon, cache: CacheRef) -> FixedConfig<EightCap, Rayon> {
             replay_buffer: NZUsize!(1 << 20),
         },
         translator: EightCap,
-        init_cache_size: Some(NZUsize!(1 << 18)),
+        init_cache: Some(NZUsize!(1 << 18)),
         init_buffer: NZUsize!(1 << 21),
         init_concurrency: (),
     }
@@ -426,6 +426,7 @@ fn main() {
         let db = <Db as DatabaseSet<tokio::Context>>::init(
             context,
             config(strategy.clone(), cache),
+            None,
         )
         .await;
 

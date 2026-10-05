@@ -14,8 +14,8 @@ use crate::{
 };
 use bytes::Bytes;
 use commonware_codec::{
-    Codec, DecodeExt as _, Encode, EncodeSize, Error as CodecError, FixedSize, RangeCfg, Read,
-    ReadExt, Write,
+    Buf, Codec, Copying, DecodeExt as _, Encode, EncodeSize, Error as CodecError, FixedSize,
+    RangeCfg, Read, ReadExt, Write,
 };
 use commonware_cryptography::{
     Digest, Hasher, PublicKey, bls12381::primitives::variant::Variant, sha256::Sha256,
@@ -266,7 +266,7 @@ impl<D: Digest, Ops: OperationList> Write for QueuedAuthenticatedRange<D, Ops> {
 impl<D: Digest> Read for QueuedAuthenticatedRange<D> {
     type Cfg = QueuedAuthenticatedRangeCfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             start: u64::read(buf)?,
             end: u64::read(buf)?,
@@ -521,7 +521,7 @@ where
 {
     type Cfg = QueuedFinalizedUploadCfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         if u32::read(buf)? != QUEUE_MAGIC
             || u16::read(buf)? != QUEUE_FORMAT_VERSION
             || u16::read(buf)? != ROW_LAYOUT_VERSION
@@ -1267,11 +1267,12 @@ where
     let mut expected = expected.iter();
     let mut matches = true;
     for encoded in &range.operations {
-        let operation = TransactionOperation::<H>::decode(encoded.as_slice()).map_err(|_| {
-            PublishError::InvalidQueuedUpload {
-                reason: "transaction operation bytes do not decode",
-            }
-        })?;
+        let operation =
+            TransactionOperation::<H>::decode(Copying(encoded.as_slice())).map_err(|_| {
+                PublishError::InvalidQueuedUpload {
+                    reason: "transaction operation bytes do not decode",
+                }
+            })?;
         if let keyless::Operation::Append(digest) = operation {
             matches &= expected.next() == Some(&digest);
         }
@@ -1295,7 +1296,7 @@ fn account_rows<D: Digest>(
     let _entered = span.enter();
     let mut rows = Vec::new();
     for (offset, encoded) in range.operations.iter().enumerate() {
-        let operation = StateOperation::decode(encoded.as_slice()).map_err(|_| {
+        let operation = StateOperation::decode(Copying(encoded.as_slice())).map_err(|_| {
             PublishError::InvalidQueuedUpload {
                 reason: "state operation bytes do not decode",
             }
@@ -1760,6 +1761,7 @@ mod tests {
         let publisher = Publisher::<Sha256, ed25519::PublicKey> {
             tx: Some(tx),
             admission: Mutex::new(None),
+            has_durable_range: Arc::new(AtomicBool::new(false)),
             join: None,
             _marker: PhantomData,
         };
@@ -3114,14 +3116,14 @@ mod tests {
             >::new(transaction_client, ());
             assert_eq!(
                 state
-                    .writer_location_watermark()
+                    .latest_published_watermark()
                     .await
                     .expect("read state watermark"),
                 Some(Location::new(4))
             );
             assert_eq!(
                 transactions
-                    .writer_location_watermark()
+                    .latest_published_watermark()
                     .await
                     .expect("read transaction watermark"),
                 Some(Location::new(4))
@@ -3142,10 +3144,13 @@ mod tests {
                     block.header.transactions_root,
                 );
                 for location in start..block.header.state_range.end() {
-                    let proof = state
-                        .operation_range_proof(state_tip, Location::new(location), 1)
-                        .await
-                        .expect("state operation proof");
+                    let proof = Box::pin(state.operation_range_proof(
+                        state_tip,
+                        Location::new(location),
+                        1,
+                    ))
+                    .await
+                    .expect("state operation proof");
                     assert_eq!(proof.root, block.header.state_root);
                     assert_eq!(proof.start_location, Location::new(location));
                     let index = usize::try_from(location).expect("location fits usize");
@@ -3155,10 +3160,13 @@ mod tests {
                     );
                 }
                 for location in start..block.header.transactions_range.end() {
-                    let proof = transactions
-                        .operation_range_proof(transaction_tip, Location::new(location), 1)
-                        .await
-                        .expect("transaction operation proof");
+                    let proof = Box::pin(transactions.operation_range_proof(
+                        transaction_tip,
+                        Location::new(location),
+                        1,
+                    ))
+                    .await
+                    .expect("transaction operation proof");
                     assert_eq!(proof.root, block.header.transactions_root);
                     assert_eq!(proof.start_location, Location::new(location));
                     let index = usize::try_from(location).expect("location fits usize");
@@ -3173,14 +3181,13 @@ mod tests {
                 let append_start = block.header.transactions_range.end() - transaction_count - 1;
                 for (offset, digest) in rows.transaction_digests.into_iter().enumerate() {
                     let offset = u64::try_from(offset).expect("transaction index fits u64");
-                    let proof = transactions
-                        .operation_range_proof(
-                            transaction_tip,
-                            Location::new(append_start + offset),
-                            1,
-                        )
-                        .await
-                        .expect("transaction append proof");
+                    let proof = Box::pin(transactions.operation_range_proof(
+                        transaction_tip,
+                        Location::new(append_start + offset),
+                        1,
+                    ))
+                    .await
+                    .expect("transaction append proof");
                     assert_eq!(
                         proof.operations,
                         vec![TransactionOperation::<Sha256>::Append(digest)],

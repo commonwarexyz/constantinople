@@ -16,19 +16,18 @@ use crate::{
     block::ApplicationBlock,
     types::*,
 };
-use commonware_coding::CodecConfig;
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
         self, Update,
         coding::{Marshaled, MarshaledConfig, shards, types::coding_config_for_participants},
-        core::{Actor as MarshalActor, Variant as MarshalVariant},
+        core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
     },
     simplex::{
         self,
         config::{Floor as SimplexFloor, ForwardPolicy, SkipBudget, SkipPolicy},
-        elector::Config as Elector,
+        elector::{Config as Elector, Elector as _},
     },
     types::{Epoch, FixedEpocher, ViewDelta},
 };
@@ -66,11 +65,12 @@ use constantinople_application::consensus::{
     Application, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{BlockCfg, PublicKeyCache, proposal::maximum_shard_size};
+use constantinople_primitives::{BlockCfg, PublicKeyCache, proposal::MAXIMUM_BLOCK_SIZE};
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -386,16 +386,16 @@ where
         let stateful_startup_context = context.child("stateful_startup");
         let mut startup_plan =
             SyncPlan::<E, ThresholdScheme<C::PublicKey, V>, EngineVariant<H, C::PublicKey>>::init(
-                &stateful_startup_context,
+                stateful_startup_context,
                 stateful_partition_prefix.clone(),
             )
             .await;
 
         // The durable plan distinguishes normal recovery from peer state sync. Normal recovery
-        // stays floorless so marshal restores its acknowledged progress; only a requested or
+        // stays floorless so marshal restores its acknowledged progress. A requested or
         // interrupted state sync discovers a new floor.
         let state_sync_requested = matches!(&config.startup, StartupMode::StateSync);
-        if startup_plan.should_state_sync(state_sync_requested) {
+        if startup_plan.should_sync(state_sync_requested) {
             let finalization = config
                 .probe
                 .as_ref()
@@ -403,11 +403,11 @@ where
                 .subscribe()
                 .await
                 .expect("probe actor exited before selecting a state-sync floor");
-            startup_plan = startup_plan.with_floor(finalization);
+            startup_plan = startup_plan.set_floor(finalization).await;
         }
 
-        // The canonical genesis is a pure function of configuration: the leader, the
-        // participant-derived coding config, and the canonical empty-database roots.
+        // Every startup derives the same genesis from the configured leader,
+        // participant-derived coding config, and canonical empty-database roots.
         let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
             &mut H::default(),
             config.genesis_leader.clone(),
@@ -416,12 +416,13 @@ where
             <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
             <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
         );
-        let coded_genesis =
-            EngineCodedBlock::new(genesis_block.into(), coding_config, &config.strategy);
-        let application_genesis =
-            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(coded_genesis.clone());
+        let coded_genesis = Arc::new(EngineCodedBlock::new(
+            genesis_block.into(),
+            coding_config,
+            &config.strategy,
+        ));
         let (application_state_target, application_transactions_target) =
-            block_targets(&application_genesis);
+            block_targets(coded_genesis.inner());
 
         #[cfg(all(test, feature = "test-utils"))]
         let startup_sync_floor = startup_plan.floor().cloned();
@@ -461,21 +462,33 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
+        // Keep the certification window resident while consensus validates ahead of ancestry.
+        let elector = L::default();
+        let optimistic_views = elector
+            .clone()
+            .build(config.output.players())
+            .terms()
+            .optimistic_views()
+            .get();
+        let shard_records = optimistic_views
+            .max(1)
+            .checked_add(2)
+            .and_then(|views| views.checked_mul(2))
+            .and_then(|records| usize::try_from(records).ok())
+            .and_then(NonZero::new)
+            .expect("shard record window must fit in usize");
+
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
-                // The f = 1 coding threshold produces the largest honest shard.
-                // Higher fault thresholds split the same block across more
-                // original shards.
-                shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: maximum_shard_size(n_participants),
-                },
+                max_block_size: NonZero::new(MAXIMUM_BLOCK_SIZE).unwrap(),
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
+                records: shard_records,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
             },
@@ -491,7 +504,7 @@ where
             application_transactions_target,
             config.finalized_hook,
         ));
-        let (stateful, stateful_mailbox) = Stateful::init(
+        let (stateful, stateful_mailbox) = Stateful::new(
             context.child("stateful"),
             StatefulConfig {
                 application,
@@ -534,7 +547,7 @@ where
             context.child("simplex"),
             simplex::Config {
                 scheme,
-                elector: L::default(),
+                elector,
                 blocker: config.blocker.clone(),
                 automaton: application.clone(),
                 relay: application,
@@ -792,7 +805,7 @@ where
             replay_buffer: REPLAY_BUFFER,
         },
         translator: EightCap,
-        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_cache: Some(STATE_INIT_CACHE_SIZE),
         init_buffer: NZUsize!(1 << 21),
         init_concurrency: (),
     }
@@ -824,7 +837,7 @@ where
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use commonware_codec::{Decode, Encode, EncodeSize, FixedSize};
+    use commonware_codec::{Decode, Encode, EncodeSize};
     use commonware_coding::{Config as CodingConfig, ReedSolomon};
     use commonware_consensus::{
         marshal::coding::types::Shard,
@@ -925,35 +938,30 @@ mod unit_tests {
                 .seal(&mut sha256::Sha256::default())
                 .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
-        type TestShard = Shard<ReedSolomon<sha256::Sha256>, sha256::Sha256>;
+        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < 4096);
+        type TestShard = Shard<
+            EngineBlock<sha256::Sha256, ed25519::PublicKey>,
+            ReedSolomon<sha256::Sha256>,
+            sha256::Sha256,
+        >;
+        let mut previous_shard_size = usize::MAX;
         for validators in [4, 7, 50] {
             let coding_config = coding_config_for_participants(validators);
-            let payload_bytes = block.encode_size() + coding_config.encode_size() + u32::SIZE;
             let shards = usize::from(coding_config.minimum_shards.get());
-            let shard_bytes = payload_bytes.div_ceil(2 * shards) * 2;
-            let limit = maximum_shard_size(validators);
-            assert!(shard_bytes <= limit);
-            assert!(limit - shard_bytes < 4096);
-
             let coded = EngineCodedBlock::new(block.clone(), coding_config, &Sequential);
             let encoded = coded.shard(0).expect("shard zero should exist").encode();
             assert!(encoded.len() <= MAXIMUM_MESSAGE_SIZE as usize);
-            TestShard::decode_cfg(
-                encoded.clone(),
-                &CodecConfig {
-                    maximum_shard_size: limit,
-                },
-            )
-            .expect("the derived limit should accept a maximum proposal");
-            assert!(
-                TestShard::decode_cfg(
-                    encoded,
-                    &CodecConfig {
-                        maximum_shard_size: shard_bytes - 2,
-                    },
-                )
-                .is_err()
-            );
+            assert!(encoded.len() < previous_shard_size);
+            previous_shard_size = encoded.len();
+
+            TestShard::decode_cfg(encoded.clone(), &NonZero::new(MAXIMUM_BLOCK_SIZE).unwrap())
+                .expect("the derived limit should accept a maximum proposal");
+            TestShard::decode_cfg(encoded.clone(), &NonZero::new(block.encode_size()).unwrap())
+                .expect("the exact block budget should accept its shard");
+
+            // Removing one coding word per original shard must reject the same proposal.
+            let smaller_budget = NonZero::new(block.encode_size() - 2 * shards).unwrap();
+            assert!(TestShard::decode_cfg(encoded, &smaller_budget).is_err());
         }
     }
 }

@@ -14,7 +14,6 @@ use commonware_coding::ReedSolomon;
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
-        Update,
         coding::{
             Coding, Marshaled, shards,
             types::{CodedBlock, StoredCodedBlock},
@@ -142,7 +141,7 @@ pub(crate) type AppMailbox<E, H, P, V, I, B, St> =
     commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, St>>;
 
 pub(crate) type EngineMarshalReporters<E, H, P, V, I, B, St, R> =
-    Reporters<Update<EngineBlock<H, P>>, AppMailbox<E, H, P, V, I, B, St>, EngineReporter<R, H, P>>;
+    Reporters<AppMailbox<E, H, P, V, I, B, St>, EngineReporter<R, H, P>>;
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
@@ -175,8 +174,7 @@ pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSol
 
 /// Reporter combinator that fans simplex activity to the marshal mailbox and
 /// an optional external observer (e.g. the indexer's certificate publisher).
-pub(crate) type SimplexReporter<H, P, V, O> =
-    Reporters<EngineActivity<P, V, H>, EngineMarshalMailbox<H, P, V>, O>;
+pub(crate) type SimplexReporter<H, P, V, O> = Reporters<EngineMarshalMailbox<H, P, V>, O>;
 
 pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
     E,

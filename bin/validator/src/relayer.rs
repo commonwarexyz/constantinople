@@ -360,7 +360,7 @@ async fn account<St: Strategy>(
     if bytes.len() != TransactionPublicKey::SIZE {
         return (StatusCode::BAD_REQUEST, String::new());
     }
-    let public_key = match TransactionPublicKey::decode(bytes.as_slice()) {
+    let public_key = match TransactionPublicKey::decode(bytes) {
         Ok(public_key) => public_key,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
     };
@@ -483,7 +483,7 @@ fn decode_batch(body: &Bytes, max_batch_bytes: usize) -> Result<usize, StatusCod
         return Err(StatusCode::BAD_REQUEST);
     };
     let cfg = (RangeCfg::new(1..=max_transactions), ());
-    let transactions = Vec::<SignedTransaction<sha256::Sha256>>::decode_cfg(body.as_ref(), &cfg)
+    let transactions = Vec::<SignedTransaction<sha256::Sha256>>::decode_cfg(body.clone(), &cfg)
         .map_err(|_| StatusCode::BAD_REQUEST)?;
     let total_bytes = transactions
         .iter()

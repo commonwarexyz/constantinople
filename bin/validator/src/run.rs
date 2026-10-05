@@ -10,9 +10,10 @@ use crate::{
 };
 use bytes::Bytes;
 use commonware_actor::Feedback;
-use commonware_codec::{Decode as _, Encode, FixedSize, Read, ReadExt as _, Write};
+use commonware_codec::{Buf, Decode as _, Encode, FixedSize, Read, ReadExt as _, Write};
 use commonware_consensus::{Reporter, simplex::elector::RoundRobin, types::Epoch};
 use commonware_cryptography::{
+    ChaCha20Poly1305,
     bls12381::primitives::variant::MinSig,
     certificate::ConstantProvider,
     ed25519::{self, Batch, PublicKey},
@@ -42,6 +43,10 @@ use commonware_runtime::{
 use commonware_storage::{
     metadata::{Config as MetadataConfig, Metadata},
     queue,
+};
+use commonware_stream::{
+    cups::{self, Cups},
+    sake::{self, Sake},
 };
 use commonware_utils::{
     NZDuration, NZU32, NZU64, NZUsize, Probability, TryCollect, ordered::Set, sequence::U64, union,
@@ -80,7 +85,10 @@ use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize},
     path::PathBuf,
     pin::Pin,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
     time::{Duration, Instant},
 };
 use tokio::{
@@ -170,7 +178,6 @@ type EngineCertReporter =
 type EnginePublisher = Publisher<Sha256, PublicKey>;
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey, MinSig>;
 type EngineCapturedUpload = CapturedFinalizedUpload<Sha256, PublicKey, MinSig>;
-type FinalizedQueueWriter = queue::Writer<RuntimeContext, FinalizedQueueRecord>;
 type FinalizedQueueReader = queue::Reader<RuntimeContext, FinalizedQueueRecord>;
 type FinalizedPayloads = PayloadStore<RuntimeContext>;
 type EngineMarshal = EngineMarshalMailbox<Sha256, PublicKey, MinSig>;
@@ -178,6 +185,99 @@ type CaptureMetadata = Metadata<RuntimeContext, U64, LatestCaptureReceipt>;
 type CriticalTask = Pin<Box<dyn Future<Output = ()> + Send>>;
 type ValidatorFinalizedHook =
     FinalizedHookFn<EngineCommitment<Sha256, PublicKey>, Sha256, PublicKey>;
+
+// A canceled mutation leaves the writer empty so the consumer forces restart recovery.
+struct FinalizedQueueWriter<E: commonware_storage::Context = RuntimeContext> {
+    queue: Arc<Mutex<Option<queue::Queue<E, FinalizedQueueRecord>>>>,
+    ready: Arc<Notify>,
+    lost: Arc<AtomicBool>,
+}
+
+// Wake the consumer even when a storage mutation is canceled or fails.
+struct QueueWakeup<'a> {
+    ready: &'a Notify,
+    lost: &'a AtomicBool,
+    completed: bool,
+}
+
+impl Drop for QueueWakeup<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.lost.store(true, Ordering::Relaxed);
+        }
+        self.ready.notify_one();
+    }
+}
+
+impl<E: commonware_storage::Context> Clone for FinalizedQueueWriter<E> {
+    fn clone(&self) -> Self {
+        Self {
+            queue: self.queue.clone(),
+            ready: self.ready.clone(),
+            lost: self.lost.clone(),
+        }
+    }
+}
+
+impl<E: commonware_storage::Context> FinalizedQueueWriter<E> {
+    fn new(queue: queue::Queue<E, FinalizedQueueRecord>) -> Self {
+        Self {
+            queue: Arc::new(Mutex::new(Some(queue))),
+            ready: Arc::new(Notify::new()),
+            lost: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    async fn enqueue(&self, record: FinalizedQueueRecord) -> Result<u64, queue::Error> {
+        let mut current = self.queue.lock().await;
+        let mut wakeup = QueueWakeup {
+            ready: &self.ready,
+            lost: &self.lost,
+            completed: false,
+        };
+        let queue = current.take().expect("finalized queue writer was lost");
+        let (queue, position) = queue.enqueue(record).await?;
+        *current = Some(queue);
+        wakeup.completed = true;
+        Ok(position)
+    }
+
+    async fn sync(&self) -> Result<(), queue::Error> {
+        let mut current = self.queue.lock().await;
+        let mut wakeup = QueueWakeup {
+            ready: &self.ready,
+            lost: &self.lost,
+            completed: false,
+        };
+        let queue = current.take().expect("finalized queue writer was lost");
+        *current = Some(queue.sync().await?);
+        wakeup.completed = true;
+        Ok(())
+    }
+
+    async fn wait_for_records(&self) {
+        self.ready.notified().await;
+        assert!(
+            !self.lost.load(Ordering::Relaxed),
+            "finalized queue writer was lost"
+        );
+    }
+}
+
+// Preserve the transport used by existing validators.
+const fn network_upgrader(
+    signer: ed25519::PrivateKey,
+) -> Cups<Sake<ed25519::PrivateKey>, ChaCha20Poly1305> {
+    Cups::new(
+        Sake {
+            signer,
+            synchrony_bound: Duration::from_secs(5),
+            max_handshake_age: Duration::from_secs(10),
+            version: sake::Version::V0,
+        },
+        cups::Version::V0,
+    )
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LatestCaptureReceipt {
@@ -230,7 +330,7 @@ impl Write for LatestCaptureReceipt {
 impl Read for LatestCaptureReceipt {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl bytes::Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
+    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
         Ok(Self {
             height: u64::read(buf)?,
             block_digest: commonware_cryptography::sha256::Digest::read(buf)?,
@@ -243,8 +343,7 @@ impl Read for LatestCaptureReceipt {
 /// Durable queue entry for one finalized block.
 ///
 /// The queue holds only this record. The encoded upload lives in the payload
-/// partition, so the consumer reads it outside the shared queue lock and a
-/// restart recovers the queue without reading any payload.
+/// partition, so restart recovers the queue without reading any payload.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct FinalizedQueueRecord {
     receipt: LatestCaptureReceipt,
@@ -276,7 +375,7 @@ impl Write for FinalizedQueueRecord {
 impl Read for FinalizedQueueRecord {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl bytes::Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
+    fn read_cfg(buf: &mut impl Buf, _: &Self::Cfg) -> Result<Self, commonware_codec::Error> {
         Ok(Self {
             receipt: LatestCaptureReceipt::read(buf)?,
             state_start: u64::read(buf)?,
@@ -600,7 +699,6 @@ struct FinalizedUploadConsumer {
     payloads: FinalizedPayloads,
     cleanup: PayloadCleanup,
     receipt_store: Arc<FinalizedReceiptStore>,
-    queue_ready: Arc<Notify>,
     max_active: usize,
     budget: UploadBudget,
     metrics: FinalizedUploadMetrics,
@@ -789,7 +887,6 @@ struct FinalizedUploadProducer {
     payloads: FinalizedPayloads,
     receipt: Arc<Mutex<Option<LatestCaptureReceipt>>>,
     publisher: Arc<LazyPublisher>,
-    queue_ready: Arc<Notify>,
     queue_metrics: FinalizedQueueMetrics,
     capture_metrics: FinalizedCaptureMetrics,
     marshal: Arc<OnceLock<EngineMarshal>>,
@@ -920,7 +1017,6 @@ impl FinalizedUploadProducer {
         self.capture_metrics
             .total
             .observe(started.elapsed().as_secs_f64());
-        self.queue_ready.notify_one();
         info!(
             height = block.header.height,
             position,
@@ -1049,10 +1145,7 @@ async fn scan_finalized_queue_records(
                 records.push((position, record));
             }
             Ok(None) => {
-                reader
-                    .reset()
-                    .await
-                    .expect("failed to reset finalized index queue reader");
+                reader.reset();
                 return records;
             }
             Err(error) => panic!("failed to scan finalized index queue. {error}"),
@@ -1143,7 +1236,6 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
         payloads,
         cleanup,
         receipt_store,
-        queue_ready,
         max_active,
         budget,
         metrics,
@@ -1168,7 +1260,7 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                     // Retry even if the producer never enqueues another entry.
                     warn!(error = %error, "failed to read finalized index queue, retrying");
                     tokio::time::sleep(Duration::from_secs(1)).await;
-                    queue_ready.notify_one();
+                    writer.ready.notify_one();
                     break;
                 }
             };
@@ -1225,7 +1317,7 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                 )
                 .await;
             }
-            () = queue_ready.notified(), if waiting.is_none() && active.len() < max_active => {}
+            () = writer.wait_for_records(), if waiting.is_none() && active.len() < max_active => {}
             result = next_completed_upload(&mut active, max_active, &metrics), if !active.is_empty() => {
                 let (position, height) = result;
                 let retained = retained_records.get_mut(&position).expect("completed upload is retained");
@@ -1239,9 +1331,8 @@ async fn run_finalized_upload_consumer(consumer: FinalizedUploadConsumer) {
                     let completion_started = Instant::now();
                     let retained = retained_records.get_mut(&position).expect("acknowledged upload is retained");
                     drop(retained.wait.take());
-                    ack_finalized_queue_entry(&reader, position, height)
-                        .instrument(info_span!(parent: &retained.trace, "indexer.queue.ack", height, position))
-                        .await;
+                    info_span!(parent: &retained.trace, "indexer.queue.ack", height, position)
+                        .in_scope(|| ack_finalized_queue_entry(&mut reader, position, height));
                     retained.wait = Some(info_span!(parent: &retained.trace, "indexer.queue.prune_wait", height));
                     metrics
                         .completion
@@ -1323,21 +1414,10 @@ async fn try_admit_queued_upload(
     None
 }
 
-async fn ack_finalized_queue_entry(reader: &FinalizedQueueReader, position: u64, height: u64) {
-    loop {
-        match reader.ack(position).await {
-            Ok(()) => break,
-            Err(error) => {
-                warn!(
-                    error = %error,
-                    position,
-                    height,
-                    "failed to ack finalized index queue entry, retrying",
-                );
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-        }
-    }
+fn ack_finalized_queue_entry(reader: &mut FinalizedQueueReader, position: u64, height: u64) {
+    reader.ack(position).unwrap_or_else(|error| {
+        panic!("failed to ack finalized index queue at height {height}. {error}")
+    });
 }
 
 /// Persist the receipt, sync the queue, and delete payloads once a whole record
@@ -1360,13 +1440,7 @@ async fn prune_finalized_queue(
     retained: &mut BTreeMap<u64, RetainedUpload>,
     payload_floor: &mut u64,
 ) {
-    let ack_floor = match reader.ack_floor().await {
-        Ok(floor) => floor,
-        Err(error) => {
-            warn!(error = %error, "failed to read finalized index queue floor");
-            return;
-        }
-    };
+    let ack_floor = reader.ack_floor();
     let boundary = pruned_record_boundary(ack_floor);
     if boundary <= *payload_floor {
         return;
@@ -1395,19 +1469,10 @@ async fn prune_finalized_queue(
         .observe(receipt_started.elapsed().as_secs_f64());
 
     let sync_started = Instant::now();
-    async {
-        loop {
-            match writer.sync().await {
-                Ok(()) => break,
-                Err(error) => {
-                    warn!(error = %error, "failed to sync finalized index queue, retrying");
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
-    }
-    .instrument(info_span!(parent: &prune, "indexer.queue.sync", first_height = *payload_floor + 1, last_height = boundary))
-    .await;
+    writer.sync()
+        .instrument(info_span!(parent: &prune, "indexer.queue.sync", first_height = *payload_floor + 1, last_height = boundary))
+        .await
+        .expect("failed to sync finalized index queue");
     metrics
         .queue_sync
         .observe(sync_started.elapsed().as_secs_f64());
@@ -1725,7 +1790,7 @@ async fn maybe_build_indexer(
         FINALIZED_QUEUE_PAGE_SIZE,
         FINALIZED_QUEUE_PAGE_CACHE_PAGES,
     );
-    let (queue_writer, mut queue_reader) = queue::shared::init(
+    let (queue, mut queue_reader) = queue::Queue::init(
         context.child("finalized_queue"),
         queue::Config {
             partition: format!("{partition_prefix}-finalized-index-records"),
@@ -1739,6 +1804,7 @@ async fn maybe_build_indexer(
     )
     .await
     .expect("failed to initialize finalized index queue");
+    let queue_writer = FinalizedQueueWriter::new(queue);
     let payloads = PayloadStore::new(
         context.child("finalized_payloads"),
         format!("{partition_prefix}-finalized-index-payloads"),
@@ -1755,10 +1821,7 @@ async fn maybe_build_indexer(
     .expect("failed to initialize finalized capture receipt");
     let metadata_receipt = metadata.get(&CAPTURE_RECEIPT_KEY).copied();
     let records = scan_finalized_queue_records(&mut queue_reader).await;
-    let payload_floor = queue_reader
-        .ack_floor()
-        .await
-        .expect("failed to read finalized index queue floor");
+    let payload_floor = queue_reader.ack_floor();
     sweep_finalized_payloads(&payloads, &records).await;
     let queue_tail = records.last().map(|(_, record)| record.receipt);
     queue_metrics
@@ -1796,7 +1859,6 @@ async fn maybe_build_indexer(
         config: metadata_config,
         metadata: Mutex::new(Some(metadata)),
     });
-    let queue_ready = Arc::new(Notify::new());
     let marshal = Arc::new(OnceLock::new());
     let traces = CaptureTraces::default();
     let finalized_producer = FinalizedUploadProducer {
@@ -1804,7 +1866,6 @@ async fn maybe_build_indexer(
         payloads: payloads.clone(),
         receipt: Arc::new(Mutex::new(receipt)),
         publisher: publisher.clone(),
-        queue_ready: queue_ready.clone(),
         queue_metrics: queue_metrics.clone(),
         capture_metrics,
         marshal: marshal.clone(),
@@ -1818,7 +1879,6 @@ async fn maybe_build_indexer(
         payloads,
         cleanup,
         receipt_store,
-        queue_ready,
         max_active: max_active_uploads,
         budget,
         metrics: upload_metrics,
@@ -1942,7 +2002,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         );
         let p2p_config = if deployer_managed {
             discovery::Config::recommended(
-                decoded.signer.clone(),
+                network_upgrader(decoded.signer.clone()),
                 b"constantinople",
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
@@ -1952,7 +2012,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             )
         } else {
             discovery::Config::local(
-                decoded.signer.clone(),
+                network_upgrader(decoded.signer.clone()),
                 b"constantinople",
                 decoded.listen_bind,
                 Ingress::Socket(decoded.listen_advertise),
@@ -2012,7 +2072,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             context: context.child("probe"),
             provider,
             strategy: strategy.clone(),
-            capacity: NZUsize!(32),
+            mailbox_size: NZUsize!(32),
             blocker: oracle.clone(),
             minimum_epoch: Epoch::zero(),
             retry_timeout: NZDuration!(Duration::from_secs(1)),
@@ -2257,7 +2317,7 @@ mod tests {
             );
             let listen = "127.0.0.1:0".parse().expect("listen address");
             let config = commonware_p2p::authenticated::discovery::Config::local(
-                signer,
+                super::network_upgrader(signer),
                 b"constantinople",
                 listen,
                 commonware_p2p::Ingress::Socket(listen),
@@ -2502,6 +2562,144 @@ mod tests {
         );
     }
 
+    fn queue_test_config(
+        partition: &str,
+        context: &impl commonware_runtime::BufferPooler,
+    ) -> commonware_storage::queue::Config<()> {
+        commonware_storage::queue::Config {
+            partition: partition.into(),
+            items_per_section: FINALIZED_QUEUE_ITEMS_PER_SECTION,
+            compression: None,
+            codec_config: (),
+            page_cache: commonware_runtime::buffer::paged::CacheRef::from_pooler(
+                context,
+                super::FINALIZED_QUEUE_PAGE_SIZE,
+                super::FINALIZED_QUEUE_PAGE_CACHE_PAGES,
+            ),
+            write_buffer: super::FINALIZED_QUEUE_WRITE_BUFFER,
+            replay_buffer: super::FINALIZED_QUEUE_WRITE_BUFFER,
+        }
+    }
+
+    fn queue_test_record(height: u64) -> FinalizedQueueRecord {
+        FinalizedQueueRecord {
+            receipt: capture_receipt(height, height + 1, height + 1),
+            state_start: height,
+            transaction_start: height,
+            payload: PayloadDescriptor { len: 7, crc: 0 },
+        }
+    }
+
+    #[test]
+    fn canceled_queue_enqueue_closes_reader_and_recovers_committed_prefix() {
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let pending = commonware_runtime::mocks::PendingSyncs::default();
+            let context = commonware_runtime::mocks::DelayedSyncContext {
+                inner: context,
+                pending: pending.clone(),
+            };
+            let config = queue_test_config("canceled-records", &context);
+            let (queue, mut reader) =
+                commonware_storage::queue::Queue::init(context.child("queue"), config.clone())
+                    .await
+                    .unwrap();
+            let writer = super::FinalizedQueueWriter::new(queue);
+            pending.unblock();
+            assert_eq!(writer.enqueue(queue_test_record(1)).await.unwrap(), 0);
+            writer.wait_for_records().await;
+            let mut wait = Box::pin(writer.wait_for_records());
+            assert!(futures::poll!(wait.as_mut()).is_pending());
+
+            // A pending durability barrier must not publish the next record.
+            pending.arm();
+            let mut enqueue = Box::pin(writer.enqueue(queue_test_record(2)));
+            assert!(futures::poll!(enqueue.as_mut()).is_pending());
+            assert!(pending.calls() > 0);
+            assert_eq!(
+                reader.try_recv().await.unwrap(),
+                Some((0, queue_test_record(1)))
+            );
+            assert!(reader.try_recv().await.unwrap().is_none());
+            drop(enqueue);
+            assert!(
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(wait))
+                    .await
+                    .is_err()
+            );
+            assert!(writer.queue.lock().await.is_none());
+            assert!(reader.recv().await.unwrap().is_none());
+            assert_eq!(reader.ack_floor(), 0);
+            drop((writer, reader));
+            pending.unblock();
+
+            let (_queue, mut reader) =
+                commonware_storage::queue::Queue::init(context.child("recovered_queue"), config)
+                    .await
+                    .unwrap();
+            assert_eq!(reader.ack_floor(), 0);
+            assert_eq!(
+                reader.try_recv().await.unwrap(),
+                Some((0, queue_test_record(1)))
+            );
+            if let Some((position, record)) = reader.try_recv().await.unwrap() {
+                assert_eq!((position, record), (1, queue_test_record(2)));
+            }
+            assert!(reader.try_recv().await.unwrap().is_none());
+        });
+    }
+
+    #[test]
+    fn failed_queue_sync_loses_writer_and_replays_acknowledged_records() {
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
+            let pending = commonware_runtime::mocks::PendingSyncs::default();
+            let context = commonware_runtime::mocks::DelayedSyncContext {
+                inner: context,
+                pending: pending.clone(),
+            };
+            let config = queue_test_config("failed-sync-records", &context);
+            let (queue, mut reader) =
+                commonware_storage::queue::Queue::init(context.child("queue"), config.clone())
+                    .await
+                    .unwrap();
+            let writer = super::FinalizedQueueWriter::new(queue);
+            pending.unblock();
+            writer.enqueue(queue_test_record(1)).await.unwrap();
+            writer.wait_for_records().await;
+            assert_eq!(
+                reader.try_recv().await.unwrap(),
+                Some((0, queue_test_record(1)))
+            );
+            reader.ack(0).unwrap();
+            assert_eq!(reader.ack_floor(), 1);
+
+            pending.arm_fail();
+            assert!(writer.sync().await.is_err());
+            assert!(
+                futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    writer.wait_for_records()
+                ))
+                .await
+                .is_err()
+            );
+            assert!(writer.queue.lock().await.is_none());
+            assert!(reader.recv().await.unwrap().is_none());
+            drop((writer, reader));
+
+            // Reopen without fault injection so a failed sync cannot hide replay.
+            let (_queue, mut reader) = commonware_storage::queue::Queue::init(
+                context.inner.child("recovered_queue"),
+                config,
+            )
+            .await
+            .unwrap();
+            assert_eq!(reader.ack_floor(), 0);
+            assert_eq!(
+                reader.try_recv().await.unwrap(),
+                Some((0, queue_test_record(1)))
+            );
+        });
+    }
+
     #[test]
     fn restart_sweeps_payloads_left_after_durable_prune() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
@@ -2518,7 +2716,7 @@ mod tests {
                 write_buffer: super::FINALIZED_QUEUE_WRITE_BUFFER,
                 replay_buffer: super::FINALIZED_QUEUE_WRITE_BUFFER,
             };
-            let (writer, mut reader) = commonware_storage::queue::shared::init(
+            let (mut queue, mut reader) = commonware_storage::queue::Queue::init(
                 context.child("queue"),
                 queue_config.clone(),
             )
@@ -2541,7 +2739,9 @@ mod tests {
                     transaction_start: height,
                     payload,
                 };
-                assert_eq!(writer.append(record).await.unwrap(), height - 1);
+                let position;
+                (queue, position) = queue.append(record).await.unwrap();
+                assert_eq!(position, height - 1);
                 retained.insert(
                     height - 1,
                     super::RetainedUpload {
@@ -2551,10 +2751,10 @@ mod tests {
                     },
                 );
             }
-            writer.sync().await.unwrap();
+            queue = queue.sync().await.unwrap();
+            let writer = super::FinalizedQueueWriter::new(queue);
             for position in 0..section {
                 assert_eq!(reader.try_recv().await.unwrap().unwrap().0, position);
-                reader.ack(position).await.unwrap();
             }
             let metadata_config = commonware_storage::metadata::Config {
                 partition: "cleanup-test-receipt".into(),
@@ -2574,6 +2774,38 @@ mod tests {
             let metrics = super::FinalizedUploadMetrics::new(&context.child("upload"));
             let (cleanup, task) = payloads.start_cleanup(context.child("cleanup"));
             let mut payload_floor = 0;
+
+            // A completion gap must retain both its receipt and every payload.
+            for position in (1..section).rev() {
+                reader.ack(position).unwrap();
+            }
+            assert_eq!(reader.ack_floor(), 0);
+            super::prune_finalized_queue(
+                &reader,
+                &writer,
+                &cleanup,
+                &receipt_store,
+                &metrics,
+                &mut retained,
+                &mut payload_floor,
+            )
+            .await;
+            assert_eq!(payload_floor, 0);
+            assert_eq!(retained.len(), usize::try_from(section + 1).unwrap());
+            assert_eq!(payloads.heights().await.unwrap().len(), retained.len());
+            assert!(
+                receipt_store
+                    .metadata
+                    .lock()
+                    .await
+                    .as_ref()
+                    .unwrap()
+                    .get(&super::CAPTURE_RECEIPT_KEY)
+                    .is_none()
+            );
+
+            reader.ack(0).unwrap();
+            assert_eq!(reader.ack_floor(), section);
             super::prune_finalized_queue(
                 &reader,
                 &writer,
@@ -2598,7 +2830,7 @@ mod tests {
                     .unwrap();
             }
             drop((writer, reader, receipt_store, payloads));
-            let (_writer, mut reader) = commonware_storage::queue::shared::init(
+            let (_writer, mut reader) = commonware_storage::queue::Queue::init(
                 context.child("recovered_queue"),
                 queue_config,
             )

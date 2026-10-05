@@ -17,7 +17,7 @@ use crate::{
     },
 };
 use bytes::Bytes;
-use commonware_codec::{FixedSize as _, Read};
+use commonware_codec::{Copying, FixedSize as _, Read};
 use commonware_consensus::{
     Heightable,
     types::{Epoch, Height, Round, View},
@@ -32,9 +32,9 @@ use datafusion::{
     },
     prelude::SessionContext,
 };
-use exoware_sdk::{ClientError, Key, PrefixedStoreClient, StoreClient};
-use exoware_simplex::{Finalized, Notarized, SimplexClient, SimplexError};
-use exoware_sql::query_context_with_min_sequence;
+use exoware_sdk::{ClientError, Key, PrefixedStoreClient, ReadSession, StoreClient};
+use exoware_simplex::{Finalized, Notarized, SimplexError, SimplexReader};
+use exoware_sql::with_read_session;
 
 type CertifiedFinalization<H, P, S> = Finalized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>;
 type CertifiedNotarization<H, P, S> = Notarized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>;
@@ -104,7 +104,7 @@ pub struct FinalizedPublicationTarget<D> {
 /// | `sql`     | Transaction bodies and proof lookup metadata           |
 #[derive(Clone)]
 pub struct IndexerClient {
-    blocks: SimplexClient,
+    blocks: SimplexReader,
     targets: PrefixedStoreClient,
     sql_store: PrefixedStoreClient,
     sql: SessionContext,
@@ -135,7 +135,7 @@ impl IndexerClient {
             .map_err(ReadError::SqlSchema)?
             .register_all(&sql)?;
         Ok(Self {
-            blocks: SimplexClient::new(simplex_client(&blocks).map_err(ClientError::from)?),
+            blocks: SimplexReader::new(simplex_client(&blocks).map_err(ClientError::from)?),
             targets: publication_target_client(&metadata).map_err(ClientError::from)?,
             sql_store,
             sql,
@@ -143,7 +143,7 @@ impl IndexerClient {
     }
 
     /// Borrow the Simplex block client.
-    pub const fn blocks(&self) -> &SimplexClient {
+    pub const fn blocks(&self) -> &SimplexReader {
         &self.blocks
     }
 
@@ -392,10 +392,9 @@ impl IndexerClient {
         let query = format!(
             "SELECT {TX_META_DIGEST}, {TX_META_QMDB_LOCATION}, {TX_META_BODY} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
         );
-        let sql = query_context_with_min_sequence(
+        let sql = with_read_session(
             &self.sql,
-            &self.sql_store,
-            Some(target.store_sequence_number),
+            ReadSession::monotonic(self.sql_store.clone(), Some(target.store_sequence_number)),
         );
         let batches = sql.sql(&query).await?.collect().await?;
         for batch in batches {
@@ -426,10 +425,7 @@ impl IndexerClient {
         let Some(bytes) = self.transaction_bytes::<H>(digest).await? else {
             return Ok(None);
         };
-        Ok(Some(codec::from_bytes::<SignedTransaction<H>>(
-            &bytes,
-            &(),
-        )?))
+        Ok(Some(codec::from_bytes::<SignedTransaction<H>>(bytes, &())?))
     }
 
     /// Fetch the encoded Simplex finalization artifact for `view`.
@@ -522,7 +518,7 @@ where
 
     Ok(FinalizedPublicationTarget {
         height,
-        block_digest: codec::from_bytes(block_digest, &())?,
+        block_digest: codec::from_bytes(Copying(block_digest), &())?,
         store_sequence_number,
     })
 }

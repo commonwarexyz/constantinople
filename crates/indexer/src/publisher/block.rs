@@ -227,7 +227,7 @@ fn read_u64(bytes: &[u8]) -> Result<u64, TryFromSliceError> {
 mod tests {
     use super::*;
     use crate::sql_schema::{BLOCK_META_TABLE, TX_ACTIVITY_TABLE, TX_META_TABLE};
-    use commonware_codec::{DecodeExt as _, EncodeSize as _, FixedSize, ReadExt as _, Write as _};
+    use commonware_codec::{Copying, DecodeExt as _, EncodeSize as _, FixedSize, Write as _};
     use commonware_consensus::{
         simplex::types::Context,
         types::{Epoch, Round, View},
@@ -301,7 +301,7 @@ mod tests {
             Vec::with_capacity(zero_value_bytes.len().encode_size() + zero_value_bytes.len());
         zero_value_bytes.len().write(&mut encoded);
         encoded.extend_from_slice(&zero_value_bytes);
-        let zero_value = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+        let zero_value = LazySignedTransaction::<Sha256>::decode(encoded)
             .expect("zero-value lazy transaction should decode");
         let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
@@ -348,7 +348,7 @@ mod tests {
         let mut encoded = Vec::with_capacity(transaction.len().encode_size() + transaction.len());
         transaction.len().write(&mut encoded);
         encoded.extend_from_slice(&transaction);
-        let lazy = LazySignedTransaction::<Sha256>::read(&mut &encoded[..])
+        let lazy = LazySignedTransaction::<Sha256>::decode(encoded)
             .expect("outer lazy transaction should decode");
 
         let block = EngineBlock::from(Sealed::new_unchecked(
@@ -446,7 +446,7 @@ mod tests {
                 candidate[1] = first;
                 candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                TransactionPublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(Copying(&candidate[..]))
                     .is_err()
                     .then_some(candidate)
             })
