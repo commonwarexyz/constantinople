@@ -245,11 +245,17 @@ mod tests {
     async fn capture_content_encoding(
         State(sender): State<mpsc::UnboundedSender<Option<String>>>,
         headers: HeaderMap,
+        body: Bytes,
     ) -> StatusCode {
-        let content_encoding = headers.get(CONTENT_ENCODING).map(|value| {
+        assert_eq!(headers[CONTENT_TYPE], "application/connect+proto");
+        assert!(!headers.contains_key(CONTENT_ENCODING));
+        assert_eq!(body[0], 1);
+        assert_eq!(&body[5..9], b"\x28\xb5\x2f\xfd");
+
+        let content_encoding = headers.get("connect-content-encoding").map(|value| {
             value
                 .to_str()
-                .expect("content-encoding should be ASCII")
+                .expect("connect-content-encoding should be ASCII")
                 .to_string()
         });
         sender
@@ -300,6 +306,7 @@ mod tests {
         let client = writer_store_client(&format!("http://{address}"), None)
             .expect("writer client should build");
         let client = PrefixedStoreClient::empty(client);
+
         // Stay above connectrpc's minimum-size compression policy (1 KiB) so
         // the header reflects a body that was actually compressed.
         let value = vec![0u8; 8192];

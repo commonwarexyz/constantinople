@@ -456,6 +456,129 @@ mod tests {
     use commonware_runtime::{Runner as _, telemetry::metrics::has_metric_value};
     use exoware_sdk::{ConnectError, Key};
 
+    fn put_error_response(code: &str, message: &str) -> axum::response::Response {
+        use axum::{http::header::CONTENT_TYPE, response::IntoResponse as _};
+
+        let error = serde_json::json!({"error": {"code": code, "message": message}})
+            .to_string()
+            .into_bytes();
+        let mut body = vec![2];
+        body.extend_from_slice(&(error.len() as u32).to_be_bytes());
+        body.extend_from_slice(&error);
+        ([(CONTENT_TYPE, "application/connect+proto")], body).into_response()
+    }
+
+    #[test]
+    fn store_commit_replays_compressed_frames_as_one_sequence() {
+        use axum::{
+            Router,
+            body::{Body, to_bytes},
+            extract::Request,
+            http::header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
+            middleware::{Next, from_fn},
+        };
+        use bytes::Bytes;
+        use exoware_sdk::{PrefixedStoreClient, limits::PUT_CHUNK_TARGET_BYTES};
+        use exoware_simulator::{AppState, Log as _, RocksStore, Sequence as _, connect_stack};
+        use std::sync::{Arc, Mutex};
+
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let metrics = StoreCommitMetrics::new(&context);
+            for failures in [0, 1] {
+                let engine =
+                    Arc::new(RocksStore::open_owned(tempfile::tempdir().unwrap(), None).unwrap());
+                let requests = Arc::new(Mutex::new(Vec::new()));
+                let observed = requests.clone();
+                let observed_engine = engine.clone();
+                let app = Router::new()
+                    .fallback_service(connect_stack(AppState::new(engine.clone())))
+                    .layer(from_fn(move |request: Request, next: Next| {
+                        let requests = observed.clone();
+                        let engine = observed_engine.clone();
+                        async move {
+                            assert_eq!(request.uri().path(), "/log.ingest.v1.Service/Put");
+                            assert_eq!(
+                                request.headers()[CONTENT_TYPE],
+                                "application/connect+proto"
+                            );
+                            assert_eq!(request.headers()[AUTHORIZATION], "Bearer write-key");
+                            assert_eq!(request.headers()["connect-content-encoding"], "zstd");
+                            assert!(!request.headers().contains_key(CONTENT_ENCODING));
+
+                            let (parts, body) = request.into_parts();
+                            let body = to_bytes(body, 8 * 1024 * 1024).await.unwrap();
+                            let attempt = {
+                                let mut requests = requests.lock().unwrap();
+                                requests.push(body.clone());
+                                requests.len()
+                            };
+                            if attempt <= failures {
+                                assert_eq!(engine.current_sequence(), 0);
+                                return put_error_response("unavailable", "retry");
+                            }
+                            next.run(Request::from_parts(parts, Body::from(body))).await
+                        }
+                    }));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let url = format!("http://{}", listener.local_addr().unwrap());
+                let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+                let client = crate::store::writer_store_client(&url, Some("write-key")).unwrap();
+                let target = PrefixedStoreClient::empty(client.clone());
+                let mut batch = StoreWriteBatch::new();
+
+                // Each row nearly fills the SDK message target, requiring three frames.
+                for marker in 1..=3 {
+                    batch
+                        .push(
+                            &target,
+                            &Key::from(vec![marker; 8]),
+                            vec![marker; PUT_CHUNK_TARGET_BYTES - 32],
+                        )
+                        .unwrap();
+                }
+                let sequence = commit_with_retry(&client, &batch, CommitKind::Chunk, &metrics)
+                    .await
+                    .unwrap();
+                assert_eq!(sequence, 1);
+                assert_eq!(engine.current_sequence(), 1);
+                let logged = engine
+                    .get_batch(sequence)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .decode_response()
+                    .unwrap();
+                let entries = logged
+                    .entries
+                    .into_iter()
+                    .map(|row| (Bytes::from(row.key), row.value))
+                    .collect::<Vec<_>>();
+                assert_eq!(entries, batch.entries());
+                assert!(engine.get_batch(sequence + 1).await.unwrap().is_none());
+
+                let requests = requests.lock().unwrap();
+                assert_eq!(requests.len(), failures + 1);
+                for request in requests.iter() {
+                    assert_eq!(request, &requests[0]);
+                    let mut remaining = request.as_ref();
+                    let mut frames = 0;
+                    while !remaining.is_empty() {
+                        assert!(remaining.len() >= 5);
+                        assert_eq!(remaining[0], 1);
+                        let length =
+                            u32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
+                        assert!(length >= 4 && remaining.len() >= 5 + length);
+                        assert_eq!(&remaining[5..9], b"\x28\xb5\x2f\xfd");
+                        remaining = &remaining[5 + length..];
+                        frames += 1;
+                    }
+                    assert_eq!(frames, 3);
+                }
+                server.abort();
+            }
+        });
+    }
+
     fn metric_sample(encoded: &str, name: &str, kind: CommitKind) -> f64 {
         let sample = format!("{name}{{kind=\"{}\"}} ", kind.label());
         encoded
@@ -530,10 +653,7 @@ mod tests {
 
     #[test]
     fn store_commit_metrics_record_failed_logical_batch_once_after_retry() {
-        use axum::{
-            Router,
-            http::{StatusCode, header::CONTENT_TYPE},
-        };
+        use axum::Router;
         use std::sync::{
             Arc,
             atomic::{AtomicUsize, Ordering},
@@ -546,18 +666,11 @@ mod tests {
                 let attempts = observed_attempts.clone();
                 async move {
                     sleep(Duration::from_millis(10)).await;
-                    let (status, body) = if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        (
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            r#"{"code":"unavailable","message":"retry"}"#,
-                        )
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        put_error_response("unavailable", "retry")
                     } else {
-                        (
-                            StatusCode::BAD_REQUEST,
-                            r#"{"code":"invalid_argument","message":"reject"}"#,
-                        )
-                    };
-                    (status, [(CONTENT_TYPE, "application/json")], body)
+                        put_error_response("invalid_argument", "reject")
+                    }
                 }
             });
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

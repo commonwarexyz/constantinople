@@ -1660,7 +1660,9 @@ dependencies = [
  "prometheus-client 0.24.1",
  "rand 0.10.2",
  "serde",
+ "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror",
  "tokio",
  "tower",
@@ -2973,7 +2975,7 @@ dependencies = [
 [[package]]
 name = "exoware-qmdb"
 version = "2026.9.0"
-source = "git+https://github.com/exowarexyz/monorepo?rev=ba368e87748ec9f493241fd30f2368557c564dc1#ba368e87748ec9f493241fd30f2368557c564dc1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=99eab1e087aa624e814e2e76701a61aaf6ee8c34#99eab1e087aa624e814e2e76701a61aaf6ee8c34"
 dependencies = [
  "axum",
  "buffa",
@@ -3006,7 +3008,7 @@ dependencies = [
 [[package]]
 name = "exoware-sdk"
 version = "2026.9.0"
-source = "git+https://github.com/exowarexyz/monorepo?rev=ba368e87748ec9f493241fd30f2368557c564dc1#ba368e87748ec9f493241fd30f2368557c564dc1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=99eab1e087aa624e814e2e76701a61aaf6ee8c34#99eab1e087aa624e814e2e76701a61aaf6ee8c34"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -3040,7 +3042,7 @@ dependencies = [
 [[package]]
 name = "exoware-server"
 version = "2026.9.0"
-source = "git+https://github.com/exowarexyz/monorepo?rev=ba368e87748ec9f493241fd30f2368557c564dc1#ba368e87748ec9f493241fd30f2368557c564dc1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=99eab1e087aa624e814e2e76701a61aaf6ee8c34#99eab1e087aa624e814e2e76701a61aaf6ee8c34"
 dependencies = [
  "axum",
  "buffa",
@@ -3050,23 +3052,20 @@ dependencies = [
  "datafusion",
  "exoware-sdk",
  "futures",
- "h2",
  "http",
  "http-body",
- "http-body-util",
  "hyper",
  "hyper-util",
  "regex",
  "thiserror",
  "tokio",
  "tower",
- "zstd",
 ]
 
 [[package]]
 name = "exoware-simplex"
 version = "2026.9.0"
-source = "git+https://github.com/exowarexyz/monorepo?rev=ba368e87748ec9f493241fd30f2368557c564dc1#ba368e87748ec9f493241fd30f2368557c564dc1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=99eab1e087aa624e814e2e76701a61aaf6ee8c34#99eab1e087aa624e814e2e76701a61aaf6ee8c34"
 dependencies = [
  "bytes",
  "clap",
@@ -3090,7 +3089,7 @@ dependencies = [
 [[package]]
 name = "exoware-simulator"
 version = "2026.9.0"
-source = "git+https://github.com/exowarexyz/monorepo?rev=ba368e87748ec9f493241fd30f2368557c564dc1#ba368e87748ec9f493241fd30f2368557c564dc1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=99eab1e087aa624e814e2e76701a61aaf6ee8c34#99eab1e087aa624e814e2e76701a61aaf6ee8c34"
 dependencies = [
  "axum",
  "buffa",
@@ -3114,7 +3113,7 @@ dependencies = [
 [[package]]
 name = "exoware-sql"
 version = "2026.9.0"
-source = "git+https://github.com/exowarexyz/monorepo?rev=ba368e87748ec9f493241fd30f2368557c564dc1#ba368e87748ec9f493241fd30f2368557c564dc1"
+source = "git+https://github.com/exowarexyz/monorepo?rev=99eab1e087aa624e814e2e76701a61aaf6ee8c34#99eab1e087aa624e814e2e76701a61aaf6ee8c34"
 dependencies = [
  "async-trait",
  "axum",
