@@ -311,7 +311,7 @@ test('reported-height proofs reject tampered transaction metadata', async (t) =>
     }), /body does not match transaction digest/);
 });
 
-test('reported-height proofs reject a QMDB response below the publication floor', async (t) => {
+test('reported-height proofs retain the request floor without response sequence metadata', async (t) => {
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
@@ -323,12 +323,17 @@ test('reported-height proofs reject a QMDB response below the publication floor'
     );
     t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
         request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
-    ) => ({ ...keylessProof(request, root, location, value), sequenceNumber: FLOOR - 1n }));
+    ) => {
+        assert.equal(request.minSequenceNumber, FLOOR);
+        return { ...keylessProof(request, root, location, value), sequenceNumber: 0n };
+    });
 
-    await assert.rejects(fetchAndVerifyTransactionProof({
+    const result = await fetchAndVerifyTransactionProof({
         ...transactionProofOptions(digest),
         finalizedHeight: HEIGHT,
-    }), /evaluated before the requested Store sequence/);
+    });
+    assert.equal(result.height, HEIGHT);
+    assert.equal(result.location, LOCATION);
 });
 
 test('a failed metadata read cancels its concurrent certificate request', async (t) => {
@@ -540,7 +545,7 @@ async function finalizedCertificate(
     };
 }
 
-test('account proof retains the publication floor for SQL and QMDB', async (t) => {
+test('account proof retains request floors without response sequence metadata', async (t) => {
     const target = { ...latestTarget(), stateStart: 2n };
     const sqlFloors: Array<bigint | undefined> = [];
     const sqlQueries: string[] = [];
@@ -566,12 +571,15 @@ test('account proof retains the publication floor for SQL and QMDB', async (t) =
             expectedKey: BytesLike,
         ) => {
             qmdbFloors.push(request.minSequenceNumber);
-            return unorderedProof(
-                request,
-                expectedRoot as Uint8Array,
-                expectedLocation,
-                expectedKey as Uint8Array,
-            );
+            return {
+                ...unorderedProof(
+                    request,
+                    expectedRoot as Uint8Array,
+                    expectedLocation,
+                    expectedKey as Uint8Array,
+                ),
+                sequenceNumber: 0n,
+            };
         },
     );
 

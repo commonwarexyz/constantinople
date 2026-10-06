@@ -629,7 +629,7 @@ async function fetchFixedKeylessAppendProof(
     signal?: AbortSignal,
 ) {
     const client = new QmdbOperationLogClient(serviceUrl);
-    const proof = await client.getFixedKeylessAppend(
+    return client.getFixedKeylessAppend(
         {
             tip,
             startLocation: location,
@@ -641,12 +641,6 @@ async function fetchFixedKeylessAppendProof(
         expectedValue,
         { signal },
     );
-    assertEvaluatedSequence(
-        proof.sequenceNumber,
-        minSequenceNumber,
-        'QMDB transaction proof',
-    );
-    return proof;
 }
 
 async function fetchFixedUnorderedUpdateProof(
@@ -660,7 +654,7 @@ async function fetchFixedUnorderedUpdateProof(
     signal?: AbortSignal,
 ): Promise<VerifiedFixedUnorderedUpdateProof> {
     const client = new QmdbOperationLogClient(serviceUrl);
-    const proof = await client.getFixedUnorderedUpdate(
+    return client.getFixedUnorderedUpdate(
         {
             tip,
             startLocation: location,
@@ -673,8 +667,6 @@ async function fetchFixedUnorderedUpdateProof(
         valueSize,
         { signal },
     );
-    assertEvaluatedSequence(proof.sequenceNumber, minSequenceNumber, 'QMDB account proof');
-    return proof;
 }
 
 const FINALIZED_TARGET_CACHE_SIZE = 128;
