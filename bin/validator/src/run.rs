@@ -31,7 +31,7 @@ use commonware_p2p::{
 };
 use commonware_parallel::Rayon;
 use commonware_runtime::{
-    BufferPoolConfig, Metrics, Quota, Runner as _, Strategizer as _, Supervisor as _,
+    BufferPoolConfig, Metrics, Quota, Runner as _, Spawner as _, Strategizer as _, Supervisor as _,
     buffer::paged::{self, CacheRef},
     telemetry::metrics::{Counter, Gauge, Histogram, MetricsExt as _},
     tokio::{
@@ -93,9 +93,9 @@ use std::{
 };
 use tokio::{
     sync::{Mutex, Notify, OwnedSemaphorePermit, Semaphore, TryAcquireError, oneshot},
-    task::{JoinHandle, JoinSet},
+    task::JoinSet,
 };
-use tracing::{Instrument as _, Span, info, info_span, warn};
+use tracing::{Instrument as _, Span, error, info, info_span, warn};
 
 const MEMPOOL_MAILBOX_SIZE: usize = 65_536;
 
@@ -1718,20 +1718,23 @@ where
     Ok(())
 }
 
+// A panic in any of these tasks already fails the runtime. This also fails it
+// when a task returns or is aborted, which would otherwise stop indexing
+// without a restart.
 fn indexer_critical_task(
     cert_join: commonware_runtime::Handle<()>,
-    finalized_join: JoinHandle<()>,
+    finalized_join: commonware_runtime::Handle<()>,
     cleanup_join: commonware_runtime::Handle<()>,
 ) -> CriticalTask {
     Box::pin(async move {
         let (task, result) = tokio::select! {
-            result = cert_join => ("Simplex certificate uploader", result.map_err(|error| error.to_string())),
-            result = finalized_join => ("finalized index uploader", result.map_err(|error| error.to_string())),
-            result = cleanup_join => ("finalized payload cleanup", result.map_err(|error| error.to_string())),
+            result = cert_join => ("Simplex certificate uploader", result),
+            result = finalized_join => ("finalized index uploader", result),
+            result = cleanup_join => ("finalized payload cleanup", result),
         };
         match result {
-            Ok(()) => warn!(task, "critical indexer task exited"),
-            Err(error) => warn!(task, error = %error, "critical indexer task failed"),
+            Ok(()) => error!(task, "critical indexer task exited"),
+            Err(error) => error!(task, %error, "critical indexer task failed"),
         }
     })
 }
@@ -1854,6 +1857,7 @@ async fn maybe_build_indexer(
     }
     let (cleanup, cleanup_join) =
         payloads.start_cleanup(context.child("finalized_payload_cleanup"));
+    let consumer_context = context.child("finalized_upload_consumer");
     let receipt_store = Arc::new(FinalizedReceiptStore {
         context,
         config: metadata_config,
@@ -1871,7 +1875,7 @@ async fn maybe_build_indexer(
         marshal: marshal.clone(),
         traces: traces.clone(),
     };
-    let finalized_join = tokio::spawn(run_finalized_upload_consumer(FinalizedUploadConsumer {
+    let consumer = FinalizedUploadConsumer {
         publisher,
         cert_reporter: cert_reporter.clone(),
         writer: queue_writer,
@@ -1886,7 +1890,8 @@ async fn maybe_build_indexer(
         payload_floor,
         traces,
         replay_through: queue_tail.map_or(0, |receipt| receipt.height),
-    }));
+    };
+    let finalized_join = consumer_context.spawn(move |_| run_finalized_upload_consumer(consumer));
     Ok(Some(IndexerHandle {
         finalized_producer,
         marshal,
@@ -2429,21 +2434,19 @@ mod tests {
     }
 
     #[test]
-    fn indexer_uploader_or_cleanup_exit_fails_the_runtime() {
-        for cleanup_exits in [false, true] {
+    fn indexer_critical_task_exit_fails_the_runtime() {
+        for exiting in 0..3 {
             commonware_runtime::tokio::Runner::default().start(|context| async move {
-                let certificate_uploader =
-                    context.child("certificate").spawn(move |_| async move {
-                        if cleanup_exits {
+                let task = |index: usize| {
+                    context.child("critical").spawn(move |_| async move {
+                        if index != exiting {
                             pending::<()>().await;
                         }
-                    });
-                let cleanup = context.child("cleanup").spawn(move |_| async move {
-                    if !cleanup_exits {
-                        pending::<()>().await;
-                    }
-                });
-                let finalized_uploader = tokio::spawn(pending::<()>());
+                    })
+                };
+                let certificate_uploader = task(0);
+                let finalized_uploader = task(1);
+                let cleanup = task(2);
                 let indexer_task =
                     indexer_critical_task(certificate_uploader, finalized_uploader, cleanup);
 
