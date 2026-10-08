@@ -20,7 +20,7 @@ that fits.
 | **Simplex block storage** | certified headers, `{ header, body }` blocks by digest, finalization indexes | Tools that need verifiable block headers, optional full block bodies, and certified height/latest reads through [`IndexerClient`](src/client.rs). |
 | **Metadata and lookup storage** (SQL) | `block_meta`, `tx_meta`, `tx_activity`, `account_meta` | The explorer ([`explorer/`](../../explorer)), [`IndexerClient`](src/client.rs), and any other consumer that wants finalized block streams, transaction bodies/proof locations, account activity, or account proof locations without paying full-block decode cost. |
 | **QMDB operation logs** | Account-state operations under Store prefix `0x00`. Transaction-hash operations under Store prefix `0x01`. | `qmdb-indexer` read APIs. `/state` serves account-state operation ranges. `/transactions` serves transaction-hash operation ranges and proofs. |
-| **Simplex proof artifacts** | `exoware-simplex` notarization/finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
+| **Simplex proof artifacts** | `exoware-simplex` finalization rows in the shared Store | The explorer and proof clients that need browser-verifiable finalization certificates. Common homepage/header reads do not fetch block bodies. |
 | **Provable targets** | Height-ordered block digests under Store prefix `0x04` | Proof clients that need the newest finalized block covered by both QMDB publication boundaries. |
 
 All paths use the same exoware Store service. The owning secondary prepares the
@@ -94,10 +94,9 @@ the full body only when requested.
   source of truth for the live `block_meta`, `tx_meta`, `tx_activity`, and
   `account_meta` table layouts. The explorer's column-name strings live here
   too, so a schema change is a one-place edit.
-- A [`CertificateReporter`](src/publisher/certificate.rs) that taps
-  simplex `Activity` events, uploads full blocks by digest, pairs certificates
-  with finalized headers, and uploads `exoware-simplex` proof artifacts to the
-  shared Store.
+- A [`CertificateReporter`](src/publisher/certificate.rs) that uploads each
+  finalized block by digest together with its finalization as
+  `exoware-simplex` proof artifacts in the shared Store.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
   on the single owning secondary. It commits SQL and authenticated QMDB data,
   then publishes only the contiguous completed prefix through one barrier.
@@ -185,7 +184,7 @@ Child spans expose these stages:
 | Capture and enqueue | Receipt lock, artifact validation, payload encoding, checksum, file writes and sync, and durable queue enqueue. `indexer.queue.enqueue_to_read` includes enqueue persistence and time until the consumer reads the record. |
 | Admission | Memory admission, payload read and decode, and waiting for the ordered admission turn. |
 | QMDB and SQL preparation | `indexer.qmdb.prepare.*` separates authenticated state and transaction preparation, metadata construction, transaction and account rows, SQL encoding and staging, QMDB staging, and request chunking. Scheduling waits are separate spans. |
-| Simplex preparation | `indexer.simplex.*` separates queue waits, full body encoding, row preparation and staging, certificate gates, and persistence. |
+| Simplex preparation | `indexer.simplex.*` separates queue waits, full body encoding, row preparation and staging, and persistence. |
 | Store uploads | Each `indexer.qmdb.chunk` records its index, chunk count, rows, and encoded bytes. Concurrent chunks appear as sibling spans. `store_commit` contains individual `store_put_attempt` spans and retry backoffs. Attempts include SDK request encoding, compression, and network time. |
 | Publication and deletion | Per-block waits cover publication, ordered acknowledgement, section pruning, cleanup capacity, and cleanup execution. Payload deletion attempts and retry delays remain within the block trace. |
 

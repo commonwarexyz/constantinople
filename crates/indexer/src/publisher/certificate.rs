@@ -1,19 +1,13 @@
-//! Simplex certificate reporter backed by the chain Store.
+//! Simplex block and finalization uploader backed by the chain Store.
 //!
 //! Consensus finalizes marshal commitments. Each commitment embeds the digest
-//! of the Constantinople block header it certifies. This reporter writes full
+//! of the Constantinople block header it certifies. This uploader writes full
 //! block `{ header, body }` data by header digest for body reads, and writes
-//! certificate artifacts with only the commitment-tagged header so height/latest
-//! verification does not fetch the full body.
+//! finalization artifacts with only the commitment-tagged header so
+//! height/latest verification does not fetch the full body.
 
-use ahash::AHashMap;
-use commonware_actor::Feedback;
 use commonware_codec::{Buf, EncodeSize, Error as CodecError, Read, ReadExt as _, Write};
-use commonware_consensus::{
-    Block, Heightable, Reporter,
-    simplex::{self, types::Activity},
-    types::Height,
-};
+use commonware_consensus::{Block, Heightable, simplex, types::Height};
 use commonware_cryptography::{Digestible, Hasher, PublicKey, certificate::Scheme};
 use commonware_runtime::{
     Handle, Metrics as RuntimeMetrics, Spawner,
@@ -21,15 +15,15 @@ use commonware_runtime::{
 };
 use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
 use exoware_sdk::{StoreBatchUpload, StoreWriteBatch};
-use exoware_simplex::{Finalized, Notarized, PreparedUpload, SimplexWriter};
+use exoware_simplex::{Finalized, PreparedUpload, SimplexWriter};
 use futures::{StreamExt, stream::FuturesUnordered};
-use std::{collections::VecDeque, sync::Arc, time::Instant};
-use tokio::sync::{mpsc, oneshot, watch};
+use std::{sync::Arc, time::Instant};
+use tokio::sync::{mpsc, oneshot};
 use tracing::{
-    Dispatch, Instrument as _, Span, debug, field, info_span, instrument::WithSubscriber as _, warn,
+    Dispatch, Instrument as _, Span, debug, field, info_span, instrument::WithSubscriber as _,
 };
 
-/// Cloneable reporter over Simplex activity.
+/// Cloneable handle to the background uploader for finalized Simplex blocks.
 pub struct CertificateReporter<H, P, S>
 where
     H: Hasher + Send + Sync + 'static,
@@ -37,7 +31,7 @@ where
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send,
 {
-    tx: mpsc::Sender<QueuedSimplexInput<H, P, S>>,
+    tx: mpsc::Sender<QueuedUpload<H, P, S>>,
     metrics: SimplexUploadMetrics,
 }
 
@@ -94,7 +88,7 @@ impl SimplexUploadMetrics {
         }
     }
 
-    fn observe_dequeued<H, P, S>(&self, input: &QueuedSimplexInput<H, P, S>)
+    fn observe_dequeued<H, P, S>(&self, upload: &QueuedUpload<H, P, S>)
     where
         H: Hasher,
         P: PublicKey,
@@ -102,7 +96,7 @@ impl SimplexUploadMetrics {
     {
         self.queue_depth.dec();
         self.input_queue_wait_duration
-            .observe(input.queued_at.elapsed().as_secs_f64());
+            .observe(upload.queued_at.elapsed().as_secs_f64());
     }
 }
 
@@ -120,18 +114,6 @@ pub enum PublishFinalizedBlockError {
     /// The background uploader stopped before accepting the finalized block.
     #[error(transparent)]
     UploaderStopped(#[from] CertificateUploaderStopped),
-}
-
-/// Completion signal for a digest-addressed Simplex block upload.
-pub struct BlockUploadCompletion {
-    rx: oneshot::Receiver<()>,
-}
-
-impl BlockUploadCompletion {
-    /// Wait until the block upload has been marked persisted.
-    pub async fn wait(self) -> Result<(), CertificateUploaderStopped> {
-        self.rx.await.map_err(|_| CertificateUploaderStopped)
-    }
 }
 
 /// Completion signal for an exact finalized block upload.
@@ -192,22 +174,6 @@ where
         Ok((Self { tx, metrics }, join))
     }
 
-    /// Queue a finalized block for digest-addressed block upload and later
-    /// certificate pairing.
-    pub async fn publish_block(
-        &self,
-        block: Arc<EngineBlock<H, P>>,
-    ) -> Result<BlockUploadCompletion, CertificateUploaderStopped>
-    where
-        H: Hasher,
-        P: PublicKey,
-    {
-        let (completion, rx) = oneshot::channel();
-        let input = QueuedSimplexInput::new(SimplexInput::Block { block, completion });
-        enqueue_input(&self.tx, &self.metrics, input).await?;
-        Ok(BlockUploadCompletion { rx })
-    }
-
     /// Queue a block and its exact finalization for one durable Store commit.
     pub async fn publish_finalized_block(
         &self,
@@ -223,12 +189,8 @@ where
         }
 
         let (completion, rx) = oneshot::channel();
-        let input = QueuedSimplexInput::new(SimplexInput::FinalizedBlock {
-            block,
-            finalization,
-            completion,
-        });
-        enqueue_input(&self.tx, &self.metrics, input).await?;
+        let upload = QueuedUpload::new(block, finalization, completion);
+        enqueue_upload(&self.tx, &self.metrics, upload).await?;
         Ok(FinalizedBlockUploadCompletion { rx })
     }
 }
@@ -247,43 +209,10 @@ where
     }
 }
 
-impl<H, P, S> Reporter for CertificateReporter<H, P, S>
-where
-    H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
-    S: Scheme + Send + Sync + 'static,
-    S::Certificate: Send,
-    simplex::types::Notarization<S, EngineCommitment<H, P>>: Send,
-    simplex::types::Finalization<S, EngineCommitment<H, P>>: Send,
-{
-    type Activity = Activity<S, EngineCommitment<H, P>>;
-
-    fn report(&mut self, activity: Self::Activity) -> Feedback {
-        match activity {
-            Activity::Notarization(notarization) => {
-                dispatch_input(
-                    &self.tx,
-                    &self.metrics,
-                    SimplexInput::Notarization(notarization),
-                );
-            }
-            Activity::Finalization(finalization) => {
-                dispatch_input(
-                    &self.tx,
-                    &self.metrics,
-                    SimplexInput::Finalization(finalization),
-                );
-            }
-            _ => {}
-        }
-        Feedback::Ok
-    }
-}
-
-async fn enqueue_input<H, P, S>(
-    tx: &mpsc::Sender<QueuedSimplexInput<H, P, S>>,
+async fn enqueue_upload<H, P, S>(
+    tx: &mpsc::Sender<QueuedUpload<H, P, S>>,
     metrics: &SimplexUploadMetrics,
-    mut input: QueuedSimplexInput<H, P, S>,
+    mut upload: QueuedUpload<H, P, S>,
 ) -> Result<(), CertificateUploaderStopped>
 where
     H: Hasher + Send + Sync + 'static,
@@ -293,64 +222,48 @@ where
 {
     let permit = tx
         .reserve()
-        .instrument(input.trace.enqueue_wait_span())
+        .instrument(upload.trace.enqueue_wait_span())
         .await
         .map_err(|_| CertificateUploaderStopped)?;
     metrics.queue_depth.inc();
-    input.prepare_wait = Some(input.trace.prepare_wait_span());
-    permit.send(input);
+    upload.prepare_wait = Some(upload.trace.prepare_wait_span());
+    permit.send(upload);
     Ok(())
 }
 
-fn dispatch_input<H, P, S>(
-    tx: &mpsc::Sender<QueuedSimplexInput<H, P, S>>,
-    metrics: &SimplexUploadMetrics,
-    input: SimplexInput<H, P, S>,
-) where
-    H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
-    S: Scheme + Send + Sync + 'static,
-    S::Certificate: Send,
-{
-    let tx = tx.clone();
-    let metrics = metrics.clone();
-    let input = QueuedSimplexInput::new(input);
-    let dispatch = input.trace.dispatch.clone();
-    tokio::spawn(
-        async move {
-            if let Err(error) = enqueue_input(&tx, &metrics, input).await {
-                warn!("simplex certificate uploader stopped; dropping activity: {error}");
-            }
-        }
-        .with_subscriber(dispatch),
-    );
-}
-
-struct QueuedSimplexInput<H, P, S>
+struct QueuedUpload<H, P, S>
 where
     H: Hasher,
     P: PublicKey,
     S: Scheme,
 {
+    block: Arc<EngineBlock<H, P>>,
+    finalization: simplex::types::Finalization<S, EngineCommitment<H, P>>,
+    completion: oneshot::Sender<()>,
     queued_at: Instant,
     trace: SimplexTrace,
     prepare_wait: Option<Span>,
-    input: SimplexInput<H, P, S>,
 }
 
-impl<H, P, S> QueuedSimplexInput<H, P, S>
+impl<H, P, S> QueuedUpload<H, P, S>
 where
     H: Hasher,
     P: PublicKey,
     S: Scheme,
 {
-    fn new(input: SimplexInput<H, P, S>) -> Self {
-        let trace = SimplexTrace::new(&input);
+    fn new(
+        block: Arc<EngineBlock<H, P>>,
+        finalization: simplex::types::Finalization<S, EngineCommitment<H, P>>,
+        completion: oneshot::Sender<()>,
+    ) -> Self {
+        let trace = SimplexTrace::new(block.height().get());
         Self {
+            block,
+            finalization,
+            completion,
             queued_at: Instant::now(),
             trace,
             prepare_wait: None,
-            input,
         }
     }
 }
@@ -359,35 +272,18 @@ where
 struct SimplexTrace {
     parent: Span,
     dispatch: Dispatch,
-    request_kind: &'static str,
-    height: Option<u64>,
+    height: u64,
     body_bytes: Option<usize>,
 }
 
 impl SimplexTrace {
-    fn new<H, P, S>(input: &SimplexInput<H, P, S>) -> Self
-    where
-        H: Hasher,
-        P: PublicKey,
-        S: Scheme,
-    {
+    fn new(height: u64) -> Self {
         Self {
             parent: Span::current(),
             dispatch: tracing::dispatcher::get_default(Clone::clone),
-            request_kind: input.request_kind(),
-            height: input.height(),
+            height,
             body_bytes: None,
         }
-    }
-
-    const fn with_request_kind(mut self, request_kind: &'static str) -> Self {
-        self.request_kind = request_kind;
-        self
-    }
-
-    const fn with_height(mut self, height: u64) -> Self {
-        self.height = Some(height);
-        self
     }
 
     const fn with_body_bytes(mut self, body_bytes: usize) -> Self {
@@ -399,7 +295,6 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.enqueue_wait",
-            request_kind = self.request_kind,
             height = field::Empty,
         );
         self.record_fields(&span);
@@ -410,7 +305,6 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.prepare_wait",
-            request_kind = self.request_kind,
             height = field::Empty,
         );
         self.record_fields(&span);
@@ -421,7 +315,6 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.prepare",
-            request_kind = self.request_kind,
             height = field::Empty,
         );
         self.record_fields(&span);
@@ -432,7 +325,6 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.encode_body",
-            request_kind = self.request_kind,
             height = field::Empty,
             body_bytes = field::Empty,
         );
@@ -444,32 +336,8 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.prepare_rows",
-            request_kind = self.request_kind,
             height = field::Empty,
             body_bytes = field::Empty,
-        );
-        self.record_fields(&span);
-        span
-    }
-
-    fn upload_wait_span(&self) -> Span {
-        let span = info_span!(
-            parent: &self.parent,
-            "indexer.simplex.upload_wait",
-            request_kind = self.request_kind,
-            height = field::Empty,
-            body_bytes = field::Empty,
-        );
-        self.record_fields(&span);
-        span
-    }
-
-    fn gate_wait_span(&self) -> Span {
-        let span = info_span!(
-            parent: &self.parent,
-            "indexer.simplex.certificate_gate_wait",
-            request_kind = self.request_kind,
-            height = field::Empty,
         );
         self.record_fields(&span);
         span
@@ -479,7 +347,6 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.stage_rows",
-            request_kind = self.request_kind,
             height = field::Empty,
             body_bytes = field::Empty,
         );
@@ -491,7 +358,6 @@ impl SimplexTrace {
         let span = info_span!(
             parent: &self.parent,
             "indexer.simplex.persist",
-            request_kind = self.request_kind,
             height = field::Empty,
             body_bytes = field::Empty,
         );
@@ -500,148 +366,9 @@ impl SimplexTrace {
     }
 
     fn record_fields(&self, span: &Span) {
-        if let Some(height) = self.height {
-            span.record("height", height);
-        }
+        span.record("height", self.height);
         if let Some(body_bytes) = self.body_bytes {
             span.record("body_bytes", body_bytes);
-        }
-    }
-}
-
-enum SimplexInput<H, P, S>
-where
-    H: Hasher,
-    P: PublicKey,
-    S: Scheme,
-{
-    Block {
-        block: Arc<EngineBlock<H, P>>,
-        completion: oneshot::Sender<()>,
-    },
-    FinalizedBlock {
-        block: Arc<EngineBlock<H, P>>,
-        finalization: simplex::types::Finalization<S, EngineCommitment<H, P>>,
-        completion: oneshot::Sender<()>,
-    },
-    Notarization(simplex::types::Notarization<S, EngineCommitment<H, P>>),
-    Finalization(simplex::types::Finalization<S, EngineCommitment<H, P>>),
-}
-
-struct PendingBlockCertificates<H, P, S>
-where
-    H: Hasher,
-    P: PublicKey,
-    S: Scheme,
-{
-    block: Option<Arc<EngineBlock<H, P>>>,
-    block_persisted: Option<watch::Receiver<bool>>,
-    notarization: Option<simplex::types::Notarization<S, EngineCommitment<H, P>>>,
-    finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
-}
-
-impl<H, P, S> Default for PendingBlockCertificates<H, P, S>
-where
-    H: Hasher,
-    P: PublicKey,
-    S: Scheme,
-{
-    fn default() -> Self {
-        Self {
-            block: None,
-            block_persisted: None,
-            notarization: None,
-            finalization: None,
-        }
-    }
-}
-
-struct ReadyUpload {
-    prepared: PreparedUpload,
-    body_bytes: usize,
-    trace: SimplexTrace,
-    upload_wait: Span,
-    kind: ReadyUploadKind,
-}
-
-enum ReadyUploadKind {
-    Block {
-        persisted: watch::Sender<bool>,
-        completion: oneshot::Sender<()>,
-        queued_at: Instant,
-    },
-    FinalizedBlock {
-        completion: oneshot::Sender<()>,
-        queued_at: Instant,
-    },
-    Certificate {
-        block_persisted: watch::Receiver<bool>,
-    },
-}
-
-impl ReadyUpload {
-    fn block(
-        prepared: PreparedUpload,
-        body_bytes: usize,
-        trace: SimplexTrace,
-        persisted: watch::Sender<bool>,
-        completion: oneshot::Sender<()>,
-        queued_at: Instant,
-    ) -> Self {
-        let upload_wait = trace.upload_wait_span();
-        Self {
-            prepared,
-            body_bytes,
-            trace,
-            upload_wait,
-            kind: ReadyUploadKind::Block {
-                persisted,
-                completion,
-                queued_at,
-            },
-        }
-    }
-
-    fn finalized_block(
-        prepared: PreparedUpload,
-        body_bytes: usize,
-        trace: SimplexTrace,
-        completion: oneshot::Sender<()>,
-        queued_at: Instant,
-    ) -> Self {
-        let upload_wait = trace.upload_wait_span();
-        Self {
-            prepared,
-            body_bytes,
-            trace,
-            upload_wait,
-            kind: ReadyUploadKind::FinalizedBlock {
-                completion,
-                queued_at,
-            },
-        }
-    }
-
-    fn certificate(
-        prepared: PreparedUpload,
-        trace: SimplexTrace,
-        block_persisted: watch::Receiver<bool>,
-    ) -> Self {
-        let trace = trace.with_body_bytes(0);
-        let upload_wait = trace.upload_wait_span();
-        Self {
-            prepared,
-            body_bytes: 0,
-            trace,
-            upload_wait,
-            kind: ReadyUploadKind::Certificate { block_persisted },
-        }
-    }
-
-    fn can_start(&self) -> bool {
-        match &self.kind {
-            ReadyUploadKind::Block { .. } | ReadyUploadKind::FinalizedBlock { .. } => true,
-            ReadyUploadKind::Certificate { block_persisted } => *block_persisted.borrow(),
         }
     }
 }
@@ -649,7 +376,7 @@ impl ReadyUpload {
 async fn run_uploader<Cx, H, P, S>(
     context: Cx,
     client: SimplexWriter,
-    mut rx: mpsc::Receiver<QueuedSimplexInput<H, P, S>>,
+    mut rx: mpsc::Receiver<QueuedUpload<H, P, S>>,
     max_in_flight: usize,
     commit_metrics: super::StoreCommitMetrics,
     metrics: SimplexUploadMetrics,
@@ -660,64 +387,30 @@ async fn run_uploader<Cx, H, P, S>(
     S: Scheme + Send + Sync + 'static,
     S::Certificate: Send + Sync,
 {
-    let mut pending: AHashMap<Vec<u8>, PendingBlockCertificates<H, P, S>> = AHashMap::new();
-    let mut uploads = FuturesUnordered::new();
-    let mut preparation = None::<Handle<_>>;
-    let mut ready_uploads = VecDeque::new();
+    let mut uploads = FuturesUnordered::<Handle<()>>::new();
     let mut rx_open = true;
-    loop {
-        while uploads.len() < max_in_flight {
-            let Some(index) = ready_uploads.iter().position(ReadyUpload::can_start) else {
-                break;
-            };
-            let upload = ready_uploads
-                .remove(index)
-                .expect("ready Simplex upload index must exist");
-            spawn_upload(
-                &mut uploads,
-                context.child("upload"),
-                &client,
-                &commit_metrics,
-                &metrics,
-                upload,
-            );
-        }
-        if !rx_open && uploads.is_empty() && ready_uploads.is_empty() && preparation.is_none() {
-            break;
-        }
-        let upload_waits_for_capacity = ready_uploads.iter().any(ReadyUpload::can_start);
+
+    // Each upload carries its own block and finalization, so uploads share no
+    // state and only the in-flight bound limits how many run at once.
+    while rx_open || !uploads.is_empty() {
         tokio::select! {
             result = uploads.next(), if !uploads.is_empty() => {
                 result
                     .expect("non-empty Simplex upload set must yield a task")
                     .expect("Simplex upload task failed");
             }
-            result = async { preparation.as_mut().expect("preparation is active").await }, if preparation.is_some() => {
-                let (updated_pending, ready) = result.expect("Simplex preparation task failed");
-                preparation = None;
-                pending = updated_pending;
-                ready_uploads.extend(ready);
-            }
-            input = rx.recv(), if rx_open && preparation.is_none() && uploads.len() < max_in_flight && !upload_waits_for_capacity => {
-                match input {
-                    Some(mut input) => {
-                        metrics.observe_dequeued(&input);
-
-                        // Move pairing state through one preparation at a time to preserve input order.
-                        let mut preparing_pending = std::mem::take(&mut pending);
-                        let client = client.clone();
-                        let dispatch = input.trace.dispatch.clone();
-                        preparation = Some(context.child("prepare").shared(true).spawn(move |_| {
-                            async move {
-                                drop(input.prepare_wait.take());
-                                let trace = input.trace.clone();
-                                let ready = trace.prepare_span().in_scope(|| {
-                                    prepare_input(&client, &mut preparing_pending, input)
-                                });
-                                (preparing_pending, ready)
-                            }
-                            .with_subscriber(dispatch)
-                        }));
+            upload = rx.recv(), if rx_open && uploads.len() < max_in_flight => {
+                match upload {
+                    Some(upload) => {
+                        metrics.observe_dequeued(&upload);
+                        spawn_upload(
+                            &mut uploads,
+                            context.child("upload"),
+                            &client,
+                            &commit_metrics,
+                            &metrics,
+                            upload,
+                        );
                     }
                     None => rx_open = false,
                 }
@@ -727,157 +420,43 @@ async fn run_uploader<Cx, H, P, S>(
     debug!("simplex certificate uploader task exiting after channel closure");
 }
 
-fn prepare_input<H, P, S>(
-    client: &SimplexWriter,
-    pending: &mut AHashMap<Vec<u8>, PendingBlockCertificates<H, P, S>>,
-    queued: QueuedSimplexInput<H, P, S>,
-) -> Vec<ReadyUpload>
-where
-    H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
-    S: Scheme + Send + Sync + 'static,
-    S::Certificate: Send + Sync,
-{
-    let QueuedSimplexInput {
-        queued_at,
-        trace,
-        prepare_wait,
-        input,
-    } = queued;
-    drop(prepare_wait);
-    let input = match input {
-        SimplexInput::FinalizedBlock {
-            block,
-            finalization,
-            completion,
-        } => {
-            let body_bytes = block.body.encode_size();
-            let trace = trace.with_body_bytes(body_bytes);
-            let commitment = finalization.proposal.payload;
-            let certified = CertifiedHeader::new(commitment, &block);
-            let finalized = Finalized::new(finalization, certified)
-                .expect("validated finalization must match its certified header");
-            let (header, body) = trace
-                .encode_body_span()
-                .in_scope(|| crate::simplex_block::encode_simplex_block_parts(&block));
-            let prepared = trace.prepare_rows_span().in_scope(|| {
-                let mut prepared = client.prepare_block(&header, body);
-                prepared.extend(
-                    client
-                        .prepare_finalized(&finalized)
-                        .expect("validated finalization upload must prepare"),
-                );
-                prepared
-            });
-            return vec![ReadyUpload::finalized_block(
-                prepared, body_bytes, trace, completion, queued_at,
-            )];
-        }
-        input => input,
-    };
-    let key = input.block_digest_key();
-    let entry = pending.entry(key.clone()).or_default();
-    let mut ready = Vec::with_capacity(3);
-    match input {
-        SimplexInput::Block { block, completion } => {
-            let body_bytes = block.body.encode_size();
-            let trace = trace.clone().with_body_bytes(body_bytes);
-            let (header, body) = trace
-                .encode_body_span()
-                .in_scope(|| crate::simplex_block::encode_simplex_block_parts(&block));
-            let (block_persisted, block_persisted_rx) = watch::channel(false);
-            ready.push(ReadyUpload::block(
-                trace
-                    .prepare_rows_span()
-                    .in_scope(|| client.prepare_block(&header, body)),
-                body_bytes,
-                trace,
-                block_persisted,
-                completion,
-                queued_at,
-            ));
-            entry.block = Some(block);
-            entry.block_persisted = Some(block_persisted_rx);
-        }
-        SimplexInput::Notarization(notarization) => entry.notarization = Some(notarization),
-        SimplexInput::Finalization(finalization) => entry.finalization = Some(finalization),
-        SimplexInput::FinalizedBlock { .. } => unreachable!(),
-    }
-    let certificate_trace = entry
-        .block
-        .as_ref()
-        .map(|block| trace.clone().with_height(block.height().get()))
-        .unwrap_or_else(|| trace.clone());
-    let has_certificates =
-        entry.block.is_some() && (entry.notarization.is_some() || entry.finalization.is_some());
-    let (certificates, finalized) = if has_certificates {
-        certificate_trace
-            .clone()
-            .with_request_kind("certificates")
-            .prepare_rows_span()
-            .in_scope(|| prepare_ready_certificates(client, entry))
-    } else {
-        (Vec::new(), false)
-    };
-    if !certificates.is_empty() {
-        let block_persisted = entry
-            .block_persisted
-            .as_ref()
-            .expect("ready certificates have a block persistence gate");
-        ready.extend(certificates.into_iter().map(|(prepared, request_kind)| {
-            ReadyUpload::certificate(
-                prepared,
-                certificate_trace.clone().with_request_kind(request_kind),
-                block_persisted.clone(),
-            )
-        }));
-    }
-    if finalized {
-        pending.remove(&key);
-    }
-    ready
-}
-
-fn spawn_upload<Cx: Spawner>(
+fn spawn_upload<Cx, H, P, S>(
     uploads: &mut FuturesUnordered<Handle<()>>,
     context: Cx,
     client: &SimplexWriter,
     commit_metrics: &super::StoreCommitMetrics,
     metrics: &SimplexUploadMetrics,
-    upload: ReadyUpload,
-) {
-    let ReadyUpload {
-        mut prepared,
-        body_bytes,
-        trace,
-        upload_wait,
-        kind,
-    } = upload;
-    let (block_persisted, block_completion) = match kind {
-        ReadyUploadKind::Block {
-            persisted,
-            completion,
-            queued_at,
-        } => (None, Some((Some(persisted), completion, queued_at))),
-        ReadyUploadKind::FinalizedBlock {
-            completion,
-            queued_at,
-        } => (None, Some((None, completion, queued_at))),
-        ReadyUploadKind::Certificate { block_persisted } => (Some(block_persisted), None),
-    };
-    metrics.body_bytes.observe(body_bytes as f64);
+    upload: QueuedUpload<H, P, S>,
+) where
+    Cx: Spawner,
+    H: Hasher + Send + Sync + 'static,
+    P: PublicKey + Send + Sync + 'static,
+    S: Scheme + Send + Sync + 'static,
+    S::Certificate: Send + Sync,
+{
     let client = client.clone();
     let commit_metrics = commit_metrics.clone();
     let metrics = metrics.clone();
-    let dispatch = trace.dispatch.clone();
+    let dispatch = upload.trace.dispatch.clone();
     uploads.push(context.shared(true).spawn(move |_| {
         async move {
-            drop(upload_wait);
-            if let Some(mut block_persisted) = block_persisted {
-                wait_for_block_persistence(&mut block_persisted)
-                    .instrument(trace.gate_wait_span())
-                    .await;
-            }
+            let QueuedUpload {
+                block,
+                finalization,
+                completion,
+                queued_at,
+                trace,
+                prepare_wait,
+            } = upload;
+            drop(prepare_wait);
+
+            let body_bytes = block.body.encode_size();
+            let trace = trace.with_body_bytes(body_bytes);
+            let mut prepared = trace
+                .prepare_span()
+                .in_scope(|| prepare_upload(&client, &trace, &block, finalization));
+            metrics.body_bytes.observe(body_bytes as f64);
+
             let mut batch = StoreWriteBatch::new();
             trace.stage_rows_span().in_scope(|| {
                 client
@@ -897,19 +476,14 @@ fn spawn_upload<Cx: Spawner>(
             }
             .instrument(trace.persist_span())
             .await;
-            if let Some((persisted, completion, queued_at)) = block_completion {
-                if let Some(persisted) = persisted {
-                    persisted.send_replace(true);
-                }
-                metrics
-                    .block_persist_duration
-                    .observe(queued_at.elapsed().as_secs_f64());
-                let _ = completion.send(());
-            }
+
+            metrics
+                .block_persist_duration
+                .observe(queued_at.elapsed().as_secs_f64());
+            let _ = completion.send(());
             debug!(
                 headers = receipt.summary.headers,
                 blocks = receipt.summary.blocks,
-                notarizations = receipt.summary.notarizations,
                 finalizations = receipt.summary.finalizations,
                 store_sequence = receipt.store_sequence_number,
                 "indexer uploaded simplex data"
@@ -919,108 +493,33 @@ fn spawn_upload<Cx: Spawner>(
     }));
 }
 
-async fn wait_for_block_persistence(persisted: &mut watch::Receiver<bool>) {
-    if *persisted.borrow_and_update() {
-        return;
-    }
-    persisted
-        .changed()
-        .await
-        .expect("block upload stopped before dependent certificate persistence");
-    assert!(
-        *persisted.borrow_and_update(),
-        "block persistence gate changed without completing"
-    );
-}
-
-impl<H, P, S> SimplexInput<H, P, S>
+/// Prepares the block and its finalization as one Store upload.
+fn prepare_upload<H, P, S>(
+    client: &SimplexWriter,
+    trace: &SimplexTrace,
+    block: &EngineBlock<H, P>,
+    finalization: simplex::types::Finalization<S, EngineCommitment<H, P>>,
+) -> PreparedUpload
 where
     H: Hasher,
     P: PublicKey,
     S: Scheme,
 {
-    const fn request_kind(&self) -> &'static str {
-        match self {
-            Self::Block { .. } => "block",
-            Self::FinalizedBlock { .. } => "finalized_block",
-            Self::Notarization(_) => "notarization",
-            Self::Finalization(_) => "finalization",
-        }
-    }
-
-    fn height(&self) -> Option<u64> {
-        match self {
-            Self::Block { block, .. } | Self::FinalizedBlock { block, .. } => {
-                Some(block.height().get())
-            }
-            Self::Notarization(_) | Self::Finalization(_) => None,
-        }
-    }
-
-    fn block_digest_key(&self) -> Vec<u8> {
-        match self {
-            Self::Block { block, .. } => block.seal().as_ref().to_vec(),
-            Self::FinalizedBlock { block, .. } => block.seal().as_ref().to_vec(),
-            Self::Notarization(notarization) => {
-                block_digest_key::<H, P>(&notarization.proposal.payload)
-            }
-            Self::Finalization(finalization) => {
-                block_digest_key::<H, P>(&finalization.proposal.payload)
-            }
-        }
-    }
-}
-
-fn block_digest_key<H, P>(commitment: &EngineCommitment<H, P>) -> Vec<u8>
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    commitment.block().as_ref().to_vec()
-}
-
-/// Prepares the entry's ready certificates and reports when the entry is complete.
-fn prepare_ready_certificates<H, P, S>(
-    client: &SimplexWriter,
-    entry: &mut PendingBlockCertificates<H, P, S>,
-) -> (Vec<(PreparedUpload, &'static str)>, bool)
-where
-    H: Hasher + Send + Sync + 'static,
-    P: PublicKey + Send + Sync + 'static,
-    S: Scheme + Send + Sync + 'static,
-    S::Certificate: Send + Sync,
-{
-    let Some(block) = entry.block.as_deref() else {
-        return (Vec::new(), false);
-    };
-
-    let mut prepared = Vec::with_capacity(2);
-    if let Some(notarization) = entry.notarization.take() {
-        let certified = CertifiedHeader::new(notarization.proposal.payload, block);
-        let notarized =
-            Notarized::new(notarization, certified).expect("notarization matches certified header");
-        prepared.push((
-            client
-                .prepare_notarized(&notarized)
-                .expect("notarization upload must prepare"),
-            "notarization",
-        ));
-    }
-
-    let mut staged_finalization = false;
-    if let Some(finalization) = entry.finalization.take() {
-        staged_finalization = true;
-        let certified = CertifiedHeader::new(finalization.proposal.payload, block);
-        let finalized =
-            Finalized::new(finalization, certified).expect("finalization matches certified header");
-        prepared.push((
+    let certified = CertifiedHeader::new(finalization.proposal.payload, block);
+    let finalized = Finalized::new(finalization, certified)
+        .expect("validated finalization must match its certified header");
+    let (header, body) = trace
+        .encode_body_span()
+        .in_scope(|| crate::simplex_block::encode_simplex_block_parts(block));
+    trace.prepare_rows_span().in_scope(|| {
+        let mut prepared = client.prepare_block(&header, body);
+        prepared.extend(
             client
                 .prepare_finalized(&finalized)
-                .expect("finalization upload must prepare"),
-            "finalization",
-        ));
-    }
-    (prepared, staged_finalization)
+                .expect("validated finalization upload must prepare"),
+        );
+        prepared
+    })
 }
 
 /// A finalized header tagged with the marshal commitment certified by Simplex.
@@ -1178,66 +677,6 @@ mod tests {
     type TestCommitment = EngineCommitment<Sha256, ed25519::PublicKey>;
 
     #[test]
-    fn block_completion_implies_store_persistence() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let (server, url) = exoware_simulator::open_temp()
-                .await
-                .expect("spawn simulator");
-            let (reporter, uploader) =
-                TestReporter::connect(context.child("metrics"), &url, None, 1)
-                    .expect("reporter connects");
-            let block = test_block(1);
-            let digest = *block.seal();
-            let body_bytes = block.body.encode_size();
-
-            let completion = reporter
-                .publish_block(block)
-                .await
-                .expect("uploader accepts block");
-            completion.wait().await.expect("block upload completes");
-
-            let encoded_metrics = context.encode();
-            assert!(has_metric_value(&encoded_metrics, "queue_depth", 0));
-            assert!(has_metric_value(
-                &encoded_metrics,
-                "input_queue_wait_duration_count",
-                1
-            ));
-            assert!(has_metric_value(
-                &encoded_metrics,
-                "block_persist_duration_count",
-                1
-            ));
-            assert!(has_metric_value(&encoded_metrics, "body_bytes_count", 1));
-            assert!(
-                has_metric_value(
-                    &encoded_metrics,
-                    "body_bytes_sum",
-                    format!("{body_bytes}.0")
-                ),
-                "{encoded_metrics}"
-            );
-            let client = SimplexReader::new(
-                crate::namespaces::simplex_client(
-                    &crate::store_client(&url, None).expect("Store client builds"),
-                )
-                .expect("simplex namespace"),
-            );
-            assert!(
-                client
-                    .get_block_raw(&digest)
-                    .await
-                    .expect("read uploaded block")
-                    .is_some()
-            );
-
-            drop(reporter);
-            uploader.await.expect("uploader exits cleanly");
-            server.abort();
-        });
-    }
-
-    #[test]
     fn finalized_block_completion_implies_exact_persistence() {
         commonware_runtime::tokio::Runner::new(
             commonware_runtime::tokio::Config::default().with_worker_threads(1),
@@ -1251,6 +690,7 @@ mod tests {
                     .expect("reporter connects");
             let block = test_block(1);
             let digest = *block.seal();
+            let body_bytes = block.body.encode_size();
             let finalization = test_finalization(&block);
             let (expected_header, expected_body) =
                 crate::simplex_block::encode_simplex_block_parts(&block);
@@ -1303,6 +743,26 @@ mod tests {
             let encoded_metrics = context.encode();
             assert!(
                 has_metric_value(&encoded_metrics, "store_commits_total", 1),
+                "{encoded_metrics}"
+            );
+            assert!(has_metric_value(&encoded_metrics, "queue_depth", 0));
+            assert!(has_metric_value(
+                &encoded_metrics,
+                "input_queue_wait_duration_count",
+                1
+            ));
+            assert!(has_metric_value(
+                &encoded_metrics,
+                "block_persist_duration_count",
+                1
+            ));
+            assert!(has_metric_value(&encoded_metrics, "body_bytes_count", 1));
+            assert!(
+                has_metric_value(
+                    &encoded_metrics,
+                    "body_bytes_sum",
+                    format!("{body_bytes}.0")
+                ),
                 "{encoded_metrics}"
             );
 
@@ -1389,12 +849,17 @@ mod tests {
             let (reporter, uploader) =
                 TestReporter::connect(context.child("metrics"), &store.url, Some("writer-key"), 1)
                     .expect("reporter connects");
+            let block = test_block(1);
+            let finalization = test_finalization(&block);
 
             let completion = reporter
-                .publish_block(test_block(1))
+                .publish_finalized_block(block, finalization)
                 .await
-                .expect("uploader accepts block");
-            completion.wait().await.expect("block upload completes");
+                .expect("uploader accepts finalized block");
+            completion
+                .wait()
+                .await
+                .expect("finalized block upload completes");
 
             let requests = store.requests();
             assert!(!requests.is_empty());
@@ -1430,24 +895,22 @@ mod tests {
             let (tx, rx) = mpsc::channel(2);
             let (first_tx, first_rx) = oneshot::channel();
             let (second_tx, second_rx) = oneshot::channel();
+            let first_block = test_block(1);
+            let first_finalization = test_finalization(&first_block);
+            let second_block = test_block(2);
+            let second_finalization = test_finalization(&second_block);
 
-            enqueue_input(
+            enqueue_upload(
                 &tx,
                 &metrics,
-                QueuedSimplexInput::new(SimplexInput::Block {
-                    block: test_block(1),
-                    completion: first_tx,
-                }),
+                QueuedUpload::new(first_block, first_finalization, first_tx),
             )
             .await
             .expect("queue first block");
-            enqueue_input(
+            enqueue_upload(
                 &tx,
                 &metrics,
-                QueuedSimplexInput::new(SimplexInput::Block {
-                    block: test_block(2),
-                    completion: second_tx,
-                }),
+                QueuedUpload::new(second_block, second_finalization, second_tx),
             )
             .await
             .expect("queue second block");
@@ -1480,84 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn certificate_upload_waits_for_block_persistence() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let store = crate::test_store::GatedIngestStore::open()
-                .await
-                .expect("spawn gated Store");
-            let metrics_context = context.child("metrics");
-            let metrics = SimplexUploadMetrics::new(&metrics_context);
-            let commit_metrics = super::super::StoreCommitMetrics::new(&metrics_context);
-            let client = SimplexWriter::new(
-                crate::namespaces::simplex_client(
-                    &crate::store::writer_store_client(&store.url, None)
-                        .expect("Store client builds"),
-                )
-                .expect("simplex namespace"),
-            );
-            let (tx, rx) = mpsc::channel(2);
-            let uploader = tokio::spawn(run_uploader::<
-                _,
-                Sha256,
-                ed25519::PublicKey,
-                ThresholdScheme<ed25519::PublicKey, MinSig>,
-            >(
-                context.child("uploader"),
-                client,
-                rx,
-                2,
-                commit_metrics,
-                metrics.clone(),
-            ));
-            let block = test_block(1);
-            let finalization = test_finalization(&block);
-            let (completion, completion_rx) = oneshot::channel();
-
-            enqueue_input(
-                &tx,
-                &metrics,
-                QueuedSimplexInput::new(SimplexInput::Block { block, completion }),
-            )
-            .await
-            .expect("queue block");
-            store.wait_for_first_ingest().await;
-            enqueue_input(
-                &tx,
-                &metrics,
-                QueuedSimplexInput::new(SimplexInput::Finalization(finalization)),
-            )
-            .await
-            .expect("queue finalization");
-
-            let certificate_overtook = store
-                .later_ingest_arrives_within(Duration::from_millis(250))
-                .await;
-            store.release_first_ingest();
-            completion_rx.await.expect("block upload completes");
-            drop(tx);
-            uploader.await.expect("uploader exits cleanly");
-            let encoded_metrics = context.encode();
-            assert!(
-                encoded_metrics.lines().any(|line| {
-                    line.contains("body_bytes_bucket{le=\"0.0\"}") && line.ends_with(" 1")
-                }),
-                "{encoded_metrics}"
-            );
-            assert!(
-                !encoded_metrics.contains("inputs_per_commit"),
-                "{encoded_metrics}"
-            );
-            store.shutdown().await;
-
-            assert!(
-                !certificate_overtook,
-                "certificate upload reached Store before its block persisted"
-            );
-        });
-    }
-
-    #[test]
-    fn unrelated_block_upload_ignores_certificate_dependency_waiters() {
+    fn later_upload_proceeds_while_earlier_commit_is_pending() {
         commonware_runtime::tokio::Runner::new(
             commonware_runtime::tokio::Config::default().with_worker_threads(1),
         )
@@ -1590,40 +976,29 @@ mod tests {
                 metrics.clone(),
             ));
             let first_block = test_block(1);
-            let finalization = test_finalization(&first_block);
+            let first_finalization = test_finalization(&first_block);
+            let second_block = test_block(2);
+            let second_finalization = test_finalization(&second_block);
             let (first_completion, first_completion_rx) = oneshot::channel();
             let (second_completion, second_completion_rx) = oneshot::channel();
 
-            enqueue_input(
+            enqueue_upload(
                 &tx,
                 &metrics,
-                QueuedSimplexInput::new(SimplexInput::Block {
-                    block: first_block,
-                    completion: first_completion,
-                }),
+                QueuedUpload::new(first_block, first_finalization, first_completion),
             )
             .await
             .expect("queue first block");
             store.wait_for_first_ingest().await;
-            enqueue_input(
+            enqueue_upload(
                 &tx,
                 &metrics,
-                QueuedSimplexInput::new(SimplexInput::Finalization(finalization)),
+                QueuedUpload::new(second_block, second_finalization, second_completion),
             )
             .await
-            .expect("queue finalization");
-            enqueue_input(
-                &tx,
-                &metrics,
-                QueuedSimplexInput::new(SimplexInput::Block {
-                    block: test_block(2),
-                    completion: second_completion,
-                }),
-            )
-            .await
-            .expect("queue unrelated block");
+            .expect("queue second block");
 
-            let unrelated_block_started = store
+            let second_upload_started = store
                 .later_ingest_arrives_within(Duration::from_millis(250))
                 .await;
             store.release_first_ingest();
@@ -1638,45 +1013,9 @@ mod tests {
             store.shutdown().await;
 
             assert!(
-                unrelated_block_started,
-                "certificate dependency waiter blocked an unrelated block upload"
+                second_upload_started,
+                "pending Store commit blocked a later upload within the in-flight limit"
             );
-        });
-    }
-
-    #[test]
-    fn publish_block_reports_stopped_uploader() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let (reporter, uploader) =
-                TestReporter::connect(context.child("metrics"), "http://127.0.0.1:1", None, 1)
-                    .expect("reporter connects");
-            uploader.abort();
-            let _ = uploader.await;
-
-            assert!(matches!(
-                reporter.publish_block(test_block(1)).await,
-                Err(CertificateUploaderStopped)
-            ));
-        });
-    }
-
-    #[test]
-    fn block_completion_reports_stopped_uploader() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let (reporter, uploader) =
-                TestReporter::connect(context.child("metrics"), "http://127.0.0.1:1", None, 1)
-                    .expect("reporter connects");
-            let completion = reporter
-                .publish_block(test_block(1))
-                .await
-                .expect("uploader accepts block");
-            uploader.abort();
-            let _ = uploader.await;
-
-            assert!(matches!(
-                completion.wait().await,
-                Err(CertificateUploaderStopped)
-            ));
         });
     }
 

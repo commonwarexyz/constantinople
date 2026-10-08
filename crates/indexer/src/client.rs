@@ -33,13 +33,11 @@ use datafusion::{
     prelude::SessionContext,
 };
 use exoware_sdk::{ClientError, Key, PrefixedStoreClient, ReadSession, StoreClient};
-use exoware_simplex::{Finalized, Notarized, SimplexError, SimplexReader};
+use exoware_simplex::{Finalized, SimplexError, SimplexReader};
 use exoware_sql::with_read_session;
 
 type CertifiedFinalization<H, P, S> = Finalized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>;
-type CertifiedNotarization<H, P, S> = Notarized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>;
 type FinalizationCfg<H, P, S> = <CertifiedFinalization<H, P, S> as Read>::Cfg;
-type NotarizationCfg<H, P, S> = <CertifiedNotarization<H, P, S> as Read>::Cfg;
 
 /// Errors returned when reading typed artifacts back out of the store.
 #[derive(Debug, thiserror::Error)]
@@ -99,7 +97,7 @@ pub struct FinalizedPublicationTarget<D> {
 ///
 /// | Field     | Families served                                        |
 /// | --------- | ------------------------------------------------------ |
-/// | `blocks`  | Simplex headers, blocks, notarizations, finals         |
+/// | `blocks`  | Simplex headers, blocks, finalizations                 |
 /// | `targets` | Finalized height, digest, and Store visibility barrier |
 /// | `sql`     | Transaction bodies and proof lookup metadata           |
 #[derive(Clone)]
@@ -451,35 +449,6 @@ impl IndexerClient {
         Ok(self
             .blocks
             .get_finalized_by_round::<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>(
-                Round::new(Epoch::zero(), View::new(view)),
-                cfg,
-            )
-            .await?)
-    }
-
-    /// Fetch the encoded Simplex notarization artifact for `view`.
-    pub async fn notarization_bytes(&self, view: u64) -> Result<Option<Bytes>, ReadError> {
-        Ok(self
-            .blocks
-            .get_notarized_by_round_raw(Round::new(Epoch::zero(), View::new(view)))
-            .await?)
-    }
-
-    /// Decode the Simplex notarization artifact for `view`.
-    pub async fn notarization_by_view<H, P, S>(
-        &self,
-        view: u64,
-        cfg: &NotarizationCfg<H, P, S>,
-    ) -> Result<Option<CertifiedNotarization<H, P, S>>, ReadError>
-    where
-        H: Hasher,
-        P: PublicKey,
-        S: Scheme,
-        <S::Certificate as Read>::Cfg: Clone,
-    {
-        Ok(self
-            .blocks
-            .get_notarized_by_round::<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>(
                 Round::new(Epoch::zero(), View::new(view)),
                 cfg,
             )
