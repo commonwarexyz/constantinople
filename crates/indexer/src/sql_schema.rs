@@ -62,6 +62,8 @@ pub const TX_ACTIVITY_COUNTERPARTY: &str = "counterparty";
 pub const TX_ACTIVITY_VALUE: &str = "value";
 /// `tx_activity`: sender nonce.
 pub const TX_ACTIVITY_NONCE: &str = "nonce";
+/// `tx_activity`: transaction-hash QMDB operation location, copied from `tx_meta`.
+pub const TX_ACTIVITY_QMDB_LOCATION: &str = "qmdb_location";
 
 // ---------- account_meta columns ----------
 
@@ -133,6 +135,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 ),
                 TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
                 TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
+                TableColumnConfig::new(TX_ACTIVITY_QMDB_LOCATION, DataType::UInt64, false),
             ],
             vec![
                 TX_ACTIVITY_ACCOUNT.to_string(),
@@ -227,6 +230,7 @@ mod tests {
         assert_eq!(TX_ACTIVITY_COUNTERPARTY, "counterparty");
         assert_eq!(TX_ACTIVITY_VALUE, "value");
         assert_eq!(TX_ACTIVITY_NONCE, "nonce");
+        assert_eq!(TX_ACTIVITY_QMDB_LOCATION, "qmdb_location");
         assert_eq!(ACCOUNT_META_ACCOUNT, "account");
         assert_eq!(ACCOUNT_META_BALANCE, "balance");
         assert_eq!(ACCOUNT_META_NONCE_BASE, "nonce_base");
