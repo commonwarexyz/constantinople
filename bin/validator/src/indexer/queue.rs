@@ -8,11 +8,12 @@ use commonware_cryptography::{
     sha256::{Digest, Sha256},
 };
 use commonware_runtime::{
-    Clock as _, Supervisor as _,
+    Supervisor,
     buffer::paged::{self, CacheRef},
     tokio::Context as RuntimeContext,
 };
 use commonware_storage::{
+    Context as StorageContext,
     metadata::{Config as MetadataConfig, Metadata},
     queue,
 };
@@ -23,10 +24,9 @@ use std::{
     collections::BTreeSet,
     num::{NonZeroU16, NonZeroU64, NonZeroUsize},
     sync::Arc,
-    time::Duration,
 };
 use tokio::sync::Mutex;
-use tracing::{info, warn};
+use tracing::info;
 
 // Queue records are under a hundred bytes. Small sections keep the payload
 // blobs of acknowledged entries on disk only until their section prunes.
@@ -35,7 +35,7 @@ const FINALIZED_QUEUE_PAGE_SIZE: NonZeroU16 = paged::page_size(4_096);
 const FINALIZED_QUEUE_PAGE_CACHE_PAGES: NonZeroUsize = NZUsize!(256);
 const FINALIZED_QUEUE_WRITE_BUFFER: NonZeroUsize = NZUsize!(64 * 1024);
 const CAPTURE_RECEIPT_KEY: U64 = U64::new(0);
-type CaptureMetadata = Metadata<RuntimeContext, U64, LatestCaptureReceipt>;
+type CaptureMetadata<E> = Metadata<E, U64, LatestCaptureReceipt>;
 pub(super) type FinalizedQueue = queue::Queue<RuntimeContext, FinalizedQueueRecord>;
 pub(super) type FinalizedQueueReader = queue::Reader<RuntimeContext, FinalizedQueueRecord>;
 
@@ -170,29 +170,25 @@ impl Read for FinalizedQueueRecord {
     }
 }
 
-pub(super) struct FinalizedReceiptStore {
-    context: RuntimeContext,
-    config: MetadataConfig<()>,
-    metadata: Mutex<Option<CaptureMetadata>>,
+pub(super) struct FinalizedReceiptStore<E: StorageContext = RuntimeContext> {
+    metadata: Mutex<Option<CaptureMetadata<E>>>,
 }
 
-impl FinalizedReceiptStore {
+impl<E: StorageContext + Supervisor> FinalizedReceiptStore<E> {
     /// Open the store and return the receipt it last persisted.
     pub(super) async fn open(
-        context: RuntimeContext,
+        context: E,
         partition_prefix: &str,
     ) -> (Self, Option<LatestCaptureReceipt>) {
         let config = MetadataConfig {
             partition: format!("{partition_prefix}-finalized-capture-receipt"),
             codec_config: (),
         };
-        let metadata = Metadata::init(context.child("metadata"), config.clone())
+        let metadata = Metadata::init(context.child("metadata"), config)
             .await
             .expect("failed to initialize finalized capture receipt");
         let receipt = metadata.get(&CAPTURE_RECEIPT_KEY).copied();
         let store = Self {
-            context,
-            config,
             metadata: Mutex::new(Some(metadata)),
         };
         (store, receipt)
@@ -200,34 +196,16 @@ impl FinalizedReceiptStore {
 
     pub(super) async fn persist(&self, receipt: LatestCaptureReceipt) {
         let mut metadata = self.metadata.lock().await;
-        loop {
-            // A failed sync consumes the handle, so the next attempt reopens it.
-            let synced = async {
-                let mut current = match metadata.take() {
-                    Some(current) => current,
-                    None => {
-                        Metadata::init(self.context.child("metadata"), self.config.clone()).await?
-                    }
-                };
-                current.put(CAPTURE_RECEIPT_KEY, receipt);
-                current.sync().await
-            }
-            .await;
-            match synced {
-                Ok(current) => {
-                    *metadata = Some(current);
-                    return;
-                }
-                Err(error) => {
-                    warn!(
-                        error = %error,
-                        height = receipt.height,
-                        "failed to persist finalized capture receipt, retrying"
-                    );
-                    self.context.sleep(Duration::from_secs(1)).await;
-                }
-            }
-        }
+        let mut current = metadata
+            .take()
+            .expect("finalized capture receipt store was lost");
+        current.put(CAPTURE_RECEIPT_KEY, receipt);
+        *metadata = Some(
+            current
+                .sync()
+                .await
+                .expect("failed to persist finalized capture receipt"),
+        );
     }
 
     #[cfg(test)]
@@ -371,9 +349,35 @@ pub(super) fn capture_receipt(
 mod tests {
     use super::{
         super::payloads::PayloadDescriptor, FINALIZED_QUEUE_ITEMS_PER_SECTION,
-        FinalizedQueueRecord, capture_receipt, pruned_record_boundary, recover_capture_receipt,
+        FinalizedQueueRecord, FinalizedReceiptStore, capture_receipt, pruned_record_boundary,
+        recover_capture_receipt,
     };
     use commonware_codec::{DecodeExt as _, Encode as _, FixedSize as _};
+    use commonware_runtime::{Clock as _, Runner as _, Supervisor as _, deterministic};
+    use commonware_utils::probability;
+    use futures::FutureExt as _;
+    use std::{panic::AssertUnwindSafe, time::Duration};
+
+    #[test]
+    fn receipt_sync_failure_is_fatal() {
+        deterministic::Runner::default().start(|context| async move {
+            let (store, receipt) =
+                FinalizedReceiptStore::open(context.child("receipt"), "failed-sync").await;
+            assert!(receipt.is_none());
+            store.persist(capture_receipt(1, 2, 2)).await;
+
+            context.storage_fault_config().write().sync_rate = Some(probability!(1.0));
+            let persist = AssertUnwindSafe(store.persist(capture_receipt(2, 3, 3))).catch_unwind();
+            let panic = tokio::select! {
+                result = persist => result.expect_err("receipt sync failure must panic"),
+                _ = context.sleep(Duration::from_secs(1)) => {
+                    panic!("receipt sync failure must not retry");
+                }
+            };
+            let message = panic.downcast_ref::<String>().expect("panic has a message");
+            assert!(message.contains("failed to persist finalized capture receipt"));
+        });
+    }
 
     #[test]
     fn queue_record_round_trips() {

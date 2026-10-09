@@ -33,7 +33,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;
-    type Captured = Option<FinalizedArtifacts<H>>;
+    type Captured = FinalizedArtifacts<H>;
     type Provider = I;
     type Input = ();
 
@@ -133,15 +133,9 @@ where
         batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) -> Self::Captured {
-        self.finalized_hook.as_ref()?;
-
         let state = {
             let database = readers.0.read().await;
             let (start, operations) = batches.0.operations();
-            let proof = batches
-                .0
-                .proof(&database)
-                .expect("finalized state batch proof must be available before apply");
             let pinned_nodes = batches
                 .0
                 .pinned_nodes(&database)
@@ -150,7 +144,6 @@ where
                 start,
                 end: batches.0.bounds().tip.size,
                 root: batches.0.root(),
-                proof,
                 pinned_nodes,
                 operations,
             }
@@ -159,10 +152,6 @@ where
         let transactions = {
             let database = readers.1.read().await;
             let (start, operations) = batches.1.operations();
-            let proof = batches
-                .1
-                .proof(&database)
-                .expect("finalized transaction batch proof must be available before apply");
             let pinned_nodes = batches
                 .1
                 .pinned_nodes(&database)
@@ -171,29 +160,23 @@ where
                 start,
                 end: batches.1.bounds().tip.size,
                 root: batches.1.root(),
-                proof,
                 pinned_nodes,
                 operations,
             }
         };
 
-        Some(FinalizedArtifacts {
+        FinalizedArtifacts {
             state,
             transactions,
-        })
+        }
     }
 
     async fn finalized(
         &mut self,
         _context: (E, Self::Context),
-        block: &Self::Block,
-        captured: Self::Captured,
+        _block: &Self::Block,
+        _captured: Self::Captured,
         _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
-        if let Some(hook) = &self.finalized_hook {
-            let artifacts = captured
-                .expect("finalized artifact capture was skipped while a hook was installed");
-            hook(block, artifacts).await;
-        }
     }
 }

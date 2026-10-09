@@ -4,17 +4,17 @@ The finalized queue records everything required to regenerate SQL, state QMDB,
 transaction QMDB, and Simplex artifacts after a restart. The queue and its
 capture receipt define local progress. Remote writer recovery is unnecessary.
 
-This implementation starts a fresh index from genesis. Existing queue formats
-and remote namespaces require a separate migration or reindex design.
+This implementation starts a fresh index from genesis. Existing durable queue
+storage must be wiped and remote namespaces must be empty. No migration is provided.
 
 ## Capture and persistence
 
-Commonware calls `Application::capture` with the winning merkleized batches and
-readers before applying them. Constantinople retains the exact operation
-vectors, range proofs, and pinned prefix nodes for both QMDBs. After successful
-application, `Application::finalized` passes those artifacts to the queue
-producer. Genesis, startup reconciliation, and state sync do not produce these
-individual artifacts.
+Commonware requests capture with the winning merkleized batches and readers
+before applying them. When a finalized hook is installed, Constantinople retains
+the exact operation vectors and pinned prefix nodes for both QMDBs. After
+successful application, the engine passes those artifacts and the shared block
+to the queue producer through the hook. Genesis, startup reconciliation, and
+state sync do not produce these individual artifacts.
 
 The producer retrieves the height finalization from the marshal archive when
 one was stored and verifies that it certifies the block commitment. Marshal
@@ -26,10 +26,9 @@ authenticated genesis sentinels.
 
 Each payload contains:
 
-- A magic number and a format version. Any incompatible change to the payload,
-  operation codecs, or derived rows bumps the format version.
+- A magic number and a format version.
 - The full block, the optional finalization certificate, and the finalized timestamp.
-- Both operation ranges, including their exact encoded operations, proofs, and pins.
+- Both operation ranges, including their exact encoded operations and pins.
 
 Payloads live in one blob per height. A small fixed-size queue record holds the
 block's capture receipt and its payload descriptor. The receipt is the height,
@@ -59,7 +58,7 @@ large allocations.
 
 Captured operation vectors use `Arc`. Sharing an `Arc` retains the existing
 allocation rather than copying the operations. The engine block also owns shared
-block data, and queued artifacts borrow their proof inputs during preparation.
+block data, and preparation borrows the queued operations and pins.
 
 Payload reads can overlap, but a predecessor admission gate ensures the
 publisher receives uploads in queue order. Completed tasks are reaped while the
@@ -72,7 +71,11 @@ Preparation validates each range against its certified header root and emits
 deterministic absolute Store rows. The exact range start comes from the captured
 batch. A header's inactivity boundary does not identify that start.
 
-The operation encodings, proof leaf count, pins, terminal commit, format
+The inactive peak count is derived from the range end and the inactivity floor
+in the block header. The pinned prefix and captured operations reconstruct the
+header root without a separate range proof.
+
+The operation encodings, range ends, pins, terminal commit, format
 version, and adjacent range boundaries must agree. Unsupported formats or
 invalid artifacts fail the supervised indexer and remain unacknowledged.
 
@@ -119,9 +122,9 @@ selects 16 MiB, so both fit under that limit.
 ## Completion, replay, and cleanup
 
 An upload completes only after its SQL and both QMDB data sets are durable, its
-publication barrier has succeeded, and its full block is persisted. The
-finalization certificate is persisted too when the payload carries one, and its
-upload waits for block persistence. Publication targets and barriers do not
+publication barrier has succeeded, and its full block is persisted. When the
+payload carries a finalization certificate, it is persisted in the same Store
+commit as the block. Publication targets and barriers do not
 depend on the certificate. Unrelated consensus observer events do not authorize
 queue completion.
 

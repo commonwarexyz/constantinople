@@ -22,7 +22,7 @@ use commonware_cryptography::{
 use commonware_parallel::Strategy;
 use commonware_runtime::{Handle, Spawner};
 use commonware_storage::{
-    merkle::{Family as _, Location, Proof, mmr},
+    merkle::{Family as _, Location, mmr},
     qmdb::{
         any::{
             operation::Operation as AnyOperation,
@@ -115,7 +115,6 @@ impl UploadCompletion {
 /// Codec limits for one authenticated operation range.
 #[derive(Clone, Debug)]
 pub struct QueuedAuthenticatedRangeCfg {
-    proof_digests: usize,
     pinned_nodes: RangeCfg<usize>,
     operations: RangeCfg<usize>,
     operation_bytes: RangeCfg<usize>,
@@ -126,7 +125,6 @@ pub struct QueuedAuthenticatedRangeCfg {
 impl Default for QueuedAuthenticatedRangeCfg {
     fn default() -> Self {
         Self {
-            proof_digests: 512,
             pinned_nodes: RangeCfg::from(0..=256),
             operations: RangeCfg::from(1..),
             operation_bytes: RangeCfg::from(0..=16 * 1024 * 1024),
@@ -196,7 +194,6 @@ impl<Op: Encode> OperationList for Arc<Vec<Op>> {
 pub struct QueuedAuthenticatedRange<D: Digest, Ops = Vec<Vec<u8>>> {
     start: u64,
     end: u64,
-    proof: Proof<QmdbFamily, D>,
     pinned_nodes: Vec<D>,
     operations: Ops,
 }
@@ -206,7 +203,6 @@ impl<D: Digest, Op> QueuedAuthenticatedRange<D, Arc<Vec<Op>>> {
         let FinalizedRange {
             start,
             end,
-            proof,
             pinned_nodes,
             operations,
             ..
@@ -215,7 +211,6 @@ impl<D: Digest, Op> QueuedAuthenticatedRange<D, Arc<Vec<Op>>> {
         Self {
             start: start.as_u64(),
             end: end.as_u64(),
-            proof,
             pinned_nodes,
             operations,
         }
@@ -226,7 +221,6 @@ impl<D: Digest, Ops: OperationList> EncodeSize for QueuedAuthenticatedRange<D, O
     fn encode_size(&self) -> usize {
         self.start.encode_size()
             + self.end.encode_size()
-            + self.proof.encode_size()
             + self.pinned_nodes.encode_size()
             + self.operations.encoded_size()
     }
@@ -236,7 +230,6 @@ impl<D: Digest, Ops: OperationList> Write for QueuedAuthenticatedRange<D, Ops> {
     fn write(&self, buf: &mut impl bytes::BufMut) {
         self.start.write(buf);
         self.end.write(buf);
-        self.proof.write(buf);
         self.pinned_nodes.write(buf);
         self.operations.write_encoded(buf);
     }
@@ -249,7 +242,6 @@ impl<D: Digest> Read for QueuedAuthenticatedRange<D> {
         Ok(Self {
             start: u64::read(buf)?,
             end: u64::read(buf)?,
-            proof: Proof::read_cfg(buf, &cfg.proof_digests)?,
             pinned_nodes: Vec::<D>::read_cfg(buf, &(cfg.pinned_nodes, ()))?,
             operations: Vec::<Vec<u8>>::read_cfg(
                 buf,
@@ -383,11 +375,11 @@ fn validate_range<D: Digest, Ops: OperationList>(
     if range.start >= range.end {
         return Err("authenticated operation range is empty");
     }
+    if !Location::<QmdbFamily>::new(range.end).is_valid() {
+        return Err("authenticated operation range end exceeds the maximum tree size");
+    }
     if range.end != header_end {
         return Err(header_mismatch);
-    }
-    if range.proof.leaves.as_u64() != range.end {
-        return Err("authenticated proof does not target the range end");
     }
     let count = range
         .end
@@ -1059,7 +1051,7 @@ where
     );
     let state = state_span.in_scope(|| {
         prepare_authenticated_range::<QmdbFamily, H, StateOperation, S>(
-            &as_authenticated_range(&upload.state),
+            &as_authenticated_range(&upload.state, upload.block.header.state_range.start()),
             &upload.block.header.state_root,
             &(),
             &strategy,
@@ -1071,7 +1063,10 @@ where
     );
     let transactions = transactions_span.in_scope(|| {
         prepare_authenticated_range::<QmdbFamily, H, TransactionOperation<H>, S>(
-            &as_authenticated_range(&upload.transactions),
+            &as_authenticated_range(
+                &upload.transactions,
+                upload.block.header.transactions_range.start(),
+            ),
             &upload.block.header.transactions_root,
             &(),
             &strategy,
@@ -1127,11 +1122,15 @@ where
 
 fn as_authenticated_range<D: Digest>(
     range: &QueuedAuthenticatedRange<D>,
+    inactivity_floor: u64,
 ) -> AuthenticatedOperationRange<'_, D, QmdbFamily> {
     AuthenticatedOperationRange {
         start_location: Location::new(range.start),
         end_location: Location::new(range.end),
-        inactive_peaks: range.proof.inactive_peaks,
+        inactive_peaks: QmdbFamily::inactive_peaks(
+            Location::new(range.end),
+            Location::new(inactivity_floor),
+        ),
         pinned_nodes: &range.pinned_nodes,
         encoded_operations: &range.operations,
     }
@@ -1562,6 +1561,20 @@ mod tests {
 
         assert!(decoded.finalization().is_none());
         assert_eq!(decoded.encode(), encoded);
+    }
+
+    #[test]
+    fn queue_rejects_ranges_beyond_the_maximum_tree_size() {
+        let range = QueuedAuthenticatedRange {
+            start: u64::MAX - 1,
+            end: u64::MAX,
+            pinned_nodes: Vec::<Sha256Digest>::new(),
+            operations: vec![Vec::new()],
+        };
+        assert_eq!(
+            validate_range(&range, u64::MAX, "header mismatch"),
+            Err("authenticated operation range end exceeds the maximum tree size")
+        );
     }
 
     #[test]
@@ -2543,6 +2556,85 @@ mod tests {
     }
 
     #[test]
+    fn data_preparation_uses_header_inactivity_floors() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = StoreClient::new("http://localhost:1");
+            let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
+            let metrics = super::super::PublisherMetrics::new(&context);
+
+            for (end, state_floor, transaction_floor) in [(8, 0, 6), (11, 7, 9), (15, 8, 12)] {
+                let state_operations = encode_operations(
+                    &(0..end)
+                        .map(|location| {
+                            StateOperation::CommitFloor(
+                                None,
+                                Location::new(location.min(state_floor)),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let transaction_operations = encode_operations(
+                    &(0..end)
+                        .map(|location| {
+                            TransactionOperation::<Sha256>::Commit(
+                                None,
+                                Location::new(location.min(transaction_floor)),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                );
+                let state = queued_range(&state_operations, end - 1, end);
+                let transactions = queued_range(&transaction_operations, end - 1, end);
+
+                // Build the expected roots from the complete histories, independently of the pins.
+                let mut header = test_block(1, &state, &transactions).header.clone();
+                header.state_root =
+                    queued_range_root(&queued_range(&state_operations, 0, end), state_floor);
+                header.transactions_root = queued_range_root(
+                    &queued_range(&transaction_operations, 0, end),
+                    transaction_floor,
+                );
+                header.state_range = non_empty_range!(state_floor, end);
+                header.transactions_range = non_empty_range!(transaction_floor, end);
+                let block = EngineBlock::from(
+                    Block::new(header, Vec::<SignedTransaction<Sha256>>::new())
+                        .seal(&mut Sha256::default()),
+                );
+                let upload = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig> {
+                    block,
+                    finalization: None,
+                    finalized_ts_micros: 1,
+                    state,
+                    transactions,
+                };
+                let decoded =
+                    QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+                        upload.encode(),
+                        &QueuedFinalizedUploadCfg::default(),
+                    )
+                    .expect("queue entry preserves distinct floors and operation starts");
+                let (_, state_end, transaction_end) = prepare_data_batch(
+                    state_qmdb_client(&store).unwrap(),
+                    transactions_qmdb_client(&store).unwrap(),
+                    schema.clone(),
+                    Sequential,
+                    UploadData {
+                        block: decoded.block,
+                        finalized_ts_micros: decoded.finalized_ts_micros,
+                        state: decoded.state,
+                        transactions: decoded.transactions,
+                        omit_pinned_nodes: false,
+                    },
+                    &metrics,
+                )
+                .expect("header floors authenticate the captured suffixes");
+                assert_eq!(state_end.as_u64(), end - 1);
+                assert_eq!(transaction_end.as_u64(), end - 1);
+            }
+        });
+    }
+
+    #[test]
     fn data_preparation_authenticates_before_metadata_decoding() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let store = StoreClient::new("http://localhost:1");
@@ -2937,10 +3029,10 @@ mod tests {
         state: QueuedAuthenticatedRange<Sha256Digest>,
         transactions: QueuedAuthenticatedRange<Sha256Digest>,
     ) -> PersistedUpload {
-        let state_root = queued_range_root(&state);
-        let transactions_root = queued_range_root(&transactions);
+        let state_root = queued_range_root(&state, state.start);
+        let transactions_root = queued_range_root(&transactions, transactions.start);
         let state = prepare_authenticated_range::<QmdbFamily, Sha256, StateOperation, Sequential>(
-            &as_authenticated_range(&state),
+            &as_authenticated_range(&state, state.start),
             &state_root,
             &(),
             &Sequential,
@@ -2952,7 +3044,7 @@ mod tests {
             TransactionOperation<Sha256>,
             Sequential,
         >(
-            &as_authenticated_range(&transactions),
+            &as_authenticated_range(&transactions, transactions.start),
             &transactions_root,
             &(),
             &Sequential,
@@ -2998,22 +3090,16 @@ mod tests {
         let batch = batch.merkleize(&memory, &hasher);
         memory.apply_batch(&batch).expect("apply test operations");
         let start = Location::new(start);
-        let end = Location::new(end);
-        let inactive_peaks = QmdbFamily::inactive_peaks(end, start);
-        let proof = memory
-            .range_proof(&hasher, start..end, inactive_peaks)
-            .expect("build range proof");
         let pinned_nodes = QmdbFamily::nodes_to_pin(start)
             .map(|position| memory.get_node(position).expect("pinned node exists"))
             .collect();
         QueuedAuthenticatedRange {
             start: start.as_u64(),
-            end: end.as_u64(),
-            proof,
+            end,
             pinned_nodes,
             operations: all_operations[usize::try_from(start.as_u64())
                 .expect("range start fits usize")
-                ..usize::try_from(end.as_u64()).expect("range end fits usize")]
+                ..usize::try_from(end).expect("range end fits usize")]
                 .to_vec(),
         }
     }
@@ -3050,8 +3136,8 @@ mod tests {
         state: &QueuedAuthenticatedRange<Sha256Digest>,
         transactions: &QueuedAuthenticatedRange<Sha256Digest>,
     ) -> EngineBlock<Sha256, ed25519::PublicKey> {
-        let state_root = queued_range_root(state);
-        let transactions_root = queued_range_root(transactions);
+        let state_root = queued_range_root(state, state.start);
+        let transactions_root = queued_range_root(transactions, transactions.start);
         let leader = ed25519::PrivateKey::from_seed(height).public_key();
         let header = Header {
             context: SimplexContext {
@@ -3084,19 +3170,35 @@ mod tests {
             start: Location::new(range.start),
             end: Location::new(range.end),
             root,
-            proof: range.proof.clone(),
             pinned_nodes: range.pinned_nodes.clone(),
             operations: Arc::new(operations.into_iter().take(end).skip(start).collect()),
         }
     }
 
-    fn queued_range_root(range: &QueuedAuthenticatedRange<Sha256Digest>) -> Sha256Digest {
-        range
-            .proof
-            .reconstruct_root(
-                &commonware_storage::qmdb::hasher::<Sha256>(),
-                &range.operations,
-                Location::new(range.start),
+    fn queued_range_root(
+        range: &QueuedAuthenticatedRange<Sha256Digest>,
+        inactivity_floor: u64,
+    ) -> Sha256Digest {
+        let hasher = commonware_storage::qmdb::hasher::<Sha256>();
+        let memory = Mem::<QmdbFamily, _>::from_components(
+            Vec::new(),
+            Location::new(range.start),
+            range.pinned_nodes.clone(),
+        )
+        .expect("restore pinned prefix");
+        let mut batch = memory.new_batch();
+        for operation in &range.operations {
+            batch = batch.add(&hasher, operation);
+        }
+        batch
+            .merkleize(&memory, &hasher)
+            .root(
+                &memory,
+                &hasher,
+                QmdbFamily::inactive_peaks(
+                    Location::new(range.end),
+                    Location::new(inactivity_floor),
+                ),
             )
             .expect("reconstruct queued range root")
     }

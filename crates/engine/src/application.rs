@@ -15,7 +15,7 @@ use commonware_glue::stateful::{
 };
 use commonware_parallel::Strategy;
 use commonware_runtime::{BufferPooler, Clock, Metrics, Spawner, Storage};
-use constantinople_application::consensus::Application;
+use constantinople_application::consensus::{Application, FinalizedArtifacts, FinalizedHookFn};
 use constantinople_mempool::TransactionSource;
 use futures::Stream;
 use rand::{CryptoRng, Rng};
@@ -38,6 +38,7 @@ where
     St: Strategy,
 {
     inner: InnerApplication<E, H, P, V, I, B, St>,
+    finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
 }
 
 pub(crate) struct EngineReporter<R, H, P> {
@@ -87,8 +88,14 @@ where
     V: Variant,
     St: Strategy,
 {
-    pub(crate) const fn new(inner: InnerApplication<E, H, P, V, I, B, St>) -> Self {
-        Self { inner }
+    pub(crate) const fn new(
+        inner: InnerApplication<E, H, P, V, I, B, St>,
+        finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
+    ) -> Self {
+        Self {
+            inner,
+            finalized_hook,
+        }
     }
 }
 
@@ -103,6 +110,7 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            finalized_hook: self.finalized_hook.clone(),
         }
     }
 }
@@ -168,7 +176,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, P>, P>;
     type Block = EngineBlock<H, P>;
     type Databases = <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::Databases;
-    type Captured = <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::Captured;
+    type Captured = Option<FinalizedArtifacts<H>>;
     type Provider = I;
     type Input = ();
 
@@ -224,18 +232,24 @@ where
         batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) -> Self::Captured {
-        self.inner.capture(context, block, batches, readers).await
+        self.finalized_hook.as_ref()?;
+        Some(self.inner.capture(context, block, batches, readers).await)
     }
 
     async fn finalized(
         &mut self,
-        context: (E, Self::Context),
+        _context: (E, Self::Context),
         block: &Self::Block,
         captured: Self::Captured,
-        readers: <Self::Databases as DatabaseSet<E>>::Readers,
+        _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
-        self.inner
-            .finalized(context, block, captured, readers)
-            .await;
+        if let Some(hook) = &self.finalized_hook {
+            let artifacts = captured
+                .expect("finalized artifact capture was skipped while a hook was installed");
+            hook(block.inner_shared(), artifacts).await;
+        }
     }
 }
+
+#[cfg(test)]
+mod tests;

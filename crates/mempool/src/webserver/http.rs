@@ -12,7 +12,7 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Copying, Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
@@ -289,8 +289,10 @@ where
             txs = tracing::field::Empty,
         )
         .entered();
+
+        // Retained fields must not keep the entire request allocation alive.
         let cfg = (RangeCfg::new(1..=max_transactions), ());
-        let signed = Vec::<SignedTransaction<H>>::decode_cfg(body, &cfg)
+        let signed = Vec::<SignedTransaction<H>>::decode_cfg(Copying(body.as_ref()), &cfg)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
         decode.record("txs", signed.len().traced());
         drop(decode);
@@ -483,7 +485,7 @@ mod tests {
         test_router_with_receiver(context, max_batch_bytes).0
     }
 
-    fn signed_body() -> bytes::Bytes {
+    fn signed_body(count: usize) -> bytes::Bytes {
         let signer = ed25519::PrivateKey::from_seed(1);
         let recipient = ed25519::PrivateKey::from_seed(2).public_key();
         let transaction = Transaction::new(
@@ -493,7 +495,51 @@ mod tests {
             0,
         )
         .seal_and_sign(&signer, HTTP_TEST_NAMESPACE, &mut sha256::Sha256::default());
-        vec![transaction].encode()
+        vec![transaction; count].encode()
+    }
+
+    #[test]
+    fn verified_transaction_does_not_retain_request_body() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (app, mut receiver) = test_router_with_receiver(context, 4 * 1024 * 1024);
+            let body: Arc<[u8]> = signed_body(128).as_ref().into();
+            let owner = Arc::downgrade(&body);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions")
+                .body(Body::from(bytes::Bytes::from_owner(body)))
+                .expect("request should build");
+            let request_task =
+                tokio::spawn(
+                    async move { app.oneshot(request).await.expect("router should respond") },
+                );
+
+            let Message::Submit {
+                mut transactions,
+                result,
+                ..
+            } = receiver.recv().await.expect("submission should arrive")
+            else {
+                panic!("expected submission");
+            };
+
+            // A surviving transaction must not retain the rest of its submission.
+            assert_eq!(transactions.len(), 128);
+            let transaction = transactions.pop().unwrap();
+            drop(transactions);
+            result
+                .expect("blocking submission should have a waiter")
+                .send(TxStatus::Finalized { height: 7 })
+                .expect("handler should await the result");
+            let response = request_task.await.expect("request task should finish");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                owner.upgrade().is_none(),
+                "transaction retained request body"
+            );
+            assert!(transaction.value().sender().is_some());
+        });
     }
 
     #[test]
@@ -536,7 +582,7 @@ mod tests {
             let request = Request::builder()
                 .method("POST")
                 .uri("/transactions/background")
-                .body(Body::from(signed_body()))
+                .body(Body::from(signed_body(1)))
                 .expect("request should build");
             let request_task =
                 tokio::spawn(

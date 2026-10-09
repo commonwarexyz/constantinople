@@ -293,7 +293,7 @@ fn indexer_finalized_hook(finalized_producer: FinalizedUploadProducer) -> Valida
         let trace = block_span(height, "finalization");
         trace.record("block_digest", tracing::field::display(block.seal()));
         let capture = info_span!(parent: &trace, "indexer.capture", height);
-        let block = EngineBlock::from(block.clone());
+        let block = EngineBlock::from(block);
         let finalized_producer = finalized_producer.clone();
         Box::pin(
             async move { finalized_producer.enqueue(&block, artifacts, trace).await }

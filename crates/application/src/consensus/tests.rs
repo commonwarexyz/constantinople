@@ -2,7 +2,7 @@ use super::{
     Application, Databases, StateSyncTarget, TransactionHistoryTarget, genesis_block,
     history::parent_transactions_inactivity_floor,
 };
-use commonware_codec::{DecodeExt as _, Encode as _, EncodeSize as _, Write as _};
+use commonware_codec::{DecodeExt as _, Encode, EncodeSize as _, Write as _};
 use commonware_consensus::{
     simplex::{
         scheme::bls12381_threshold::standard as threshold, types::Context as SimplexContext,
@@ -25,7 +25,7 @@ use commonware_storage::{
     journal::contiguous::{
         fixed::Config as FixedJournalConfig, variable::Config as VariableJournalConfig,
     },
-    merkle::{full::Config as MmrConfig, mmr},
+    merkle::{Family as _, full::Config as MmrConfig, mem::Mem, mmr},
     qmdb::{any::FixedConfig, chain::Bounds, keyless::fixed as keyless_fixed},
     translator::EightCap,
 };
@@ -184,7 +184,6 @@ async fn verify_harness(context: &deterministic::Context) -> VerifyHarness {
             PublicKeyCache::new(context.child("public_key_cache"), NZUsize!(64)),
             state_target.clone(),
             transaction_target.clone(),
-            None,
         ),
         dbs,
         parent,
@@ -528,87 +527,111 @@ fn propose_drops_inapplicable_and_refills() {
     });
 }
 
+fn finalized_range_root<Op: Encode>(
+    range: &super::FinalizedRange<sha256::Digest, Op>,
+    floor: u64,
+) -> sha256::Digest {
+    let hasher = commonware_storage::qmdb::hasher::<sha256::Sha256>();
+    let mut memory =
+        Mem::<mmr::Family, _>::from_components(Vec::new(), range.start, range.pinned_nodes.clone())
+            .expect("captured frontier initializes the prefix");
+    let mut batch = memory.new_batch();
+    for operation in range.operations.iter() {
+        batch = batch.add(&hasher, &operation.encode());
+    }
+    let batch = batch.merkleize(&memory, &hasher);
+    memory.apply_batch(&batch).expect("apply captured suffix");
+    assert_eq!(memory.leaves(), range.end);
+    let inactive_peaks = mmr::Family::inactive_peaks(range.end, mmr::Location::new(floor));
+    memory.root(&hasher, inactive_peaks).expect("captured root")
+}
+
 #[test]
 fn finalized_capture_preserves_both_authenticated_ranges() {
     deterministic::Runner::default().start(|context| async move {
         let VerifyHarness {
             mut app,
             dbs,
-            parent,
+            mut parent,
             leader,
             sender,
             recipient,
             ..
         } = Box::pin(verify_harness(&context)).await;
-        app.finalized_hook = Some(Arc::new(|_, _| Box::pin(async {})));
-        context.sleep(Duration::from_millis(10)).await;
-        let consensus_context = SimplexContext {
-            round: Round::new(Epoch::zero(), View::new(1)),
-            leader: leader.public_key(),
-            parent: (View::zero(), *parent.seal()),
-        };
-        let mut input = StaticTransactionSource::new(vec![vec![transfer(&sender, &recipient, 1)]]);
-        let parent_state_end = parent.header.state_range.end();
-        let parent_transaction_end = parent.header.transactions_range.end();
-        let proposed = app
-            .propose_child(
-                (context.child("propose"), consensus_context.clone()),
-                Arc::new(parent),
-                dbs.new_batches().await,
-                &mut input,
-            )
-            .await
-            .expect("proposal succeeds");
-        let artifacts = StatefulApplication::capture(
-            &mut app,
-            (context.child("capture"), consensus_context),
-            &proposed.block,
-            &proposed.merkleized,
-            dbs.readers(),
-        )
-        .await
-        .expect("hook enables finalized capture");
-        let hasher = commonware_storage::qmdb::hasher::<sha256::Sha256>();
-        let state = artifacts
-            .state
-            .operations
-            .iter()
-            .map(|operation| operation.encode())
-            .collect::<Vec<_>>();
-        let transactions = artifacts
-            .transactions
-            .operations
-            .iter()
-            .map(|operation| operation.encode())
-            .collect::<Vec<_>>();
 
-        assert_eq!(artifacts.state.start.as_u64(), parent_state_end);
-        assert_eq!(
-            artifacts.state.end.as_u64(),
-            proposed.block.header.state_range.end()
-        );
-        assert!(artifacts.state.proof.verify_proof_and_pinned_nodes(
-            &hasher,
-            &state,
-            artifacts.state.start,
-            &artifacts.state.pinned_nodes,
-            &artifacts.state.root,
-        ));
-        assert_eq!(
-            artifacts.transactions.start.as_u64(),
-            parent_transaction_end
-        );
-        assert_eq!(
-            artifacts.transactions.end.as_u64(),
-            proposed.block.header.transactions_range.end()
-        );
-        assert!(artifacts.transactions.proof.verify_proof_and_pinned_nodes(
-            &hasher,
-            &transactions,
-            artifacts.transactions.start,
-            &artifacts.transactions.pinned_nodes,
-            &artifacts.transactions.root,
-        ));
+        // The empty successor retains its parent's transaction range, so its
+        // inactivity floor and append start produce different root commitments.
+        for height in 1..=2 {
+            context.sleep(Duration::from_millis(10)).await;
+            let consensus_context = SimplexContext {
+                round: Round::new(Epoch::zero(), View::new(height)),
+                leader: leader.public_key(),
+                parent: (View::new(height - 1), *parent.seal()),
+            };
+            let transactions = if height == 1 {
+                vec![transfer(&sender, &recipient, 1)]
+            } else {
+                Vec::new()
+            };
+            let mut input = StaticTransactionSource::new(vec![transactions]);
+            let parent_state_end = parent.header.state_range.end();
+            let parent_transaction_end = parent.header.transactions_range.end();
+            let proposed = app
+                .propose_child(
+                    (context.child("propose"), consensus_context.clone()),
+                    Arc::new(parent),
+                    dbs.new_batches().await,
+                    &mut input,
+                )
+                .await
+                .expect("proposal succeeds");
+            let artifacts = StatefulApplication::capture(
+                &mut app,
+                (context.child("capture"), consensus_context),
+                &proposed.block,
+                &proposed.merkleized,
+                dbs.readers(),
+            )
+            .await;
+            let header = &proposed.block.header;
+
+            assert_eq!(artifacts.state.start.as_u64(), parent_state_end);
+            assert_eq!(artifacts.state.end.as_u64(), header.state_range.end());
+            assert_eq!(artifacts.state.root, header.state_root);
+            assert_eq!(
+                finalized_range_root(&artifacts.state, header.state_range.start()),
+                header.state_root,
+            );
+            assert_eq!(
+                artifacts.transactions.start.as_u64(),
+                parent_transaction_end
+            );
+            assert_eq!(
+                artifacts.transactions.end.as_u64(),
+                header.transactions_range.end()
+            );
+            assert_eq!(artifacts.transactions.root, header.transactions_root);
+            assert_eq!(
+                finalized_range_root(&artifacts.transactions, header.transactions_range.start()),
+                header.transactions_root,
+            );
+            assert_ne!(
+                header.transactions_range.start(),
+                artifacts.transactions.start.as_u64()
+            );
+            if height == 2 {
+                assert_ne!(
+                    finalized_range_root(
+                        &artifacts.transactions,
+                        artifacts.transactions.start.as_u64(),
+                    ),
+                    header.transactions_root,
+                );
+            }
+
+            dbs.apply(proposed.merkleized).await;
+            parent = proposed.block;
+        }
     });
 }
 
@@ -842,7 +865,6 @@ fn build_timeout_bounds_refill_rounds() {
             PublicKeyCache::new(context.child("deadline_pkc"), NZUsize!(64)),
             harness.state_target.clone(),
             harness.transaction_target.clone(),
-            None,
         );
 
         context.sleep(Duration::from_millis(10)).await;

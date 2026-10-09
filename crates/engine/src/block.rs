@@ -79,6 +79,16 @@ where
     }
 }
 
+impl<H, P> From<Arc<InnerBlock<H, P>>> for EngineBlock<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    fn from(block: Arc<InnerBlock<H, P>>) -> Self {
+        Self(block)
+    }
+}
+
 impl<H, P> Deref for EngineBlock<H, P>
 where
     H: Hasher,

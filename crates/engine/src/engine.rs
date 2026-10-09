@@ -494,17 +494,19 @@ where
                 peer_provider: config.manager.clone(),
             },
         );
-        let application = EngineApplication::new(Application::new(
-            context.child("application"),
-            config.strategy.clone(),
-            config.genesis_leader.clone(),
-            genesis_parent,
-            config.transaction_namespace,
-            config.public_key_cache,
-            application_state_target,
-            application_transactions_target,
+        let application = EngineApplication::new(
+            Application::new(
+                context.child("application"),
+                config.strategy.clone(),
+                config.genesis_leader.clone(),
+                genesis_parent,
+                config.transaction_namespace,
+                config.public_key_cache,
+                application_state_target,
+                application_transactions_target,
+            ),
             config.finalized_hook,
-        ));
+        );
         let (stateful, stateful_mailbox) = Stateful::new(
             context.child("stateful"),
             StatefulConfig {

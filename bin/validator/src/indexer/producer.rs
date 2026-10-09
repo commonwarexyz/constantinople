@@ -172,8 +172,8 @@ impl FinalizedUploadProducer {
         trace.record("position", position);
 
         // The queue tail is the receipt while any record exists. The consumer
-        // persists a receipt only when a section prunes, so the hook pays for
-        // two fsyncs per block instead of three.
+        // persists a separate receipt only when a section prunes, avoiding a
+        // per-block receipt sync in this hook.
         *current = Some(receipt);
         self.capture_metrics
             .total
