@@ -86,8 +86,6 @@ where
     }
     let tx_count = u64::try_from(body_len).expect("transaction count fits u64");
 
-    // Readers derive a transaction's height from block_meta, so no
-    // per-transaction proof row is needed.
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
     sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
@@ -119,6 +117,7 @@ where
             digest,
             qmdb_location,
             body: tx.bytes,
+            height,
         }));
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
@@ -290,6 +289,10 @@ mod tests {
                 let Some(CellValue::UInt64(location)) = row.values.get(1) else {
                     panic!("tx_meta location should be u64");
                 };
+                let Some(CellValue::UInt64(height)) = row.values.get(3) else {
+                    panic!("tx_meta height should be u64");
+                };
+                assert_eq!(*height, block.header.height);
                 (digest.clone(), *location)
             })
             .collect::<Vec<_>>();
@@ -519,14 +522,14 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        assert_eq!(meta.values.len(), 3);
+        assert_eq!(meta.values.len(), 4);
         assert!(matches!(meta.values.get(1), Some(CellValue::UInt64(0))));
         let Some(CellValue::Binary(body)) = meta.values.get(2) else {
             panic!("tx_meta body should be binary");
         };
         assert_eq!(body.as_slice(), expected_body);
 
-        // Readers derive proof heights from block metadata.
+        // Proof heights live on tx_meta rows, not in a separate table.
         assert!(
             rows.iter().all(|row| {
                 row.table == crate::sql_schema::TX_META_TABLE

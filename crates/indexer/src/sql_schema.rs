@@ -1,12 +1,12 @@
 //! SQL metadata tables for finalized blocks, transactions, and account history.
 //!
 //! Primary keys identify immutable Store rows. Each account-state operation
-//! gets its own row keyed by account and operation location. Transaction heights
-//! are derived from the block transaction-log boundaries.
+//! gets its own row keyed by account and operation location. Transaction rows
+//! record their containing height and QMDB location.
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::PrefixedStoreClient;
-use exoware_sql::{IndexSpec, KvSchema, TableColumnConfig};
+use exoware_sql::{KvSchema, TableColumnConfig};
 
 /// Name of the SQL table that the explorer subscribes to.
 pub const BLOCK_META_TABLE: &str = "block_meta";
@@ -43,6 +43,8 @@ pub const TX_META_DIGEST: &str = "tx_digest";
 pub const TX_META_QMDB_LOCATION: &str = "qmdb_location";
 /// `tx_meta`: encoded signed transaction bytes.
 pub const TX_META_BODY: &str = "body";
+/// `tx_meta`: finalized block height containing this transaction.
+pub const TX_META_HEIGHT: &str = "height";
 
 // ---------- tx_activity columns ----------
 
@@ -80,13 +82,6 @@ pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
 /// Build the metadata-store [`KvSchema`] for every SQL table.
 pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String> {
-    // Transaction height lookups seek the greatest transaction tip at or below
-    // a location. That tip belongs to the preceding block, so the transaction's
-    // height is one more.
-    let transactions_tip_index = IndexSpec::lexicographic(
-        BLOCK_META_TRANSACTIONS_TIP,
-        vec![BLOCK_META_TRANSACTIONS_TIP.to_string()],
-    )?;
     KvSchema::new(client)
         .table(
             BLOCK_META_TABLE,
@@ -108,7 +103,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 ),
             ],
             vec![BLOCK_META_HEIGHT.to_string()],
-            vec![transactions_tip_index],
+            vec![],
         )?
         .table(
             TX_META_TABLE,
@@ -116,6 +111,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 TableColumnConfig::new(TX_META_DIGEST, DataType::FixedSizeBinary(32), false),
                 TableColumnConfig::new(TX_META_QMDB_LOCATION, DataType::UInt64, false),
                 TableColumnConfig::new(TX_META_BODY, DataType::Binary, false),
+                TableColumnConfig::new(TX_META_HEIGHT, DataType::UInt64, false),
             ],
             vec![TX_META_DIGEST.to_string()],
             vec![],
@@ -222,6 +218,7 @@ mod tests {
         assert_eq!(TX_META_DIGEST, "tx_digest");
         assert_eq!(TX_META_QMDB_LOCATION, "qmdb_location");
         assert_eq!(TX_META_BODY, "body");
+        assert_eq!(TX_META_HEIGHT, "height");
         assert_eq!(TX_ACTIVITY_ACCOUNT, "account");
         assert_eq!(TX_ACTIVITY_HEIGHT, "height");
         assert_eq!(TX_ACTIVITY_INDEX, "index");

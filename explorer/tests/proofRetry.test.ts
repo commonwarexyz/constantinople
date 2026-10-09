@@ -186,10 +186,6 @@ test('account proof index catch-up errors are retried', () => {
         ),
         true,
     );
-    assert.equal(
-        isRetryableAccountProofError('tx digest abc123 missing from raw transaction index'),
-        true,
-    );
     assert.equal(isRetryableAccountProofError('finalization missing at height 42'), true);
     assert.equal(isRetryableAccountProofError('[unavailable] transport disconnected'), true);
     assert.equal(isRetryableAccountProofError('TypeError: Failed to fetch'), true);
@@ -204,7 +200,6 @@ test('missing account proof rows are not retried as index catch-up', () => {
 test('account retries distinguish indexer lag from service errors', () => {
     for (const detail of [
         CONSISTENCY_NOT_READY,
-        'tx digest abc123 missing from raw transaction index',
         'finalization missing at height 42',
         'transaction location 9 is not yet covered by a provable finalization',
         '[out_of_range] requested proof tip is not published yet',
@@ -214,11 +209,7 @@ test('account retries distinguish indexer lag from service errors', () => {
     for (const detail of ['[unavailable] transport disconnected', 'TypeError: Failed to fetch']) {
         assert.equal(accountRetryReason(new Error(detail)), 'retrying after service error', detail);
     }
-    for (const detail of [
-        'SQL transaction body does not match transaction digest',
-        'SQL transaction metadata contains a duplicate digest',
-        'SQL transaction metadata contains an unexpected digest',
-    ]) {
+    for (const detail of ['SQL transaction body does not match transaction digest']) {
         assert.equal(accountRetryReason(new Error(detail)), undefined, detail);
         assert.equal(isRetryableAccountProofError(new Error(detail)), false, detail);
     }

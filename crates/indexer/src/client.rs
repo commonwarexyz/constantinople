@@ -14,8 +14,8 @@ use crate::{
     },
     publisher::certificate::CertifiedHeader,
     sql_schema::{
-        BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_TIP,
-        TX_META_BODY, TX_META_DIGEST, TX_META_QMDB_LOCATION, TX_META_TABLE, build_meta_schema,
+        BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, TX_META_BODY, TX_META_DIGEST,
+        TX_META_HEIGHT, TX_META_QMDB_LOCATION, TX_META_TABLE, build_meta_schema,
     },
 };
 use bytes::Bytes;
@@ -392,7 +392,7 @@ impl IndexerClient {
     {
         let digest_hex = hex_lower(digest.as_ref());
         let query = format!(
-            "SELECT {TX_META_QMDB_LOCATION}, {TX_META_BODY} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
+            "SELECT {TX_META_QMDB_LOCATION}, {TX_META_BODY}, {TX_META_HEIGHT} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
         );
         let batches = self.sql.sql(&query).await?.collect().await?;
         let Some(batch) = first_row(batches) else {
@@ -400,47 +400,21 @@ impl IndexerClient {
         };
         let qmdb_location = column::<UInt64Array>(&batch, 0, "tx_meta.qmdb_location")?.value(0);
         let body = verified_transaction_body::<H>(&batch, 1, digest)?;
-        let height_hint = transaction_containing_height(&self.sql, qmdb_location).await?;
-        let Some(height) = self
-            .published_transaction_height::<H>(qmdb_location, height_hint)
-            .await?
-        else {
+        let height = column::<UInt64Array>(&batch, 2, "tx_meta.height")?.value(0);
+        let Some(target) = self.publication_target::<H>(height).await? else {
             return Ok(None);
         };
+        let sql = with_read_session(
+            &self.sql,
+            self.sql_store
+                .create_session_with_sequence(target.store_sequence_number),
+        );
+        validate_target_block_digest(&sql, height, target.block_digest.as_ref()).await?;
         Ok(Some(TransactionMetadata {
             height,
             qmdb_location,
             body,
         }))
-    }
-
-    async fn published_transaction_height<H>(
-        &self,
-        qmdb_location: u64,
-        mut height_hint: u64,
-    ) -> Result<Option<u64>, ReadError>
-    where
-        H: Hasher,
-    {
-        loop {
-            let Some(target) = self.publication_target::<H>(height_hint).await? else {
-                return Ok(None);
-            };
-            let sql = with_read_session(
-                &self.sql,
-                self.sql_store
-                    .create_session_with_sequence(target.store_sequence_number),
-            );
-            let height = transaction_containing_height(&sql, qmdb_location).await?;
-            if !validate_transaction_height(height, target.height)? {
-                // A fresher read can reveal a boundary missing from the hint.
-                // Retry with that height's publication target before returning.
-                height_hint = height;
-                continue;
-            }
-            validate_target_block_digest(&sql, height, target.block_digest.as_ref()).await?;
-            return Ok(Some(height));
-        }
     }
 
     /// Fetch and decode the transaction using [`Self::transaction_metadata`].
@@ -520,37 +494,6 @@ fn column<'a, A: Array + 'static>(
     Ok(values)
 }
 
-fn validate_transaction_height(actual: u64, target: u64) -> Result<bool, ReadError> {
-    if actual < target {
-        return Err(ReadError::SqlRow(format!(
-            "derived transaction height {actual} does not match publication target height {target}"
-        )));
-    }
-    Ok(actual == target)
-}
-
-async fn transaction_containing_height(
-    sql: &SessionContext,
-    qmdb_location: u64,
-) -> Result<u64, ReadError> {
-    let batches = sql
-        .sql(&transaction_height_predecessor_sql(qmdb_location))
-        .await?
-        .collect()
-        .await?;
-    let predecessor_height = first_row(batches)
-        .map(|batch| {
-            column::<UInt64Array>(&batch, 0, "block_meta.height").map(|values| values.value(0))
-        })
-        .transpose()?;
-    predecessor_height
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| {
-            ReadError::SqlRow("transaction containing block height overflows u64".to_string())
-        })
-}
-
 async fn validate_target_block_digest(
     sql: &SessionContext,
     height: u64,
@@ -572,12 +515,6 @@ async fn validate_target_block_digest(
         ));
     }
     Ok(())
-}
-
-fn transaction_height_predecessor_sql(qmdb_location: u64) -> String {
-    format!(
-        "SELECT {BLOCK_META_HEIGHT} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_TRANSACTIONS_TIP} <= {qmdb_location} ORDER BY {BLOCK_META_TRANSACTIONS_TIP} DESC LIMIT 1"
-    )
 }
 
 fn verified_transaction_body<H>(
@@ -618,125 +555,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::publisher::sql::{BlockMetaRow, encode_block_meta_row};
     use commonware_cryptography::{sha256, sha256::Sha256};
     use exoware_sql::CellValue;
-
-    #[test]
-    fn transaction_height_above_publication_target_requires_refresh() {
-        assert!(!validate_transaction_height(8, 7).expect("a later row requires a new target"));
-        assert!(validate_transaction_height(7, 7).expect("the exact height is ready"));
-        let error = validate_transaction_height(6, 7)
-            .expect_err("a lower height contradicts the immutable hint");
-        assert!(
-            matches!(error, ReadError::SqlRow(message) if message.contains("does not match publication target height"))
-        );
-    }
-
-    #[tokio::test]
-    async fn transaction_height_lookup_uses_a_bounded_index_scan() {
-        let client = IndexerClient::new(
-            StoreClient::new("http://127.0.0.1:1"),
-            StoreClient::new("http://127.0.0.1:1"),
-        );
-        let query = client
-            .sql()
-            .sql(&transaction_height_predecessor_sql(42))
-            .await
-            .expect("plan transaction height lookup");
-        let plan = query
-            .create_physical_plan()
-            .await
-            .expect("build physical plan");
-        let plan = datafusion::physical_plan::displayable(plan.as_ref())
-            .indent(true)
-            .to_string();
-
-        assert!(
-            plan.contains("fetch=Some(1), direction=Some(Reverse)"),
-            "{plan}"
-        );
-        assert!(plan.contains("secondary_index"), "{plan}");
-        assert!(plan.contains("exact=true"), "{plan}");
-        assert!(!plan.contains("SortExec"), "{plan}");
-    }
-
-    #[tokio::test]
-    async fn published_transaction_height_retries_a_stale_hint() {
-        let (simulator, url) = exoware_simulator::open_temp()
-            .await
-            .expect("spawn simulator");
-        let store = StoreClient::new(&url);
-        let client = IndexerClient::new(store.clone(), store.clone());
-        let location = 4;
-        let hint = transaction_containing_height(client.sql(), location)
-            .await
-            .expect("derive hint before block boundaries are visible");
-        assert_eq!(hint, 1);
-
-        // Preserve the old hint while publishing the boundaries that identify
-        // height two as the owner of this location.
-        let schema = build_meta_schema(sql_meta_client(&store).expect("SQL metadata namespace"))
-            .expect("build SQL metadata schema");
-        let mut writer = schema.batch_writer();
-        for (height, transactions_tip) in [(1, 3), (2, 5)] {
-            let row = encode_block_meta_row(BlockMetaRow {
-                height,
-                digest: [height as u8; 32],
-                tx_count: 1,
-                transactions_root: [0; 32],
-                transactions_tip,
-                view: 0,
-                finalized_ts_micros: 0,
-            });
-            writer
-                .insert(row.table, row.values)
-                .expect("stage boundary");
-        }
-        writer.flush().await.expect("publish block boundaries");
-        let targets = publication_target_client(&store).expect("publication target namespace");
-        targets
-            .ingest()
-            .put(&[(&publication_target_key(1), &[1; 32])])
-            .await
-            .expect("publish hint target");
-        assert_eq!(
-            client
-                .published_transaction_height::<Sha256>(location, hint)
-                .await
-                .expect("missing exact target is not an error"),
-            None
-        );
-
-        targets
-            .ingest()
-            .put(&[(&publication_target_key(2), &[2; 32])])
-            .await
-            .expect("publish exact target");
-        assert_eq!(
-            client
-                .published_transaction_height::<Sha256>(location, hint)
-                .await
-                .expect("refresh stale hint"),
-            Some(2)
-        );
-
-        targets
-            .ingest()
-            .put(&[(&publication_target_key(3), &[3; 32])])
-            .await
-            .expect("publish contradictory target");
-        let error = client
-            .published_transaction_height::<Sha256>(location, 3)
-            .await
-            .expect_err("a lower height contradicts the hint");
-        assert!(
-            matches!(error, ReadError::SqlRow(message) if message.contains("does not match publication target height"))
-        );
-
-        simulator.abort();
-        let _ = simulator.await;
-    }
 
     #[tokio::test]
     async fn transaction_metadata_waits_for_its_exact_publication_target() {
@@ -781,6 +601,7 @@ mod tests {
                         CellValue::FixedBinary(digest.as_ref().to_vec()),
                         CellValue::UInt64(qmdb_location),
                         CellValue::Binary(body.clone()),
+                        CellValue::UInt64(height),
                     ],
                 )
                 .expect("stage out-of-order transaction metadata");
