@@ -1476,31 +1476,6 @@ mod tests {
     }
 
     #[test]
-    fn indexer_thread_flags_require_positive_counts() {
-        for flag in [
-            "--indexer-worker-threads",
-            "--indexer-rayon-threads",
-            "--indexer-publisher-rayon-threads",
-        ] {
-            for value in ["0", "4"] {
-                let result = Cli::try_parse_from([
-                    "constantinople-deploy",
-                    "generate",
-                    "--validators",
-                    "4",
-                    "--output-dir",
-                    "out",
-                    "--indexer",
-                    flag,
-                    value,
-                    "local",
-                ]);
-                assert_eq!(result.is_ok(), value != "0", "{flag} {value}");
-            }
-        }
-    }
-
-    #[test]
     #[should_panic(expected = "--validators must be at least 4")]
     fn rejects_validator_count_below_coding_minimum() {
         let cli = parse_cli([

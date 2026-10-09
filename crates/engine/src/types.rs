@@ -173,7 +173,7 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
 /// Reporter combinator that fans simplex activity to the marshal mailbox and
-/// an optional external observer (e.g. the indexer's certificate publisher).
+/// an optional external observer.
 pub(crate) type SimplexReporter<H, P, V, O> = Reporters<EngineMarshalMailbox<H, P, V>, O>;
 
 pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<

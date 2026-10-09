@@ -24,11 +24,9 @@ those counts for the indexer secondary in either deployment mode.
 `--indexer-publisher-rayon-threads` sizes its separate publication pool and defaults
 to `2`. The generated indexer YAML stores this as `indexer.publisher_rayon_threads`.
 
-`deploy.sh` configures the 32-vCPU indexer with 8 async workers, 12 engine Rayon
-threads, and 4 publisher Rayon threads. Other validator runtimes use 3 async
-workers and 13 engine Rayon threads. Chunk request encoding and compression use
-the runtime's shared blocking pool. These counts leave CPU headroom for that work
-but do not pin threads to particular cores.
+`deploy.sh` sets these counts for its own topology. Chunk request encoding and
+compression use the runtime's shared blocking pool, so leave CPU headroom for
+that work. Thread counts do not pin threads to particular cores.
 
 ## Local Deployment
 

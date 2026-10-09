@@ -9,7 +9,9 @@
 
 use crate::{
     codec,
-    namespaces::{publication_target_client, simplex_client, sql_meta_client},
+    namespaces::{
+        publication_target_client, publication_target_key, simplex_client, sql_meta_client,
+    },
     publisher::certificate::CertifiedHeader,
     sql_schema::{
         BLOCK_META_DIGEST, BLOCK_META_HEIGHT, BLOCK_META_TABLE, BLOCK_META_TRANSACTIONS_TIP,
@@ -17,7 +19,7 @@ use crate::{
     },
 };
 use bytes::Bytes;
-use commonware_codec::{Copying, FixedSize as _, Read};
+use commonware_codec::{DecodeExt, FixedSize as _, Read};
 use commonware_consensus::{
     Heightable,
     types::{Epoch, Height, Round, View},
@@ -32,7 +34,7 @@ use datafusion::{
     },
     prelude::SessionContext,
 };
-use exoware_sdk::{ClientError, Key, PrefixedStoreClient, ReadSession, StoreClient};
+use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient};
 use exoware_simplex::{Finalized, SimplexError, SimplexReader};
 use exoware_sql::with_read_session;
 
@@ -63,9 +65,6 @@ pub enum ReadError {
     /// Decoding failed.
     #[error("decode error: {0}")]
     Codec(#[from] commonware_codec::Error),
-    /// A publication target did not contain one complete digest.
-    #[error("publication target digest has length {actual}. expected {expected}")]
-    PublicationTargetDigestLength { expected: usize, actual: usize },
     /// A publication target read did not report its Store visibility sequence.
     #[error("publication target read did not report a Store sequence")]
     PublicationTargetSequence,
@@ -87,7 +86,7 @@ pub struct TransactionMetadata {
 pub struct FinalizedPublicationTarget<D> {
     /// Finalized block height.
     pub height: u64,
-    /// Certified block-header digest at this height.
+    /// Block-header digest at this height.
     pub block_digest: D,
     /// Store sequence at which this target read was evaluated.
     pub store_sequence_number: u64,
@@ -145,11 +144,6 @@ impl IndexerClient {
         &self.blocks
     }
 
-    /// Borrow the finalized publication-target Store client.
-    pub const fn publication_targets(&self) -> &PrefixedStoreClient {
-        &self.targets
-    }
-
     /// Borrow the SQL metadata context used for transaction lookups.
     pub const fn sql(&self) -> &SessionContext {
         &self.sql
@@ -157,9 +151,8 @@ impl IndexerClient {
 
     /// Fetch the finalized publication target for `height`.
     ///
-    /// Presence means the writer atomically published this target with both
-    /// QMDB watermarks. Callers can carry `store_sequence_number` as the
-    /// minimum sequence for subsequent Store-backed reads.
+    /// Presence means the complete index for this height is visible. Use
+    /// `store_sequence_number` as the minimum sequence for subsequent reads.
     pub async fn publication_target<H>(
         &self,
         height: u64,
@@ -175,11 +168,11 @@ impl IndexerClient {
             .evaluated_sequence()
             .ok_or(ReadError::PublicationTargetSequence)?;
 
-        Ok(Some(decode_publication_target::<H::Digest>(
+        Ok(Some(FinalizedPublicationTarget {
             height,
-            &block_digest,
+            block_digest: H::Digest::decode(block_digest)?,
             store_sequence_number,
-        )?))
+        }))
     }
 
     /// Fetch the encoded Simplex `{ header, body }` envelope for `digest`.
@@ -230,6 +223,8 @@ impl IndexerClient {
     }
 
     /// Decode the certified header at `height`.
+    ///
+    /// Returns `None` for heights without their own finalization certificate.
     pub async fn certified_header_by_height<H, P, S>(
         &self,
         height: u64,
@@ -252,6 +247,8 @@ impl IndexerClient {
     }
 
     /// Fetch the certified block-header digest at `height`.
+    ///
+    /// Returns `None` for heights without their own finalization certificate.
     pub async fn digest_by_height<H, P, S>(
         &self,
         height: u64,
@@ -270,6 +267,8 @@ impl IndexerClient {
     }
 
     /// Decode and return the certified full block at `height`.
+    ///
+    /// Returns `None` for heights without their own finalization certificate.
     pub async fn block_by_height<H, P, S>(
         &self,
         height: u64,
@@ -288,8 +287,9 @@ impl IndexerClient {
         self.block_by_digest::<H, P>(&digest, block_cfg).await
     }
 
-    /// Latest finalized block header, decoded from the Simplex finalization
-    /// height index without fetching the block body.
+    /// Latest block header with its own finalization certificate.
+    ///
+    /// Heights finalized through a descendant are omitted.
     pub async fn latest_certified_header<H, P, S>(
         &self,
         cfg: &FinalizationCfg<H, P, S>,
@@ -307,7 +307,9 @@ impl IndexerClient {
             .map(|finalized| finalized.header))
     }
 
-    /// Latest finalized height from the certified Simplex finalization index.
+    /// Latest height with its own finalization certificate.
+    ///
+    /// Heights finalized through a descendant are omitted.
     pub async fn latest_height<H, P, S>(
         &self,
         cfg: &FinalizationCfg<H, P, S>,
@@ -324,8 +326,9 @@ impl IndexerClient {
             .map(|header| header.height().get()))
     }
 
-    /// Latest finalized full block. This fetches the body by digest after
-    /// decoding the latest certified header.
+    /// Latest full block with its own finalization certificate.
+    ///
+    /// Heights finalized through a descendant are omitted.
     pub async fn latest_block<H, P, S>(
         &self,
         block_cfg: &BlockCfg,
@@ -367,49 +370,34 @@ impl IndexerClient {
         H: Hasher,
     {
         let digest_hex = hex_lower(digest.as_ref());
-        let hint_sql = format!(
-            "SELECT {TX_META_QMDB_LOCATION} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
+        let query = format!(
+            "SELECT {TX_META_QMDB_LOCATION}, {TX_META_BODY} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
         );
-        let batches = self.sql.sql(&hint_sql).await?.collect().await?;
-        let mut location_hint = None;
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            location_hint = Some(required_u64(&batch, 0, TX_META_QMDB_LOCATION)?);
-            break;
-        }
-        let Some(location_hint) = location_hint else {
+        let batches = self.sql.sql(&query).await?.collect().await?;
+        let Some(batch) = first_row(batches) else {
             return Ok(None);
         };
-        let height_hint = transaction_containing_height(&self.sql, location_hint).await?;
+        let qmdb_location = column::<UInt64Array>(&batch, 0, "tx_meta.qmdb_location")?.value(0);
+        let body = verified_transaction_body::<H>(&batch, 1, digest)?;
+        let height_hint = transaction_containing_height(&self.sql, qmdb_location).await?;
         let Some(target) = self.publication_target::<H>(height_hint).await? else {
             return Ok(None);
         };
-
-        let query = format!(
-            "SELECT {TX_META_DIGEST}, {TX_META_QMDB_LOCATION}, {TX_META_BODY} FROM {TX_META_TABLE} WHERE {TX_META_DIGEST} = X'{digest_hex}' LIMIT 1"
-        );
         let sql = with_read_session(
             &self.sql,
-            ReadSession::monotonic(self.sql_store.clone(), Some(target.store_sequence_number)),
+            self.sql_store
+                .create_session_with_sequence(target.store_sequence_number),
         );
-        let batches = sql.sql(&query).await?.collect().await?;
-        for batch in batches {
-            if batch.num_rows() == 0 {
-                continue;
-            }
-            let (qmdb_location, body) = decode_transaction_row::<H>(&batch, digest)?;
-            let height = transaction_containing_height(&sql, qmdb_location).await?;
-            validate_transaction_height(height, target.height)?;
-            validate_target_block_digest(&sql, height, target.block_digest.as_ref()).await?;
-            return Ok(Some(TransactionMetadata {
-                height,
-                qmdb_location,
-                body,
-            }));
+        let height = transaction_containing_height(&sql, qmdb_location).await?;
+        if !validate_transaction_height(height, target.height)? {
+            return Ok(None);
         }
-        Ok(None)
+        validate_target_block_digest(&sql, height, target.block_digest.as_ref()).await?;
+        Ok(Some(TransactionMetadata {
+            height,
+            qmdb_location,
+            body,
+        }))
     }
 
     /// Decode and return the transaction for `digest`, or `None` if absent.
@@ -466,81 +454,33 @@ fn hex_lower(bytes: &[u8]) -> String {
     out
 }
 
-fn publication_target_key(height: u64) -> Key {
-    Key::from(Bytes::copy_from_slice(&height.to_be_bytes()))
+fn first_row(batches: Vec<RecordBatch>) -> Option<RecordBatch> {
+    batches.into_iter().find(|batch| batch.num_rows() > 0)
 }
 
-fn decode_publication_target<D>(
-    height: u64,
-    block_digest: &[u8],
-    store_sequence_number: u64,
-) -> Result<FinalizedPublicationTarget<D>, ReadError>
-where
-    D: Digest,
-{
-    if block_digest.len() != D::SIZE {
-        return Err(ReadError::PublicationTargetDigestLength {
-            expected: D::SIZE,
-            actual: block_digest.len(),
-        });
-    }
-
-    Ok(FinalizedPublicationTarget {
-        height,
-        block_digest: codec::from_bytes(Copying(block_digest), &())?,
-        store_sequence_number,
-    })
-}
-
-fn decode_transaction_row<H>(
-    batch: &RecordBatch,
-    digest: &H::Digest,
-) -> Result<(u64, Bytes), ReadError>
-where
-    H: Hasher,
-{
-    let stored_digest = batch
-        .column(0)
-        .as_any()
-        .downcast_ref::<FixedSizeBinaryArray>()
-        .ok_or_else(|| ReadError::SqlRow("tx_meta.tx_digest must be FixedSizeBinary(32)".into()))?;
-    if stored_digest.is_null(0) {
-        return Err(ReadError::SqlRow(
-            "tx_meta.tx_digest must not be null".into(),
-        ));
-    }
-    if stored_digest.value(0) != digest.as_ref() {
-        return Err(ReadError::SqlRow(
-            "tx_meta.tx_digest does not match the requested digest".into(),
-        ));
-    }
-
-    let qmdb_location = required_u64(batch, 1, TX_META_QMDB_LOCATION)?;
-    let body = verified_transaction_body::<H>(batch, 2, digest)?;
-    Ok((qmdb_location, body))
-}
-
-fn required_u64(batch: &RecordBatch, column: usize, name: &str) -> Result<u64, ReadError> {
+fn column<'a, A: Array + 'static>(
+    batch: &'a RecordBatch,
+    index: usize,
+    label: &str,
+) -> Result<&'a A, ReadError> {
     let values = batch
-        .column(column)
+        .column(index)
         .as_any()
-        .downcast_ref::<UInt64Array>()
-        .ok_or_else(|| ReadError::SqlRow(format!("tx_meta.{name} must be UInt64")))?;
+        .downcast_ref::<A>()
+        .ok_or_else(|| ReadError::SqlRow(format!("{label} has an unexpected SQL type")))?;
     if values.is_null(0) {
-        return Err(ReadError::SqlRow(format!(
-            "tx_meta.{name} must not be null"
-        )));
+        return Err(ReadError::SqlRow(format!("{label} must not be null")));
     }
-    Ok(values.value(0))
+    Ok(values)
 }
 
-fn validate_transaction_height(actual: u64, target: u64) -> Result<(), ReadError> {
-    if actual != target {
+fn validate_transaction_height(actual: u64, target: u64) -> Result<bool, ReadError> {
+    if actual < target {
         return Err(ReadError::SqlRow(format!(
             "derived transaction height {actual} does not match publication target height {target}"
         )));
     }
-    Ok(())
+    Ok(actual == target)
 }
 
 async fn transaction_containing_height(
@@ -552,25 +492,17 @@ async fn transaction_containing_height(
         .await?
         .collect()
         .await?;
-    let mut predecessor_height = None;
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let block_height = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<UInt64Array>()
-            .ok_or_else(|| ReadError::SqlRow("block_meta.height must be UInt64".to_string()))?;
-        if block_height.is_null(0) {
-            return Err(ReadError::SqlRow(
-                "block_meta.height must not be null".to_string(),
-            ));
-        }
-        predecessor_height = Some(block_height.value(0));
-        break;
-    }
-    containing_block_height(predecessor_height)
+    let predecessor_height = first_row(batches)
+        .map(|batch| {
+            column::<UInt64Array>(&batch, 0, "block_meta.height").map(|values| values.value(0))
+        })
+        .transpose()?;
+    predecessor_height
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or_else(|| {
+            ReadError::SqlRow("transaction containing block height overflows u64".to_string())
+        })
 }
 
 async fn validate_target_block_digest(
@@ -582,41 +514,18 @@ async fn validate_target_block_digest(
         "SELECT {BLOCK_META_DIGEST} FROM {BLOCK_META_TABLE} WHERE {BLOCK_META_HEIGHT} = {height} LIMIT 1"
     );
     let batches = sql.sql(&query).await?.collect().await?;
-    for batch in batches {
-        if batch.num_rows() == 0 {
-            continue;
-        }
-        let digest = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<FixedSizeBinaryArray>()
-            .ok_or_else(|| {
-                ReadError::SqlRow("block_meta.digest must be FixedSizeBinary(32)".to_string())
-            })?;
-        if digest.is_null(0) {
-            return Err(ReadError::SqlRow(
-                "block_meta.digest must not be null".to_string(),
-            ));
-        }
-        if digest.value(0) != target_digest {
-            return Err(ReadError::SqlRow(
-                "block_meta.digest does not match the publication target".to_string(),
-            ));
-        }
-        return Ok(());
+    let batch = first_row(batches).ok_or_else(|| {
+        ReadError::SqlRow(format!(
+            "block_meta row is missing for publication target height {height}"
+        ))
+    })?;
+    let digest = column::<FixedSizeBinaryArray>(&batch, 0, "block_meta.digest")?;
+    if digest.value(0) != target_digest {
+        return Err(ReadError::SqlRow(
+            "block_meta.digest does not match the publication target".to_string(),
+        ));
     }
-    Err(ReadError::SqlRow(format!(
-        "block_meta row is missing for publication target height {height}"
-    )))
-}
-
-fn containing_block_height(predecessor_height: Option<u64>) -> Result<u64, ReadError> {
-    predecessor_height
-        .unwrap_or(0)
-        .checked_add(1)
-        .ok_or_else(|| {
-            ReadError::SqlRow("transaction containing block height overflows u64".to_string())
-        })
+    Ok(())
 }
 
 fn transaction_height_predecessor_sql(qmdb_location: u64) -> String {
@@ -627,22 +536,13 @@ fn transaction_height_predecessor_sql(qmdb_location: u64) -> String {
 
 fn verified_transaction_body<H>(
     batch: &RecordBatch,
-    column: usize,
+    index: usize,
     digest: &H::Digest,
 ) -> Result<Bytes, ReadError>
 where
     H: Hasher,
 {
-    let body = batch
-        .column(column)
-        .as_any()
-        .downcast_ref::<BinaryArray>()
-        .ok_or_else(|| ReadError::SqlRow("tx_meta.body must be Binary".to_string()))?;
-    if body.is_null(0) {
-        return Err(ReadError::SqlRow(
-            "tx_meta.body must not be null".to_string(),
-        ));
-    }
+    let body = column::<BinaryArray>(batch, index, "tx_meta.body")?;
     let body = Bytes::copy_from_slice(body.value(0));
     verify_signed_transaction_digest::<H>(&body, digest)?;
     Ok(body)
@@ -676,67 +576,13 @@ mod tests {
     use exoware_sql::CellValue;
 
     #[test]
-    fn publication_target_uses_big_endian_height_key() {
-        let height = 0x0102_0304_0506_0708;
-
-        assert_eq!(
-            publication_target_key(height).as_ref(),
-            &[1, 2, 3, 4, 5, 6, 7, 8]
-        );
-    }
-
-    #[test]
-    fn decodes_publication_target_with_store_sequence() {
-        let digest = Sha256::hash(&[b"finalized block"]);
-
-        let target = decode_publication_target::<sha256::Digest>(19, digest.as_ref(), 41)
-            .expect("publication target should decode");
-
-        assert_eq!(
-            target,
-            FinalizedPublicationTarget {
-                height: 19,
-                block_digest: digest,
-                store_sequence_number: 41,
-            }
-        );
-    }
-
-    #[test]
-    fn rejects_publication_target_with_wrong_digest_length() {
-        let error = decode_publication_target::<sha256::Digest>(19, &[0; 31], 41)
-            .expect_err("short publication target digest should be rejected");
-
-        assert!(matches!(
-            error,
-            ReadError::PublicationTargetDigestLength {
-                expected: 32,
-                actual: 31,
-            }
-        ));
-    }
-
-    #[test]
-    fn rejects_transaction_height_that_differs_from_publication_target() {
-        let error = validate_transaction_height(8, 7)
-            .expect_err("a later visible row must not satisfy the selected target");
-
+    fn transaction_height_above_publication_target_is_not_ready() {
+        assert!(!validate_transaction_height(8, 7).expect("a later row is not ready"));
+        assert!(validate_transaction_height(7, 7).expect("the exact height is ready"));
+        let error = validate_transaction_height(6, 7)
+            .expect_err("a lower height contradicts the immutable hint");
         assert!(
             matches!(error, ReadError::SqlRow(message) if message.contains("does not match publication target height"))
-        );
-    }
-
-    #[test]
-    fn containing_block_height_rejects_overflow() {
-        let error = containing_block_height(Some(u64::MAX)).expect_err("height should overflow");
-        assert!(matches!(error, ReadError::SqlRow(message) if message.contains("overflows")));
-    }
-
-    #[test]
-    fn transaction_height_query_seeks_the_preceding_boundary() {
-        assert_eq!(
-            transaction_height_predecessor_sql(42),
-            "SELECT height FROM block_meta WHERE transactions_tip <= 42 ORDER BY transactions_tip DESC LIMIT 1"
         );
     }
 

@@ -47,6 +47,7 @@ constantinople-primitives = { path = "crates/primitives" }
 constantinople-application = { path = "crates/application" }
 
 # Commonware
+# Match Exoware so public Rust types use the same crate revisions.
 commonware-actor = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c4407b6907f520ea828b825829ecea942a0e9b9" }
 commonware-p2p = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c4407b6907f520ea828b825829ecea942a0e9b9" }
 commonware-glue = { git = "https://github.com/commonwarexyz/monorepo", rev = "4c4407b6907f520ea828b825829ecea942a0e9b9" }
@@ -101,12 +102,9 @@ serde_yaml = "0.9"
 tempfile = "3"
 mimalloc = "0.1.52"
 derive_more = { version = "2.1.1", default-features = false }
-prometheus-client = { version = "0.24.0", default-features = false }
+prometheus-client = { version = "0.25", default-features = false }
 tracing-subscriber = "0.3"
 url = "2.5.8"
-opentelemetry = { version = "0.32", default-features = false }
-opentelemetry_sdk = { version = "0.32", default-features = false }
-tracing-opentelemetry = { version = "0.33", default-features = false }
 
 [profile.samply]
 inherits = "release"

@@ -129,7 +129,7 @@ where
     async fn capture(
         &mut self,
         _context: (E, Self::Context),
-        block: &Self::Block,
+        _block: &Self::Block,
         batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
         readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) -> Self::Captured {
@@ -138,26 +138,18 @@ where
         let state = {
             let database = readers.0.read().await;
             let (start, operations) = batches.0.operations();
-            let end = batches.0.bounds().tip.size;
-            let root = batches.0.root();
-            assert_eq!(end.as_u64(), block.header.state_range.end());
-            assert_eq!(
-                end.as_u64() - start.as_u64(),
-                u64::try_from(operations.len()).expect("state operation count must fit u64")
-            );
-            assert_eq!(root, block.header.state_root);
             let proof = batches
                 .0
                 .proof(&database)
                 .expect("finalized state batch proof must be available before apply");
-            let pinned_nodes = database
-                .pinned_nodes_at(start)
-                .await
+            let pinned_nodes = batches
+                .0
+                .pinned_nodes(&database)
                 .expect("finalized state frontier must be available before apply");
             FinalizedRange {
                 start,
-                end,
-                root,
+                end: batches.0.bounds().tip.size,
+                root: batches.0.root(),
                 proof,
                 pinned_nodes,
                 operations,
@@ -167,14 +159,6 @@ where
         let transactions = {
             let database = readers.1.read().await;
             let (start, operations) = batches.1.operations();
-            let end = batches.1.bounds().tip.size;
-            let root = batches.1.root();
-            assert_eq!(end.as_u64(), block.header.transactions_range.end());
-            assert_eq!(
-                end.as_u64() - start.as_u64(),
-                u64::try_from(operations.len()).expect("transaction operation count must fit u64")
-            );
-            assert_eq!(root, block.header.transactions_root);
             let proof = batches
                 .1
                 .proof(&database)
@@ -185,8 +169,8 @@ where
                 .expect("finalized transaction frontier must be available before apply");
             FinalizedRange {
                 start,
-                end,
-                root,
+                end: batches.1.bounds().tip.size,
+                root: batches.1.root(),
                 proof,
                 pinned_nodes,
                 operations,

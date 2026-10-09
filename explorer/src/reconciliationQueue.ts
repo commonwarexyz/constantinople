@@ -4,16 +4,6 @@ export interface TransactionReconciliation {
     waitingForHeight: bigint | null;
 }
 
-export function activeReconciliations(
-    reconciliations: ReadonlyMap<string, TransactionReconciliation>,
-): number {
-    let active = 0;
-    for (const reconciliation of reconciliations.values()) {
-        if (reconciliation.timer === null) active += 1;
-    }
-    return active;
-}
-
 export function wakeCoveredReconciliations(
     reconciliations: Map<string, TransactionReconciliation>,
     height: bigint,

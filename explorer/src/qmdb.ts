@@ -1,5 +1,6 @@
-import { fromHex, toArrayBuffer } from './codec.ts';
-import { assertTransactionLocationBeforeTip, transactionProofTip } from './proofMath.ts';
+import { bytesEqual, fromHex, toArrayBuffer } from './codec.ts';
+import { transactionProofTip } from './proofMath.ts';
+import { errorMessage } from './proofRetry.ts';
 import type { PublishedProofTarget } from './proofTarget.ts';
 import {
     SqlClient,
@@ -18,6 +19,14 @@ import {
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
+import {
+    BLOCK_META_HEIGHT,
+    BLOCK_META_TABLE,
+    BLOCK_META_TRANSACTIONS_TIP,
+    BLOCK_META_TX_COUNT,
+    containingTransactionHeight,
+    transactionHeightPredecessorQuery,
+} from './transactionHeight.ts';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
@@ -34,11 +43,6 @@ const TRANSACTION_BODY_BYTES =
     TRANSACTION_PUBLIC_KEY_BYTES + ACCOUNT_KEY_BYTES + TRANSACTION_VALUE_BYTES + TRANSACTION_NONCE_BYTES;
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
-
-const BLOCK_META_TABLE = 'block_meta';
-const BLOCK_META_HEIGHT = 'height';
-const BLOCK_META_TX_COUNT = 'tx_count';
-const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
 
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
@@ -125,15 +129,11 @@ export interface VerifiedAccountProof {
 }
 
 export interface TransactionRowMetadata {
-    readonly digest: string;
     readonly location: bigint;
-    readonly sqlUrl: string;
     readonly sequenceNumber: bigint;
 }
 
 export interface AccountProofMetadata extends AccountProofRow {
-    readonly account: string;
-    readonly sqlUrl: string;
     readonly sequenceNumber: bigint;
 }
 
@@ -198,12 +198,7 @@ export async function fetchTransactionRowMetadata({
         if (!digests.has(hex)) throw new Error('SQL transaction metadata contains an unexpected digest');
         const location = await verifiedTransactionLocation(row, digest);
         if (metadata.has(hex)) throw new Error('SQL transaction metadata contains a duplicate digest');
-        metadata.set(hex, {
-            digest: hex,
-            location,
-            sqlUrl: trimTrailingSlash(sqlUrl),
-            sequenceNumber: result.sequenceNumber,
-        });
+        metadata.set(hex, { location, sequenceNumber: result.sequenceNumber });
     }));
     for (const digest of digests.keys()) {
         if (!metadata.has(digest)) {
@@ -234,13 +229,8 @@ export async function fetchAndVerifyTransactionProof({
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
-    if (finalizedHeight !== undefined && finalizedHeight < 0n) {
-        throw new Error('finalized height must be non-negative');
-    }
     if (finalizedHeight !== undefined && finalizedHeight > publishedTarget.height) {
-        throw new Error(
-            `transaction height ${finalizedHeight} is not yet covered by a provable finalization`,
-        );
+        throw uncoveredError(`transaction height ${finalizedHeight}`);
     }
 
     const controller = new AbortController();
@@ -272,14 +262,10 @@ export async function fetchAndVerifyTransactionProof({
             ),
         ]);
         if (metadata.height > publishedTarget.height) {
-            throw new Error(
-                `transaction height ${metadata.height} is not yet covered by a provable finalization`,
-            );
+            throw uncoveredError(`transaction height ${metadata.height}`);
         }
         if (finalizedHeight === undefined && metadata.location >= proofTarget.transactionsTip) {
-            throw new Error(
-                `transaction location ${metadata.location} is not yet covered by a provable finalization`,
-            );
+            throw uncoveredError(`transaction location ${metadata.location}`);
         }
         const target = metadata.height === proofTarget.height
             ? proofTarget
@@ -408,8 +394,6 @@ export async function fetchAndVerifyAccountProof({
     // Floor raises can move an idle account past this certificate's tip.
     // Reuse speculative SQL only while its location and read floor still fit.
     const row = metadata &&
-        metadata.account === toHex(accountBytes) &&
-        metadata.sqlUrl === trimTrailingSlash(sqlUrl) &&
         metadata.sequenceNumber >= target.sequenceNumber &&
         metadata.location >= target.stateStart && metadata.location < stateEnd
         ? metadata
@@ -472,10 +456,7 @@ export async function fetchAndVerifyTransactionRowProof({
 }): Promise<VerifiedTransactionProof> {
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const location = metadata &&
-        metadata.digest === toHex(digestBytes) &&
-        metadata.sqlUrl === trimTrailingSlash(sqlUrl) &&
-        metadata.sequenceNumber >= target.sequenceNumber
+    const location = metadata && metadata.sequenceNumber >= target.sequenceNumber
         ? metadata.location
         : await fetchVerifiedSqlTransactionMetadata(
             sqlUrl,
@@ -485,11 +466,8 @@ export async function fetchAndVerifyTransactionRowProof({
         );
 
     if (location >= target.transactionsTip) {
-        throw new Error(
-            `transaction location ${location} is not yet covered by a provable finalization`,
-        );
+        throw uncoveredError(`transaction location ${location}`);
     }
-    assertTransactionLocationBeforeTip(location, target.transactionsTip);
 
     const tip = transactionProofTip(target.transactionsTip);
     const verification = await fetchFixedKeylessAppendProof(
@@ -567,19 +545,30 @@ async function fetchTransactionProofMetadata(
             signal,
         );
     } catch (error) {
-        const detail = error instanceof Error ? error.message : String(error);
-        if (detail.includes('missing from raw transaction index')) {
+        if (errorMessage(error).includes('missing from raw transaction index')) {
             throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
         }
         throw error;
     }
+
+    // A bounded seek on the covered tip index finds the last block boundary
+    // at or before the location. Ranges are contiguous, so the next height owns it.
+    const predecessors = await sqlQuery(
+        sqlUrl,
+        transactionHeightPredecessorQuery(location),
+        minSequenceNumber,
+        signal,
+    );
+    const predecessor = firstTableRow(predecessors.table);
+    const height = containingTransactionHeight(
+        predecessor ? expectBigint(columnValue(predecessor, BLOCK_META_HEIGHT), BLOCK_META_HEIGHT) : null,
+    );
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_TRANSACTIONS_TIP}, ${BLOCK_META_TX_COUNT}
+            SELECT ${BLOCK_META_TRANSACTIONS_TIP}, ${BLOCK_META_TX_COUNT}
             FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_TRANSACTIONS_TIP} > ${location.toString()}
-            ORDER BY ${BLOCK_META_HEIGHT} ASC
+            WHERE ${BLOCK_META_HEIGHT} = ${height.toString()}
             LIMIT 1
         `,
         minSequenceNumber,
@@ -594,13 +583,14 @@ async function fetchTransactionProofMetadata(
     // retain this transaction without identifying its original block.
     const tip = expectBigint(columnValue(row, BLOCK_META_TRANSACTIONS_TIP), BLOCK_META_TRANSACTIONS_TIP);
     const count = expectBigint(columnValue(row, BLOCK_META_TX_COUNT), BLOCK_META_TX_COUNT);
-    if (location < tip - count) {
+    if (location < tip - count || location >= tip) {
         throw new Error(`tx digest ${shortHex(digest)} is not finalized yet in the selected block range`);
     }
-    return {
-        height: expectBigint(columnValue(row, BLOCK_META_HEIGHT), BLOCK_META_HEIGHT),
-        location,
-    };
+    return { height, location };
+}
+
+function uncoveredError(subject: string): Error {
+    return new Error(`${subject} is not yet covered by a provable finalization`);
 }
 
 function transactionProofErrorDetail(
@@ -608,9 +598,8 @@ function transactionProofErrorDetail(
     target: FinalizedTransactionTarget,
     metadata: TransactionProofMetadata,
 ): string {
-    const reason = error instanceof Error ? error.message : String(error);
     return [
-        reason,
+        errorMessage(error),
         `height ${target.height.toString()}`,
         `location ${metadata.location.toString()}`,
         `tip ${transactionProofTip(target.transactionsTip).toString()}`,
@@ -688,7 +677,9 @@ async function finalizedTransactionTarget(
 ): Promise<FinalizedTransactionTarget> {
     signal?.throwIfAborted();
     if (height < 0n) throw new Error('finalized height must be non-negative');
-    const key = JSON.stringify([trimTrailingSlash(storeUrl), simplexVerificationMaterial, height.toString()]);
+
+    // URLs cannot contain spaces, so the material suffix is unambiguous.
+    const key = `${height} ${trimTrailingSlash(storeUrl)} ${simplexVerificationMaterial}`;
     const cached = finalizedTargets.get(key);
     if (cached) {
         finalizedTargets.delete(key);
@@ -998,6 +989,11 @@ async function fetchAccountProofRow(
     minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<AccountProofMetadata> {
+    const predicates = [`${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}`];
+    if (beforeLocation !== undefined) {
+        predicates.push(`${ACCOUNT_META_QMDB_LOCATION} < ${beforeLocation.toString()}`);
+    }
+
     const result = await sqlQuery(
         sqlUrl,
         `
@@ -1007,8 +1003,7 @@ async function fetchAccountProofRow(
                 ${ACCOUNT_META_NONCE_BITMAP},
                 ${ACCOUNT_META_QMDB_LOCATION}
             FROM ${ACCOUNT_META_TABLE}
-            WHERE ${ACCOUNT_META_ACCOUNT} = ${fixedBinaryLiteral(account)}
-                ${beforeLocation === undefined ? '' : `AND ${ACCOUNT_META_QMDB_LOCATION} < ${beforeLocation.toString()}`}
+            WHERE ${predicates.join(' AND ')}
             ORDER BY ${ACCOUNT_META_QMDB_LOCATION} DESC
             LIMIT 1
         `,
@@ -1020,8 +1015,6 @@ async function fetchAccountProofRow(
         throw new Error(`account ${shortHex(toHex(account))} is not indexed`);
     }
     return {
-        account: toHex(account),
-        sqlUrl: trimTrailingSlash(sqlUrl),
         sequenceNumber: result.sequenceNumber,
         balance: expectBigint(columnValue(row, ACCOUNT_META_BALANCE), ACCOUNT_META_BALANCE),
         nonce: expectBigint(columnValue(row, ACCOUNT_META_NONCE_BASE), ACCOUNT_META_NONCE_BASE),
@@ -1184,14 +1177,6 @@ function writeU64Be(bytes: Uint8Array, offset: number, value: bigint) {
         bytes[offset + index] = Number(remaining & 0xffn);
         remaining >>= 8n;
     }
-}
-
-function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
-    if (left.length !== right.length) return false;
-    for (let index = 0; index < left.length; index++) {
-        if (left[index] !== right[index]) return false;
-    }
-    return true;
 }
 
 function toHex(bytes: Uint8Array): string {

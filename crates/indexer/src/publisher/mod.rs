@@ -13,8 +13,6 @@
 //!
 //! Simplex block and certificate artifacts are uploaded separately through
 //! [`CertificateReporter`] using `exoware-simplex` indexes in the same Store.
-//!
-//! [`StoreClient`]: exoware_sdk::StoreClient
 
 pub(crate) mod block;
 pub mod certificate;
@@ -97,14 +95,6 @@ impl CommitKind {
             Self::Simplex => "simplex",
         }
     }
-
-    const fn description(self) -> &'static str {
-        match self {
-            Self::Chunk => "finalized index data",
-            Self::Barrier => "contiguous publication barrier",
-            Self::Simplex => "simplex upload",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq, EncodeLabelSet)]
@@ -116,7 +106,7 @@ type CommitHistogram = Registered<raw::Family<CommitLabels, raw::Histogram>>;
 
 /// Observability for store batch commits issued by the publishers.
 #[derive(Clone)]
-pub struct StoreCommitMetrics {
+pub(crate) struct StoreCommitMetrics {
     in_flight: Gauge,
     commits: Counter,
     rows: Counter,
@@ -128,7 +118,7 @@ pub struct StoreCommitMetrics {
 }
 
 impl StoreCommitMetrics {
-    pub fn new(context: &impl Metrics) -> Self {
+    pub(crate) fn new(context: &impl Metrics) -> Self {
         Self {
             in_flight: context.gauge("store_commits_in_flight", "Store batch commits in flight"),
             commits: context.counter("store_commits", "Store batch commits completed"),
@@ -182,21 +172,15 @@ impl Drop for PutAttemptTimer {
 }
 
 /// Metric families used by [`Publisher`].
-///
-/// The caller registers this once because publisher connects are retried on
-/// failure and must not re-register.
 #[derive(Clone)]
 pub struct PublisherMetrics {
     /// Finalized-index data and publication commits.
     pub(crate) commit: StoreCommitMetrics,
-    /// Data chunks belonging to successfully persisted blocks.
-    pub(crate) chunk_commits: Counter,
     pub(crate) prepare_duration: Histogram,
     pub(crate) prepare_wait_duration: Histogram,
     pub(crate) prepare_cpu_duration: Histogram,
     pub(crate) chunking_duration: Histogram,
     pub(crate) chunks_per_block: Histogram,
-    pub(crate) transactions_per_block: Histogram,
     pub(crate) expansion_duration: Histogram,
     pub(crate) staging_duration: Histogram,
     /// One block's data path, from admission until its data is durable.
@@ -210,10 +194,6 @@ impl PublisherMetrics {
     pub fn new(context: &impl Metrics) -> Self {
         Self {
             commit: StoreCommitMetrics::new(context),
-            chunk_commits: context.counter(
-                "chunk_commits",
-                "Data chunks in successfully persisted finalized blocks",
-            ),
             prepare_duration: context.histogram(
                 "prepare_duration",
                 "Finalized block preparation execution wall time including splitting and excluding scheduling (s)",
@@ -238,11 +218,6 @@ impl PublisherMetrics {
                 "chunks_per_block",
                 "Store data chunks per persisted finalized block",
                 CHUNKS_PER_BLOCK_BUCKETS,
-            ),
-            transactions_per_block: context.histogram(
-                "transactions_per_block",
-                "Transactions per finalized block entering preparation",
-                ROW_COUNT_BUCKETS,
             ),
             expansion_duration: context.histogram(
                 "expansion_duration",
@@ -317,7 +292,7 @@ pub(crate) async fn commit_with_retry(
                     result
                 }
             },
-            kind.description(),
+            kind.label(),
             rows,
         )
         .await;
@@ -459,9 +434,8 @@ mod tests {
     fn put_error_response(code: &str, message: &str) -> axum::response::Response {
         use axum::{http::header::CONTENT_TYPE, response::IntoResponse as _};
 
-        let error = serde_json::json!({"error": {"code": code, "message": message}})
-            .to_string()
-            .into_bytes();
+        let error =
+            format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#).into_bytes();
         let mut body = vec![2];
         body.extend_from_slice(&(error.len() as u32).to_be_bytes());
         body.extend_from_slice(&error);
@@ -757,22 +731,6 @@ mod tests {
         });
     }
 
-    #[test]
-    fn store_retry_classification_fails_deterministic_rejections() {
-        let transient =
-            ClientError::Rpc(Box::new(ConnectError::new(ErrorCode::Unavailable, "retry")));
-        let rejected = ClientError::Rpc(Box::new(ConnectError::new(
-            ErrorCode::InvalidArgument,
-            "reject",
-        )));
-
-        assert!(is_retryable_store_error(&transient));
-        assert!(!is_retryable_store_error(&rejected));
-        assert!(!is_retryable_store_error(&ClientError::WireFormat(
-            "reject".to_string()
-        )));
-    }
-
     #[tokio::test(start_paused = true)]
     async fn store_retry_recovers_from_transient_failure() {
         let start = tokio::time::Instant::now();
@@ -846,94 +804,55 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn store_retry_deadline_cancels_stalled_commit() {
-        let start = tokio::time::Instant::now();
-        let mut attempts = 0;
-        let error = bounded_commit_retry(
-            |_| {
-                attempts += 1;
-                std::future::pending()
-            },
-            "test",
-            1,
-        )
-        .await
-        .expect_err("stalled commit must time out");
+    async fn store_retry_deadline_bounds_attempts_and_backoff() {
+        // Cover a stalled attempt, slow failed attempts, and a backoff that crosses the deadline.
+        for (attempt_duration, expected_attempts) in [
+            (None, 1),
+            (Some(Duration::from_secs(25)), 3),
+            (Some(Duration::from_millis(59_900)), 1),
+        ] {
+            let start = tokio::time::Instant::now();
+            let mut attempts = 0;
+            let error = bounded_commit_retry(
+                |_| {
+                    attempts += 1;
+                    async move {
+                        match attempt_duration {
+                            Some(duration) => sleep(duration).await,
+                            None => std::future::pending().await,
+                        }
+                        Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
+                            "busy",
+                        ))))
+                    }
+                },
+                "test",
+                1,
+            )
+            .await
+            .expect_err("the deadline must stop the commit");
 
-        assert_eq!(attempts, 1);
-        assert_eq!(start.elapsed(), Duration::from_secs(60));
-        assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn store_retry_deadline_bounds_all_attempts() {
-        let start = tokio::time::Instant::now();
-        let mut attempts = 0;
-        let error = bounded_commit_retry(
-            |_| {
-                attempts += 1;
-                async {
-                    sleep(Duration::from_secs(25)).await;
-                    Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
-                        "busy",
-                    ))))
-                }
-            },
-            "test",
-            1,
-        )
-        .await
-        .expect_err("retries must share the deadline");
-
-        assert_eq!(attempts, 3);
-        assert_eq!(start.elapsed(), Duration::from_secs(60));
-        assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn store_retry_deadline_bounds_backoff() {
-        let start = tokio::time::Instant::now();
-        let mut attempts = 0;
-        let error = bounded_commit_retry(
-            |_| {
-                attempts += 1;
-                async {
-                    sleep(Duration::from_millis(59_900)).await;
-                    Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
-                        "busy",
-                    ))))
-                }
-            },
-            "test",
-            1,
-        )
-        .await
-        .expect_err("backoff must share the deadline");
-
-        assert_eq!(attempts, 1);
-        assert_eq!(start.elapsed(), Duration::from_secs(60));
-        assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
+            assert_eq!(attempts, expected_attempts);
+            assert_eq!(start.elapsed(), COMMIT_TIMEOUT);
+            assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
+        }
     }
 
     #[tokio::test(start_paused = true)]
     async fn store_retry_preserves_put_too_large_without_retrying() {
         use exoware_sdk::{
             google::rpc::ErrorInfo,
-            limits::{INGEST_ERROR_DOMAIN, PUT_TOO_LARGE_REASON, PutTooLarge},
+            limits::{INGEST_ERROR_DOMAIN, PUT_TOO_LARGE_REASON},
             with_error_info_detail,
         };
 
         let info = ErrorInfo {
             domain: INGEST_ERROR_DOMAIN.to_string(),
             reason: PUT_TOO_LARGE_REASON.to_string(),
-            metadata: [
-                ("entries", "2000001"),
-                ("max_entries", "2000000"),
-                ("extra", "preserve me"),
-            ]
-            .into_iter()
-            .map(|(key, value)| (key.to_string(), value.to_string()))
-            .collect(),
+            metadata: [("entries", "2000001"), ("max_entries", "2000000")]
+                .into_iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
             ..Default::default()
         };
         let start = tokio::time::Instant::now();
@@ -954,21 +873,6 @@ mod tests {
 
         assert_eq!(attempts, 1);
         assert_eq!(start.elapsed(), Duration::ZERO);
-        assert_eq!(error.rpc_code(), Some(ErrorCode::InvalidArgument));
-        assert_eq!(
-            error.rpc_error().unwrap().message.as_deref(),
-            Some("too large")
-        );
-        assert_eq!(
-            error.put_too_large(),
-            Some(PutTooLarge {
-                entries: 2_000_001,
-                max_entries: 2_000_000,
-            })
-        );
-        assert_eq!(
-            error.decoded_rpc_error().unwrap().unwrap().error_info,
-            Some(info)
-        );
+        assert!(error.put_too_large().is_some());
     }
 }

@@ -6,6 +6,7 @@ import {
     useState,
     type CSSProperties,
 } from 'react';
+import { SqlClient } from '@exowarexyz/sql';
 import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
@@ -19,7 +20,7 @@ import {
     wakeCoveredReconciliations,
     type TransactionReconciliation,
 } from './reconciliationQueue';
-import { type ObservedBlock, subscribeBlocks } from './indexer';
+import { type ObservedBlock, subscribeBlocksFromTargets } from './indexer';
 import {
     fetchAccount,
     submitTransactions,
@@ -58,7 +59,7 @@ import {
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
-    isRetryableSequenceConsistencyError,
+    isConsistencyNotReadyError,
     retryAccountWork,
 } from './proofRetry';
 import {
@@ -314,8 +315,7 @@ export default function App() {
         };
 
         (async () => {
-            for await (const block of subscribeBlocks(indexerUrl, storeUrl, {
-                targets: blockTargets,
+            for await (const block of subscribeBlocksFromTargets(new SqlClient(indexerUrl), blockTargets, {
                 signal: controller.signal,
                 onError: (message) =>
                     setStatus({ kind: 'error', message: `backend error: ${message}` }),
@@ -330,11 +330,7 @@ export default function App() {
             for await (const target of proofTargets) {
                 if (controller.signal.aborted) return;
                 setPublishedProofTarget((current) =>
-                    current &&
-                    (current.height >= target.height ||
-                        current.sequenceNumber > target.sequenceNumber)
-                        ? current
-                        : target,
+                    current && current.height >= target.height ? current : target,
                 );
             }
         })().catch(failed);
@@ -534,7 +530,7 @@ export default function App() {
                 signal: controller.signal,
             }),
             controller.signal,
-            isRetryableSequenceConsistencyError,
+            isConsistencyNotReadyError,
         )
             .then((page) => {
                 if (controller.signal.aborted) return;
@@ -682,18 +678,20 @@ export default function App() {
         };
     }, [historyKey]);
 
+    const requeueReconciliation = (digest: string) => {
+        reconciliationSequenceRef.current += 1;
+        reconciliationOrderRef.current.set(digest, reconciliationSequenceRef.current);
+        setHistory((current) =>
+            markReconciliationWaiting(digest, WAITING_FINALIZATION_PROOF.detail, current),
+        );
+    };
+
     const wakeReconciliations = (height: bigint) => {
         wakeCoveredReconciliations(
             reconciliationsRef.current,
             height,
             (timer) => window.clearTimeout(timer),
-            (digest) => {
-                reconciliationSequenceRef.current += 1;
-                reconciliationOrderRef.current.set(digest, reconciliationSequenceRef.current);
-                setHistory((current) =>
-                    markReconciliationWaiting(digest, WAITING_FINALIZATION_PROOF.detail, current),
-                );
-            },
+            requeueReconciliation,
         );
     };
 
@@ -879,18 +877,7 @@ export default function App() {
                         ) {
                             return;
                         }
-                        reconciliationSequenceRef.current += 1;
-                        reconciliationOrderRef.current.set(
-                            tx.digest,
-                            reconciliationSequenceRef.current,
-                        );
-                        setHistory((current) =>
-                            markReconciliationWaiting(
-                                tx.digest,
-                                WAITING_FINALIZATION_PROOF.detail,
-                                current,
-                            ),
-                        );
+                        requeueReconciliation(tx.digest);
                     }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
                     const latest = publishedProofTargetRef.current;
                     if (latest) wakeReconciliations(latest.height);

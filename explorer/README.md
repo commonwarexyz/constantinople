@@ -8,7 +8,7 @@ proofs through QMDB, and renders both as they arrive.
 
 The explorer bootstraps the newest publication target with one Store range
 read, then keeps it current through a direct Store subscription. A separate
-SQL subscription caches up to 128 `block_meta` rows. Each row is displayed
+[SQL subscription][rpc] caches recent `block_meta` rows. Each row is displayed
 only after a matching publication target covers its commit sequence. This
 keeps block delivery independent of SQL query visibility delays. Bootstrap
 and cache misses use point queries under the target's Store sequence floor.
@@ -109,15 +109,17 @@ metadata service (`metadata-indexer` bin from `constantinople-indexer`), the
 QMDB facade (`qmdb-indexer` bin), and this dev server to the printed mprocs command list (see
 [`bin/deploy/src/local.rs`](../bin/deploy/src/local.rs)).
 
-## Build
+## Verification
+
+Run from the repository root:
 
 ```sh
+just explorer-test
 just explorer-build
 ```
 
-Outputs a static bundle to `dist/`. The explorer lives outside the Cargo
-workspace and is **not** exercised by `just test`. Run `just explorer-test`
-for client tests and `just explorer-build` to type-check and bundle the app.
+The build outputs a static bundle to `explorer/dist/`. The Explorer tests run
+separately from the Rust workspace's `just test` recipe.
 
 ## Styling: why we don't depend on www-sacred directly
 

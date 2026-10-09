@@ -1172,7 +1172,7 @@ dependencies = [
  "commonware-storage",
  "commonware-utils",
  "futures",
- "prometheus-client 0.25.0",
+ "prometheus-client",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "thiserror",
@@ -1317,7 +1317,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
- "prometheus-client 0.25.0",
+ "prometheus-client",
  "rand 0.10.2",
  "rand_core 0.10.1",
  "rayon",
@@ -1657,10 +1657,9 @@ dependencies = [
  "futures",
  "http-body",
  "mimalloc",
- "prometheus-client 0.24.1",
+ "prometheus-client",
  "rand 0.10.2",
  "serde",
- "serde_json",
  "serde_yaml",
  "tempfile",
  "thiserror",
@@ -1780,17 +1779,15 @@ dependencies = [
  "constantinople-primitives",
  "futures",
  "mimalloc",
- "opentelemetry",
- "opentelemetry_sdk",
  "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
+ "thiserror",
  "tokio",
  "tower",
  "tower-http 0.6.11",
  "tracing",
- "tracing-opentelemetry",
  "tracing-subscriber",
 ]
 
@@ -4808,18 +4805,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8fd00f0bb2e90d81d1044c2b32617f68fcb9fa3bb7640c23e9c748e53fb30934"
 dependencies = [
  "unicode-ident",
-]
-
-[[package]]
-name = "prometheus-client"
-version = "0.24.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cca3d75b4566b9a29fe1ed623587fb058e826eb329a0be4b7c4da1ebb2d7a6ca"
-dependencies = [
- "dtoa",
- "itoa",
- "parking_lot",
- "prometheus-client-derive-encode",
 ]
 
 [[package]]

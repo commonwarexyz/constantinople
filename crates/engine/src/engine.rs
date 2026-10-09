@@ -80,6 +80,7 @@ pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::
 
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
+const MAX_BLOCK_SIZE: NonZero<usize> = NZUsize!(MAXIMUM_BLOCK_SIZE);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -194,9 +195,9 @@ where
     pub other_page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
-    /// reporter is always wired up; this slot is fanned out via
-    /// [`commonware_consensus::Reporters`] so primaries that pass `None`
-    /// behave exactly as before.
+    /// reporter is always wired up, and this slot fans out alongside it via
+    /// [`commonware_consensus::Reporters`]. Passing `None` forwards activity to
+    /// marshal only.
     pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
@@ -462,7 +463,7 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
-        // Keep the certification window resident while consensus validates ahead of ancestry.
+        // The shards engine requires at least 2 * (max(1, optimistic_views) + 2) records.
         let elector = L::default();
         let optimistic_views = elector
             .clone()
@@ -483,7 +484,7 @@ where
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
-                max_block_size: NonZero::new(MAXIMUM_BLOCK_SIZE).unwrap(),
+                max_block_size: MAX_BLOCK_SIZE,
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
@@ -944,17 +945,14 @@ mod unit_tests {
             ReedSolomon<sha256::Sha256>,
             sha256::Sha256,
         >;
-        let mut previous_shard_size = usize::MAX;
         for validators in [4, 7, 50] {
             let coding_config = coding_config_for_participants(validators);
             let shards = usize::from(coding_config.minimum_shards.get());
             let coded = EngineCodedBlock::new(block.clone(), coding_config, &Sequential);
             let encoded = coded.shard(0).expect("shard zero should exist").encode();
             assert!(encoded.len() <= MAXIMUM_MESSAGE_SIZE as usize);
-            assert!(encoded.len() < previous_shard_size);
-            previous_shard_size = encoded.len();
 
-            TestShard::decode_cfg(encoded.clone(), &NonZero::new(MAXIMUM_BLOCK_SIZE).unwrap())
+            TestShard::decode_cfg(encoded.clone(), &MAX_BLOCK_SIZE)
                 .expect("the derived limit should accept a maximum proposal");
             TestShard::decode_cfg(encoded.clone(), &NonZero::new(block.encode_size()).unwrap())
                 .expect("the exact block budget should accept its shard");

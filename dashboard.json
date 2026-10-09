@@ -5862,7 +5862,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "indexer_finalized_queue_pending_uploads{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
+          "expr": "indexer_finalized_queue_tip{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"} - indexer_finalized_queue_floor{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}",
           "legendFormat": "pending",
           "range": true,
           "refId": "A"
@@ -6546,17 +6546,6 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_completion_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
-          "legendFormat": "ack",
-          "range": true,
-          "refId": "F"
-        },
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "PBFA97CFB590B2093"
-          },
-          "editorMode": "code",
           "expr": "histogram_quantile(0.95, sum by(le) (rate(indexer_finalized_upload_receipt_sync_duration_bucket{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])))",
           "legendFormat": "receipt sync (per section)",
           "range": true,
@@ -6921,7 +6910,7 @@
             "uid": "PBFA97CFB590B2093"
           },
           "editorMode": "code",
-          "expr": "sum(rate(indexer_publisher_chunk_commits_total{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / sum(rate(indexer_publisher_persist_duration_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
+          "expr": "sum(rate(indexer_publisher_chunks_per_block_sum{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval])) / sum(rate(indexer_publisher_chunks_per_block_count{deployer_name=~\"$Validator\", deployer_region=~\"$Region\"}[$__rate_interval]))",
           "legendFormat": "average",
           "range": true,
           "refId": "A"

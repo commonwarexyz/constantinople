@@ -8,8 +8,8 @@ use crate::{
     SPAMMER_BINARY_FILE, SPAMMER_CONFIG_FILE, STORAGE_CLASS, SecondaryRole, SpammerConfig,
     VALIDATOR_BINARY_FILE, ValidatorConfig, absolute_path, default_bootstrappers,
     ensure_output_dir_missing, generate_deployer_tag, generate_remote_cluster_material,
-    indexer_enabled, ports::Ports, secondary_roles, total_secondaries, validate_generate_args,
-    write_simplex_verification_material, write_yaml_config,
+    indexer_enabled, ports::Ports, secondary_roles, secondary_runtime_threads, total_secondaries,
+    validate_generate_args, write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_deployer::aws::{self, METRICS_PORT};
@@ -211,7 +211,7 @@ fn build_secondaries(
         let public_key = &material.secondary_public_keys[secondary_index];
         let public_key_hex = hex(&public_key.encode());
 
-        let (worker_threads, rayon_threads) = crate::secondary_runtime_threads(args, role);
+        let (worker_threads, rayon_threads) = secondary_runtime_threads(args, role);
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
@@ -406,14 +406,12 @@ fn build_deployer_config(
             availability_zone_group: (secondary.config.indexer.is_some()
                 && local_chain_indexer(args, remote))
             .then(|| EXOWARE_AVAILABILITY_ZONE_GROUP.to_string()),
-            instance_type: if secondary.config.indexer.is_some() {
-                remote
-                    .indexer_instance_type
-                    .clone()
-                    .unwrap_or_else(|| remote.instance_type.clone())
-            } else {
-                remote.instance_type.clone()
-            },
+            instance_type: secondary
+                .config
+                .indexer
+                .as_ref()
+                .and(remote.indexer_instance_type.clone())
+                .unwrap_or_else(|| remote.instance_type.clone()),
             storage_size: remote.storage_size,
             storage_class: STORAGE_CLASS.to_string(),
             storage_iops: remote.storage_iops,
@@ -562,8 +560,8 @@ mod tests {
         GenerateTarget, LocalArgs, METADATA_INDEXER_BINARY_FILE, QMDB_INDEXER_BINARY_FILE,
         RemoteArgs, STORAGE_CLASS, StartupModeConfig, VALIDATOR_BINARY_FILE, ValidatorConfig,
         default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, generate_local_cluster_material, total_secondaries,
-        validate_generate_args,
+        default_public_key_cache_size, default_publisher_rayon_threads,
+        generate_local_cluster_material, total_secondaries, validate_generate_args,
     };
     use commonware_codec::Encode;
     use commonware_formatting::hex;
@@ -580,7 +578,7 @@ mod tests {
             rayon_threads: 2,
             indexer_worker_threads: None,
             indexer_rayon_threads: None,
-            indexer_publisher_rayon_threads: crate::default_publisher_rayon_threads(),
+            indexer_publisher_rayon_threads: default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),

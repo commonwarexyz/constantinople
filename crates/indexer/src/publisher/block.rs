@@ -63,21 +63,6 @@ where
     })
 }
 
-fn indexed_transactions<H, P>(
-    block: &EngineBlock<H, P>,
-) -> impl Iterator<Item = IndexedTransaction<H::Digest>> + '_
-where
-    H: Hasher,
-    P: PublicKey,
-{
-    let height = block.header.height;
-    block
-        .body
-        .iter()
-        .enumerate()
-        .filter_map(move |(idx, lazy)| index_transaction::<H>(height, idx, lazy))
-}
-
 pub(crate) fn encode_block_rows<H, P>(
     block: &EngineBlock<H, P>,
     finalized_ts_micros: i64,
@@ -94,7 +79,12 @@ where
         transactions = body_len
     )
     .entered();
-    let indexed_txs = indexed_transactions(block).collect::<Vec<_>>();
+    let indexed_txs = block
+        .body
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, lazy)| index_transaction::<H>(height, idx, lazy))
+        .collect::<Vec<_>>();
     let tx_count = u64::try_from(indexed_txs.len()).expect("transaction count fits u64");
     let append_start = block
         .header
@@ -103,10 +93,8 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    // Three rows per transaction. No per-transaction proof row is emitted
-    // because readers derive the finalized height from block_meta by
-    // transactions_tip, and every extra row per transaction lands in the bulk
-    // Store commit that bounds indexer throughput.
+    // Readers derive a transaction's height from block_meta, so no
+    // per-transaction proof row is needed.
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
     sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
@@ -115,10 +103,16 @@ where
         transaction_digests.push(tx.digest);
         let idx_u32 = u32::try_from(tx.block_index).expect("transaction index fits u32");
         let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
-        let mut digest = [0u8; 32];
-        digest.copy_from_slice(tx.digest.as_ref());
-        let mut sender = [0u8; AccountKey::SIZE];
-        sender.copy_from_slice(tx.sender.as_ref());
+        let digest: [u8; 32] = tx
+            .digest
+            .as_ref()
+            .try_into()
+            .expect("transaction digest has fixed width");
+        let sender: [u8; AccountKey::SIZE] = tx
+            .sender
+            .as_ref()
+            .try_into()
+            .expect("account key has fixed width");
         let receiver = tx.to;
         sql.push(encode_tx_meta_row(TxMetaRow {
             digest,

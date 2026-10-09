@@ -7,7 +7,7 @@ import { getEventListeners } from 'node:events';
 
 import {
     createSharedProofTargets,
-    createSharedProofTargetsFromStore,
+    shareProofTargets,
     decodePublishedProofTarget,
     subscribePublishedProofTargetsFromStore,
     type PublishedProofTargetStore,
@@ -34,11 +34,11 @@ test('provable target decodes its big-endian height and block digest', () => {
 
 test('provable target rejects malformed keys and digests', () => {
     assert.throws(
-        () => decodePublishedProofTarget(new Uint8Array(7), new Uint8Array(32)),
+        () => decodePublishedProofTarget(new Uint8Array(7), new Uint8Array(32), 0n),
         /key must be 8 bytes/,
     );
     assert.throws(
-        () => decodePublishedProofTarget(new Uint8Array(8), new Uint8Array(31)),
+        () => decodePublishedProofTarget(new Uint8Array(8), new Uint8Array(31), 0n),
         /digest must be 32 bytes/,
     );
 });
@@ -161,7 +161,7 @@ test('provable target subscription releases a pending bootstrap on abort', async
         query(...args: Parameters<PublishedProofTargetStore['query']>) {
             seenSignal = args[6]?.signal;
             started();
-            return new Promise<never>(() => {});
+            return untilAborted(seenSignal);
         },
         subscribe() {
             return batches([]);
@@ -432,7 +432,7 @@ test('shared targets use one query and stream while retaining every slow-consume
             });
         },
     } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store, { signal: controller.signal });
+    const shared = shareProofTargets(store, { signal: controller.signal });
     const proof = shared.subscribe();
     const blocks = shared.subscribe();
     for (const height of [4n, 5n, 6n, 7n]) assert.equal((await proof.next()).value?.height, height);
@@ -455,11 +455,11 @@ test('a consumer abort releases only that consumer while owner close cancels boo
     const store = {
         query(...args: Parameters<PublishedProofTargetStore['query']>) {
             querySignal = args[6]?.signal;
-            return new Promise<never>(() => {});
+            return untilAborted(querySignal);
         },
         subscribe() { return batches([]); },
     } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store, { signal: owner.signal });
+    const shared = shareProofTargets(store, { signal: owner.signal });
     const first = shared.subscribe({ signal: consumer.signal });
     const second = shared.subscribe();
     const firstPending = first.next();
@@ -482,7 +482,7 @@ test('shared terminal errors reject all consumers and late subscribers', async (
             return batches([{ sequenceNumber: 15n, entries: [{ key: heightKey(5n), value: new Uint8Array(1) }] }]);
         },
     } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store);
+    const shared = shareProofTargets(store);
     const first = shared.subscribe();
     const second = shared.subscribe();
     await Promise.all([first.next(), second.next()]);
@@ -499,11 +499,11 @@ test('return releases a waiting shared iterator without aborting its peers', asy
     const store = {
         query(...args: Parameters<PublishedProofTargetStore['query']>) {
             querySignal = args[6]?.signal;
-            return new Promise<never>(() => {});
+            return untilAborted(querySignal);
         },
         subscribe() { return batches([]); },
     } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store);
+    const shared = shareProofTargets(store);
     const first = shared.subscribe();
     const second = shared.subscribe();
     const pending = first.next();
@@ -521,7 +521,7 @@ test('an aborted shared owner starts no bootstrap and delivers no cached target'
         async query() { assert.fail('aborted owner queried Store'); },
         subscribe() { assert.fail('aborted owner opened a stream'); },
     } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store, { signal: controller.signal });
+    const shared = shareProofTargets(store, { signal: controller.signal });
     assert.deepEqual(await shared.subscribe().next(), { done: true, value: undefined });
     shared.close();
 });
@@ -588,34 +588,17 @@ test('invalid persisted hints and storage failures cannot prevent bootstrap', as
     shared.close();
 });
 
-test('a slow consumer fails explicitly at the queue bound while proofs keep advancing', async () => {
-    const store = {
-        async query() { return queryResult(0n, 0n); },
-        async *subscribe(_request: unknown, options: { signal?: AbortSignal } = {}) {
-            for (let height = 1n; height <= 4100n; height++) {
-                yield { sequenceNumber: height, entries: [{ key: heightKey(height), value: digest(1) }] };
-            }
-            await new Promise<void>((resolve) => {
-                if (options.signal?.aborted) resolve();
-                else options.signal?.addEventListener('abort', () => resolve(), { once: true });
-            });
-        },
-    } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store);
-    const slow = shared.subscribe();
-    const fast = shared.subscribe();
-    for (let height = 0n; height <= 4100n; height++) {
-        assert.equal((await fast.next()).value?.height, height);
-    }
-    await assert.rejects(slow.next(), /exceeded 4096 queued targets/);
-    shared.close();
-});
-
 function mockHeightStorage(context: TestContext, storage: Pick<Storage, 'getItem' | 'setItem'>) {
     const descriptor = Object.getOwnPropertyDescriptor(globalThis, 'localStorage');
     Object.defineProperty(globalThis, 'localStorage', { configurable: true, value: storage });
     context.after(() => {
         if (descriptor) Object.defineProperty(globalThis, 'localStorage', descriptor);
         else Reflect.deleteProperty(globalThis, 'localStorage');
+    });
+}
+
+function untilAborted(signal?: AbortSignal): Promise<never> {
+    return new Promise((_resolve, reject) => {
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
 }

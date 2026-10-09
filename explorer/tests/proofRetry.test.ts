@@ -4,13 +4,15 @@ import { Code, ConnectError } from '@connectrpc/connect';
 import { HttpError } from '@exowarexyz/sdk';
 
 import {
+    isConsistencyNotReadyError,
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
-    isRetryableSequenceConsistencyError,
     retryAccountWork,
 } from '../src/proofRetry.ts';
-import { assertTransactionLocationBeforeTip, transactionProofTip } from '../src/proofMath.ts';
+import { transactionProofTip } from '../src/proofMath.ts';
+
+const CONSISTENCY_NOT_READY = '[aborted] minimum consistency token is not yet visible';
 
 test('SQL tx metadata misses are retried while the indexer catches up', () => {
     assert.equal(
@@ -20,23 +22,16 @@ test('SQL tx metadata misses are retried while the indexer catches up', () => {
 });
 
 test('sequence freshness gates are retried while a query node catches up', () => {
-    assert.equal(
-        isRetryableProofError('[aborted] consistency_not_ready'),
-        true,
-    );
-    assert.equal(
-        isRetryableAccountProofError('[aborted] consistency_not_ready'),
-        true,
-    );
-    assert.equal(
-        isRetryableSequenceConsistencyError('[aborted] consistency_not_ready'),
-        true,
-    );
-    assert.equal(isRetryableSequenceConsistencyError('[unavailable] disconnected'), false);
+    for (const detail of [CONSISTENCY_NOT_READY, `HTTP error: 409 ${CONSISTENCY_NOT_READY}`]) {
+        assert.equal(isRetryableProofError(detail), true);
+        assert.equal(isRetryableAccountProofError(detail), true);
+        assert.equal(isConsistencyNotReadyError(detail), true);
+    }
+    assert.equal(isConsistencyNotReadyError('[unavailable] disconnected'), false);
 });
 
 test('structured consistency lag is retried without accepting unrelated aborted errors', () => {
-    const cause = new ConnectError('minimum consistency token is not yet visible', Code.Aborted);
+    const cause = new ConnectError('consistency lag', Code.Aborted);
     cause.details.push({
         type: 'google.rpc.ErrorInfo',
         value: new Uint8Array([
@@ -78,14 +73,15 @@ test('account work remains pending beyond the old retry bound', async () => {
         async () => {
             attempts += 1;
             if (attempts <= 13) {
-                throw new Error('[aborted] consistency_not_ready');
+                throw new Error(CONSISTENCY_NOT_READY);
             }
             return 'ready';
         },
         controller.signal,
-        isRetryableSequenceConsistencyError,
+        isConsistencyNotReadyError,
         async (delayMs) => {
             delays.push(delayMs);
+            return true;
         },
     );
 
@@ -103,13 +99,13 @@ test('account work stops when retry backoff is aborted', async () => {
         retryAccountWork(
             async () => {
                 attempts += 1;
-                throw new Error('[aborted] consistency_not_ready');
+                throw new Error(CONSISTENCY_NOT_READY);
             },
             controller.signal,
-            isRetryableSequenceConsistencyError,
+            isConsistencyNotReadyError,
             async () => {
                 controller.abort();
-                throw new Error('account lookup cancelled');
+                return false;
             },
         ),
         /account lookup cancelled/,
@@ -135,6 +131,7 @@ test('account proof retries adopt a newer published target', async () => {
         isRetryableAccountProofError,
         async () => {
             publishedTarget = { height: 42n, sequenceNumber: 705n };
+            return true;
         },
     );
 
@@ -165,17 +162,6 @@ test('non-indexer proof errors are not retried forever', () => {
 
 test('QMDB transaction proof tip uses inclusive operation location', () => {
     assert.equal(transactionProofTip(128n), 127n);
-});
-
-test('latest-root transaction proofs allow locations before the sync floor', () => {
-    assert.doesNotThrow(() => assertTransactionLocationBeforeTip(567443n, 900000n));
-});
-
-test('latest-root transaction proofs reject only future locations', () => {
-    assert.throws(
-        () => assertTransactionLocationBeforeTip(900000n, 900000n),
-        /outside finalized transaction range/,
-    );
 });
 
 test('account proof index catch-up errors are retried', () => {
@@ -235,7 +221,7 @@ test('deterministic account proof failures are terminal', async () => {
                 },
                 controller.signal,
                 isRetryableAccountProofError,
-                async () => {},
+                async () => true,
             ),
             new RegExp(detail),
         );

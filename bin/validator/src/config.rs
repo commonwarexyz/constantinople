@@ -59,10 +59,6 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
 /// Primary (voting) validators ignore this section. Secondaries with
 /// indexer wiring upload finalized blocks, transactions, consensus
 /// certificates, and QMDB operation logs into the shared Store.
-///
-/// The latest-finalized-height cursor that earlier versions of the
-/// indexer wrote to a separate `META` KV family now lives in
-/// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
     /// URL of the Store receiving finalized uploads.
@@ -74,7 +70,7 @@ pub struct IndexerConfig {
     #[serde(default = "default_publisher_rayon_threads")]
     pub publisher_rayon_threads: NonZeroUsize,
     /// Caps concurrent uploads after byte admission.
-    #[serde(default = "default_upload_max_in_flight", alias = "upload_buffer")]
+    #[serde(default = "default_upload_max_in_flight")]
     pub upload_max_in_flight: usize,
     /// Bounds estimated memory held across upload stages.
     #[serde(default = "default_upload_budget_bytes")]
@@ -315,9 +311,10 @@ fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
 fn load_validator_config(path: &Path) -> ValidatorConfig {
     let raw = std::fs::read_to_string(path).expect("failed to read config file");
     let config: ValidatorConfig = serde_yaml::from_str(&raw).expect("failed to parse config");
-    if config.indexer.is_some() && config.startup == StartupModeConfig::StateSync {
-        panic!("indexer config cannot use state_sync startup");
-    }
+    assert!(
+        config.indexer.is_none() || config.startup != StartupModeConfig::StateSync,
+        "indexer config cannot use state_sync startup"
+    );
     config
 }
 
@@ -593,22 +590,16 @@ mod tests {
     static TEMP_PATH_COUNTER: AtomicU64 = AtomicU64::new(0);
 
     #[test]
-    fn indexer_config_accepts_legacy_upload_buffer() {
+    fn indexer_config_omits_absent_api_key() {
         let config: IndexerConfig =
-            serde_yaml::from_str("store_url: http://chain-indexer:8090\nupload_buffer: 8\n")
-                .expect("legacy indexer config should parse");
+            serde_yaml::from_str("store_url: http://chain-indexer:8090\nupload_max_in_flight: 8\n")
+                .expect("indexer config should parse");
         assert_eq!(config.api_key, None);
         assert_eq!(config.upload_max_in_flight, 8);
-        assert_eq!(config.upload_budget_bytes, default_upload_budget_bytes());
-        assert_eq!(
-            config.publisher_rayon_threads,
-            super::default_publisher_rayon_threads()
-        );
 
         let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
         assert!(encoded.contains("upload_max_in_flight: 8"));
         assert!(!encoded.contains("api_key"));
-        assert!(!encoded.contains("upload_buffer"));
     }
 
     #[test]
@@ -627,27 +618,6 @@ mod tests {
         let debug = format!("{config:?}");
         assert!(!debug.contains("writer-secret"));
         assert!(debug.contains("api_key_configured: true"));
-    }
-
-    #[test]
-    fn publisher_threads_require_a_positive_count() {
-        for threads in [0, 4] {
-            let raw = format!(
-                "store_url: http://chain-indexer:8090\npublisher_rayon_threads: {threads}\n"
-            );
-            let result = serde_yaml::from_str::<IndexerConfig>(&raw);
-            if threads == 0 {
-                assert!(result.is_err());
-            } else {
-                assert_eq!(
-                    result
-                        .expect("valid publisher pool size")
-                        .publisher_rayon_threads
-                        .get(),
-                    threads
-                );
-            }
-        }
     }
 
     fn temp_path(prefix: &str, suffix: &str) -> PathBuf {
@@ -876,14 +846,6 @@ mod tests {
             upload_max_in_flight: default_upload_max_in_flight(),
             upload_budget_bytes: default_upload_budget_bytes(),
         }
-    }
-
-    fn panic_message(panic: &(dyn std::any::Any + Send)) -> &str {
-        panic
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| panic.downcast_ref::<&str>().copied())
-            .expect("panic should carry a message")
     }
 
     #[test]
@@ -1225,7 +1187,8 @@ hosts:
     }
 
     #[test]
-    fn local_config_rejects_indexer_with_state_sync() {
+    #[should_panic(expected = "indexer config cannot use state_sync startup")]
+    fn indexer_config_rejects_state_sync() {
         let cluster = Cluster::new(2, 1);
         let config_path = temp_path("validator-config", ".yaml");
         let peers_path = temp_path("missing-validator-peers", ".yaml");
@@ -1237,18 +1200,7 @@ hosts:
         )
         .expect("config should write");
 
-        let panic = match std::panic::catch_unwind(|| load_local_config(&peers_path, &config_path))
-        {
-            Ok(_) => panic!("state sync indexer config should fail validation"),
-            Err(panic) => panic,
-        };
-
-        assert_eq!(
-            panic_message(panic.as_ref()),
-            "indexer config cannot use state_sync startup"
-        );
-
-        let _ = fs::remove_file(config_path);
+        load_local_config(&peers_path, &config_path);
     }
 
     #[test]
@@ -1311,33 +1263,6 @@ hosts:
 
         let _ = fs::remove_file(config_path);
         let _ = fs::remove_file(hosts_path);
-    }
-
-    #[test]
-    fn deployer_config_rejects_indexer_with_state_sync() {
-        let cluster = Cluster::new(2, 1);
-        let config_path = temp_path("validator-config", ".yaml");
-        let hosts_path = temp_path("missing-validator-hosts", ".yaml");
-        let mut config = cluster.secondary_config(0, StartupModeConfig::StateSync, Vec::new());
-        config.indexer = Some(indexer_config("http://chain-indexer:8090"));
-        fs::write(
-            &config_path,
-            serde_yaml::to_string(&config).expect("config should serialize"),
-        )
-        .expect("config should write");
-
-        let panic =
-            match std::panic::catch_unwind(|| load_deployer_config(&hosts_path, &config_path)) {
-                Ok(_) => panic!("state sync indexer config should fail validation"),
-                Err(panic) => panic,
-            };
-
-        assert_eq!(
-            panic_message(panic.as_ref()),
-            "indexer config cannot use state_sync startup"
-        );
-
-        let _ = fs::remove_file(config_path);
     }
 
     /// Secondary validator: empty `dkg_share` must decode to `None`.

@@ -701,9 +701,11 @@ where
     let transaction_batch = apply.await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    db::finalize_execution(staged, state_updates, ready(transaction_batch))
-        .await
-        .map_err(|_| STATIC_INVALID_TRANSACTION)
+    Ok(
+        db::finalize_execution(staged, state_updates, ready(transaction_batch))
+            .await
+            .expect("database merkleization during replay must succeed"),
+    )
 }
 
 pub(super) fn commitments_match<E, C, P, H, S>(

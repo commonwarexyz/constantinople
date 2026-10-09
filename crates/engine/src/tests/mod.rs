@@ -535,8 +535,8 @@ fn run_state_sync(engine: TestEngineDefinition) {
 }
 
 fn run_state_sync_deterministic(engine: TestEngineDefinition) {
-    let seeds = 0..2;
     let delayed = delay_first(&engine, 80);
+    let seeds = 0..2;
     let first = PlanBuilder::new(engine.clone())
         .link(default_link())
         .max_message_size(MAX_PROBE_MESSAGE_SIZE)

@@ -1,17 +1,20 @@
-import { type DecodedQueryResult, type DecodedSubscribeFrame, SqlClient } from '@exowarexyz/sql';
+import type { DecodedQueryResult, DecodedSubscribeFrame, SqlClient } from '@exowarexyz/sql';
+import { bytesEqual } from './codec.ts';
 import {
-    subscribePublishedProofTargets,
+    errorMessage,
+    isConsistencyNotReadyError,
+    NETWORK_RECONNECT_DELAY_MS,
     waitForRetry,
-    withAbort,
-    type PublishedProofTarget,
-} from './proofTarget.ts';
+} from './proofRetry.ts';
+import type { PublishedProofTarget } from './proofTarget.ts';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
+import {
+    BLOCK_META_DIGEST,
+    BLOCK_META_HEIGHT,
+    BLOCK_META_TABLE,
+    BLOCK_META_TX_COUNT,
+} from './transactionHeight.ts';
 
-const BLOCK_META_TABLE = 'block_meta';
-const COL_HEIGHT = 'height';
-const COL_DIGEST = 'digest';
-const COL_TX_COUNT = 'tx_count';
-const NETWORK_RECONNECT_DELAY_MS = 5_000;
 const CATCH_UP_RETRY_DELAY_MS = 250;
 const MAX_CACHED_BLOCK_ROWS = 128;
 
@@ -20,34 +23,16 @@ export interface ObservedBlock {
     readonly digest: Uint8Array;
     readonly txCount: number;
     readonly arrivedAt: number;
-    readonly sequence: bigint;
 }
 
 export interface SubscribeBlocksOptions {
-    readonly targets?: AsyncIterable<PublishedProofTarget>;
     readonly signal?: AbortSignal;
     readonly reconnectDelayMs?: number;
     readonly onError?: (message: string) => void;
     readonly onReconnect?: () => void;
 }
 
-export type BlockMetadataSqlClient = Pick<SqlClient, 'query'> & Partial<Pick<SqlClient, 'subscribe'>>;
-
-export async function* subscribeBlocks(
-    sqlUrl: string,
-    storeUrl: string,
-    options: SubscribeBlocksOptions = {},
-): AsyncGenerator<ObservedBlock, void, void> {
-    const targets = options.targets ?? subscribePublishedProofTargets(storeUrl, {
-        signal: options.signal,
-        reconnectDelayMs: options.reconnectDelayMs,
-        onError: (message) => {
-            options.onError?.(message);
-            options.onReconnect?.();
-        },
-    });
-    yield* subscribeBlocksFromTargets(new SqlClient(sqlUrl), targets, options);
-}
+export type BlockMetadataSqlClient = Pick<SqlClient, 'query' | 'subscribe'>;
 
 export async function* subscribeBlocksFromTargets(
     sql: BlockMetadataSqlClient,
@@ -63,24 +48,21 @@ export async function* subscribeBlocksFromTargets(
     const metadata = new Map<bigint, { row: SqlRow; sequence: bigint }>();
     const controller = new AbortController();
     const abort = () => controller.abort();
-    if (sql.subscribe) signal?.addEventListener('abort', abort, { once: true });
+    signal?.addEventListener('abort', abort, { once: true });
     let deliveredHeight = -1n;
     let reader: Promise<void> | undefined;
 
     try {
         for await (const target of targets) {
-            if (!reader && sql.subscribe) {
+            if (!reader) {
                 reader = readBlockMetadata(
-                    sql.subscribe.bind(sql),
+                    sql,
                     target.sequenceNumber,
                     controller.signal,
                     reconnectDelayMs,
                     (frame) => {
                         for (const row of tableRows(frame.table)) {
-                            const height = columnValue(row, COL_HEIGHT);
-                            if (typeof height !== 'bigint') {
-                                throw new Error('block metadata height must be a bigint');
-                            }
+                            const height = rowHeight(row);
                             if (height <= deliveredHeight || metadata.has(height)) continue;
                             metadata.set(height, { row, sequence: frame.sequenceNumber });
                             if (metadata.size > MAX_CACHED_BLOCK_ROWS) {
@@ -103,16 +85,20 @@ export async function* subscribeBlocksFromTargets(
                 } else {
                     let result: DecodedQueryResult;
                     try {
-                        result = await withAbort(
-                            () => sql.query(
-                                blockMetadataQuery(target.height),
-                                target.sequenceNumber,
-                                { signal },
-                            ),
-                            signal,
+                        result = await sql.query(
+                            blockMetadataQuery(target.height),
+                            target.sequenceNumber,
+                            { signal },
                         );
                     } catch (error) {
                         if (signal?.aborted) return;
+
+                        // A target can reach the browser before the SQL service
+                        // ingests its rows. That lag is catch-up, not an outage.
+                        if (isConsistencyNotReadyError(error)) {
+                            if (!(await waitForRetry(catchUpDelayMs, signal))) return;
+                            continue;
+                        }
                         options.onError?.(errorMessage(error));
                         if (!(await waitForRetry(reconnectDelayMs, signal))) return;
                         options.onReconnect?.();
@@ -140,7 +126,7 @@ export async function* subscribeBlocksFromTargets(
 }
 
 async function readBlockMetadata(
-    subscribe: SqlClient['subscribe'],
+    sql: BlockMetadataSqlClient,
     sinceSequenceNumber: bigint,
     signal: AbortSignal,
     reconnectDelayMs: number,
@@ -150,7 +136,7 @@ async function readBlockMetadata(
     let nextSequence: bigint | undefined = sinceSequenceNumber;
     while (!signal.aborted) {
         try {
-            for await (const frame of subscribe(
+            for await (const frame of sql.subscribe(
                 { table: BLOCK_META_TABLE, sinceSequenceNumber: nextSequence },
                 { signal },
             )) {
@@ -171,7 +157,7 @@ async function readBlockMetadata(
 }
 
 function blockMetadataQuery(height: bigint): string {
-    return `SELECT ${COL_HEIGHT}, ${COL_DIGEST}, ${COL_TX_COUNT} FROM ${BLOCK_META_TABLE} WHERE ${COL_HEIGHT} = ${height} LIMIT 1`;
+    return `SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_DIGEST}, ${BLOCK_META_TX_COUNT} FROM ${BLOCK_META_TABLE} WHERE ${BLOCK_META_HEIGHT} = ${height} LIMIT 1`;
 }
 
 function decodeBlockMetadata(
@@ -188,12 +174,9 @@ function decodeBlockMetadata(
 }
 
 function decodeBlockMetadataRow(row: SqlRow, target: PublishedProofTarget): ObservedBlock {
-    const height = columnValue(row, COL_HEIGHT);
-    const digest = columnValue(row, COL_DIGEST);
-    const txCount = columnValue(row, COL_TX_COUNT);
-    if (typeof height !== 'bigint') {
-        throw new Error('block metadata height must be a bigint');
-    }
+    const height = rowHeight(row);
+    const digest = columnValue(row, BLOCK_META_DIGEST);
+    const txCount = columnValue(row, BLOCK_META_TX_COUNT);
     if (height !== target.height) {
         throw new Error(`block metadata height ${height} does not match proof target ${target.height}`);
     }
@@ -212,18 +195,13 @@ function decodeBlockMetadataRow(row: SqlRow, target: PublishedProofTarget): Obse
         digest: digest.slice(),
         txCount: Number(txCount),
         arrivedAt: Date.now(),
-        sequence: target.sequenceNumber,
     };
 }
 
-function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
-    if (left.length !== right.length) return false;
-    for (let index = 0; index < left.length; index++) {
-        if (left[index] !== right[index]) return false;
+function rowHeight(row: SqlRow): bigint {
+    const height = columnValue(row, BLOCK_META_HEIGHT);
+    if (typeof height !== 'bigint') {
+        throw new Error('block metadata height must be a bigint');
     }
-    return true;
-}
-
-function errorMessage(error: unknown): string {
-    return error instanceof Error ? error.message : String(error);
+    return height;
 }

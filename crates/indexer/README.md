@@ -48,8 +48,8 @@ height lookups. Every table is append-only. Store keys are immutable, so
 no table may rewrite an existing key with a different value. `account_meta` is
 keyed by `(account, qmdb_location)` with one row per account-state QMDB
 operation, and readers take the highest location for an account. Each
-finalized transaction adds exactly three rows to the bulk commit: one `tx_meta`
-row and one `tx_activity` row per side. The bulk commit is what bounds indexer
+finalized transaction adds one `tx_meta` row and one `tx_activity` row per
+distinct side to the bulk commit. The bulk commit bounds indexer
 throughput, so a per-transaction row is only added when readers cannot derive
 the same information elsewhere.
 
@@ -83,9 +83,11 @@ freshness floor.
 Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate. Height/latest reads start from a
 finalization certificate, verify the commitment/header relationship, and fetch
-the full body only when requested.
+the full body only when requested. A height finalized through a descendant
+certificate, or backfilled after downtime, has no certificate of its own.
+Readers cannot obtain one directly for those heights, so Explorer transaction
+proofs for them never complete.
 
-[`StoreClient`]: https://docs.rs/exoware-sdk/latest/exoware_sdk/struct.StoreClient.html
 [kvschema]: https://docs.rs/exoware-sql/latest/exoware_sql/struct.KvSchema.html
 
 ## Crate contents
@@ -95,8 +97,8 @@ the full body only when requested.
   `account_meta` table layouts. The explorer's column-name strings live here
   too, so a schema change is a one-place edit.
 - A [`CertificateReporter`](src/publisher/certificate.rs) that uploads each
-  finalized block by digest together with its finalization as
-  `exoware-simplex` proof artifacts in the shared Store.
+  finalized block by digest as `exoware-simplex` proof artifacts in the shared
+  Store, together with its finalization certificate when one was observed.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
   on the single owning secondary. It commits SQL and authenticated QMDB data,
   then publishes only the contiguous completed prefix through one barrier.
@@ -123,10 +125,11 @@ The durable queue and authenticated publication contract is specified in
 
 The application captures owned authenticated range artifacts before applying a
 winning batch. The finalized hook combines those artifacts with the finalized
-block and exact finalization certificate, syncs the encoded entry as one payload
-blob per block, then commits a small queue record before returning. The entry
-records the metadata encoder version and rejects unsupported versions before
-replay. This schema requires a fresh index from genesis.
+block and its finalization certificate when one was observed, syncs the encoded
+entry as one payload blob per block, then commits a small queue record before
+returning. The payload starts with a magic number and a format version, and
+unsupported versions are rejected before replay. This schema requires a fresh
+index from genesis.
 
 The background uploader derives SQL rows and authenticated QMDB writes from the
 queue entry. Uploads may complete concurrently, but publication barriers and
@@ -154,8 +157,11 @@ messages on demand. This bounds ordinary message encoding buffers, but does not
 overlap row preparation with transmission or bound total preparation memory.
 
 Remote Store commits retry the fully staged `StoreWriteBatch` with capped
-exponential backoff. Retries resend the complete logical request. Publication
-barriers advance only after all data requests have succeeded.
+exponential backoff. Retries resend the complete logical request. Retryable
+failures retry for at most 8 attempts and 60 seconds per commit. After that the
+indexer task fails and the validator exits. The restarted process replays from
+the durable queue. Publication barriers advance only after all data requests
+have succeeded.
 
 [`Exact`]: https://docs.rs/commonware-utils/latest/commonware_utils/acknowledgement/struct.Exact.html
 
@@ -175,8 +181,8 @@ Add `&& resource.service.name = "<secondary public key>"` inside the braces to
 restrict the search to one secondary. Heights are numeric span attributes.
 
 Each `indexer.block` trace starts at the finalized hook and remains open through
-durable queue pruning and successful payload deletion. Its fields include
-`height`, `block_digest`, queue `position`, `payload_bytes`, and `outcome`.
+durable queue pruning and payload deletion. Its fields include `height`,
+`block_digest`, queue `position`, `payload_bytes`, and `outcome`.
 Child spans expose these stages:
 
 | Stage | Spans and timing |
@@ -186,7 +192,7 @@ Child spans expose these stages:
 | QMDB and SQL preparation | `indexer.qmdb.prepare.*` separates authenticated state and transaction preparation, metadata construction, transaction and account rows, SQL encoding and staging, QMDB staging, and request chunking. Scheduling waits are separate spans. |
 | Simplex preparation | `indexer.simplex.*` separates queue waits, full body encoding, row preparation and staging, and persistence. |
 | Store uploads | Each `indexer.qmdb.chunk` records its index, chunk count, rows, and encoded bytes. Concurrent chunks appear as sibling spans. `store_commit` contains individual `store_put_attempt` spans and retry backoffs. Attempts include SDK request encoding, compression, and network time. |
-| Publication and deletion | Per-block waits cover publication, ordered acknowledgement, section pruning, cleanup capacity, and cleanup execution. Payload deletion attempts and retry delays remain within the block trace. |
+| Publication and deletion | Per-block spans cover the publication wait, the wait for the record section to prune, and payload deletion. |
 
 Grouped publication barriers and queue pruning cover multiple blocks. They carry
 height ranges and span links to the contributing block traces. Each block also

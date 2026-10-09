@@ -5,7 +5,8 @@
 //! one physical Store. All prefix assignments live in this module: adding a
 //! new family means claiming an unused byte here.
 
-use exoware_sdk::{PrefixedStoreClient, StoreClient, StoreKeyPrefix, StoreKeyPrefixError};
+use bytes::Bytes;
+use exoware_sdk::{Key, PrefixedStoreClient, StoreClient, StoreKeyPrefix, StoreKeyPrefixError};
 
 /// Store namespace byte for QMDB account-state rows.
 pub const STATE_QMDB_PREFIX_VALUE: u8 = 0x00;
@@ -81,9 +82,22 @@ pub fn publication_target_client(
     ))
 }
 
+pub(crate) fn publication_target_key(height: u64) -> Key {
+    Key::from(Bytes::copy_from_slice(&height.to_be_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_target_uses_big_endian_height_key() {
+        let height = 0x0102_0304_0506_0708;
+        assert_eq!(
+            publication_target_key(height).as_ref(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
 
     /// Every Store family must live under its own namespace prefix.
     #[test]

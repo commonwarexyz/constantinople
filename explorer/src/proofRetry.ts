@@ -1,23 +1,17 @@
+import { BinaryReader, WireType } from '@bufbuild/protobuf/wire';
 import { Code, ConnectError } from '@connectrpc/connect';
 import { HttpError } from '@exowarexyz/sdk';
 
 const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
 const CONSISTENCY_NOT_READY = 'CONSISTENCY_NOT_READY';
-const CONSISTENCY_NOT_READY_BYTES = new TextEncoder().encode(CONSISTENCY_NOT_READY);
-const CONSISTENCY_NOT_READY_FIELD = new Uint8Array([
-    0x0a,
-    CONSISTENCY_NOT_READY_BYTES.length,
-    ...CONSISTENCY_NOT_READY_BYTES,
-]);
 const SERIALIZED_CONSISTENCY_NOT_READY =
-    /^(?:HTTP error: 409 )?\[aborted\] (?:consistency_not_ready\b|minimum consistency token is not yet visible\b)/i;
+    /^(?:HTTP error: 409 )?\[aborted\] minimum consistency token is not yet visible\b/i;
 const RETRYABLE_PROOF_ERROR =
     /tx_meta missing|tx digest .* (missing at height|is not finalized yet)|finalization missing|QMDB transaction proof response missing|not yet covered by a provable finalization|out_of_range|unavailable/i;
 const RETRYABLE_FETCH_ERROR =
     /(?:^|:\s)(?:failed to fetch|fetch failed|load failed|networkerror when attempting to fetch resource\.?)$/i;
 
 const RETRYABLE_ACCOUNT_PROOF_ERRORS = [
-    /consistency_not_ready/,
     /\[unavailable\]/i,
     RETRYABLE_FETCH_ERROR,
     /^finalization missing at height \d+$/,
@@ -28,14 +22,21 @@ const RETRYABLE_ACCOUNT_PROOF_ERRORS = [
     /^\[out_of_range\] requested location \d+ is above published writer watermark \d+$/,
 ];
 
+export const NETWORK_RECONNECT_DELAY_MS = 5_000;
+
 const ACCOUNT_RETRY_INITIAL_DELAY_MS = 350;
 const ACCOUNT_RETRY_DELAY_STEP_MS = 150;
 const ACCOUNT_RETRY_MAX_DELAY_MS = 2_000;
 
-type RetryWait = (delayMs: number, signal: AbortSignal) => Promise<void>;
+type RetryWait = (delayMs: number, signal: AbortSignal) => Promise<boolean>;
+
+export interface ErrorInfo {
+    readonly reason: string;
+    readonly domain: string;
+}
 
 export function isRetryableProofError(error: unknown): boolean {
-    const detail = errorDetail(error);
+    const detail = errorMessage(error);
     return (
         isConsistencyNotReadyError(error) ||
         RETRYABLE_PROOF_ERROR.test(detail) ||
@@ -47,16 +48,35 @@ export function isMissingAccountProofError(detail: string): boolean {
     return /^account .+ is not indexed$/.test(detail);
 }
 
-export function isRetryableSequenceConsistencyError(error: unknown): boolean {
-    return isConsistencyNotReadyError(error);
-}
-
 export function isRetryableAccountProofError(error: unknown): boolean {
-    const detail = errorDetail(error);
+    const detail = errorMessage(error);
     return (
         isConsistencyNotReadyError(error) ||
         RETRYABLE_ACCOUNT_PROOF_ERRORS.some((pattern) => pattern.test(detail))
     );
+}
+
+// Proof errors can be rethrown with added context, so the serialized server
+// message is accepted alongside the structured reason.
+export function isConsistencyNotReadyError(error: unknown): boolean {
+    return (
+        errorInfos(error, Code.Aborted).some(({ reason }) => reason === CONSISTENCY_NOT_READY) ||
+        SERIALIZED_CONSISTENCY_NOT_READY.test(errorMessage(error))
+    );
+}
+
+export function errorInfos(error: unknown, code: Code): ErrorInfo[] {
+    const cause = error instanceof HttpError ? error.cause : error;
+    if (!(cause instanceof ConnectError) || cause.code !== code) return [];
+
+    return cause.details.flatMap((detail) => {
+        if (!('type' in detail) || detail.type !== ERROR_INFO_TYPE) return [];
+        try {
+            return [decodeErrorInfo(detail.value)];
+        } catch {
+            return [];
+        }
+    });
 }
 
 export async function retryAccountWork<T>(
@@ -75,68 +95,47 @@ export async function retryAccountWork<T>(
             if (!isRetryable(error)) {
                 throw error;
             }
-            await wait(retryDelay(failures), signal);
+            if (!(await wait(retryDelay(failures), signal))) throw cancelledError();
             failures += 1;
         }
     }
 }
 
-function isConsistencyNotReadyError(error: unknown): boolean {
-    const connectError = asConnectError(error);
-    if (connectError) {
-        return (
-            connectError.code === Code.Aborted &&
-            (connectError.rawMessage.toUpperCase().includes(CONSISTENCY_NOT_READY) ||
-                connectError.details.some(isConsistencyNotReadyDetail))
-        );
-    }
-    return SERIALIZED_CONSISTENCY_NOT_READY.test(errorDetail(error));
+export function waitForRetry(ms: number, signal?: AbortSignal): Promise<boolean> {
+    if (signal?.aborted) return Promise.resolve(false);
+
+    return new Promise((resolve) => {
+        const finish = (completed: boolean) => {
+            clearTimeout(timeout);
+            signal?.removeEventListener('abort', onAbort);
+            resolve(completed);
+        };
+        const onAbort = () => finish(false);
+        const timeout = setTimeout(() => finish(true), ms);
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
 }
 
-function asConnectError(error: unknown): ConnectError | undefined {
-    if (error instanceof ConnectError) return error;
-    if (
-        error instanceof HttpError &&
-        error.connectCode === Code.Aborted &&
-        error.cause instanceof ConnectError
-    ) {
-        return error.cause;
-    }
-    return undefined;
-}
-
-function isConsistencyNotReadyDetail(detail: unknown): boolean {
-    if (!isRecord(detail)) return false;
-
-    const descriptor = detail.desc;
-    const value = detail.value;
-    if (isRecord(descriptor) && descriptor.typeName === ERROR_INFO_TYPE && isRecord(value)) {
-        return isConsistencyNotReadyReason(value.reason);
-    }
-
-    if (detail.type !== ERROR_INFO_TYPE) return false;
-    if (isRecord(detail.debug) && isConsistencyNotReadyReason(detail.debug.reason)) return true;
-    return value instanceof Uint8Array && containsBytes(value, CONSISTENCY_NOT_READY_FIELD);
-}
-
-function isConsistencyNotReadyReason(reason: unknown): boolean {
-    return typeof reason === 'string' && reason.toUpperCase() === CONSISTENCY_NOT_READY;
-}
-
-function containsBytes(bytes: Uint8Array, expected: Uint8Array): boolean {
-    for (let start = 0; start <= bytes.length - expected.length; start++) {
-        if (expected.every((byte, offset) => bytes[start + offset] === byte)) return true;
-    }
-    return false;
-}
-
-function errorDetail(error: unknown): string {
-    if (typeof error === 'string') return error;
+export function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-    return typeof value === 'object' && value !== null;
+function decodeErrorInfo(value: Uint8Array): ErrorInfo {
+    const reader = new BinaryReader(value);
+    let reason = '';
+    let domain = '';
+
+    while (reader.pos < reader.len) {
+        const [fieldNumber, wireType] = reader.tag();
+        if (wireType === WireType.LengthDelimited && fieldNumber === 1) {
+            reason = reader.string();
+        } else if (wireType === WireType.LengthDelimited && fieldNumber === 2) {
+            domain = reader.string();
+        } else {
+            reader.skip(wireType, fieldNumber);
+        }
+    }
+    return { reason, domain };
 }
 
 function retryDelay(failures: number): number {
@@ -144,21 +143,6 @@ function retryDelay(failures: number): number {
         ACCOUNT_RETRY_INITIAL_DELAY_MS + failures * ACCOUNT_RETRY_DELAY_STEP_MS,
         ACCOUNT_RETRY_MAX_DELAY_MS,
     );
-}
-
-function waitForRetry(delayMs: number, signal: AbortSignal): Promise<void> {
-    throwIfCancelled(signal);
-    return new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => {
-            signal.removeEventListener('abort', onAbort);
-            resolve();
-        }, delayMs);
-        const onAbort = () => {
-            clearTimeout(timeout);
-            reject(cancelledError());
-        };
-        signal.addEventListener('abort', onAbort, { once: true });
-    });
 }
 
 function throwIfCancelled(signal: AbortSignal): void {

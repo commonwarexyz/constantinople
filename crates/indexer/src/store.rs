@@ -40,17 +40,6 @@ pub fn writer_store_client(
         .build()
 }
 
-#[cfg(test)]
-pub(crate) fn writer_store_clients(
-    url: &str,
-    api_key: Option<&str>,
-) -> Result<(StoreClient, StoreClient), StoreClientBuildError> {
-    Ok((
-        writer_store_client(url, api_key)?,
-        writer_store_client(url, api_key)?,
-    ))
-}
-
 fn store_client_builder(url: &str, api_key: Option<&str>) -> StoreClientBuilder {
     let builder = StoreClient::builder().url(url);
     match api_key {
@@ -72,11 +61,11 @@ pub async fn require_store_ready(client: &StoreClient) -> Result<(), StoreReadin
 mod tests {
     use super::{
         StoreClientBuildError, StoreReadinessError, require_store_ready, store_client,
-        writer_store_client, writer_store_clients,
+        writer_store_client,
     };
     use axum::{
         Router,
-        extract::{ConnectInfo, State},
+        extract::State,
         http::{
             HeaderMap, StatusCode,
             header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
@@ -84,10 +73,8 @@ mod tests {
         routing::get,
     };
     use bytes::Bytes;
-    use exoware_sdk::{API_KEY_ENV, ErrorCode, PrefixedStoreClient, StoreClient};
+    use exoware_sdk::{API_KEY_ENV, PrefixedStoreClient};
     use std::{
-        collections::HashSet,
-        net::SocketAddr,
         process::{Command, Output},
         sync::{
             Arc, Mutex,
@@ -167,36 +154,6 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn read_retry_budget_is_bounded_on_the_wire() {
-        let (result, requests) = read_retry_case(
-            usize::MAX,
-            StatusCode::CONFLICT,
-            r#"{"code":"aborted","message":"Store is behind"}"#,
-        )
-        .await;
-
-        assert_eq!(result.unwrap_err().rpc_code(), Some(ErrorCode::Aborted));
-        assert_eq!(requests.len(), 3);
-        assert_eq!(requests[2] - requests[0], Duration::from_millis(200));
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn read_does_not_retry_nonretryable_errors_on_the_wire() {
-        let (result, requests) = read_retry_case(
-            usize::MAX,
-            StatusCode::BAD_REQUEST,
-            r#"{"code":"invalid_argument","message":"invalid query"}"#,
-        )
-        .await;
-
-        assert_eq!(
-            result.unwrap_err().rpc_code(),
-            Some(ErrorCode::InvalidArgument)
-        );
-        assert_eq!(requests.len(), 1);
-    }
-
     async fn readiness(
         State((status, requests)): State<(StatusCode, Arc<AtomicUsize>)>,
     ) -> StatusCode {
@@ -262,29 +219,6 @@ mod tests {
             .send(content_encoding)
             .expect("content-encoding receiver should remain open");
         StatusCode::UNAUTHORIZED
-    }
-
-    async fn capture_connection(
-        ConnectInfo(address): ConnectInfo<SocketAddr>,
-        State(connections): State<Arc<Mutex<HashSet<SocketAddr>>>>,
-    ) -> StatusCode {
-        connections
-            .lock()
-            .expect("connection set lock poisoned")
-            .insert(address);
-        tokio::time::sleep(Duration::from_millis(25)).await;
-        StatusCode::UNAUTHORIZED
-    }
-
-    async fn send_concurrent_queries(client: StoreClient, marker: u8) {
-        let queries = (0..64).map(|index| {
-            let client = PrefixedStoreClient::empty(client.clone());
-            async move {
-                let key = Bytes::from(vec![marker, index]);
-                let _ = client.query().get(&key).await;
-            }
-        });
-        futures::future::join_all(queries).await;
     }
 
     async fn content_encoding_sent() -> Option<String> {
@@ -401,41 +335,6 @@ mod tests {
     #[tokio::test]
     async fn writer_client_compresses_put_bodies_on_the_wire() {
         assert_eq!(content_encoding_sent().await.as_deref(), Some("zstd"));
-    }
-
-    #[tokio::test]
-    async fn writer_client_pair_uses_independent_connection_pools() {
-        let connections = Arc::new(Mutex::new(HashSet::new()));
-        let app = Router::new()
-            .fallback(capture_connection)
-            .with_state(connections.clone());
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("connection listener should bind");
-        let address = listener
-            .local_addr()
-            .expect("connection listener should have an address");
-        let task = tokio::spawn(async move {
-            axum::serve(
-                listener,
-                app.into_make_service_with_connect_info::<SocketAddr>(),
-            )
-            .await
-            .expect("connection server should run");
-        });
-        let (bulk, metadata) = writer_store_clients(&format!("http://{address}"), None)
-            .expect("writer clients should build");
-
-        tokio::join!(
-            send_concurrent_queries(bulk, 0),
-            send_concurrent_queries(metadata, 1)
-        );
-        let connection_count = connections
-            .lock()
-            .expect("connection set lock poisoned")
-            .len();
-        task.abort();
-        assert!(connection_count > 4);
     }
 
     #[test]

@@ -2,9 +2,7 @@
 
 use crate::{Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
-use commonware_consensus::{
-    marshal::coding::types::coding_config_for_participants, types::coding::COMMITMENT_SIZE,
-};
+use commonware_consensus::types::coding::COMMITMENT_SIZE;
 use commonware_cryptography::{ed25519, sha256};
 
 /// Maximum encoded block size accepted by consensus, including its header and body framing.
@@ -29,18 +27,6 @@ pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
     let framing = max_transaction_count.encode_size()
         + max_transaction_count * minimum_transaction.encode_size();
     body_bytes.checked_sub(framing)
-}
-
-/// Maximum raw shard size for blocks admitted by consensus.
-///
-/// Panics if fewer than four validators are supplied.
-pub fn maximum_shard_size(num_validators: u16) -> usize {
-    let config = coding_config_for_participants(num_validators);
-
-    // Coding metadata and Reed-Solomon's length prefix precede the split into even-width shards.
-    let payload_bytes = MAXIMUM_BLOCK_SIZE + config.encode_size() + u32::SIZE;
-    let shards = usize::from(config.minimum_shards.get());
-    payload_bytes.div_ceil(2 * shards) * 2
 }
 
 fn maximum_header_size() -> usize {
@@ -170,13 +156,5 @@ mod tests {
         for budget in [0, MAXIMUM_BLOCK_SIZE + 1, usize::MAX] {
             assert_eq!(max_transaction_bytes(budget), None);
         }
-    }
-
-    #[test]
-    fn shard_limit_scales_with_original_shards() {
-        assert_eq!(maximum_shard_size(4), 8 * 1024 * 1024 + 4);
-        assert!(maximum_shard_size(7) < maximum_shard_size(4));
-        assert!(maximum_shard_size(50) < maximum_shard_size(7));
-        assert!(maximum_shard_size(u16::MAX) > 0);
     }
 }

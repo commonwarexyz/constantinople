@@ -2,7 +2,7 @@
 
 use super::{
     Mailbox,
-    actor::{AccountReaderCell, IngestStatus, StoredBatchStatus},
+    actor::{AccountReaderCell, IngestStatus},
     mailbox::SubmissionLane,
 };
 use axum::{
@@ -271,6 +271,7 @@ where
     // Cheap decode failures must not train the scheduler to run expensive
     // valid batches on the async worker. Force the outer handoff while
     // retaining adaptive scheduling inside signature verification.
+    // Pool threads have an empty tracing context, so capture the caller's span explicitly.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
@@ -350,15 +351,9 @@ where
     };
 
     // Hex-encoding digest lists (partially finalized batches only) is O(txs)
-    // formatting, so it runs on the strategy's pool; every other status is
+    // formatting, so it runs on the strategy's pool. Every other status is
     // constant-size.
-    if status.has_digest_lists() {
-        let work_size = match &status {
-            StoredBatchStatus::PartiallyFinalized {
-                included, filtered, ..
-            } => included.len().saturating_add(filtered.len()),
-            _ => 0,
-        };
+    if let Some(work_size) = status.digest_list_len() {
         return state
             .strategy
             .spawn(work_size, move |_| ok_json(&status.to_wire()))

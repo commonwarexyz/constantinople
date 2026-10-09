@@ -7,7 +7,9 @@ import {
     subscribeBlocksFromTargets,
     type BlockMetadataSqlClient,
 } from '../src/indexer.ts';
-import { createSharedProofTargetsFromStore, type PublishedProofTarget, type PublishedProofTargetStore } from '../src/proofTarget.ts';
+import { shareProofTargets, type PublishedProofTarget, type PublishedProofTargetStore } from '../src/proofTarget.ts';
+
+const MAX_QUEUED_TARGETS = 4096;
 
 test('block subscription queries SQL after the target and keeps its sequence floor', async () => {
     const events: string[] = [];
@@ -27,7 +29,6 @@ test('block subscription queries SQL after the target and keeps its sequence flo
     assert.equal(next.value.height, 7n);
     assert.deepEqual(next.value.digest, target.blockDigest);
     assert.equal(next.value.txCount, 9);
-    assert.equal(next.value.sequence, 23n);
     await stream.return();
 });
 
@@ -115,10 +116,7 @@ test('block metadata retries backend errors until cancelled', async () => {
         reconnectDelayMs: 0,
         onError: (message) => {
             errors.push(message);
-            if (errors.length === 2) {
-                assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
-                controller.abort();
-            }
+            if (errors.length === 2) controller.abort();
         },
         onReconnect: () => {
             reconnects++;
@@ -128,6 +126,42 @@ test('block metadata retries backend errors until cancelled', async () => {
     assert.deepEqual(await stream.next(), { done: true, value: undefined });
     assert.deepEqual(errors, ['backend unavailable', 'backend unavailable']);
     assert.equal(reconnects, 2);
+    assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('a consistency lag on the block point read is retried as catch-up', async () => {
+    const target = proofTarget(7n, 23n, 0xa5);
+    const controller = new AbortController();
+    const errors: string[] = [];
+    let reconnects = 0;
+    let queries = 0;
+    const sql = sqlClient(async (_query, minSequenceNumber) => {
+        queries++;
+        assert.equal(minSequenceNumber, 23n);
+        if (queries === 1) {
+            throw new Error('HTTP error: 409 [aborted] minimum consistency token is not yet visible');
+        }
+        return queryResult(23n, 7n, target.blockDigest, 2n);
+    });
+    const stream = subscribeBlocksFromTargets(sql, targets(target), {
+        signal: controller.signal,
+        reconnectDelayMs: 60_000,
+        onError: (message) => errors.push(message),
+        onReconnect: () => {
+            reconnects++;
+        },
+    });
+
+    const stalled = setTimeout(() => controller.abort(), 2_000);
+    const next = await stream.next();
+    clearTimeout(stalled);
+
+    assert.equal(next.done, false, 'block delivery stalled behind a consistency lag');
+    assert.equal(next.value.height, 7n);
+    assert.equal(queries, 2);
+    assert.deepEqual(errors, []);
+    assert.equal(reconnects, 1);
+    await stream.return();
 });
 
 test('streamed metadata waits for its publication target and avoids a point read', async () => {
@@ -156,7 +190,6 @@ test('streamed metadata waits for its publication target and avoids a point read
 
     const block = (await pending).value;
     assert.equal(block?.height, 8n);
-    assert.equal(block?.sequence, 29n);
     assert.equal(block?.txCount, 9);
     assert.equal(queries.length, 1);
     await stream.return();
@@ -232,7 +265,7 @@ test('metadata subscription resumes live after a lost cursor while point reads c
         await source.ready;
         return queryResult(23n, 7n, first.blockDigest, 1n);
     });
-    const subscribe = source.client.subscribe!;
+    const subscribe = source.client.subscribe;
     const cursors: Array<bigint | undefined> = [];
     source.client.subscribe = async function* (request, options) {
         cursors.push(request.sinceSequenceNumber);
@@ -279,7 +312,7 @@ function streamingSql(frames: DecodedQueryResult[], query: BlockMetadataSqlClien
 function sqlClient(
     query: BlockMetadataSqlClient['query'],
 ): BlockMetadataSqlClient {
-    return { query };
+    return streamingSql([], query).client;
 }
 
 function queryResult(
@@ -328,36 +361,27 @@ function digest(seed: number): Uint8Array {
     return new Uint8Array(32).fill(seed);
 }
 
-
 test('a blocked SQL read cannot delay proof listeners on the shared target source', async () => {
     const controller = new AbortController();
     let sqlStarted!: () => void;
     const sqlPending = new Promise<void>((resolve) => { sqlStarted = resolve; });
     let publish!: () => void;
     const publication = new Promise<void>((resolve) => { publish = resolve; });
-    const key = (height: bigint) => {
-        const bytes = new Uint8Array(8);
-        new DataView(bytes.buffer).setBigUint64(0, height);
-        return bytes;
-    };
     const store = {
         async query() {
-            return { sequenceNumber: 10n, results: [{ key: key(1n), value: digest(1) }] };
+            return { sequenceNumber: 10n, results: [{ key: heightKey(1n), value: digest(1) }] };
         },
         async *subscribe(_request: unknown, options: { signal?: AbortSignal } = {}) {
             await publication;
-            yield { sequenceNumber: 20n, entries: [{ key: key(2n), value: digest(2) }] };
-            await new Promise<void>((resolve) => {
-                if (options.signal?.aborted) resolve();
-                else options.signal?.addEventListener('abort', () => resolve(), { once: true });
-            });
+            yield { sequenceNumber: 20n, entries: [{ key: heightKey(2n), value: digest(2) }] };
+            await untilAborted(options.signal).catch(() => {});
         },
     } as PublishedProofTargetStore;
-    const shared = createSharedProofTargetsFromStore(store, { signal: controller.signal });
+    const shared = shareProofTargets(store, { signal: controller.signal });
     const proof = shared.subscribe();
-    const blocks = subscribeBlocksFromTargets(sqlClient(() => {
+    const blocks = subscribeBlocksFromTargets(sqlClient((_query, _floor, options) => {
         sqlStarted();
-        return new Promise<never>(() => {});
+        return untilAborted(options?.signal);
     }), shared.subscribe(), { signal: controller.signal });
     const pendingBlock = blocks.next();
     assert.equal((await proof.next()).value?.height, 1n);
@@ -367,3 +391,57 @@ test('a blocked SQL read cannot delay proof listeners on the shared target sourc
     controller.abort();
     assert.deepEqual(await pendingBlock, { done: true, value: undefined });
 });
+
+test('a SQL outage across a long target backlog resumes at the latest target', async () => {
+    const controller = new AbortController();
+    const backlog = 4100n;
+    const store = {
+        async query() {
+            return { sequenceNumber: 0n, results: [] };
+        },
+        async *subscribe(_request: unknown, options: { signal?: AbortSignal } = {}) {
+            for (let height = 1n; height <= backlog; height++) {
+                yield { sequenceNumber: height, entries: [{ key: heightKey(height), value: digest(1) }] };
+            }
+            await untilAborted(options.signal).catch(() => {});
+        },
+    } as PublishedProofTargetStore;
+    const shared = shareProofTargets(store, { signal: controller.signal });
+    const proof = shared.subscribe();
+    let recovered = false;
+    const blocks = subscribeBlocksFromTargets(sqlClient(async (query, floor) => {
+        if (!recovered) throw new Error('SQL unavailable');
+        const height = BigInt(/height = (\d+)/.exec(query)![1]!);
+        return queryResult(floor!, height, digest(1), 0n);
+    }), shared.subscribe(), { signal: controller.signal, reconnectDelayMs: 0 });
+
+    const first = blocks.next();
+    for (let height = 1n; height <= backlog; height++) {
+        assert.equal((await proof.next()).value?.height, height);
+    }
+    recovered = true;
+    let previous = (await first).value!.height;
+    let delivered = 1;
+    while (previous < backlog) {
+        const height = (await blocks.next()).value!.height;
+        assert.ok(height > previous);
+        previous = height;
+        delivered++;
+    }
+    assert.ok(delivered <= MAX_QUEUED_TARGETS + 1);
+    controller.abort();
+    await blocks.return();
+});
+
+function heightKey(height: bigint): Uint8Array {
+    const key = new Uint8Array(8);
+    new DataView(key.buffer).setBigUint64(0, height);
+    return key;
+}
+
+function untilAborted(signal?: AbortSignal): Promise<never> {
+    return new Promise((_resolve, reject) => {
+        if (signal?.aborted) reject(signal.reason);
+        else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
+    });
+}

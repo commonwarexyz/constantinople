@@ -5,8 +5,8 @@ use crate::{
     QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
     absolute_path, default_bootstrappers, ensure_output_dir_missing,
     generate_local_cluster_material, indexer_enabled, ports::Ports, secondary_roles,
-    total_secondaries, validate_generate_args, write_simplex_verification_material,
-    write_yaml_config,
+    secondary_runtime_threads, total_secondaries, validate_generate_args,
+    write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
 use commonware_formatting::hex;
@@ -209,7 +209,7 @@ fn build_secondaries(
             .checked_add(offset)
             .expect("secondary metrics port overflow");
 
-        let (worker_threads, rayon_threads) = crate::secondary_runtime_threads(args, role);
+        let (worker_threads, rayon_threads) = secondary_runtime_threads(args, role);
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
@@ -480,7 +480,7 @@ mod tests {
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
         default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries,
+        default_publisher_rayon_threads, generate_local_cluster_material, total_secondaries,
     };
     use std::{
         fs,
@@ -506,7 +506,7 @@ mod tests {
             rayon_threads: 2,
             indexer_worker_threads: None,
             indexer_rayon_threads: None,
-            indexer_publisher_rayon_threads: crate::default_publisher_rayon_threads(),
+            indexer_publisher_rayon_threads: default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),

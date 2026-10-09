@@ -1,3 +1,5 @@
+//! Keeps capture traces bounded while linking durable work across tasks.
+
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
@@ -7,7 +9,7 @@ use tracing::{Span, field, info_span};
 // A stalled Store must not turn the durable queue into unbounded telemetry state.
 const MAX_QUEUED_TRACES: usize = 4096;
 
-pub(crate) fn block_span(height: u64, origin: &'static str) -> Span {
+pub(super) fn block_span(height: u64, origin: &'static str) -> Span {
     info_span!(
         parent: None,
         "indexer.block",
@@ -26,12 +28,12 @@ struct QueuedTrace {
 }
 
 #[derive(Clone, Default)]
-pub(crate) struct CaptureTraces {
+pub(super) struct CaptureTraces {
     queued: Arc<Mutex<BTreeMap<u64, QueuedTrace>>>,
 }
 
 impl CaptureTraces {
-    pub(crate) fn register(&self, height: u64, root: Span) {
+    pub(super) fn register(&self, height: u64, root: Span) {
         if root.is_disabled() {
             return;
         }
@@ -47,7 +49,7 @@ impl CaptureTraces {
         assert!(replaced.is_none(), "capture trace registered twice");
     }
 
-    pub(crate) fn take(&self, height: u64, replay: bool) -> Span {
+    pub(super) fn take(&self, height: u64, replay: bool) -> Span {
         let captured = self
             .queued
             .lock()
@@ -61,7 +63,7 @@ impl CaptureTraces {
 }
 
 #[cfg(test)]
-pub(crate) mod testing {
+mod testing {
     use std::{
         collections::BTreeMap,
         sync::{Arc, Mutex},
@@ -74,11 +76,11 @@ pub(crate) mod testing {
     use tracing_subscriber::{Layer, layer::Context, registry::LookupSpan};
 
     #[derive(Clone, Debug)]
-    pub(crate) struct RecordedSpan {
-        pub(crate) name: &'static str,
-        pub(crate) parent: Option<u64>,
-        pub(crate) closed: bool,
-        pub(crate) fields: BTreeMap<String, String>,
+    pub(super) struct RecordedSpan {
+        pub(super) name: &'static str,
+        pub(super) parent: Option<u64>,
+        pub(super) closed: bool,
+        pub(super) fields: BTreeMap<String, String>,
     }
 
     struct Fields<'a>(&'a mut BTreeMap<String, String>);
@@ -94,10 +96,10 @@ pub(crate) mod testing {
     }
 
     #[derive(Clone, Default)]
-    pub(crate) struct Capture(Arc<Mutex<BTreeMap<u64, RecordedSpan>>>);
+    pub(super) struct Capture(Arc<Mutex<BTreeMap<u64, RecordedSpan>>>);
 
     impl Capture {
-        pub(crate) fn spans(&self) -> BTreeMap<u64, RecordedSpan> {
+        pub(super) fn spans(&self) -> BTreeMap<u64, RecordedSpan> {
             self.0.lock().unwrap().clone()
         }
     }

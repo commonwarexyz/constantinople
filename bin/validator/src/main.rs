@@ -2,8 +2,7 @@
 
 mod cli;
 mod config;
-mod finalized_payloads;
-mod indexer_tracing;
+mod indexer;
 mod relayer;
 mod run;
 mod state_reader;

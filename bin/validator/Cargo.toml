@@ -44,6 +44,7 @@ bytes.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
@@ -53,11 +54,6 @@ futures.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
-opentelemetry = { workspace = true, features = ["trace"] }
-opentelemetry_sdk = { workspace = true, features = ["testing"] }
-tracing-opentelemetry.workspace = true
-
-# Other
 tower = { workspace = true, features = ["util"] }
 
 [[bin]]

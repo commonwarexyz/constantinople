@@ -112,9 +112,13 @@ impl<D: Display> StoredBatchStatus<D> {
         }
     }
 
-    /// Whether the wire form carries digest lists (nontrivial to encode).
-    pub(super) const fn has_digest_lists(&self) -> bool {
-        matches!(self, Self::PartiallyFinalized { .. })
+    pub(super) const fn digest_list_len(&self) -> Option<usize> {
+        match self {
+            Self::PartiallyFinalized {
+                included, filtered, ..
+            } => Some(included.len().saturating_add(filtered.len())),
+            _ => None,
+        }
     }
 }
 

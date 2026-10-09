@@ -38,6 +38,10 @@ import {
 const HEIGHT = 7n;
 const FLOOR = 41n;
 const LOCATION = 4n;
+const OWNING_BLOCKS = [
+    { height: HEIGHT - 1n, transactions_tip: LOCATION, tx_count: 1n },
+    { height: HEIGHT, transactions_tip: 7n, tx_count: 3n },
+];
 
 let storeId = 0;
 
@@ -71,7 +75,10 @@ test('account target retries when publication precedes its Simplex certificate',
         }),
         controller.signal,
         isRetryableAccountProofError,
-        async () => { available = true; },
+        async () => {
+            available = true;
+            return true;
+        },
     );
 
     assert.equal(read.mock.callCount(), 2);
@@ -97,7 +104,7 @@ test('reported height starts certificate and metadata reads together and retains
         assert.equal(minSequenceNumber, FLOOR);
         if (sql.includes('FROM block_meta')) {
             reads.push('block');
-            return queryResult({ height: HEIGHT, transactions_tip: 7n, tx_count: 3n });
+            return blockMetaResult(sql, OWNING_BLOCKS);
         }
         reads.push('metadata');
         assert.match(sql, /FROM tx_meta/);
@@ -133,7 +140,7 @@ test('reported height starts certificate and metadata reads together and retains
         proofSizeBytes: 12,
     });
     assert.deepEqual(reads.slice(0, 2).sort(), ['certificate', 'metadata']);
-    assert.deepEqual(reads.slice(2), ['block', 'verified', 'proof']);
+    assert.deepEqual(reads.slice(2), ['block', 'block', 'verified', 'proof']);
 });
 
 for (const containingHeight of [1n, HEIGHT]) {
@@ -152,7 +159,9 @@ for (const containingHeight of [1n, HEIGHT]) {
             queries.push(sql);
             return sql.includes('FROM tx_meta')
                 ? queryResult({ qmdb_location: LOCATION, body })
-                : queryResult({ height: containingHeight, transactions_tip: 7n, tx_count: 3n });
+                : blockMetaResult(sql, containingHeight === HEIGHT
+                    ? OWNING_BLOCKS
+                    : [{ height: containingHeight, transactions_tip: 7n, tx_count: 3n }]);
         });
         t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
             request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
@@ -164,10 +173,12 @@ for (const containingHeight of [1n, HEIGHT]) {
 
         assert.equal(proof.height, containingHeight);
         assert.deepEqual(heights, [(HEIGHT + 1n).toString(), containingHeight.toString()]);
-        assert.equal(queries.length, 2);
-        assert.match(queries[1]!, /FROM block_meta/);
-        assert.match(queries[1]!, /WHERE transactions_tip > 4/);
-        assert.match(queries[1]!, /ORDER BY height ASC/);
+        assert.equal(queries.length, 3);
+        assert.match(
+            queries[1]!,
+            /SELECT height FROM block_meta WHERE transactions_tip <= 4 ORDER BY transactions_tip DESC LIMIT 1/,
+        );
+        assert.match(queries[2]!, new RegExp(`FROM block_meta WHERE height = ${containingHeight} LIMIT 1`));
     });
 }
 
@@ -213,9 +224,11 @@ for (const finalizedHeight of [undefined, HEIGHT + 1n]) {
             floors.push(minSequenceNumber);
             return sql.includes('FROM tx_meta')
                 ? queryResult({ qmdb_location: LOCATION, body })
-                : queryResult(blockPublished
-                    ? { height: HEIGHT, transactions_tip: 7n, tx_count: 3n }
-                    : { height: HEIGHT + 1n, transactions_tip: 11n, tx_count: 3n });
+                : blockMetaResult(sql, [
+                    OWNING_BLOCKS[0]!,
+                    ...(blockPublished ? [OWNING_BLOCKS[1]!] : []),
+                    { height: HEIGHT + 1n, transactions_tip: 11n, tx_count: 3n },
+                ]);
         });
         t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) =>
             height === HEIGHT.toString() ? containing : later,
@@ -240,7 +253,7 @@ for (const finalizedHeight of [undefined, HEIGHT + 1n]) {
         assert.equal(proof.height, HEIGHT);
         assert.deepEqual(finalizations, [HEIGHT]);
         assert.equal(proofRequest.mock.callCount(), 1);
-        assert.deepEqual(floors, [FLOOR, FLOOR, FLOOR, FLOOR]);
+        assert.deepEqual(floors, Array(6).fill(FLOOR));
     });
 }
 
@@ -265,7 +278,10 @@ test('a reported height cannot place a transaction outside its certified range',
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         sql.includes('FROM tx_meta')
             ? queryResult({ qmdb_location: 8n, body })
-            : queryResult({ height: HEIGHT, transactions_tip: 9n, tx_count: 1n }),
+            : blockMetaResult(sql, [
+                { height: HEIGHT - 1n, transactions_tip: 8n, tx_count: 1n },
+                { height: HEIGHT, transactions_tip: 9n, tx_count: 1n },
+            ]),
     );
     const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => { throw new Error('unexpected proof'); });
     let verified = false;
@@ -288,7 +304,10 @@ test('a reported height at the publication boundary still authenticates its dige
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         sql.includes('FROM tx_meta')
             ? queryResult({ qmdb_location: LOCATION, body })
-            : queryResult({ height: HEIGHT + 1n, transactions_tip: 7n, tx_count: 3n }),
+            : blockMetaResult(sql, [
+                { height: HEIGHT, transactions_tip: LOCATION, tx_count: 1n },
+                { height: HEIGHT + 1n, transactions_tip: 7n, tx_count: 3n },
+            ]),
     );
 
     await assert.rejects(fetchAndVerifyTransactionProof({
@@ -319,7 +338,7 @@ test('reported-height proofs retain the request floor without response sequence 
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         sql.includes('FROM tx_meta')
             ? queryResult({ qmdb_location: LOCATION, body })
-            : queryResult({ height: HEIGHT, transactions_tip: 7n, tx_count: 3n }),
+            : blockMetaResult(sql, OWNING_BLOCKS),
     );
     t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
         request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
@@ -376,7 +395,7 @@ test('prefetched certificates share verification and retain each proof publicati
         assert.equal(floor, FLOOR);
         return sql.includes('FROM tx_meta')
             ? queryResult({ qmdb_location: LOCATION, body })
-            : queryResult({ height: HEIGHT, transactions_tip: 7n, tx_count: 3n });
+            : blockMetaResult(sql, OWNING_BLOCKS);
     });
     t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
         request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
@@ -762,7 +781,7 @@ test('row metadata fetched at an older sequence is refreshed at the covering bar
     ) => keylessProof(request, root, location, value));
     const proof = await fetchAndVerifyTransactionRowProof({
         qmdbUrl: 'http://qmdb', sqlUrl: 'http://sql', row: activityRow(digest), target: latestTarget(),
-        metadata: { digest, sqlUrl: 'http://sql', sequenceNumber: FLOOR - 1n, location: LOCATION + 1n },
+        metadata: { sequenceNumber: FLOOR - 1n, location: LOCATION + 1n },
     });
     assert.equal(query.mock.callCount(), 1);
     assert.equal(proof.location, LOCATION);
@@ -812,8 +831,7 @@ test('speculative account SQL with an older floor is refreshed before proving', 
     await fetchAndVerifyAccountProof({
         qmdbUrl: 'http://qmdb', sqlUrl: 'http://sql', account: '22'.repeat(32), target: latestTarget(),
         metadata: {
-            account: '22'.repeat(32), sqlUrl: 'http://sql', sequenceNumber: FLOOR - 1n,
-            balance: 9n, nonce: 2n, nonceBitmap: 3n, location: LOCATION,
+            sequenceNumber: FLOOR - 1n, balance: 9n, nonce: 2n, nonceBitmap: 3n, location: LOCATION,
         },
     });
     assert.equal(queries.length, 1);
@@ -832,6 +850,29 @@ function queryResult(values: Record<string, unknown>): DecodedQueryResult {
         sequenceNumber: FLOOR,
         table: testTable([values]),
     };
+}
+
+interface BlockMetaRow {
+    readonly height: bigint;
+    readonly transactions_tip: bigint;
+    readonly tx_count: bigint;
+}
+
+// Blocks are listed in height order, so the last bounded row is the predecessor.
+function blockMetaResult(sql: string, blocks: readonly BlockMetaRow[]): DecodedQueryResult {
+    const bound = /transactions_tip <= (\d+)/.exec(sql);
+    if (bound) {
+        const predecessor = blocks
+            .filter(({ transactions_tip }) => transactions_tip <= BigInt(bound[1]!))
+            .at(-1);
+        return predecessor ? queryResult({ height: predecessor.height }) : emptyQueryResult();
+    }
+
+    const height = BigInt(/WHERE height = (\d+)/.exec(sql)![1]!);
+    const block = blocks.find((row) => row.height === height);
+    return block
+        ? queryResult({ transactions_tip: block.transactions_tip, tx_count: block.tx_count })
+        : emptyQueryResult();
 }
 
 function emptyQueryResult(): DecodedQueryResult {

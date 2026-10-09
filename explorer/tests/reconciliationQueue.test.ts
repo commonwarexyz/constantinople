@@ -1,7 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
-    activeReconciliations,
     wakeCoveredReconciliations,
     type TransactionReconciliation,
 } from '../src/reconciliationQueue.ts';
@@ -9,18 +8,6 @@ import {
 function entry(timer: number | null, waitingForHeight: bigint | null): TransactionReconciliation {
     return { controller: new AbortController(), timer, waitingForHeight };
 }
-
-test('backoff releases slots without making waiting transactions eligible again', () => {
-    const reconciliations = new Map([
-        ['active', entry(null, null)],
-        ['coverage', entry(1, 42n)],
-        ['aged', entry(2, null)],
-    ]);
-
-    assert.equal(activeReconciliations(reconciliations), 1);
-    assert.equal(reconciliations.has('coverage'), true);
-    assert.equal(reconciliations.has('aged'), true);
-});
 
 test('a covering target removes only target-fixable waits before rescheduling them', () => {
     const reconciliations = new Map([

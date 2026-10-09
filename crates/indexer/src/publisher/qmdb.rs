@@ -1,4 +1,4 @@
-//! Stateless finalized SQL and QMDB publication.
+//! Finalized SQL and QMDB publication.
 
 use super::{
     block::encode_block_rows,
@@ -6,13 +6,12 @@ use super::{
 };
 use crate::{
     namespaces::{
-        publication_target_client, simplex_client, sql_meta_client, state_qmdb_client,
-        transactions_qmdb_client,
+        publication_target_client, publication_target_key, simplex_client, sql_meta_client,
+        state_qmdb_client, transactions_qmdb_client,
     },
     sql_schema::build_meta_schema,
     store::writer_store_client,
 };
-use bytes::Bytes;
 use commonware_codec::{
     Buf, Codec, Copying, DecodeExt as _, Encode, EncodeSize, Error as CodecError, FixedSize,
     RangeCfg, Read, ReadExt, Write,
@@ -20,8 +19,8 @@ use commonware_codec::{
 use commonware_cryptography::{
     Digest, Hasher, PublicKey, bls12381::primitives::variant::Variant, sha256::Sha256,
 };
-use commonware_parallel::{Sequential, Strategy};
-use commonware_runtime::Spawner;
+use commonware_parallel::Strategy;
+use commonware_runtime::{Handle, Spawner};
 use commonware_storage::{
     merkle::{Family as _, Location, Proof, mmr},
     qmdb::{
@@ -47,32 +46,24 @@ use exoware_qmdb::{
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, KvSchema};
-use futures::{StreamExt as _, future::BoxFuture, stream};
+use futures::{
+    FutureExt as _, StreamExt as _,
+    future::BoxFuture,
+    stream::{self, FuturesUnordered},
+};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    marker::PhantomData,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{
-    sync::{Mutex, mpsc, oneshot},
-    task::{JoinHandle, JoinSet},
-};
+use tokio::sync::{Mutex, mpsc, oneshot};
 use tracing::{Instrument as _, Span, debug, info_span, instrument::WithSubscriber as _, warn};
 
 const QUEUE_MAGIC: u32 = 0x4351_5545;
 const QUEUE_FORMAT_VERSION: u16 = 1;
-const ROW_LAYOUT_VERSION: u16 = 1;
-pub const METADATA_ENCODER_VERSION: u16 = 1;
-const HASHER_SHA256: u8 = 1;
-const MERKLE_MMR: u8 = 1;
-const STATE_UNORDERED: u8 = 1;
-const TRANSACTIONS_KEYLESS: u8 = 1;
-const STATE_OPERATION_CODEC_VERSION: u16 = 1;
-const TRANSACTION_OPERATION_CODEC_VERSION: u16 = 1;
 const MAX_BUFFERED_UPLOADS: usize = 64;
 
 // Split byte-heavy SQL chunks to reduce encoding, compression, and transfer time.
@@ -91,27 +82,17 @@ type StateOperation = UnorderedOperation<QmdbFamily, AccountKey, StateEncoding>;
 type TransactionEncoding<H> = FixedEncoding<<H as Hasher>::Digest>;
 type TransactionOperation<H> = keyless::Operation<QmdbFamily, TransactionEncoding<H>>;
 
-/// Completion details for one contiguously published block.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct PublicationReceipt<D: Digest> {
-    pub height: u64,
-    pub block_digest: D,
-    pub store_sequence_number: u64,
-}
-
 /// Completion signals for a queued finalized-block upload.
 ///
-/// Persistence and publication are separate stages. Every data commit for a
-/// block lands independently, while publication waits for the contiguous
-/// prefix, so a caller can release resources held for the upload before
-/// earlier blocks have published.
-pub struct UploadCompletion<D: Digest> {
+/// Persistence and publication are separate stages. A block's data can be
+/// durable before earlier blocks publish.
+pub struct UploadCompletion {
     height: u64,
     persisted: oneshot::Receiver<()>,
-    published: oneshot::Receiver<PublicationReceipt<D>>,
+    published: oneshot::Receiver<()>,
 }
 
-impl<D: Digest> UploadCompletion<D> {
+impl UploadCompletion {
     /// Wait until every data commit for this block is durable in the Store.
     pub async fn persisted(&mut self) -> Result<(), PublishError> {
         (&mut self.persisted)
@@ -122,7 +103,7 @@ impl<D: Digest> UploadCompletion<D> {
     }
 
     /// Wait until the contiguous prefix through this block is published.
-    pub async fn published(self) -> Result<PublicationReceipt<D>, PublishError> {
+    pub async fn published(self) -> Result<(), PublishError> {
         self.published
             .await
             .map_err(|_| PublishError::CommitterStopped {
@@ -134,10 +115,10 @@ impl<D: Digest> UploadCompletion<D> {
 /// Codec limits for one authenticated operation range.
 #[derive(Clone, Debug)]
 pub struct QueuedAuthenticatedRangeCfg {
-    pub proof_digests: usize,
-    pub pinned_nodes: RangeCfg<usize>,
-    pub operations: RangeCfg<usize>,
-    pub operation_bytes: RangeCfg<usize>,
+    proof_digests: usize,
+    pinned_nodes: RangeCfg<usize>,
+    operations: RangeCfg<usize>,
+    operation_bytes: RangeCfg<usize>,
 }
 
 // Valid captures can exceed a fixed operation count. The codec bounds
@@ -156,18 +137,16 @@ impl Default for QueuedAuthenticatedRangeCfg {
 /// Codec configuration for a durable finalized upload.
 #[derive(Clone, Debug, Default)]
 pub struct QueuedFinalizedUploadCfg {
-    pub block: BlockCfg,
-    pub state: QueuedAuthenticatedRangeCfg,
-    pub transactions: QueuedAuthenticatedRangeCfg,
+    block: BlockCfg,
+    state: QueuedAuthenticatedRangeCfg,
+    transactions: QueuedAuthenticatedRangeCfg,
 }
 
 /// Operations of an authenticated range in their queue-payload layout.
 ///
 /// A payload stores each operation as length-prefixed bytes, the layout the
-/// codec uses for `Vec<Vec<u8>>`. The finalized hook writes that layout
-/// straight from the application's captured `Arc<Vec<Op>>`, so the payload
-/// never passes through a per-operation `Vec<u8>`. The publisher decodes
-/// payloads into `Vec<Vec<u8>>` and re-encodes those exact bytes.
+/// codec uses for `Vec<Vec<u8>>`. Typed operation lists write that layout
+/// without a per-operation `Vec<u8>`.
 pub trait OperationList {
     fn count(&self) -> usize;
 
@@ -215,11 +194,11 @@ impl<Op: Encode> OperationList for Arc<Vec<Op>> {
 /// Exact half-open operation range captured from a finalized batch.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedAuthenticatedRange<D: Digest, Ops = Vec<Vec<u8>>> {
-    pub start: u64,
-    pub end: u64,
-    pub proof: Proof<QmdbFamily, D>,
-    pub pinned_nodes: Vec<D>,
-    pub operations: Ops,
+    start: u64,
+    end: u64,
+    proof: Proof<QmdbFamily, D>,
+    pinned_nodes: Vec<D>,
+    operations: Ops,
 }
 
 impl<D: Digest, Op> QueuedAuthenticatedRange<D, Arc<Vec<Op>>> {
@@ -282,10 +261,8 @@ impl<D: Digest> Read for QueuedAuthenticatedRange<D> {
 
 /// Self-contained durable queue payload.
 ///
-/// The default form holds decoded operation bytes and is what the publisher
-/// works from. The finalized hook builds [CapturedFinalizedUpload], whose
-/// operations are the application's own vectors, and both forms encode to
-/// identical bytes.
+/// The default form holds decoded operation bytes. [CapturedFinalizedUpload]
+/// holds typed operations. Both forms encode to identical bytes.
 pub struct QueuedFinalizedUpload<H, P, V, S = Vec<Vec<u8>>, T = Vec<Vec<u8>>>
 where
     H: Hasher,
@@ -293,7 +270,7 @@ where
     V: Variant,
 {
     block: EngineBlock<H, P>,
-    finalization: EngineFinalization<P, V, H>,
+    finalization: Option<EngineFinalization<P, V, H>>,
     finalized_ts_micros: i64,
     state: QueuedAuthenticatedRange<H::Digest, S>,
     transactions: QueuedAuthenticatedRange<H::Digest, T>,
@@ -308,38 +285,17 @@ pub type CapturedFinalizedUpload<H, P, V> = QueuedFinalizedUpload<
     Arc<Vec<TransactionHistoryOperation<H>>>,
 >;
 
-impl<H, P, V, S, T> Clone for QueuedFinalizedUpload<H, P, V, S, T>
-where
-    H: Hasher,
-    P: PublicKey,
-    V: Variant,
-    S: Clone,
-    T: Clone,
-    EngineFinalization<P, V, H>: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            block: self.block.clone(),
-            finalization: self.finalization.clone(),
-            finalized_ts_micros: self.finalized_ts_micros,
-            state: self.state.clone(),
-            transactions: self.transactions.clone(),
-        }
-    }
-}
-
 impl<H, P, V> CapturedFinalizedUpload<H, P, V>
 where
     H: Hasher,
     H::Digest: Codec,
     P: PublicKey,
     V: Variant,
-    EngineFinalization<P, V, H>: Clone,
 {
     /// Build an entry from the exact pre-apply handoff.
     pub fn from_finalized_artifacts(
         block: &EngineBlock<H, P>,
-        finalization: EngineFinalization<P, V, H>,
+        finalization: Option<EngineFinalization<P, V, H>>,
         finalized_ts_micros: i64,
         artifacts: FinalizedArtifacts<H>,
     ) -> Result<Self, PublishError> {
@@ -362,7 +318,9 @@ where
             state,
             transactions,
         };
-        upload.validate()?;
+        upload
+            .validate()
+            .map_err(|reason| PublishError::InvalidQueuedUpload { reason })?;
         Ok(upload)
     }
 }
@@ -375,7 +333,6 @@ where
     V: Variant,
     S: OperationList,
     T: OperationList,
-    EngineFinalization<P, V, H>: Clone,
 {
     pub fn height(&self) -> u64 {
         self.block.header.height
@@ -385,73 +342,59 @@ where
         &self.block
     }
 
-    pub fn finalization(&self) -> EngineFinalization<P, V, H> {
-        self.finalization.clone()
-    }
-
-    pub const fn state_start(&self) -> u64 {
-        self.state.start
+    pub const fn finalization(&self) -> Option<&EngineFinalization<P, V, H>> {
+        self.finalization.as_ref()
     }
 
     pub const fn state_end(&self) -> u64 {
         self.state.end
     }
 
-    pub const fn transaction_start(&self) -> u64 {
-        self.transactions.start
-    }
-
     pub const fn transaction_end(&self) -> u64 {
         self.transactions.end
     }
 
-    fn validate(&self) -> Result<(), PublishError> {
-        if self.finalization.proposal.payload.block() != *self.block.seal() {
-            return Err(PublishError::InvalidQueuedUpload {
-                reason: "finalization commitment does not match the block",
-            });
+    fn validate(&self) -> Result<(), &'static str> {
+        if self
+            .finalization
+            .as_ref()
+            .is_some_and(|finalization| finalization.proposal.payload.block() != *self.block.seal())
+        {
+            return Err("finalization commitment does not match the block");
         }
-        validate_range(&self.state, self.block.header.state_range.end(), "state")?;
+        validate_range(
+            &self.state,
+            self.block.header.state_range.end(),
+            "state range does not match the finalized header",
+        )?;
         validate_range(
             &self.transactions,
             self.block.header.transactions_range.end(),
-            "transaction",
-        )?;
-        Ok(())
+            "transaction range does not match the finalized header",
+        )
     }
 }
 
 fn validate_range<D: Digest, Ops: OperationList>(
     range: &QueuedAuthenticatedRange<D, Ops>,
     header_end: u64,
-    label: &'static str,
-) -> Result<(), PublishError> {
+    header_mismatch: &'static str,
+) -> Result<(), &'static str> {
     if range.start >= range.end {
-        return Err(PublishError::InvalidQueuedUpload {
-            reason: "authenticated operation range is empty",
-        });
+        return Err("authenticated operation range is empty");
     }
     if range.end != header_end {
-        return Err(PublishError::InvalidQueuedUpload {
-            reason: match label {
-                "state" => "state range does not match the finalized header",
-                _ => "transaction range does not match the finalized header",
-            },
-        });
+        return Err(header_mismatch);
     }
     if range.proof.leaves.as_u64() != range.end {
-        return Err(PublishError::InvalidQueuedUpload {
-            reason: "authenticated proof does not target the range end",
-        });
+        return Err("authenticated proof does not target the range end");
     }
     let count = range
         .end
         .checked_sub(range.start)
         .and_then(|count| usize::try_from(count).ok());
     if count != Some(range.operations.count()) {
-        return Err(PublishError::InvalidQueuedUpload {
-            reason: "authenticated operation count does not match the range",
-        });
+        return Err("authenticated operation count does not match the range");
     }
     Ok(())
 }
@@ -468,14 +411,6 @@ where
     fn encode_size(&self) -> usize {
         QUEUE_MAGIC.encode_size()
             + QUEUE_FORMAT_VERSION.encode_size()
-            + ROW_LAYOUT_VERSION.encode_size()
-            + METADATA_ENCODER_VERSION.encode_size()
-            + HASHER_SHA256.encode_size()
-            + MERKLE_MMR.encode_size()
-            + STATE_UNORDERED.encode_size()
-            + TRANSACTIONS_KEYLESS.encode_size()
-            + STATE_OPERATION_CODEC_VERSION.encode_size()
-            + TRANSACTION_OPERATION_CODEC_VERSION.encode_size()
             + self.block.encode_size()
             + self.finalization.encode_size()
             + self.finalized_ts_micros.encode_size()
@@ -496,14 +431,6 @@ where
     fn write(&self, buf: &mut impl bytes::BufMut) {
         QUEUE_MAGIC.write(buf);
         QUEUE_FORMAT_VERSION.write(buf);
-        ROW_LAYOUT_VERSION.write(buf);
-        METADATA_ENCODER_VERSION.write(buf);
-        HASHER_SHA256.write(buf);
-        MERKLE_MMR.write(buf);
-        STATE_UNORDERED.write(buf);
-        TRANSACTIONS_KEYLESS.write(buf);
-        STATE_OPERATION_CODEC_VERSION.write(buf);
-        TRANSACTION_OPERATION_CODEC_VERSION.write(buf);
         self.block.write(buf);
         self.finalization.write(buf);
         self.finalized_ts_micros.write(buf);
@@ -517,44 +444,27 @@ where
     P: PublicKey,
     V: Variant,
     EngineBlock<Sha256, P>: Read<Cfg = BlockCfg>,
-    EngineFinalization<P, V, Sha256>: Read<Cfg = ()> + Clone,
+    EngineFinalization<P, V, Sha256>: Read<Cfg = ()>,
 {
     type Cfg = QueuedFinalizedUploadCfg;
 
     fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
-        if u32::read(buf)? != QUEUE_MAGIC
-            || u16::read(buf)? != QUEUE_FORMAT_VERSION
-            || u16::read(buf)? != ROW_LAYOUT_VERSION
-        {
+        if u32::read(buf)? != QUEUE_MAGIC || u16::read(buf)? != QUEUE_FORMAT_VERSION {
             return Err(CodecError::Invalid(
                 "QueuedFinalizedUpload",
                 "unsupported durable queue format",
             ));
         }
-        let metadata_encoder_version = u16::read(buf)?;
-        if metadata_encoder_version != METADATA_ENCODER_VERSION
-            || u8::read(buf)? != HASHER_SHA256
-            || u8::read(buf)? != MERKLE_MMR
-            || u8::read(buf)? != STATE_UNORDERED
-            || u8::read(buf)? != TRANSACTIONS_KEYLESS
-            || u16::read(buf)? != STATE_OPERATION_CODEC_VERSION
-            || u16::read(buf)? != TRANSACTION_OPERATION_CODEC_VERSION
-        {
-            return Err(CodecError::Invalid(
-                "QueuedFinalizedUpload",
-                "unsupported durable queue encoder identity",
-            ));
-        }
         let upload = Self {
             block: EngineBlock::<Sha256, P>::read_cfg(buf, &cfg.block)?,
-            finalization: EngineFinalization::<P, V, Sha256>::read(buf)?,
+            finalization: Option::<EngineFinalization<P, V, Sha256>>::read(buf)?,
             finalized_ts_micros: i64::read(buf)?,
             state: QueuedAuthenticatedRange::read_cfg(buf, &cfg.state)?,
             transactions: QueuedAuthenticatedRange::read_cfg(buf, &cfg.transactions)?,
         };
-        upload.validate().map_err(|_| {
-            CodecError::Invalid("QueuedFinalizedUpload", "invalid finalized upload payload")
-        })?;
+        upload
+            .validate()
+            .map_err(|reason| CodecError::Invalid("QueuedFinalizedUpload", reason))?;
         Ok(upload)
     }
 }
@@ -601,18 +511,15 @@ struct Admission {
     transaction_next: u64,
 }
 
-/// Owns stateless range preparation and contiguous publication.
-#[derive(Debug)]
+/// Owns range preparation and contiguous publication.
 pub struct Publisher<H, P>
 where
     H: Hasher,
     P: PublicKey,
 {
-    tx: Option<mpsc::Sender<PendingUpload<H, P>>>,
+    tx: mpsc::Sender<PendingUpload<H, P>>,
     admission: Mutex<Option<Admission>>,
     has_durable_range: Arc<AtomicBool>,
-    join: Option<JoinHandle<()>>,
-    _marker: PhantomData<P>,
 }
 
 struct PendingUpload<H, P>
@@ -620,26 +527,39 @@ where
     H: Hasher,
     P: PublicKey,
 {
+    publication: PendingPublication<H::Digest>,
+    commit: DataCommit<H, P>,
+}
+
+struct DataCommit<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
     span: Span,
-    queue_wait_span: Option<Span>,
-    scheduling_span: Option<Span>,
+    queue_wait_span: Span,
     enqueued_at: Instant,
-    height: u64,
+    data: UploadData<H, P>,
+    persisted: oneshot::Sender<()>,
+}
+
+struct UploadData<H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
     block: EngineBlock<H, P>,
     finalized_ts_micros: i64,
     state: QueuedAuthenticatedRange<H::Digest>,
     transactions: QueuedAuthenticatedRange<H::Digest>,
     omit_pinned_nodes: bool,
-    has_durable_range: Arc<AtomicBool>,
-    persisted: Option<oneshot::Sender<()>>,
-    published: Option<oneshot::Sender<PublicationReceipt<H::Digest>>>,
 }
 
 struct PendingPublication<D: Digest> {
     height: u64,
     block_digest: D,
     finalized_ts_micros: i64,
-    published: oneshot::Sender<PublicationReceipt<D>>,
+    published: oneshot::Sender<()>,
 }
 
 struct PersistedUpload {
@@ -664,54 +584,12 @@ where
     H::Digest: Codec + Send + Sync,
     P: PublicKey + Send + Sync + 'static,
 {
-    pub async fn connect<Cx>(
-        context: Cx,
-        store_url: &str,
-        api_key: Option<&str>,
-        buffer: usize,
-        metrics: super::PublisherMetrics,
-    ) -> Result<Self, PublishError>
-    where
-        Cx: Spawner,
-    {
-        Self::connect_with_strategy(context, store_url, api_key, buffer, metrics, Sequential).await
-    }
-
-    pub async fn connect_with_strategy<Cx, S>(
-        context: Cx,
-        store_url: &str,
-        api_key: Option<&str>,
-        buffer: usize,
-        metrics: super::PublisherMetrics,
-        strategy: S,
-    ) -> Result<Self, PublishError>
-    where
-        Cx: Spawner,
-        S: Strategy,
-    {
-        Self::connect_inner(
-            context, store_url, api_key, buffer, metrics, strategy, false,
-        )
-        .await
-    }
-
-    /// Connect after verifying every remote namespace is empty.
-    pub async fn connect_fresh_with_strategy<Cx, S>(
-        context: Cx,
-        store_url: &str,
-        api_key: Option<&str>,
-        buffer: usize,
-        metrics: super::PublisherMetrics,
-        strategy: S,
-    ) -> Result<Self, PublishError>
-    where
-        Cx: Spawner,
-        S: Strategy,
-    {
-        Self::connect_inner(context, store_url, api_key, buffer, metrics, strategy, true).await
-    }
-
-    async fn connect_inner<Cx, S>(
+    /// Connect a publisher and spawn its worker. With `require_fresh`, every
+    /// remote namespace must be empty.
+    ///
+    /// The returned handle resolves once the publisher is dropped and every
+    /// accepted upload has published.
+    pub async fn connect<Cx, S>(
         context: Cx,
         store_url: &str,
         api_key: Option<&str>,
@@ -719,50 +597,60 @@ where
         metrics: super::PublisherMetrics,
         strategy: S,
         require_fresh: bool,
-    ) -> Result<Self, PublishError>
+    ) -> Result<(Self, Handle<()>), PublishError>
     where
         Cx: Spawner,
         S: Strategy,
     {
         let store = writer_store_client(store_url, api_key)?;
-        let clients = WorkerClients {
-            state: state_qmdb_client(&store)?,
-            transactions: transactions_qmdb_client(&store)?,
-            targets: publication_target_client(&store)?,
-            sql_schema: Arc::new(
-                build_meta_schema(sql_meta_client(&store)?).map_err(PublishError::SqlSchema)?,
-            ),
-            store,
-        };
+        let state = state_qmdb_client(&store)?;
+        let transactions = transactions_qmdb_client(&store)?;
+        let targets = publication_target_client(&store)?;
+        let sql_meta = sql_meta_client(&store)?;
         if require_fresh {
-            require_empty_namespace(&clients.state, "state QMDB").await?;
-            require_empty_namespace(&clients.transactions, "transaction QMDB").await?;
-            require_empty_namespace(&clients.targets, "publication target").await?;
-            require_empty_namespace(&sql_meta_client(&clients.store)?, "SQL metadata").await?;
-            require_empty_namespace(&simplex_client(&clients.store)?, "Simplex").await?;
+            require_empty_namespace(&state, "state QMDB").await?;
+            require_empty_namespace(&transactions, "transaction QMDB").await?;
+            require_empty_namespace(&targets, "publication target").await?;
+            require_empty_namespace(&sql_meta, "SQL metadata").await?;
+            require_empty_namespace(&simplex_client(&store)?, "Simplex").await?;
         }
+        let clients = WorkerClients {
+            sql_schema: Arc::new(build_meta_schema(sql_meta).map_err(PublishError::SqlSchema)?),
+            store,
+            state,
+            transactions,
+            targets,
+        };
         let buffer = buffer.clamp(1, MAX_BUFFERED_UPLOADS);
         let (tx, rx) = mpsc::channel(buffer);
-        let join = tokio::spawn(
-            run_publisher(context, clients, strategy, metrics, rx, buffer)
-                .with_current_subscriber(),
-        );
-        Ok(Self {
-            tx: Some(tx),
+        let has_durable_range = Arc::new(AtomicBool::new(false));
+        let worker_durable_range = has_durable_range.clone();
+        let join = context.spawn(move |context| {
+            run_publisher(
+                context,
+                clients,
+                strategy,
+                metrics,
+                worker_durable_range,
+                rx,
+                buffer,
+            )
+            .with_current_subscriber()
+        });
+        let publisher = Self {
+            tx,
             admission: Mutex::new(None),
-            has_durable_range: Arc::new(AtomicBool::new(false)),
-            join: Some(join),
-            _marker: PhantomData,
-        })
+            has_durable_range,
+        };
+        Ok((publisher, join))
     }
 
     pub async fn enqueue_queued_finalized<V>(
         &self,
         upload: QueuedFinalizedUpload<H, P, V>,
-    ) -> Result<UploadCompletion<H::Digest>, PublishError>
+    ) -> Result<UploadCompletion, PublishError>
     where
         V: Variant,
-        EngineFinalization<P, V, H>: Clone,
     {
         let enqueued_at = Instant::now();
         let height = upload.height();
@@ -808,24 +696,35 @@ where
             // Seed the prefix in this process before reusing earlier ranges' nodes.
             // Contiguous publication waits for any still-pending predecessor rows.
             let omit_pinned_nodes = self.has_durable_range.load(Ordering::Relaxed);
+            let QueuedFinalizedUpload {
+                block,
+                finalized_ts_micros,
+                state,
+                transactions,
+                ..
+            } = upload;
             let pending = PendingUpload {
-                span,
-                queue_wait_span: Some(queue_wait_span),
-                scheduling_span: None,
-                enqueued_at,
-                height,
-                block: upload.block,
-                finalized_ts_micros: upload.finalized_ts_micros,
-                state: upload.state,
-                transactions: upload.transactions,
-                omit_pinned_nodes,
-                has_durable_range: self.has_durable_range.clone(),
-                persisted: Some(persisted_tx),
-                published: Some(published_tx),
+                publication: PendingPublication {
+                    height,
+                    block_digest: *block.seal(),
+                    finalized_ts_micros,
+                    published: published_tx,
+                },
+                commit: DataCommit {
+                    span,
+                    queue_wait_span,
+                    enqueued_at,
+                    data: UploadData {
+                        block,
+                        finalized_ts_micros,
+                        state,
+                        transactions,
+                        omit_pinned_nodes,
+                    },
+                    persisted: persisted_tx,
+                },
             };
             self.tx
-                .as_ref()
-                .ok_or(PublishError::CommitterStopped { height })?
                 .send(pending)
                 .await
                 .map_err(|_| PublishError::CommitterStopped { height })?;
@@ -838,13 +737,6 @@ where
         }
         .instrument(enqueue_span)
         .await
-    }
-
-    pub async fn shutdown(mut self) {
-        drop(self.tx.take());
-        if let Some(join) = self.join.take() {
-            join.await.expect("finalized publisher task failed");
-        }
     }
 }
 
@@ -866,6 +758,7 @@ async fn run_publisher<Cx, H, P, S>(
     clients: WorkerClients,
     strategy: S,
     metrics: super::PublisherMetrics,
+    has_durable_range: Arc<AtomicBool>,
     mut rx: mpsc::Receiver<PendingUpload<H, P>>,
     max_in_flight: usize,
 ) where
@@ -876,17 +769,15 @@ async fn run_publisher<Cx, H, P, S>(
     S: Strategy,
 {
     let mut rx_closed = false;
-    let mut commits = JoinSet::<Result<PersistedUpload, PublishError>>::new();
+    let mut commits = FuturesUnordered::<Handle<Result<PersistedUpload, PublishError>>>::new();
     let mut pending = VecDeque::new();
     let mut persisted = BTreeMap::new();
     let mut publication = None::<BoxFuture<'static, (usize, u64)>>;
     loop {
         // Include every available completion before selecting the next publication prefix.
-        while let Some(result) = commits.try_join_next() {
-            let result = result
-                .expect("finalized data commit task failed")
-                .expect("finalized data preparation must succeed");
-            persisted.insert(result.height, result);
+        while let Some(Some(result)) = commits.next().now_or_never() {
+            let upload = persisted_upload(result);
+            persisted.insert(upload.height, upload);
         }
         if publication.is_none() {
             publication = publish_ready_prefix::<H>(&clients, &metrics, &pending, &persisted);
@@ -902,41 +793,23 @@ async fn run_publisher<Cx, H, P, S>(
         tokio::select! {
             upload = rx.recv(), if !rx_closed && pending.len() < max_in_flight => {
                 match upload {
-                    Some(mut upload) => {
-                        drop(upload.queue_wait_span.take());
-                        upload.scheduling_span = Some(info_span!(
-                            parent: &upload.span,
-                            "indexer.qmdb.schedule",
-                            height = upload.height
-                        ));
-                        let publication = PendingPublication {
-                            height: upload.height,
-                            block_digest: *upload.block.seal(),
-                            finalized_ts_micros: upload.finalized_ts_micros,
-                            published: upload
-                                .published
-                                .take()
-                                .expect("pending upload publication signal must be present"),
-                        };
-                        pending.push_back(publication);
-                        spawn_data_commit(
-                            &mut commits,
+                    Some(upload) => {
+                        pending.push_back(upload.publication);
+                        commits.push(spawn_data_commit(
                             context.child("data"),
                             &clients,
                             strategy.clone(),
                             metrics.clone(),
-                            upload,
-                        );
+                            has_durable_range.clone(),
+                            upload.commit,
+                        ));
                     }
                     None => rx_closed = true,
                 }
             }
-            result = commits.join_next(), if !commits.is_empty() => {
-                let result = result
-                    .expect("non-empty finalized commit set must produce a result")
-                    .expect("finalized data commit task failed")
-                    .expect("finalized data preparation must succeed");
-                persisted.insert(result.height, result);
+            Some(result) = commits.next(), if !commits.is_empty() => {
+                let upload = persisted_upload(result);
+                persisted.insert(upload.height, upload);
             }
             (ready, sequence) = async { publication.as_mut().expect("publication is active").await }, if publication.is_some() => {
                 publication = None;
@@ -944,41 +817,52 @@ async fn run_publisher<Cx, H, P, S>(
             }
         }
     }
-    debug!("stateless finalized publisher task exiting after channel closure");
+    debug!("finalized publisher exiting after channel closure");
+}
+
+fn persisted_upload(
+    result: Result<Result<PersistedUpload, PublishError>, commonware_runtime::Error>,
+) -> PersistedUpload {
+    result
+        .expect("finalized data commit task failed")
+        .expect("finalized data preparation must succeed")
 }
 
 fn spawn_data_commit<Cx, H, P, S>(
-    commits: &mut JoinSet<Result<PersistedUpload, PublishError>>,
     context: Cx,
     clients: &WorkerClients,
     strategy: S,
     metrics: super::PublisherMetrics,
-    mut upload: PendingUpload<H, P>,
-) where
+    has_durable_range: Arc<AtomicBool>,
+    commit: DataCommit<H, P>,
+) -> Handle<Result<PersistedUpload, PublishError>>
+where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
     H::Digest: Codec + Send + Sync,
     P: PublicKey + Send + Sync + 'static,
     S: Strategy,
 {
+    let DataCommit {
+        span: block_span,
+        queue_wait_span,
+        enqueued_at,
+        data,
+        persisted,
+    } = commit;
+    drop(queue_wait_span);
+    let height = data.block.header.height;
+    let scheduling_span = info_span!(parent: &block_span, "indexer.qmdb.schedule", height);
     let store = clients.store.clone();
     let state_client = clients.state.clone();
     let transaction_client = clients.transactions.clone();
     let sql_schema = clients.sql_schema.clone();
-    let persisted = upload
-        .persisted
-        .take()
-        .expect("pending upload persistence signal must be present");
-    let height = upload.height;
-    let block_span = upload.span.clone();
-    let scheduling_span = upload.scheduling_span.take();
-    let has_durable_range = upload.has_durable_range.clone();
     let admitted_at = Instant::now();
 
     // Supervise preparation and data commits without holding a blocking
     // thread while waiting for their completion.
     let data_span = info_span!(parent: &block_span, "indexer.qmdb.persist", height);
-    let commit = context.spawn(move |context| {
+    context.spawn(move |context| {
         async move {
             drop(scheduling_span);
             let prepare_metrics = metrics.clone();
@@ -1000,39 +884,18 @@ fn spawn_data_commit<Cx, H, P, S>(
                     let started = Instant::now();
                     prepare_metrics
                         .prepare_wait_duration
-                        .observe(started.duration_since(upload.enqueued_at).as_secs_f64());
-                    prepare_metrics
-                        .transactions_per_block
-                        .observe(upload.block.body.len() as f64);
+                        .observe(started.duration_since(enqueued_at).as_secs_f64());
 
                     // Keep both CPU-clock reads on this thread without an intervening await.
                     let cpu_started = ThreadTime::try_now();
-                    let prepared = (|| {
-                        let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
-                            state_client,
-                            transaction_client,
-                            sql_schema,
-                            strategy,
-                            upload,
-                            &prepare_metrics,
-                        )?;
-                        let chunking_started = Instant::now();
-                        let split_span = info_span!(
-                            "indexer.qmdb.prepare.chunking",
-                            rows = batch.len(),
-                            encoded_bytes = batch.encoded_len(),
-                            chunks = tracing::field::Empty
-                        );
-                        let batches = split_span
-                            .in_scope(|| batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES));
-                        if let Ok(batches) = &batches {
-                            split_span.record("chunks", batches.len());
-                        }
-                        prepare_metrics
-                            .chunking_duration
-                            .observe(chunking_started.elapsed().as_secs_f64());
-                        Ok::<_, PublishError>((batches?, state, transactions))
-                    })();
+                    let prepared = prepare_chunks::<H, P, S>(
+                        state_client,
+                        transaction_client,
+                        sql_schema,
+                        strategy,
+                        data,
+                        &prepare_metrics,
+                    );
                     let cpu_elapsed = cpu_started.and_then(|started| started.try_elapsed());
                     prepare_metrics
                         .prepare_duration
@@ -1052,7 +915,7 @@ fn spawn_data_commit<Cx, H, P, S>(
             let (batches, state, transactions) = prepare
                 .await
                 .expect("finalized index preparation task failed")?;
-            let chunks = batches.len() as u64;
+            let chunks = batches.len();
             commit_chunks(
                 context.child("commit"),
                 &store,
@@ -1063,7 +926,6 @@ fn spawn_data_commit<Cx, H, P, S>(
             .await?;
             has_durable_range.store(true, Ordering::Relaxed);
             let persisted_at = Instant::now();
-            metrics.chunk_commits.inc_by(chunks);
             metrics.chunks_per_block.observe(chunks as f64);
             metrics
                 .persist_duration
@@ -1088,8 +950,7 @@ fn spawn_data_commit<Cx, H, P, S>(
         }
         .instrument(data_span)
         .with_current_subscriber()
-    });
-    commits.spawn(async move { commit.await.expect("finalized index data task failed") });
+    })
 }
 
 async fn commit_chunks<Cx: Spawner>(
@@ -1101,6 +962,7 @@ async fn commit_chunks<Cx: Spawner>(
 ) -> Result<(), ClientError> {
     let chunk_count = batches.len();
     let parent_span = Span::current();
+
     // Spawn lazily so the limit covers request encoding, compression, and retries.
     let mut commits = stream::iter(batches)
         .enumerate()
@@ -1133,12 +995,55 @@ async fn commit_chunks<Cx: Spawner>(
     Ok(())
 }
 
+type PreparedChunks = (
+    Vec<StoreWriteBatch>,
+    Location<QmdbFamily>,
+    Location<QmdbFamily>,
+);
+
+fn prepare_chunks<H, P, S>(
+    state_client: PrefixedStoreClient,
+    transaction_client: PrefixedStoreClient,
+    sql_schema: Arc<KvSchema>,
+    strategy: S,
+    data: UploadData<H, P>,
+    metrics: &super::PublisherMetrics,
+) -> Result<PreparedChunks, PublishError>
+where
+    H: Hasher,
+    H::Digest: Codec + Send + Sync,
+    P: PublicKey,
+    S: Strategy,
+{
+    let (batch, state, transactions) = prepare_data_batch::<H, P, S>(
+        state_client,
+        transaction_client,
+        sql_schema,
+        strategy,
+        data,
+        metrics,
+    )?;
+    let chunking_started = Instant::now();
+    let split_span = info_span!(
+        "indexer.qmdb.prepare.chunking",
+        rows = batch.len(),
+        encoded_bytes = batch.encoded_len(),
+        chunks = tracing::field::Empty
+    );
+    let batches = split_span.in_scope(|| batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES))?;
+    split_span.record("chunks", batches.len());
+    metrics
+        .chunking_duration
+        .observe(chunking_started.elapsed().as_secs_f64());
+    Ok((batches, state, transactions))
+}
+
 fn prepare_data_batch<H, P, S>(
     state_client: PrefixedStoreClient,
     transaction_client: PrefixedStoreClient,
     sql_schema: Arc<KvSchema>,
     strategy: S,
-    upload: PendingUpload<H, P>,
+    upload: UploadData<H, P>,
     metrics: &super::PublisherMetrics,
 ) -> Result<(StoreWriteBatch, Location<QmdbFamily>, Location<QmdbFamily>), PublishError>
 where
@@ -1295,7 +1200,7 @@ fn account_rows<D: Digest>(
     );
     let _entered = span.enter();
     let mut rows = Vec::new();
-    for (offset, encoded) in range.operations.iter().enumerate() {
+    for (location, encoded) in (range.start..).zip(&range.operations) {
         let operation = StateOperation::decode(Copying(encoded.as_slice())).map_err(|_| {
             PublishError::InvalidQueuedUpload {
                 reason: "state operation bytes do not decode",
@@ -1304,12 +1209,6 @@ fn account_rows<D: Digest>(
         let AnyOperation::Update(UnorderedUpdate(key, account)) = operation else {
             continue;
         };
-        let location = range
-            .start
-            .checked_add(u64::try_from(offset).expect("state operation offset fits u64"))
-            .ok_or(PublishError::InvalidQueuedUpload {
-                reason: "state operation location overflows",
-            })?;
         rows.push(encode_account_meta_row(AccountMetaRow {
             account: key
                 .as_ref()
@@ -1402,9 +1301,12 @@ where
     stage_watermark(&clients.transactions, last_data.transactions, &mut batch)
         .expect("validated transaction range has a watermark");
     for publication in pending.iter().take(ready) {
-        let key = Key::from(Bytes::copy_from_slice(&publication.height.to_be_bytes()));
         batch
-            .push(&clients.targets, &key, publication.block_digest.as_ref())
+            .push(
+                &clients.targets,
+                &publication_target_key(publication.height),
+                publication.block_digest.as_ref(),
+            )
             .expect("publication target row must stage");
     }
     let store = clients.store.clone();
@@ -1458,17 +1360,14 @@ fn complete_publication<D: Digest>(
                 barrier_sequence, "published finalized index prefix"
             );
         });
-        let _ = publication.published.send(PublicationReceipt {
-            height: publication.height,
-            block_digest: publication.block_digest,
-            store_sequence_number: barrier_sequence,
-        });
+        let _ = publication.published.send(());
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
     use commonware_codec::Decode as _;
     use commonware_consensus::{
         simplex::{
@@ -1485,7 +1384,8 @@ mod tests {
     };
     use commonware_parallel::Sequential;
     use commonware_runtime::{
-        Metrics as _, Runner as _, Supervisor as _, telemetry::metrics::has_metric_value,
+        Metrics as _, Runner as _, Supervisor as _,
+        telemetry::metrics::{has_metric_value, metric_samples},
     };
     use commonware_storage::merkle::mem::Mem;
     use commonware_utils::{NZU16, non_empty_range};
@@ -1607,12 +1507,7 @@ mod tests {
         let transactions = queued_range(&encode_operations(&transaction_operations), 1, 2);
         let upload = queued_upload(1, state, transactions);
         let encoded = upload.encode();
-        assert_eq!(
-            &encoded[..18],
-            &[
-                0x43, 0x51, 0x55, 0x45, 0, 1, 0, 1, 0, 1, 1, 1, 1, 1, 0, 1, 0, 1
-            ]
-        );
+        assert_eq!(&encoded[..6], &[0x43, 0x51, 0x55, 0x45, 0, 1]);
         let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
             encoded.clone(),
             &QueuedFinalizedUploadCfg::default(),
@@ -1621,15 +1516,15 @@ mod tests {
 
         assert_eq!(decoded.encode(), encoded);
         assert_eq!(
-            decoded.finalization().encode(),
-            upload.finalization().encode()
+            decoded.finalization().map(Encode::encode),
+            upload.finalization().map(Encode::encode)
         );
-        assert_eq!(decoded.state_start(), upload.state_start());
+        assert_eq!(decoded.state.start, upload.state.start);
         assert_eq!(decoded.state_end(), upload.state_end());
-        assert_eq!(decoded.transaction_start(), upload.transaction_start());
+        assert_eq!(decoded.transactions.start, upload.transactions.start);
         assert_eq!(decoded.transaction_end(), upload.transaction_end());
 
-        for index in 0..18 {
+        for index in 0..6 {
             let mut unsupported = encoded.to_vec();
             unsupported[index] ^= u8::MAX;
             assert!(
@@ -1640,6 +1535,33 @@ mod tests {
                 .is_err()
             );
         }
+    }
+
+    #[test]
+    fn uncertified_upload_round_trips() {
+        let state_operations = [
+            StateOperation::CommitFloor(None, Location::new(0)),
+            StateOperation::CommitFloor(None, Location::new(1)),
+        ];
+        let transaction_operations = [
+            TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
+            TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
+        ];
+        let mut upload = queued_upload(
+            1,
+            queued_range(&encode_operations(&state_operations), 1, 2),
+            queued_range(&encode_operations(&transaction_operations), 1, 2),
+        );
+        upload.finalization = None;
+        let encoded = upload.encode();
+        let decoded = QueuedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::decode_cfg(
+            encoded.clone(),
+            &QueuedFinalizedUploadCfg::default(),
+        )
+        .expect("uncertified queue entry decodes");
+
+        assert!(decoded.finalization().is_none());
+        assert_eq!(decoded.encode(), encoded);
     }
 
     #[test]
@@ -1695,7 +1617,7 @@ mod tests {
         let captured =
             CapturedFinalizedUpload::<Sha256, ed25519::PublicKey, MinSig>::from_finalized_artifacts(
                 &block,
-                finalization.clone(),
+                Some(finalization.clone()),
                 1,
                 artifacts,
             )
@@ -1714,82 +1636,6 @@ mod tests {
     }
 
     #[test]
-    fn upload_completion_reports_persistence_before_publication() {
-        commonware_runtime::tokio::Runner::default().start(|_| async move {
-            let (persisted_tx, persisted) = oneshot::channel();
-            let (published_tx, published) = oneshot::channel();
-            let mut completion = UploadCompletion::<Sha256Digest> {
-                height: 3,
-                persisted,
-                published,
-            };
-
-            persisted_tx.send(()).expect("persisted receiver is alive");
-            completion
-                .persisted()
-                .await
-                .expect("persisted stage resolves");
-
-            let receipt = PublicationReceipt {
-                height: 3,
-                block_digest: Sha256Digest::from([3; Sha256Digest::SIZE]),
-                store_sequence_number: 9,
-            };
-            published_tx
-                .send(receipt)
-                .expect("published receiver is alive");
-            assert_eq!(completion.published().await.expect("published"), receipt);
-
-            let (_persisted_tx, persisted) = oneshot::channel();
-            let (published_tx, published) = oneshot::channel::<PublicationReceipt<Sha256Digest>>();
-            let completion = UploadCompletion::<Sha256Digest> {
-                height: 4,
-                persisted,
-                published,
-            };
-            drop(published_tx);
-            assert!(matches!(
-                completion.published().await,
-                Err(PublishError::CommitterStopped { height: 4 })
-            ));
-        });
-    }
-
-    #[tokio::test]
-    async fn queued_upload_moves_operations_to_worker() {
-        let (tx, mut rx) = mpsc::channel(1);
-        let publisher = Publisher::<Sha256, ed25519::PublicKey> {
-            tx: Some(tx),
-            admission: Mutex::new(None),
-            has_durable_range: Arc::new(AtomicBool::new(false)),
-            join: None,
-            _marker: PhantomData,
-        };
-        let state = encode_operations(&[
-            StateOperation::CommitFloor(None, Location::new(0)),
-            StateOperation::CommitFloor(None, Location::new(1)),
-        ]);
-        let transactions = encode_operations(&[
-            TransactionOperation::<Sha256>::Commit(None, Location::new(0)),
-            TransactionOperation::<Sha256>::Commit(None, Location::new(1)),
-        ]);
-        let upload = queued_upload(
-            1,
-            queued_range(&state, 1, 2),
-            queued_range(&transactions, 1, 2),
-        );
-        let state = upload.state.operations.as_ptr();
-        let transactions = upload.transactions.operations.as_ptr();
-        let _completion = publisher
-            .enqueue_queued_finalized(upload)
-            .await
-            .expect("admission succeeds");
-        let pending = rx.recv().await.expect("worker receives upload");
-        assert_eq!(pending.state.operations.as_ptr(), state);
-        assert_eq!(pending.transactions.operations.as_ptr(), transactions);
-    }
-
-    #[test]
     fn writer_clients_authenticate_both_uploaders() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let store = crate::test_store::ObservedStore::open("writer-key")
@@ -1804,13 +1650,14 @@ mod tests {
                     context.child("simplex"), &store.url, Some("writer-key"), 2
                 )
                 .expect("certificate reporter connects");
-            let publisher = Publisher::<Sha256, ed25519::PublicKey>::connect_fresh_with_strategy(
+            let (publisher, worker) = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("qmdb_publisher"),
                 &store.url,
                 Some("writer-key"),
                 2,
                 super::super::PublisherMetrics::new(&context.child("metrics")),
                 Sequential,
+                true,
             )
             .await
             .expect("publisher connects");
@@ -1828,7 +1675,7 @@ mod tests {
                 queued_range(&transactions, 1, 2),
             );
             let block = Arc::new(upload.block().clone());
-            let finalization = upload.finalization();
+            let finalization = upload.finalization().cloned();
             publisher
                 .enqueue_queued_finalized(upload)
                 .await
@@ -1864,7 +1711,9 @@ mod tests {
                 "fresh namespace validation reaches authenticated Store queries"
             );
 
-            publisher.shutdown().await;
+            drop(publisher);
+
+            worker.await.expect("publisher drains");
             store.shutdown().await;
         });
     }
@@ -1872,17 +1721,19 @@ mod tests {
     #[test]
     fn canceled_enqueue_preserves_publication_continuity() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let store = crate::test_store::GatedIngestStore::open_gating_ingest(1)
+            let store = crate::test_store::GatedIngestStore::open(1..2)
                 .await
                 .expect("open Store");
             let physical = writer_store_client(&store.url, None).expect("build Store client");
             let targets = publication_target_client(&physical).expect("target namespace");
-            let publisher = Publisher::connect(
+            let (publisher, worker) = Publisher::connect(
                 context.child("publisher_task"),
                 &store.url,
                 None,
                 1,
                 super::super::PublisherMetrics::new(&context.child("publisher")),
+                Sequential,
+                false,
             )
             .await
             .expect("connect publisher");
@@ -1907,7 +1758,7 @@ mod tests {
             };
 
             let mut first = publisher.enqueue_queued_finalized(upload(1)).await.unwrap();
-            store.wait_for_first_ingest().await;
+            store.wait_for_ingests(2).await;
             first.persisted().await.unwrap();
             let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
             {
@@ -1915,7 +1766,7 @@ mod tests {
                 assert!(futures::poll!(enqueue.as_mut()).is_pending());
             }
 
-            store.release_first_ingest();
+            store.release_ingest();
             let third = publisher.enqueue_queued_finalized(upload(3)).await.unwrap();
             for completion in [first, second, third] {
                 completion.published().await.unwrap();
@@ -1923,7 +1774,8 @@ mod tests {
             for height in 1..=3 {
                 assert!(target(&targets, height).await.is_some());
             }
-            publisher.shutdown().await;
+            drop(publisher);
+            worker.await.expect("publisher drains");
             store.shutdown().await;
         });
     }
@@ -1936,10 +1788,9 @@ mod tests {
             commonware_runtime::tokio::Config::default().with_worker_threads(1),
         )
         .start(|context| async move {
-            let store =
-                crate::test_store::GatedIngestStore::open_gating_ingests(0..MAX_CONCURRENT_CHUNKS)
-                    .await
-                    .expect("open Store");
+            let store = crate::test_store::GatedIngestStore::open(0..MAX_CONCURRENT_CHUNKS)
+                .await
+                .expect("open Store");
             let physical = writer_store_client(&store.url, None).expect("build Store client");
             let client = PrefixedStoreClient::empty(physical.clone());
             let metrics = super::super::StoreCommitMetrics::new(&context);
@@ -1974,7 +1825,7 @@ mod tests {
             );
 
             // Later chunks can finish while the other initial chunks remain blocked.
-            store.release_first_ingest();
+            store.release_ingest();
             tokio::time::timeout(Duration::from_secs(5), store.wait_for_ingests(count))
                 .await
                 .expect("completed requests free concurrency slots");
@@ -1985,7 +1836,7 @@ mod tests {
             );
 
             for _ in 1..MAX_CONCURRENT_CHUNKS {
-                store.release_first_ingest();
+                store.release_ingest();
             }
             tokio::time::timeout(Duration::from_secs(5), commit)
                 .await
@@ -2000,86 +1851,25 @@ mod tests {
     }
 
     #[test]
-    fn chunk_commit_rejection_does_not_wait_for_other_chunks() {
-        use axum::{Router, http::StatusCode};
-        use std::time::Duration;
-
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let (arrived, mut requests) = mpsc::unbounded_channel();
-            let app = Router::new().fallback(move || {
-                let arrived = arrived.clone();
-                async move {
-                    let (release, status) = oneshot::channel::<StatusCode>();
-                    arrived.send(release).unwrap();
-                    (
-                        status.await.unwrap(),
-                        [("content-type", "application/json")],
-                        r#"{"code":"invalid_argument","message":"invalid chunk"}"#,
-                    )
-                }
-            });
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            let physical = writer_store_client(&url, None).unwrap();
-            let client = PrefixedStoreClient::empty(physical.clone());
-            let metrics = super::super::StoreCommitMetrics::new(&context);
-            let mut batch = StoreWriteBatch::new();
-            batch.push(&client, &Key::from(vec![1]), vec![1]).unwrap();
-            let commit = context.spawn(move |context| async move {
-                commit_chunks(
-                    context,
-                    &physical,
-                    &metrics,
-                    1,
-                    vec![batch; MAX_CONCURRENT_CHUNKS + 1],
-                )
-                .await
-            });
-
-            let mut held = Vec::new();
-            for _ in 0..MAX_CONCURRENT_CHUNKS {
-                held.push(
-                    tokio::time::timeout(Duration::from_secs(5), requests.recv())
-                        .await
-                        .expect("chunk starts")
-                        .unwrap(),
-                );
-            }
-            held.pop().unwrap().send(StatusCode::BAD_REQUEST).unwrap();
-            let error = tokio::time::timeout(Duration::from_secs(5), commit)
-                .await
-                .expect("rejection does not wait for blocked chunks")
-                .expect("commit task succeeds")
-                .expect_err("rejected chunk fails the block");
-            assert_eq!(
-                error.rpc_code(),
-                Some(exoware_sdk::ErrorCode::InvalidArgument)
-            );
-            assert!(requests.try_recv().is_err());
-            server.abort();
-            let _ = server.await;
-        });
-    }
-
-    #[test]
     fn delayed_publication_allows_bounded_data_progress_and_coalesces_completions() {
         commonware_runtime::tokio::Runner::new(
             commonware_runtime::tokio::Config::default().with_worker_threads(1),
         )
         .start(|context| async move {
-            let store = crate::test_store::GatedIngestStore::open_gating_ingest(1)
+            let store = crate::test_store::GatedIngestStore::open(1..2)
                 .await
                 .expect("open Store");
             let physical = writer_store_client(&store.url, None).expect("build Store client");
             let targets = publication_target_client(&physical).expect("target namespace");
             let metrics = super::super::PublisherMetrics::new(&context.child("publisher"));
-            let publisher = Publisher::connect(
+            let (publisher, worker) = Publisher::connect(
                 context.child("publisher_task"),
                 &store.url,
                 None,
                 3,
                 metrics.clone(),
+                Sequential,
+                false,
             )
             .await
             .expect("connect publisher");
@@ -2113,12 +1903,9 @@ mod tests {
             };
 
             let mut first = publisher.enqueue_queued_finalized(upload(1)).await.unwrap();
-            tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                store.wait_for_first_ingest(),
-            )
-            .await
-            .expect("first publication reaches Store");
+            tokio::time::timeout(std::time::Duration::from_secs(5), store.wait_for_ingests(2))
+                .await
+                .expect("first publication reaches Store");
             first.persisted().await.unwrap();
             let mut second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
             let mut third = publisher.enqueue_queued_finalized(upload(3)).await.unwrap();
@@ -2129,7 +1916,11 @@ mod tests {
             .await
             .expect("later data persists while publication is delayed");
             let encoded_metrics = context.encode();
-            assert!(has_metric_value(&encoded_metrics, "chunk_commits_total", 3));
+            assert!(has_metric_value(
+                &encoded_metrics,
+                "chunks_per_block_count",
+                3
+            ));
             assert!(has_metric_value(
                 &encoded_metrics,
                 "finalization_to_publication_duration_count",
@@ -2146,31 +1937,32 @@ mod tests {
                     .is_err(),
                 "unpublished work remains bounded"
             );
-            let mut shutdown = Box::pin(publisher.shutdown());
+            drop(publisher);
+            let mut worker = worker;
             assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(25), &mut shutdown)
+                tokio::time::timeout(std::time::Duration::from_millis(25), &mut worker)
                     .await
                     .is_err(),
-                "shutdown waits for publication"
+                "a dropped publisher drains before its worker exits"
             );
 
-            store.release_first_ingest();
+            store.release_ingest();
             tokio::time::timeout(std::time::Duration::from_secs(5), async {
-                let first = first.published().await.unwrap();
-                let second = second.published().await.unwrap();
-                let third = third.published().await.unwrap();
+                first.published().await.unwrap();
+                second.published().await.unwrap();
+                third.published().await.unwrap();
                 fourth.persisted().await.unwrap();
-                let fourth = fourth.published().await.unwrap();
-                assert!(first.store_sequence_number < second.store_sequence_number);
-                assert_eq!(second.store_sequence_number, third.store_sequence_number);
-                assert!(third.store_sequence_number < fourth.store_sequence_number);
-                shutdown.await;
+                fourth.published().await.unwrap();
+                worker.await.expect("publisher drains");
             })
             .await
             .expect("publisher drains after the barrier succeeds");
             let encoded_metrics = context.encode();
+
+            // Heights two and three share one barrier between those of heights one and four.
             assert!(
-                has_metric_value(&encoded_metrics, "chunk_commits_total", 4),
+                metric_samples(&encoded_metrics, "store_commit_duration_count")
+                    .any(|sample| sample == ("kind=\"barrier\"", "3")),
                 "{encoded_metrics}"
             );
             for metric in [
@@ -2181,7 +1973,6 @@ mod tests {
                 "prepare_cpu_duration_count",
                 "chunking_duration_count",
                 "chunks_per_block_count",
-                "transactions_per_block_count",
                 "persist_duration_count",
                 "finalization_to_publication_duration_count",
             ] {
@@ -2228,19 +2019,21 @@ mod tests {
             )
             .start(move |context| {
                 async move {
-                    let store = crate::test_store::GatedIngestStore::open_gating_ingest(1)
+                    let store = crate::test_store::GatedIngestStore::open(1..2)
                         .await
                         .expect("open Store");
                     let physical =
                         writer_store_client(&store.url, None).expect("build Store client");
                     let client = PrefixedStoreClient::empty(physical.clone());
                     let metrics = super::super::PublisherMetrics::new(&context.child("publisher"));
-                    let publisher = Publisher::connect(
+                    let (publisher, worker) = Publisher::connect(
                         context.child("publisher_task"),
                         &store.url,
                         None,
                         3,
                         metrics.clone(),
+                        Sequential,
+                        false,
                     )
                     .await
                     .expect("connect publisher");
@@ -2298,21 +2091,14 @@ mod tests {
                     .await
                     .expect("later blocks persist while the first barrier is held");
 
-                    store.release_first_ingest();
-                    let (_, second_receipt, third_receipt) =
-                        tokio::time::timeout(Duration::from_secs(5), async {
-                            (
-                                first.published().await.unwrap(),
-                                second.published().await.unwrap(),
-                                third.published().await.unwrap(),
-                            )
-                        })
-                        .await
-                        .expect("grouped publication completes");
-                    assert_eq!(
-                        second_receipt.store_sequence_number,
-                        third_receipt.store_sequence_number
-                    );
+                    store.release_ingest();
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        first.published().await.unwrap();
+                        second.published().await.unwrap();
+                        third.published().await.unwrap();
+                    })
+                    .await
+                    .expect("grouped publication completes");
 
                     let fanout_root = root(9);
                     let fanout_root_id = fanout_root.id().unwrap().into_u64();
@@ -2339,7 +2125,9 @@ mod tests {
                     .await
                     .expect("chunk fanout commits");
 
-                    publisher.shutdown().await;
+                    drop(publisher);
+
+                    worker.await.expect("publisher drains");
                     store.shutdown().await;
 
                     let spans = capture.spans();
@@ -2394,11 +2182,13 @@ mod tests {
                         .expect("grouped publication span exists");
                     assert_eq!(publication.parent, Some(second_wait));
                     assert!(publication.follows_from.contains(&third_wait));
-                    let publication_sequence = second_receipt.store_sequence_number.to_string();
+                    let publication_sequence = spans[&second_wait].fields.get("sequence");
+                    assert!(publication_sequence.is_some());
                     assert_eq!(
-                        publication.fields.get("sequence").map(String::as_str),
-                        Some(publication_sequence.as_str())
+                        spans[&third_wait].fields.get("sequence"),
+                        publication_sequence
                     );
+                    assert_eq!(publication.fields.get("sequence"), publication_sequence);
 
                     let fanout_chunks = spans
                         .values()
@@ -2508,13 +2298,11 @@ mod tests {
                 publish_ready_prefix::<Sha256>(&clients, &metrics, &pending, &persisted)
                     .expect("both blocks are ready")
                     .await;
+            assert_eq!(ready, 2);
             complete_publication(ready, sequence, &metrics, &mut pending, &mut persisted);
 
-            let first = first_rx.await.expect("first publication completes");
-            let second = second_rx.await.expect("second publication completes");
-            assert_eq!(first.block_digest, first_digest);
-            assert_eq!(second.block_digest, second_digest);
-            assert_eq!(first.store_sequence_number, second.store_sequence_number);
+            first_rx.await.expect("first publication completes");
+            second_rx.await.expect("second publication completes");
             assert_eq!(target(&clients.targets, 1).await, Some(first_digest));
             assert_eq!(target(&clients.targets, 2).await, Some(second_digest));
             assert!(pending.is_empty());
@@ -2533,7 +2321,7 @@ mod tests {
                 .expect("spawn simulator");
             let physical = writer_store_client(&url, None).expect("build Store client");
             let targets = publication_target_client(&physical).expect("target namespace");
-            let key = Key::from(Bytes::copy_from_slice(&1u64.to_be_bytes()));
+            let key = publication_target_key(1);
             targets
                 .ingest()
                 .put(&[(&key, &[1; Sha256Digest::SIZE])])
@@ -2541,16 +2329,19 @@ mod tests {
                 .expect("seed stale target");
             let metrics = super::super::PublisherMetrics::new(&context.child("publisher"));
 
-            let error = Publisher::<Sha256, ed25519::PublicKey>::connect_fresh_with_strategy(
+            let Err(error) = Publisher::<Sha256, ed25519::PublicKey>::connect(
                 context.child("publisher_task"),
                 &url,
                 None,
                 1,
                 metrics,
                 Sequential,
+                true,
             )
             .await
-            .expect_err("fresh connect rejects existing rows");
+            else {
+                panic!("fresh connect rejects existing rows");
+            };
 
             assert!(matches!(
                 error,
@@ -2592,20 +2383,12 @@ mod tests {
                         transactions_qmdb_client(&store).unwrap(),
                         schema.clone(),
                         Sequential,
-                        PendingUpload {
-                            span: Span::none(),
-                            queue_wait_span: None,
-                            scheduling_span: None,
-                            enqueued_at: Instant::now(),
-                            height: start,
+                        UploadData {
                             block: test_block(start, &state, &transactions),
                             finalized_ts_micros: 1,
                             state: state.clone(),
                             transactions: transactions.clone(),
                             omit_pinned_nodes,
-                            has_durable_range: Arc::new(AtomicBool::new(false)),
-                            persisted: None,
-                            published: None,
                         },
                         &metrics,
                     )
@@ -2638,17 +2421,19 @@ mod tests {
     #[test]
     fn omitted_pins_wait_for_predecessors_and_reset_after_restart() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
-            let store = crate::test_store::GatedIngestStore::open_gating_ingest(2)
+            let store = crate::test_store::GatedIngestStore::open(2..3)
                 .await
                 .expect("open Store");
             let physical = writer_store_client(&store.url, None).unwrap();
             let targets = publication_target_client(&physical).unwrap();
-            let publisher = Publisher::connect(
+            let (publisher, worker) = Publisher::connect(
                 context.child("publisher_task"),
                 &store.url,
                 None,
                 3,
                 super::super::PublisherMetrics::new(&context.child("publisher")),
+                Sequential,
+                false,
             )
             .await
             .unwrap();
@@ -2680,12 +2465,12 @@ mod tests {
             first.published().await.unwrap();
 
             let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
-            store.wait_for_first_ingest().await;
+            store.wait_for_ingests(3).await;
             let mut third = publisher.enqueue_queued_finalized(upload(3)).await.unwrap();
             third.persisted().await.unwrap();
             assert!(target(&targets, 2).await.is_none());
             assert!(target(&targets, 3).await.is_none());
-            store.release_first_ingest();
+            store.release_ingest();
             second.published().await.unwrap();
             third.published().await.unwrap();
 
@@ -2721,14 +2506,17 @@ mod tests {
             );
             assert!(state_proof.verify::<Sha256>());
             assert!(transaction_proof.verify::<Sha256>());
-            publisher.shutdown().await;
+            drop(publisher);
+            worker.await.expect("publisher drains");
 
-            let restarted = Publisher::connect(
+            let (restarted, restarted_worker) = Publisher::connect(
                 context.child("restarted_task"),
                 &store.url,
                 None,
                 1,
                 super::super::PublisherMetrics::new(&context.child("restarted")),
+                Sequential,
+                false,
             )
             .await
             .unwrap();
@@ -2748,7 +2536,8 @@ mod tests {
             .await
             .unwrap();
             assert!(proof.verify::<Sha256>());
-            restarted.shutdown().await;
+            drop(restarted);
+            restarted_worker.await.expect("publisher drains");
             store.shutdown().await;
         });
     }
@@ -2786,20 +2575,12 @@ mod tests {
                     transactions_qmdb_client(&store).unwrap(),
                     schema.clone(),
                     Sequential,
-                    PendingUpload {
-                        span: Span::none(),
-                        queue_wait_span: None,
-                        scheduling_span: None,
-                        enqueued_at: Instant::now(),
-                        height: 1,
+                    UploadData {
                         block,
                         finalized_ts_micros: 1,
                         state,
                         transactions,
                         omit_pinned_nodes: false,
-                        has_durable_range: Arc::new(AtomicBool::new(false)),
-                        persisted: None,
-                        published: None,
                     },
                     &metrics,
                 )
@@ -2811,66 +2592,6 @@ mod tests {
                 ));
             }
         });
-    }
-
-    #[test]
-    fn data_requests_preserve_rows_and_respect_byte_budget() {
-        let store = StoreClient::new("http://localhost:1");
-        let client = state_qmdb_client(&store).unwrap();
-        let mut batch = StoreWriteBatch::new();
-        for index in 0..3u8 {
-            let key = Key::from(vec![index; 32]);
-            batch
-                .push(&client, &key, Bytes::from(vec![index; 64]))
-                .unwrap();
-        }
-        let expected = batch.entries().to_vec();
-        let row_size = batch.encoded_len() / batch.len();
-        let requests = batch
-            .clone()
-            .split(DATA_REQUEST_ROWS, row_size * 2)
-            .unwrap();
-        assert_eq!(requests.len(), 2);
-        assert_eq!(requests[0].len(), 2);
-        assert_eq!(requests[1].len(), 1);
-        assert_eq!(
-            requests
-                .iter()
-                .flat_map(|batch| batch.entries().iter())
-                .collect::<Vec<_>>(),
-            expected.iter().collect::<Vec<_>>()
-        );
-        assert_eq!(
-            batch
-                .clone()
-                .split(DATA_REQUEST_ROWS, row_size * 3)
-                .unwrap()
-                .len(),
-            1
-        );
-        assert_eq!(
-            batch.split(DATA_REQUEST_ROWS, row_size - 1).unwrap_err(),
-            exoware_sdk::SplitError::EntryTooLarge {
-                index: 0,
-                encoded_bytes: row_size,
-                max_encoded_bytes: row_size - 1,
-            }
-        );
-    }
-
-    #[test]
-    fn data_requests_bound_rows_independently_of_bytes() {
-        let store = StoreClient::new("http://localhost:1");
-        let client = PrefixedStoreClient::empty(store);
-        let key = Key::from(vec![0; 32]);
-        let mut batch = StoreWriteBatch::new();
-        for _ in 0..=DATA_REQUEST_ROWS {
-            batch.push(&client, &key, Bytes::new()).unwrap();
-        }
-        let batches = batch.split(DATA_REQUEST_ROWS, DATA_REQUEST_BYTES).unwrap();
-        assert_eq!(batches.len(), 2);
-        assert_eq!(batches[0].len(), DATA_REQUEST_ROWS);
-        assert_eq!(batches[1].len(), 1);
     }
 
     #[test]
@@ -2952,20 +2673,12 @@ mod tests {
                 transactions_qmdb_client(&physical).unwrap(),
                 schema,
                 Sequential,
-                PendingUpload {
-                    span: Span::none(),
-                    queue_wait_span: None,
-                    scheduling_span: None,
-                    enqueued_at: Instant::now(),
-                    height: 1,
+                UploadData {
                     block,
                     finalized_ts_micros: 1,
                     state,
                     transactions,
                     omit_pinned_nodes: false,
-                    has_durable_range: Arc::new(AtomicBool::new(false)),
-                    persisted: None,
-                    published: None,
                 },
                 &super::super::PublisherMetrics::new(&context.child("publisher")),
             )
@@ -3007,10 +2720,17 @@ mod tests {
                 transactions_qmdb_client(&physical).expect("transaction namespace");
             let target_client = publication_target_client(&physical).expect("target namespace");
             let metrics = super::super::PublisherMetrics::new(&context.child("publisher"));
-            let publisher =
-                Publisher::connect(context.child("publisher_task"), &url, None, 2, metrics)
-                    .await
-                    .expect("connect publisher");
+            let (publisher, worker) = Publisher::connect(
+                context.child("publisher_task"),
+                &url,
+                None,
+                2,
+                metrics,
+                Sequential,
+                false,
+            )
+            .await
+            .expect("connect publisher");
 
             let signer = ed25519::PrivateKey::from_seed(7);
             let key = TransactionPublicKey::ed25519(signer.public_key());
@@ -3095,10 +2815,9 @@ mod tests {
                 .expect("enqueue second upload");
             first.persisted().await.expect("persist first upload");
             second.persisted().await.expect("persist second upload");
-            let first_receipt = first.published().await.expect("publish first upload");
-            let second_receipt = second.published().await.expect("publish second upload");
+            first.published().await.expect("publish first upload");
+            second.published().await.expect("publish second upload");
 
-            assert!(first_receipt.store_sequence_number <= second_receipt.store_sequence_number);
             assert_eq!(target(&target_client, 1).await, Some(first_digest));
             assert_eq!(target(&target_client, 2).await, Some(second_digest));
             let state = UnorderedClient::<
@@ -3195,17 +2914,18 @@ mod tests {
                 }
             }
 
-            publisher.shutdown().await;
+            drop(publisher);
+
+            worker.await.expect("publisher drains");
             store.abort();
             let _ = store.await;
         });
     }
 
     async fn target(client: &PrefixedStoreClient, height: u64) -> Option<Sha256Digest> {
-        let key = Key::from(Bytes::copy_from_slice(&height.to_be_bytes()));
         let value = client
             .query()
-            .get(&key)
+            .get(&publication_target_key(height))
             .await
             .expect("read publication target")?;
         Sha256Digest::decode(value).ok()
@@ -3317,7 +3037,7 @@ mod tests {
         let upload = QueuedFinalizedUpload {
             finalized_ts_micros: i64::try_from(block.header.height).expect("height fits timestamp"),
             block,
-            finalization,
+            finalization: Some(finalization),
             state,
             transactions,
         };

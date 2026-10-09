@@ -1,5 +1,7 @@
 export const BLOCK_META_TABLE = 'block_meta';
 export const BLOCK_META_HEIGHT = 'height';
+export const BLOCK_META_DIGEST = 'digest';
+export const BLOCK_META_TX_COUNT = 'tx_count';
 export const BLOCK_META_TRANSACTIONS_TIP = 'transactions_tip';
 
 export function transactionHeightPredecessorQuery(location: bigint): string {
