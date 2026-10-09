@@ -63,6 +63,7 @@ const TX_ACTIVITY_DIGEST = 'tx_digest';
 const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
 const TX_ACTIVITY_VALUE = 'value';
 const TX_ACTIVITY_NONCE = 'nonce';
+const TX_ACTIVITY_QMDB_LOCATION = 'qmdb_location';
 const TX_ACTIVITY_ROLE_SENDER = 0n;
 const TX_ACTIVITY_ROLE_RECEIVER = 1n;
 
@@ -117,6 +118,7 @@ export interface AccountTransactionRow {
     readonly nonce: bigint;
     readonly height: bigint;
     readonly blockIndex: number;
+    readonly location: bigint;
 }
 
 export interface AccountTransactionPage {
@@ -132,17 +134,6 @@ export interface VerifiedAccountProof {
     readonly tip: bigint;
     readonly proofSizeBytes: number;
 }
-
-export interface TransactionRowMetadata {
-    readonly location: bigint;
-    readonly sequenceNumber: bigint;
-}
-
-// Missing rows may still be indexing, while invalid rows can never verify.
-export type TransactionRowMetadataResult =
-    | { readonly status: 'indexed'; readonly metadata: TransactionRowMetadata }
-    | { readonly status: 'missing'; readonly error: Error }
-    | { readonly status: 'invalid'; readonly error: Error };
 
 export interface AccountProofMetadata extends AccountProofRow {
     readonly sequenceNumber: bigint;
@@ -181,67 +172,6 @@ export function fetchAccountProofMetadata({
     signal?: AbortSignal;
 }): Promise<AccountProofMetadata> {
     return fetchAccountProofRow(sqlUrl, parseAccountBytes(account), undefined, minSequenceNumber, signal);
-}
-
-// Each digest's body is validated on its own, so one bad or lagging row cannot
-// withhold metadata from the rest of the page. Failures that cannot be
-// attributed to a requested digest still reject the whole batch.
-export async function fetchTransactionRowMetadata({
-    sqlUrl,
-    rows,
-    minSequenceNumber,
-    signal,
-}: {
-    sqlUrl: string;
-    rows: readonly AccountTransactionRow[];
-    minSequenceNumber: bigint;
-    signal?: AbortSignal;
-}): Promise<ReadonlyMap<string, TransactionRowMetadataResult>> {
-    const digests = new Map(rows.map(({ digest }) => {
-        const bytes = fromHex(digest);
-        assertByteLength(bytes, DIGEST_BYTES, 'transaction digest');
-        return [toHex(bytes), bytes];
-    }));
-    if (digests.size === 0) return new Map();
-
-    const result = await sqlQuery(
-        sqlUrl,
-        `SELECT ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
-         FROM ${TX_META_TABLE}
-         WHERE ${TX_META_DIGEST} IN (${[...digests.values()].map(fixedBinaryLiteral).join(', ')})`,
-        minSequenceNumber,
-        signal,
-    );
-
-    const matches = new Map<string, SqlRow[]>();
-    for (const row of tableRows(result.table)) {
-        const hex = toHex(expectVariableBytes(columnValue(row, TX_META_DIGEST), TX_META_DIGEST));
-        if (!digests.has(hex)) throw new Error('SQL transaction metadata contains an unexpected digest');
-        matches.set(hex, [...matches.get(hex) ?? [], row]);
-    }
-
-    return new Map(await Promise.all([...digests].map(async ([hex, digest]) => [
-        hex,
-        await transactionRowMetadataResult(matches.get(hex) ?? [], digest, result.sequenceNumber),
-    ] as const)));
-}
-
-async function transactionRowMetadataResult(
-    rows: readonly SqlRow[],
-    digest: Uint8Array,
-    sequenceNumber: bigint,
-): Promise<TransactionRowMetadataResult> {
-    const [row, duplicate] = rows;
-    if (!row) return { status: 'missing', error: missingTransactionMetadataError(digest) };
-    if (duplicate) {
-        return { status: 'invalid', error: new Error('SQL transaction metadata contains a duplicate digest') };
-    }
-    try {
-        const location = await verifiedTransactionLocation(row, digest);
-        return { status: 'indexed', metadata: { location, sequenceNumber } };
-    } catch (error) {
-        return { status: 'invalid', error: error instanceof Error ? error : new Error(String(error)) };
-    }
 }
 
 export async function fetchAndVerifyTransactionProof({
@@ -502,30 +432,18 @@ export async function fetchAndVerifyAccountProof({
 
 export async function fetchAndVerifyTransactionRowProof({
     qmdbUrl,
-    sqlUrl,
     row,
     target,
-    metadata,
     signal,
 }: {
     qmdbUrl: string;
-    sqlUrl: string;
     row: AccountTransactionRow;
     target: LatestProofTarget;
-    metadata?: TransactionRowMetadata;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const location = metadata && metadata.sequenceNumber >= target.sequenceNumber
-        ? metadata.location
-        : await fetchVerifiedSqlTransactionMetadata(
-            sqlUrl,
-            digestBytes,
-            target.sequenceNumber,
-            signal,
-        );
-
+    const { location } = row;
     if (location >= target.transactionsTip) {
         throw uncoveredError(`transaction location ${location}`);
     }
@@ -1303,7 +1221,8 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE}
+                ${TX_ACTIVITY_NONCE},
+                ${TX_ACTIVITY_QMDB_LOCATION}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
             ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
@@ -1333,6 +1252,7 @@ function decodeAccountActivityRow(row: SqlRow): AccountTransactionRow {
         nonce: expectBigint(columnValue(row, TX_ACTIVITY_NONCE), TX_ACTIVITY_NONCE),
         height: expectBigint(columnValue(row, TX_ACTIVITY_HEIGHT), TX_ACTIVITY_HEIGHT),
         blockIndex: expectSafeNumber(columnValue(row, TX_ACTIVITY_INDEX), TX_ACTIVITY_INDEX),
+        location: expectBigint(columnValue(row, TX_ACTIVITY_QMDB_LOCATION), TX_ACTIVITY_QMDB_LOCATION),
     };
 }
 

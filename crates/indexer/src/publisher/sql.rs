@@ -58,6 +58,7 @@ pub(crate) struct TxActivityRow {
     pub counterparty: [u8; 32],
     pub value: u64,
     pub nonce: u64,
+    pub qmdb_location: u64,
 }
 
 /// One `account_meta` row per account-state QMDB operation.
@@ -119,6 +120,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
             CellValue::FixedBinary(tx.counterparty.to_vec()),
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
+            CellValue::UInt64(tx.qmdb_location),
         ],
     }
 }

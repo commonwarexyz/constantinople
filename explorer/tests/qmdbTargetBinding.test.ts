@@ -21,7 +21,6 @@ import { StoreClient, TraversalMode, type GetManyResultItem, type QueryResult } 
 import { toArrayBuffer, toHex } from '../src/codec.ts';
 import { normalizeSubmittedTransaction } from '../src/submissionHistory.ts';
 import {
-    accountRetryReason,
     isRetryableAccountProofError,
     isRetryableProofError,
     retryAccountWork,
@@ -34,12 +33,8 @@ import {
     fetchLatestProofTarget,
     prefetchFinalizedCertificate,
     fetchAccountProofMetadata,
-    fetchTransactionRowMetadata,
-    type AccountTransactionRow,
     type LatestProofTarget,
-    type TransactionRowMetadataResult,
 } from '../src/qmdb.ts';
-import { TransactionRowMetadataCache } from '../src/rowMetadata.ts';
 
 const HEIGHT = 7n;
 const FLOOR = 41n;
@@ -907,306 +902,61 @@ test('account page SQL request stops when its forwarded signal is aborted', asyn
     await assert.rejects(page, /account page cancelled/);
 });
 
-test('transaction row proof retains the publication floor for SQL and QMDB', async (t) => {
-    const target = latestTarget();
-    const body = new Uint8Array(82).fill(0x33);
-    const digest = new Uint8Array(
-        await crypto.subtle.digest('SHA-256', toArrayBuffer(body)),
-    );
-    const sqlFloors: Array<bigint | undefined> = [];
-    t.mock.method(SqlClient.prototype, 'query', async (_sql: string, minSequenceNumber?: bigint) => {
-        sqlFloors.push(minSequenceNumber);
-        return queryResult({ qmdb_location: LOCATION, body });
+test('account page decodes the activity row QMDB location', async (t) => {
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) => {
+        assert.match(sql, /FROM tx_activity/);
+        assert.match(sql, /qmdb_location/);
+        return queryResult({
+            height: HEIGHT, index: 1n, role: 0n, tx_digest: new Uint8Array(32).fill(0x33),
+            counterparty: new Uint8Array(32).fill(0x44), value: 5n, nonce: 2n, qmdb_location: LOCATION,
+        });
     });
 
+    const page = await fetchAccountTransactionsPage({
+        sqlUrl: 'http://sql', account: '22'.repeat(32), minSequenceNumber: FLOOR, maxHeight: HEIGHT,
+    });
+
+    assert.equal(page.rows[0]?.location, LOCATION);
+});
+
+test('transaction row proof uses the activity location without SQL and retains the QMDB floor', async (t) => {
+    const digest = '33'.repeat(32);
+    const query = t.mock.method(SqlClient.prototype, 'query', async () => {
+        throw new Error('unexpected SQL request');
+    });
     const qmdbFloors: Array<bigint | undefined> = [];
-    t.mock.method(
-        QmdbOperationLogClient.prototype,
-        'getFixedKeylessAppend',
-        async (
-            request: OperationRangeRequest,
-            expectedRoot: BytesLike,
-            expectedLocation: bigint,
-            expectedValue: BytesLike,
-        ) => {
-            qmdbFloors.push(request.minSequenceNumber);
-            return keylessProof(
-                request,
-                expectedRoot as Uint8Array,
-                expectedLocation,
-                expectedValue as Uint8Array,
-            );
-        },
-    );
-
-    await fetchAndVerifyTransactionRowProof({
-        qmdbUrl: 'http://qmdb',
-        sqlUrl: 'http://sql',
-        row: {
-            digest: toHex(digest),
-            direction: 'sent',
-            counterparty: '44'.repeat(32),
-            value: 1n,
-            nonce: 2n,
-            height: HEIGHT,
-            blockIndex: 0,
-        },
-        target,
+    t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
+        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
+    ) => {
+        qmdbFloors.push(request.minSequenceNumber);
+        assert.equal(location, LOCATION);
+        assert.equal(toHex(value), digest);
+        return keylessProof(request, root, location, value);
     });
 
-    assert.deepEqual(sqlFloors, [FLOOR]);
+    const proof = await fetchAndVerifyTransactionRowProof({
+        qmdbUrl: 'http://qmdb', row: activityRow(digest), target: latestTarget(),
+    });
+
+    assert.equal(proof.location, LOCATION);
+    assert.equal(query.mock.callCount(), 0);
     assert.deepEqual(qmdbFloors, [FLOOR]);
 });
 
-test('batched transaction metadata authenticates bodies and skips row SQL reads', async (t) => {
-    const bodies = [new Uint8Array(82).fill(0x33), new Uint8Array(82).fill(0x44)];
-    const digests = await Promise.all(bodies.map(async (body) => new Uint8Array(
-        await crypto.subtle.digest('SHA-256', toArrayBuffer(body)),
-    )));
-    const rows = digests.map((digest) => activityRow(toHex(digest)));
-    const query = t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
-        assert.match(sql, /WHERE tx_digest IN \(X'[a-f0-9]+', X'[a-f0-9]+'\)/);
-        assert.equal(floor, FLOOR);
-        return {
-            sequenceNumber: FLOOR,
-            table: testTable(bodies.map((body, index) => ({
-                tx_digest: digests[index], qmdb_location: LOCATION + BigInt(index), body,
-            }))),
-        };
+test('transaction row proof waits for a target covering the activity location', async (t) => {
+    const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+        throw new Error('unexpected proof request');
     });
-    const metadata = await fetchTransactionRowMetadata({ sqlUrl: 'http://sql', rows, minSequenceNumber: FLOOR });
-    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
-        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
-    ) => {
-        assert.equal(request.minSequenceNumber, FLOOR);
-        return keylessProof(request, root, location, value);
-    });
-    await Promise.all(rows.map((row) => fetchAndVerifyTransactionRowProof({
-        qmdbUrl: 'http://qmdb', sqlUrl: 'http://sql', row, target: latestTarget(),
-        metadata: indexedMetadata(metadata, row.digest),
-    })));
-    assert.equal(query.mock.callCount(), 1);
-    assert.equal(proof.mock.callCount(), 2);
-});
-
-test('a forged body invalidates only its own digest in a batch', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const forged = activityRow('11'.repeat(32));
-    t.mock.method(SqlClient.prototype, 'query', async () => ({
-        sequenceNumber: FLOOR,
-        table: testTable([
-            valid.sqlRow,
-            { tx_digest: new Uint8Array(32).fill(0x11), qmdb_location: LOCATION + 1n, body: new Uint8Array(82) },
-        ]),
-    }));
-    const results = await fetchTransactionRowMetadata({
-        sqlUrl: 'http://sql', rows: [valid.row, forged], minSequenceNumber: FLOOR,
-    });
-    assert.deepEqual(indexedMetadata(results, valid.row.digest), { location: LOCATION, sequenceNumber: FLOOR });
-    const error = failedMetadata(results, forged.digest, 'invalid');
-    assert.match(error.message, /body does not match transaction digest/);
-    assert.equal(isRetryableAccountProofError(error), false);
-});
-
-test('a missing row is reported per digest with the retryable index error', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const missing = activityRow('11'.repeat(32));
-    t.mock.method(SqlClient.prototype, 'query', async () => ({
-        sequenceNumber: FLOOR, table: testTable([valid.sqlRow]),
-    }));
-    const results = await fetchTransactionRowMetadata({
-        sqlUrl: 'http://sql', rows: [valid.row, missing], minSequenceNumber: FLOOR,
-    });
-    assert.deepEqual(indexedMetadata(results, valid.row.digest), { location: LOCATION, sequenceNumber: FLOOR });
-    const error = failedMetadata(results, missing.digest, 'missing');
-    assert.match(error.message, /missing from raw transaction index/);
-    assert.equal(isRetryableAccountProofError(error), true);
-});
-
-test('duplicate rows invalidate only the ambiguous digest', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const duplicated = await indexedTransaction(0x44);
-    t.mock.method(SqlClient.prototype, 'query', async () => ({
-        sequenceNumber: FLOOR,
-        table: testTable([
-            duplicated.sqlRow,
-            valid.sqlRow,
-            { ...duplicated.sqlRow, qmdb_location: LOCATION + 2n },
-        ]),
-    }));
-    const results = await fetchTransactionRowMetadata({
-        sqlUrl: 'http://sql', rows: [valid.row, duplicated.row], minSequenceNumber: FLOOR,
-    });
-    assert.deepEqual(indexedMetadata(results, valid.row.digest), { location: LOCATION, sequenceNumber: FLOOR });
-    const error = failedMetadata(results, duplicated.row.digest, 'invalid');
-    assert.match(error.message, /duplicate digest/);
-    assert.equal(isRetryableAccountProofError(error), false);
-});
-
-test('an unrequested digest rejects the whole batch', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const unrequested = await indexedTransaction(0x44);
-    t.mock.method(SqlClient.prototype, 'query', async () => ({
-        sequenceNumber: FLOOR, table: testTable([valid.sqlRow, unrequested.sqlRow]),
-    }));
-    await assert.rejects(fetchTransactionRowMetadata({
-        sqlUrl: 'http://sql', rows: [valid.row], minSequenceNumber: FLOOR,
-    }), (error) => {
-        assert.match(String(error), /unexpected digest/);
-        assert.equal(isRetryableAccountProofError(error), false);
-        return true;
-    });
-});
-
-test('a valid row verifies while a missing row retries on its own query', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const lagging = await indexedTransaction(0x44, LOCATION + 1n);
-    let laggingIndexed = false;
-    const batchQueries: string[] = [];
-    const rowQueries: string[] = [];
-    t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
-        assert.equal(floor, FLOOR);
-        if (sql.includes(' IN (')) {
-            batchQueries.push(sql);
-            return { sequenceNumber: FLOOR, table: testTable([valid.sqlRow]) };
-        }
-        rowQueries.push(sql);
-        return laggingIndexed
-            ? queryResult({ qmdb_location: LOCATION + 1n, body: lagging.body })
-            : emptyQueryResult();
-    });
-    mockKeylessProofs(t);
-    const controller = new AbortController();
-    const cache = rowMetadataCache([lagging.row, valid.row], controller.signal);
-
-    // The lagging row cannot recover until the valid row has verified, so a
-    // page-wide wait for every digest would never settle.
-    const validVerified = deferred<void>();
-    const laggingReasons: Array<string | undefined> = [];
-    let laggingWaits = 0;
-    const laggingProof = proveRow(cache, lagging.row, controller.signal, {
-        wait: async () => {
-            await validVerified.promise;
-            laggingWaits += 1;
-            laggingIndexed = laggingWaits >= 2;
-            return true;
-        },
-        onRetry: (error) => laggingReasons.push(accountRetryReason(error)),
-    });
-    const validProof = await proveRow(cache, valid.row, controller.signal, { onRetry: unexpectedRetry });
-    validVerified.resolve();
-
-    assert.equal(validProof.location, LOCATION);
-    assert.equal((await laggingProof).location, LOCATION + 1n);
-    assert.equal(batchQueries.length, 1);
-    assert.equal(rowQueries.length, 2);
-    assert.deepEqual(laggingReasons, ['waiting for indexer', 'waiting for indexer']);
-});
-
-test('a forged row fails without retrying or delaying valid rows', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const forged = activityRow('11'.repeat(32));
-    const query = t.mock.method(SqlClient.prototype, 'query', async () => ({
-        sequenceNumber: FLOOR,
-        table: testTable([
-            valid.sqlRow,
-            { tx_digest: new Uint8Array(32).fill(0x11), qmdb_location: LOCATION + 1n, body: new Uint8Array(82) },
-        ]),
-    }));
-    const proofs = mockKeylessProofs(t);
-    const controller = new AbortController();
-    const cache = rowMetadataCache([valid.row, forged], controller.signal);
-
-    const [validProof, forgedProof] = await Promise.allSettled([
-        proveRow(cache, valid.row, controller.signal, { onRetry: unexpectedRetry }),
-        proveRow(cache, forged, controller.signal, { onRetry: unexpectedRetry }),
-    ]);
-    assert.equal(validProof.status, 'fulfilled');
-    assert.equal(forgedProof.status, 'rejected');
-    assert.match(String(forgedProof.reason), /body does not match transaction digest/);
-    assert.equal(query.mock.callCount(), 1);
-    assert.equal(proofs.mock.callCount(), 1);
-});
-
-test('a transient batch failure is retried with one shared replacement query', async (t) => {
-    const first = await indexedTransaction(0x33);
-    const second = await indexedTransaction(0x44, LOCATION + 1n);
-    const query = t.mock.method(SqlClient.prototype, 'query', async () => {
-        if (query.mock.callCount() === 0) throw new Error('[unavailable] transport disconnected');
-        return { sequenceNumber: FLOOR, table: testTable([first.sqlRow, second.sqlRow]) };
-    });
-    mockKeylessProofs(t);
-    const controller = new AbortController();
-    const cache = rowMetadataCache([first.row, second.row], controller.signal);
-
-    const reasons: Array<string | undefined> = [];
-    const options = {
-        wait: async () => true,
-        onRetry: (error: unknown) => reasons.push(accountRetryReason(error)),
-    };
-    await Promise.all([
-        proveRow(cache, first.row, controller.signal, options),
-        proveRow(cache, second.row, controller.signal, options),
-    ]);
-    assert.equal(query.mock.callCount(), 2);
-    assert.deepEqual(reasons, ['retrying after service error', 'retrying after service error']);
-});
-
-test('a terminal batch failure is reported by every row without querying again', async (t) => {
-    const valid = await indexedTransaction(0x33);
-    const other = await indexedTransaction(0x44);
-    const unrequested = await indexedTransaction(0x55);
-    const query = t.mock.method(SqlClient.prototype, 'query', async () => ({
-        sequenceNumber: FLOOR, table: testTable([valid.sqlRow, unrequested.sqlRow]),
-    }));
-    const controller = new AbortController();
-    const cache = rowMetadataCache([valid.row, other.row], controller.signal);
-
-    for (const row of [valid.row, other.row]) {
-        await assert.rejects(
-            proveRow(cache, row, controller.signal, { onRetry: unexpectedRetry }),
-            /unexpected digest/,
-        );
-    }
-    assert.equal(query.mock.callCount(), 1);
-});
-
-test('cancelling a page stops a missing row from retrying', async (t) => {
-    const missing = activityRow('11'.repeat(32));
-    const query = t.mock.method(SqlClient.prototype, 'query', async () => emptyQueryResult());
-    const controller = new AbortController();
-    const cache = rowMetadataCache([missing], controller.signal);
 
     await assert.rejects(
-        proveRow(cache, missing, controller.signal, { onRetry: () => controller.abort() }),
-        /account lookup cancelled/,
+        fetchAndVerifyTransactionRowProof({
+            qmdbUrl: 'http://qmdb',
+            row: { ...activityRow('33'.repeat(32)), location: latestTarget().transactionsTip },
+            target: latestTarget(),
+        }),
+        /not yet covered by a provable finalization/,
     );
-    assert.equal(query.mock.callCount(), 1);
-});
-
-test('an empty activity page does not request transaction metadata', async (t) => {
-    const query = t.mock.method(SqlClient.prototype, 'query', async () => emptyQueryResult());
-    const metadata = await fetchTransactionRowMetadata({ sqlUrl: 'http://sql', rows: [], minSequenceNumber: FLOOR });
-    assert.equal(metadata.size, 0);
-    assert.equal(query.mock.callCount(), 0);
-});
-
-test('row metadata fetched at an older sequence is refreshed at the covering barrier', async (t) => {
-    const body = new Uint8Array(82).fill(0x33);
-    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
-    const query = t.mock.method(SqlClient.prototype, 'query', async (_sql: string, floor?: bigint) => {
-        assert.equal(floor, FLOOR);
-        return queryResult({ qmdb_location: LOCATION, body });
-    });
-    t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
-        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
-    ) => keylessProof(request, root, location, value));
-    const proof = await fetchAndVerifyTransactionRowProof({
-        qmdbUrl: 'http://qmdb', sqlUrl: 'http://sql', row: activityRow(digest), target: latestTarget(),
-        metadata: { sequenceNumber: FLOOR - 1n, location: LOCATION + 1n },
-    });
-    assert.equal(query.mock.callCount(), 1);
-    assert.equal(proof.location, LOCATION);
+    assert.equal(proofRequest.mock.callCount(), 0);
 });
 
 for (const movedLocation of [LOCATION, 10n, 15n, 0n]) {
@@ -1263,72 +1013,8 @@ test('speculative account SQL with an older floor is refreshed before proving', 
 function activityRow(digest: string) {
     return {
         digest, direction: 'sent' as const, counterparty: '44'.repeat(32),
-        value: 1n, nonce: 2n, height: HEIGHT, blockIndex: 0,
+        value: 1n, nonce: 2n, height: HEIGHT, blockIndex: 0, location: LOCATION,
     };
-}
-
-async function indexedTransaction(fill: number, location = LOCATION) {
-    const body = new Uint8Array(82).fill(fill);
-    const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body)));
-    return {
-        body,
-        row: activityRow(toHex(digest)),
-        sqlRow: { tx_digest: digest, qmdb_location: location, body },
-    };
-}
-
-function indexedMetadata(results: ReadonlyMap<string, TransactionRowMetadataResult>, digest: string) {
-    const result = results.get(digest);
-    if (result?.status !== 'indexed') assert.fail(`expected indexed metadata, got ${result?.status}`);
-    return result.metadata;
-}
-
-function failedMetadata(
-    results: ReadonlyMap<string, TransactionRowMetadataResult>,
-    digest: string,
-    status: 'missing' | 'invalid',
-): Error {
-    const result = results.get(digest);
-    if (result?.status !== status) assert.fail(`expected ${status} metadata, got ${result?.status}`);
-    return result.error;
-}
-
-function rowMetadataCache(rows: readonly AccountTransactionRow[], signal: AbortSignal) {
-    return new TransactionRowMetadataCache({
-        fetchBatch: (minSequenceNumber) => fetchTransactionRowMetadata({
-            sqlUrl: 'http://sql', rows, minSequenceNumber, signal,
-        }),
-        isRetryable: isRetryableAccountProofError,
-        floor: FLOOR,
-    });
-}
-
-// Mirrors the explorer's per-row retry loop over a shared page cache.
-function proveRow(
-    cache: TransactionRowMetadataCache,
-    row: AccountTransactionRow,
-    signal: AbortSignal,
-    options: Parameters<typeof retryAccountWork>[3],
-) {
-    const target = latestTarget();
-    return retryAccountWork(async () => fetchAndVerifyTransactionRowProof({
-        qmdbUrl: 'http://qmdb',
-        sqlUrl: 'http://sql',
-        row,
-        target,
-        metadata: await cache.lookup(row.digest, target.sequenceNumber),
-        signal,
-    }), signal, isRetryableAccountProofError, options);
-}
-
-function mockKeylessProofs(t: test.TestContext) {
-    return t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
-        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
-    ) => keylessProof(request, root, location, value));
-}
-
-function unexpectedRetry(error: unknown): never {
-    assert.fail(`unexpected retry after ${String(error)}`);
 }
 
 function queryResult(values: Record<string, unknown>): DecodedQueryResult {

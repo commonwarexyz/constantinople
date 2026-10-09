@@ -129,6 +129,7 @@ where
             counterparty: receiver,
             value: tx.value,
             nonce: tx.nonce,
+            qmdb_location,
         }));
         if receiver != sender {
             sql.push(encode_tx_activity_row(TxActivityRow {
@@ -140,6 +141,7 @@ where
                 counterparty: sender,
                 value: tx.value,
                 nonce: tx.nonce,
+                qmdb_location,
             }));
         }
     }
@@ -298,6 +300,22 @@ mod tests {
                 (digests[1].as_ref().to_vec(), 8)
             ]
         );
+
+        // Activity rows repeat their transaction's location for account-page proofs.
+        let activity = rows
+            .iter()
+            .filter(|row| row.table == TX_ACTIVITY_TABLE)
+            .collect::<Vec<_>>();
+        assert!(activity.len() >= digests.len());
+        for row in activity {
+            let Some(CellValue::FixedBinary(digest)) = row.values.get(4) else {
+                panic!("tx_activity digest should be fixed binary");
+            };
+            let Some(CellValue::UInt64(location)) = row.values.get(8) else {
+                panic!("tx_activity location should be u64");
+            };
+            assert!(locations.contains(&(digest.clone(), *location)));
+        }
     }
 
     #[test]
