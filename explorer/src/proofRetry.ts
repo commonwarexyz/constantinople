@@ -18,7 +18,6 @@ const ACCOUNT_SERVICE_ERRORS = [
 
 const ACCOUNT_INDEXER_LAG_ERRORS = [
     /^finalization missing at height \d+$/,
-    /^tx digest .+ missing from raw transaction index$/,
     /^account location \d+ is outside finalized state range$/,
     /^transaction location \d+ is not yet covered by a provable finalization$/,
     /^\[out_of_range\] requested proof tip is not published yet$/,

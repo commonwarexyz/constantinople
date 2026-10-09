@@ -30,6 +30,7 @@ pub(crate) struct TxMetaRow {
     pub digest: [u8; 32],
     pub qmdb_location: u64,
     pub body: Bytes,
+    pub height: u64,
 }
 
 /// Transaction activity role stored in `tx_activity`.
@@ -103,6 +104,7 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::UInt64(tx.qmdb_location),
             CellValue::Binary(tx.body.to_vec()),
+            CellValue::UInt64(tx.height),
         ],
     }
 }
