@@ -8,12 +8,11 @@ import {
 } from './proofRetry.ts';
 import type { PublishedProofTarget } from './proofTarget.ts';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
-import {
-    BLOCK_META_DIGEST,
-    BLOCK_META_HEIGHT,
-    BLOCK_META_TABLE,
-    BLOCK_META_TX_COUNT,
-} from './transactionHeight.ts';
+
+const BLOCK_META_TABLE = 'block_meta';
+const BLOCK_META_HEIGHT = 'height';
+const BLOCK_META_DIGEST = 'digest';
+const BLOCK_META_TX_COUNT = 'tx_count';
 
 const CATCH_UP_RETRY_DELAY_MS = 250;
 const MAX_CACHED_BLOCK_ROWS = 128;

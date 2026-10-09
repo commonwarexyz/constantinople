@@ -19,14 +19,6 @@ import {
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
-import {
-    BLOCK_META_HEIGHT,
-    BLOCK_META_TABLE,
-    BLOCK_META_TRANSACTIONS_TIP,
-    BLOCK_META_TX_COUNT,
-    containingTransactionHeight,
-    transactionHeightPredecessorQuery,
-} from './transactionHeight.ts';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
@@ -48,6 +40,7 @@ const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
 const TX_META_BODY = 'body';
+const TX_META_HEIGHT = 'height';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -431,18 +424,20 @@ export async function fetchAndVerifyTransactionRowProof({
     };
 }
 
-async function fetchVerifiedSqlTransactionMetadata(
+async function fetchTransactionProofMetadata(
     sqlUrl: string,
-    digest: Uint8Array,
+    digest: string,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<bigint> {
+): Promise<TransactionProofMetadata> {
+    const digestBytes = fromHex(digest);
+    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
+            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}, ${TX_META_HEIGHT}
             FROM ${TX_META_TABLE}
-            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
+            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
             LIMIT 1
         `,
         minSequenceNumber,
@@ -450,10 +445,12 @@ async function fetchVerifiedSqlTransactionMetadata(
     );
     const row = firstTableRow(result.table);
     if (!row) {
-        throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
+        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
     }
-
-    return verifiedTransactionLocation(row, digest);
+    return {
+        height: expectBigint(columnValue(row, TX_META_HEIGHT), TX_META_HEIGHT),
+        location: await verifiedTransactionLocation(row, digestBytes),
+    };
 }
 
 async function verifiedTransactionLocation(row: SqlRow, digest: Uint8Array): Promise<bigint> {
@@ -468,67 +465,6 @@ async function verifiedTransactionLocation(row: SqlRow, digest: Uint8Array): Pro
         throw new Error('SQL transaction body does not match transaction digest');
     }
     return location;
-}
-
-async function fetchTransactionProofMetadata(
-    sqlUrl: string,
-    digest: string,
-    minSequenceNumber: bigint,
-    signal?: AbortSignal,
-): Promise<TransactionProofMetadata> {
-    const digestBytes = fromHex(digest);
-    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    let location: bigint;
-    try {
-        location = await fetchVerifiedSqlTransactionMetadata(
-            sqlUrl,
-            digestBytes,
-            minSequenceNumber,
-            signal,
-        );
-    } catch (error) {
-        if (errorMessage(error).includes('missing from raw transaction index')) {
-            throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
-        }
-        throw error;
-    }
-
-    // A bounded seek on the covered tip index finds the last block boundary
-    // at or before the location. Ranges are contiguous, so the next height owns it.
-    const predecessors = await sqlQuery(
-        sqlUrl,
-        transactionHeightPredecessorQuery(location),
-        minSequenceNumber,
-        signal,
-    );
-    const predecessor = firstTableRow(predecessors.table);
-    const height = containingTransactionHeight(
-        predecessor ? expectBigint(columnValue(predecessor, BLOCK_META_HEIGHT), BLOCK_META_HEIGHT) : null,
-    );
-    const result = await sqlQuery(
-        sqlUrl,
-        `
-            SELECT ${BLOCK_META_TRANSACTIONS_TIP}, ${BLOCK_META_TX_COUNT}
-            FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_HEIGHT} = ${height.toString()}
-            LIMIT 1
-        `,
-        minSequenceNumber,
-        signal,
-    );
-    const row = firstTableRow(result.table);
-    if (!row) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
-    }
-
-    // The tip is the trailing commit location. A later certified range can
-    // retain this transaction without identifying its original block.
-    const tip = expectBigint(columnValue(row, BLOCK_META_TRANSACTIONS_TIP), BLOCK_META_TRANSACTIONS_TIP);
-    const count = expectBigint(columnValue(row, BLOCK_META_TX_COUNT), BLOCK_META_TX_COUNT);
-    if (location < tip - count || location >= tip) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet in the selected block range`);
-    }
-    return { height, location };
 }
 
 function uncoveredError(subject: string): Error {

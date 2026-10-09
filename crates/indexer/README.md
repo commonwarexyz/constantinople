@@ -37,14 +37,13 @@ The current SQL table-prefix allocation is:
 
 | SQL table | Table prefix | Secondary indexes |
 | --------- | ------------ | ----------------- |
-| `block_meta` | `0x0` | `transactions_tip` |
+| `block_meta` | `0x0` | none |
 | `tx_meta` | `0x1` | none |
 | `tx_activity` | `0x2` | none |
 | `account_meta` | `0x3` | none |
 
-`exoware-sql` expands those table prefixes into its Store key layout. A secondary
-index on `block_meta.transactions_tip` adds one entry per block for transaction
-height lookups. Every table is append-only. Store keys are immutable, so
+`exoware-sql` expands those table prefixes into its Store key layout. Every
+table is append-only. Store keys are immutable, so
 no table may rewrite an existing key with a different value. `account_meta` is
 keyed by `(account, qmdb_location)` with one row per account-state QMDB
 operation, and readers take the highest location for an account. Each
@@ -60,14 +59,12 @@ The digest-keyed `tx_meta` row contract is:
 | `tx_digest` | fixed-size binary with 32 bytes | non-null | Transaction digest and primary key. |
 | `qmdb_location` | unsigned 64-bit integer | non-null | Transaction-hash QMDB append location. |
 | `body` | binary | non-null | Encoded signed transaction bytes. |
+| `height` | unsigned 64-bit integer | non-null | Finalized block height containing the transaction. |
 
-A transaction proof needs the finalized height that contains the transaction.
-Readers derive it from `block_meta`. Every block commits its transaction log
-after appending its transactions, so the newest block whose `transactions_tip`
-is at or below `tx_meta.qmdb_location` immediately precedes the containing
-block. Genesis has no transactions or metadata row, so a missing predecessor
-identifies height one. The reverse lookup seeks the preceding tip through the
-secondary index and reads at most one index entry.
+A transaction proof needs the finalized height that contains the transaction
+and its QMDB location. `tx_meta` carries both, so a digest lookup is one point
+read. Each `tx_activity` row also carries its transaction's `qmdb_location`, so
+account pages prove their rows without reading `tx_meta`.
 
 Proofs become queryable once a grouped publication barrier covers the upload
 that carried the transaction. The publisher writes append-only publication

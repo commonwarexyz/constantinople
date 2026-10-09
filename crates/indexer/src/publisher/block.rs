@@ -93,8 +93,6 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    // Readers derive a transaction's height from block_meta, so no
-    // per-transaction proof row is needed.
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
     sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
@@ -118,6 +116,7 @@ where
             digest,
             qmdb_location,
             body: tx.bytes,
+            height,
         }));
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
@@ -362,7 +361,7 @@ mod tests {
     }
 
     #[test]
-    fn activity_rows_carry_tx_meta_location() {
+    fn tx_rows_carry_qmdb_location_and_height() {
         let mut rng = StdRng::from_seed([5; 32]);
         let consensus_key = ed25519::PrivateKey::random(&mut rng);
         let signer = ed25519::PrivateKey::random(&mut rng);
@@ -398,12 +397,19 @@ mod tests {
             .sql
             .iter()
             .filter(|row| row.table == TX_META_TABLE)
-            .map(|row| match (&row.values[0], &row.values[1]) {
-                (CellValue::FixedBinary(digest), CellValue::UInt64(location)) => {
-                    (digest.clone(), *location)
-                }
-                _ => panic!("tx_meta digest and location should be typed"),
-            })
+            .map(
+                |row| match (&row.values[0], &row.values[1], &row.values[3]) {
+                    (
+                        CellValue::FixedBinary(digest),
+                        CellValue::UInt64(location),
+                        CellValue::UInt64(height),
+                    ) => {
+                        assert_eq!(*height, block.header.height);
+                        (digest.clone(), *location)
+                    }
+                    _ => panic!("tx_meta digest, location, and height should be typed"),
+                },
+            )
             .collect::<Vec<_>>();
         assert_eq!(
             meta_locations.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
@@ -449,14 +455,14 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        assert_eq!(meta.values.len(), 3);
+        assert_eq!(meta.values.len(), 4);
         assert!(matches!(meta.values.get(1), Some(CellValue::UInt64(0))));
         let Some(CellValue::Binary(body)) = meta.values.get(2) else {
             panic!("tx_meta body should be binary");
         };
         assert_eq!(body.as_slice(), expected_body);
 
-        // Readers derive proof heights from block metadata.
+        // Proof heights live on tx_meta rows, not in a separate table.
         assert!(
             rows.iter().all(|row| {
                 row.table == crate::sql_schema::TX_META_TABLE
