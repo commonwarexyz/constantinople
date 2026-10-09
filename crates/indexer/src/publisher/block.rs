@@ -128,6 +128,7 @@ where
             counterparty: receiver,
             value: tx.value,
             nonce: tx.nonce,
+            qmdb_location,
         }));
         if receiver != sender {
             sql.push(encode_tx_activity_row(TxActivityRow {
@@ -139,6 +140,7 @@ where
                 counterparty: sender,
                 value: tx.value,
                 nonce: tx.nonce,
+                qmdb_location,
             }));
         }
     }
@@ -357,6 +359,75 @@ mod tests {
         assert_activity_sender(&rows.sql, sender_account.as_ref());
         assert_eq!(rows.transaction_digests.len(), 1);
         assert_tx_meta_body(&rows.sql, &transaction);
+    }
+
+    #[test]
+    fn activity_rows_carry_tx_meta_location() {
+        let mut rng = StdRng::from_seed([5; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let transactions = (0..2)
+            .map(|nonce| {
+                let recipient = TransactionPublicKey::ed25519(
+                    ed25519::PrivateKey::random(&mut rng).public_key(),
+                );
+                Transaction::<sha256::Digest>::new(
+                    sender.clone(),
+                    recipient,
+                    NonZeroU64::new(1).expect("test value should be non-zero"),
+                    nonce,
+                )
+                .seal_and_sign(
+                    &signer,
+                    TRANSACTION_NAMESPACE,
+                    &mut Sha256::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let block = EngineBlock::from(
+            Block::<TestCommitment, PublicKey, Sha256>::new(
+                test_header(consensus_key.public_key(), transactions.len()),
+                transactions,
+            )
+            .seal(&mut Sha256::default()),
+        );
+
+        let rows = encode_block_rows(&block, 1_000);
+        let meta_locations = rows
+            .sql
+            .iter()
+            .filter(|row| row.table == TX_META_TABLE)
+            .map(|row| match (&row.values[0], &row.values[1]) {
+                (CellValue::FixedBinary(digest), CellValue::UInt64(location)) => {
+                    (digest.clone(), *location)
+                }
+                _ => panic!("tx_meta digest and location should be typed"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            meta_locations.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let activity = rows
+            .sql
+            .iter()
+            .filter(|row| row.table == TX_ACTIVITY_TABLE)
+            .collect::<Vec<_>>();
+        assert_eq!(activity.len(), 4, "sender and receiver row per transaction");
+        for row in activity {
+            let (CellValue::FixedBinary(digest), CellValue::UInt64(location)) =
+                (&row.values[4], &row.values[8])
+            else {
+                panic!("tx_activity digest and location should be typed");
+            };
+            let (_, expected) = meta_locations
+                .iter()
+                .find(|(meta_digest, _)| meta_digest == digest)
+                .expect("activity digest should have a tx_meta row");
+            assert_eq!(location, expected);
+        }
     }
 
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {
