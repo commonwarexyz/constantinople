@@ -274,10 +274,10 @@ pub(super) async fn scan_finalized_queue_records(
 
 /// Reconcile payload blobs with the scanned records.
 ///
-/// Every record must have a payload. Reads verify its length and checksum. A
-/// blob without a record is left over from a crash between a payload sync and
-/// its record commit, or from a deletion that failed or never ran after its
-/// section pruned, and is removed here.
+/// Every record must have a payload of the recorded length. Reads verify its
+/// checksum. A blob without a record is left over from a crash between a payload
+/// sync and its record commit, or from a deletion that failed or never ran after
+/// its section pruned, and is removed here.
 pub(super) async fn sweep_finalized_payloads(
     payloads: &FinalizedPayloads,
     records: &[(u64, FinalizedQueueRecord)],
@@ -293,6 +293,17 @@ pub(super) async fn sweep_finalized_payloads(
         assert!(
             on_disk.contains(&height),
             "finalized queue record at height {height} has no payload"
+        );
+
+        // Reading a missing payload creates an empty blob, so presence alone does not
+        // prove the payload survived.
+        let len = payloads
+            .stored_len(height)
+            .await
+            .expect("failed to open finalized index payload");
+        assert_eq!(
+            len, record.payload.len,
+            "finalized queue record at height {height} has a {len}-byte payload"
         );
         referenced.insert(height);
         retained_bytes = retained_bytes.saturating_add(record.payload.len);

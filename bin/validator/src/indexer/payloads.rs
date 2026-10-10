@@ -228,6 +228,18 @@ impl<E: Storage> PayloadStore<E> {
         Ok(bytes)
     }
 
+    /// Length of the payload on disk for `height`.
+    ///
+    /// Opening creates a missing blob, so callers must first find `height` in [`Self::heights`].
+    pub(super) async fn stored_len(&self, height: u64) -> Result<u64, Error> {
+        let (_, len) = self
+            .inner
+            .context
+            .open(&self.inner.partition, &blob_name(height))
+            .await?;
+        Ok(len)
+    }
+
     /// Remove the payload for `height`. A payload that is already gone is not an error.
     pub(super) async fn remove(&self, height: u64, len: u64) -> Result<(), Error> {
         match self

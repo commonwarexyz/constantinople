@@ -82,7 +82,6 @@ The indexer publishes every finalized block to complementary surfaces
 | `VITE_STORE_URL` | `http://127.0.0.1:8090` | The shared `chain-indexer` Store used for Simplex artifacts and provable-target updates. |
 | `VITE_MEMPOOL_URL` | `http://127.0.0.1:8080` | The transaction admission endpoint. Local deploy points this at the relayer when `--relayer` is enabled. |
 | `VITE_SIMPLEX_VERIFICATION_MATERIAL` | empty | Hex-encoded Simplex committee verification material. Required for certificate and transaction proof verification. |
-| `VITE_VERIFY_CERTIFICATES` | `true` | Set to `false` to disable block-list certificate verification while profiling live block streaming. |
 
 The metadata and QMDB services enable permissive CORS layers, so the dev
 server can talk to them cross-origin without a Vite proxy.

@@ -127,14 +127,6 @@ const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
 const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
 const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
-const verifyCertificates = parseBooleanEnv(import.meta.env.VITE_VERIFY_CERTIFICATES, true);
-
-function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
-    if (typeof value !== 'string') return fallback;
-    if (/^(0|false|off|no)$/i.test(value)) return false;
-    if (/^(1|true|on|yes)$/i.test(value)) return true;
-    return fallback;
-}
 
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
@@ -1349,7 +1341,6 @@ export default function App() {
                             signedInAccountKey={signedInAccountKey}
                             onCopy={copyValue}
                             onOpenAddress={openAccountPage}
-                            verifyCertificates={verifyCertificates}
                         />
                     </WalletModal>
                 )}
@@ -1885,13 +1876,11 @@ function TransactionHistory({
     signedInAccountKey,
     onCopy,
     onOpenAddress,
-    verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
     signedInAccountKey: string | null;
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
-    verifyCertificates: boolean;
 }) {
     const formatter = useMemo(
         () =>
@@ -1919,7 +1908,6 @@ function TransactionHistory({
                         onOpenAddress={onOpenAddress}
                         signedInAccountKey={signedInAccountKey}
                         tx={tx}
-                        verifyCertificates={verifyCertificates}
                     />
                 ))}
             </div>
@@ -1933,14 +1921,12 @@ function TransactionRecord({
     onOpenAddress,
     signedInAccountKey,
     tx,
-    verifyCertificates,
 }: {
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
     signedInAccountKey: string | null;
     tx: SubmittedTransaction;
-    verifyCertificates: boolean;
 }) {
     const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
     return (
@@ -1965,17 +1951,9 @@ function TransactionRecord({
             </div>
             <div className="tx-record__secondary">
                 <span className="tx-record__detail">{tx.detail}</span>
-                {verifyCertificates && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">cert</span>
-                        <CertificateCell
-                            certificate={tx.certificate}
-                            finalizedHeight={tx.finalizedHeight}
-                            verifyCertificates={verifyCertificates}
-                        />
-                    </>
-                )}
+                <span className="tx-sep" aria-hidden="true">·</span>
+                <span className="tx-label">cert</span>
+                <CertificateCell certificate={tx.certificate} finalizedHeight={tx.finalizedHeight} />
                 <span className="tx-sep" aria-hidden="true">·</span>
                 <span className="tx-label">proof</span>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
@@ -2001,23 +1979,10 @@ function TransactionRecord({
 function CertificateCell({
     certificate,
     finalizedHeight,
-    verifyCertificates,
 }: {
     certificate: BlockCertificateState;
     finalizedHeight: number | null;
-    verifyCertificates: boolean;
 }) {
-    if (!verifyCertificates) {
-        return (
-            <span
-                className="tx-proof-muted"
-                aria-label="block certificate verification disabled"
-                title="block certificate verification disabled"
-            >
-                -
-            </span>
-        );
-    }
     if (certificate.status === 'verified') {
         return (
             <span

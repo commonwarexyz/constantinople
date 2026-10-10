@@ -215,8 +215,6 @@ The printed `mprocs` command list grows by four entries:
   metadata service, streams new finalized blocks live, and verifies
   submitted-transaction proofs against `qmdb-indexer` and Simplex finalization
   certificates in the shared store.
-  Add `VITE_VERIFY_CERTIFICATES=false` to disable block-list certificate
-  verification during streaming-performance experiments.
 
 The generated metadata and QMDB commands require `curl`. They poll Store's
 `/ready` endpoint before starting each adapter. Failed probes are retried after

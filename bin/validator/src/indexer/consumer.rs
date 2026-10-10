@@ -760,6 +760,29 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "finalized queue record at height 1 has a 0-byte payload")]
+    fn restart_rejects_a_payload_left_empty_by_a_missing_read() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let payloads = PayloadStore::new(context.child("payloads"), "emptied-payloads".into());
+            let payload = payloads
+                .write(1, Bytes::from_static(b"payload"))
+                .await
+                .unwrap();
+            payloads.remove(1, payload.len).await.unwrap();
+
+            // Reading the missing payload fails but leaves an empty blob behind.
+            assert!(payloads.read(1, payload).await.is_err());
+            assert_eq!(payloads.heights().await.unwrap(), [1].into());
+
+            let record = FinalizedQueueRecord {
+                receipt: capture_receipt(1, 2, 2),
+                payload,
+            };
+            sweep_finalized_payloads(&payloads, &[(0, record)]).await;
+        });
+    }
+
+    #[test]
     fn restart_after_a_failed_queue_sync_recovers_from_the_queue_tail() {
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let section = FINALIZED_QUEUE_ITEMS_PER_SECTION.get();

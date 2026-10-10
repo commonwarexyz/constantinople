@@ -761,14 +761,14 @@ async fn run_publisher<Cx, H, P, S>(
     S: Strategy,
 {
     let mut rx_closed = false;
-    let mut commits = FuturesUnordered::<Handle<Result<PersistedUpload, PublishError>>>::new();
+    let mut commits = FuturesUnordered::<Handle<PersistedUpload>>::new();
     let mut pending = VecDeque::new();
     let mut persisted = BTreeMap::new();
     let mut publication = None::<BoxFuture<'static, (usize, u64)>>;
     loop {
         // Include every available completion before selecting the next publication prefix.
         while let Some(Some(result)) = commits.next().now_or_never() {
-            let upload = persisted_upload(result);
+            let upload = result.expect("finalized data commit task failed");
             persisted.insert(upload.height, upload);
         }
         if publication.is_none() {
@@ -800,7 +800,7 @@ async fn run_publisher<Cx, H, P, S>(
                 }
             }
             Some(result) = commits.next(), if !commits.is_empty() => {
-                let upload = persisted_upload(result);
+                let upload = result.expect("finalized data commit task failed");
                 persisted.insert(upload.height, upload);
             }
             (ready, sequence) = async { publication.as_mut().expect("publication is active").await }, if publication.is_some() => {
@@ -812,14 +812,6 @@ async fn run_publisher<Cx, H, P, S>(
     debug!("finalized publisher exiting after channel closure");
 }
 
-fn persisted_upload(
-    result: Result<Result<PersistedUpload, PublishError>, commonware_runtime::Error>,
-) -> PersistedUpload {
-    result
-        .expect("finalized data commit task failed")
-        .expect("finalized data preparation must succeed")
-}
-
 fn spawn_data_commit<Cx, H, P, S>(
     context: Cx,
     clients: &WorkerClients,
@@ -827,7 +819,7 @@ fn spawn_data_commit<Cx, H, P, S>(
     metrics: super::PublisherMetrics,
     has_durable_range: Arc<AtomicBool>,
     commit: DataCommit<H, P>,
-) -> Handle<Result<PersistedUpload, PublishError>>
+) -> Handle<PersistedUpload>
 where
     Cx: Spawner,
     H: Hasher + Send + Sync + 'static,
@@ -887,7 +879,8 @@ where
                         strategy,
                         data,
                         &prepare_metrics,
-                    );
+                    )
+                    .expect("finalized data preparation must succeed");
                     let cpu_elapsed = cpu_started.and_then(|started| started.try_elapsed());
                     prepare_metrics
                         .prepare_duration
@@ -906,7 +899,7 @@ where
             });
             let (batches, state, transactions) = prepare
                 .await
-                .expect("finalized index preparation task failed")?;
+                .expect("finalized index preparation task failed");
             let chunks = batches.len();
             commit_chunks(
                 context.child("commit"),
@@ -915,7 +908,8 @@ where
                 height,
                 batches,
             )
-            .await?;
+            .await
+            .expect("finalized data chunks were rejected");
             has_durable_range.store(true, Ordering::Relaxed);
             let persisted_at = Instant::now();
             metrics.chunks_per_block.observe(chunks as f64);
@@ -932,13 +926,13 @@ where
                 sequence = tracing::field::Empty
             );
             let _ = persisted.send(());
-            Ok(PersistedUpload {
+            PersistedUpload {
                 height,
                 state,
                 transactions,
                 persisted_at,
                 publication_wait_span,
-            })
+            }
         }
         .instrument(data_span)
         .with_current_subscriber()

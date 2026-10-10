@@ -28,7 +28,7 @@ use constantinople_primitives::{
 };
 use rand::{CryptoRng, Rng};
 use std::{future::Future, sync::Arc};
-use tracing::{Instrument as _, info, info_span, warn};
+use tracing::{Instrument as _, error, info, info_span, warn};
 
 impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
 where
@@ -288,12 +288,14 @@ where
         let strategy = self.strategy.clone();
         let body = block.body.clone();
         let work_size = body.len();
+        let height = block.header.height;
         let prepare_span = info_span!("application.apply.prepare", txs = body.len().traced());
         let (body, digests) = strategy
             .spawn(work_size, move |s| {
                 prepare_span.in_scope(|| prepare_lazy(&s, &body))
             })
             .await
+            .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
             .ok()?;
 
         let (state_batch, transaction_batch) = batches;
@@ -306,6 +308,7 @@ where
             strategy,
         )
         .await
+        .inspect_err(|&reason| error!(height, reason, "application.apply.reject"))
         .ok()
     }
 }
