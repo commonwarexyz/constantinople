@@ -8,14 +8,18 @@ use axum::{
 };
 use exoware_simulator::{AppState, RocksStore, connect_stack};
 use std::{
-    path::{Path, PathBuf},
+    ops::Range,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
 };
+use tokio::{
+    sync::{Notify, Semaphore},
+    task::JoinHandle,
+};
 
-static STORE_COUNTER: AtomicU64 = AtomicU64::new(0);
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Clone, Debug)]
 pub(crate) struct RequestObservation {
@@ -32,32 +36,19 @@ struct ObservationState {
 pub(crate) struct ObservedStore {
     pub url: String,
     requests: Arc<Mutex<Vec<RequestObservation>>>,
-    server: tokio::task::JoinHandle<()>,
+    server: JoinHandle<()>,
 }
 
 impl ObservedStore {
-    pub async fn open(
-        expected_key: &str,
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let directory = TestDirectory::new()?;
-        let engine = RocksStore::open_owned(directory, None).map_err(std::io::Error::other)?;
-        let connect = connect_stack(AppState::new(Arc::new(engine)));
+    pub async fn open(expected_key: &str) -> Result<Self, BoxError> {
         let requests = Arc::new(Mutex::new(Vec::new()));
-        let expected = format!("Bearer {expected_key}").parse()?;
         let state = ObservationState {
-            expected,
+            expected: format!("Bearer {expected_key}").parse()?,
             requests: requests.clone(),
         };
-        let app = Router::new()
-            .route("/health", get(|| async { "ok" }))
-            .fallback_service(connect)
-            .layer(middleware::from_fn_with_state(state, observe_authorization));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let url = format!("http://{}", listener.local_addr()?);
-        let server = tokio::spawn(async move {
-            let _ = axum::serve(listener, app).await;
-        });
-
+        let (url, server) =
+            serve(|app| app.layer(middleware::from_fn_with_state(state, observe_authorization)))
+                .await?;
         Ok(Self {
             url,
             requests,
@@ -73,6 +64,69 @@ impl ObservedStore {
         self.server.abort();
         let _ = self.server.await;
     }
+}
+
+#[derive(Clone)]
+struct IngestGate {
+    gated: Range<usize>,
+    ingests: Arc<AtomicUsize>,
+    arrived: Arc<Notify>,
+    release: Arc<Semaphore>,
+}
+
+/// Holds Store ingests whose zero-based arrival index is in the gated range.
+pub(crate) struct GatedIngestStore {
+    pub url: String,
+    gate: IngestGate,
+    server: JoinHandle<()>,
+}
+
+impl GatedIngestStore {
+    pub async fn open(gated: Range<usize>) -> Result<Self, BoxError> {
+        let gate = IngestGate {
+            gated,
+            ingests: Arc::default(),
+            arrived: Arc::default(),
+            release: Arc::new(Semaphore::new(0)),
+        };
+        let state = gate.clone();
+        let (url, server) =
+            serve(|app| app.layer(middleware::from_fn_with_state(state, gate_ingest))).await?;
+        Ok(Self { url, gate, server })
+    }
+
+    /// Wait until at least `count` ingests have arrived, gated or not.
+    pub async fn wait_for_ingests(&self, count: usize) {
+        while self.gate.ingests.load(Ordering::SeqCst) < count {
+            self.gate.arrived.notified().await;
+        }
+    }
+
+    /// Let one held ingest proceed.
+    pub fn release_ingest(&self) {
+        self.gate.release.add_permits(1);
+    }
+
+    pub async fn shutdown(self) {
+        self.server.abort();
+        let _ = self.server.await;
+    }
+}
+
+async fn serve(wrap: impl FnOnce(Router) -> Router) -> Result<(String, JoinHandle<()>), BoxError> {
+    let engine =
+        RocksStore::open_owned(tempfile::tempdir()?, None).map_err(std::io::Error::other)?;
+    let app = wrap(
+        Router::new()
+            .route("/health", get(|| async { "ok" }))
+            .fallback_service(connect_stack(AppState::new(Arc::new(engine)))),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let url = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    Ok((url, server))
 }
 
 async fn observe_authorization(
@@ -92,28 +146,13 @@ async fn observe_authorization(
     next.run(request).await
 }
 
-struct TestDirectory(PathBuf);
-
-impl TestDirectory {
-    fn new() -> std::io::Result<Self> {
-        let id = STORE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "constantinople-observed-store-{}-{id}",
-            std::process::id()
-        ));
-        std::fs::create_dir(&path)?;
-        Ok(Self(path))
+async fn gate_ingest(State(gate): State<IngestGate>, request: Request, next: Next) -> Response {
+    if request.uri().path().starts_with("/log.ingest.v1.Service/") {
+        let index = gate.ingests.fetch_add(1, Ordering::SeqCst);
+        gate.arrived.notify_one();
+        if gate.gated.contains(&index) {
+            gate.release.acquire().await.unwrap().forget();
+        }
     }
-}
-
-impl AsRef<Path> for TestDirectory {
-    fn as_ref(&self) -> &Path {
-        &self.0
-    }
-}
-
-impl Drop for TestDirectory {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
+    next.run(request).await
 }

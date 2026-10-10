@@ -1,7 +1,9 @@
 pub use exoware_sdk::{ClientBuildError as StoreClientBuildError, StoreClient};
 use exoware_sdk::{
-    ClientError, ConnectRequestCompression, StoreClientBuilder, transport::BalancedHttp2Config,
+    ClientError, ConnectRequestCompression, RetryConfig, StoreClientBuilder,
+    transport::BalancedHttp2Config,
 };
+use std::time::Duration;
 
 /// Failure from the adapter's startup readiness check.
 #[derive(Debug, thiserror::Error)]
@@ -19,7 +21,11 @@ pub fn store_client(
     url: &str,
     api_key: Option<&str>,
 ) -> Result<StoreClient, StoreClientBuildError> {
-    store_client_builder(url, api_key).build()
+    // A lagging Store should be checked again promptly without increasing the
+    // SDK's read attempt budget. This also caps other retryable read errors.
+    store_client_builder(url, api_key)
+        .retry_config(RetryConfig::standard().with_max_backoff(Duration::from_millis(100)))
+        .build()
 }
 
 /// Balances uploads across connections and compresses large writer batches.
@@ -30,7 +36,7 @@ pub fn writer_store_client(
 ) -> Result<StoreClient, StoreClientBuildError> {
     store_client_builder(url, api_key)
         .balanced_http2_transport(BalancedHttp2Config::default())
-        .connect_request_compression(ConnectRequestCompression::Zstd)
+        .connect_request_compression(ConnectRequestCompression::Zstd { level: -1 })
         .build()
 }
 
@@ -62,7 +68,7 @@ mod tests {
         extract::State,
         http::{
             HeaderMap, StatusCode,
-            header::{AUTHORIZATION, CONTENT_ENCODING},
+            header::{AUTHORIZATION, CONTENT_ENCODING, CONTENT_TYPE},
         },
         routing::get,
     };
@@ -71,11 +77,82 @@ mod tests {
     use std::{
         process::{Command, Output},
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        time::Duration,
     };
-    use tokio::sync::mpsc;
+    use tokio::{sync::mpsc, time::Instant};
+
+    async fn read_retry_case(
+        failures: usize,
+        status: StatusCode,
+        error_body: &'static str,
+    ) -> (
+        Result<Option<Bytes>, exoware_sdk::ClientError>,
+        Vec<Instant>,
+    ) {
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = Router::new().route(
+            "/store.query.v1.Service/Get",
+            axum::routing::post(move |headers: HeaderMap, body: Bytes| {
+                let requests = observed.clone();
+                async move {
+                    assert_eq!(headers[CONTENT_TYPE], "application/proto");
+
+                    // These protobuf fields pin key="key" and the Store sequence
+                    // floor at 42 on every physical attempt.
+                    assert_eq!(body.as_ref(), b"\x0a\x03key\x10\x2a");
+                    let mut requests = requests.lock().expect("request lock poisoned");
+                    requests.push(Instant::now());
+                    if requests.len() <= failures {
+                        (
+                            status,
+                            [(CONTENT_TYPE, "application/json")],
+                            error_body.as_bytes(),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            [(CONTENT_TYPE, "application/proto")],
+                            b"\x0a\x05value".as_slice(),
+                        )
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("retry listener should bind");
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = PrefixedStoreClient::empty(store_client(&url, None).unwrap());
+        let result = client
+            .query()
+            .get_with_min_sequence_number(&Bytes::from_static(b"key"), 42)
+            .await;
+        server.abort();
+        let requests = requests.lock().expect("request lock poisoned").clone();
+        (result, requests)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn read_retries_preserve_floor_and_cap_server_hint_on_the_wire() {
+        // RetryInfo encodes a one-second hint. Both retries must use the cap.
+        let (result, requests) = read_retry_case(
+            2,
+            StatusCode::CONFLICT,
+            r#"{"code":"aborted","message":"Store is behind","details":[{"type":"google.rpc.RetryInfo","value":"CgIIAQ=="}]}"#,
+        )
+        .await;
+
+        assert_eq!(result.unwrap(), Some(Bytes::from_static(b"value")));
+        assert_eq!(requests.len(), 3);
+        for pair in requests.windows(2) {
+            assert_eq!(pair[1] - pair[0], Duration::from_millis(100));
+        }
+    }
 
     async fn readiness(
         State((status, requests)): State<(StatusCode, Arc<AtomicUsize>)>,
@@ -125,11 +202,17 @@ mod tests {
     async fn capture_content_encoding(
         State(sender): State<mpsc::UnboundedSender<Option<String>>>,
         headers: HeaderMap,
+        body: Bytes,
     ) -> StatusCode {
-        let content_encoding = headers.get(CONTENT_ENCODING).map(|value| {
+        assert_eq!(headers[CONTENT_TYPE], "application/connect+proto");
+        assert!(!headers.contains_key(CONTENT_ENCODING));
+        assert_eq!(body[0], 1);
+        assert_eq!(&body[5..9], b"\x28\xb5\x2f\xfd");
+
+        let content_encoding = headers.get("connect-content-encoding").map(|value| {
             value
                 .to_str()
-                .expect("content-encoding should be ASCII")
+                .expect("connect-content-encoding should be ASCII")
                 .to_string()
         });
         sender
@@ -243,8 +326,8 @@ mod tests {
         assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
     }
 
-    #[test]
-    fn writer_client_builds() {
+    #[tokio::test]
+    async fn writer_client_builds_in_runtime() {
         writer_store_client("https://store.example.com", Some("write-key"))
             .expect("writer client should build");
     }

@@ -102,7 +102,7 @@ use commonware_parallel::Strategy;
 use commonware_runtime::{
     BufferPooler, Clock, Metrics, Storage, telemetry::traces::TracedExt as _,
 };
-use commonware_storage::{merkle::Family, mmr, qmdb::batch_chain::Bounds, translator::EightCap};
+use commonware_storage::{merkle::Family, mmr, qmdb::chain::Bounds, translator::EightCap};
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::{Account, Header, LazySignedTransaction, SignedTransaction};
@@ -168,9 +168,12 @@ where
     S: Strategy,
 {
     let plan_span = info_span!("application.execute.plan", txs = transfers.len().traced());
+    let work_size = transfers.len();
     let plan = {
         let transfers = Arc::clone(&transfers);
-        strategy.spawn(move |_: S| plan_span.in_scope(|| executor::execution_plan(&transfers)))
+        strategy.spawn(work_size, move |_: S| {
+            plan_span.in_scope(|| executor::execution_plan(&transfers))
+        })
     }
     .await;
     let Some(plan) = plan else {
@@ -182,7 +185,9 @@ where
         accounts = values.len().traced()
     );
     let updates = strategy
-        .spawn(move |_: S| build_span.in_scope(|| build_updates(plan, transfers, values)))
+        .spawn(work_size, move |_: S| {
+            build_span.in_scope(|| build_updates(plan, transfers, values))
+        })
         .await;
     (staged, updates)
 }
@@ -440,8 +445,9 @@ where
         );
         let accounts_span =
             info_span!("application.execute.accounts", keys = tracing::field::Empty);
+        let work_size = candidates.len();
         let (candidates_back, prepared, transfers, selector_back, missing) = strategy
-            .spawn({
+            .spawn(work_size, {
                 let accounts_span = accounts_span.clone();
                 let mut selector = selector;
                 move |s: S| {
@@ -504,8 +510,9 @@ where
             txs = transfers.len().traced(),
             dropped = tracing::field::Empty,
         );
+        let work_size = transfers.len();
         let (selector_back, body_back, chunk, included_delta, dropped_bytes) = strategy
-            .spawn({
+            .spawn(work_size, {
                 let span = select_span.clone();
                 let mut selector = selector;
                 let mut body = body;
@@ -552,7 +559,8 @@ where
                     .expect("transaction batch is owned until the first append"),
             };
             let apply_span = info_span!("application.execute.apply", txs = chunk.len().traced());
-            pending_append = Some(Box::pin(strategy.spawn(move |_: S| {
+            let work_size = chunk.len();
+            pending_append = Some(Box::pin(strategy.spawn(work_size, move |_: S| {
                 apply_span.in_scope(|| apply_transaction_digests(batch, &chunk))
             })));
         }
@@ -625,8 +633,11 @@ where
     S: Strategy,
 {
     let prepare_span = info_span!("application.execute.prepare", txs = body.len().traced());
+    let work_size = body.len();
     let (transfers, digests) = strategy
-        .spawn(move |s| prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice())))
+        .spawn(work_size, move |s| {
+            prepare_span.in_scope(|| prepare_lazy(&s, body.as_ref().as_slice()))
+        })
         .await?;
 
     let transaction_count = transfers.len();
@@ -635,7 +646,8 @@ where
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let apply = strategy.spawn(move |_: S| {
+    let work_size = digests.len();
+    let apply = strategy.spawn(work_size, move |_: S| {
         apply_span.in_scope(|| apply_transaction_digests(transaction_batch, &digests))
     });
     let (staged, updates) = compute(state_batch, transfers, &strategy).await;
@@ -675,7 +687,8 @@ where
     // The transaction-history append has no dependency on state execution, so
     // it runs on the pool concurrently with compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
-    let apply = strategy.spawn(move |_: S| {
+    let work_size = digests.len();
+    let apply = strategy.spawn(work_size, move |_: S| {
         apply_span.in_scope(|| {
             apply_transaction_digests(transaction_batch, &digests)
                 .with_inactivity_floor(transaction_floor)
@@ -688,9 +701,11 @@ where
     let transaction_batch = apply.await;
     let state_updates = updates.ok_or(STATIC_INVALID_TRANSACTION)?;
 
-    db::finalize_execution(staged, state_updates, ready(transaction_batch))
-        .await
-        .map_err(|_| STATIC_INVALID_TRANSACTION)
+    Ok(
+        db::finalize_execution(staged, state_updates, ready(transaction_batch))
+            .await
+            .expect("database merkleization during replay must succeed"),
+    )
 }
 
 pub(super) fn commitments_match<E, C, P, H, S>(
@@ -774,7 +789,7 @@ mod tests {
     use commonware_cryptography::{Digest as _, sha256};
     use commonware_storage::{
         mmr,
-        qmdb::batch_chain::{Bounds, Commitment},
+        qmdb::chain::{Bounds, Commitment},
     };
     use commonware_utils::non_empty_range;
 

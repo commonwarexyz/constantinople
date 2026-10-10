@@ -6,7 +6,6 @@ interface ImportMetaEnv {
     readonly VITE_STORE_URL?: string;
     readonly VITE_MEMPOOL_URL?: string;
     readonly VITE_SIMPLEX_VERIFICATION_MATERIAL?: string;
-    readonly VITE_VERIFY_CERTIFICATES?: string;
 }
 
 interface ImportMeta {

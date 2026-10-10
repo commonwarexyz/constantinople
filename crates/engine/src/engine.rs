@@ -11,23 +11,25 @@
 //! threshold scheme are fixed at startup from the supplied threshold output and
 //! optional local share.
 
-use crate::types::*;
-use commonware_coding::CodecConfig;
+use crate::{
+    application::{EngineApplication, EngineReporter},
+    block::ApplicationBlock,
+    types::*,
+};
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
         self, Update,
         coding::{Marshaled, MarshaledConfig, shards, types::coding_config_for_participants},
-        core::{Actor as MarshalActor, Variant as MarshalVariant},
+        core::Actor as MarshalActor,
         resolver::p2p as marshal_resolver,
     },
     simplex::{
         self,
         config::{Floor as SimplexFloor, ForwardPolicy, SkipBudget, SkipPolicy},
-        elector::Config as Elector,
-        types::Finalization,
+        elector::{Config as Elector, Elector as _},
     },
-    types::{Epoch, FixedEpocher, ViewDelta, coding::Commitment},
+    types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
     BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
@@ -60,14 +62,15 @@ use commonware_storage::{
 };
 use commonware_utils::{NZU16, NZU64, NZUsize, non_empty_range, union};
 use constantinople_application::consensus::{
-    Application, FinalizedHookFn, StateSyncTarget, TransactionHistoryTarget,
+    Application, StateSyncTarget, TransactionHistoryTarget,
 };
 use constantinople_mempool::TransactionSource;
-use constantinople_primitives::{BlockCfg, PublicKeyCache, proposal::maximum_shard_size};
+use constantinople_primitives::{BlockCfg, PublicKeyCache, proposal::MAXIMUM_BLOCK_SIZE};
 use futures::future::try_join_all;
 use rand::CryptoRng;
 use std::{
     num::{NonZero, NonZeroU16},
+    sync::Arc,
     time::{Duration, Instant},
 };
 use tracing::{error, info, warn};
@@ -77,6 +80,7 @@ pub type ThresholdScheme<P, V> = simplex::scheme::bls12381_threshold::standard::
 
 const FIXED_EPOCH_LENGTH: NonZero<u64> = NZU64!(u64::MAX);
 const MAILBOX_SIZE: NonZero<usize> = NZUsize!(1024);
+const MAX_BLOCK_SIZE: NonZero<usize> = NZUsize!(MAXIMUM_BLOCK_SIZE);
 const ACTIVITY_TIMEOUT: ViewDelta = ViewDelta::new(256);
 const FREEZER_VALUE_COMPRESSION: Option<u8> = None;
 const REPLAY_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
@@ -91,7 +95,6 @@ const SHARD_PEER_BUFFER_SIZE: NonZero<usize> = NZUsize!(64);
 
 const DB_WRITE_BUFFER: NonZero<usize> = NZUsize!(8 * 1024 * 1024);
 const STATE_INIT_CACHE_SIZE: NonZero<usize> = NZUsize!(1 << 18);
-const STATE_SYNC_INITIAL: Duration = Duration::from_secs(1);
 const STATE_SYNC_TIMEOUT: Duration = Duration::from_secs(2);
 const STATE_SYNC_RETRY: Duration = Duration::from_millis(100);
 
@@ -152,16 +155,15 @@ pub enum StartupMode {
     StateSync,
 }
 
-pub struct Config<E, C, M, B, V, St, I, H, O>
+pub struct Config<C, M, B, V, St, I, H, O>
 where
-    E: BufferPooler + Storage + Clock + Metrics,
     C: Signer,
     M: Manager<PublicKey = C::PublicKey>,
     B: Blocker<PublicKey = C::PublicKey>,
     V: Variant,
     St: Strategy,
     H: Hasher,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     pub signer: C,
     pub manager: M,
@@ -193,13 +195,13 @@ where
     pub other_page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
-    /// reporter is always wired up; this slot is fanned out via
-    /// [`commonware_consensus::Reporters`] so primaries that pass `None`
-    /// behave exactly as before.
+    /// reporter is always wired up, and this slot fans out alongside it via
+    /// [`commonware_consensus::Reporters`]. Passing `None` forwards activity to
+    /// marshal only.
     pub simplex_observer: Option<O>,
     /// Optional hook that observes finalized blocks after local database
     /// application and before state pruning.
-    pub finalized_hook: Option<FinalizedHookFn<E, Commitment, H, C::PublicKey, St>>,
+    pub finalized_hook: Option<EngineFinalizedHook<H, C::PublicKey>>,
 }
 
 /// Fully assembled validator engine.
@@ -213,9 +215,9 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     context: ContextCell<E>,
     signer: C,
@@ -235,22 +237,16 @@ where
         E,
         EngineVariant<H, C::PublicKey>,
         SchemeProvider<C::PublicKey, V>,
-        PrunableArchive<
-            EightCap,
-            E,
-            H::Digest,
-            Finalization<ThresholdScheme<C::PublicKey, V>, Commitment>,
-        >,
+        PrunableArchive<EightCap, E, H::Digest, EngineFinalization<C::PublicKey, V, H>>,
         PrunableArchive<EightCap, E, H::Digest, CodingBlock<H, C::PublicKey>>,
         FixedEpocher,
         St,
     >,
-    #[cfg(all(test, feature = "test-utils"))]
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
     #[cfg(all(test, feature = "test-utils"))]
-    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V>>,
+    startup_sync_floor: Option<EngineFinalization<C::PublicKey, V, H>>,
     #[cfg(all(test, feature = "test-utils"))]
-    genesis_commitment: Commitment,
+    genesis_commitment: EngineCommitment<H, C::PublicKey>,
     simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
 }
 
@@ -264,22 +260,22 @@ where
     V: Variant,
     L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
-    I: TransactionSource<Commitment, C::PublicKey, H> + Sync,
+    I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
-    O: Reporter<Activity = EngineActivity<C::PublicKey, V>>,
+    O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
-    #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
+    /// Returns a handle for reading durably archived marshal data.
+    pub fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
         self.marshal_mailbox.clone()
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V>> {
+    pub(crate) fn startup_sync_floor(&self) -> Option<EngineFinalization<C::PublicKey, V, H>> {
         self.startup_sync_floor.clone()
     }
 
     #[cfg(all(test, feature = "test-utils"))]
-    pub(crate) const fn genesis_commitment(&self) -> Commitment {
+    pub(crate) const fn genesis_commitment(&self) -> EngineCommitment<H, C::PublicKey> {
         self.genesis_commitment
     }
 
@@ -304,7 +300,7 @@ where
 
     /// Initializes the full engine stack.
     #[boxed]
-    pub async fn new(context: E, config: Config<E, C, M, B, V, St, I, H, O>) -> Self {
+    pub async fn new(context: E, config: Config<C, M, B, V, St, I, H, O>) -> Self {
         let page_cache = CacheRef::from_pooler(
             &context.child("other"),
             PAGE_CACHE_PAGE_SIZE,
@@ -333,7 +329,6 @@ where
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    initial: STATE_SYNC_INITIAL,
                     timeout: STATE_SYNC_TIMEOUT,
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
@@ -350,7 +345,6 @@ where
                     database: None,
                     mailbox_size: MAILBOX_SIZE,
                     me: Some(config.signer.public_key()),
-                    initial: STATE_SYNC_INITIAL,
                     timeout: STATE_SYNC_TIMEOUT,
                     fetch_retry_timeout: STATE_SYNC_RETRY,
                     priority_requests: false,
@@ -361,7 +355,7 @@ where
         let n_participants = u16::try_from(config.output.players().len())
             .expect("participant count must fit in u16");
         let coding_config = coding_config_for_participants(n_participants);
-        let genesis_parent = Commitment::from((
+        let genesis_parent = EngineCommitment::<H, C::PublicKey>::from((
             H::Digest::EMPTY,
             H::Digest::EMPTY,
             H::Digest::EMPTY,
@@ -393,16 +387,16 @@ where
         let stateful_startup_context = context.child("stateful_startup");
         let mut startup_plan =
             SyncPlan::<E, ThresholdScheme<C::PublicKey, V>, EngineVariant<H, C::PublicKey>>::init(
-                &stateful_startup_context,
+                stateful_startup_context,
                 stateful_partition_prefix.clone(),
             )
             .await;
 
         // The durable plan distinguishes normal recovery from peer state sync. Normal recovery
-        // stays floorless so marshal restores its acknowledged progress; only a requested or
+        // stays floorless so marshal restores its acknowledged progress. A requested or
         // interrupted state sync discovers a new floor.
         let state_sync_requested = matches!(&config.startup, StartupMode::StateSync);
-        if startup_plan.should_state_sync(state_sync_requested) {
+        if startup_plan.should_sync(state_sync_requested) {
             let finalization = config
                 .probe
                 .as_ref()
@@ -410,11 +404,11 @@ where
                 .subscribe()
                 .await
                 .expect("probe actor exited before selecting a state-sync floor");
-            startup_plan = startup_plan.with_floor(finalization);
+            startup_plan = startup_plan.set_floor(finalization).await;
         }
 
-        // The canonical genesis is a pure function of configuration: the leader, the
-        // participant-derived coding config, and the canonical empty-database roots.
+        // Every startup derives the same genesis from the configured leader,
+        // participant-derived coding config, and canonical empty-database roots.
         let genesis_block = constantinople_application::consensus::genesis_block_with_parent(
             &mut H::default(),
             config.genesis_leader.clone(),
@@ -423,11 +417,13 @@ where
             <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
             <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
         );
-        let coded_genesis = EngineCodedBlock::new(genesis_block, coding_config, &config.strategy);
-        let application_genesis =
-            <EngineVariant<H, C::PublicKey> as MarshalVariant>::into_inner(coded_genesis.clone());
+        let coded_genesis = Arc::new(EngineCodedBlock::new(
+            genesis_block.into(),
+            coding_config,
+            &config.strategy,
+        ));
         let (application_state_target, application_transactions_target) =
-            block_targets(&application_genesis);
+            block_targets(coded_genesis.inner());
 
         #[cfg(all(test, feature = "test-utils"))]
         let startup_sync_floor = startup_plan.floor().cloned();
@@ -467,34 +463,51 @@ where
             probe.attach(marshal_mailbox.clone());
         }
 
+        // The shards engine requires at least 2 * (max(1, optimistic_views) + 2) records.
+        let elector = L::default();
+        let optimistic_views = elector
+            .clone()
+            .build(config.output.players())
+            .terms()
+            .optimistic_views()
+            .get();
+        let shard_records = optimistic_views
+            .max(1)
+            .checked_add(2)
+            .and_then(|views| views.checked_mul(2))
+            .and_then(|records| usize::try_from(records).ok())
+            .and_then(NonZero::new)
+            .expect("shard record window must fit in usize");
+
         let (shards, shard_mailbox) = shards::Engine::new(
             context.child("shards"),
             shards::Config {
                 scheme_provider: provider.clone(),
                 blocker: config.blocker.clone(),
-                shard_codec_cfg: CodecConfig {
-                    maximum_shard_size: maximum_shard_size(n_participants),
-                },
+                max_block_size: MAX_BLOCK_SIZE,
                 block_codec_cfg: config.block_codec.clone(),
                 strategy: config.strategy.clone(),
                 mailbox_size: MAILBOX_SIZE,
                 peer_buffer_size: SHARD_PEER_BUFFER_SIZE,
+                records: shard_records,
                 background_channel_capacity: SHARD_BACKGROUND_CHANNEL_CAPACITY,
                 peer_provider: config.manager.clone(),
             },
         );
-        let application = Application::new(
-            context.child("application"),
-            config.strategy.clone(),
-            config.genesis_leader.clone(),
-            genesis_parent,
-            config.transaction_namespace,
-            config.public_key_cache,
-            application_state_target,
-            application_transactions_target,
+        let application = EngineApplication::new(
+            Application::new(
+                context.child("application"),
+                config.strategy.clone(),
+                config.genesis_leader.clone(),
+                genesis_parent,
+                config.transaction_namespace,
+                config.public_key_cache,
+                application_state_target,
+                application_transactions_target,
+            ),
             config.finalized_hook,
         );
-        let (stateful, stateful_mailbox) = Stateful::init(
+        let (stateful, stateful_mailbox) = Stateful::new(
             context.child("stateful"),
             StatefulConfig {
                 application,
@@ -527,17 +540,9 @@ where
                 epocher,
             },
         );
-        // Fan simplex activity to the marshal mailbox and any external
-        // observer (e.g. the indexer's certificate publisher). When
-        // `simplex_observer` is `None`, this combinator is equivalent to
-        // forwarding activity to the marshal mailbox alone — primaries that
-        // pass `None` see exactly the previous behavior.
-        #[cfg(all(test, feature = "test-utils"))]
+        // Fan Simplex activity to the marshal mailbox and any external observer.
         let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
             Reporters::from((marshal_mailbox.clone(), config.simplex_observer));
-        #[cfg(not(all(test, feature = "test-utils")))]
-        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
-            Reporters::from((marshal_mailbox, config.simplex_observer));
 
         // Retain votes for late equivocation reports. The upstream wall-clock skip policy
         // avoids waiting on silent leaders while a quorum remains active.
@@ -545,7 +550,7 @@ where
             context.child("simplex"),
             simplex::Config {
                 scheme,
-                elector: L::default(),
+                elector,
                 blocker: config.blocker.clone(),
                 automaton: application.clone(),
                 relay: application,
@@ -584,7 +589,6 @@ where
             shards,
             shard_mailbox,
             marshal,
-            #[cfg(all(test, feature = "test-utils"))]
             marshal_mailbox,
             #[cfg(all(test, feature = "test-utils"))]
             startup_sync_floor,
@@ -603,7 +607,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey> + Send + 'static,
         Rx: Receiver<PublicKey = C::PublicKey> + Send + 'static,
-        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<ApplicationBlock<H, C::PublicKey>>>,
     {
         spawn_cell!(self.context, self.run(channels, reporter))
     }
@@ -612,7 +616,7 @@ where
     where
         Sx: Sender<PublicKey = C::PublicKey>,
         Rx: Receiver<PublicKey = C::PublicKey>,
-        Rep: Reporter<Activity = Update<EngineBlock<H, C::PublicKey>>>,
+        Rep: Reporter<Activity = Update<ApplicationBlock<H, C::PublicKey>>>,
     {
         let resolver_context = self.context.into_present();
         let marshal_resolver = marshal_resolver::init(
@@ -622,7 +626,6 @@ where
                 peer_provider: self.manager.clone(),
                 blocker: self.blocker.clone(),
                 mailbox_size: MAILBOX_SIZE,
-                initial: STATE_SYNC_INITIAL,
                 timeout: STATE_SYNC_TIMEOUT,
                 fetch_retry_timeout: STATE_SYNC_RETRY,
                 priority_requests: false,
@@ -638,8 +641,9 @@ where
         let shard_handle = self.shards.start(channels.marshal);
         let stateful_handle = self.stateful.start();
 
-        let reporters: Reporters<Update<EngineBlock<H, C::PublicKey>>, _, Rep> =
-            Reporters::from((self.stateful_mailbox, reporter));
+        let reporter = reporter.map(EngineReporter::new);
+        let reporters: EngineMarshalReporters<E, H, C::PublicKey, V, I, BV, St, Rep> =
+            EngineMarshalReporters::from((self.stateful_mailbox, reporter));
         let marshal_handle = self
             .marshal
             .start(reporters, self.shard_mailbox, marshal_resolver);
@@ -713,7 +717,7 @@ async fn init_finalizations_archive<E, H, P, V>(
     page_cache: &CacheRef,
     partition_prefix: &str,
     items_per_section: NonZero<u64>,
-) -> PrunableArchive<EightCap, E, H::Digest, Finalization<ThresholdScheme<P, V>, Commitment>>
+) -> PrunableArchive<EightCap, E, H::Digest, EngineFinalization<P, V, H>>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     H: Hasher,
@@ -725,6 +729,7 @@ where
         context.child("finalizations_by_height"),
         prunable::Config {
             translator: EightCap,
+            metadata_partition: format!("{partition_prefix}-finalizations-by-height-metadata"),
             key_partition: format!("{partition_prefix}-finalizations-by-height-key"),
             key_page_cache: page_cache.clone(),
             value_partition: format!("{partition_prefix}-finalizations-by-height-value"),
@@ -759,6 +764,7 @@ where
         context.child("finalized_blocks"),
         prunable::Config {
             translator: EightCap,
+            metadata_partition: format!("{partition_prefix}-finalized-blocks-metadata"),
             key_partition: format!("{partition_prefix}-finalized-blocks-key"),
             key_page_cache: page_cache.clone(),
             value_partition: format!("{partition_prefix}-finalized-blocks-value"),
@@ -790,6 +796,7 @@ where
             metadata_partition: format!("{partition_prefix}-state-metadata"),
             items_per_blob: ITEMS_PER_BLOB,
             write_buffer: DB_WRITE_BUFFER,
+            replay_buffer: REPLAY_BUFFER,
             strategy,
             page_cache: page_cache.clone(),
         },
@@ -798,9 +805,10 @@ where
             items_per_blob: ITEMS_PER_BLOB,
             page_cache: page_cache.clone(),
             write_buffer: DB_WRITE_BUFFER,
+            replay_buffer: REPLAY_BUFFER,
         },
         translator: EightCap,
-        init_cache_size: Some(STATE_INIT_CACHE_SIZE),
+        init_cache: Some(STATE_INIT_CACHE_SIZE),
         init_buffer: NZUsize!(1 << 21),
         init_concurrency: (),
     }
@@ -823,6 +831,7 @@ where
             codec_config: (),
             page_cache: page_cache.clone(),
             write_buffer: DB_WRITE_BUFFER,
+            replay_buffer: REPLAY_BUFFER,
         },
         commit_codec_config: (),
     }
@@ -831,20 +840,67 @@ where
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use commonware_codec::{Decode, Encode, EncodeSize, FixedSize};
-    use commonware_coding::ReedSolomon;
+    use commonware_codec::{Decode, Encode, EncodeSize};
+    use commonware_coding::{Config as CodingConfig, ReedSolomon};
     use commonware_consensus::{
         marshal::coding::types::Shard,
         simplex::types::Context,
-        types::{Round, View},
+        types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{ed25519, sha256};
+    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
+    use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
+    use commonware_utils::{NZU16, non_empty_range};
     use constantinople_primitives::{
         Block, Header, Sealable, Transaction, TransactionPublicKey,
         proposal::{MAXIMUM_BLOCK_SIZE, MAXIMUM_MESSAGE_SIZE, max_transaction_bytes},
     };
+    use rand::{SeedableRng, rngs::StdRng};
     use std::num::NonZeroU64;
+
+    #[test]
+    fn engine_block_preserves_inner_wire_encoding() {
+        let mut rng = StdRng::from_seed([17u8; 32]);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let coding_config = CodingConfig {
+            minimum_shards: NZU16!(2),
+            extra_shards: NZU16!(2),
+        };
+        let parent = EngineCommitment::<sha256::Sha256, ed25519::PublicKey>::from((
+            sha256::Digest::EMPTY,
+            sha256::Digest::EMPTY,
+            sha256::Digest::EMPTY,
+            coding_config,
+        ));
+        let header = constantinople_primitives::Header {
+            context: Context {
+                round: Round::new(Epoch::zero(), View::zero()),
+                leader: signer.public_key(),
+                parent: (View::zero(), parent),
+            },
+            parent: sha256::Digest::EMPTY,
+            height: 0,
+            timestamp: 0,
+            state_root: sha256::Digest::EMPTY,
+            state_range: non_empty_range!(0, 1),
+            transactions_root: sha256::Digest::EMPTY,
+            transactions_range: non_empty_range!(0, 1),
+        };
+        let inner = Block::new(header, Vec::new()).seal(&mut sha256::Sha256::default());
+        let encoded = inner.encode();
+        let block: EngineBlock<sha256::Sha256, ed25519::PublicKey> = inner.into();
+
+        assert_eq!(block.encode(), encoded);
+        assert_eq!(
+            EngineBlock::<sha256::Sha256, ed25519::PublicKey>::decode_cfg(
+                encoded.clone(),
+                &BlockCfg::default(),
+            )
+            .expect("typed block encoding should decode")
+            .encode(),
+            encoded,
+        );
+    }
 
     #[test]
     fn shard_limit_accepts_maximum_proposals() {
@@ -867,7 +923,10 @@ mod unit_tests {
             context: Context {
                 round: Round::new(Epoch::new(u64::MAX), View::new(u64::MAX)),
                 leader: signer.public_key(),
-                parent: (View::new(u64::MAX), Commitment::default()),
+                parent: (
+                    View::new(u64::MAX),
+                    EngineCommitment::<sha256::Sha256, ed25519::PublicKey>::default(),
+                ),
             },
             parent: sha256::Digest::EMPTY,
             height: u64::MAX,
@@ -877,38 +936,32 @@ mod unit_tests {
             transactions_root: sha256::Digest::EMPTY,
             transactions_range: non_empty_range!(u64::MAX - 1, u64::MAX),
         };
-        let block = Block::new(header, vec![transaction; transaction_count])
-            .seal(&mut sha256::Sha256::default());
+        let block: EngineBlock<sha256::Sha256, ed25519::PublicKey> =
+            Block::new(header, vec![transaction; transaction_count])
+                .seal(&mut sha256::Sha256::default())
+                .into();
         assert!(block.encode_size() <= MAXIMUM_BLOCK_SIZE);
-        type TestShard = Shard<ReedSolomon<sha256::Sha256>, sha256::Sha256>;
+        assert!(MAXIMUM_BLOCK_SIZE - block.encode_size() < 4096);
+        type TestShard = Shard<
+            EngineBlock<sha256::Sha256, ed25519::PublicKey>,
+            ReedSolomon<sha256::Sha256>,
+            sha256::Sha256,
+        >;
         for validators in [4, 7, 50] {
             let coding_config = coding_config_for_participants(validators);
-            let payload_bytes = block.encode_size() + coding_config.encode_size() + u32::SIZE;
             let shards = usize::from(coding_config.minimum_shards.get());
-            let shard_bytes = payload_bytes.div_ceil(2 * shards) * 2;
-            let limit = maximum_shard_size(validators);
-            assert!(shard_bytes <= limit);
-            assert!(limit - shard_bytes < 4096);
-
             let coded = EngineCodedBlock::new(block.clone(), coding_config, &Sequential);
             let encoded = coded.shard(0).expect("shard zero should exist").encode();
             assert!(encoded.len() <= MAXIMUM_MESSAGE_SIZE as usize);
-            TestShard::decode_cfg(
-                encoded.clone(),
-                &CodecConfig {
-                    maximum_shard_size: limit,
-                },
-            )
-            .expect("the derived limit should accept a maximum proposal");
-            assert!(
-                TestShard::decode_cfg(
-                    encoded,
-                    &CodecConfig {
-                        maximum_shard_size: shard_bytes - 2,
-                    },
-                )
-                .is_err()
-            );
+
+            TestShard::decode_cfg(encoded.clone(), &MAX_BLOCK_SIZE)
+                .expect("the derived limit should accept a maximum proposal");
+            TestShard::decode_cfg(encoded.clone(), &NonZero::new(block.encode_size()).unwrap())
+                .expect("the exact block budget should accept its shard");
+
+            // Removing one coding word per original shard must reject the same proposal.
+            let smaller_budget = NonZero::new(block.encode_size() - 2 * shards).unwrap();
+            assert!(TestShard::decode_cfg(encoded, &smaller_budget).is_err());
         }
     }
 }

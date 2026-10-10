@@ -17,7 +17,6 @@
     },
     "include": [
         "tests/**/*.ts",
-        "src/blockSequence.ts",
         "src/codec.ts",
         "src/historyKey.ts",
         "src/nonce.ts",

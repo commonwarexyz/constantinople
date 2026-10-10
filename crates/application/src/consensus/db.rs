@@ -47,10 +47,8 @@ pub type TransactionDatabase<E, H, S> = Shared<TransactionHistoryDb<E, H, S>>;
 /// The backing databases owned by the application.
 pub type Databases<E, H, T, S> = (StateDatabase<E, H, T, S>, TransactionDatabase<E, H, S>);
 
-pub type StateReader<E, H, T, S> = Reader<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>;
-
 pub type DatabaseReaders<E, H, T, S> = (
-    StateReader<E, H, T, S>,
+    Reader<fixed::Db<mmr::Family, E, AccountKey, Account, H, T, S>>,
     Reader<TransactionHistoryDb<E, H, S>>,
 );
 
@@ -160,6 +158,7 @@ mod tests {
                 metadata_partition: "state-order-test-merkle-metadata".into(),
                 items_per_blob: NZU64!(1024),
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
                 strategy: Sequential,
                 page_cache: cache.clone(),
             },
@@ -168,9 +167,10 @@ mod tests {
                 items_per_blob: NZU64!(1024),
                 page_cache: cache,
                 write_buffer: NZUsize!(4096),
+                replay_buffer: NZUsize!(4096),
             },
             translator: EightCap,
-            init_cache_size: Some(NZUsize!(1024)),
+            init_cache: Some(NZUsize!(1024)),
             init_buffer: NZUsize!(1 << 21),
             init_concurrency: (),
         }
@@ -181,7 +181,8 @@ mod tests {
         deterministic::Runner::default().start(|context| async move {
             let cache = CacheRef::from_pooler(&context, NZU16!(16), NZUsize!(4096));
             let db =
-                <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache)).await;
+                <Db as DatabaseSet<deterministic::Context>>::init(context, config(cache), None)
+                    .await;
             let key = |byte| AccountKey::from([byte; AccountKey::SIZE]);
             let account = |balance| Account {
                 balance,

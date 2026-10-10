@@ -1,7 +1,8 @@
 //! `commonware_glue::stateful` trait integration.
 
 use super::{
-    Application, db::Databases, genesis_block_with_parent, history::header_range_to_target,
+    Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
+    history::header_range_to_target,
 };
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
@@ -24,7 +25,7 @@ where
     C: Digest,
     S: Scheme<PublicKey = P>,
     P: PublicKey,
-    I: TransactionSource<C, P, H> + Sync,
+    I: TransactionSource<C, P, H> + Clone + Sync,
     B: Send + Sync + 'static,
     St: Strategy,
 {
@@ -32,6 +33,7 @@ where
     type Context = commonware_consensus::simplex::types::Context<C, P>;
     type Block = SealedBlock<C, P, H>;
     type Databases = Databases<E, H, EightCap, St>;
+    type Captured = FinalizedArtifacts<H>;
     type Provider = I;
     type Input = ();
 
@@ -120,27 +122,61 @@ where
         context: (E, Self::Context),
         block: &Self::Block,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
-    ) -> <Self::Databases as DatabaseSet<E>>::Merkleized {
-        self.apply_certified(context, block, batches).await
+    ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
+        self.apply_block(context, block, batches).await
+    }
+
+    async fn capture(
+        &mut self,
+        _context: (E, Self::Context),
+        _block: &Self::Block,
+        batches: &<Self::Databases as DatabaseSet<E>>::Merkleized,
+        readers: <Self::Databases as DatabaseSet<E>>::Readers,
+    ) -> Self::Captured {
+        let state = {
+            let database = readers.0.read().await;
+            let (start, operations) = batches.0.operations();
+            let pinned_nodes = batches
+                .0
+                .pinned_nodes(&database)
+                .expect("finalized state frontier must be available before apply");
+            FinalizedRange {
+                start,
+                end: batches.0.bounds().tip.size,
+                root: batches.0.root(),
+                pinned_nodes,
+                operations,
+            }
+        };
+
+        let transactions = {
+            let database = readers.1.read().await;
+            let (start, operations) = batches.1.operations();
+            let pinned_nodes = batches
+                .1
+                .pinned_nodes(&database)
+                .expect("finalized transaction frontier must be available before apply");
+            FinalizedRange {
+                start,
+                end: batches.1.bounds().tip.size,
+                root: batches.1.root(),
+                pinned_nodes,
+                operations,
+            }
+        };
+
+        FinalizedArtifacts {
+            state,
+            transactions,
+        }
     }
 
     async fn finalized(
         &mut self,
-        context: (E, Self::Context),
-        block: &Self::Block,
-        databases: <Self::Databases as DatabaseSet<E>>::Readers,
+        _context: (E, Self::Context),
+        _block: &Self::Block,
+        _captured: Self::Captured,
+        _readers: <Self::Databases as DatabaseSet<E>>::Readers,
     ) {
-        if let Some(hook) = &self.finalized_hook {
-            // Proof construction must not occupy an async worker or outlive the pre-prune hook.
-            let hook = hook.clone();
-            let block = Arc::new(block.clone());
-            context
-                .0
-                .child("finalized_hook")
-                .shared(true)
-                .spawn(move |_| async move { hook(block, &databases).await })
-                .await
-                .expect("finalized hook task failed");
-        }
     }
 }

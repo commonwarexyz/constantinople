@@ -6,6 +6,7 @@ import {
     useState,
     type CSSProperties,
 } from 'react';
+import { SqlClient } from '@exowarexyz/sql';
 import {
     accountKeyFromPublicKey,
     encodeSignedTransaction,
@@ -15,7 +16,11 @@ import {
     toHex,
 } from './codec';
 import { submittedTransactionHistoryKey } from './historyKey';
-import { type ObservedBlock, subscribeBlocks } from './indexer';
+import {
+    wakeCoveredReconciliations,
+    type TransactionReconciliation,
+} from './reconciliationQueue';
+import { type ObservedBlock, subscribeBlocksFromTargets } from './indexer';
 import {
     fetchAccount,
     submitTransactions,
@@ -28,6 +33,9 @@ import {
 } from './submissionResponse';
 import {
     fetchAccountTransactionsPage,
+    fetchAccountProofMetadata,
+    fetchTransactionRowMetadata,
+    prefetchFinalizedCertificate,
     fetchAndVerifyAccountProof,
     fetchAndVerifyTransactionProof,
     fetchAndVerifyTransactionRowProof,
@@ -37,6 +45,7 @@ import {
     type LatestProofTarget,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
+    type TransactionRowMetadata,
 } from './qmdb';
 import {
     consumeNonce,
@@ -50,7 +59,13 @@ import {
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
+    isConsistencyNotReadyError,
+    retryAccountWork,
 } from './proofRetry';
+import {
+    createSharedProofTargets,
+    type PublishedProofTarget,
+} from './proofTarget';
 import {
     clearSession,
     createWallet,
@@ -112,14 +127,6 @@ const qmdbUrl = import.meta.env.VITE_QMDB_URL ?? DEFAULT_QMDB_URL;
 const storeUrl = import.meta.env.VITE_STORE_URL ?? DEFAULT_STORE_URL;
 const simplexVerificationMaterial = import.meta.env.VITE_SIMPLEX_VERIFICATION_MATERIAL ?? '';
 const mempoolUrl = import.meta.env.VITE_MEMPOOL_URL ?? DEFAULT_MEMPOOL_URL;
-const verifyCertificates = parseBooleanEnv(import.meta.env.VITE_VERIFY_CERTIFICATES, true);
-
-function parseBooleanEnv(value: unknown, fallback: boolean): boolean {
-    if (typeof value !== 'string') return fallback;
-    if (/^(0|false|off|no)$/i.test(value)) return false;
-    if (/^(1|true|on|yes)$/i.test(value)) return true;
-    return fallback;
-}
 
 type AccountProofState =
     | { readonly status: 'waiting'; readonly detail: string }
@@ -131,6 +138,13 @@ type AccountProofState =
       } & VerifiedAccountProof)
     | { readonly status: 'error'; readonly detail: string };
 
+interface AccountPage {
+    readonly account: string;
+    readonly rows: AccountTransactionRow[];
+    readonly minSequenceNumber: bigint;
+    readonly metadata: Promise<ReadonlyMap<string, TransactionRowMetadata>>;
+}
+
 interface AccountTxWithProof {
     readonly row: AccountTransactionRow;
     readonly proof: TransactionProofState;
@@ -139,11 +153,6 @@ interface AccountTxWithProof {
 interface ObservedRateWindow {
     readonly firstBlockAt: number | null;
     readonly latestBlockAt: number | null;
-}
-
-interface TransactionReconciliation {
-    readonly controller: AbortController;
-    timer: number | null;
 }
 
 function disposeReconciliation(reconciliation: TransactionReconciliation) {
@@ -181,12 +190,15 @@ export default function App() {
     const [loadedHistoryKey, setLoadedHistoryKey] = useState<string | null>(null);
     const [lookupAccount, setLookupAccount] = useState(() => accountFromLocation());
     const [accountInput, setAccountInput] = useState(() => accountFromLocation());
+    const [publishedProofTarget, setPublishedProofTarget] =
+        useState<PublishedProofTarget | null>(null);
     const [accountTarget, setAccountTarget] = useState<LatestProofTarget | null>(null);
     const [accountProof, setAccountProof] = useState<AccountProofState>({
         status: 'waiting',
         detail: 'enter an account',
     });
     const [accountTransactions, setAccountTransactions] = useState<AccountTxWithProof[]>([]);
+    const [accountPage, setAccountPage] = useState<AccountPage | null>(null);
     const [accountActivityError, setAccountActivityError] = useState('');
     const [accountActivityMode, setAccountActivityMode] = useState<AccountActivityMode>('all');
     const [accountCursorStack, setAccountCursorStack] = useState<(Uint8Array | null)[]>([null]);
@@ -223,9 +235,13 @@ export default function App() {
     const reconciliationFailuresRef = useRef(new Map<string, number>());
     const reconciliationSequenceRef = useRef(0);
     const foregroundSubmissionsRef = useRef(new Set<string>());
+    const publishedProofTargetRef = useRef<PublishedProofTarget | null>(publishedProofTarget);
     activeHistoryKeyRef.current = historyKey;
     loadedHistoryKeyRef.current = loadedHistoryKey;
+    publishedProofTargetRef.current = publishedProofTarget;
     const currentAccountCursor = accountCursorStack[accountCursorStack.length - 1] ?? null;
+    const proofTargetReady = publishedProofTarget !== null;
+    const accountTargetReady = accountTarget !== null;
 
     const setLocalNonceState = (nextNonce: NonceState) => {
         nextNonceRef.current = nextNonce;
@@ -243,7 +259,8 @@ export default function App() {
         applyLocalNonceReservations();
     };
 
-    // Render delivered blocks immediately so the UI adds no buffering delay.
+    // Render delivered blocks immediately so the UI adds no buffering delay
+    // to publication or catch-up delivery.
     const applyObservedBlocks = (nextBlocks: readonly ObservedBlock[]) => {
         if (nextBlocks.length === 0) return;
 
@@ -274,31 +291,45 @@ export default function App() {
 
     useEffect(() => {
         const controller = new AbortController();
-        let cancelled = false;
+        const targets = createSharedProofTargets(storeUrl, {
+            signal: controller.signal,
+            onError: (message) =>
+                setStatus({ kind: 'error', message: `proof target error: ${message}` }),
+        });
+        const blockTargets = targets.subscribe({ signal: controller.signal });
+        const proofTargets = targets.subscribe({ signal: controller.signal });
+        const failed = (error: unknown) => {
+            if (controller.signal.aborted) return;
+            setStatus({
+                kind: 'error',
+                message: error instanceof Error ? error.message : String(error),
+            });
+        };
 
         (async () => {
-            try {
-                for await (const block of subscribeBlocks(indexerUrl, {
-                    signal: controller.signal,
-                    onNetworkError: (message) =>
-                        setStatus({ kind: 'error', message: `backend error: ${message}` }),
-                    onReconnect: () => setStatus({ kind: 'connecting' }),
-                })) {
-                    if (cancelled) return;
-                    applyObservedBlocks([block]);
-                }
-            } catch (error) {
-                if (cancelled || controller.signal.aborted) return;
-                setStatus({
-                    kind: 'error',
-                    message: error instanceof Error ? error.message : String(error),
-                });
+            for await (const block of subscribeBlocksFromTargets(new SqlClient(indexerUrl), blockTargets, {
+                signal: controller.signal,
+                onError: (message) =>
+                    setStatus({ kind: 'error', message: `backend error: ${message}` }),
+                onReconnect: () => setStatus({ kind: 'connecting' }),
+            })) {
+                if (controller.signal.aborted) return;
+                applyObservedBlocks([block]);
             }
-        })();
+        })().catch(failed);
+
+        (async () => {
+            for await (const target of proofTargets) {
+                if (controller.signal.aborted) return;
+                setPublishedProofTarget((current) =>
+                    current && current.height >= target.height ? current : target,
+                );
+            }
+        })().catch(failed);
 
         return () => {
-            cancelled = true;
             controller.abort();
+            targets.close();
         };
     }, []);
 
@@ -365,39 +396,82 @@ export default function App() {
             setAccountProof({ status: 'waiting', detail: 'enter an account' });
             return;
         }
+        if (!publishedProofTarget) {
+            setAccountTarget(null);
+            setAccountProof({ status: 'waiting', detail: 'waiting for provable state' });
+            return;
+        }
 
         const controller = new AbortController();
         setAccountTarget(null);
         setAccountProof({ status: 'fetching', detail: 'fetching account proof' });
 
-        retryAccountPageStep(async () => {
-            const target = await fetchLatestProofTarget({
-                storeUrl,
-                simplexVerificationMaterial,
-                signal: controller.signal,
-            });
+        retryAccountWork(async () => {
+            const attempt = new AbortController();
+            const signal = AbortSignal.any([controller.signal, attempt.signal]);
             try {
-                const proof = await fetchAndVerifyAccountProof({
-                    qmdbUrl,
+                const published = publishedProofTargetRef.current;
+                if (!published) {
+                    throw new Error('latest provable target is missing');
+                }
+                const targetPromise = fetchLatestProofTarget({
+                    storeUrl,
+                    simplexVerificationMaterial,
+                    publishedTarget: published,
+                    signal,
+                }).then((target) => {
+                    signal.throwIfAborted();
+                    setAccountTarget(target);
+                    return target;
+                });
+                const metadataPromise = fetchAccountProofMetadata({
                     sqlUrl: indexerUrl,
                     account: lookupAccount,
-                    target,
-                    signal: controller.signal,
+                    minSequenceNumber: published.sequenceNumber,
+                    signal,
                 });
-                return { target, proof };
-            } catch (error) {
-                const detail = error instanceof Error ? error.message : String(error);
-                if (isMissingAccountProofError(detail)) {
-                    return { target, proof: null };
+
+                // A missing account must not prevent independent transaction proofs.
+                const [target, metadataResult] = await Promise.all([
+                    targetPromise,
+                    metadataPromise.then(
+                        (metadata) => ({ metadata }),
+                        (error: unknown) => ({ error }),
+                    ),
+                ]);
+                if ('error' in metadataResult) {
+                    const { error } = metadataResult;
+                    const detail = error instanceof Error ? error.message : String(error);
+                    if (isMissingAccountProofError(detail)) return { target, proof: null };
+                    throw error;
                 }
-                throw error;
+                const { metadata } = metadataResult;
+
+                try {
+                    const proof = await fetchAndVerifyAccountProof({
+                        qmdbUrl,
+                        sqlUrl: indexerUrl,
+                        account: lookupAccount,
+                        target,
+                        metadata,
+                        signal,
+                    });
+                    return { target, proof };
+                } catch (error) {
+                    const detail = error instanceof Error ? error.message : String(error);
+                    if (isMissingAccountProofError(detail)) {
+                        return { target, proof: null };
+                    }
+                    throw error;
+                }
+            } finally {
+                attempt.abort();
             }
-        }, controller.signal)
+        }, controller.signal, isRetryableAccountProofError)
             .then(({ target, proof }) => {
                 if (controller.signal.aborted) return;
                 if (proof === null) {
                     setAccountProof({ status: 'missing', detail: 'not yet exists' });
-                    setAccountTarget(target);
                     return;
                 }
                 setAccountProof({
@@ -405,7 +479,6 @@ export default function App() {
                     detail: `verified at height ${target.height.toString()}`,
                     ...proof,
                 });
-                setAccountTarget(target);
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
@@ -416,73 +489,173 @@ export default function App() {
             });
 
         return () => controller.abort();
-    }, [lookupAccount]);
+    }, [lookupAccount, proofTargetReady]);
 
+    // Only a change of account, page, or mode replaces the listed rows. The
+    // proof target arrives later and must not clear rows already on screen.
     useEffect(() => {
         if (!lookupAccount) {
+            setAccountPage(null);
             setAccountTransactions([]);
             setAccountNextCursor(null);
             setAccountActivityError('');
             return;
         }
+        if (!publishedProofTarget) return;
 
         const controller = new AbortController();
+        setAccountPage(null);
         setAccountTransactions([]);
         setAccountNextCursor(null);
         setAccountActivityError('');
 
-        fetchAccountTransactionsPage({
-            sqlUrl: indexerUrl,
-            account: lookupAccount,
-            cursor: currentAccountCursor,
-            mode: accountActivityMode,
-        })
-            .then(async (page) => {
+        const minSequenceNumber = publishedProofTarget.sequenceNumber;
+
+        retryAccountWork(
+            () => fetchAccountTransactionsPage({
+                sqlUrl: indexerUrl,
+                account: lookupAccount,
+                cursor: currentAccountCursor,
+                mode: accountActivityMode,
+                minSequenceNumber,
+                maxHeight: publishedProofTarget.height,
+                signal: controller.signal,
+            }),
+            controller.signal,
+            isConsistencyNotReadyError,
+        )
+            .then((page) => {
                 if (controller.signal.aborted) return;
                 setAccountNextCursor(page.nextCursor);
                 setAccountTransactions(page.rows.map((row) => ({
                     row,
                     proof: { status: 'waiting', detail: 'waiting for latest finalization' },
                 })));
-                if (!accountTarget) return;
-
-                setAccountTransactions(page.rows.map((row) => ({
-                    row,
-                    proof: { status: 'fetching', detail: 'fetching transaction proof' },
-                })));
-                const results = await Promise.allSettled(
-                    page.rows.map((row) =>
-                        retryAccountPageStep(() => fetchAndVerifyTransactionRowProof({
-                            qmdbUrl,
-                            sqlUrl: indexerUrl,
-                            row,
-                            target: accountTarget,
-                            signal: controller.signal,
-                        }), controller.signal),
-                    ),
-                );
-                if (controller.signal.aborted) return;
-                setAccountTransactions((current) =>
-                    current.map((entry, index) => {
-                        const result = results[index];
-                        if (!result) return entry;
-                        if (result.status === 'fulfilled') {
-                            return { ...entry, proof: verifiedProofState(result.value) };
-                        }
-                        const detail = result.reason instanceof Error ? result.reason.message : String(result.reason);
-                        return { ...entry, proof: { status: 'error', detail } };
+                const metadata = retryAccountWork(
+                    () => fetchTransactionRowMetadata({
+                        sqlUrl: indexerUrl,
+                        rows: page.rows,
+                        minSequenceNumber,
+                        signal: controller.signal,
                     }),
+                    controller.signal,
+                    isRetryableAccountProofError,
                 );
+
+                // The certificate may still be loading when this request fails.
+                void metadata.catch(() => {});
+                setAccountPage({ account: lookupAccount, rows: page.rows, minSequenceNumber, metadata });
             })
             .catch((error) => {
                 if (controller.signal.aborted) return;
+                setAccountPage(null);
                 setAccountTransactions([]);
                 setAccountNextCursor(null);
                 setAccountActivityError(error instanceof Error ? error.message : String(error));
             });
 
         return () => controller.abort();
-    }, [lookupAccount, currentAccountCursor, accountActivityMode, accountTarget]);
+    }, [lookupAccount, currentAccountCursor, accountActivityMode, proofTargetReady]);
+
+    // Each page keeps its certificate while row proofs run. Account-state
+    // retries must not restart independent transaction proofs.
+    useEffect(() => {
+        if (!accountPage || !accountTarget || accountPage.account !== lookupAccount) return;
+
+        const controller = new AbortController();
+        const rows = accountPage.rows;
+        const updateRow = (index: number, proof: TransactionProofState) => {
+            setAccountTransactions((current) =>
+                current.map((entry, position) =>
+                    position === index && entry.row.digest === rows[index]?.digest
+                        ? { ...entry, proof }
+                        : entry,
+                ),
+            );
+        };
+
+        rows.forEach((_row, index) => {
+            updateRow(index, { status: 'fetching', detail: 'fetching transaction proof' });
+        });
+
+        const newestHeight = rows.reduce(
+            (height, row) => row.height > height ? row.height : height,
+            0n,
+        );
+        let rowTarget = accountTarget;
+        let targetRefresh: Promise<LatestProofTarget> | undefined;
+        let metadataFloor = accountPage.minSequenceNumber;
+        let metadataPromise = accountPage.metadata;
+        const rowMetadata = (target: LatestProofTarget) => {
+            if (target.sequenceNumber > metadataFloor) {
+                metadataFloor = target.sequenceNumber;
+                metadataPromise = retryAccountWork(
+                    () => fetchTransactionRowMetadata({
+                        sqlUrl: indexerUrl,
+                        rows,
+                        minSequenceNumber: target.sequenceNumber,
+                        signal: controller.signal,
+                    }),
+                    controller.signal,
+                    isRetryableAccountProofError,
+                );
+            }
+            return metadataPromise;
+        };
+
+        // A newer page can require a later certificate. Share that refresh
+        // across rows and retain it through retries without following the tip.
+        const rowProofTarget = (): Promise<LatestProofTarget> => {
+            const published = publishedProofTargetRef.current;
+            if (
+                newestHeight <= rowTarget.height ||
+                !published ||
+                published.height <= rowTarget.height
+            ) {
+                return Promise.resolve(rowTarget);
+            }
+            if (!targetRefresh) {
+                targetRefresh = fetchLatestProofTarget({
+                    storeUrl,
+                    simplexVerificationMaterial,
+                    publishedTarget: published,
+                    signal: controller.signal,
+                })
+                    .then((target) => {
+                        rowTarget = target;
+                        return target;
+                    })
+                    .finally(() => { targetRefresh = undefined; });
+            }
+            return targetRefresh;
+        };
+
+        rows.forEach((row, index) => {
+            retryAccountWork(async () => {
+                const target = await rowProofTarget();
+                const metadata = await rowMetadata(target);
+                return fetchAndVerifyTransactionRowProof({
+                    qmdbUrl,
+                    sqlUrl: indexerUrl,
+                    row,
+                    target,
+                    metadata: metadata.get(row.digest),
+                    signal: controller.signal,
+                });
+            }, controller.signal, isRetryableAccountProofError)
+                .then((proof) => {
+                    if (controller.signal.aborted) return;
+                    updateRow(index, verifiedProofState(proof));
+                })
+                .catch((error) => {
+                    if (controller.signal.aborted) return;
+                    const detail = error instanceof Error ? error.message : String(error);
+                    updateRow(index, { status: 'error', detail });
+                });
+        });
+
+        return () => controller.abort();
+    }, [accountPage, accountTargetReady, lookupAccount]);
 
     useEffect(() => {
         const reconciliations = reconciliationsRef.current;
@@ -497,8 +670,32 @@ export default function App() {
         };
     }, [historyKey]);
 
+    const requeueReconciliation = (digest: string) => {
+        reconciliationSequenceRef.current += 1;
+        reconciliationOrderRef.current.set(digest, reconciliationSequenceRef.current);
+        setHistory((current) =>
+            markReconciliationWaiting(digest, WAITING_FINALIZATION_PROOF.detail, current),
+        );
+    };
+
+    const wakeReconciliations = (height: bigint) => {
+        wakeCoveredReconciliations(
+            reconciliationsRef.current,
+            height,
+            (timer) => window.clearTimeout(timer),
+            requeueReconciliation,
+        );
+    };
+
+    useEffect(() => {
+        if (historyKey === null || loadedHistoryKey !== historyKey || !publishedProofTarget) return;
+        wakeReconciliations(publishedProofTarget.height);
+    }, [publishedProofTarget, historyKey, loadedHistoryKey]);
+
     useEffect(() => {
         if (historyKey === null || loadedHistoryKey !== historyKey) return;
+        const publishedTarget = publishedProofTargetRef.current;
+        if (!publishedTarget) return;
 
         const reconciliations = reconciliationsRef.current;
         const trackedDigests = new Set(history.map((tx) => tx.digest));
@@ -538,6 +735,7 @@ export default function App() {
             const reconciliation: TransactionReconciliation = {
                 controller: new AbortController(),
                 timer: null,
+                waitingForHeight: null,
             };
             reconciliations.set(tx.digest, reconciliation);
             const releaseReconciliation = () => {
@@ -553,6 +751,8 @@ export default function App() {
                 sqlUrl: indexerUrl,
                 simplexVerificationMaterial,
                 digest: tx.digest,
+                publishedTarget,
+                finalizedHeight: tx.finalizedHeight === null ? undefined : BigInt(tx.finalizedHeight),
                 signal: reconciliation.controller.signal,
                 onFinalizationVerified: (target) => {
                     if (
@@ -634,7 +834,7 @@ export default function App() {
                     }
 
                     const detail = error instanceof Error ? error.message : String(error);
-                    if (!isRetryableProofError(detail)) {
+                    if (!isRetryableProofError(error)) {
                         if (!releaseReconciliation()) return;
                         reconciliationOrderRef.current.delete(tx.digest);
                         reconciliationFailuresRef.current.delete(tx.digest);
@@ -647,6 +847,14 @@ export default function App() {
                     const failures =
                         (reconciliationFailuresRef.current.get(tx.digest) ?? 0) + 1;
                     reconciliationFailuresRef.current.set(tx.digest, failures);
+
+                    // Only publication coverage waits can be resolved by a new target.
+                    // Missing old transactions and transport failures retain their backoff.
+                    reconciliation.waitingForHeight =
+                        tx.finalizedHeight !== null &&
+                        BigInt(tx.finalizedHeight) > publishedTarget.height
+                            ? BigInt(tx.finalizedHeight)
+                            : null;
                     const waitingDetail = 'reconciliation retry scheduled';
                     setHistory((current) =>
                         markReconciliationWaiting(tx.digest, waitingDetail, current),
@@ -661,22 +869,13 @@ export default function App() {
                         ) {
                             return;
                         }
-                        reconciliationSequenceRef.current += 1;
-                        reconciliationOrderRef.current.set(
-                            tx.digest,
-                            reconciliationSequenceRef.current,
-                        );
-                        setHistory((current) =>
-                            markReconciliationWaiting(
-                                tx.digest,
-                                WAITING_FINALIZATION_PROOF.detail,
-                                current,
-                            ),
-                        );
+                        requeueReconciliation(tx.digest);
                     }, reconciliationRetryDelay(failures, Date.now() - tx.submittedAt));
+                    const latest = publishedProofTargetRef.current;
+                    if (latest) wakeReconciliations(latest.height);
                 });
         }
-    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet]);
+    }, [history, historyKey, loadedHistoryKey, signedInAccountKey, wallet, proofTargetReady]);
 
     useEffect(() => {
         return () => {
@@ -974,6 +1173,14 @@ export default function App() {
                 throw new TransactionSubmissionError('ambiguous', outcome.detail);
             }
 
+            // This warms only the verified certificate cache. Reconciliation still
+            // ties the digest to the block before showing its certificate as verified.
+            void prefetchFinalizedCertificate({
+                storeUrl,
+                simplexVerificationMaterial,
+                height: BigInt(outcome.height),
+            }).catch(() => {});
+
             const observedAt = Date.now();
             updateSubmittedHistory(
                 originHistoryKey,
@@ -1134,7 +1341,6 @@ export default function App() {
                             signedInAccountKey={signedInAccountKey}
                             onCopy={copyValue}
                             onOpenAddress={openAccountPage}
-                            verifyCertificates={verifyCertificates}
                         />
                     </WalletModal>
                 )}
@@ -1670,13 +1876,11 @@ function TransactionHistory({
     signedInAccountKey,
     onCopy,
     onOpenAddress,
-    verifyCertificates,
 }: {
     transactions: SubmittedTransaction[];
     signedInAccountKey: string | null;
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
-    verifyCertificates: boolean;
 }) {
     const formatter = useMemo(
         () =>
@@ -1704,7 +1908,6 @@ function TransactionHistory({
                         onOpenAddress={onOpenAddress}
                         signedInAccountKey={signedInAccountKey}
                         tx={tx}
-                        verifyCertificates={verifyCertificates}
                     />
                 ))}
             </div>
@@ -1718,14 +1921,12 @@ function TransactionRecord({
     onOpenAddress,
     signedInAccountKey,
     tx,
-    verifyCertificates,
 }: {
     formatter: Intl.DateTimeFormat;
     onCopy: (value: string) => void;
     onOpenAddress: (value: string) => void;
     signedInAccountKey: string | null;
     tx: SubmittedTransaction;
-    verifyCertificates: boolean;
 }) {
     const ownsTx = signedInAccountKey !== null && tx.sender === signedInAccountKey;
     return (
@@ -1750,17 +1951,9 @@ function TransactionRecord({
             </div>
             <div className="tx-record__secondary">
                 <span className="tx-record__detail">{tx.detail}</span>
-                {verifyCertificates && (
-                    <>
-                        <span className="tx-sep" aria-hidden="true">·</span>
-                        <span className="tx-label">cert</span>
-                        <CertificateCell
-                            certificate={tx.certificate}
-                            finalizedHeight={tx.finalizedHeight}
-                            verifyCertificates={verifyCertificates}
-                        />
-                    </>
-                )}
+                <span className="tx-sep" aria-hidden="true">·</span>
+                <span className="tx-label">cert</span>
+                <CertificateCell certificate={tx.certificate} finalizedHeight={tx.finalizedHeight} />
                 <span className="tx-sep" aria-hidden="true">·</span>
                 <span className="tx-label">proof</span>
                 <ProofCell ownsTx={ownsTx} proof={tx.proof} />
@@ -1786,23 +1979,10 @@ function TransactionRecord({
 function CertificateCell({
     certificate,
     finalizedHeight,
-    verifyCertificates,
 }: {
     certificate: BlockCertificateState;
     finalizedHeight: number | null;
-    verifyCertificates: boolean;
 }) {
-    if (!verifyCertificates) {
-        return (
-            <span
-                className="tx-proof-muted"
-                aria-label="block certificate verification disabled"
-                title="block certificate verification disabled"
-            >
-                -
-            </span>
-        );
-    }
     if (certificate.status === 'verified') {
         return (
             <span
@@ -1927,33 +2107,6 @@ function verifiedBlockCertificateState(certificate: {
         height: certificate.height.toString(),
         view: certificate.view.toString(),
     };
-}
-
-async function retryAccountPageStep<T>(
-    run: () => Promise<T>,
-    signal: AbortSignal,
-): Promise<T> {
-    let lastError: unknown;
-    for (let attempt = 0; attempt < 12; attempt++) {
-        if (signal.aborted) {
-            throw new Error('account lookup cancelled');
-        }
-        try {
-            return await run();
-        } catch (error) {
-            lastError = error;
-            const detail = error instanceof Error ? error.message : String(error);
-            if (!isRetryableAccountProofError(detail)) {
-                throw error;
-            }
-            await sleep(350 + attempt * 150);
-        }
-    }
-    throw lastError instanceof Error ? lastError : new Error(String(lastError));
-}
-
-function sleep(ms: number): Promise<void> {
-    return new Promise((resolve) => window.setTimeout(resolve, ms));
 }
 
 function shortHex(value: string): string {

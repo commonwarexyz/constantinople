@@ -14,12 +14,8 @@ use constantinople_indexer::{
     namespaces::{state_qmdb_client, transactions_qmdb_client},
 };
 use constantinople_primitives::{Account, AccountKey};
-use exoware_qmdb::{
-    KeylessClient, UnorderedClient, keyless_operation_log_connect_stack,
-    unordered_operation_log_connect_stack,
-};
+use exoware_qmdb::{keyless_operation_log_connect_stack, unordered_operation_log_connect_stack};
 use exoware_sdk::StoreClient;
-use std::sync::Arc;
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -31,27 +27,28 @@ const PROFILE: Profile = Profile {
 };
 
 type AccountValue = FixedBytes<{ Account::SIZE }>;
-type StateClient =
-    UnorderedClient<mmr::Family, Sha256, AccountKey, AccountValue, FixedEncoding<AccountValue>>;
-type TransactionClient = KeylessClient<
-    mmr::Family,
-    Sha256,
-    commonware_cryptography::sha256::Digest,
-    FixedEncoding<commonware_cryptography::sha256::Digest>,
->;
+type TransactionValue = commonware_cryptography::sha256::Digest;
 
 fn build_routes(client: &StoreClient) -> Result<Router, BoxError> {
-    let state = Arc::new(StateClient::new(state_qmdb_client(client)?, ()));
-    let transactions = Arc::new(TransactionClient::new(
-        transactions_qmdb_client(client)?,
-        (),
-    ));
-
     Ok(Router::new()
-        .nest_service("/state", unordered_operation_log_connect_stack(state))
+        .nest_service(
+            "/state",
+            unordered_operation_log_connect_stack::<
+                mmr::Family,
+                Sha256,
+                AccountKey,
+                AccountValue,
+                FixedEncoding<AccountValue>,
+            >(state_qmdb_client(client)?, ()),
+        )
         .nest_service(
             "/transactions",
-            keyless_operation_log_connect_stack(transactions),
+            keyless_operation_log_connect_stack::<
+                mmr::Family,
+                Sha256,
+                TransactionValue,
+                FixedEncoding<TransactionValue>,
+            >(transactions_qmdb_client(client)?, ()),
         ))
 }
 

@@ -1,7 +1,7 @@
 //! YAML-serializable validator configuration.
 
 use ahash::AHashMap;
-use commonware_codec::{Encode, Read as CodecRead, ReadExt};
+use commonware_codec::{Copying, Encode, Read as CodecRead, ReadExt};
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -13,21 +13,29 @@ use commonware_cryptography::{
 use commonware_deployer::aws::Hosts;
 use commonware_formatting::{from_hex, hex};
 use commonware_p2p::{Ingress, authenticated::discovery::Bootstrapper};
-use commonware_utils::NZU32;
+use commonware_utils::{NZU32, NZUsize};
 use constantinople_primitives::proposal::{MAXIMUM_BLOCK_SIZE, max_transaction_bytes};
 use serde::Deserialize;
-use std::{fmt, net::SocketAddr, path::Path};
+use std::{fmt, net::SocketAddr, num::NonZeroUsize, path::Path};
 
 pub(crate) const fn default_rayon_threads() -> usize {
     2
+}
+
+pub(crate) const fn default_publisher_rayon_threads() -> NonZeroUsize {
+    NZUsize!(2)
 }
 
 pub(crate) const fn default_metrics_port() -> u16 {
     9090
 }
 
-pub(crate) const fn default_upload_buffer() -> usize {
+pub(crate) const fn default_upload_max_in_flight() -> usize {
     64
+}
+
+pub(crate) const fn default_upload_budget_bytes() -> u64 {
+    3 * 1024 * 1024 * 1024
 }
 
 pub(crate) const fn default_max_propose_bytes() -> usize {
@@ -51,10 +59,6 @@ pub(crate) const fn default_public_key_cache_size() -> usize {
 /// Primary (voting) validators ignore this section. Secondaries with
 /// indexer wiring upload finalized blocks, transactions, consensus
 /// certificates, and QMDB operation logs into the shared Store.
-///
-/// The latest-finalized-height cursor that earlier versions of the
-/// indexer wrote to a separate `META` KV family now lives in
-/// `block_meta`; consumers query `MAX(height) FROM block_meta`.
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub struct IndexerConfig {
     /// URL of the Store receiving finalized uploads.
@@ -62,9 +66,15 @@ pub struct IndexerConfig {
     /// API key used by the writer Store clients.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Number of blocks buffered before upload.
-    #[serde(default = "default_upload_buffer")]
-    pub upload_buffer: usize,
+    /// Rayon threads reserved for index publication.
+    #[serde(default = "default_publisher_rayon_threads")]
+    pub publisher_rayon_threads: NonZeroUsize,
+    /// Caps concurrent uploads after byte admission.
+    #[serde(default = "default_upload_max_in_flight")]
+    pub upload_max_in_flight: usize,
+    /// Bounds estimated memory held across upload stages.
+    #[serde(default = "default_upload_budget_bytes")]
+    pub upload_budget_bytes: u64,
 }
 
 impl fmt::Debug for IndexerConfig {
@@ -72,7 +82,9 @@ impl fmt::Debug for IndexerConfig {
         f.debug_struct("IndexerConfig")
             .field("store_url", &self.store_url)
             .field("api_key_configured", &self.api_key.is_some())
-            .field("upload_buffer", &self.upload_buffer)
+            .field("publisher_rayon_threads", &self.publisher_rayon_threads)
+            .field("upload_max_in_flight", &self.upload_max_in_flight)
+            .field("upload_budget_bytes", &self.upload_budget_bytes)
             .finish()
     }
 }
@@ -266,7 +278,7 @@ fn decode_hex(field_name: &str, hex_str: &str) -> Vec<u8> {
 
 fn decode_private_key(hex_str: &str) -> ed25519::PrivateKey {
     let bytes = decode_hex("private_key", hex_str);
-    ed25519::PrivateKey::read(&mut &bytes[..]).expect("failed to decode private key")
+    ed25519::PrivateKey::read(&mut Copying(&bytes)).expect("failed to decode private key")
 }
 
 fn decode_dkg_output(
@@ -275,7 +287,7 @@ fn decode_dkg_output(
 ) -> dkg::Output<MinSig, ed25519::PublicKey> {
     let bytes = decode_hex("dkg_output", hex_str);
     dkg::Output::read_cfg(
-        &mut &bytes[..],
+        &mut Copying(&bytes),
         &(NZU32!(num_validators), ModeVersion::v0()),
     )
     .expect("failed to decode DKG output")
@@ -288,17 +300,22 @@ fn decode_share_opt(hex_str: &str) -> Option<Share> {
         return None;
     }
     let bytes = decode_hex("dkg_share", hex_str);
-    Some(Share::read(&mut &bytes[..]).expect("failed to decode DKG share"))
+    Some(Share::read(&mut Copying(&bytes)).expect("failed to decode DKG share"))
 }
 
 fn decode_public_key(field_name: &str, hex_str: &str) -> ed25519::PublicKey {
     let bytes = decode_hex(field_name, hex_str);
-    ed25519::PublicKey::read(&mut &bytes[..]).expect("failed to decode public key")
+    ed25519::PublicKey::read(&mut Copying(&bytes)).expect("failed to decode public key")
 }
 
 fn load_validator_config(path: &Path) -> ValidatorConfig {
     let raw = std::fs::read_to_string(path).expect("failed to read config file");
-    serde_yaml::from_str(&raw).expect("failed to parse config")
+    let config: ValidatorConfig = serde_yaml::from_str(&raw).expect("failed to parse config");
+    assert!(
+        config.indexer.is_none() || config.startup != StartupModeConfig::StateSync,
+        "indexer config cannot use state_sync startup"
+    );
+    config
 }
 
 fn parse_socket(name: &str, socket: &str) -> SocketAddr {
@@ -547,8 +564,8 @@ mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
         default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_buffer, load_deployer_config,
-        load_local_config,
+        default_public_key_cache_size, default_upload_budget_bytes, default_upload_max_in_flight,
+        load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -575,13 +592,13 @@ mod tests {
     #[test]
     fn indexer_config_omits_absent_api_key() {
         let config: IndexerConfig =
-            serde_yaml::from_str("store_url: http://chain-indexer:8090\nupload_buffer: 8\n")
+            serde_yaml::from_str("store_url: http://chain-indexer:8090\nupload_max_in_flight: 8\n")
                 .expect("indexer config should parse");
         assert_eq!(config.api_key, None);
-        assert_eq!(config.upload_buffer, 8);
+        assert_eq!(config.upload_max_in_flight, 8);
 
         let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
-        assert!(encoded.contains("upload_buffer: 8"));
+        assert!(encoded.contains("upload_max_in_flight: 8"));
         assert!(!encoded.contains("api_key"));
     }
 
@@ -590,7 +607,9 @@ mod tests {
         let config = IndexerConfig {
             store_url: "https://store.example.com".to_string(),
             api_key: Some("writer-secret".to_string()),
-            upload_buffer: default_upload_buffer(),
+            publisher_rayon_threads: super::default_publisher_rayon_threads(),
+            upload_max_in_flight: default_upload_max_in_flight(),
+            upload_budget_bytes: default_upload_budget_bytes(),
         };
 
         let encoded = serde_yaml::to_string(&config).expect("indexer config should serialize");
@@ -817,6 +836,16 @@ mod tests {
             decode_proposal_config(&cluster, minimum).max_propose_bytes,
             minimum
         );
+    }
+
+    fn indexer_config(store_url: &str) -> IndexerConfig {
+        IndexerConfig {
+            store_url: store_url.to_string(),
+            api_key: None,
+            publisher_rayon_threads: super::default_publisher_rayon_threads(),
+            upload_max_in_flight: default_upload_max_in_flight(),
+            upload_budget_bytes: default_upload_budget_bytes(),
+        }
     }
 
     #[test]
@@ -1158,6 +1187,23 @@ hosts:
     }
 
     #[test]
+    #[should_panic(expected = "indexer config cannot use state_sync startup")]
+    fn indexer_config_rejects_state_sync() {
+        let cluster = Cluster::new(2, 1);
+        let config_path = temp_path("validator-config", ".yaml");
+        let peers_path = temp_path("missing-validator-peers", ".yaml");
+        let mut config = cluster.secondary_config(0, StartupModeConfig::StateSync, Vec::new());
+        config.indexer = Some(indexer_config("http://127.0.0.1:8090"));
+        fs::write(
+            &config_path,
+            serde_yaml::to_string(&config).expect("config should serialize"),
+        )
+        .expect("config should write");
+
+        load_local_config(&peers_path, &config_path);
+    }
+
+    #[test]
     fn deployer_config_resolves_named_store_url() {
         let cluster = Cluster::new(2, 1);
         let self_key = &cluster.secondary_keys[0];
@@ -1175,9 +1221,8 @@ hosts:
             vec![bootstrapper_entry(primary0_key)],
         );
         config.indexer = Some(IndexerConfig {
-            store_url: "http://chain-indexer:8090".to_string(),
             api_key: Some("writer-key".to_string()),
-            upload_buffer: default_upload_buffer(),
+            ..indexer_config("http://chain-indexer:8090")
         });
         fs::write(
             &config_path,
@@ -1447,11 +1492,12 @@ hosts:
         let config_path = temp_path("validator-config", ".yaml");
         let peers_path = temp_path("validator-peers", ".yaml");
 
-        let config = cluster.secondary_config(
+        let mut config = cluster.secondary_config(
             0,
             StartupModeConfig::MarshalSync,
             vec![bootstrapper_entry(primary0_key)],
         );
+        config.indexer = Some(indexer_config("http://127.0.0.1:8090"));
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -1485,6 +1531,7 @@ secondaries:
         assert_eq!(loaded.decoded.primary_participants.len(), 2);
         assert_eq!(loaded.decoded.secondary_participants.len(), 1);
         assert!(loaded.decoded.secondary_participants.contains(self_key));
+        assert!(loaded.indexer.is_some());
         assert_eq!(
             loaded.decoded.listen_advertise,
             "127.0.0.1:9100".parse::<SocketAddr>().unwrap()

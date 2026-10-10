@@ -33,6 +33,7 @@ commonware-deployer.workspace = true
 commonware-parallel.workspace = true
 commonware-consensus.workspace = true
 commonware-storage.workspace = true
+commonware-stream.workspace = true
 commonware-cryptography = { workspace = true, features = ["std"] }
 
 # Other
@@ -43,6 +44,7 @@ bytes.workspace = true
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+thiserror.workspace = true
 tokio = { workspace = true, features = ["full"] }
 tower-http = { version = "0.6", features = ["cors"] }
 tracing.workspace = true
@@ -52,9 +54,6 @@ futures.workspace = true
 mimalloc.workspace = true
 
 [dev-dependencies]
-exoware-simulator.workspace = true
-
-# Other
 tower = { workspace = true, features = ["util"] }
 
 [[bin]]

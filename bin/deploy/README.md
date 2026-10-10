@@ -18,6 +18,16 @@ receiving valid peer blocks. Network messages remain capped at 32 MiB.
 `--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
 Run `./deploy.sh --help` for defaults.
 
+`--worker-threads` and `--rayon-threads` set each node's async workers and engine
+Rayon pool. Use `--indexer-worker-threads` and `--indexer-rayon-threads` to override
+those counts for the indexer secondary in either deployment mode.
+`--indexer-publisher-rayon-threads` sizes its separate publication pool and defaults
+to `2`. The generated indexer YAML stores this as `indexer.publisher_rayon_threads`.
+
+`deploy.sh` sets these counts for its own topology. Chunk request encoding and
+compression use the runtime's shared blocking pool, so leave CPU headroom for
+that work. Thread counts do not pin threads to particular cores.
+
 ## Local Deployment
 
 Generate a local bundle:
@@ -205,8 +215,6 @@ The printed `mprocs` command list grows by four entries:
   metadata service, streams new finalized blocks live, and verifies
   submitted-transaction proofs against `qmdb-indexer` and Simplex finalization
   certificates in the shared store.
-  Add `VITE_VERIFY_CERTIFICATES=false` to disable block-list certificate
-  verification during streaming-performance experiments.
 
 The generated metadata and QMDB commands require `curl`. They poll Store's
 `/ready` endpoint before starting each adapter. Failed probes are retried after

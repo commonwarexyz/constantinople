@@ -1,10 +1,11 @@
 use crate::{
     CHAIN_INDEXER_BINARY_FILE, CHAIN_INDEXER_DATA_DIR, ClusterMaterial, GenerateArgs,
-    INDEXER_UPLOAD_BUFFER, IndexerConfig, LocalArgs, METADATA_INDEXER_BINARY_FILE,
-    PEERS_CONFIG_FILE, PeerEntry, PeersConfig, QMDB_INDEXER_BINARY_FILE, RelayerConfig,
-    RelayerLeaderConfig, SecondaryRole, ValidatorConfig, absolute_path, default_bootstrappers,
-    ensure_output_dir_missing, generate_local_cluster_material, indexer_enabled, ports::Ports,
-    secondary_roles, total_secondaries, validate_generate_args,
+    INDEXER_UPLOAD_BUDGET_BYTES, INDEXER_UPLOAD_MAX_IN_FLIGHT, IndexerConfig, LocalArgs,
+    METADATA_INDEXER_BINARY_FILE, PEERS_CONFIG_FILE, PeerEntry, PeersConfig,
+    QMDB_INDEXER_BINARY_FILE, RelayerConfig, RelayerLeaderConfig, SecondaryRole, ValidatorConfig,
+    absolute_path, default_bootstrappers, ensure_output_dir_missing,
+    generate_local_cluster_material, indexer_enabled, ports::Ports, secondary_roles,
+    secondary_runtime_threads, total_secondaries, validate_generate_args,
     write_simplex_verification_material, write_yaml_config,
 };
 use commonware_codec::Encode;
@@ -208,6 +209,7 @@ fn build_secondaries(
             .checked_add(offset)
             .expect("secondary metrics port overflow");
 
+        let (worker_threads, rayon_threads) = secondary_runtime_threads(args, role);
         let config = ValidatorConfig {
             private_key: hex(&material.secondary_signers[secondary_index].encode()),
             dkg_output: hex(&material.dkg_output.encode()),
@@ -220,8 +222,8 @@ fn build_secondaries(
             primary_validators: primary_validators.clone(),
             secondary_validators: secondary_validators.clone(),
             log_level: args.log_level.clone(),
-            worker_threads: args.worker_threads,
-            rayon_threads: args.rayon_threads,
+            worker_threads,
+            rayon_threads,
             http_port,
             metrics_port,
             max_propose_bytes: args.max_propose_bytes,
@@ -232,7 +234,7 @@ fn build_secondaries(
             traces: 0.0,
             bootstrappers: bootstrappers.clone(),
             indexer: matches!(role, SecondaryRole::Indexer)
-                .then(|| local_indexer_config(local.chain_indexer_port)),
+                .then(|| local_indexer_config(args, local.chain_indexer_port)),
             relayer: matches!(role, SecondaryRole::Relayer)
                 .then(|| local_relayer_config(local, material)),
         };
@@ -275,12 +277,14 @@ fn local_relayer_config(local: &LocalArgs, material: &ClusterMaterial) -> Relaye
 ///
 /// All rows go through the shared Store URL. Store prefixes
 /// keep raw KV, SQL, and QMDB rows disjoint.
-fn local_indexer_config(indexer_port: u16) -> IndexerConfig {
+fn local_indexer_config(args: &GenerateArgs, indexer_port: u16) -> IndexerConfig {
     let url = format!("http://127.0.0.1:{indexer_port}");
     IndexerConfig {
         store_url: url,
         api_key: None,
-        upload_buffer: INDEXER_UPLOAD_BUFFER,
+        publisher_rayon_threads: args.indexer_publisher_rayon_threads,
+        upload_max_in_flight: INDEXER_UPLOAD_MAX_IN_FLIGHT,
+        upload_budget_bytes: INDEXER_UPLOAD_BUDGET_BYTES,
     }
 }
 
@@ -476,7 +480,7 @@ mod tests {
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
         default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
-        generate_local_cluster_material, total_secondaries,
+        default_publisher_rayon_threads, generate_local_cluster_material, total_secondaries,
     };
     use std::{
         fs,
@@ -500,6 +504,9 @@ mod tests {
             log_level: "info".to_string(),
             worker_threads: 2,
             rayon_threads: 2,
+            indexer_worker_threads: None,
+            indexer_rayon_threads: None,
+            indexer_publisher_rayon_threads: default_publisher_rayon_threads(),
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
@@ -1257,6 +1264,11 @@ mod tests {
         let mut args = test_args(false);
         args.indexer = true;
         args.relayer = true;
+        args.worker_threads = 3;
+        args.rayon_threads = 13;
+        args.indexer_worker_threads = std::num::NonZeroUsize::new(8);
+        args.indexer_rayon_threads = std::num::NonZeroUsize::new(12);
+        args.indexer_publisher_rayon_threads = commonware_utils::NZUsize!(4);
         set_local_ports(&mut args, 8090, 8091, 8092);
 
         let material = generate_local_cluster_material(args.validators, total_secondaries(&args));
@@ -1275,6 +1287,15 @@ mod tests {
 
         // Primaries never get indexer wiring.
         assert!(validators.iter().all(|v| v.config.indexer.is_none()));
+        assert!(
+            validators
+                .iter()
+                .all(|v| v.config.worker_threads == 3 && v.config.rayon_threads == 13)
+        );
+        assert_eq!(secondaries[0].config.worker_threads, 8);
+        assert_eq!(secondaries[0].config.rayon_threads, 12);
+        assert_eq!(secondaries[1].config.worker_threads, 3);
+        assert_eq!(secondaries[1].config.rayon_threads, 13);
 
         // Secondaries point at the configured shared store URL.
         let indexer = secondaries[0]
@@ -1282,7 +1303,9 @@ mod tests {
             .indexer
             .as_ref()
             .expect("secondary should have indexer config");
-        assert_eq!(indexer.upload_buffer, 64);
+        assert_eq!(indexer.upload_max_in_flight, 64);
+        assert_eq!(indexer.publisher_rayon_threads.get(), 4);
+        assert_eq!(indexer.upload_budget_bytes, 3 * 1024 * 1024 * 1024);
         let expected_url = "http://127.0.0.1:8090".to_string();
         assert_eq!(indexer.store_url, expected_url);
         assert_eq!(indexer.api_key, None);

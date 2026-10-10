@@ -8,7 +8,9 @@
 use crate::{
     LazySignedTransaction, Sealable, Sealed, SignedTransaction, proposal::MAXIMUM_BLOCK_SIZE,
 };
-use commonware_codec::{Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write};
+use commonware_codec::{
+    Buf, Encode, EncodeSize, Error as CodecError, RangeCfg, Read, ReadExt, Write,
+};
 use commonware_consensus::{
     Block as ConsensusBlock, CertifiableBlock, Heightable, simplex::types::Context, types::Height,
 };
@@ -115,7 +117,7 @@ where
 {
     type Cfg = ();
 
-    fn read_cfg(buf: &mut impl bytes::Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, _cfg: &Self::Cfg) -> Result<Self, CodecError> {
         Ok(Self {
             context: Context::read(buf)?,
             parent: D::read(buf)?,
@@ -285,7 +287,7 @@ where
 {
     type Cfg = BlockCfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, CodecError> {
         // Limit this block without consuming trailing metadata from its enclosing message.
         let mut buf = bytes::Buf::take(buf, MAXIMUM_BLOCK_SIZE);
         let tx_vec_cfg = (cfg.max_transactions, ());
@@ -427,11 +429,9 @@ mod tests {
         let mut buf = Vec::with_capacity(header.encode_size());
         header.write(&mut buf);
 
-        let decoded = Header::<sha256::Digest, sha256::Digest, ed25519::PublicKey>::decode_cfg(
-            &mut &buf[..],
-            &(),
-        )
-        .expect("decoding should succeed");
+        let decoded =
+            Header::<sha256::Digest, sha256::Digest, ed25519::PublicKey>::decode_cfg(buf, &())
+                .expect("decoding should succeed");
         assert_eq!(decoded, header);
     }
 
@@ -454,7 +454,7 @@ mod tests {
         block.write(&mut buf);
 
         let decoded = Block::<sha256::Digest, ed25519::PublicKey, sha256::Sha256>::decode_cfg(
-            &mut &buf[..],
+            buf,
             &BlockCfg::default(),
         )
         .expect("decoding should succeed");
@@ -494,15 +494,15 @@ mod tests {
         for size in [MAXIMUM_BLOCK_SIZE - 1, MAXIMUM_BLOCK_SIZE] {
             let mut encoded = encoded_block_with_size(size);
             encoded.extend_from_slice(&[1, 2, 3, 4]);
-            let mut reader = encoded.as_slice();
+            let mut reader = bytes::Bytes::from(encoded);
             let block = TestBlock::read_cfg(&mut reader, &BlockCfg::default())
                 .expect("a block within the consensus limit should decode");
             assert_eq!(block.encode_size(), size);
-            assert_eq!(reader, &[1, 2, 3, 4]);
+            assert_eq!(reader.as_ref(), &[1, 2, 3, 4]);
         }
 
         let encoded = encoded_block_with_size(MAXIMUM_BLOCK_SIZE + 1);
-        assert!(TestBlock::decode_cfg(encoded.as_slice(), &BlockCfg::default()).is_err());
+        assert!(TestBlock::decode_cfg(encoded, &BlockCfg::default()).is_err());
     }
 
     #[test]
@@ -541,7 +541,7 @@ mod tests {
         );
 
         let encoded = block.encode();
-        let mut reader = encoded.as_ref();
+        let mut reader = encoded;
         let _decoded =
             <Block<sha256::Digest, ed25519::PublicKey, sha256::Sha256> as commonware_codec::Read>::read_cfg(
                 &mut reader,

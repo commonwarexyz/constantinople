@@ -6,7 +6,7 @@ mod properties;
 use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
     PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
-    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL, types::EngineCommitment,
 };
 use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
@@ -16,7 +16,7 @@ use commonware_consensus::{
     Heightable,
     marshal::core::CommitmentFallback,
     simplex::elector::RoundRobin,
-    types::{Epoch, Round, View, coding::Commitment},
+    types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
     Signer,
@@ -44,7 +44,8 @@ use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Handle, Quota, Spawner, Supervisor};
 use commonware_utils::{
-    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
+    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, probability,
+    sync::Mutex, union,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::PublicKeyCache;
@@ -63,7 +64,7 @@ const fn default_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
-        success_rate: commonware_utils::probability!(1.0),
+        success_rate: probability!(1.0),
     }
 }
 
@@ -71,7 +72,7 @@ const fn lossy_link() -> Link {
     Link {
         latency: Duration::from_millis(200),
         jitter: Duration::from_millis(150),
-        success_rate: commonware_utils::probability!(0.7),
+        success_rate: probability!(0.7),
     }
 }
 
@@ -88,7 +89,8 @@ struct TestEngineDefinition {
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
-    genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
+    genesis_commitments:
+        Arc<Mutex<BTreeMap<TestPublicKey, EngineCommitment<TestHasher, TestPublicKey>>>>,
     restart_barrier: Option<RestartBarrier>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
@@ -251,7 +253,7 @@ impl EngineDefinition for TestEngineDefinition {
                     context: context.child("probe"),
                     provider,
                     strategy: Sequential,
-                    capacity: NZUsize!(32),
+                    mailbox_size: NZUsize!(32),
                     blocker: blocker.clone(),
                     minimum_epoch: Epoch::zero(),
                     retry_timeout: NZDuration!(Duration::from_millis(100)),
@@ -286,8 +288,11 @@ impl EngineDefinition for TestEngineDefinition {
                 transaction_resolver,
             };
 
-            let input =
-                StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
+            let input = StaticTransactionSource::<
+                EngineCommitment<TestHasher, TestPublicKey>,
+                TestPublicKey,
+                TestHasher,
+            >::new(Vec::new());
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
@@ -389,9 +394,9 @@ impl EngineDefinition for TestEngineDefinition {
 
             if is_restart {
                 let processed = restart_marshal
-                    .get_processed_height()
+                    .get_processed()
                     .await
-                    .map_or(0, |height| height.get());
+                    .map_or(0, |processed| processed.height().get());
                 let barrier = restart_barrier.expect("restart barrier must exist");
                 barrier.observe_processed(processed);
                 barrier.release();
@@ -726,7 +731,7 @@ fn run_network_partition(engine: TestEngineDefinition) {
     let dead_link = Link {
         latency: Duration::from_secs(1),
         jitter: Duration::ZERO,
-        success_rate: commonware_utils::probability!(0.0),
+        success_rate: probability!(0.0),
     };
     let mut schedule = Schedule::new();
     for peer in &participants[1..] {

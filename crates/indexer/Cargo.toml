@@ -45,6 +45,7 @@ exoware-sql.workspace = true
 datafusion.workspace = true
 
 # Other
+cpu-time.workspace = true
 ahash.workspace = true
 axum.workspace = true
 bytes.workspace = true
@@ -67,6 +68,7 @@ commonware-glue.workspace = true
 commonware-math.workspace = true
 exoware-simulator.workspace = true
 rand.workspace = true
+tempfile.workspace = true
 tokio = { workspace = true, features = ["full", "test-util"] }
 tower = { workspace = true, features = ["util"] }
 

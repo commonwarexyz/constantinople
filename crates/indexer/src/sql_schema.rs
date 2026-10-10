@@ -1,28 +1,12 @@
-//! Metadata-store schema for the SQL streaming path.
+//! SQL metadata tables for finalized blocks, transactions, and account history.
 //!
-//! Constantinople fans every finalized block out across complementary storage
-//! paths:
-//!
-//! - **Simplex block/certificate storage** — certified headers, full
-//!   `{ header, body }` block envelopes by digest, and finalization indexes.
-//!   Height/latest block reads start with a certified header and only fetch the
-//!   body when needed.
-//! - **Metadata and lookup storage (SQL)** — columnar tables registered onto
-//!   the SQL metadata namespace (see [`crate::namespaces`]) via [`KvSchema`].
-//!   The `block_meta` table is what
-//!   the explorer subscribes to over the `sql.v1.Service` `Subscribe`
-//!   RPC. `tx_meta` stores one row per finalized transaction with proof and
-//!   body data. `tx_activity` stores one account-ordered row for each sender
-//!   and receiver side of a transaction. `account_meta` stores the latest
-//!   indexed account state plus its QMDB operation location.
-//!
-//! The string constants in this module are intentionally `pub` so that
-//! external consumers (the explorer and the SQL CLI) can hard-code the
-//! exact same identifiers without an out-of-band agreement.
+//! Primary keys identify immutable Store rows. Each account-state operation
+//! gets its own row keyed by account and operation location. Transaction heights
+//! are derived from the block transaction-log boundaries.
 
 use datafusion::arrow::datatypes::{DataType, TimeUnit};
 use exoware_sdk::PrefixedStoreClient;
-use exoware_sql::{KvSchema, TableColumnConfig};
+use exoware_sql::{IndexSpec, KvSchema, TableColumnConfig};
 
 /// Name of the SQL table that the explorer subscribes to.
 pub const BLOCK_META_TABLE: &str = "block_meta";
@@ -31,7 +15,7 @@ pub const BLOCK_META_TABLE: &str = "block_meta";
 pub const TX_META_TABLE: &str = "tx_meta";
 /// Name of the SQL table that indexes account transaction activity.
 pub const TX_ACTIVITY_TABLE: &str = "tx_activity";
-/// Name of the SQL table that records the latest indexed account state.
+/// Name of the SQL table that records one row per account-state QMDB operation.
 pub const ACCOUNT_META_TABLE: &str = "account_meta";
 
 // ---------- block_meta columns ----------
@@ -81,7 +65,7 @@ pub const TX_ACTIVITY_NONCE: &str = "nonce";
 
 // ---------- account_meta columns ----------
 
-/// `account_meta`: account key (primary key), fixed-size binary.
+/// `account_meta`: account key (primary key first column), fixed-size binary.
 pub const ACCOUNT_META_ACCOUNT: &str = "account";
 /// `account_meta`: indexed account balance.
 pub const ACCOUNT_META_BALANCE: &str = "balance";
@@ -89,24 +73,18 @@ pub const ACCOUNT_META_BALANCE: &str = "balance";
 pub const ACCOUNT_META_NONCE_BASE: &str = "nonce_base";
 /// `account_meta`: indexed account run-ahead nonce bitmap.
 pub const ACCOUNT_META_NONCE_BITMAP: &str = "nonce_bitmap";
-/// `account_meta`: account-state QMDB operation location.
+/// `account_meta`: account-state QMDB operation location (primary key second column).
 pub const ACCOUNT_META_QMDB_LOCATION: &str = "qmdb_location";
 
-/// Build the metadata-store [`KvSchema`] used by the SQL streaming path.
-///
-/// The returned schema declares all metadata tables on top of the supplied
-/// [`PrefixedStoreClient`]. Callers can either:
-///
-/// - Hand the schema to a fresh [`SessionContext`] via
-///   [`KvSchema::register_all`] (the `exoware-sql` SQL server does this),
-///   or
-/// - Build a [`BatchWriter`] from it via [`KvSchema::batch_writer`] and
-///   stream rows through `BatchWriter::insert` + `flush().await` (this is
-///   what `crate::publisher::sql` does on every finalized block).
-///
-/// [`BatchWriter`]: exoware_sql::BatchWriter
-/// [`SessionContext`]: datafusion::prelude::SessionContext
+/// Build the metadata-store [`KvSchema`] for every SQL table.
 pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String> {
+    // Transaction height lookups seek the greatest transaction tip at or below
+    // a location. That tip belongs to the preceding block, so the transaction's
+    // height is one more.
+    let transactions_tip_index = IndexSpec::lexicographic(
+        BLOCK_META_TRANSACTIONS_TIP,
+        vec![BLOCK_META_TRANSACTIONS_TIP.to_string()],
+    )?;
     KvSchema::new(client)
         .table(
             BLOCK_META_TABLE,
@@ -128,7 +106,7 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
                 ),
             ],
             vec![BLOCK_META_HEIGHT.to_string()],
-            vec![],
+            vec![transactions_tip_index],
         )?
         .table(
             TX_META_TABLE,
@@ -139,59 +117,46 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
             ],
             vec![TX_META_DIGEST.to_string()],
             vec![],
+        )?
+        .table(
+            TX_ACTIVITY_TABLE,
+            vec![
+                TableColumnConfig::new(TX_ACTIVITY_ACCOUNT, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(TX_ACTIVITY_HEIGHT, DataType::UInt64, false),
+                TableColumnConfig::new(TX_ACTIVITY_INDEX, DataType::UInt64, false),
+                TableColumnConfig::new(TX_ACTIVITY_ROLE, DataType::UInt64, false),
+                TableColumnConfig::new(TX_ACTIVITY_DIGEST, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(
+                    TX_ACTIVITY_COUNTERPARTY,
+                    DataType::FixedSizeBinary(32),
+                    false,
+                ),
+                TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
+                TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
+            ],
+            vec![
+                TX_ACTIVITY_ACCOUNT.to_string(),
+                TX_ACTIVITY_HEIGHT.to_string(),
+                TX_ACTIVITY_INDEX.to_string(),
+                TX_ACTIVITY_ROLE.to_string(),
+            ],
+            vec![],
+        )?
+        .table(
+            ACCOUNT_META_TABLE,
+            vec![
+                TableColumnConfig::new(ACCOUNT_META_ACCOUNT, DataType::FixedSizeBinary(32), false),
+                TableColumnConfig::new(ACCOUNT_META_BALANCE, DataType::UInt64, false),
+                TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
+                TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
+                TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
+            ],
+            vec![
+                ACCOUNT_META_ACCOUNT.to_string(),
+                ACCOUNT_META_QMDB_LOCATION.to_string(),
+            ],
+            vec![],
         )
-        .and_then(|schema| {
-            schema.table(
-                TX_ACTIVITY_TABLE,
-                vec![
-                    TableColumnConfig::new(
-                        TX_ACTIVITY_ACCOUNT,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(TX_ACTIVITY_HEIGHT, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_INDEX, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_ROLE, DataType::UInt64, false),
-                    TableColumnConfig::new(
-                        TX_ACTIVITY_DIGEST,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(
-                        TX_ACTIVITY_COUNTERPARTY,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(TX_ACTIVITY_VALUE, DataType::UInt64, false),
-                    TableColumnConfig::new(TX_ACTIVITY_NONCE, DataType::UInt64, false),
-                ],
-                vec![
-                    TX_ACTIVITY_ACCOUNT.to_string(),
-                    TX_ACTIVITY_HEIGHT.to_string(),
-                    TX_ACTIVITY_INDEX.to_string(),
-                    TX_ACTIVITY_ROLE.to_string(),
-                ],
-                vec![],
-            )
-        })
-        .and_then(|schema| {
-            schema.table(
-                ACCOUNT_META_TABLE,
-                vec![
-                    TableColumnConfig::new(
-                        ACCOUNT_META_ACCOUNT,
-                        DataType::FixedSizeBinary(32),
-                        false,
-                    ),
-                    TableColumnConfig::new(ACCOUNT_META_BALANCE, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_NONCE_BASE, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_NONCE_BITMAP, DataType::UInt64, false),
-                    TableColumnConfig::new(ACCOUNT_META_QMDB_LOCATION, DataType::UInt64, false),
-                ],
-                vec![ACCOUNT_META_ACCOUNT.to_string()],
-                vec![],
-            )
-        })
 }
 
 #[cfg(test)]
