@@ -161,13 +161,10 @@ QMDB roots and boundaries, and pass the floor through Store, SQL, Simplex, and
 QMDB requests. A metadata row appearing early does not establish publication.
 A lagging service or unpublished QMDB tip remains retryable.
 
-`tx_meta` contains the digest, QMDB location, and signed transaction bytes.
-The containing height is derived from the preceding `block_meta` transaction
-boundary. A secondary index on `transactions_tip` bounds that lookup to one
-index entry, including for old transactions. Rust lookups read the immutable
-transaction row and derive a height hint, then require its publication target
-and repeat the height derivation at that target's Store floor. There is no
-separate transaction-proof metadata table.
+`tx_meta` contains the digest, QMDB location, containing height, and signed
+transaction bytes. Rust lookups read the immutable transaction row, require the
+publication target at its height, and check the target's block digest at that
+target's Store floor. There is no separate transaction-proof metadata table.
 
 `account_meta` is append-only with key `(account, qmdb_location)`. Historical
 account reads select the latest location below the certified state boundary.

@@ -30,6 +30,7 @@ pub(crate) struct TxMetaRow {
     pub digest: [u8; 32],
     pub qmdb_location: u64,
     pub body: Bytes,
+    pub height: u64,
 }
 
 /// Transaction activity role stored in `tx_activity`.
@@ -58,6 +59,7 @@ pub(crate) struct TxActivityRow {
     pub counterparty: [u8; 32],
     pub value: u64,
     pub nonce: u64,
+    pub qmdb_location: u64,
 }
 
 /// One `account_meta` row per account-state QMDB operation.
@@ -102,6 +104,7 @@ pub(crate) fn encode_tx_meta_row(tx: TxMetaRow) -> SqlRow {
             CellValue::FixedBinary(tx.digest.to_vec()),
             CellValue::UInt64(tx.qmdb_location),
             CellValue::Binary(tx.body.to_vec()),
+            CellValue::UInt64(tx.height),
         ],
     }
 }
@@ -119,6 +122,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
             CellValue::FixedBinary(tx.counterparty.to_vec()),
             CellValue::UInt64(tx.value),
             CellValue::UInt64(tx.nonce),
+            CellValue::UInt64(tx.qmdb_location),
         ],
     }
 }

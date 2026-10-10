@@ -93,8 +93,6 @@ where
         .checked_sub(tx_count + 1)
         .expect("transaction range includes appends plus commit");
 
-    // Readers derive a transaction's height from block_meta, so no
-    // per-transaction proof row is needed.
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
     sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
@@ -118,6 +116,7 @@ where
             digest,
             qmdb_location,
             body: tx.bytes,
+            height,
         }));
         sql.push(encode_tx_activity_row(TxActivityRow {
             account: sender,
@@ -128,6 +127,7 @@ where
             counterparty: receiver,
             value: tx.value,
             nonce: tx.nonce,
+            qmdb_location,
         }));
         if receiver != sender {
             sql.push(encode_tx_activity_row(TxActivityRow {
@@ -139,6 +139,7 @@ where
                 counterparty: sender,
                 value: tx.value,
                 nonce: tx.nonce,
+                qmdb_location,
             }));
         }
     }
@@ -359,6 +360,82 @@ mod tests {
         assert_tx_meta_body(&rows.sql, &transaction);
     }
 
+    #[test]
+    fn tx_rows_carry_qmdb_location_and_height() {
+        let mut rng = StdRng::from_seed([5; 32]);
+        let consensus_key = ed25519::PrivateKey::random(&mut rng);
+        let signer = ed25519::PrivateKey::random(&mut rng);
+        let sender = TransactionPublicKey::ed25519(signer.public_key());
+        let transactions = (0..2)
+            .map(|nonce| {
+                let recipient = TransactionPublicKey::ed25519(
+                    ed25519::PrivateKey::random(&mut rng).public_key(),
+                );
+                Transaction::<sha256::Digest>::new(
+                    sender.clone(),
+                    recipient,
+                    NonZeroU64::new(1).expect("test value should be non-zero"),
+                    nonce,
+                )
+                .seal_and_sign(
+                    &signer,
+                    TRANSACTION_NAMESPACE,
+                    &mut Sha256::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let block = EngineBlock::from(
+            Block::<TestCommitment, PublicKey, Sha256>::new(
+                test_header(consensus_key.public_key(), transactions.len()),
+                transactions,
+            )
+            .seal(&mut Sha256::default()),
+        );
+
+        let rows = encode_block_rows(&block, 1_000);
+        let meta_locations = rows
+            .sql
+            .iter()
+            .filter(|row| row.table == TX_META_TABLE)
+            .map(
+                |row| match (&row.values[0], &row.values[1], &row.values[3]) {
+                    (
+                        CellValue::FixedBinary(digest),
+                        CellValue::UInt64(location),
+                        CellValue::UInt64(height),
+                    ) => {
+                        assert_eq!(*height, block.header.height);
+                        (digest.clone(), *location)
+                    }
+                    _ => panic!("tx_meta digest, location, and height should be typed"),
+                },
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(
+            meta_locations.iter().map(|(_, l)| *l).collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let activity = rows
+            .sql
+            .iter()
+            .filter(|row| row.table == TX_ACTIVITY_TABLE)
+            .collect::<Vec<_>>();
+        assert_eq!(activity.len(), 4, "sender and receiver row per transaction");
+        for row in activity {
+            let (CellValue::FixedBinary(digest), CellValue::UInt64(location)) =
+                (&row.values[4], &row.values[8])
+            else {
+                panic!("tx_activity digest and location should be typed");
+            };
+            let (_, expected) = meta_locations
+                .iter()
+                .find(|(meta_digest, _)| meta_digest == digest)
+                .expect("activity digest should have a tx_meta row");
+            assert_eq!(location, expected);
+        }
+    }
+
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {
         let sender = rows
             .iter()
@@ -378,14 +455,14 @@ mod tests {
             .iter()
             .find(|row| row.table == TX_META_TABLE)
             .expect("tx_meta row should be indexed");
-        assert_eq!(meta.values.len(), 3);
+        assert_eq!(meta.values.len(), 4);
         assert!(matches!(meta.values.get(1), Some(CellValue::UInt64(0))));
         let Some(CellValue::Binary(body)) = meta.values.get(2) else {
             panic!("tx_meta body should be binary");
         };
         assert_eq!(body.as_slice(), expected_body);
 
-        // Readers derive proof heights from block metadata.
+        // Proof heights live on tx_meta rows, not in a separate table.
         assert!(
             rows.iter().all(|row| {
                 row.table == crate::sql_schema::TX_META_TABLE
