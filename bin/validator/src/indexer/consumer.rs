@@ -13,8 +13,8 @@ use super::{
 use bytes::Bytes;
 use commonware_codec::Decode as _;
 use commonware_runtime::{
-    Clock as _, Metrics,
-    telemetry::metrics::{Histogram, MetricsExt as _},
+    Clock, Handle, Metrics, Spawner as _, Supervisor as _,
+    telemetry::metrics::{Histogram, HistogramExt as _, MetricsExt as _},
     tokio::Context as RuntimeContext,
 };
 use commonware_storage::queue;
@@ -22,13 +22,14 @@ use constantinople_indexer::publisher::{
     certificate::CertificateUploaderStopped,
     qmdb::{PublishError, QueuedFinalizedUploadCfg},
 };
+use futures::stream::{FuturesUnordered, StreamExt as _};
 use std::{
     collections::BTreeMap,
     future::Future,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, SystemTime},
 };
-use tokio::{sync::oneshot, task::JoinSet};
+use tokio::sync::oneshot;
 use tracing::{Instrument as _, Span, info_span, warn};
 
 #[derive(Clone)]
@@ -115,13 +116,14 @@ struct PendingQueuedUpload {
     position: u64,
     record: FinalizedQueueRecord,
     charge: UploadCharge,
-    admission_started: Instant,
+    admission_started: SystemTime,
     trace: Span,
     admission_span: Span,
 }
 
 impl PendingQueuedUpload {
     fn new(
+        clock: &impl Clock,
         position: u64,
         record: FinalizedQueueRecord,
         budget: &UploadBudget,
@@ -137,7 +139,7 @@ impl PendingQueuedUpload {
             position,
             record,
             charge: budget.charge(record.payload.len),
-            admission_started: Instant::now(),
+            admission_started: clock.current(),
             trace,
             admission_span,
         }
@@ -160,7 +162,7 @@ impl FinalizedUploadConsumer {
             traces,
             replay_through,
         } = self;
-        let mut active = JoinSet::new();
+        let mut active = FuturesUnordered::new();
         let mut retained_records: BTreeMap<u64, RetainedUpload> = BTreeMap::new();
         let mut waiting: Option<PendingQueuedUpload> = None;
         let mut admission_turn = None;
@@ -170,7 +172,7 @@ impl FinalizedUploadConsumer {
 
             // Reading without waiting first keeps idle time out of the read timer.
             let read = if can_read {
-                try_read_finalized_queue_entry(&mut reader, &metrics).await
+                try_read_finalized_queue_entry(&context, &mut reader, &metrics).await
             } else {
                 Ok(None)
             };
@@ -182,7 +184,8 @@ impl FinalizedUploadConsumer {
                             .await
                     }, if waiting.is_some() && active.len() < max_active => {
                         let pending = waiting.take().expect("waiting upload exists");
-                        active.spawn(queued_upload(
+                        active.push(spawn_upload(
+                            &context,
                             publisher.clone(),
                             cert_reporter.clone(),
                             &payloads,
@@ -194,7 +197,7 @@ impl FinalizedUploadConsumer {
                         continue;
                     }
                     read = reader.recv(), if can_read => read,
-                    result = next_completed_upload(&mut active, max_active, &metrics), if !active.is_empty() => {
+                    result = next_completed_upload(&context, &mut active, max_active, &metrics), if !active.is_empty() => {
                         let (position, height) = result;
                         reader.ack(position).unwrap_or_else(|error| {
                             panic!("failed to ack finalized index queue at height {height}. {error}")
@@ -208,6 +211,7 @@ impl FinalizedUploadConsumer {
                             height
                         ));
                         prune_finalized_queue(
+                            &context,
                             &reader,
                             &writer,
                             &payloads,
@@ -236,7 +240,8 @@ impl FinalizedUploadConsumer {
             let trace = traces.take(height, height <= replay_through);
             trace.record("position", position);
             trace.record("payload_bytes", record.payload.len);
-            let pending = PendingQueuedUpload::new(position, record, &budget, trace.clone());
+            let pending =
+                PendingQueuedUpload::new(&context, position, record, &budget, trace.clone());
             retained_records.insert(
                 position,
                 RetainedUpload {
@@ -247,7 +252,8 @@ impl FinalizedUploadConsumer {
             );
             match budget.try_reserve(pending.charge) {
                 Some(reservation) => {
-                    active.spawn(queued_upload(
+                    active.push(spawn_upload(
+                        &context,
                         publisher.clone(),
                         cert_reporter.clone(),
                         &payloads,
@@ -264,30 +270,32 @@ impl FinalizedUploadConsumer {
 }
 
 async fn next_completed_upload(
-    active: &mut JoinSet<(u64, u64)>,
+    clock: &impl Clock,
+    active: &mut FuturesUnordered<Handle<(u64, u64)>>,
     max_active: usize,
     metrics: &FinalizedUploadMetrics,
 ) -> (u64, u64) {
-    let capacity_wait_started = (active.len() >= max_active).then(Instant::now);
-    let result = active.join_next().await;
+    let capacity_wait_started = (active.len() >= max_active).then(|| clock.current());
+    let result = active.next().await;
     if let Some(started) = capacity_wait_started {
         metrics
             .active_capacity_wait
-            .observe(started.elapsed().as_secs_f64());
+            .observe_between(started, clock.current());
     }
     result
         .expect("active upload set is not empty")
-        .expect("finalized index upload task panicked")
+        .expect("finalized index upload task failed")
 }
 
 async fn try_read_finalized_queue_entry(
+    clock: &impl Clock,
     reader: &mut FinalizedQueueReader,
     metrics: &FinalizedUploadMetrics,
 ) -> Result<Option<(u64, FinalizedQueueRecord)>, queue::Error> {
-    let started = Instant::now();
+    let started = clock.current();
     let item = reader.try_recv().await?;
     if item.is_some() {
-        metrics.queue_read.observe(started.elapsed().as_secs_f64());
+        metrics.queue_read.observe_between(started, clock.current());
     }
     Ok(item)
 }
@@ -301,7 +309,12 @@ async fn try_read_finalized_queue_entry(
 /// because a crash between a prune and its receipt would leave an empty queue
 /// with no capture boundary. Syncing once per section rather than per
 /// acknowledgement removes most consumer fsyncs.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the consumer loop destructures its state, so each piece is passed separately"
+)]
 async fn prune_finalized_queue(
+    clock: &impl Clock,
     reader: &FinalizedQueueReader,
     writer: &FinalizedQueueWriter,
     payloads: &FinalizedPayloads,
@@ -334,7 +347,7 @@ async fn prune_finalized_queue(
     for (_, entry) in retained.range(*payload_floor..boundary) {
         prune.follows_from(entry.trace.id());
     }
-    let receipt_started = Instant::now();
+    let receipt_started = clock.current();
     receipt_store
         .persist(receipt)
         .instrument(info_span!(
@@ -345,9 +358,9 @@ async fn prune_finalized_queue(
         .await;
     metrics
         .receipt_sync
-        .observe(receipt_started.elapsed().as_secs_f64());
+        .observe_between(receipt_started, clock.current());
 
-    let sync_started = Instant::now();
+    let sync_started = clock.current();
     writer
         .sync()
         .instrument(info_span!(
@@ -360,7 +373,7 @@ async fn prune_finalized_queue(
         .expect("failed to sync finalized index queue");
     metrics
         .queue_sync
-        .observe(sync_started.elapsed().as_secs_f64());
+        .observe_between(sync_started, clock.current());
 
     // Deletion is best effort. Startup removes any payload left behind.
     let remaining = retained.split_off(&boundary);
@@ -391,13 +404,18 @@ async fn prune_finalized_queue(
     *payload_floor = boundary;
 }
 
-/// Build the upload task for an admitted record.
+/// Spawn the upload task for an admitted record.
 ///
 /// Payload reads and decodes run concurrently across admitted uploads so the
 /// consumer loop never waits on them. The publisher still needs heights in
 /// queue order, so each task waits for its predecessor to finish admitting
 /// before it admits its own block, then hands the turn to its successor.
-fn queued_upload(
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the consumer loop destructures its state, so each piece is passed separately"
+)]
+fn spawn_upload(
+    context: &RuntimeContext,
     publisher: Arc<LazyPublisher>,
     cert_reporter: EngineCertReporter,
     payloads: &FinalizedPayloads,
@@ -405,7 +423,7 @@ fn queued_upload(
     admission_turn: &mut Option<oneshot::Receiver<()>>,
     pending: PendingQueuedUpload,
     reservation: UploadReservation,
-) -> impl Future<Output = (u64, u64)> + Send + 'static {
+) -> Handle<(u64, u64)> {
     let PendingQueuedUpload {
         position,
         record,
@@ -417,7 +435,7 @@ fn queued_upload(
     drop(admission_span);
     metrics
         .admission_wait
-        .observe(admission_started.elapsed().as_secs_f64());
+        .observe_between(admission_started, context.current());
     let height = record.height();
     assert_eq!(
         height,
@@ -431,84 +449,87 @@ fn queued_upload(
     let turn = admission_turn.replace(admitted_rx);
 
     let upload_span = info_span!(parent: &trace, "indexer.upload", height, position);
-    async move {
-        let bytes = read_finalized_payload(&payloads, height, record.payload)
-            .instrument(info_span!(
-                "indexer.payload.load",
+    context.child("upload").spawn(move |context| {
+        async move {
+            let bytes = read_finalized_payload(&payloads, height, record.payload)
+                .instrument(info_span!(
+                    "indexer.payload.load",
+                    height,
+                    bytes = record.payload.len
+                ))
+                .await;
+
+            // Decoding is CPU work over hundreds of thousands of operations, so it
+            // runs on the blocking pool instead of a runtime worker.
+            let upload = decode_finalized_payload(&context, height, bytes, &metrics).await;
+            trace.record(
+                "block_digest",
+                tracing::field::display(upload.block().seal()),
+            );
+            assert_eq!(
+                LatestCaptureReceipt::from_upload(&upload),
+                record.receipt,
+                "finalized index payload at height {height} does not match its record"
+            );
+            let block = Arc::new(upload.block().clone());
+            let finalization = upload.finalization().cloned();
+
+            wait_for_upload_turn(&context, turn, &metrics)
+                .instrument(info_span!("indexer.queue.admission_turn", height))
+                .await;
+            let engine_publisher = publisher
+                .publisher()
+                .instrument(info_span!("indexer.publisher.connect", height))
+                .await;
+            let mut completion = engine_publisher
+                .enqueue_queued_finalized(upload)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to start finalized index upload at height {height}. {error}")
+                });
+            let _ = admitted_tx.send(());
+
+            let simplex_completion = cert_reporter
+                .publish_finalized_block(block, finalization)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("failed to start finalized block upload at height {height}. {error}")
+                });
+            release_reservation_after_uploads(
                 height,
-                bytes = record.payload.len
-            ))
+                completion
+                    .persisted()
+                    .instrument(info_span!("indexer.upload.metadata_wait", height)),
+                simplex_completion
+                    .wait()
+                    .instrument(info_span!("indexer.upload.simplex_wait", height)),
+                reservation,
+            )
             .await;
-
-        // Decoding is CPU work over hundreds of thousands of operations, so it
-        // runs on the blocking pool instead of a runtime worker.
-        let upload = decode_finalized_payload(height, bytes, &metrics).await;
-        trace.record(
-            "block_digest",
-            tracing::field::display(upload.block().seal()),
-        );
-        assert_eq!(
-            LatestCaptureReceipt::from_upload(&upload),
-            record.receipt,
-            "finalized index payload at height {height} does not match its record"
-        );
-        let block = Arc::new(upload.block().clone());
-        let finalization = upload.finalization().cloned();
-
-        wait_for_upload_turn(turn, &metrics)
-            .instrument(info_span!("indexer.queue.admission_turn", height))
-            .await;
-        let engine_publisher = publisher
-            .publisher()
-            .instrument(info_span!("indexer.publisher.connect", height))
-            .await;
-        let mut completion = engine_publisher
-            .enqueue_queued_finalized(upload)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("failed to start finalized index upload at height {height}. {error}")
-            });
-        let _ = admitted_tx.send(());
-
-        let simplex_completion = cert_reporter
-            .publish_finalized_block(block, finalization)
-            .await
-            .unwrap_or_else(|error| {
-                panic!("failed to start finalized block upload at height {height}. {error}")
-            });
-        release_reservation_after_uploads(
-            height,
             completion
-                .persisted()
-                .instrument(info_span!("indexer.upload.metadata_wait", height)),
-            simplex_completion
-                .wait()
-                .instrument(info_span!("indexer.upload.simplex_wait", height)),
-            reservation,
-        )
-        .await;
-        completion
-            .published()
-            .instrument(info_span!("indexer.upload.publication_wait", height))
-            .await
-            .unwrap_or_else(|error| {
-                panic!("finalized index publication failed at height {height}. {error}")
-            });
-        (position, height)
-    }
-    .instrument(upload_span)
+                .published()
+                .instrument(info_span!("indexer.upload.publication_wait", height))
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("finalized index publication failed at height {height}. {error}")
+                });
+            (position, height)
+        }
+        .instrument(upload_span)
+    })
 }
 
 async fn wait_for_upload_turn(
+    clock: &impl Clock,
     turn: Option<oneshot::Receiver<()>>,
     metrics: &FinalizedUploadMetrics,
 ) {
-    let started = Instant::now();
+    let started = clock.current();
     if let Some(turn) = turn {
         turn.await
             .expect("earlier finalized index upload exited before admitting its block");
     }
-    metrics.turn_wait.observe(started.elapsed().as_secs_f64());
+    metrics.turn_wait.observe_between(started, clock.current());
 }
 
 /// Hold the admission reservation only until this block's own uploads are durable.
@@ -556,31 +577,36 @@ async fn read_finalized_payload(
 }
 
 async fn decode_finalized_payload(
+    context: &RuntimeContext,
     height: u64,
     bytes: Bytes,
     metrics: &FinalizedUploadMetrics,
 ) -> EngineQueuedUpload {
     let metrics = metrics.clone();
-    let scheduled = Instant::now();
+    let scheduled = context.current();
     let parent = Span::current();
     let queued = info_span!(parent: &parent, "indexer.payload.decode_schedule", height);
-    tokio::task::spawn_blocking(move || {
-        drop(queued);
-        let _span =
-            info_span!(parent: &parent, "indexer.payload.decode", height, bytes = bytes.len())
-                .entered();
-        metrics
-            .decode_schedule_wait
-            .observe(scheduled.elapsed().as_secs_f64());
-        let started = Instant::now();
-        let upload = EngineQueuedUpload::decode_cfg(bytes, &QueuedFinalizedUploadCfg::default());
-        metrics.decode.observe(started.elapsed().as_secs_f64());
-        upload.unwrap_or_else(|error| {
-            panic!("failed to decode finalized index payload at height {height}. {error}")
+    context
+        .child("decode")
+        .shared(true)
+        .spawn(move |context| async move {
+            drop(queued);
+            let _span =
+                info_span!(parent: &parent, "indexer.payload.decode", height, bytes = bytes.len())
+                    .entered();
+            metrics
+                .decode_schedule_wait
+                .observe_between(scheduled, context.current());
+            let started = context.current();
+            let upload =
+                EngineQueuedUpload::decode_cfg(bytes, &QueuedFinalizedUploadCfg::default());
+            metrics.decode.observe_between(started, context.current());
+            upload.unwrap_or_else(|error| {
+                panic!("failed to decode finalized index payload at height {height}. {error}")
+            })
         })
-    })
-    .await
-    .expect("finalized index payload decode task panicked")
+        .await
+        .expect("finalized index payload decode task failed")
 }
 
 #[cfg(test)]
@@ -612,6 +638,7 @@ mod tests {
         receipt_store: FinalizedReceiptStore,
         metrics: FinalizedUploadMetrics,
         retained: BTreeMap<u64, RetainedUpload>,
+        context: RuntimeContext,
     }
 
     impl PruneFixture {
@@ -656,11 +683,13 @@ mod tests {
                 receipt_store,
                 metrics: FinalizedUploadMetrics::new(&context.child("upload")),
                 retained,
+                context: context.child("prune"),
             }
         }
 
         async fn prune(&mut self, payload_floor: &mut u64) {
             prune_finalized_queue(
+                &self.context,
                 &self.reader,
                 &self.writer,
                 &self.payloads,

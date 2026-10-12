@@ -309,7 +309,7 @@ mod tests {
         maybe_build_indexer,
         queue::{FinalizedReceiptStore, capture_receipt},
     };
-    use commonware_runtime::{Runner as _, Supervisor as _};
+    use commonware_runtime::{Clock as _, Runner as _, Supervisor as _};
     use commonware_utils::NZUsize;
     use std::time::Duration;
 
@@ -325,30 +325,37 @@ mod tests {
             };
 
             // Remote namespaces must be validated as fresh before the first capture.
-            let fresh = tokio::time::timeout(
-                Duration::from_millis(500),
-                maybe_build_indexer(
-                    context.child("fresh"),
-                    false,
-                    Some(indexer.clone()),
-                    "fresh",
-                ),
-            )
-            .await;
+            let fresh = context
+                .timeout(
+                    Duration::from_millis(500),
+                    Box::pin(maybe_build_indexer(
+                        context.child("fresh"),
+                        false,
+                        Some(indexer.clone()),
+                        "fresh",
+                    )),
+                )
+                .await;
             assert!(fresh.is_err(), "fresh startup must wait for validation");
 
             // A durable capture receipt means validation already happened.
             let (store, _) = FinalizedReceiptStore::open(context.child("seed"), "restart").await;
             store.persist(capture_receipt(1, 2, 2)).await;
             drop(store);
-            tokio::time::timeout(
-                Duration::from_secs(2),
-                maybe_build_indexer(context.child("restart"), false, Some(indexer), "restart"),
-            )
-            .await
-            .expect("publisher connection should not block restart")
-            .expect("indexer Store client should build")
-            .expect("secondary should keep indexer wiring");
+            context
+                .timeout(
+                    Duration::from_secs(2),
+                    Box::pin(maybe_build_indexer(
+                        context.child("restart"),
+                        false,
+                        Some(indexer),
+                        "restart",
+                    )),
+                )
+                .await
+                .expect("publisher connection should not block restart")
+                .expect("indexer Store client should build")
+                .expect("secondary should keep indexer wiring");
         });
     }
 
@@ -362,14 +369,20 @@ mod tests {
                 upload_max_in_flight: 1,
                 upload_budget_bytes: FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
             };
-            let error = tokio::time::timeout(
-                Duration::from_secs(2),
-                maybe_build_indexer(context, false, Some(indexer), "test"),
-            )
-            .await
-            .expect("invalid URL must not enter the connection retry loop")
-            .err()
-            .expect("invalid URL should fail startup");
+            let error = context
+                .timeout(
+                    Duration::from_secs(2),
+                    Box::pin(maybe_build_indexer(
+                        context.child("indexer"),
+                        false,
+                        Some(indexer),
+                        "test",
+                    )),
+                )
+                .await
+                .expect("invalid URL must not enter the connection retry loop")
+                .err()
+                .expect("invalid URL should fail startup");
 
             assert!(matches!(error, StoreClientBuildError::InvalidUrl { .. }));
         });
@@ -385,14 +398,20 @@ mod tests {
                 upload_max_in_flight: 1,
                 upload_budget_bytes: FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
             };
-            let error = tokio::time::timeout(
-                Duration::from_secs(2),
-                maybe_build_indexer(context, false, Some(indexer), "test"),
-            )
-            .await
-            .expect("invalid API key must not enter the connection retry loop")
-            .err()
-            .expect("invalid API key should fail startup");
+            let error = context
+                .timeout(
+                    Duration::from_secs(2),
+                    Box::pin(maybe_build_indexer(
+                        context.child("indexer"),
+                        false,
+                        Some(indexer),
+                        "test",
+                    )),
+                )
+                .await
+                .expect("invalid API key must not enter the connection retry loop")
+                .err()
+                .expect("invalid API key should fail startup");
 
             assert!(matches!(error, StoreClientBuildError::InvalidApiKey));
         });
