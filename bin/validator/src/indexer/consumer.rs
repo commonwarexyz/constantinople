@@ -23,12 +23,7 @@ use constantinople_indexer::publisher::{
     qmdb::{PublishError, QueuedFinalizedUploadCfg},
 };
 use futures::stream::{FuturesUnordered, StreamExt as _};
-use std::{
-    collections::BTreeMap,
-    future::Future,
-    sync::Arc,
-    time::{Duration, SystemTime},
-};
+use std::{collections::BTreeMap, future::Future, sync::Arc, time::SystemTime};
 use tokio::sync::oneshot;
 use tracing::{Instrument as _, Span, info_span, warn};
 
@@ -226,14 +221,13 @@ impl FinalizedUploadConsumer {
                 },
                 read => read,
             };
+
+            // A failed read does not advance the reader, so retrying would reread the same record
+            // forever. Storage failures are fatal, like every other queue operation here.
             let (position, record) = match read {
                 Ok(Some(item)) => item,
                 Ok(None) => panic!("finalized queue writer was lost"),
-                Err(error) => {
-                    warn!(error = %error, "failed to read finalized index queue, retrying");
-                    context.sleep(Duration::from_secs(1)).await;
-                    continue;
-                }
+                Err(error) => panic!("failed to read finalized index queue. {error}"),
             };
 
             let height = record.height();
