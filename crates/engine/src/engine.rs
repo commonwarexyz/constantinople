@@ -14,8 +14,10 @@
 use crate::{
     application::{EngineApplication, EngineReporter},
     block::ApplicationBlock,
+    shard_filter::ShardFilter,
     types::*,
 };
+use commonware_coding::Config as CodingConfig;
 use commonware_consensus::{
     Reporter, Reporters,
     marshal::{
@@ -229,6 +231,7 @@ where
     stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, St>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
+    coding_config: CodingConfig,
     #[expect(
         clippy::type_complexity,
         reason = "marshal actor type is inherently complex"
@@ -588,6 +591,7 @@ where
             stateful_mailbox,
             shards,
             shard_mailbox,
+            coding_config,
             marshal,
             marshal_mailbox,
             #[cfg(all(test, feature = "test-utils"))]
@@ -638,7 +642,10 @@ where
         let transaction_resolver_handle = self
             .transaction_resolver
             .start(channels.transaction_resolver);
-        let shard_handle = self.shards.start(channels.marshal);
+        let (marshal_sender, marshal_receiver) = channels.marshal;
+        let marshal_receiver =
+            ShardFilter::<_, _, H>::new(marshal_receiver, self.blocker.clone(), self.coding_config);
+        let shard_handle = self.shards.start((marshal_sender, marshal_receiver));
         let stateful_handle = self.stateful.start();
 
         let reporter = reporter.map(EngineReporter::new);
