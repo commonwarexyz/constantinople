@@ -1,7 +1,7 @@
 //! Captures finalized artifacts before their source state can be pruned.
 
 use super::{
-    DURATION_BUCKETS, EngineCapturedUpload, EngineMarshal, FinalizedPayloads,
+    DURATION_BUCKETS, EngineCapturedUpload, EngineFinalizationReader, FinalizedPayloads,
     queue::{FinalizedQueueRecord, FinalizedQueueWriter, LatestCaptureReceipt},
     traces::CaptureTraces,
 };
@@ -72,7 +72,7 @@ pub(super) struct FinalizedUploadProducer {
     pub(super) payloads: FinalizedPayloads,
     pub(super) receipt: Arc<Mutex<Option<LatestCaptureReceipt>>>,
     pub(super) capture_metrics: FinalizedCaptureMetrics,
-    pub(super) marshal: Arc<OnceLock<EngineMarshal>>,
+    pub(super) finalizations: Arc<OnceLock<EngineFinalizationReader>>,
     pub(super) traces: CaptureTraces,
 }
 
@@ -108,12 +108,11 @@ impl FinalizedUploadProducer {
         info_span!("indexer.capture.validate", height)
             .in_scope(|| validate_next_capture(*current, &artifacts));
         let started = Instant::now();
-        let marshal = self
-            .marshal
+        let finalization = self
+            .finalizations
             .get()
-            .expect("marshal mailbox must be installed before engine start");
-        let finalization = marshal
-            .get_finalization(commonware_consensus::types::Height::new(height))
+            .expect("finalization reader must be installed before engine start")
+            .get(commonware_consensus::types::Height::new(height))
             .instrument(info_span!("indexer.capture.finalization_lookup", height))
             .await;
         self.capture_metrics

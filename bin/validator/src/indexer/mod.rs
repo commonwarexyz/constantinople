@@ -20,7 +20,7 @@ use commonware_runtime::{
 use constantinople_application::consensus::FinalizedHookFn;
 use constantinople_engine::{
     ThresholdScheme,
-    types::{EngineBlock, EngineCommitment, EngineMarshalMailbox},
+    types::{EngineBlock, EngineCommitment, FinalizationReader},
 };
 use constantinople_indexer::{
     CertificateReporter, Publisher, StoreClientBuildError,
@@ -61,7 +61,7 @@ type EnginePublisher = Publisher<Sha256, PublicKey>;
 type EngineQueuedUpload = QueuedFinalizedUpload<Sha256, PublicKey, MinSig>;
 type EngineCapturedUpload = CapturedFinalizedUpload<Sha256, PublicKey, MinSig>;
 type FinalizedPayloads = PayloadStore<RuntimeContext>;
-type EngineMarshal = EngineMarshalMailbox<Sha256, PublicKey, MinSig>;
+type EngineFinalizationReader = FinalizationReader<Sha256, PublicKey, MinSig>;
 type ValidatorFinalizedHook =
     FinalizedHookFn<EngineCommitment<Sha256, PublicKey>, Sha256, PublicKey>;
 
@@ -73,7 +73,7 @@ fn metric_i64(value: u64) -> i64 {
 /// Bundle of indexer state that needs to outlive engine startup.
 pub(crate) struct IndexerHandle {
     pub(crate) finalized_hook: ValidatorFinalizedHook,
-    pub(crate) marshal: Arc<OnceLock<EngineMarshal>>,
+    pub(crate) finalizations: Arc<OnceLock<EngineFinalizationReader>>,
     pub(crate) critical_task: CriticalTask,
 }
 
@@ -255,14 +255,14 @@ pub(crate) async fn maybe_build_indexer(
     }
 
     let consumer_context = context.child("finalized_upload_consumer");
-    let marshal = Arc::new(OnceLock::new());
+    let finalizations = Arc::new(OnceLock::new());
     let traces = CaptureTraces::default();
     let finalized_producer = FinalizedUploadProducer {
         writer: queue_writer.clone(),
         payloads: payloads.clone(),
         receipt: Arc::new(Mutex::new(receipt)),
         capture_metrics,
-        marshal: marshal.clone(),
+        finalizations: finalizations.clone(),
         traces: traces.clone(),
     };
     let consumer = FinalizedUploadConsumer {
@@ -282,7 +282,7 @@ pub(crate) async fn maybe_build_indexer(
     let finalized_join = consumer_context.spawn(move |context| consumer.run(context));
     Ok(Some(IndexerHandle {
         finalized_hook: indexer_finalized_hook(finalized_producer),
-        marshal,
+        finalizations,
         critical_task: indexer_critical_task(cert_join, finalized_join),
     }))
 }

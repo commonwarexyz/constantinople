@@ -387,12 +387,16 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         )
         .await
         .expect("failed to configure indexer Store client");
-        let (finalized_hook, indexer_marshal, indexer_task) = match indexer_handle {
+        let (finalized_hook, indexer_finalizations, indexer_task) = match indexer_handle {
             Some(IndexerHandle {
                 finalized_hook,
-                marshal,
+                finalizations,
                 critical_task,
-            }) => (Some(finalized_hook), Some(marshal), Some(critical_task)),
+            }) => (
+                Some(finalized_hook),
+                Some(finalizations),
+                Some(critical_task),
+            ),
             None => (None, None, None),
         };
 
@@ -438,10 +442,10 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         )
         .await;
 
-        if let Some(marshal) = indexer_marshal {
+        if let Some(finalizations) = indexer_finalizations {
             assert!(
-                marshal.set(engine.marshal_mailbox()).is_ok(),
-                "marshal mailbox must be installed exactly once"
+                finalizations.set(engine.finalization_reader()).is_ok(),
+                "finalization reader must be installed exactly once"
             );
         }
 

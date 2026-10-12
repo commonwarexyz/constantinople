@@ -21,7 +21,7 @@ use commonware_consensus::{
         core::Mailbox as MarshalMailbox,
     },
     simplex::{self, types::Finalization},
-    types::{Epoch, FixedEpocher},
+    types::{Epoch, FixedEpocher, Height},
 };
 use commonware_cryptography::{
     Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::ConstantProvider,
@@ -47,6 +47,20 @@ pub type EngineCodedBlock<H, P> = CodedBlock<EngineBlock<H, P>, ReedSolomon<H>, 
 
 /// Marshal mailbox parameterized over the engine's threshold scheme.
 pub type EngineMarshalMailbox<H, P, V> = MarshalMailbox<ThresholdScheme<P, V>, EngineVariant<H, P>>;
+
+/// Read-only access to the finalization certificates marshal has stored.
+pub struct FinalizationReader<H: Hasher, P: PublicKey, V: Variant>(EngineMarshalMailbox<H, P, V>);
+
+impl<H: Hasher, P: PublicKey, V: Variant> FinalizationReader<H, P, V> {
+    pub(crate) const fn new(mailbox: EngineMarshalMailbox<H, P, V>) -> Self {
+        Self(mailbox)
+    }
+
+    /// Returns the finalization stored locally for `height`, if any. This never fetches from peers.
+    pub async fn get(&self, height: Height) -> Option<EngineFinalization<P, V, H>> {
+        self.0.get_finalization(height).await
+    }
+}
 
 /// Probe mailbox parameterized over the engine's threshold scheme.
 pub type EngineProbeMailbox<H, P, V> =

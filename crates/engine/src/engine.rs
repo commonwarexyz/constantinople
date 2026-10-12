@@ -267,8 +267,13 @@ where
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
-    /// Returns a handle for reading durably archived marshal data.
-    pub fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
+    /// Returns a handle for reading finalization certificates stored by marshal.
+    pub fn finalization_reader(&self) -> FinalizationReader<H, C::PublicKey, V> {
+        FinalizationReader::new(self.marshal_mailbox.clone())
+    }
+
+    #[cfg(all(test, feature = "test-utils"))]
+    pub(crate) fn marshal_mailbox(&self) -> EngineMarshalMailbox<H, C::PublicKey, V> {
         self.marshal_mailbox.clone()
     }
 
