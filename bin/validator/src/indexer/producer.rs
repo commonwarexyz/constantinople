@@ -8,8 +8,9 @@ use super::{
 use commonware_codec::Encode;
 use commonware_cryptography::{ed25519::PublicKey, sha256::Sha256};
 use commonware_runtime::{
-    Metrics,
+    Metrics, Spawner as _, Supervisor as _,
     telemetry::metrics::{Histogram, MetricsExt as _},
+    tokio::Context as RuntimeContext,
 };
 use constantinople_application::consensus::FinalizedArtifacts;
 use constantinople_engine::types::EngineBlock;
@@ -68,6 +69,7 @@ enum CapturePosition {
 
 #[derive(Clone)]
 pub(super) struct FinalizedUploadProducer {
+    pub(super) context: Arc<RuntimeContext>,
     pub(super) writer: FinalizedQueueWriter,
     pub(super) payloads: FinalizedPayloads,
     pub(super) receipt: Arc<Mutex<Option<LatestCaptureReceipt>>>,
@@ -79,7 +81,7 @@ pub(super) struct FinalizedUploadProducer {
 impl FinalizedUploadProducer {
     pub(super) async fn enqueue(
         self,
-        block: &EngineBlock<Sha256, PublicKey>,
+        block: EngineBlock<Sha256, PublicKey>,
         artifacts: FinalizedArtifacts<Sha256>,
         trace: Span,
     ) {
@@ -96,7 +98,7 @@ impl FinalizedUploadProducer {
                     && receipt.height == height
                 {
                     assert!(
-                        receipt.matches_block(block),
+                        receipt.matches_block(&block),
                         "finalized replay conflicts with the durable capture receipt"
                     );
                 }
@@ -119,23 +121,33 @@ impl FinalizedUploadProducer {
             .finalization_lookup
             .observe(started.elapsed().as_secs_f64());
 
-        // Construction is synchronous, so the span guard never crosses an await.
+        // Await the CPU work on the blocking pool so async workers stay
+        // available while capture ordering is preserved.
         let construct_started = Instant::now();
-        let (receipt, encoded) = {
-            let _span = info_span!("indexer.capture.construct", height).entered();
-            let upload = info_span!("indexer.capture.artifacts", height)
-                .in_scope(|| {
-                    EngineCapturedUpload::from_finalized_artifacts(
-                        block,
-                        finalization,
-                        current_time_micros(),
-                        artifacts,
-                    )
+        let construct_span = info_span!("indexer.capture.construct", height);
+        let (receipt, encoded) = self
+            .context
+            .child("construct")
+            .shared(true)
+            .spawn(move |_| async move {
+                construct_span.in_scope(|| {
+                    let upload = info_span!("indexer.capture.artifacts", height)
+                        .in_scope(|| {
+                            EngineCapturedUpload::from_finalized_artifacts(
+                                &block,
+                                finalization,
+                                current_time_micros(),
+                                artifacts,
+                            )
+                        })
+                        .expect("captured finalized artifacts must form a valid queue entry");
+                    let encoded =
+                        info_span!("indexer.capture.encode", height).in_scope(|| upload.encode());
+                    (LatestCaptureReceipt::from_upload(&upload), encoded)
                 })
-                .expect("captured finalized artifacts must form a valid queue entry");
-            let encoded = info_span!("indexer.capture.encode", height).in_scope(|| upload.encode());
-            (LatestCaptureReceipt::from_upload(&upload), encoded)
-        };
+            })
+            .await
+            .expect("finalized index payload construction task failed");
         self.capture_metrics
             .construct
             .observe(construct_started.elapsed().as_secs_f64());

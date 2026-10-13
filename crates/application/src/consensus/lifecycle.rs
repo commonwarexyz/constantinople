@@ -90,14 +90,15 @@ where
         )
         .await;
 
-        // The parent reference (possibly the last one to a full block of
-        // decoded transactions) is released on the strategy's pool so the
-        // drop stays off the propose path.
+        // The last parent reference destroys the whole body. Bypass adaptive
+        // scheduling because transaction count cannot predict that ownership
+        // change. A multi-worker Rayon strategy keeps cleanup off this task.
         let drop_span = info_span!("application.propose.drop_parent");
         let drop_work = parent.body.len();
         drop(
             self.strategy
-                .spawn(drop_work, move |_: St| drop_span.in_scope(|| drop(parent))),
+                .manual()
+                .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
         );
 
         let header = Header {
@@ -188,9 +189,8 @@ where
         drop(block);
 
         // Signature verification needs only the block body, so it starts
-        // immediately and overlaps the parent fetch below. The child context
-        // serves only as an owned CryptoRng for the pool job; no runtime task
-        // is spawned under its label.
+        // before the parent fetch and can overlap it when offloaded. The
+        // child context supplies an owned CryptoRng for verification.
         let (state_batch, transaction_batch) = batches;
         let signatures = verify_signatures::<E, H, St>(
             runtime.child("verify_signatures"),
@@ -216,10 +216,9 @@ where
             return None;
         }
 
-        // Signatures verify concurrently with execution on the shared pool:
-        // the join measures ~2ms faster than sequencing the merkleize after
-        // the signature burst, and the merkleize's stretched wall time
-        // during the burst reflects pool sharing, not lost work.
+        // Join verification with execution so offloaded signature work can
+        // overlap execution and the timestamp wait. The adaptive strategy
+        // may already have completed signature verification inline.
         let execution = execute_body(
             self.strategy.clone(),
             state_batch,
@@ -231,14 +230,15 @@ where
 
         let result = futures::try_join!(signatures, execution, wait);
 
-        // The parent reference (possibly the last one to a full block of
-        // decoded transactions) is released on the strategy's pool so the
-        // drop stays off the verify path.
+        // The last parent reference destroys the whole body. Bypass adaptive
+        // scheduling because transaction count cannot predict that ownership
+        // change. A multi-worker Rayon strategy keeps cleanup off this task.
         let drop_span = info_span!("application.verify.drop_parent");
         let drop_work = parent.body.len();
         drop(
             self.strategy
-                .spawn(drop_work, move |_: St| drop_span.in_scope(|| drop(parent))),
+                .manual()
+                .spawn(drop_work, move |_| drop_span.in_scope(|| drop(parent))),
         );
 
         let execution = match result {

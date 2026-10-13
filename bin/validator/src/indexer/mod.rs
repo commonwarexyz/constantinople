@@ -258,6 +258,7 @@ pub(crate) async fn maybe_build_indexer(
     let finalizations = Arc::new(OnceLock::new());
     let traces = CaptureTraces::default();
     let finalized_producer = FinalizedUploadProducer {
+        context: Arc::new(context.child("finalized_capture")),
         writer: queue_writer.clone(),
         payloads: payloads.clone(),
         receipt: Arc::new(Mutex::new(receipt)),
@@ -296,7 +297,7 @@ fn indexer_finalized_hook(finalized_producer: FinalizedUploadProducer) -> Valida
         let block = EngineBlock::from(block);
         let finalized_producer = finalized_producer.clone();
         Box::pin(
-            async move { finalized_producer.enqueue(&block, artifacts, trace).await }
+            async move { finalized_producer.enqueue(block, artifacts, trace).await }
                 .instrument(capture),
         )
     })

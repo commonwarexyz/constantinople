@@ -71,7 +71,7 @@
 //! `execute_body` prepares a proposed body, recomputes execution, and compares
 //! the resulting commitments to the header. Certified apply shallow-clones the
 //! block's lazy body (per-transaction handles whose decode cache stays shared)
-//! to move it into the pool's prepare job, without building an intermediate
+//! to move it into the prepare job, without building an intermediate
 //! materialized transaction vector. Preparing a transfer does
 //! not invent a second transaction identifier: it reads the transaction's sealed
 //! message digest. For lazily encoded block bodies, whichever consumer first
@@ -388,12 +388,11 @@ const BUILD_TIMEOUT: Duration = Duration::from_millis(50);
 /// surviving body re-executes cleanly under all-or-nothing verification with
 /// identical account writes.
 ///
-/// The transaction-history append is pipelined per round: a round's accepted
-/// digests append on the strategy's pool while the next round refills,
-/// prepares, stages, and selects, and the final round's append drains
-/// concurrently with the state merkleize inside `finalize_child` (chunked
-/// appends fold to exactly the accepted digests in block order). An empty
-/// selection proposes an empty block so an idle chain keeps making progress.
+/// Each round starts appending its accepted digests before the next refill.
+/// When offloaded, the append can overlap later rounds and the final state
+/// merkleize. The strategy may instead complete an append inline. Chained
+/// appends preserve the accepted digests' block order. An empty selection
+/// proposes an empty block so an idle chain keeps making progress.
 #[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "application.execute", level = "info", skip_all)]
 pub(super) async fn execute_proposal<E, C, P, H, S, I>(
@@ -422,9 +421,8 @@ where
     let mut included_bytes = 0usize;
     let mut candidates = candidates;
 
-    // The history append for a round's accepted digests runs on the pool
-    // while later rounds refill, prepare, stage, and select; rounds chain on
-    // the batch, so the previous append is joined before the next is spawned.
+    // Rounds share one history batch, so each append is joined before the
+    // next starts. Offloaded appends can overlap the next round's work.
     let mut transaction_batch = Some(transaction_batch);
     let mut pending_append: Option<PendingAppend<E, H, S>> = None;
     let deadline = clock.current() + BUILD_TIMEOUT;
@@ -434,11 +432,9 @@ where
             break;
         }
 
-        // Prepare the candidates on the pool: a proposer chooses its body,
-        // so a candidate that fails preparation is simply excluded (unlike
-        // verification's all-or-nothing preparation). Results stay
-        // index-aligned with the candidate vector; the same job compacts the
-        // well-formed transfers and records first-touched accounts.
+        // A proposer chooses its body, so candidates that fail preparation
+        // can be excluded. Keep results aligned with the candidate vector
+        // while compacting valid transfers and recording first-touched accounts.
         let prepare_span = info_span!(
             "application.execute.prepare",
             txs = candidates.len().traced()
@@ -503,7 +499,7 @@ where
         }
 
         // Apply in block order and fold the survivors into the body, all in
-        // one pool job so the split is attributed and the candidates move
+        // one job so the split is attributed and the candidates move
         // straight into the body.
         let select_span = info_span!(
             "application.execute.select",
@@ -545,8 +541,8 @@ where
         included_bytes += included_delta;
         select_span.record("dropped", dropped_bytes.traced());
 
-        // Chain this round's history append on the pool; it overlaps the
-        // refill round-trip and the next round's prepare, stage, and select.
+        // Start this round's history append before refilling so it can
+        // overlap the next round when the strategy offloads it.
         if !chunk.is_empty() {
             let batch = match pending_append.take() {
                 Some(append) => {
@@ -583,8 +579,7 @@ where
         None => stage_empty(unstaged.take().expect("nothing was staged")).await,
     };
 
-    // The final account values are computed on this task while the last
-    // round's history append drains on the pool.
+    // Compute final account values while any offloaded history append drains.
     let updates_span = info_span!(
         "application.execute.updates",
         accounts = tracing::field::Empty
@@ -592,9 +587,8 @@ where
     let updates = updates_span.in_scope(|| selector.into_updates());
     updates_span.record("accounts", updates.len().traced());
 
-    // The last append drains concurrently with the state merkleize inside
-    // `finalize_child`; appending zero digests is an identity, so an empty
-    // selection skips the pool round-trip entirely.
+    // Pass the append future into `finalize_child` so any remaining work can
+    // overlap state merkleization. Empty selections need no append job.
     let drained = transaction_batch.take();
     let append = pending_append.take();
     let transaction_batch = async move {
@@ -643,8 +637,8 @@ where
     let transaction_count = transfers.len();
     let transfers = Arc::new(transfers);
 
-    // The transaction-history append has no dependency on state execution, so
-    // it runs on the pool concurrently with compute.
+    // The history append is independent of state execution, so start it before
+    // compute. The strategy may run it inline or offload it to overlap compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
     let work_size = digests.len();
     let apply = strategy.spawn(work_size, move |_: S| {
@@ -684,8 +678,8 @@ where
 {
     let transfers = Arc::new(transfers);
 
-    // The transaction-history append has no dependency on state execution, so
-    // it runs on the pool concurrently with compute.
+    // The history append is independent of state execution, so start it before
+    // compute. The strategy may run it inline or offload it to overlap compute.
     let apply_span = info_span!("application.execute.apply", txs = digests.len().traced());
     let work_size = digests.len();
     let apply = strategy.spawn(work_size, move |_: S| {
