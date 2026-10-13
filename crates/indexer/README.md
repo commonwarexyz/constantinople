@@ -102,11 +102,15 @@ proofs for them never complete.
 - A [`Publisher`](src/publisher/qmdb.rs) that runs from the finalized hook
   on the single owning secondary. It commits SQL and authenticated QMDB data,
   then publishes only the contiguous completed prefix through one barrier.
-- [`IndexerClient`](src/client.rs) — typed read wrapper over Simplex block
+- [`IndexerClient`](src/client.rs) is a typed read wrapper over Simplex block
   storage and SQL transaction lookup rows. Digest lookups combine `tx_meta`
-  with `block_meta` under the publication target's Store sequence floor, then
-  expose the finalized height, QMDB location, and signed body through
-  `TransactionMetadata`.
+  with `block_meta` and a publication target to coordinate read visibility.
+  `TransactionMetadata` returns the index's claimed height and QMDB location
+  as untrusted lookup hints, together with signed transaction bytes whose body
+  hashes to the requested digest. It does not verify the signature or finalized
+  inclusion. Callers establish inclusion with a QMDB proof against a root from
+  a verified finalized header. Establishing the exact inclusion height also
+  requires authenticating that the location belongs to that block's new appends.
   Latest-finalized-height is derived from the Simplex finalization height index.
 - `[[bin]] chain-indexer` requires `--features chain-indexer`. It wraps
   `exoware_simulator::server::run` for local development and deployer-managed remote bundles.

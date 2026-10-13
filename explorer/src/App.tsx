@@ -416,6 +416,7 @@ export default function App() {
                 }
                 const targetPromise = fetchLatestProofTarget({
                     storeUrl,
+                    sqlUrl: indexerUrl,
                     simplexVerificationMaterial,
                     publishedTarget: published,
                     signal,
@@ -617,6 +618,7 @@ export default function App() {
             if (!targetRefresh) {
                 targetRefresh = fetchLatestProofTarget({
                     storeUrl,
+                    sqlUrl: indexerUrl,
                     simplexVerificationMaterial,
                     publishedTarget: published,
                     signal: controller.signal,
@@ -1177,6 +1179,7 @@ export default function App() {
             // ties the digest to the block before showing its certificate as verified.
             void prefetchFinalizedCertificate({
                 storeUrl,
+                sqlUrl: indexerUrl,
                 simplexVerificationMaterial,
                 height: BigInt(outcome.height),
             }).catch(() => {});

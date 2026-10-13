@@ -154,7 +154,8 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState>
     ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(async move {
             let recovered_finalized = self.barrier.recovered_finalized();
-            if recovered_finalized <= 1 {
+            let expected_processed = self.barrier.processed_height();
+            if recovered_finalized <= expected_processed + 1 {
                 return Err(format!(
                     "restart recovered finalization {recovered_finalized}, expected a height above the held processed floor"
                 ));
@@ -164,9 +165,9 @@ impl Property<crate::tests::common::TestPublicKey, ValidatorState>
                 .barrier
                 .observed_processed()
                 .ok_or_else(|| "restart processed height was not observed".to_string())?;
-            if observed_processed != 0 {
+            if observed_processed != expected_processed {
                 return Err(format!(
-                    "restart moved processed height from 0 to {observed_processed} before acknowledgement; recovered finalization was {recovered_finalized}"
+                    "restart moved processed height from {expected_processed} to {observed_processed} before acknowledgement. Recovered finalization was {recovered_finalized}"
                 ));
             }
 

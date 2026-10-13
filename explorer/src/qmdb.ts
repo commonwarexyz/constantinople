@@ -6,9 +6,13 @@ import {
     SqlClient,
     type DecodedQueryResult,
 } from '@exowarexyz/sql';
-import { Client, StoreKeyPrefix } from '@exowarexyz/sdk';
+import { Client, StoreKeyPrefix, TraversalMode, type StoreClient } from '@exowarexyz/sdk';
 import {
     SimplexClient,
+    SimplexRecordKind,
+    finalizedByHeightKey,
+    headerByDigestKey,
+    rangeForKind,
     type VerifiedSimplexCertificate,
     type SimplexCertificateVerifier,
 } from '@exowarexyz/simplex';
@@ -20,6 +24,7 @@ import {
 } from '@exowarexyz/qmdb';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
 import {
+    BLOCK_META_DIGEST,
     BLOCK_META_HEIGHT,
     BLOCK_META_TABLE,
     BLOCK_META_TRANSACTIONS_TIP,
@@ -139,16 +144,23 @@ export interface AccountProofMetadata extends AccountProofRow {
 
 export async function prefetchFinalizedCertificate({
     storeUrl,
+    sqlUrl,
     simplexVerificationMaterial,
     height,
     signal,
 }: {
     storeUrl: string;
+    sqlUrl: string;
     simplexVerificationMaterial: string;
     height: bigint;
     signal?: AbortSignal;
 }): Promise<void> {
-    await finalizedTransactionTarget(storeUrl, simplexVerificationMaterial, height, 0n, signal);
+    await finalizedTransactionTarget(
+        { storeUrl, sqlUrl, simplexVerificationMaterial },
+        height,
+        0n,
+        signal,
+    );
 }
 
 export function fetchAccountProofMetadata({
@@ -229,27 +241,28 @@ export async function fetchAndVerifyTransactionProof({
     signal?: AbortSignal;
     onFinalizationVerified?: (target: VerifiedFinalizationTarget) => void;
 }): Promise<VerifiedTransactionProof> {
-    if (finalizedHeight !== undefined && finalizedHeight > publishedTarget.height) {
-        throw uncoveredError(`transaction height ${finalizedHeight}`);
-    }
+    const coveredHeightHint = finalizedHeight !== undefined && finalizedHeight <= publishedTarget.height
+        ? finalizedHeight
+        : undefined;
+    const source = { storeUrl, sqlUrl, simplexVerificationMaterial };
 
     const controller = new AbortController();
     signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     try {
-        // A reported height starts certificate verification early. SQL still
-        // identifies the owning block before finalization is recorded.
-        const targetHeight = finalizedHeight ?? publishedTarget.height;
+        // A covered hint starts certificate verification early. An ahead-of-target
+        // report must not prevent SQL from identifying the owning block.
+        const targetHeight = coveredHeightHint ?? publishedTarget.height;
         const [proofTarget, metadata] = await Promise.all([
             targetHeight === publishedTarget.height
                 ? fetchLatestProofTarget({
                     storeUrl,
+                    sqlUrl,
                     simplexVerificationMaterial,
                     publishedTarget,
                     signal,
                 })
                 : finalizedTransactionTarget(
-                    storeUrl,
-                    simplexVerificationMaterial,
+                    source,
                     targetHeight,
                     publishedTarget.sequenceNumber,
                     signal,
@@ -264,14 +277,13 @@ export async function fetchAndVerifyTransactionProof({
         if (metadata.height > publishedTarget.height) {
             throw uncoveredError(`transaction height ${metadata.height}`);
         }
-        if (finalizedHeight === undefined && metadata.location >= proofTarget.transactionsTip) {
+        if (coveredHeightHint === undefined && metadata.location >= proofTarget.transactionsTip) {
             throw uncoveredError(`transaction location ${metadata.location}`);
         }
         const target = metadata.height === proofTarget.height
             ? proofTarget
             : await finalizedTransactionTarget(
-                storeUrl,
-                simplexVerificationMaterial,
+                source,
                 metadata.height,
                 publishedTarget.sequenceNumber,
                 signal,
@@ -310,22 +322,24 @@ export async function fetchAndVerifyTransactionProof({
 }
 
 // The published target is committed atomically with the state and transaction
-// QMDB publication boundary. The certificate read authenticates its digest
-// and supplies the roots used for subsequent proofs.
+// QMDB publication boundary. Finalization of the target height, either directly
+// or through a certified descendant, authenticates its digest and supplies the
+// roots used for subsequent proofs.
 export async function fetchLatestProofTarget({
     storeUrl,
+    sqlUrl,
     simplexVerificationMaterial,
     publishedTarget,
     signal,
 }: {
     storeUrl: string;
+    sqlUrl: string;
     simplexVerificationMaterial: string;
     publishedTarget: PublishedProofTarget;
     signal?: AbortSignal;
 }): Promise<LatestProofTarget> {
     const target = await finalizedTransactionTarget(
-        storeUrl,
-        simplexVerificationMaterial,
+        { storeUrl, sqlUrl, simplexVerificationMaterial },
         publishedTarget.height,
         publishedTarget.sequenceNumber,
         signal,
@@ -659,18 +673,33 @@ async function fetchFixedUnorderedUpdateProof(
 }
 
 const FINALIZED_TARGET_CACHE_SIZE = 128;
-const finalizedTargets = new Map<string, FinalizedTransactionTarget>();
+const FINALIZED_ANCESTOR_BATCH = 128n;
+const MAX_U64 = (1n << 64n) - 1n;
+const U64_BYTES = 8;
+const finalizedTargets = new Map<string, AuthenticatedTarget>();
 const pendingFinalizedTargets = new Map<string, PendingFinalizedTarget>();
+
+interface FinalizationSource {
+    readonly storeUrl: string;
+    readonly sqlUrl: string;
+    readonly simplexVerificationMaterial: string;
+}
+
+// The parent digest lets a cached descendant anchor later ancestor checks.
+interface AuthenticatedTarget extends FinalizedTransactionTarget {
+    readonly parentDigest: Uint8Array;
+}
 
 interface PendingFinalizedTarget {
     readonly controller: AbortController;
-    readonly promise: Promise<FinalizedTransactionTarget>;
+    readonly promise: Promise<AuthenticatedTarget>;
+    readonly minSequenceNumber: bigint;
+    readonly settled: () => boolean;
     callers: number;
 }
 
 async function finalizedTransactionTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
+    source: FinalizationSource,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
@@ -678,39 +707,36 @@ async function finalizedTransactionTarget(
     signal?.throwIfAborted();
     if (height < 0n) throw new Error('finalized height must be non-negative');
 
-    // URLs cannot contain spaces, so the material suffix is unambiguous.
-    const key = `${height} ${trimTrailingSlash(storeUrl)} ${simplexVerificationMaterial}`;
-    const cached = finalizedTargets.get(key);
-    if (cached) {
-        finalizedTargets.delete(key);
-        finalizedTargets.set(key, cached);
-        return copyFinalizedTarget(cached);
-    }
+    const cacheKey = finalizedTargetKey(source, height);
+    const cached = cachedFinalizedTarget(cacheKey);
+    if (cached) return publicFinalizedTarget(cached);
 
+    // A verified target does not depend on SQL hints, but a failed attempt can.
+    // Callers join an attempt only when it uses their SQL service and covers
+    // their read floor, so a stale miss is never shared with a newer caller.
+    const key = `${cacheKey} ${trimTrailingSlash(source.sqlUrl)}`;
     let pending = pendingFinalizedTargets.get(key);
-    if (!pending) {
+    if (!pending || pending.minSequenceNumber < minSequenceNumber) {
         const controller = new AbortController();
+        let settled = false;
         const promise = fetchFinalizedTransactionTarget(
-            storeUrl,
-            simplexVerificationMaterial,
+            source,
             height,
             minSequenceNumber,
             controller.signal,
         ).then((target) => {
-            // A verified certificate is immutable across publication barriers.
+            // A verified target is immutable across publication barriers.
             // SQL and QMDB reads still use each caller's covering sequence floor.
             controller.signal.throwIfAborted();
-            finalizedTargets.set(key, target);
-            if (finalizedTargets.size > FINALIZED_TARGET_CACHE_SIZE) {
-                finalizedTargets.delete(finalizedTargets.keys().next().value!);
-            }
+            cacheFinalizedTarget(cacheKey, target);
             return target;
         }).finally(() => {
+            settled = true;
             if (pendingFinalizedTargets.get(key)?.controller === controller) {
                 pendingFinalizedTargets.delete(key);
             }
         });
-        pending = { controller, promise, callers: 0 };
+        pending = { controller, promise, minSequenceNumber, settled: () => settled, callers: 0 };
         pendingFinalizedTargets.set(key, pending);
     }
     const shared = pending;
@@ -718,15 +744,18 @@ async function finalizedTransactionTarget(
 
     // Each waiter owns only its subscription. Stop the shared request when
     // its last caller leaves so a cancelled page does not retain network work.
-    const target = await new Promise<FinalizedTransactionTarget>((resolve, reject) => {
+    // A request replaced by a higher floor still stops with its own callers.
+    const target = await new Promise<AuthenticatedTarget>((resolve, reject) => {
         let settled = false;
-        const finish = (error: unknown, value?: FinalizedTransactionTarget) => {
+        const finish = (error: unknown, value?: AuthenticatedTarget) => {
             if (settled) return;
             settled = true;
             signal?.removeEventListener('abort', abort);
             shared.callers--;
-            if (shared.callers === 0 && pendingFinalizedTargets.get(key) === shared) {
-                pendingFinalizedTargets.delete(key);
+            if (shared.callers === 0 && !shared.settled()) {
+                if (pendingFinalizedTargets.get(key) === shared) {
+                    pendingFinalizedTargets.delete(key);
+                }
                 shared.controller.abort();
             }
             if (value) resolve(value);
@@ -736,40 +765,297 @@ async function finalizedTransactionTarget(
         signal?.addEventListener('abort', abort, { once: true });
         shared.promise.then((value) => finish(undefined, value), (error) => finish(error));
     });
-    return copyFinalizedTarget(target);
+    return publicFinalizedTarget(copyFinalizedTarget(target));
 }
 
-function copyFinalizedTarget(target: FinalizedTransactionTarget): FinalizedTransactionTarget {
+// The parent digest only anchors ancestor checks, so callers get the public shape.
+function publicFinalizedTarget(target: AuthenticatedTarget): FinalizedTransactionTarget {
+    const { parentDigest: _parentDigest, ...finalized } = target;
+    return finalized;
+}
+
+// URLs cannot contain spaces, so the material suffix is unambiguous.
+function finalizedTargetKey(source: FinalizationSource, height: bigint): string {
+    return `${height} ${trimTrailingSlash(source.storeUrl)} ${source.simplexVerificationMaterial}`;
+}
+
+function cachedFinalizedTarget(key: string): AuthenticatedTarget | undefined {
+    const cached = finalizedTargets.get(key);
+    if (!cached) return undefined;
+    finalizedTargets.delete(key);
+    finalizedTargets.set(key, cached);
+    return copyFinalizedTarget(cached);
+}
+
+function cacheFinalizedTarget(key: string, target: AuthenticatedTarget) {
+    finalizedTargets.set(key, target);
+    if (finalizedTargets.size > FINALIZED_TARGET_CACHE_SIZE) {
+        finalizedTargets.delete(finalizedTargets.keys().next().value!);
+    }
+}
+
+function copyFinalizedTarget(target: AuthenticatedTarget): AuthenticatedTarget {
     return {
         ...target,
         blockDigest: target.blockDigest.slice(),
+        parentDigest: target.parentDigest.slice(),
         stateRoot: target.stateRoot.slice(),
         transactionsRoot: target.transactionsRoot.slice(),
     };
 }
 
 async function fetchFinalizedTransactionTarget(
-    storeUrl: string,
-    simplexVerificationMaterial: string,
+    source: FinalizationSource,
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<FinalizedTransactionTarget> {
-    const simplex = await verifiedSimplexClient(storeUrl, simplexVerificationMaterial);
+): Promise<AuthenticatedTarget> {
+    const simplex = await verifiedSimplexClient(source.storeUrl, source.simplexVerificationMaterial);
     signal?.throwIfAborted();
+    const target = await certifiedTarget(simplex, height, minSequenceNumber, signal);
+    if (target) return target;
+
+    // Capture can permanently omit a height's certificate, and a missing row
+    // alone cannot distinguish that from upload lag. A later finalization also
+    // finalizes its ancestors, so try to authenticate this header through one.
+    return descendantFinalizedTarget(source, simplex, height, minSequenceNumber, signal);
+}
+
+async function certifiedTarget(
+    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    height: bigint,
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
+): Promise<AuthenticatedTarget | null> {
     const certificate = await simplex.getFinalizationByHeight(
         height.toString(),
         minSequenceNumber,
         { signal },
     );
-    if (!certificate) {
-        throw new Error(`finalization missing at height ${height}`);
-    }
+    if (!certificate) return null;
     const target = await finalizedTargetFromCertificate(certificate);
     if (target.height !== height) {
         throw new Error(`finalized certificate height ${target.height} does not match requested height ${height}`);
     }
     return target;
+}
+
+async function descendantFinalizedTarget(
+    source: FinalizationSource,
+    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    height: bigint,
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
+): Promise<AuthenticatedTarget> {
+    if (height >= MAX_U64) throw missingFinalization(height);
+
+    // Height keys are big endian, so a forward range finds the nearest
+    // certificate above the requested height. The row only locates a candidate.
+    const store = simplexStore(source.storeUrl);
+    const nearest = await store.query(
+        finalizedByHeightKey(height + 1n),
+        rangeForKind(SimplexRecordKind.FinalizedByHeight).end,
+        1,
+        1,
+        TraversalMode.FORWARD,
+        minSequenceNumber,
+        { signal },
+    );
+    assertEvaluatedSequence(nearest.sequenceNumber, minSequenceNumber, 'Simplex descendant query');
+    const row = nearest.results[0];
+    if (!row) throw missingFinalization(height);
+    const descendantHeight = finalizedHeightFromKey(row.key);
+    if (descendantHeight <= height) {
+        throw new Error(`Simplex descendant query returned height ${descendantHeight} at or below ${height}`);
+    }
+
+    // The exact read verifies the certificate. Flooring it and the header reads
+    // at the range's evaluated sequence keeps them at least as fresh as the row.
+    const descendant = await descendantTarget(
+        source,
+        simplex,
+        descendantHeight,
+        nearest.sequenceNumber,
+        signal,
+    );
+    if (!descendant) throw missingFinalization(height);
+    return ancestorTarget(
+        source.sqlUrl,
+        store,
+        descendant,
+        height,
+        minSequenceNumber,
+        nearest.sequenceNumber,
+        signal,
+    );
+}
+
+async function descendantTarget(
+    source: FinalizationSource,
+    simplex: SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>,
+    height: bigint,
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
+): Promise<AuthenticatedTarget | null> {
+    const key = finalizedTargetKey(source, height);
+    const cached = cachedFinalizedTarget(key);
+    if (cached) return cached;
+
+    const target = await certifiedTarget(simplex, height, minSequenceNumber, signal);
+    if (target) {
+        signal?.throwIfAborted();
+        cacheFinalizedTarget(key, target);
+    }
+    return target;
+}
+
+// Walk back from the certified descendant one bounded batch at a time. SQL
+// supplies candidate digests so each batch needs one Store read rather than
+// one read per parent. Only recomputed header hashes and contiguous heights
+// establish the chain, so a wrong hint fails the lookup closed and never extends it.
+// Intermediate heights are not cached. The certified descendant is, and transient
+// heights would evict live targets from the small cache.
+async function ancestorTarget(
+    sqlUrl: string,
+    store: StoreClient,
+    descendant: AuthenticatedTarget,
+    height: bigint,
+    sqlFloor: bigint,
+    headerFloor: bigint,
+    signal?: AbortSignal,
+): Promise<AuthenticatedTarget> {
+    let expected = descendant.parentDigest;
+    let top = descendant.height - 1n;
+    while (true) {
+        const bottom = top - height >= FINALIZED_ANCESTOR_BATCH
+            ? top - FINALIZED_ANCESTOR_BATCH + 1n
+            : height;
+        const hints = bottom < top
+            ? await blockDigestHints(sqlUrl, bottom, top, height, sqlFloor, signal)
+            : [];
+        const digests = [...hints, expected];
+        const headers = await headersByDigest(store, digests, headerFloor, signal);
+
+        for (let index = digests.length - 1; index >= 0; index--) {
+            const blockHeight = bottom + BigInt(index);
+            if (!bytesEqual(digests[index]!, expected)) {
+                throw new Error(`SQL block digest at height ${blockHeight} does not match its certified child`);
+            }
+            const bytes = headers[index];
+            if (!bytes) throw missingFinalization(height);
+            const header = await authenticatedHeader(bytes, expected, blockHeight);
+            if (blockHeight === height) {
+                // An ancestor has no certificate of its own, so report the view it
+                // was proposed in rather than the descendant certificate's view.
+                // Without epoch changes there are no re-proposals, so this matches
+                // the view a direct finalization would carry.
+                return {
+                    height,
+                    view: header.view,
+                    blockDigest: expected,
+                    parentDigest: header.parentDigest,
+                    stateRoot: header.stateRoot,
+                    stateStart: header.stateStart,
+                    stateTip: header.stateTip,
+                    transactionsRoot: header.transactionsRoot,
+                    transactionsStart: header.transactionsStart,
+                    transactionsTip: header.transactionsTip,
+                };
+            }
+            expected = header.parentDigest;
+        }
+        top = bottom - 1n;
+    }
+}
+
+async function blockDigestHints(
+    sqlUrl: string,
+    bottom: bigint,
+    top: bigint,
+    requestedHeight: bigint,
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
+): Promise<Uint8Array[]> {
+    const result = await sqlQuery(
+        sqlUrl,
+        `
+            SELECT ${BLOCK_META_HEIGHT}, ${BLOCK_META_DIGEST}
+            FROM ${BLOCK_META_TABLE}
+            WHERE ${BLOCK_META_HEIGHT} >= ${bottom.toString()} AND ${BLOCK_META_HEIGHT} < ${top.toString()}
+            ORDER BY ${BLOCK_META_HEIGHT}
+            LIMIT ${(top - bottom).toString()}
+        `,
+        minSequenceNumber,
+        signal,
+    );
+    const digests = new Map<bigint, Uint8Array>();
+    for (const row of tableRows(result.table)) {
+        const blockHeight = expectBigint(columnValue(row, BLOCK_META_HEIGHT), BLOCK_META_HEIGHT);
+        const digest = expectBytes(columnValue(row, BLOCK_META_DIGEST), BLOCK_META_DIGEST, DIGEST_BYTES);
+        if (blockHeight < bottom || blockHeight >= top || digests.has(blockHeight)) {
+            throw new Error(`SQL block digest hints contain unexpected height ${blockHeight}`);
+        }
+        digests.set(blockHeight, digest);
+    }
+
+    // A missing row may only be indexing lag, so it remains retryable.
+    const hints: Uint8Array[] = [];
+    for (let blockHeight = bottom; blockHeight < top; blockHeight++) {
+        const digest = digests.get(blockHeight);
+        if (!digest) throw missingFinalization(requestedHeight);
+        hints.push(digest);
+    }
+    return hints;
+}
+
+// Header values are unauthenticated. Results are matched by key, so a missing
+// or extra row cannot shift a value onto another digest.
+async function headersByDigest(
+    store: StoreClient,
+    digests: readonly Uint8Array[],
+    minSequenceNumber: bigint,
+    signal?: AbortSignal,
+): Promise<Array<Uint8Array | undefined>> {
+    const keys = digests.map((digest) => headerByDigestKey(digest));
+
+    // The SDK cannot cancel getMany, so an abandoned walk stops after this batch.
+    const entries = await store.getMany(keys, keys.length, undefined, minSequenceNumber);
+    signal?.throwIfAborted();
+    const values = new Map<string, Uint8Array>();
+    for (const { key, value } of entries) {
+        if (value !== undefined) values.set(toHex(key), value);
+    }
+    return keys.map((key) => values.get(toHex(key)));
+}
+
+async function authenticatedHeader(
+    bytes: Uint8Array,
+    digest: Uint8Array,
+    height: bigint,
+): Promise<DecodedBlockHeader> {
+    const actual = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(bytes)));
+    if (!bytesEqual(actual, digest)) {
+        throw new Error(`block header at height ${height} does not match its certified digest`);
+    }
+    const header = decodeBlockHeader(bytes, 0);
+    if (header.endOffset !== bytes.length) {
+        throw new Error(`block header at height ${height} has trailing bytes`);
+    }
+    if (header.height !== height) {
+        throw new Error(`block header height ${header.height} does not match chain height ${height}`);
+    }
+    return header;
+}
+
+function finalizedHeightFromKey(key: Uint8Array): bigint {
+    if (key.length !== 1 + U64_BYTES || key[0] !== SimplexRecordKind.FinalizedByHeight) {
+        throw new Error('Simplex descendant query returned a malformed height key');
+    }
+    return readU64Be(key, 1);
+}
+
+function missingFinalization(height: bigint): Error {
+    return new Error(`finalization missing at height ${height}`);
 }
 
 async function verifiedSimplexClient(
@@ -779,12 +1065,15 @@ async function verifiedSimplexClient(
     if (simplexVerificationMaterial.trim().length === 0) {
         throw new Error('Simplex verification material is not configured');
     }
-    const store = new Client(trimTrailingSlash(storeUrl)).store(
-        new StoreKeyPrefix(SIMPLEX_STORE_PREFIX),
-    );
-    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(store, {
+    return new SimplexClient<VerifiedSimplexCertificate, VerifiedSimplexCertificate>(simplexStore(storeUrl), {
         verifier: await simplexFinalizationVerifier(simplexVerificationMaterial),
     });
+}
+
+function simplexStore(storeUrl: string): StoreClient {
+    return new Client(trimTrailingSlash(storeUrl)).store(
+        new StoreKeyPrefix(SIMPLEX_STORE_PREFIX),
+    );
 }
 
 function simplexFinalizationVerifier(
@@ -801,7 +1090,7 @@ function simplexFinalizationVerifier(
 
 async function finalizedTargetFromCertificate(
     certificate: VerifiedSimplexCertificate,
-): Promise<FinalizedTransactionTarget> {
+): Promise<AuthenticatedTarget> {
     const certified = certificate.header;
     if (certificate.payload.length !== COMMITMENT_BYTES) {
         throw new Error(`certified commitment must be ${COMMITMENT_BYTES} bytes`);
@@ -834,10 +1123,13 @@ async function finalizedTargetFromCertificate(
         stateStart: header.stateStart,
         stateTip: header.stateTip,
         blockDigest,
+        parentDigest: header.parentDigest,
     };
 }
 
 interface DecodedBlockHeader {
+    readonly view: bigint;
+    readonly parentDigest: Uint8Array;
     readonly height: bigint;
     readonly stateRoot: Uint8Array;
     readonly stateStart: bigint;
@@ -848,44 +1140,55 @@ interface DecodedBlockHeader {
     readonly endOffset: number;
 }
 
+// Header<Commitment, Sha256, Ed25519> encodes its context (round epoch and view,
+// leader, and parent view and commitment), then the parent digest, height,
+// timestamp, state target, and transaction target. This parser stays narrow.
+// Callers bind the exact encoded bytes to a certified digest before trusting fields.
 function decodeBlockHeader(bytes: Uint8Array, offset: number): DecodedBlockHeader {
-    // Header<Commitment, Sha256, Ed25519>: Context, parent digest, height,
-    // timestamp, state target, and transaction target. We keep this parser
-    // narrow and verify the exact encoded header hash before trusting fields.
-    offset = readVarint(bytes, offset).offset; // context.round.epoch
-    offset = readVarint(bytes, offset).offset; // context.round.view
-    offset = skip(bytes, offset, ED25519_PUBLIC_KEY_BYTES); // context.leader
-    offset = readVarint(bytes, offset).offset; // context.parent.view
-    offset = skip(bytes, offset, COMMITMENT_BYTES); // context.parent.digest
-    offset = skip(bytes, offset, DIGEST_BYTES); // header.parent
-    const height = readU64Be(bytes, offset);
-    offset = skip(bytes, offset, 8);
-    offset = skip(bytes, offset, 8); // header.timestamp
+    const epoch = readVarint(bytes, offset);
+    const view = readVarint(bytes, epoch.offset);
+    offset = skip(bytes, view.offset, ED25519_PUBLIC_KEY_BYTES);
+    offset = readVarint(bytes, offset).offset;
+    offset = skip(bytes, offset, COMMITMENT_BYTES);
+
+    const parentDigest = readBytes(bytes, offset, DIGEST_BYTES);
+    offset = skip(bytes, offset, DIGEST_BYTES);
+    const height = readHeaderU64(bytes, offset);
+    const timestamp = readHeaderU64(bytes, height.offset);
+    offset = timestamp.offset;
+
     const stateRoot = readBytes(bytes, offset, DIGEST_BYTES);
     offset = skip(bytes, offset, DIGEST_BYTES);
-    const stateStart = readU64Be(bytes, offset);
-    offset = skip(bytes, offset, 8);
-    const stateTip = readU64Be(bytes, offset);
-    offset = skip(bytes, offset, 8);
+    const stateStart = readHeaderU64(bytes, offset);
+    const stateTip = readHeaderU64(bytes, stateStart.offset);
+    offset = stateTip.offset;
+
     const transactionsRoot = readBytes(bytes, offset, DIGEST_BYTES);
     offset = skip(bytes, offset, DIGEST_BYTES);
-    const transactionsStart = readU64Be(bytes, offset);
-    offset = skip(bytes, offset, 8);
-    const transactionsTip = readU64Be(bytes, offset);
-    offset = skip(bytes, offset, 8);
-    if (stateStart >= stateTip || transactionsStart >= transactionsTip) {
+    const transactionsStart = readHeaderU64(bytes, offset);
+    const transactionsTip = readHeaderU64(bytes, transactionsStart.offset);
+    offset = transactionsTip.offset;
+
+    if (stateStart.value >= stateTip.value || transactionsStart.value >= transactionsTip.value) {
         throw new Error('finalized block contains an empty QMDB range');
     }
     return {
-        height,
+        view: view.value,
+        parentDigest,
+        height: height.value,
         stateRoot,
-        stateStart,
-        stateTip,
+        stateStart: stateStart.value,
+        stateTip: stateTip.value,
         transactionsRoot,
-        transactionsStart,
-        transactionsTip,
+        transactionsStart: transactionsStart.value,
+        transactionsTip: transactionsTip.value,
         endOffset: offset,
     };
+}
+
+function readHeaderU64(bytes: Uint8Array, offset: number): { value: bigint; offset: number } {
+    const next = skip(bytes, offset, U64_BYTES);
+    return { value: readU64Be(bytes, offset), offset: next };
 }
 
 function readBytes(bytes: Uint8Array, offset: number, length: number): Uint8Array {

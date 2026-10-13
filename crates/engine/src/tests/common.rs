@@ -38,6 +38,7 @@ pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX
 
 #[derive(Clone, Default)]
 pub(crate) struct RestartBarrier {
+    processed_height: u64,
     held: Arc<Mutex<Vec<Exact>>>,
     released: Arc<AtomicBool>,
     starts: Arc<AtomicUsize>,
@@ -47,6 +48,17 @@ pub(crate) struct RestartBarrier {
 }
 
 impl RestartBarrier {
+    pub(crate) fn new(processed_height: u64) -> Self {
+        Self {
+            processed_height,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn processed_height(&self) -> u64 {
+        self.processed_height
+    }
+
     pub(crate) fn begin_start(&self) -> bool {
         let restarting = self.starts.fetch_add(1, Ordering::SeqCst) > 0;
         if !restarting {
@@ -66,7 +78,7 @@ impl RestartBarrier {
     }
 
     fn acknowledge(&self, block_height: u64, acknowledgement: Exact) {
-        if block_height == 0 || self.released.load(Ordering::SeqCst) {
+        if block_height <= self.processed_height || self.released.load(Ordering::SeqCst) {
             acknowledgement.acknowledge();
             return;
         }

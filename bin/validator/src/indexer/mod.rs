@@ -75,6 +75,22 @@ pub(crate) struct IndexerHandle {
     pub(crate) finalized_hook: ValidatorFinalizedHook,
     pub(crate) finalizations: Arc<OnceLock<EngineFinalizationReader>>,
     pub(crate) critical_task: CriticalTask,
+    captured_height: u64,
+}
+
+impl IndexerHandle {
+    pub(crate) fn validate_startup(&self, processed_height: u64) {
+        validate_capture_progress(self.captured_height, processed_height);
+    }
+}
+
+fn validate_capture_progress(captured_height: u64, processed_height: u64) {
+    // Capture commits before Marshal records the acknowledgement, so a receipt
+    // ahead of processed progress is valid after a crash.
+    assert!(
+        captured_height >= processed_height,
+        "cannot start indexer with capture height {captured_height} behind the node's processed height {processed_height}. Indexing requires continuous capture from genesis. Restore matching node and indexer data or use a fresh indexing node and Store"
+    );
 }
 
 /// Connects the indexer publisher once and shares it across uploads.
@@ -285,6 +301,7 @@ pub(crate) async fn maybe_build_indexer(
         finalized_hook: indexer_finalized_hook(finalized_producer),
         finalizations,
         critical_task: indexer_critical_task(cert_join, finalized_join),
+        captured_height: receipt.map_or(0, |receipt| receipt.height),
     }))
 }
 
@@ -309,10 +326,34 @@ mod tests {
         FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES, IndexerConfig, StoreClientBuildError,
         maybe_build_indexer,
         queue::{FinalizedReceiptStore, capture_receipt},
+        validate_capture_progress,
     };
     use commonware_runtime::{Clock as _, Runner as _, Supervisor as _};
     use commonware_utils::NZUsize;
     use std::time::Duration;
+
+    #[test]
+    fn startup_allows_fresh_capture_and_acknowledgement_replay() {
+        validate_capture_progress(0, 0);
+        validate_capture_progress(7, 7);
+        validate_capture_progress(8, 7);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "cannot start indexer with capture height 0 behind the node's processed height 7"
+    )]
+    fn startup_rejects_enabling_capture_after_processing_history() {
+        validate_capture_progress(0, 7);
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "cannot start indexer with capture height 6 behind the node's processed height 7"
+    )]
+    fn startup_rejects_capture_history_behind_processed_progress() {
+        validate_capture_progress(6, 7);
+    }
 
     #[test]
     fn only_fresh_startup_waits_for_the_publisher_connection() {

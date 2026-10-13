@@ -2,7 +2,7 @@
 
 use crate::{
     config::{LoadedConfig, StartupModeConfig, load_deployer_config, load_local_config},
-    indexer::{IndexerHandle, maybe_build_indexer},
+    indexer::maybe_build_indexer,
     state_reader::StateDbReader,
 };
 use commonware_codec::Encode;
@@ -387,18 +387,9 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         )
         .await
         .expect("failed to configure indexer Store client");
-        let (finalized_hook, indexer_finalizations, indexer_task) = match indexer_handle {
-            Some(IndexerHandle {
-                finalized_hook,
-                finalizations,
-                critical_task,
-            }) => (
-                Some(finalized_hook),
-                Some(finalizations),
-                Some(critical_task),
-            ),
-            None => (None, None, None),
-        };
+        let finalized_hook = indexer_handle
+            .as_ref()
+            .map(|indexer| indexer.finalized_hook.clone());
 
         info!("initializing engine");
         let engine = Engine::<
@@ -427,6 +418,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 strategy,
                 public_key_cache,
                 startup,
+                allow_state_sync: indexer_handle.is_none(),
                 sync_config: production_sync_config(),
                 prune_config: Some(PRUNE_CONFIG),
                 genesis_leader: decoded.genesis_leader,
@@ -442,9 +434,13 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         )
         .await;
 
-        if let Some(finalizations) = indexer_finalizations {
+        if let Some(indexer) = &indexer_handle {
+            indexer.validate_startup(engine.startup_processed_height());
             assert!(
-                finalizations.set(engine.finalization_reader()).is_ok(),
+                indexer
+                    .finalizations
+                    .set(engine.finalization_reader())
+                    .is_ok(),
                 "finalization reader must be installed exactly once"
             );
         }
@@ -475,7 +471,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
 
         wait_for_critical_task_exit(
             Some(probe_handle),
-            indexer_task,
+            indexer_handle.map(|indexer| indexer.critical_task),
             engine_handle,
             mempool_handle,
             network_handle,

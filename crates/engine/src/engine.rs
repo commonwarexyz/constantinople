@@ -178,6 +178,8 @@ where
     pub strategy: St,
     pub public_key_cache: PublicKeyCache,
     pub startup: StartupMode,
+    /// Whether requested or interrupted peer state sync may skip local execution.
+    pub allow_state_sync: bool,
     pub sync_config: SyncEngineConfig,
     pub prune_config: Option<PruneConfig>,
     pub genesis_leader: C::PublicKey,
@@ -246,6 +248,7 @@ where
         St,
     >,
     marshal_mailbox: EngineMarshalMailbox<H, C::PublicKey, V>,
+    startup_processed_height: u64,
     #[cfg(all(test, feature = "test-utils"))]
     startup_sync_floor: Option<EngineFinalization<C::PublicKey, V, H>>,
     #[cfg(all(test, feature = "test-utils"))]
@@ -267,6 +270,12 @@ where
     BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
+    /// Returns the durable processed height recovered before the engine starts.
+    /// Genesis and an empty processed history both return zero.
+    pub const fn startup_processed_height(&self) -> u64 {
+        self.startup_processed_height
+    }
+
     /// Returns a handle for reading finalization certificates stored by marshal.
     pub fn finalization_reader(&self) -> FinalizationReader<H, C::PublicKey, V> {
         FinalizationReader::new(self.marshal_mailbox.clone())
@@ -405,6 +414,10 @@ where
         // interrupted state sync discovers a new floor.
         let state_sync_requested = matches!(&config.startup, StartupMode::StateSync);
         if startup_plan.should_sync(state_sync_requested) {
+            assert!(
+                config.allow_state_sync,
+                "cannot start with a requested or interrupted state sync while full finalized history is required. Indexing requires continuous capture from genesis"
+            );
             let finalization = config
                 .probe
                 .as_ref()
@@ -467,6 +480,9 @@ where
             },
         )
         .await;
+        let startup_processed_height = marshal_floor
+            .processed()
+            .map_or(0, |processed| processed.height().get());
         if let Some(probe) = &config.probe {
             probe.attach(marshal_mailbox.clone());
         }
@@ -599,6 +615,7 @@ where
             coding_config,
             marshal,
             marshal_mailbox,
+            startup_processed_height,
             #[cfg(all(test, feature = "test-utils"))]
             startup_sync_floor,
             #[cfg(all(test, feature = "test-utils"))]
