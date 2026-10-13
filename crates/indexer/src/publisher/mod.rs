@@ -33,7 +33,7 @@ use std::{
     future::Future,
     time::{Duration, Instant},
 };
-use tokio::time::{sleep, timeout};
+use tokio::time::sleep;
 use tracing::{Instrument as _, field, info_span, warn};
 
 // Resolve the subsecond differences between preparation and Store commits.
@@ -248,11 +248,8 @@ impl PublisherMetrics {
     }
 }
 
-// Persistent failures must release the worker so supervision can recover it.
-const COMMIT_MAX_ATTEMPTS: u32 = 8;
-const COMMIT_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// Retries transient Store failures within a fixed attempt and time budget.
+/// Retries transient Store failures until the batch commits.
+/// Individual requests are bounded by the Store client deadline.
 pub(crate) async fn commit_with_retry(
     client: &StoreClient,
     batch: &StoreWriteBatch,
@@ -265,7 +262,7 @@ pub(crate) async fn commit_with_retry(
     async {
         let start = Instant::now();
         metrics.in_flight.inc();
-        let result = bounded_commit_retry(
+        let result = retry_store_commit(
             |attempt| {
                 let labels = labels.clone();
                 async move {
@@ -326,7 +323,7 @@ pub(crate) async fn commit_with_retry(
     .await
 }
 
-async fn bounded_commit_retry<F>(
+async fn retry_store_commit<F>(
     mut commit: impl FnMut(u32) -> F,
     what: &'static str,
     rows: usize,
@@ -334,47 +331,38 @@ async fn bounded_commit_retry<F>(
 where
     F: Future<Output = Result<u64, ClientError>>,
 {
-    timeout(COMMIT_TIMEOUT, async {
-        let mut attempt = 0;
-        loop {
-            attempt += 1;
-            match commit(attempt).await {
-                Ok(seq) => return Ok(seq),
-                Err(error) => {
-                    if !is_retryable_store_error(&error) || attempt == COMMIT_MAX_ATTEMPTS {
-                        warn!(
-                            ?error,
-                            put_too_large = ?error.put_too_large(),
-                            attempt,
-                            rows,
-                            what,
-                            "store batch commit failed, stopping"
-                        );
-                        return Err(error);
-                    }
+    let mut attempt = 0u32;
+    loop {
+        attempt = attempt.saturating_add(1);
+        match commit(attempt).await {
+            Ok(seq) => return Ok(seq),
+            Err(error) => {
+                if !is_retryable_store_error(&error) {
                     warn!(
                         ?error,
-                        attempt, rows, what, "store batch commit failed, retrying"
+                        put_too_large = ?error.put_too_large(),
+                        attempt,
+                        rows,
+                        what,
+                        "store batch commit failed, stopping"
                     );
-                    let backoff = retry_backoff(attempt);
-                    sleep(backoff)
-                        .instrument(info_span!(
-                            "store_commit_backoff",
-                            attempt,
-                            backoff_ms = backoff.as_millis(),
-                        ))
-                        .await;
+                    return Err(error);
                 }
+                warn!(
+                    ?error,
+                    attempt, rows, what, "store batch commit failed, retrying"
+                );
+                let backoff = retry_backoff(attempt);
+                sleep(backoff)
+                    .instrument(info_span!(
+                        "store_commit_backoff",
+                        attempt,
+                        backoff_ms = backoff.as_millis(),
+                    ))
+                    .await;
             }
         }
-    })
-    .await
-    .unwrap_or_else(|_| {
-        warn!(rows, what, "store batch commit retry deadline expired");
-        Err(ClientError::Rpc(Box::new(
-            exoware_sdk::ConnectError::deadline_exceeded("Store commit retry budget expired"),
-        )))
-    })
+    }
 }
 
 fn store_error_label(error: &ClientError) -> &'static str {
@@ -430,6 +418,7 @@ mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, telemetry::metrics::has_metric_value};
     use exoware_sdk::{ConnectError, Key};
+    use tokio::time::timeout;
 
     fn put_error_response(code: &str, message: &str) -> axum::response::Response {
         use axum::{http::header::CONTENT_TYPE, response::IntoResponse as _};
@@ -735,7 +724,7 @@ mod tests {
     async fn store_retry_recovers_from_transient_failure() {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
-        let sequence = bounded_commit_retry(
+        let sequence = retry_store_commit(
             |_| {
                 attempts += 1;
                 std::future::ready(if attempts == 1 {
@@ -761,7 +750,7 @@ mod tests {
     async fn store_retry_stops_on_nonretryable_error() {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
-        let error = bounded_commit_retry(
+        let error = retry_store_commit(
             |_| {
                 attempts += 1;
                 std::future::ready(Err(ClientError::WireFormat("reject".to_string())))
@@ -778,64 +767,53 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn store_retry_stops_after_attempt_budget() {
+    async fn store_retry_recovers_after_repeated_overload() {
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
-        let error = bounded_commit_retry(
-            |_| {
-                attempts += 1;
-                std::future::ready(Err(ClientError::Rpc(Box::new(
-                    ConnectError::resource_exhausted(format!("busy attempt {attempts}")),
-                ))))
+        let sequence = retry_store_commit(
+            |attempt| {
+                attempts = attempt;
+                std::future::ready(if attempt <= 8 {
+                    Err(ClientError::Rpc(Box::new(
+                        ConnectError::resource_exhausted("busy"),
+                    )))
+                } else {
+                    Ok(17)
+                })
             },
             "test",
             1,
         )
         .await
-        .expect_err("persistent overload must stop");
+        .expect("overload should recover without restarting");
 
-        assert_eq!(attempts, 8);
-        assert_eq!(start.elapsed(), Duration::from_secs(9));
-        assert_eq!(error.rpc_code(), Some(ErrorCode::ResourceExhausted));
-        assert_eq!(
-            error.rpc_error().unwrap().message.as_deref(),
-            Some("busy attempt 8")
-        );
+        assert_eq!(attempts, 9);
+        assert_eq!(sequence, 17);
+        assert_eq!(start.elapsed(), Duration::from_secs(11));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn store_retry_deadline_bounds_attempts_and_backoff() {
-        // Cover a stalled attempt, slow failed attempts, and a backoff that crosses the deadline.
-        for (attempt_duration, expected_attempts) in [
-            (None, 1),
-            (Some(Duration::from_secs(25)), 3),
-            (Some(Duration::from_millis(59_900)), 1),
-        ] {
-            let start = tokio::time::Instant::now();
-            let mut attempts = 0;
-            let error = bounded_commit_retry(
-                |_| {
-                    attempts += 1;
-                    async move {
-                        match attempt_duration {
-                            Some(duration) => sleep(duration).await,
-                            None => std::future::pending().await,
-                        }
-                        Err(ClientError::Rpc(Box::new(ConnectError::unavailable(
-                            "busy",
-                        ))))
-                    }
-                },
-                "test",
-                1,
-            )
-            .await
-            .expect_err("the deadline must stop the commit");
+    async fn store_retry_recovers_after_repeated_request_timeouts() {
+        let start = tokio::time::Instant::now();
+        let sequence = retry_store_commit(
+            |attempt| async move {
+                if attempt <= 3 {
+                    sleep(Duration::from_secs(30)).await;
+                    Err(ClientError::Rpc(Box::new(ConnectError::deadline_exceeded(
+                        "request timed out",
+                    ))))
+                } else {
+                    Ok(17)
+                }
+            },
+            "test",
+            1,
+        )
+        .await
+        .expect("request timeouts should not impose an overall deadline");
 
-            assert_eq!(attempts, expected_attempts);
-            assert_eq!(start.elapsed(), COMMIT_TIMEOUT);
-            assert_eq!(error.rpc_code(), Some(ErrorCode::DeadlineExceeded));
-        }
+        assert_eq!(sequence, 17);
+        assert_eq!(start.elapsed(), Duration::from_millis(91_400));
     }
 
     #[tokio::test(start_paused = true)]
@@ -857,7 +835,7 @@ mod tests {
         };
         let start = tokio::time::Instant::now();
         let mut attempts = 0;
-        let error = bounded_commit_retry(
+        let error = retry_store_commit(
             |_| {
                 attempts += 1;
                 std::future::ready(Err(ClientError::Rpc(Box::new(with_error_info_detail(

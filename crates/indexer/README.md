@@ -162,10 +162,9 @@ overlap row preparation with transmission or bound total preparation memory.
 
 Remote Store commits retry the fully staged `StoreWriteBatch` with capped
 exponential backoff. Retries resend the complete logical request. Retryable
-failures retry for at most 8 attempts and 60 seconds per commit. After that the
-indexer task fails and the validator exits. The restarted process replays from
-the durable queue. Publication barriers advance only after all data requests
-have succeeded.
+failures have no attempt cap or overall deadline. Each writer request retains
+its 30-second timeout. Permanent errors fail the indexer task. Publication
+barriers advance only after all data requests have succeeded.
 
 [`Exact`]: https://docs.rs/commonware-utils/latest/commonware_utils/acknowledgement/struct.Exact.html
 

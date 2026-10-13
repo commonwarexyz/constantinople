@@ -106,11 +106,11 @@ and one height-to-digest publication target for every newly covered height.
 Only one barrier is in flight. A later block cannot publish across an earlier
 incomplete block, even if its data has already committed.
 
-Transient and ambiguous failures repeat the same deterministic writes. Each
-Store commit retries for at most 8 attempts and 60 seconds. After that the
-indexer task fails and the validator exits. The restarted process replays from
-the durable queue. Store request encoding and compression run off the async
-executor. QMDB preparation uses a separate publisher CPU pool. The ignored
+Transient and ambiguous failures repeat the same deterministic writes with
+capped exponential backoff and no attempt cap or overall deadline. Each writer
+request retains its 30-second timeout. Permanent errors fail the indexer task.
+Store request encoding and compression run off the async executor. QMDB
+preparation uses a separate publisher CPU pool. The ignored
 `large_block_data_uploads_with_bounded_requests` test uploads a 32 MiB proposal's
 SQL and QMDB rows through the real simulator transport.
 
