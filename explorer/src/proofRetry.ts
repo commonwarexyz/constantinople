@@ -11,9 +11,12 @@ const RETRYABLE_PROOF_ERROR =
 const RETRYABLE_FETCH_ERROR =
     /(?:^|:\s)(?:failed to fetch|fetch failed|load failed|networkerror when attempting to fetch resource\.?)$/i;
 
-const RETRYABLE_ACCOUNT_PROOF_ERRORS = [
+const ACCOUNT_SERVICE_ERRORS = [
     /\[unavailable\]/i,
     RETRYABLE_FETCH_ERROR,
+];
+
+const ACCOUNT_INDEXER_LAG_ERRORS = [
     /^finalization missing at height \d+$/,
     /^tx digest .+ missing from raw transaction index$/,
     /^account location \d+ is outside finalized state range$/,
@@ -29,6 +32,13 @@ const ACCOUNT_RETRY_DELAY_STEP_MS = 150;
 const ACCOUNT_RETRY_MAX_DELAY_MS = 2_000;
 
 type RetryWait = (delayMs: number, signal: AbortSignal) => Promise<boolean>;
+
+export interface RetryOptions {
+    readonly wait?: RetryWait;
+    readonly onRetry?: (error: unknown) => void;
+}
+
+export type AccountRetryReason = 'waiting for indexer' | 'retrying after service error';
 
 export interface ErrorInfo {
     readonly reason: string;
@@ -49,11 +59,23 @@ export function isMissingAccountProofError(detail: string): boolean {
 }
 
 export function isRetryableAccountProofError(error: unknown): boolean {
+    return accountRetryReason(error) !== undefined;
+}
+
+// Lagging reads resolve once the indexer catches up, while service errors
+// depend on the backend recovering. Anything else is terminal.
+export function accountRetryReason(error: unknown): AccountRetryReason | undefined {
     const detail = errorMessage(error);
-    return (
+    if (
         isConsistencyNotReadyError(error) ||
-        RETRYABLE_ACCOUNT_PROOF_ERRORS.some((pattern) => pattern.test(detail))
-    );
+        ACCOUNT_INDEXER_LAG_ERRORS.some((pattern) => pattern.test(detail))
+    ) {
+        return 'waiting for indexer';
+    }
+    if (ACCOUNT_SERVICE_ERRORS.some((pattern) => pattern.test(detail))) {
+        return 'retrying after service error';
+    }
+    return undefined;
 }
 
 // Proof errors can be rethrown with added context, so the serialized server
@@ -83,7 +105,7 @@ export async function retryAccountWork<T>(
     run: () => Promise<T>,
     signal: AbortSignal,
     isRetryable: (error: unknown) => boolean,
-    wait: RetryWait = waitForRetry,
+    { wait = waitForRetry, onRetry }: RetryOptions = {},
 ): Promise<T> {
     let failures = 0;
     while (true) {
@@ -95,6 +117,7 @@ export async function retryAccountWork<T>(
             if (!isRetryable(error)) {
                 throw error;
             }
+            onRetry?.(error);
             if (!(await wait(retryDelay(failures), signal))) throw cancelledError();
             failures += 1;
         }

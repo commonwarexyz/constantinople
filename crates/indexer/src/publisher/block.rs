@@ -2,6 +2,7 @@
 
 use crate::publisher::{
     SqlRow,
+    qmdb::PublishError,
     sql::{
         BlockMetaRow, TxActivityRole, TxActivityRow, TxMetaRow, encode_block_meta_row,
         encode_tx_activity_row, encode_tx_meta_row,
@@ -15,17 +16,9 @@ use constantinople_primitives::{
     AccountKey, LazySignedTransaction, Transaction, TransactionPublicKey,
 };
 use std::array::TryFromSliceError;
-use tracing::{info_span, warn};
-
-pub(crate) struct BlockRows<D: Digest> {
-    /// SQL rows for the block, its transactions, and their account activity.
-    pub sql: Vec<SqlRow>,
-    /// Transaction digests in append order.
-    pub transaction_digests: Vec<D>,
-}
+use tracing::info_span;
 
 struct IndexedTransaction<D: Digest> {
-    block_index: usize,
     digest: D,
     bytes: Bytes,
     sender: AccountKey,
@@ -63,10 +56,17 @@ where
     })
 }
 
+/// Encode SQL rows for a finalized block whose transaction history appends
+/// `appended` starting at `append_start`.
+///
+/// Consensus only finalizes well-formed transactions and appends each body
+/// digest in order, so any disagreement means the upload cannot be indexed.
 pub(crate) fn encode_block_rows<H, P>(
     block: &EngineBlock<H, P>,
     finalized_ts_micros: i64,
-) -> BlockRows<H::Digest>
+    append_start: u64,
+    appended: &[H::Digest],
+) -> Result<Vec<SqlRow>, PublishError>
 where
     H: Hasher,
     P: PublicKey,
@@ -79,30 +79,31 @@ where
         transactions = body_len
     )
     .entered();
-    let indexed_txs = block
-        .body
-        .iter()
-        .enumerate()
-        .filter_map(|(idx, lazy)| index_transaction::<H>(height, idx, lazy))
-        .collect::<Vec<_>>();
-    let tx_count = u64::try_from(indexed_txs.len()).expect("transaction count fits u64");
-    let append_start = block
-        .header
-        .transactions_range
-        .end()
-        .checked_sub(tx_count + 1)
-        .expect("transaction range includes appends plus commit");
+    if appended.len() != body_len {
+        return Err(PublishError::InvalidQueuedUpload {
+            reason: "transaction appends do not match the block body",
+        });
+    }
+    let tx_count = u64::try_from(body_len).expect("transaction count fits u64");
 
     // Readers derive a transaction's height from block_meta, so no
     // per-transaction proof row is needed.
     let mut sql = Vec::with_capacity(1 + 3 * body_len);
     sql.push(block_meta_row(block, tx_count, finalized_ts_micros));
 
-    let mut transaction_digests = Vec::with_capacity(indexed_txs.len());
-    for (materialized_idx, tx) in indexed_txs.into_iter().enumerate() {
-        transaction_digests.push(tx.digest);
-        let idx_u32 = u32::try_from(tx.block_index).expect("transaction index fits u32");
-        let qmdb_location = append_start + u64::try_from(materialized_idx).expect("index fits u64");
+    for (index, (lazy, appended)) in block.body.iter().zip(appended).enumerate() {
+        let tx = index_transaction::<H>(height, index, lazy)?;
+
+        // Proofs for a tx_meta location must return this transaction's digest.
+        if tx.digest != *appended {
+            return Err(PublishError::InvalidTransaction {
+                height,
+                index,
+                reason: "digest does not match its transaction history append",
+            });
+        }
+        let idx_u32 = u32::try_from(index).expect("transaction index fits u32");
+        let qmdb_location = append_start + u64::try_from(index).expect("index fits u64");
         let digest: [u8; 32] = tx
             .digest
             .as_ref()
@@ -143,43 +144,32 @@ where
         }
     }
 
-    BlockRows {
-        sql,
-        transaction_digests,
-    }
+    Ok(sql)
 }
 
 fn index_transaction<H>(
     height: u64,
-    block_index: usize,
+    index: usize,
     transaction: &LazySignedTransaction<H>,
-) -> Option<IndexedTransaction<H::Digest>>
+) -> Result<IndexedTransaction<H::Digest>, PublishError>
 where
     H: Hasher,
 {
+    let invalid = |reason| PublishError::InvalidTransaction {
+        height,
+        index,
+        reason,
+    };
     let signed_bytes = transaction.encoded_signed_transaction();
     let transaction_size = Transaction::<H::Digest>::SIZE;
     if signed_bytes.len() < transaction_size {
-        warn!(
-            height,
-            block_index,
-            signed_len = signed_bytes.len(),
-            transaction_size,
-            "indexer: skipping transaction with truncated signed payload"
-        );
-        return None;
+        return Err(invalid("signed payload is shorter than a transaction"));
     }
 
     let transaction_bytes = &signed_bytes[..transaction_size];
-    let Some(sender) =
+    let sender =
         AccountKey::from_public_key_bytes(&transaction_bytes[..TransactionPublicKey::SIZE])
-    else {
-        warn!(
-            height,
-            block_index, "indexer: sender public key bytes cannot derive an account key"
-        );
-        return None;
-    };
+            .ok_or_else(|| invalid("sender public key bytes cannot derive an account key"))?;
 
     let to_start = TransactionPublicKey::SIZE;
     let to_end = to_start + AccountKey::SIZE;
@@ -190,11 +180,7 @@ where
     let value = read_u64(&transaction_bytes[value_start..value_end])
         .expect("transaction value slice has fixed width");
     if value == 0 {
-        warn!(
-            height,
-            block_index, "indexer: skipping transaction with zero value"
-        );
-        return None;
+        return Err(invalid("value is zero"));
     }
 
     let nonce = read_u64(&transaction_bytes[nonce_start..nonce_end])
@@ -202,8 +188,7 @@ where
     let mut to = [0u8; AccountKey::SIZE];
     to.copy_from_slice(&transaction_bytes[to_start..to_end]);
 
-    Some(IndexedTransaction {
-        block_index,
+    Ok(IndexedTransaction {
         digest: H::hash(&[transaction_bytes]),
         bytes: signed_bytes,
         sender,
@@ -236,8 +221,8 @@ mod tests {
     use commonware_utils::{NZU16, non_empty_range, range::NonEmptyRange};
     use constantinople_engine::types::{EngineBlock, EngineCommitment};
     use constantinople_primitives::{
-        Block, Header, LazySignedTransaction, Sealable, Sealed, TRANSACTION_NAMESPACE, Transaction,
-        TransactionPublicKey,
+        Block, Header, LazySignedTransaction, Sealable, Sealed, SignedTransaction,
+        TRANSACTION_NAMESPACE, Transaction, TransactionPublicKey,
     };
     use core::num::NonZeroU64;
     use exoware_sql::CellValue;
@@ -260,61 +245,167 @@ mod tests {
             0,
         )
         .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
+        let digest = *transaction.message_digest();
         let block = EngineBlock::from(
             Block::<TestCommitment, PublicKey, Sha256>::new(
-                test_header(consensus_key.public_key(), 1),
+                test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
                 vec![transaction],
             )
             .seal(&mut Sha256::default()),
         );
 
-        let rows = encode_block_rows(&block, 1_000);
-        assert_activity_sender(&rows.sql, sender_account.as_ref());
+        let rows = encode_block_rows(&block, 1_000, 0, &[digest]).expect("block should index");
+        assert_activity_sender(&rows, sender_account.as_ref());
     }
 
     #[test]
-    fn block_meta_row_counts_indexed_transactions() {
-        let mut rng = StdRng::from_seed([5; 32]);
-        let consensus_key = ed25519::PrivateKey::random(&mut rng);
-        let signer = ed25519::PrivateKey::random(&mut rng);
-        let sender = TransactionPublicKey::ed25519(signer.public_key());
-        let recipient =
-            TransactionPublicKey::ed25519(ed25519::PrivateKey::random(&mut rng).public_key());
-        let transaction = Transaction::<sha256::Digest>::new(
-            sender,
-            recipient,
-            NonZeroU64::new(1).expect("test value should be non-zero"),
-            0,
-        )
-        .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default());
-        let mut zero_value_bytes = Vec::with_capacity(transaction.encode_size());
-        transaction.write(&mut zero_value_bytes);
-        let value_start = TransactionPublicKey::SIZE + AccountKey::SIZE;
-        zero_value_bytes[value_start..value_start + u64::SIZE].fill(0);
-        let mut encoded =
-            Vec::with_capacity(zero_value_bytes.len().encode_size() + zero_value_bytes.len());
-        zero_value_bytes.len().write(&mut encoded);
-        encoded.extend_from_slice(&zero_value_bytes);
-        let zero_value = LazySignedTransaction::<Sha256>::decode(encoded)
-            .expect("zero-value lazy transaction should decode");
-        let block = EngineBlock::from(Sealed::new_unchecked(
-            Block {
-                header: test_header(consensus_key.public_key(), 1),
-                body: vec![LazySignedTransaction::new(transaction), zero_value],
-            },
-            sha256::Digest::EMPTY,
-        ));
+    fn rows_locate_transactions_at_their_appends() {
+        let first = transfer(1);
+        let second = transfer(3);
+        let digests = [*first.message_digest(), *second.message_digest()];
 
-        let rows = encode_block_rows(&block, 1_000);
-        let row = &rows.sql[0];
-        assert_eq!(row.table, BLOCK_META_TABLE);
-        assert!(matches!(row.values.first(), Some(CellValue::UInt64(7))));
-        assert!(matches!(row.values.get(2), Some(CellValue::UInt64(1))));
-        assert_eq!(rows.transaction_digests.len(), 1);
-        assert!(matches!(
-            row.values.get(6),
-            Some(CellValue::Timestamp(1_000))
-        ));
+        // Earlier blocks' retained operations sit between the range start and these appends.
+        let block = unchecked_block(
+            vec![
+                LazySignedTransaction::new(first),
+                LazySignedTransaction::new(second),
+            ],
+            non_empty_range!(2u64, 10u64),
+        );
+        let rows = encode_block_rows(&block, 1_000, 7, &digests).expect("block should index");
+
+        let meta = &rows[0];
+        assert_eq!(meta.table, BLOCK_META_TABLE);
+        assert!(matches!(meta.values.get(2), Some(CellValue::UInt64(2))));
+        assert!(matches!(meta.values.get(4), Some(CellValue::UInt64(9))));
+        let locations = rows
+            .iter()
+            .filter(|row| row.table == TX_META_TABLE)
+            .map(|row| {
+                let Some(CellValue::FixedBinary(digest)) = row.values.first() else {
+                    panic!("tx_meta digest should be fixed binary");
+                };
+                let Some(CellValue::UInt64(location)) = row.values.get(1) else {
+                    panic!("tx_meta location should be u64");
+                };
+                (digest.clone(), *location)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            locations,
+            vec![
+                (digests[0].as_ref().to_vec(), 7),
+                (digests[1].as_ref().to_vec(), 8)
+            ]
+        );
+    }
+
+    #[test]
+    fn appends_must_cover_the_body_exactly() {
+        let transaction = transfer(1);
+        let digest = *transaction.message_digest();
+
+        // An empty block appends nothing before its commit.
+        let empty = unchecked_block(Vec::new(), non_empty_range!(0u64, 4u64));
+        let rows = encode_block_rows(&empty, 1_000, 3, &[]).expect("empty block should index");
+        assert_eq!(rows.len(), 1);
+        assert!(matches!(rows[0].values.get(2), Some(CellValue::UInt64(0))));
+
+        let single = unchecked_block(
+            vec![LazySignedTransaction::new(transaction)],
+            non_empty_range!(0u64, 4u64),
+        );
+        for (block, appended) in [
+            (&empty, vec![digest]),
+            (&single, Vec::new()),
+            (&single, vec![digest, digest]),
+        ] {
+            let Err(error) = encode_block_rows(block, 1_000, 1, &appended) else {
+                panic!("invalid block should not index");
+            };
+            assert!(
+                matches!(
+                    error,
+                    PublishError::InvalidQueuedUpload {
+                        reason: "transaction appends do not match the block body"
+                    }
+                ),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn append_digest_must_match_its_transaction() {
+        let first = transfer(1);
+        let second = transfer(3);
+        let first_digest = *first.message_digest();
+        let block = unchecked_block(
+            vec![
+                LazySignedTransaction::new(first),
+                LazySignedTransaction::new(second),
+            ],
+            non_empty_range!(0u64, 3u64),
+        );
+
+        let Err(error) = encode_block_rows(&block, 1_000, 0, &[first_digest, first_digest]) else {
+            panic!("invalid block should not index");
+        };
+        assert!(
+            matches!(
+                error,
+                PublishError::InvalidTransaction {
+                    height: 7,
+                    index: 1,
+                    reason: "digest does not match its transaction history append",
+                }
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn malformed_transactions_are_errors() {
+        let valid = transfer(1);
+        let digest = *valid.message_digest();
+        let mut encoded = Vec::with_capacity(valid.encode_size());
+        valid.write(&mut encoded);
+
+        let value_start = TransactionPublicKey::SIZE + AccountKey::SIZE;
+        let mut zero_value = encoded.clone();
+        zero_value[value_start..value_start + u64::SIZE].fill(0);
+        let mut unknown_scheme = encoded;
+        unknown_scheme[0] = u8::MAX;
+
+        for (malformed, reason) in [
+            (zero_value, "value is zero"),
+            (
+                unknown_scheme,
+                "sender public key bytes cannot derive an account key",
+            ),
+        ] {
+            let block = unchecked_block(
+                vec![
+                    LazySignedTransaction::new(valid.clone()),
+                    lazy_from_bytes(&malformed),
+                ],
+                non_empty_range!(0u64, 3u64),
+            );
+            let Err(error) = encode_block_rows(&block, 1_000, 0, &[digest, digest]) else {
+                panic!("invalid block should not index");
+            };
+            assert!(
+                matches!(
+                    error,
+                    PublishError::InvalidTransaction {
+                        height: 7,
+                        index: 1,
+                        reason: actual,
+                    } if actual == reason
+                ),
+                "{error}"
+            );
+        }
     }
 
     #[test]
@@ -339,24 +430,56 @@ mod tests {
         let sender_account = AccountKey::from_public_key_bytes(&invalid_sender)
             .expect("invalid ed25519 curve bytes still define an account key");
         transaction[..TransactionPublicKey::SIZE].copy_from_slice(&invalid_sender);
-        let mut encoded = Vec::with_capacity(transaction.len().encode_size() + transaction.len());
-        transaction.len().write(&mut encoded);
-        encoded.extend_from_slice(&transaction);
-        let lazy = LazySignedTransaction::<Sha256>::decode(encoded)
-            .expect("outer lazy transaction should decode");
+        let lazy = lazy_from_bytes(&transaction);
 
+        // The append digest covers the unsigned transaction bytes.
+        let digest = Sha256::hash(&[&transaction[..Transaction::<sha256::Digest>::SIZE]]);
         let block = EngineBlock::from(Sealed::new_unchecked(
             Block {
-                header: test_header(consensus_key.public_key(), 1),
+                header: test_header(consensus_key.public_key(), non_empty_range!(0u64, 2u64)),
                 body: vec![lazy],
             },
             sha256::Digest::EMPTY,
         ));
 
-        let rows = encode_block_rows(&block, 1_000);
-        assert_activity_sender(&rows.sql, sender_account.as_ref());
-        assert_eq!(rows.transaction_digests.len(), 1);
-        assert_tx_meta_body(&rows.sql, &transaction);
+        let rows = encode_block_rows(&block, 1_000, 0, &[digest]).expect("block should index");
+        assert_activity_sender(&rows, sender_account.as_ref());
+        assert_tx_meta_body(&rows, &transaction);
+    }
+
+    fn transfer(seed: u64) -> SignedTransaction<Sha256> {
+        let signer = ed25519::PrivateKey::from_seed(seed);
+        let recipient = ed25519::PrivateKey::from_seed(seed + 1).public_key();
+        Transaction::<sha256::Digest>::new(
+            TransactionPublicKey::ed25519(signer.public_key()),
+            TransactionPublicKey::ed25519(recipient),
+            NonZeroU64::MIN,
+            0,
+        )
+        .seal_and_sign(&signer, TRANSACTION_NAMESPACE, &mut Sha256::default())
+    }
+
+    // Decoding defers validation, so arbitrary bytes can stand in for a body entry.
+    fn lazy_from_bytes(transaction: &[u8]) -> LazySignedTransaction<Sha256> {
+        let mut encoded = Vec::with_capacity(transaction.len().encode_size() + transaction.len());
+        transaction.len().write(&mut encoded);
+        encoded.extend_from_slice(transaction);
+        LazySignedTransaction::<Sha256>::decode(encoded)
+            .expect("outer lazy transaction should decode")
+    }
+
+    fn unchecked_block(
+        body: Vec<LazySignedTransaction<Sha256>>,
+        transactions_range: NonEmptyRange<u64>,
+    ) -> EngineBlock<Sha256, PublicKey> {
+        let leader = ed25519::PrivateKey::from_seed(0).public_key();
+        EngineBlock::from(Sealed::new_unchecked(
+            Block {
+                header: test_header(leader, transactions_range),
+                body,
+            },
+            sha256::Digest::EMPTY,
+        ))
     }
 
     fn assert_activity_sender(rows: &[SqlRow], expected_account: &[u8]) {
@@ -398,9 +521,8 @@ mod tests {
 
     fn test_header(
         leader: PublicKey,
-        tx_count: usize,
+        transactions_range: NonEmptyRange<u64>,
     ) -> Header<TestCommitment, sha256::Digest, PublicKey> {
-        let transactions_end = u64::try_from(tx_count).expect("tx count fits u64") + 1;
         Header {
             context: Context {
                 round: Round::new(Epoch::zero(), View::zero()),
@@ -413,7 +535,7 @@ mod tests {
             state_root: sha256::Digest::EMPTY,
             state_range: non_empty_range!(0u64, 1u64) as NonEmptyRange<u64>,
             transactions_root: sha256::Digest::EMPTY,
-            transactions_range: non_empty_range!(0u64, transactions_end) as NonEmptyRange<u64>,
+            transactions_range,
         }
     }
 

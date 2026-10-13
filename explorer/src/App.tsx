@@ -45,8 +45,11 @@ import {
     type LatestProofTarget,
     type VerifiedAccountProof,
     type VerifiedTransactionProof,
-    type TransactionRowMetadata,
 } from './qmdb';
+import {
+    TransactionRowMetadataCache,
+    type TransactionRowMetadataBatch,
+} from './rowMetadata';
 import {
     consumeNonce,
     emptyNonceState,
@@ -56,6 +59,8 @@ import {
     type NonceState,
 } from './nonce';
 import {
+    accountRetryReason,
+    errorMessage,
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
@@ -142,7 +147,7 @@ interface AccountPage {
     readonly account: string;
     readonly rows: AccountTransactionRow[];
     readonly minSequenceNumber: bigint;
-    readonly metadata: Promise<ReadonlyMap<string, TransactionRowMetadata>>;
+    readonly metadata: Promise<TransactionRowMetadataBatch>;
 }
 
 interface AccountTxWithProof {
@@ -468,7 +473,9 @@ export default function App() {
             } finally {
                 attempt.abort();
             }
-        }, controller.signal, isRetryableAccountProofError)
+        }, controller.signal, isRetryableAccountProofError, {
+            onRetry: (error) => setAccountProof(retryingProofState(error)),
+        })
             .then(({ target, proof }) => {
                 if (controller.signal.aborted) return;
                 if (proof === null) {
@@ -532,18 +539,14 @@ export default function App() {
                     row,
                     proof: { status: 'waiting', detail: 'waiting for latest finalization' },
                 })));
-                const metadata = retryAccountWork(
-                    () => fetchTransactionRowMetadata({
-                        sqlUrl: indexerUrl,
-                        rows: page.rows,
-                        minSequenceNumber,
-                        signal: controller.signal,
-                    }),
-                    controller.signal,
-                    isRetryableAccountProofError,
-                );
+                const metadata = fetchTransactionRowMetadata({
+                    sqlUrl: indexerUrl,
+                    rows: page.rows,
+                    minSequenceNumber,
+                    signal: controller.signal,
+                });
 
-                // The certificate may still be loading when this request fails.
+                // Row proofs retry a failed prefetch once the certificate is ready.
                 void metadata.catch(() => {});
                 setAccountPage({ account: lookupAccount, rows: page.rows, minSequenceNumber, metadata });
             })
@@ -585,24 +588,17 @@ export default function App() {
         );
         let rowTarget = accountTarget;
         let targetRefresh: Promise<LatestProofTarget> | undefined;
-        let metadataFloor = accountPage.minSequenceNumber;
-        let metadataPromise = accountPage.metadata;
-        const rowMetadata = (target: LatestProofTarget) => {
-            if (target.sequenceNumber > metadataFloor) {
-                metadataFloor = target.sequenceNumber;
-                metadataPromise = retryAccountWork(
-                    () => fetchTransactionRowMetadata({
-                        sqlUrl: indexerUrl,
-                        rows,
-                        minSequenceNumber: target.sequenceNumber,
-                        signal: controller.signal,
-                    }),
-                    controller.signal,
-                    isRetryableAccountProofError,
-                );
-            }
-            return metadataPromise;
-        };
+        const metadata = new TransactionRowMetadataCache({
+            fetchBatch: (minSequenceNumber) => fetchTransactionRowMetadata({
+                sqlUrl: indexerUrl,
+                rows,
+                minSequenceNumber,
+                signal: controller.signal,
+            }),
+            isRetryable: isRetryableAccountProofError,
+            floor: accountPage.minSequenceNumber,
+            prefetched: accountPage.metadata,
+        });
 
         // A newer page can require a later certificate. Share that refresh
         // across rows and retain it through retries without following the tip.
@@ -635,16 +631,17 @@ export default function App() {
         rows.forEach((row, index) => {
             retryAccountWork(async () => {
                 const target = await rowProofTarget();
-                const metadata = await rowMetadata(target);
                 return fetchAndVerifyTransactionRowProof({
                     qmdbUrl,
                     sqlUrl: indexerUrl,
                     row,
                     target,
-                    metadata: metadata.get(row.digest),
+                    metadata: await metadata.lookup(row.digest, target.sequenceNumber),
                     signal: controller.signal,
                 });
-            }, controller.signal, isRetryableAccountProofError)
+            }, controller.signal, isRetryableAccountProofError, {
+                onRetry: (error) => updateRow(index, retryingProofState(error)),
+            })
                 .then((proof) => {
                     if (controller.signal.aborted) return;
                     updateRow(index, verifiedProofState(proof));
@@ -2098,6 +2095,10 @@ function verifiedProofState(proof: VerifiedTransactionProof): TransactionProofSt
         tip: proof.tip.toString(),
         proofSizeBytes: proof.proofSizeBytes,
     };
+}
+
+function retryingProofState(error: unknown) {
+    return { status: 'waiting', detail: accountRetryReason(error) ?? errorMessage(error) } as const;
 }
 
 function verifiedBlockCertificateState(certificate: {

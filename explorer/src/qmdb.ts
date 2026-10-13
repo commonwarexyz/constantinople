@@ -138,6 +138,12 @@ export interface TransactionRowMetadata {
     readonly sequenceNumber: bigint;
 }
 
+// Missing rows may still be indexing, while invalid rows can never verify.
+export type TransactionRowMetadataResult =
+    | { readonly status: 'indexed'; readonly metadata: TransactionRowMetadata }
+    | { readonly status: 'missing'; readonly error: Error }
+    | { readonly status: 'invalid'; readonly error: Error };
+
 export interface AccountProofMetadata extends AccountProofRow {
     readonly sequenceNumber: bigint;
 }
@@ -177,6 +183,9 @@ export function fetchAccountProofMetadata({
     return fetchAccountProofRow(sqlUrl, parseAccountBytes(account), undefined, minSequenceNumber, signal);
 }
 
+// Each digest's body is validated on its own, so one bad or lagging row cannot
+// withhold metadata from the rest of the page. Failures that cannot be
+// attributed to a requested digest still reject the whole batch.
 export async function fetchTransactionRowMetadata({
     sqlUrl,
     rows,
@@ -187,7 +196,7 @@ export async function fetchTransactionRowMetadata({
     rows: readonly AccountTransactionRow[];
     minSequenceNumber: bigint;
     signal?: AbortSignal;
-}): Promise<ReadonlyMap<string, TransactionRowMetadata>> {
+}): Promise<ReadonlyMap<string, TransactionRowMetadataResult>> {
     const digests = new Map(rows.map(({ digest }) => {
         const bytes = fromHex(digest);
         assertByteLength(bytes, DIGEST_BYTES, 'transaction digest');
@@ -203,21 +212,36 @@ export async function fetchTransactionRowMetadata({
         minSequenceNumber,
         signal,
     );
-    const metadata = new Map<string, TransactionRowMetadata>();
-    await Promise.all(tableRows(result.table).map(async (row) => {
-        const digest = expectVariableBytes(columnValue(row, TX_META_DIGEST), TX_META_DIGEST);
-        const hex = toHex(digest);
+
+    const matches = new Map<string, SqlRow[]>();
+    for (const row of tableRows(result.table)) {
+        const hex = toHex(expectVariableBytes(columnValue(row, TX_META_DIGEST), TX_META_DIGEST));
         if (!digests.has(hex)) throw new Error('SQL transaction metadata contains an unexpected digest');
-        const location = await verifiedTransactionLocation(row, digest);
-        if (metadata.has(hex)) throw new Error('SQL transaction metadata contains a duplicate digest');
-        metadata.set(hex, { location, sequenceNumber: result.sequenceNumber });
-    }));
-    for (const digest of digests.keys()) {
-        if (!metadata.has(digest)) {
-            throw new Error(`tx digest ${shortHex(digest)} missing from raw transaction index`);
-        }
+        matches.set(hex, [...matches.get(hex) ?? [], row]);
     }
-    return metadata;
+
+    return new Map(await Promise.all([...digests].map(async ([hex, digest]) => [
+        hex,
+        await transactionRowMetadataResult(matches.get(hex) ?? [], digest, result.sequenceNumber),
+    ] as const)));
+}
+
+async function transactionRowMetadataResult(
+    rows: readonly SqlRow[],
+    digest: Uint8Array,
+    sequenceNumber: bigint,
+): Promise<TransactionRowMetadataResult> {
+    const [row, duplicate] = rows;
+    if (!row) return { status: 'missing', error: missingTransactionMetadataError(digest) };
+    if (duplicate) {
+        return { status: 'invalid', error: new Error('SQL transaction metadata contains a duplicate digest') };
+    }
+    try {
+        const location = await verifiedTransactionLocation(row, digest);
+        return { status: 'indexed', metadata: { location, sequenceNumber } };
+    } catch (error) {
+        return { status: 'invalid', error: error instanceof Error ? error : new Error(String(error)) };
+    }
 }
 
 export async function fetchAndVerifyTransactionProof({
@@ -522,10 +546,14 @@ async function fetchVerifiedSqlTransactionMetadata(
     );
     const row = firstTableRow(result.table);
     if (!row) {
-        throw new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
+        throw missingTransactionMetadataError(digest);
     }
 
     return verifiedTransactionLocation(row, digest);
+}
+
+function missingTransactionMetadataError(digest: Uint8Array): Error {
+    return new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
 }
 
 async function verifiedTransactionLocation(row: SqlRow, digest: Uint8Array): Promise<bigint> {

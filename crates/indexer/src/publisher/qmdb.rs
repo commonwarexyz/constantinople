@@ -482,6 +482,12 @@ pub enum PublishError {
     SqlRow(String),
     #[error("invalid durable finalized upload because {reason}")]
     InvalidQueuedUpload { reason: &'static str },
+    #[error("finalized block {height} transaction {index} cannot be indexed because {reason}")]
+    InvalidTransaction {
+        height: u64,
+        index: usize,
+        reason: &'static str,
+    },
     #[error("finalized publication expected height {expected}, got {actual}")]
     HeightOutOfOrder { expected: u64, actual: u64 },
     #[error("{family} range expected start {expected}, got {actual}")]
@@ -1146,41 +1152,44 @@ where
         rows = tracing::field::Empty
     );
     let _entered = span.enter();
-    let block_rows = encode_block_rows(block, finalized_ts_micros);
-    validate_transaction_metadata_ops::<H>(&block_rows.transaction_digests, transactions)?;
-    let mut rows = block_rows.sql;
+    let appended = transaction_appends::<H>(transactions)?;
+    let mut rows = encode_block_rows(block, finalized_ts_micros, transactions.start, &appended)?;
     rows.extend(account_rows(state)?);
     span.record("rows", rows.len());
     Ok(rows)
 }
 
-fn validate_transaction_metadata_ops<H>(
-    expected: &[H::Digest],
+/// Digests appended by a finalized transaction-history batch.
+///
+/// Each batch appends one digest per block transaction and then commits once.
+/// Transaction locations are derived from that layout, so any other shape is
+/// rejected instead of shifting rows onto the wrong operations.
+fn transaction_appends<H>(
     range: &QueuedAuthenticatedRange<H::Digest>,
-) -> Result<(), PublishError>
+) -> Result<Vec<H::Digest>, PublishError>
 where
     H: Hasher,
     H::Digest: Codec,
 {
-    let mut expected = expected.iter();
-    let mut matches = true;
-    for encoded in &range.operations {
-        let operation =
-            TransactionOperation::<H>::decode(Copying(encoded.as_slice())).map_err(|_| {
-                PublishError::InvalidQueuedUpload {
+    // Authentication already requires the range to end at a commit.
+    let appends = range
+        .operations
+        .split_last()
+        .map_or(&[][..], |(_, appends)| appends);
+    appends
+        .iter()
+        .map(
+            |encoded| match TransactionOperation::<H>::decode(Copying(encoded.as_slice())) {
+                Ok(keyless::Operation::Append(digest)) => Ok(digest),
+                Ok(keyless::Operation::Commit(..)) => Err(PublishError::InvalidQueuedUpload {
+                    reason: "transaction operations commit before the final operation",
+                }),
+                Err(_) => Err(PublishError::InvalidQueuedUpload {
                     reason: "transaction operation bytes do not decode",
-                }
-            })?;
-        if let keyless::Operation::Append(digest) = operation {
-            matches &= expected.next() == Some(&digest);
-        }
-    }
-    if !matches || expected.next().is_some() {
-        return Err(PublishError::InvalidQueuedUpload {
-            reason: "transaction operations do not match block metadata",
-        });
-    }
-    Ok(())
+                }),
+            },
+        )
+        .collect()
 }
 
 fn account_rows<D: Digest>(
@@ -2681,6 +2690,118 @@ mod tests {
     }
 
     #[test]
+    fn data_preparation_requires_appends_then_one_commit() {
+        use constantinople_primitives::{Transaction, TransactionPublicKey};
+        use std::num::NonZeroU64;
+
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let store = StoreClient::new("http://localhost:1");
+            let schema = Arc::new(build_meta_schema(sql_meta_client(&store).unwrap()).unwrap());
+            let metrics = super::super::PublisherMetrics::new(&context);
+            let state_operations = encode_operations(&[
+                StateOperation::CommitFloor(None, Location::new(0)),
+                StateOperation::CommitFloor(None, Location::new(1)),
+            ]);
+            let signer = ed25519::PrivateKey::from_seed(7);
+            let key = TransactionPublicKey::ed25519(signer.public_key());
+            let transaction =
+                Transaction::<Sha256Digest>::new(key.clone(), key, NonZeroU64::MIN, 0)
+                    .seal_and_sign(
+                        &signer,
+                        constantinople_primitives::TRANSACTION_NAMESPACE,
+                        &mut Sha256::default(),
+                    );
+            let digest = *transaction.message_digest();
+            let append = || TransactionOperation::<Sha256>::Append(digest);
+            let commit = || TransactionOperation::<Sha256>::Commit(None, Location::new(0));
+
+            // Authentication owns the trailing commit, so metadata never sees a range without one.
+            let history = vec![commit(), append()];
+            let state = queued_range(&state_operations, 1, 2);
+            let transactions = queued_range(&encode_operations(&history), 1, 2);
+            let header = test_block(1, &state, &transactions).header.clone();
+            let block = Block::new(header, vec![transaction.clone()])
+                .seal(&mut Sha256::default())
+                .into();
+            let error = prepare_data_batch(
+                state_qmdb_client(&store).unwrap(),
+                transactions_qmdb_client(&store).unwrap(),
+                schema.clone(),
+                Sequential,
+                UploadData {
+                    block,
+                    finalized_ts_micros: 1,
+                    state,
+                    transactions,
+                    omit_pinned_nodes: false,
+                },
+                &metrics,
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    PublishError::Qmdb(QmdbError::CorruptData(ref message))
+                        if message == "authenticated range must end at a commit"
+                ),
+                "{error}"
+            );
+
+            // A trailing extra commit would shift derived locations off the appends.
+            for (has_transaction, operations, expected) in [
+                (false, vec![commit()], None),
+                (true, vec![append(), commit()], None),
+                (
+                    true,
+                    vec![append(), commit(), commit()],
+                    Some("transaction operations commit before the final operation"),
+                ),
+                (
+                    false,
+                    vec![commit(), commit()],
+                    Some("transaction operations commit before the final operation"),
+                ),
+            ] {
+                let mut history = vec![commit()];
+                history.extend(operations);
+                let end = u64::try_from(history.len()).expect("history length fits u64");
+                let state = queued_range(&state_operations, 1, 2);
+                let transactions = queued_range(&encode_operations(&history), 1, end);
+                let header = test_block(1, &state, &transactions).header.clone();
+                let body = if has_transaction {
+                    vec![transaction.clone()]
+                } else {
+                    Vec::new()
+                };
+                let block = Block::new(header, body).seal(&mut Sha256::default()).into();
+
+                let result = prepare_data_batch(
+                    state_qmdb_client(&store).unwrap(),
+                    transactions_qmdb_client(&store).unwrap(),
+                    schema.clone(),
+                    Sequential,
+                    UploadData {
+                        block,
+                        finalized_ts_micros: 1,
+                        state,
+                        transactions,
+                        omit_pinned_nodes: false,
+                    },
+                    &metrics,
+                );
+                match (result, expected) {
+                    (Ok(_), None) => {}
+                    (Err(PublishError::InvalidQueuedUpload { reason }), Some(expected)) => {
+                        assert_eq!(reason, expected);
+                    }
+                    (Ok(_), Some(expected)) => panic!("expected rejection because {expected}"),
+                    (Err(error), _) => panic!("unexpected preparation error {error}"),
+                }
+            }
+        });
+    }
+
+    #[test]
     #[ignore = "builds and uploads a deployment-sized block"]
     fn large_block_data_uploads_with_bounded_requests() {
         use constantinople_primitives::{Nonce, Transaction, TransactionPublicKey};
@@ -2980,11 +3101,14 @@ mod tests {
                         transaction_encoded[index..index + 1],
                     );
                 }
-                let rows = encode_block_rows(block, 0);
-                let transaction_count = u64::try_from(rows.transaction_digests.len())
-                    .expect("transaction count fits u64");
+                let transaction_count =
+                    u64::try_from(block.body.len()).expect("transaction count fits u64");
                 let append_start = block.header.transactions_range.end() - transaction_count - 1;
-                for (offset, digest) in rows.transaction_digests.into_iter().enumerate() {
+                for (offset, transaction) in block.body.iter().enumerate() {
+                    let digest = *transaction
+                        .get()
+                        .expect("test transaction decodes")
+                        .message_digest();
                     let offset = u64::try_from(offset).expect("transaction index fits u64");
                     let proof = Box::pin(transactions.operation_range_proof(
                         transaction_tip,
