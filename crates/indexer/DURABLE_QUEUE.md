@@ -109,9 +109,10 @@ incomplete block, even if its data has already committed.
 Transient and ambiguous failures repeat the same deterministic writes with
 capped exponential backoff and no attempt cap or overall deadline. Each writer
 request retains its 30-second timeout. Permanent errors fail the indexer task.
-Store request encoding and compression run off the async executor. QMDB
-preparation uses a separate publisher CPU pool. The ignored
-`large_block_data_uploads_with_bounded_requests` test uploads a 32 MiB proposal's
+QMDB preparation and Simplex block encoding and staging use blocking tasks.
+Store requests and retry backoff run on the async executor. The transport also
+encodes and compresses request messages there as it polls the outgoing body.
+The ignored `large_block_data_uploads_with_bounded_requests` test uploads a 32 MiB proposal's
 SQL and QMDB rows through the real simulator transport.
 
 Simplex stores the full encoded block as one value. The Store's value limit

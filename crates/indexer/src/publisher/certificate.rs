@@ -318,7 +318,7 @@ fn spawn_upload<Cx, H, P, S>(
     let client = client.clone();
     let commit_metrics = commit_metrics.clone();
     let metrics = metrics.clone();
-    uploads.push(context.shared(true).spawn(move |_| {
+    uploads.push(context.spawn(move |context| {
         async move {
             let QueuedUpload {
                 block,
@@ -328,22 +328,30 @@ fn spawn_upload<Cx, H, P, S>(
                 parent,
                 prepare_wait,
             } = upload;
-            drop(prepare_wait);
-
             let height = block.height().get();
-            let body_bytes = block.body.encode_size();
-            let mut prepared = info_span!(parent: &parent, "indexer.simplex.prepare", height)
-                .in_scope(|| prepare_upload(&client, &block, finalization, body_bytes));
+            let prepare_client = client.clone();
+            let prepare_parent = parent.clone();
+
+            // Release the blocking thread before waiting for Store persistence.
+            let (prepared, batch, body_bytes) = context
+                .child("prepare")
+                .shared(true)
+                .spawn(move |_| {
+                    async move {
+                        drop(prepare_wait);
+                        prepare_and_stage_upload(
+                            &prepare_client,
+                            &block,
+                            finalization,
+                            &prepare_parent,
+                        )
+                    }
+                    .with_current_subscriber()
+                })
+                .await
+                .expect("Simplex preparation task failed");
             metrics.body_bytes.observe(body_bytes as f64);
 
-            let mut batch = StoreWriteBatch::new();
-            let stage_rows =
-                info_span!(parent: &parent, "indexer.simplex.stage_rows", height, body_bytes);
-            stage_rows.in_scope(|| {
-                client
-                    .stage_upload(&mut prepared, &mut batch)
-                    .expect("prepared simplex upload must stage");
-            });
             let receipt = async {
                 let seq = super::commit_with_retry(
                     client.store_client().client(),
@@ -377,6 +385,32 @@ fn spawn_upload<Cx, H, P, S>(
         }
         .with_current_subscriber()
     }));
+}
+
+fn prepare_and_stage_upload<H, P, S>(
+    client: &SimplexWriter,
+    block: &EngineBlock<H, P>,
+    finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
+    parent: &Span,
+) -> (PreparedUpload, StoreWriteBatch, usize)
+where
+    H: Hasher,
+    P: PublicKey,
+    S: Scheme,
+{
+    let height = block.height().get();
+    let body_bytes = block.body.encode_size();
+    let mut prepared = info_span!(parent: parent, "indexer.simplex.prepare", height)
+        .in_scope(|| prepare_upload(client, block, finalization, body_bytes));
+
+    let mut batch = StoreWriteBatch::new();
+    let stage_rows = info_span!(parent: parent, "indexer.simplex.stage_rows", height, body_bytes);
+    stage_rows.in_scope(|| {
+        client
+            .stage_upload(&mut prepared, &mut batch)
+            .expect("prepared simplex upload must stage");
+    });
+    (prepared, batch, body_bytes)
 }
 
 /// Prepares the block, and its finalization when present, as one Store upload.
@@ -567,7 +601,9 @@ mod tests {
     #[test]
     fn finalized_block_completion_implies_exact_persistence() {
         commonware_runtime::tokio::Runner::new(
-            commonware_runtime::tokio::Config::default().with_worker_threads(1),
+            commonware_runtime::tokio::Config::default()
+                .with_worker_threads(1)
+                .with_max_blocking_threads(1),
         )
         .start(|context| async move {
             let store = crate::test_store::GatedIngestStore::open(0..1)
@@ -596,7 +632,11 @@ mod tests {
                 .await
                 .expect("uploader accepts finalized block");
             let mut wait = Box::pin(completion.wait());
-            store.wait_for_ingests(1).await;
+            let arrived =
+                tokio::time::timeout(Duration::from_secs(5), store.wait_for_ingests(1)).await;
+            let mut probe = context.child("probe").shared(true).spawn(|_| async {});
+            let probe_result = tokio::time::timeout(Duration::from_secs(1), &mut probe).await;
+            let probe_completed = matches!(&probe_result, Ok(Ok(())));
             assert!(
                 tokio::time::timeout(Duration::from_millis(10), wait.as_mut())
                     .await
@@ -604,7 +644,24 @@ mod tests {
                 "completion resolved before Store persistence"
             );
             store.release_ingest();
-            wait.await.expect("finalized block upload completes");
+            let persisted = tokio::time::timeout(Duration::from_secs(5), wait).await;
+            if persisted.is_err() {
+                uploader.abort();
+                probe.abort();
+            }
+            persisted
+                .expect("upload must not deadlock the blocking pool")
+                .expect("finalized block upload completes");
+            if probe_result.is_err() {
+                let drained = tokio::time::timeout(Duration::from_secs(5), &mut probe).await;
+                if drained.is_err() {
+                    uploader.abort();
+                    probe.abort();
+                }
+                drained
+                    .expect("probe must not deadlock the blocking pool")
+                    .expect("probe completes after persistence");
+            }
 
             let client = SimplexReader::new(
                 crate::namespaces::simplex_client(
@@ -657,6 +714,11 @@ mod tests {
             drop(reporter);
             uploader.await.expect("uploader exits cleanly");
             store.shutdown().await;
+            arrived.expect("upload reaches Store");
+            assert!(
+                probe_completed,
+                "Store waits must not occupy the blocking pool"
+            );
         });
     }
 

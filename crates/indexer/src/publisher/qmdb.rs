@@ -849,8 +849,8 @@ where
     let sql_schema = clients.sql_schema.clone();
     let admitted_at = Instant::now();
 
-    // Supervise preparation and data commits without holding a blocking
-    // thread while waiting for their completion.
+    // Only preparation holds a blocking thread. Store requests and retry
+    // backoff stay on the async executor.
     let data_span = info_span!(parent: &block_span, "indexer.qmdb.persist", height);
     context.spawn(move |context| {
         async move {
@@ -970,7 +970,7 @@ async fn commit_chunks<Cx: Spawner>(
                 rows = batch.len(),
                 encoded_bytes = batch.encoded_len()
             );
-            context.child("chunk").shared(true).spawn(move |_| {
+            context.child("chunk").spawn(move |_| {
                 async move {
                     super::commit_with_retry(&store, &batch, super::CommitKind::Chunk, &metrics)
                         .await
@@ -1793,6 +1793,68 @@ mod tests {
             drop(publisher);
             worker.await.expect("publisher drains");
             store.shutdown().await;
+        });
+    }
+
+    #[test]
+    fn chunk_commit_releases_blocking_pool_during_store_wait() {
+        use std::time::Duration;
+
+        commonware_runtime::tokio::Runner::new(
+            commonware_runtime::tokio::Config::default()
+                .with_worker_threads(1)
+                .with_max_blocking_threads(1),
+        )
+        .start(|context| async move {
+            let store = crate::test_store::GatedIngestStore::open(0..1)
+                .await
+                .expect("open Store");
+            let physical = writer_store_client(&store.url, None).expect("build Store client");
+            let client = PrefixedStoreClient::empty(physical.clone());
+            let metrics = super::super::StoreCommitMetrics::new(&context);
+            let mut batch = StoreWriteBatch::new();
+            batch
+                .push(
+                    &client,
+                    &Key::from_static(b"key"),
+                    Bytes::from_static(b"value"),
+                )
+                .expect("stage row");
+            let mut commit = context.child("commit").spawn(move |context| async move {
+                commit_chunks(context, &physical, &metrics, 1, vec![batch]).await
+            });
+            let arrived =
+                tokio::time::timeout(Duration::from_secs(5), store.wait_for_ingests(1)).await;
+            let mut probe = context.child("probe").shared(true).spawn(|_| async {});
+            let probe_result = tokio::time::timeout(Duration::from_secs(1), &mut probe).await;
+            let probe_completed = matches!(&probe_result, Ok(Ok(())));
+
+            // Drain the upload before asserting so a regression cannot strand a blocking task.
+            store.release_ingest();
+            let persisted = tokio::time::timeout(Duration::from_secs(5), &mut commit).await;
+            if persisted.is_err() {
+                commit.abort();
+                probe.abort();
+            }
+            persisted
+                .expect("upload must not deadlock the blocking pool")
+                .expect("commit task completes")
+                .expect("chunk persists");
+            if probe_result.is_err() {
+                let drained = tokio::time::timeout(Duration::from_secs(5), &mut probe).await;
+                if drained.is_err() {
+                    probe.abort();
+                }
+                drained
+                    .expect("probe must not deadlock the blocking pool")
+                    .expect("probe completes after persistence");
+            }
+            store.shutdown().await;
+            arrived.expect("upload reaches Store");
+            assert!(
+                probe_completed,
+                "Store waits must not occupy the blocking pool"
+            );
         });
     }
 
