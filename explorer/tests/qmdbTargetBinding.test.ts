@@ -329,6 +329,130 @@ test('transaction proof discovers its height despite an ahead-of-target report r
     assert.equal(proofRequest.mock.callCount(), 1);
 });
 
+for (const hintState of ['missing', 'error', 'pending'] as const) {
+    test(`transaction proof ignores a ${hintState} certificate for a different hinted height`, { timeout: 5_000 }, async (t) => {
+        const body = new Uint8Array(82).fill(0x33);
+        const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+        const certificate = await finalizedCertificate(HEIGHT);
+        const hintStarted = deferred<void>();
+        let hintSignal: AbortSignal | undefined;
+        const heights: string[] = [];
+        t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
+            height: string, floor: bigint, options: { signal?: AbortSignal },
+        ) => {
+            assert.equal(floor, FLOOR);
+            heights.push(height);
+            if (height === HEIGHT.toString()) return certificate;
+            assert.equal(height, (HEIGHT - 1n).toString());
+            hintSignal = options.signal;
+            hintStarted.resolve();
+            if (hintState === 'missing') return null;
+            if (hintState === 'error') throw new Error('hint certificate unavailable');
+            return new Promise<VerifiedSimplexCertificate>((_resolve, reject) => {
+                hintSignal!.addEventListener('abort', () => reject(hintSignal!.reason), { once: true });
+            });
+        });
+        mockNoDescendant(t);
+        t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
+            assert.equal(floor, FLOOR);
+            await hintStarted.promise;
+            return sql.includes('FROM tx_meta')
+                ? queryResult({ qmdb_location: LOCATION, body })
+                : blockMetaResult(sql, OWNING_BLOCKS);
+        });
+        const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
+            request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
+        ) => {
+            assert.equal(request.minSequenceNumber, FLOOR);
+            assert.equal(request.tip, 7n);
+            assert.equal(location, LOCATION);
+            assert.equal(toHex(value), digest);
+            assert.deepEqual(root, latestTarget().transactionsRoot);
+            return keylessProof(request, root, location, value);
+        });
+        const finalizations: bigint[] = [];
+
+        const proof = await fetchAndVerifyTransactionProof({
+            ...transactionProofOptions(digest),
+            finalizedHeight: HEIGHT - 1n,
+            signal: t.signal,
+            onFinalizationVerified: (target) => { finalizations.push(target.height); },
+        });
+
+        assert.equal(proof.height, HEIGHT);
+        assert.deepEqual(heights, [(HEIGHT - 1n).toString(), HEIGHT.toString()]);
+        assert.deepEqual(finalizations, [HEIGHT]);
+        assert.equal(proofRequest.mock.callCount(), 1);
+        if (hintState === 'pending') assert.equal(hintSignal?.aborted, true);
+    });
+}
+
+test('a certificate failure still rejects when SQL confirms the hinted height', async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const failure = new Error('owning certificate is invalid');
+    const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => {
+        throw failure;
+    });
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) => sql.includes('FROM tx_meta')
+        ? queryResult({ qmdb_location: LOCATION, body })
+        : blockMetaResult(sql, OWNING_BLOCKS));
+    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+        throw new Error('unexpected proof');
+    });
+
+    await assert.rejects(fetchAndVerifyTransactionProof({
+        ...transactionProofOptions(digest),
+        finalizedHeight: HEIGHT,
+    }), (error) => error === failure);
+
+    assert.equal(read.mock.callCount(), 1);
+    assert.equal(proof.mock.callCount(), 0);
+});
+
+test('cancellation stops the SQL-derived lookup after discarding a pending hint', { timeout: 5_000 }, async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const hintStarted = deferred<void>();
+    const owningStarted = deferred<void>();
+    const signals: AbortSignal[] = [];
+    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
+        height: string, _floor: bigint, options: { signal?: AbortSignal },
+    ) => new Promise<VerifiedSimplexCertificate>((_resolve, reject) => {
+        const signal = options.signal!;
+        signals.push(signal);
+        signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+        if (height === HEIGHT.toString()) owningStarted.resolve();
+        else hintStarted.resolve();
+    }));
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) => {
+        await hintStarted.promise;
+        return sql.includes('FROM tx_meta')
+            ? queryResult({ qmdb_location: LOCATION, body })
+            : blockMetaResult(sql, OWNING_BLOCKS);
+    });
+    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+        throw new Error('unexpected proof');
+    });
+    const controller = new AbortController();
+    const cancellation = new Error('caller left');
+    const pending = fetchAndVerifyTransactionProof({
+        ...transactionProofOptions(digest),
+        finalizedHeight: HEIGHT - 1n,
+        signal: AbortSignal.any([controller.signal, t.signal]),
+    });
+    const rejected = assert.rejects(pending, (error) => error === cancellation);
+
+    await owningStarted.promise;
+    assert.equal(signals[0]!.aborted, true);
+    controller.abort(cancellation);
+    await rejected;
+
+    assert.equal(signals.length, 2);
+    assert.equal(signals[1]!.aborted, true);
+    assert.equal(proof.mock.callCount(), 0);
+});
+
 test('an ahead-of-target report still waits when the SQL-derived height is uncovered', async (t) => {
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
@@ -405,6 +529,32 @@ test('a reported height at the publication boundary still authenticates its dige
         ...transactionProofOptions(digest),
         finalizedHeight: HEIGHT + 1n,
     }), /provable target digest does not match/);
+});
+
+test('a lower hint cannot bypass the publication digest when SQL resolves to the tip', async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const containing = await finalizedCertificate(HEIGHT);
+    const lower = await finalizedCertificate(HEIGHT - 1n);
+    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) =>
+        height === HEIGHT.toString() ? containing : lower);
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) => sql.includes('FROM tx_meta')
+        ? queryResult({ qmdb_location: LOCATION, body })
+        : blockMetaResult(sql, OWNING_BLOCKS));
+    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+        throw new Error('unexpected proof');
+    });
+    const finalizations: bigint[] = [];
+
+    await assert.rejects(fetchAndVerifyTransactionProof({
+        ...transactionProofOptions(digest),
+        publishedTarget: { height: HEIGHT, blockDigest: new Uint8Array(32), sequenceNumber: FLOOR },
+        finalizedHeight: HEIGHT - 1n,
+        onFinalizationVerified: (target) => { finalizations.push(target.height); },
+    }), /provable target digest does not match/);
+
+    assert.deepEqual(finalizations, []);
+    assert.equal(proof.mock.callCount(), 0);
 });
 
 test('reported-height proofs reject tampered transaction metadata', async (t) => {

@@ -47,11 +47,11 @@ index on `block_meta.transactions_tip` adds one entry per block for transaction
 height lookups. Every table is append-only. Store keys are immutable, so
 no table may rewrite an existing key with a different value. `account_meta` is
 keyed by `(account, qmdb_location)` with one row per account-state QMDB
-operation, and readers take the highest location for an account. Each
-finalized transaction adds one `tx_meta` row and one `tx_activity` row per
-distinct side to the bulk commit. The bulk commit bounds indexer
-throughput, so a per-transaction row is only added when readers cannot derive
-the same information elsewhere.
+operation, and proof readers take the highest location below the certified
+state boundary for an account. Each finalized transaction adds one `tx_meta`
+row and one `tx_activity` row per distinct side to the bulk commit. The bulk
+commit bounds indexer throughput, so a per-transaction row is only added when
+readers cannot derive the same information elsewhere.
 
 The digest-keyed `tx_meta` row contract is:
 
@@ -84,9 +84,11 @@ Simplex is the canonical block/header store. Blocks are available by digest
 without requiring a height certificate. Height/latest reads start from a
 finalization certificate, verify the commitment/header relationship, and fetch
 the full body only when requested. A height finalized through a descendant
-certificate, or backfilled after downtime, has no certificate of its own.
-Readers cannot obtain one directly for those heights, so Explorer transaction
-proofs for them never complete.
+certificate, or backfilled after downtime, may have no certificate available at
+capture. Explorer can authenticate that height using a verified descendant
+certificate and the parent-header chain. It batches header reads using SQL
+digest hints and verifies every link. Missing proof inputs remain retryable
+while their uploads catch up.
 
 [kvschema]: https://docs.rs/exoware-sql/latest/exoware_sql/struct.KvSchema.html
 

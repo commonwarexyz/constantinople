@@ -24,9 +24,11 @@ those counts for the indexer secondary in either deployment mode.
 `--indexer-publisher-rayon-threads` sizes its separate publication pool and defaults
 to `2`. The generated indexer YAML stores this as `indexer.publisher_rayon_threads`.
 
-`deploy.sh` sets these counts for its own topology. Chunk request encoding and
-compression use the runtime's shared blocking pool, so leave CPU headroom for
-that work. Thread counts do not pin threads to particular cores.
+`deploy.sh` sets these counts for its own topology. QMDB preparation and Simplex
+block encoding and staging use the runtime's shared blocking pool. Store
+requests run on async workers, including transport encoding and compression.
+Leave CPU headroom for both pools. Thread counts do not pin threads to
+particular cores.
 
 ## Local Deployment
 

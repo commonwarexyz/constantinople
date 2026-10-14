@@ -273,38 +273,52 @@ export async function fetchAndVerifyTransactionProof({
     const controller = new AbortController();
     signal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
     try {
-        // A covered hint starts certificate verification early. An ahead-of-target
-        // report must not prevent SQL from identifying the owning block.
+        // The hint overlaps verification with SQL, but must not gate a lookup
+        // for a different owning block. Observe failures even if SQL discards it.
         const targetHeight = coveredHeightHint ?? publishedTarget.height;
-        const [proofTarget, metadata] = await Promise.all([
-            targetHeight === publishedTarget.height
-                ? fetchLatestProofTarget({
-                    storeUrl,
-                    sqlUrl,
-                    simplexVerificationMaterial,
-                    publishedTarget,
-                    signal,
-                })
-                : finalizedTransactionTarget(
-                    source,
-                    targetHeight,
-                    publishedTarget.sequenceNumber,
-                    signal,
-                ),
-            fetchTransactionProofMetadata(
+        const targetController = new AbortController();
+        const targetSignal = AbortSignal.any([signal, targetController.signal]);
+        const targetResult = (targetHeight === publishedTarget.height
+            ? fetchLatestProofTarget({
+                storeUrl,
                 sqlUrl,
-                digest,
+                simplexVerificationMaterial,
+                publishedTarget,
+                signal: targetSignal,
+            })
+            : finalizedTransactionTarget(
+                source,
+                targetHeight,
                 publishedTarget.sequenceNumber,
-                signal,
-            ),
-        ]);
+                targetSignal,
+            )).then(
+                (target) => ({ target }),
+                (error: unknown) => ({ error }),
+            );
+        const metadata = await fetchTransactionProofMetadata(
+            sqlUrl,
+            digest,
+            publishedTarget.sequenceNumber,
+            signal,
+        );
+        signal.throwIfAborted();
         if (metadata.height > publishedTarget.height) {
             throw uncoveredError(`transaction height ${metadata.height}`);
         }
-        if (coveredHeightHint === undefined && metadata.location >= proofTarget.transactionsTip) {
+
+        let proofTarget: FinalizedTransactionTarget | undefined;
+        if (coveredHeightHint !== undefined && metadata.height !== targetHeight) {
+            targetController.abort();
+        } else {
+            const result = await targetResult;
+            signal.throwIfAborted();
+            if ('error' in result) throw result.error;
+            proofTarget = result.target;
+        }
+        if (coveredHeightHint === undefined && proofTarget && metadata.location >= proofTarget.transactionsTip) {
             throw uncoveredError(`transaction location ${metadata.location}`);
         }
-        const target = metadata.height === proofTarget.height
+        const target = metadata.height === proofTarget?.height
             ? proofTarget
             : await finalizedTransactionTarget(
                 source,
@@ -312,6 +326,8 @@ export async function fetchAndVerifyTransactionProof({
                 publishedTarget.sequenceNumber,
                 signal,
             );
+        signal.throwIfAborted();
+        assertPublishedTargetDigest(target, publishedTarget);
         if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
             throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
         }
@@ -368,12 +384,19 @@ export async function fetchLatestProofTarget({
         publishedTarget.sequenceNumber,
         signal,
     );
-    if (!bytesEqual(target.blockDigest, publishedTarget.blockDigest)) {
+    assertPublishedTargetDigest(target, publishedTarget);
+    return { ...target, sequenceNumber: publishedTarget.sequenceNumber };
+}
+
+function assertPublishedTargetDigest(
+    target: FinalizedTransactionTarget,
+    publishedTarget: PublishedProofTarget,
+): void {
+    if (target.height === publishedTarget.height && !bytesEqual(target.blockDigest, publishedTarget.blockDigest)) {
         throw new Error(
             `provable target digest does not match finalized certificate at height ${publishedTarget.height}`,
         );
     }
-    return { ...target, sequenceNumber: publishedTarget.sequenceNumber };
 }
 
 export async function fetchAccountTransactionsPage({

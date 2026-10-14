@@ -156,7 +156,8 @@ impl IndexerClient {
 
     /// Fetch the finalized publication target for `height`.
     ///
-    /// Presence reports that the publisher made the complete index visible.
+    /// Presence reports that the publisher made SQL metadata and both QMDB
+    /// ranges visible. Simplex block and certificate uploads may still be pending.
     /// Use `store_sequence_number` as the minimum sequence for subsequent reads.
     /// Authenticate the block digest against a verified finalization certificate
     /// before trusting roots from its header.

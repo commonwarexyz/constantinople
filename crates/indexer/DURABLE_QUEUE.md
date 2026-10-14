@@ -19,10 +19,10 @@ state sync do not produce these individual artifacts.
 The producer retrieves the height finalization from the marshal archive when
 one was stored and verifies that it certifies the block commitment. Marshal
 stores a per-height certificate only when it observed one. Heights finalized
-through a descendant certificate, and heights backfilled after downtime, carry
-none. The producer requires consecutive heights and operation ranges. The first
-captured block is height one and both ranges start at location one, after their
-authenticated genesis sentinels.
+through a descendant certificate, or backfilled after downtime, may have no
+certificate available at capture. The producer requires consecutive heights
+and operation ranges. The first captured block is height one and both ranges
+start at location one, after their authenticated genesis sentinels.
 
 Each payload contains:
 
@@ -62,8 +62,8 @@ block data, and preparation borrows the queued operations and pins.
 
 Payload reads can overlap, but a predecessor admission gate ensures the
 publisher receives uploads in queue order. Completed tasks are reaped while the
-next record waits for capacity. Queue read errors retry even if the producer
-never enqueues another block.
+next record waits for capacity. Queue read errors stop the indexer. Unacknowledged
+records remain available for recovery after restart.
 
 ## Authenticated preparation and publication
 
@@ -157,10 +157,11 @@ The publication target binds a height to its block digest. Its observed Store
 sequence is a minimum visibility floor for subsequent reads. It is not a
 snapshot ceiling, and a service may observe later rows.
 
-Readers verify the target's certificate and block digest, use the certified
-QMDB roots and boundaries, and pass the floor through Store, SQL, Simplex, and
-QMDB requests. A metadata row appearing early does not establish publication.
-A lagging service or unpublished QMDB tip remains retryable.
+Readers authenticate the target's block digest through its own finalization
+certificate or a verified descendant and parent-header chain. They use the
+authenticated QMDB roots and boundaries and pass the floor through Store, SQL,
+Simplex, and QMDB requests. A metadata row appearing early does not establish
+publication. Simplex artifacts may arrive after their publication target.
 
 `tx_meta` contains the digest, QMDB location, and signed transaction bytes.
 The containing height is derived from the preceding `block_meta` transaction
@@ -178,10 +179,16 @@ Explorer subscribes to publication targets and yields every covered height in a
 Store frame. A separate SQL stream caches block metadata ahead of publication.
 Display still requires matching publication sequence and digest checks, with
 point queries covering cache misses. Proof inputs can load concurrently, and
-account-page rows share a certificate instead of refreshing it per row. A proof
-for a height without a certificate cannot complete. The Explorer cannot yet
-tell a missing certificate apart from one whose Simplex upload has not landed,
-so it keeps retrying that proof.
+account-page rows share an authenticated target instead of refreshing it per row.
+If a height's certificate is missing, Explorer looks for a certified descendant
+and verifies the parent-header chain back to that height. Header reads are
+batched using untrusted SQL digest hints. Recomputed hashes and consecutive
+heights establish the chain.
+
+A missing certificate alone cannot distinguish upload lag from permanent
+omission. Explorer retries unavailable proof inputs and transient service
+failures with capped backoff and no attempt cap. The request remains active until
+it succeeds, is cancelled, or encounters a non-retryable error.
 
 ## Deployment and observability
 
@@ -199,6 +206,14 @@ The deploy CLI exposes indexer runtime threads, publisher CPU threads, and
 optional indexer instance sizing. The generated YAML sets upload concurrency
 and the upload byte budget. The configured amplification estimate needs
 validation under representative load.
+
+The on-disk backlog has no configured size limit. Size free disk space for the
+expected outage duration multiplied by the observed payload capture rate in
+bytes per second, with headroom for other node storage. Monitor
+`indexer_finalized_payloads_retained_bytes` alongside filesystem free space.
+Choose an alert threshold that leaves enough time to restore uploads before
+the disk fills. Payload bytes are retained until the completed queue section
+can be pruned.
 
 The publisher records preparation timings for queue wait, expansion, staging,
 and chunking, plus a paired CPU histogram for the preparation thread. It also
@@ -240,7 +255,8 @@ Regression coverage must establish:
 - Payloads and Simplex uploads for heights without a finalization certificate.
 - Retry and cancellation behavior when a worker or service fails.
 - Published-height reads that preserve sequence, digest, and root bindings.
-- Multi-height subscriptions, metadata catch-up, and bounded proof retries.
+- Multi-height subscriptions, metadata catch-up, and cancellable proof retries
+  with capped backoff.
 
 Deployment acceptance additionally requires backlog catch-up, restart, and
 request-size measurements at the intended proposal size. Confirm that memory

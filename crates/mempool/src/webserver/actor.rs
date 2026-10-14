@@ -848,8 +848,8 @@ where
                 Message::Report(Update::Block(block, acknowledgement)) => {
                     // Only this node's outstanding proposals consume the
                     // finalized-digest set (~1 in `participants` views), so
-                    // the full-body decode is skipped otherwise; the block is
-                    // still released on the strategy's pool off this loop.
+                    // the full-body decode is skipped otherwise. Adaptive
+                    // scheduling may release a small block inline.
                     if proposed.is_empty() {
                         let work_size = block.body.len();
                         drop(strategy.spawn(work_size, move |_: St| drop(block)));
@@ -861,9 +861,9 @@ where
                     let work_size = block.body.len();
 
                     // Deriving the finalized set decodes any transaction the
-                    // application has not already materialized, so it runs on
-                    // the strategy's pool (which also releases the block
-                    // there).
+                    // application has not already materialized. The strategy
+                    // schedules that work and block release together, but may
+                    // run small jobs inline.
                     let finalized: AHashSet<H::Digest> = strategy
                         .spawn(work_size, move |_: St| {
                             block

@@ -123,7 +123,7 @@ pub(crate) fn encode_tx_activity_row(tx: TxActivityRow) -> SqlRow {
     }
 }
 
-/// Encode one latest account row.
+/// Encode one account-state operation row.
 pub(crate) fn encode_account_meta_row(account: AccountMetaRow) -> SqlRow {
     SqlRow {
         table: ACCOUNT_META_TABLE,
