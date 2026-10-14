@@ -13,8 +13,8 @@ use tracing::info_span;
 
 pub(super) type PreparedBody<H> = Arc<Vec<LazySignedTransaction<H>>>;
 
-/// Starts signature verification on the strategy's pool, returning a future
-/// that resolves to the outcome.
+/// Starts signature verification, returning a future that resolves to the
+/// outcome. The strategy may run the work inline.
 pub(super) fn verify_signatures<E, H, St>(
     mut rng: E,
     namespace: &'static [u8],
@@ -28,7 +28,8 @@ where
     St: Strategy,
 {
     let span = info_span!("application.verify.signatures", txs = body.len().traced());
-    strategy.spawn(move |strategy| {
+    let work_size = body.len();
+    strategy.spawn(work_size, move |strategy| {
         span.in_scope(|| {
             let transactions = body.as_ref().as_slice();
             (preload_transaction_slice(transactions, &strategy)

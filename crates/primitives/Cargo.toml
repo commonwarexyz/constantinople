@@ -33,6 +33,7 @@ serde_json.workspace = true
 
 [dev-dependencies]
 # Commonware
+commonware-coding.workspace = true
 commonware-math = { workspace = true, features = ["arbitrary"] }
 commonware-codec = { workspace = true, features = ["arbitrary"] }
 commonware-utils = { workspace = true, features = ["arbitrary"] }

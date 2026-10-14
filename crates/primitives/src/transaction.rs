@@ -1,9 +1,9 @@
 //! Constantinople transaction type and transaction wrappers.
 
 use crate::{AccountKey, Sealable, Sealed, TransactionPublicKey, TransactionSignature};
-use bytes::{Buf, BufMut};
+use bytes::BufMut;
 use commonware_codec::{
-    Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
+    Buf, Encode, EncodeSize, Error, FixedSize, Read, ReadExt, Write, types::lazy::Lazy,
 };
 use commonware_cryptography::{Digest, Hasher, Signer};
 use core::num::NonZeroU64;
@@ -264,7 +264,7 @@ mod test {
     use super::*;
     use crate::Sealable;
     use arbitrary::{Arbitrary, unstructured::Unstructured};
-    use commonware_codec::{DecodeExt, EncodeSize};
+    use commonware_codec::{Copying, DecodeExt, EncodeSize};
     use commonware_cryptography::{Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use core::num::NonZeroU64;
@@ -283,8 +283,8 @@ mod test {
         let mut encoded = Vec::with_capacity(reference_tx.encode_size());
         reference_tx.write(&mut encoded);
 
-        let decoded = Transaction::<sha256::Digest>::decode(&mut &encoded[..])
-            .expect("decoding should succeed");
+        let decoded =
+            Transaction::<sha256::Digest>::decode(encoded).expect("decoding should succeed");
 
         assert_eq!(
             decoded, reference_tx,
@@ -326,8 +326,7 @@ mod test {
         let mut buf = Vec::with_capacity(tx.encode_size());
         tx.write(&mut buf);
 
-        let decoded =
-            Transaction::<sha256::Digest>::decode(&mut &buf[..]).expect("decoding should succeed");
+        let decoded = Transaction::<sha256::Digest>::decode(buf).expect("decoding should succeed");
         assert_eq!(decoded, tx);
     }
 
@@ -362,7 +361,7 @@ mod test {
         0u64.write(&mut buf);
         tx.nonce.write(&mut buf);
 
-        let result = Transaction::<sha256::Digest>::decode(&mut &buf[..]);
+        let result = Transaction::<sha256::Digest>::decode(buf);
         assert!(result.is_err(), "zero-value transactions must be rejected");
     }
 
@@ -376,7 +375,7 @@ mod test {
                 candidate[1] = first;
                 candidate[TransactionPublicKey::SIZE - 1] = last;
 
-                TransactionPublicKey::decode(&mut &candidate[..])
+                TransactionPublicKey::decode(Copying(&candidate))
                     .is_err()
                     .then_some(candidate)
             })
@@ -388,7 +387,7 @@ mod test {
         1u64.write(&mut buf);
         9u64.write(&mut buf);
 
-        let decoded = Transaction::<sha256::Digest>::decode(&mut &buf[..])
+        let decoded = Transaction::<sha256::Digest>::decode(buf)
             .expect("decoding should defer sender validation");
 
         assert!(decoded.sender().is_none());

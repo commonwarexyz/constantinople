@@ -12,7 +12,7 @@ use axum::{
     http::{Method, StatusCode, header::CONTENT_TYPE},
     routing::{get, post},
 };
-use commonware_codec::{Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
+use commonware_codec::{Copying, Decode, DecodeExt, EncodeSize, FixedSize, RangeCfg};
 use commonware_cryptography::{Digest, Hasher, PublicKey};
 use commonware_formatting::from_hex;
 use commonware_parallel::Strategy;
@@ -268,16 +268,17 @@ where
         return Err(StatusCode::INTERNAL_SERVER_ERROR);
     };
 
-    // Hashing, decoding, and verifying a relayer batch is a ~470 core-ms
-    // burst at production sizes, so it runs on the strategy pool; a pool
-    // member (unlike a blocking thread) work-steals during the nested
-    // parallel signature verification. Pool threads have an empty tracing
-    // context, so capture the caller's span explicitly.
+    // Cheap decode failures must not train the scheduler to run expensive
+    // valid batches on the async worker. Force the outer handoff while
+    // retaining adaptive scheduling inside signature verification.
+    // Pool threads have an empty tracing context, so capture the caller's span explicitly.
     let parent = tracing::Span::current();
     let max_batch_bytes = state.max_batch_bytes;
     let namespace = state.namespace;
     let public_key_cache = state.public_key_cache.clone();
-    let verified = state.strategy.spawn(move |strategy| {
+    let work_size = body.len();
+    let strategy = state.strategy.clone();
+    let verified = state.strategy.manual().spawn(work_size, move |_| {
         let _permit = permit;
         let batch_id = H::hash(&[body.as_ref()]).to_string();
 
@@ -288,8 +289,10 @@ where
             txs = tracing::field::Empty,
         )
         .entered();
+
+        // Retained fields must not keep the entire request allocation alive.
         let cfg = (RangeCfg::new(1..=max_transactions), ());
-        let signed = Vec::<SignedTransaction<H>>::decode_cfg(body.as_ref(), &cfg)
+        let signed = Vec::<SignedTransaction<H>>::decode_cfg(Copying(body.as_ref()), &cfg)
             .map_err(|_| StatusCode::BAD_REQUEST)?;
         decode.record("txs", signed.len().traced());
         drop(decode);
@@ -350,12 +353,12 @@ where
     };
 
     // Hex-encoding digest lists (partially finalized batches only) is O(txs)
-    // formatting, so it runs on the strategy's pool; every other status is
+    // formatting, so it runs on the strategy's pool. Every other status is
     // constant-size.
-    if status.has_digest_lists() {
+    if let Some(work_size) = status.digest_list_len() {
         return state
             .strategy
-            .spawn(move |_| ok_json(&status.to_wire()))
+            .spawn(work_size, move |_| ok_json(&status.to_wire()))
             .await;
     }
     ok_json(&status.to_wire())
@@ -384,7 +387,7 @@ where
     if bytes.len() != TransactionPublicKey::SIZE {
         return (StatusCode::BAD_REQUEST, String::new());
     }
-    let public_key = match TransactionPublicKey::decode(bytes.as_slice()) {
+    let public_key = match TransactionPublicKey::decode(bytes) {
         Ok(public_key) => public_key,
         Err(_) => return (StatusCode::BAD_REQUEST, String::new()),
     };
@@ -482,7 +485,7 @@ mod tests {
         test_router_with_receiver(context, max_batch_bytes).0
     }
 
-    fn signed_body() -> bytes::Bytes {
+    fn signed_body(count: usize) -> bytes::Bytes {
         let signer = ed25519::PrivateKey::from_seed(1);
         let recipient = ed25519::PrivateKey::from_seed(2).public_key();
         let transaction = Transaction::new(
@@ -492,7 +495,51 @@ mod tests {
             0,
         )
         .seal_and_sign(&signer, HTTP_TEST_NAMESPACE, &mut sha256::Sha256::default());
-        vec![transaction].encode()
+        vec![transaction; count].encode()
+    }
+
+    #[test]
+    fn verified_transaction_does_not_retain_request_body() {
+        commonware_runtime::tokio::Runner::default().start(|context| async move {
+            let (app, mut receiver) = test_router_with_receiver(context, 4 * 1024 * 1024);
+            let body: Arc<[u8]> = signed_body(128).as_ref().into();
+            let owner = Arc::downgrade(&body);
+            let request = Request::builder()
+                .method("POST")
+                .uri("/transactions")
+                .body(Body::from(bytes::Bytes::from_owner(body)))
+                .expect("request should build");
+            let request_task =
+                tokio::spawn(
+                    async move { app.oneshot(request).await.expect("router should respond") },
+                );
+
+            let Message::Submit {
+                mut transactions,
+                result,
+                ..
+            } = receiver.recv().await.expect("submission should arrive")
+            else {
+                panic!("expected submission");
+            };
+
+            // A surviving transaction must not retain the rest of its submission.
+            assert_eq!(transactions.len(), 128);
+            let transaction = transactions.pop().unwrap();
+            drop(transactions);
+            result
+                .expect("blocking submission should have a waiter")
+                .send(TxStatus::Finalized { height: 7 })
+                .expect("handler should await the result");
+            let response = request_task.await.expect("request task should finish");
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                owner.upgrade().is_none(),
+                "transaction retained request body"
+            );
+            assert!(transaction.value().sender().is_some());
+        });
     }
 
     #[test]
@@ -535,7 +582,7 @@ mod tests {
             let request = Request::builder()
                 .method("POST")
                 .uri("/transactions/background")
-                .body(Body::from(signed_body()))
+                .body(Body::from(signed_body(1)))
                 .expect("request should build");
             let request_task =
                 tokio::spawn(

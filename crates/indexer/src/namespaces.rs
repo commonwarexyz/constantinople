@@ -5,7 +5,8 @@
 //! one physical Store. All prefix assignments live in this module: adding a
 //! new family means claiming an unused byte here.
 
-use exoware_sdk::{PrefixedStoreClient, StoreClient, StoreKeyPrefix, StoreKeyPrefixError};
+use bytes::Bytes;
+use exoware_sdk::{Key, PrefixedStoreClient, StoreClient, StoreKeyPrefix, StoreKeyPrefixError};
 
 /// Store namespace byte for QMDB account-state rows.
 pub const STATE_QMDB_PREFIX_VALUE: u8 = 0x00;
@@ -15,6 +16,8 @@ pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u8 = 0x01;
 pub const SIMPLEX_PREFIX_VALUE: u8 = 0x02;
 /// Store namespace byte for SQL metadata rows.
 pub const SQL_META_PREFIX_VALUE: u8 = 0x03;
+/// Store namespace byte for finalized publication targets.
+pub const PUBLICATION_TARGET_PREFIX_VALUE: u8 = 0x04;
 
 /// Store namespace prefix for account-state QMDB rows.
 pub fn state_qmdb_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
@@ -34,6 +37,11 @@ pub fn simplex_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
 /// Store namespace prefix for SQL metadata rows.
 pub fn sql_meta_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
     StoreKeyPrefix::new(vec![SQL_META_PREFIX_VALUE])
+}
+
+/// Store namespace prefix for finalized height-to-digest targets.
+pub fn publication_target_prefix() -> Result<StoreKeyPrefix, StoreKeyPrefixError> {
+    StoreKeyPrefix::new(vec![PUBLICATION_TARGET_PREFIX_VALUE])
 }
 
 /// Clone `client` into the account-state QMDB namespace.
@@ -64,9 +72,32 @@ pub fn sql_meta_client(client: &StoreClient) -> Result<PrefixedStoreClient, Stor
     Ok(PrefixedStoreClient::new(client.clone(), sql_meta_prefix()?))
 }
 
+/// Clone `client` into the finalized publication-target namespace.
+pub fn publication_target_client(
+    client: &StoreClient,
+) -> Result<PrefixedStoreClient, StoreKeyPrefixError> {
+    Ok(PrefixedStoreClient::new(
+        client.clone(),
+        publication_target_prefix()?,
+    ))
+}
+
+pub(crate) fn publication_target_key(height: u64) -> Key {
+    Key::from(Bytes::copy_from_slice(&height.to_be_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn publication_target_uses_big_endian_height_key() {
+        let height = 0x0102_0304_0506_0708;
+        assert_eq!(
+            publication_target_key(height).as_ref(),
+            &[1, 2, 3, 4, 5, 6, 7, 8]
+        );
+    }
 
     /// Every Store family must live under its own namespace prefix.
     #[test]
@@ -76,6 +107,7 @@ mod tests {
             transactions_qmdb_prefix().expect("transaction prefix"),
             simplex_prefix().expect("simplex prefix"),
             sql_meta_prefix().expect("sql metadata prefix"),
+            publication_target_prefix().expect("publication target prefix"),
         ];
 
         for (i, a) in prefixes.iter().enumerate() {

@@ -7,6 +7,7 @@ use crate::{
     CERTIFICATE_CHANNEL, Channels, Config, Engine, MARSHAL_CHANNEL, MARSHAL_RESOLVER_CHANNEL,
     PROBE_CHANNEL, RESOLVER_CHANNEL, STATE_RESOLVER_CHANNEL, StartupMode,
     TRANSACTION_RESOLVER_CHANNEL, VOTE_CHANNEL,
+    types::{EngineCommitment, EngineFinalization, EngineVariant},
 };
 use common::{
     HeightMonitorReporter, RestartBarrier, TEST_QUOTA, TRANSACTION_NAMESPACE, TestHasher,
@@ -14,18 +15,22 @@ use common::{
 };
 use commonware_consensus::{
     Heightable,
-    marshal::core::CommitmentFallback,
-    simplex::elector::RoundRobin,
-    types::{Epoch, Round, View, coding::Commitment},
+    marshal::{coding::types::coding_config_for_participants, core::CommitmentFallback},
+    simplex::{
+        elector::RoundRobin,
+        types::{Finalization, Finalize, Proposal},
+    },
+    types::{Epoch, Round, View},
 };
 use commonware_cryptography::{
-    Signer,
+    Digest as _, Signer,
     bls12381::{
         dkg::feldman_desmedt::Output,
         primitives::{group::Share, variant::MinSig},
     },
     certificate::ConstantProvider,
     ed25519::Batch as Ed25519Batch,
+    sha256,
 };
 use commonware_glue::{
     simulate::{
@@ -34,7 +39,7 @@ use commonware_glue::{
         plan::PlanBuilder,
     },
     stateful::{
-        PruneConfig,
+        PruneConfig, SyncPlan,
         db::SyncEngineConfig,
         probe::{Config as ProbeConfig, Probe},
     },
@@ -44,7 +49,8 @@ use commonware_p2p::{Manager as _, TrackedPeers, simulated::Link};
 use commonware_parallel::Sequential;
 use commonware_runtime::{Handle, Quota, Spawner, Supervisor};
 use commonware_utils::{
-    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, ordered::Set, sync::Mutex, union,
+    NZDuration, NZU64, NZUsize, TryCollect, channel::oneshot, non_empty, ordered::Set, probability,
+    sync::Mutex, union,
 };
 use constantinople_mempool::mocks::StaticTransactionSource;
 use constantinople_primitives::PublicKeyCache;
@@ -63,7 +69,7 @@ const fn default_link() -> Link {
     Link {
         latency: Duration::from_millis(10),
         jitter: Duration::from_millis(1),
-        success_rate: commonware_utils::probability!(1.0),
+        success_rate: probability!(1.0),
     }
 }
 
@@ -71,7 +77,7 @@ const fn lossy_link() -> Link {
     Link {
         latency: Duration::from_millis(200),
         jitter: Duration::from_millis(150),
-        success_rate: commonware_utils::probability!(0.7),
+        success_rate: probability!(0.7),
     }
 }
 
@@ -88,8 +94,10 @@ struct TestEngineDefinition {
     /// configured by `PlanBuilder`.
     use_discovery_split: bool,
     sync_heights: Arc<Mutex<BTreeMap<TestPublicKey, u64>>>,
-    genesis_commitments: Arc<Mutex<BTreeMap<TestPublicKey, Commitment>>>,
+    genesis_commitments:
+        Arc<Mutex<BTreeMap<TestPublicKey, EngineCommitment<TestHasher, TestPublicKey>>>>,
     restart_barrier: Option<RestartBarrier>,
+    pending_sync_floor: Option<EngineFinalization<TestPublicKey, MinSig>>,
     prunable_items_per_section: NonZeroU64,
     retained_marshal_blocks: usize,
 }
@@ -107,6 +115,7 @@ impl TestEngineDefinition {
             sync_heights: Arc::new(Mutex::new(BTreeMap::new())),
             genesis_commitments: Arc::new(Mutex::new(BTreeMap::new())),
             restart_barrier: None,
+            pending_sync_floor: None,
             prunable_items_per_section: NZU64!(4_096),
             retained_marshal_blocks: 16,
         }
@@ -140,6 +149,45 @@ impl TestEngineDefinition {
 
     const fn with_state_sync(mut self) -> Self {
         self.enable_state_sync = true;
+        self
+    }
+
+    fn with_interrupted_state_sync(mut self) -> Self {
+        // Startup permission must reject the durable plan before resolving its payload.
+        let proposal = Proposal {
+            round: Round::new(Epoch::zero(), View::new(1)),
+            parent: View::zero(),
+            payload: EngineCommitment::<TestHasher, TestPublicKey>::from((
+                sha256::Digest::EMPTY,
+                sha256::Digest::EMPTY,
+                sha256::Digest::EMPTY,
+                coding_config_for_participants(
+                    u16::try_from(self.output.players().len()).expect("fixture fits coding limit"),
+                ),
+            )),
+        };
+        let schemes = self
+            .shares
+            .values()
+            .filter_map(Option::as_ref)
+            .map(|share| {
+                TestScheme::signer(
+                    &union(ENGINE_NAMESPACE, b"_CONSENSUS"),
+                    self.output.players().clone(),
+                    self.output.public().clone(),
+                    share.clone(),
+                )
+                .expect("fixture share must create a signing scheme")
+            })
+            .collect::<Vec<_>>();
+        let finalizes = schemes
+            .iter()
+            .map(|scheme| Finalize::sign(scheme, proposal.clone()).expect("fixture must sign"))
+            .collect::<Vec<_>>();
+        self.pending_sync_floor = Some(
+            Finalization::from_finalizes(&schemes[0], non_empty![@finalizes.iter()], &Sequential)
+                .expect("fixture votes must form a finalization"),
+        );
         self
     }
 
@@ -203,6 +251,9 @@ impl EngineDefinition for TestEngineDefinition {
         let retained_marshal_blocks = self.retained_marshal_blocks;
         let enable_state_sync = self.enable_state_sync;
         let uses_state_sync = enable_state_sync && index == 0;
+        let pending_sync_floor = (index == 0)
+            .then(|| self.pending_sync_floor.clone())
+            .flatten();
         let restart_barrier = (index == 0).then(|| self.restart_barrier.clone()).flatten();
         let is_restart = restart_barrier
             .as_ref()
@@ -251,7 +302,7 @@ impl EngineDefinition for TestEngineDefinition {
                     context: context.child("probe"),
                     provider,
                     strategy: Sequential,
-                    capacity: NZUsize!(32),
+                    mailbox_size: NZUsize!(32),
                     blocker: blocker.clone(),
                     minimum_epoch: Epoch::zero(),
                     retry_timeout: NZDuration!(Duration::from_millis(100)),
@@ -286,13 +337,27 @@ impl EngineDefinition for TestEngineDefinition {
                 transaction_resolver,
             };
 
-            let input =
-                StaticTransactionSource::<Commitment, TestPublicKey, TestHasher>::new(Vec::new());
+            let input = StaticTransactionSource::<
+                EngineCommitment<TestHasher, TestPublicKey>,
+                TestPublicKey,
+                TestHasher,
+            >::new(Vec::new());
             let reporter = HeightMonitorReporter::new(
                 public_key.clone(),
                 monitor,
                 TestReporter::new(restart_barrier.clone()),
             );
+            let allow_state_sync = pending_sync_floor.is_none();
+            if let Some(floor) = pending_sync_floor {
+                let plan =
+                    SyncPlan::<_, TestScheme, EngineVariant<TestHasher, TestPublicKey>>::init(
+                        context.child("engine").child("stateful_startup"),
+                        format!("{partition_prefix}_stateful"),
+                    )
+                    .await;
+                drop(plan.set_floor(floor).await);
+            }
+
             let engine = Engine::<
                 _,
                 _,
@@ -326,6 +391,7 @@ impl EngineDefinition for TestEngineDefinition {
                         NZUsize!(1024),
                     ),
                     startup,
+                    allow_state_sync,
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),
                         apply_batch_size: NZU64!(64),
@@ -358,8 +424,8 @@ impl EngineDefinition for TestEngineDefinition {
             }
 
             let selected_sync_floor = engine.startup_sync_floor();
+            let startup_processed_height = engine.startup_processed_height();
             let marshal = engine.marshal_mailbox();
-            let restart_marshal = marshal.clone();
             let engine_handle = engine.start(channels, Some(reporter));
             let startup_sync_height = if let Some(finalization) = selected_sync_floor {
                 let block = marshal
@@ -388,12 +454,8 @@ impl EngineDefinition for TestEngineDefinition {
             }
 
             if is_restart {
-                let processed = restart_marshal
-                    .get_processed_height()
-                    .await
-                    .map_or(0, |height| height.get());
                 let barrier = restart_barrier.expect("restart barrier must exist");
-                barrier.observe_processed(processed);
+                barrier.observe_processed(startup_processed_height);
                 barrier.release();
             }
             let engine_result = if let Some(probe_handle) = probe_handle {
@@ -481,7 +543,13 @@ fn run_crash_restart(engine: TestEngineDefinition) {
 }
 
 fn run_restart_with_archived_finalizations() {
-    let barrier = RestartBarrier::default();
+    for processed_height in [0, 5] {
+        run_restart_at_processed_height(processed_height);
+    }
+}
+
+fn run_restart_at_processed_height(processed_height: u64) {
+    let barrier = RestartBarrier::new(processed_height);
     let engine = TestEngineDefinition::new(NUM_VALIDATORS).with_restart_barrier(barrier.clone());
     let validator = engine.participants()[0].clone();
 
@@ -726,7 +794,7 @@ fn run_network_partition(engine: TestEngineDefinition) {
     let dead_link = Link {
         latency: Duration::from_secs(1),
         jitter: Duration::ZERO,
-        success_rate: commonware_utils::probability!(0.0),
+        success_rate: probability!(0.0),
     };
     let mut schedule = Schedule::new();
     for peer in &participants[1..] {
@@ -796,6 +864,17 @@ fn restart_preserves_genesis_after_pruning() {
 #[test_traced("DEBUG")]
 fn restart_replays_finalizations_archived_before_acknowledgement() {
     run_restart_with_archived_finalizations();
+}
+
+#[test]
+#[should_panic(expected = "cannot start with a requested or interrupted state sync")]
+fn interrupted_state_sync_rejected_when_permission_disabled() {
+    PlanBuilder::new(TestEngineDefinition::new(NUM_VALIDATORS).with_interrupted_state_sync())
+        .link(default_link())
+        .seed(0)
+        .timeout(Duration::from_secs(1))
+        .run()
+        .unwrap();
 }
 
 #[test_group("slow")]

@@ -68,6 +68,14 @@ export function toArrayBuffer(bytes: Uint8Array): ArrayBuffer {
     return copy.buffer;
 }
 
+export function bytesEqual(left: Uint8Array, right: Uint8Array): boolean {
+    if (left.length !== right.length) return false;
+    for (let index = 0; index < left.length; index++) {
+        if (left[index] !== right[index]) return false;
+    }
+    return true;
+}
+
 export function fromHex(value: string): Uint8Array {
     const bytes = new Uint8Array(value.length / 2);
     for (let i = 0; i < bytes.length; i++) {

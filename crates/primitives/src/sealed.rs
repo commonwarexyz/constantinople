@@ -3,7 +3,7 @@
 //! This module provides the [`Sealable`] trait for types that can be hashed into
 //! a [`Sealed`] wrapper, which caches the computed digest alongside the original value.
 
-use commonware_codec::{EncodeSize, Error, Read, Write};
+use commonware_codec::{Buf, EncodeSize, Error, Read, Write};
 use commonware_cryptography::{Digest, Digestible, Hasher};
 use derive_more::{Debug, Deref};
 
@@ -114,7 +114,7 @@ where
 {
     type Cfg = <T as Read>::Cfg;
 
-    fn read_cfg(buf: &mut impl bytes::Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
+    fn read_cfg(buf: &mut impl Buf, cfg: &Self::Cfg) -> Result<Self, Error> {
         let inner = T::read_cfg(buf, cfg)?;
         Ok(inner.seal(&mut H::default()))
     }

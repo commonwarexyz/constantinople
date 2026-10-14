@@ -5,7 +5,7 @@ mod ports;
 mod remote;
 
 use clap::{Args, Parser, Subcommand};
-use commonware_codec::{Encode, Read as CodecRead};
+use commonware_codec::{Copying, Encode, Read as CodecRead};
 use commonware_cryptography::{
     Signer,
     bls12381::{
@@ -20,13 +20,14 @@ use commonware_cryptography::{
 };
 use commonware_formatting::{from_hex, hex};
 use commonware_math::algebra::Random;
-use commonware_utils::{N3f1, NZU32, TryCollect};
+use commonware_utils::{N3f1, NZU32, NZUsize, TryCollect};
 use constantinople_primitives::proposal::{MAXIMUM_BLOCK_SIZE, max_transaction_bytes};
 use rand::{rand_core::UnwrapErr, rngs::SysRng};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::BTreeMap,
     fs,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     process::ExitCode,
     time::{SystemTime, UNIX_EPOCH},
@@ -65,7 +66,8 @@ const DEFAULT_CHAIN_INDEXER_PORT: u16 = 8090;
 const DEFAULT_METADATA_INDEXER_PORT: u16 = 8091;
 const DEFAULT_QMDB_INDEXER_PORT: u16 = 8092;
 const DEFAULT_BOOTSTRAPPERS: usize = 3;
-const INDEXER_UPLOAD_BUFFER: usize = 64;
+const INDEXER_UPLOAD_MAX_IN_FLIGHT: usize = 64;
+const INDEXER_UPLOAD_BUDGET_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 const DEFAULT_SPAMMER_PRESIGNED_BATCHES: usize = 16;
 const DEFAULT_SPAMMER_RAYON_THREADS: usize = 2;
 const DEFAULT_PUBLIC_KEY_CACHE_SIZE: usize = 100_000;
@@ -122,6 +124,15 @@ pub(crate) struct GenerateArgs {
     /// Rayon threads per validator for parallel verification.
     #[arg(long, default_value_t = 2)]
     rayon_threads: usize,
+    /// Override Tokio worker threads for the indexer secondary.
+    #[arg(long)]
+    indexer_worker_threads: Option<NonZeroUsize>,
+    /// Override engine Rayon threads for the indexer secondary.
+    #[arg(long)]
+    indexer_rayon_threads: Option<NonZeroUsize>,
+    /// Rayon threads reserved for index publication.
+    #[arg(long, default_value_t = default_publisher_rayon_threads())]
+    indexer_publisher_rayon_threads: NonZeroUsize,
     /// Capacity of each node's decompressed public key cache.
     #[arg(long, default_value_t = DEFAULT_PUBLIC_KEY_CACHE_SIZE)]
     public_key_cache_size: usize,
@@ -224,6 +235,9 @@ pub(crate) struct RemoteArgs {
     /// EC2 instance type for validators.
     #[arg(long)]
     instance_type: String,
+    /// EC2 instance type for the indexer secondary. Defaults to --instance-type.
+    #[arg(long)]
+    indexer_instance_type: Option<String>,
     /// Validator EBS volume size in GiB.
     #[arg(long)]
     storage_size: i32,
@@ -509,8 +523,13 @@ pub(crate) struct IndexerConfig {
     /// Store writer credential used by the indexer secondary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
-    /// Number of blocks buffered before upload.
-    pub upload_buffer: usize,
+    /// Rayon threads reserved for index publication.
+    #[serde(default = "default_publisher_rayon_threads")]
+    pub publisher_rayon_threads: NonZeroUsize,
+    /// Caps concurrent uploads after byte admission.
+    pub upload_max_in_flight: usize,
+    /// Bounds estimated memory held across upload stages.
+    pub upload_budget_bytes: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -615,6 +634,10 @@ const fn default_spammer_rayon_threads() -> usize {
     DEFAULT_SPAMMER_RAYON_THREADS
 }
 
+const fn default_publisher_rayon_threads() -> NonZeroUsize {
+    NZUsize!(2)
+}
+
 fn main() -> ExitCode {
     init_tracing();
     let cli = Cli::parse();
@@ -692,11 +715,30 @@ pub(crate) fn total_secondaries(args: &GenerateArgs) -> u32 {
     secondary_roles(args).len() as u32
 }
 
+pub(crate) fn secondary_runtime_threads(
+    args: &GenerateArgs,
+    role: SecondaryRole,
+) -> (usize, usize) {
+    match role {
+        SecondaryRole::Indexer => (
+            args.indexer_worker_threads
+                .map_or(args.worker_threads, NonZeroUsize::get),
+            args.indexer_rayon_threads
+                .map_or(args.rayon_threads, NonZeroUsize::get),
+        ),
+        SecondaryRole::Relayer => (args.worker_threads, args.rayon_threads),
+    }
+}
+
 pub(crate) const fn indexer_enabled(args: &GenerateArgs) -> bool {
     args.indexer
 }
 
 pub(crate) fn validate_generate_args(args: &GenerateArgs) {
+    assert!(
+        !args.indexer || args.startup != StartupModeConfig::StateSync,
+        "--indexer cannot be combined with --startup state-sync"
+    );
     assert!(
         !args.spammer || args.relayer,
         "--spammer requires --relayer"
@@ -803,7 +845,7 @@ fn simplex_verification_material_from_config(config_path: &Path) -> String {
         serde_yaml::from_str(&raw).expect("failed to parse validator config");
     let bytes = from_hex(&config.dkg_output).expect("bad dkg_output hex");
     let dkg_output = dkg::Output::<MinSig, ed25519::PublicKey>::read_cfg(
-        &mut &bytes[..],
+        &mut Copying(&bytes),
         &(NZU32!(config.num_validators), ModeVersion::v0()),
     )
     .expect("failed to decode dkg_output");
@@ -1249,9 +1291,10 @@ mod tests {
 
     #[test]
     fn generated_indexer_api_keys_default_and_omit() {
-        let indexer: IndexerConfig =
-            serde_yaml::from_str("store_url: https://store.example.com\nupload_buffer: 64\n")
-                .expect("indexer config without an API key should parse");
+        let indexer: IndexerConfig = serde_yaml::from_str(
+            "store_url: https://store.example.com\nupload_max_in_flight: 64\nupload_budget_bytes: 1024\n",
+        )
+        .expect("indexer config without an API key should parse");
         let metadata: AdapterConfig =
             serde_yaml::from_str("port: 8091\nstore_url: https://store.example.com\n")
                 .expect("metadata config without an API key should parse");
@@ -1521,6 +1564,30 @@ mod tests {
     fn rejects_validator_count_above_coding_maximum() {
         let args = proposal_args(u32::from(u16::MAX) + 1, 0);
         super::validate_generate_args(&args);
+    }
+
+    #[test]
+    #[should_panic(expected = "--indexer cannot be combined with --startup state-sync")]
+    fn rejects_indexer_with_state_sync() {
+        let cli = parse_cli([
+            "constantinople-deploy",
+            "generate",
+            "--validators",
+            "4",
+            "--output-dir",
+            "out",
+            "--indexer",
+            "--startup",
+            "state-sync",
+            "local",
+        ])
+        .expect("local invocation should parse");
+
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+
+        super::validate_generate_args(&generate);
     }
 
     #[test]

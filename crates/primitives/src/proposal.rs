@@ -2,9 +2,7 @@
 
 use crate::{Transaction, TransactionSignature};
 use commonware_codec::{EncodeSize, FixedSize, varint::UInt};
-use commonware_consensus::{
-    marshal::coding::types::coding_config_for_participants, types::coding::Commitment,
-};
+use commonware_consensus::types::coding::COMMITMENT_SIZE;
 use commonware_cryptography::{ed25519, sha256};
 
 /// Maximum encoded block size accepted by consensus, including its header and body framing.
@@ -31,23 +29,11 @@ pub fn max_transaction_bytes(block_bytes: usize) -> Option<usize> {
     body_bytes.checked_sub(framing)
 }
 
-/// Maximum raw shard size for blocks admitted by consensus.
-///
-/// Panics if fewer than four validators are supplied.
-pub fn maximum_shard_size(num_validators: u16) -> usize {
-    let config = coding_config_for_participants(num_validators);
-
-    // Coding metadata and Reed-Solomon's length prefix precede the split into even-width shards.
-    let payload_bytes = MAXIMUM_BLOCK_SIZE + config.encode_size() + u32::SIZE;
-    let shards = usize::from(config.minimum_shards.get());
-    payload_bytes.div_ceil(2 * shards) * 2
-}
-
 fn maximum_header_size() -> usize {
     // Epoch and the two views use varints. The remaining header counters are fixed width.
     3 * UInt(u64::MAX).encode_size()
         + ed25519::PublicKey::SIZE
-        + Commitment::SIZE
+        + COMMITMENT_SIZE
         + 3 * sha256::Digest::SIZE
         + 6 * u64::SIZE
 }
@@ -56,17 +42,25 @@ fn maximum_header_size() -> usize {
 mod tests {
     use super::*;
     use crate::{
-        Block, Header, Sealable, SignedTransaction, TRANSACTION_NAMESPACE, TransactionPublicKey,
+        Block, Header, Sealable, SealedBlock, SignedTransaction, TRANSACTION_NAMESPACE,
+        TransactionPublicKey,
     };
     use commonware_codec::Encode;
+    use commonware_coding::ReedSolomon;
     use commonware_consensus::{
         simplex::types::Context,
-        types::{Epoch, Round, View},
+        types::{Epoch, Round, View, coding::Commitment as CodingCommitment},
     };
     use commonware_cryptography::{Digest, Signer, secp256r1::standard as secp256r1};
     use commonware_math::algebra::Random;
     use commonware_utils::non_empty_range;
     use std::num::NonZeroU64;
+
+    type Commitment = CodingCommitment<
+        SealedBlock<sha256::Digest, ed25519::PublicKey, sha256::Sha256>,
+        ReedSolomon<sha256::Sha256>,
+        sha256::Sha256,
+    >;
 
     fn maximum_header() -> Header<Commitment, sha256::Digest, ed25519::PublicKey> {
         Header {
@@ -162,13 +156,5 @@ mod tests {
         for budget in [0, MAXIMUM_BLOCK_SIZE + 1, usize::MAX] {
             assert_eq!(max_transaction_bytes(budget), None);
         }
-    }
-
-    #[test]
-    fn shard_limit_scales_with_original_shards() {
-        assert_eq!(maximum_shard_size(4), 8 * 1024 * 1024 + 4);
-        assert!(maximum_shard_size(7) < maximum_shard_size(4));
-        assert!(maximum_shard_size(50) < maximum_shard_size(7));
-        assert!(maximum_shard_size(u16::MAX) > 0);
     }
 }
