@@ -161,22 +161,23 @@ pub fn build_meta_schema(client: PrefixedStoreClient) -> Result<KvSchema, String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::prelude::SessionContext;
+    use exoware_sql::SqlContext;
 
     /// `build_meta_schema` must register all metadata tables onto a fresh
-    /// `SessionContext` without error.
+    /// `SqlContext` without error.
     #[tokio::test]
-    async fn schema_registers_into_session_context() {
+    async fn schema_registers_into_sql_context() {
         let client = crate::namespaces::sql_meta_client(&exoware_sdk::StoreClient::new(
             "http://127.0.0.1:0",
         ))
         .expect("sql metadata client");
+        let ctx = SqlContext::new(client.clone());
         let schema = build_meta_schema(client).expect("build schema");
-        let ctx = SessionContext::new();
         schema.register_all(&ctx).expect("register");
 
         // All tables must be visible to the catalog after registration.
         let tables = ctx
+            .datafusion()
             .catalog("datafusion")
             .expect("default catalog")
             .schema("public")

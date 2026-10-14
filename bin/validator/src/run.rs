@@ -11,7 +11,7 @@ use commonware_cryptography::{
     ChaCha20Poly1305,
     bls12381::primitives::variant::MinSig,
     certificate::ConstantProvider,
-    ed25519::{self, Batch, PublicKey},
+    ed25519::{self, PublicKey},
     sha256::Sha256,
 };
 use commonware_formatting::hex;
@@ -402,7 +402,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             RoundRobin<Sha256>,
             Rayon,
             _,
-            Batch,
             crate::relayer::Observer,
         >::new(
             context.child("engine"),
