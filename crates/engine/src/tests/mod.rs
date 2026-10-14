@@ -29,7 +29,6 @@ use commonware_cryptography::{
         primitives::{group::Share, variant::MinSig},
     },
     certificate::ConstantProvider,
-    ed25519::Batch as Ed25519Batch,
     sha256,
 };
 use commonware_glue::{
@@ -368,7 +367,6 @@ impl EngineDefinition for TestEngineDefinition {
                 RoundRobin<TestHasher>,
                 _,
                 _,
-                Ed25519Batch,
                 crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
             >::new(
                 context.child("engine"),

@@ -34,7 +34,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
-    BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
+    Committable, Digest, Hasher, PublicKey, Signer,
     bls12381::{
         dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
@@ -209,7 +209,7 @@ where
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
+pub struct Engine<E, C, M, B, H, V, L, St, I, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
@@ -220,7 +220,6 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
-    BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     context: ContextCell<E>,
@@ -229,8 +228,8 @@ where
     blocker: B,
     state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, St>,
     transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, St>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, St>,
+    stateful: StatefulApp<E, H, C::PublicKey, V, I, (), St>,
+    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, (), St>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     coding_config: CodingConfig,
@@ -253,10 +252,10 @@ where
     startup_sync_floor: Option<EngineFinalization<C::PublicKey, V, H>>,
     #[cfg(all(test, feature = "test-utils"))]
     genesis_commitment: EngineCommitment<H, C::PublicKey>,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, (), O>,
 }
 
-impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
+impl<E, C, M, B, H, V, L, St, I, O> Engine<E, C, M, B, H, V, L, St, I, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
@@ -267,7 +266,6 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
-    BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     /// Returns the durable processed height recovered before the engine starts.
@@ -671,7 +669,7 @@ where
         let stateful_handle = self.stateful.start();
 
         let reporter = reporter.map(EngineReporter::new);
-        let reporters: EngineMarshalReporters<E, H, C::PublicKey, V, I, BV, St, Rep> =
+        let reporters: EngineMarshalReporters<E, H, C::PublicKey, V, I, (), St, Rep> =
             EngineMarshalReporters::from((self.stateful_mailbox, reporter));
         let marshal_handle = self
             .marshal
