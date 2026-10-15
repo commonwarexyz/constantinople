@@ -168,6 +168,7 @@ pub(crate) type StatefulApp<E, H, P, V, I, B, St> = Stateful<
         StateResolverMailbox<E, H, St>,
         TransactionResolverMailbox<E, H, St>,
     ),
+    St,
 >;
 
 pub(crate) type MarshaledApp<E, H, P, V, I, B, St> = Marshaled<
@@ -186,9 +187,10 @@ pub(crate) type ShardsEngine<E, B, M, H, P, V, T> =
 
 pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSolomon<H>, H, P>;
 
-/// Reporter combinator that fans simplex activity to the marshal mailbox and
-/// an optional external observer.
-pub(crate) type SimplexReporter<H, P, V, O> = Reporters<EngineMarshalMailbox<H, P, V>, O>;
+/// Reporter combinator that fans simplex activity to the marshaled
+/// application and an optional external observer.
+pub(crate) type SimplexReporter<E, H, P, V, I, BV, St, O> =
+    Reporters<MarshaledApp<E, H, P, V, I, BV, St>, O>;
 
 pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
     E,
@@ -198,6 +200,6 @@ pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
     EngineCommitment<H, P>,
     MarshaledApp<E, H, P, V, I, BV, St>,
     MarshaledApp<E, H, P, V, I, BV, St>,
-    SimplexReporter<H, P, V, O>,
+    SimplexReporter<E, H, P, V, I, BV, St, O>,
     St,
 >;

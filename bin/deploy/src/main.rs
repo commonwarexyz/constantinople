@@ -143,14 +143,12 @@ pub(crate) struct GenerateArgs {
     /// Maximum mempool size in bytes.
     #[arg(long = "max-pool-bytes", default_value_t = default_max_pool_bytes())]
     max_pool_bytes: usize,
-    /// Capacity in bytes of each validator's state QMDB page cache. Must
-    /// hold the state journal's working set: 512 MiB thrashed once the live
-    /// account set passed ~2M and build/verify doubled on cache misses.
-    #[arg(long = "state-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    /// Capacity in bytes of each validator's state QMDB page cache.
+    #[arg(long = "state-page-cache-bytes", default_value_t = default_state_page_cache_bytes())]
     state_page_cache_bytes: usize,
     /// Capacity in bytes of each validator's non-state page cache
     /// (archives, transaction history, journal).
-    #[arg(long = "other-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    #[arg(long = "other-page-cache-bytes", default_value_t = default_other_page_cache_bytes())]
     other_page_cache_bytes: usize,
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
@@ -876,7 +874,12 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-pub(crate) const fn default_page_cache_bytes() -> usize {
+// Keep operation-log pages in probation until floor advancement reuses them.
+pub(crate) const fn default_state_page_cache_bytes() -> usize {
+    6 * 1024 * 1024 * 1024
+}
+
+pub(crate) const fn default_other_page_cache_bytes() -> usize {
     2 * 1024 * 1024 * 1024
 }
 
@@ -950,6 +953,33 @@ mod tests {
             "--dashboard",
             "dashboard.json",
         ]
+    }
+
+    #[test]
+    fn cache_budgets_default_independently_and_allow_overrides() {
+        let cli = parse_cli(remote_cli_args()).unwrap();
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.state_page_cache_bytes, 6 * 1024 * 1024 * 1024);
+        assert_eq!(generate.other_page_cache_bytes, 2 * 1024 * 1024 * 1024);
+
+        let mut args = remote_cli_args();
+        args.splice(
+            2..2,
+            [
+                "--state-page-cache-bytes",
+                "67108864",
+                "--other-page-cache-bytes",
+                "33554432",
+            ],
+        );
+        let cli = parse_cli(args).unwrap();
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.state_page_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(generate.other_page_cache_bytes, 32 * 1024 * 1024);
     }
 
     #[test]

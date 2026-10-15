@@ -8,7 +8,8 @@ use commonware_consensus::{
     marshal::{Update, ancestry::Ancestry},
 };
 use commonware_cryptography::{
-    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::Scheme,
+    Digested, Digestible, Hasher, PublicKey, bls12381::primitives::variant::Variant,
+    certificate::Scheme,
 };
 use commonware_glue::stateful::{
     Application as StatefulApplication, Input, Proposed, db::DatabaseSet,
@@ -22,12 +23,21 @@ use rand::{CryptoRng, Rng};
 use std::{
     marker::PhantomData,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
 type InnerApplication<E, H, P, V, I, B, St> =
     Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, B, St>;
+
+// An engine block delegates its digest to the sealed block it wraps, so the
+// marshal's digest is reused instead of hashing the block again.
+fn application_block<H, P>(block: &Digested<EngineBlock<H, P>>) -> Digested<ApplicationBlock<H, P>>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    Digested::precomputed(block.inner().inner_shared(), block.digest())
+}
 
 pub(crate) struct EngineApplication<E, H, P, V, I, B, St>
 where
@@ -73,7 +83,7 @@ where
         let activity = match activity {
             Update::Tip(round, height, digest) => Update::Tip(round, height, digest),
             Update::Block(block, acknowledgement) => {
-                Update::Block(block.inner_shared(), acknowledgement)
+                Update::Block(application_block(&block), acknowledgement)
             }
         };
         self.inner.report(activity)
@@ -115,24 +125,52 @@ where
     }
 }
 
-struct InnerAncestry<A, H, P> {
+struct InnerAncestry<A, H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
     ancestry: A,
-    _marker: PhantomData<fn() -> (H, P)>,
+
+    // `peek` returns a borrow, so the converted head is refreshed whenever
+    // polling can change the wrapped stream's head.
+    head: Option<Digested<ApplicationBlock<H, P>>>,
 }
 
-impl<A, H, P> InnerAncestry<A, H, P> {
-    const fn new(ancestry: A) -> Self {
+impl<A, H, P> InnerAncestry<A, H, P>
+where
+    A: Ancestry<EngineBlock<H, P>>,
+    H: Hasher,
+    P: PublicKey,
+{
+    fn new(ancestry: A) -> Self {
+        let head = ancestry.peek().map(application_block);
+        Self { ancestry, head }
+    }
+}
+
+impl<A, H, P> Clone for InnerAncestry<A, H, P>
+where
+    A: Clone,
+    H: Hasher,
+    P: PublicKey,
+{
+    fn clone(&self) -> Self {
         Self {
-            ancestry,
-            _marker: PhantomData,
+            ancestry: self.ancestry.clone(),
+            head: self.head.clone(),
         }
     }
 }
 
-impl<A: Clone, H, P> Clone for InnerAncestry<A, H, P> {
-    fn clone(&self) -> Self {
-        Self::new(self.ancestry.clone())
-    }
+// Fields are never pinned structurally, so the cached head can move freely
+// even when the digest type itself is not `Unpin`.
+impl<A, H, P> Unpin for InnerAncestry<A, H, P>
+where
+    A: Unpin,
+    H: Hasher,
+    P: PublicKey,
+{
 }
 
 impl<A, H, P> Stream for InnerAncestry<A, H, P>
@@ -141,12 +179,13 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    type Item = Arc<ApplicationBlock<H, P>>;
+    type Item = Digested<ApplicationBlock<H, P>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().ancestry)
-            .poll_next(cx)
-            .map(|block| block.map(|block| block.inner_shared()))
+        let this = self.get_mut();
+        let next = Pin::new(&mut this.ancestry).poll_next(cx);
+        this.head = this.ancestry.peek().map(application_block);
+        next.map(|block| block.as_ref().map(application_block))
     }
 }
 
@@ -156,8 +195,8 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    fn peek(&self) -> Option<&ApplicationBlock<H, P>> {
-        self.ancestry.peek().map(|block| &**block)
+    fn peek(&self) -> Option<&Digested<ApplicationBlock<H, P>>> {
+        self.head.as_ref()
     }
 }
 

@@ -505,9 +505,8 @@ const fn production_sync_config() -> SyncEngineConfig {
     SyncEngineConfig {
         fetch_batch_size: NZU64!(1024),
         apply_batch_size: STATE_SYNC_APPLY_BATCH_SIZE,
-        max_outstanding_requests: 8,
+        max_outstanding_requests: NZUsize!(8),
         update_channel_size: NZUsize!(256),
-        max_retained_roots: 32,
     }
 }
 

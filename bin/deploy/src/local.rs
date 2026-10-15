@@ -479,8 +479,9 @@ mod tests {
     };
     use crate::{
         GenerateArgs, GenerateTarget, LocalArgs, StartupModeConfig, default_max_pool_bytes,
-        default_max_propose_bytes, default_page_cache_bytes, default_public_key_cache_size,
-        default_publisher_rayon_threads, generate_local_cluster_material, total_secondaries,
+        default_max_propose_bytes, default_other_page_cache_bytes, default_public_key_cache_size,
+        default_publisher_rayon_threads, default_state_page_cache_bytes,
+        generate_local_cluster_material, total_secondaries,
     };
     use std::{
         fs,
@@ -510,8 +511,8 @@ mod tests {
             public_key_cache_size: default_public_key_cache_size(),
             max_propose_bytes: default_max_propose_bytes(),
             max_pool_bytes: default_max_pool_bytes(),
-            state_page_cache_bytes: default_page_cache_bytes(),
-            other_page_cache_bytes: default_page_cache_bytes(),
+            state_page_cache_bytes: default_state_page_cache_bytes(),
+            other_page_cache_bytes: default_other_page_cache_bytes(),
             startup: StartupModeConfig::MarshalSync,
             spammer,
             spammer_accounts: 10,

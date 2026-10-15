@@ -18,6 +18,14 @@ receiving valid peer blocks. Network messages remain capped at 32 MiB.
 `--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
 Run `./deploy.sh --help` for defaults.
 
+Each node defaults to a 6 GiB state page cache and a separate 2 GiB cache for
+other storage. This applies to validators and secondary roles, including the
+spammer and indexer. The larger state cache gives operation-log pages more room
+to remain cached until floor advancement reuses them with the standard Clock2Q+ policy.
+Use the generator's `--state-page-cache-bytes` and `--other-page-cache-bytes`
+options to override these budgets, including for local clusters. Existing YAML
+configs with explicit cache budgets retain those values.
+
 `--worker-threads` and `--rayon-threads` set each node's async workers and engine
 Rayon pool. Use `--indexer-worker-threads` and `--indexer-rayon-threads` to override
 those counts for the indexer secondary in either deployment mode.

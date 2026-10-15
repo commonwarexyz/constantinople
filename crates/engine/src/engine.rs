@@ -34,7 +34,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
-    Committable, Digest, Hasher, PublicKey, Signer,
+    Committable, Digest, Digested, Hasher, PublicKey, Signer,
     bls12381::{
         dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
@@ -436,11 +436,10 @@ where
             <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
             <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
         );
-        let coded_genesis = Arc::new(EngineCodedBlock::new(
-            genesis_block.into(),
-            coding_config,
-            &config.strategy,
-        ));
+        let genesis_block = Digested::compute(EngineBlock::from(genesis_block), &config.strategy);
+        let coded_genesis = Arc::new(
+            EngineCodedBlock::encode(genesis_block.await, coding_config, &config.strategy).await,
+        );
         let (application_state_target, application_transactions_target) =
             block_targets(coded_genesis.inner());
 
@@ -548,6 +547,7 @@ where
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
                 prune_config: config.prune_config,
+                strategy: config.strategy.clone(),
             },
         );
 
@@ -562,9 +562,11 @@ where
                 epocher,
             },
         );
-        // Fan Simplex activity to the marshal mailbox and any external observer.
-        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
-            Reporters::from((marshal_mailbox.clone(), config.simplex_observer));
+        // Simplex activity reaches marshal through the marshaled application,
+        // which retires its proposal gates on finalization before forwarding.
+        // Reporting to the marshal mailbox directly would leak those gates.
+        let simplex_reporter: SimplexReporter<E, H, C::PublicKey, V, I, (), St, O> =
+            Reporters::from((application.clone(), config.simplex_observer));
 
         // Retain votes for late equivocation reports. The upstream wall-clock skip policy
         // avoids waiting on silent leaders while a quorum remains active.
@@ -874,7 +876,7 @@ mod unit_tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
+    use commonware_cryptography::{Digest, Digestible, Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
     use commonware_utils::{NZU16, non_empty_range};
@@ -882,6 +884,7 @@ mod unit_tests {
         Block, Header, Sealable, Transaction, TransactionPublicKey,
         proposal::{MAXIMUM_BLOCK_SIZE, MAXIMUM_MESSAGE_SIZE, max_transaction_bytes},
     };
+    use futures::FutureExt;
     use rand::{SeedableRng, rngs::StdRng};
     use std::num::NonZeroU64;
 
@@ -977,7 +980,12 @@ mod unit_tests {
         for validators in [4, 7, 50] {
             let coding_config = coding_config_for_participants(validators);
             let shards = usize::from(coding_config.minimum_shards.get());
-            let coded = EngineCodedBlock::new(block.clone(), coding_config, &Sequential);
+
+            // Sequential runs the coding job inline, so the future is already ready.
+            let digested = Digested::precomputed(block.clone(), block.digest());
+            let coded = EngineCodedBlock::encode(digested, coding_config, &Sequential)
+                .now_or_never()
+                .expect("sequential encoding completes inline");
             let encoded = coded.shard(0).expect("shard zero should exist").encode();
             assert!(encoded.len() <= MAXIMUM_MESSAGE_SIZE as usize);
 
