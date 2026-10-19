@@ -1398,7 +1398,7 @@ mod tests {
     use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
     use exoware_qmdb::adapter::{Keyless, Unordered};
     use rand::{SeedableRng, rngs::StdRng};
-    use std::sync::Mutex as StdMutex;
+    use std::{pin::pin, sync::Mutex as StdMutex};
     use tracing::{
         Id, Subscriber,
         field::{Field, Visit},
@@ -1781,7 +1781,7 @@ mod tests {
             first.persisted().await.unwrap();
             let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
             {
-                let mut enqueue = std::pin::pin!(publisher.enqueue_queued_finalized(upload(3)));
+                let mut enqueue = pin!(publisher.enqueue_queued_finalized(upload(3)));
                 assert!(futures::poll!(enqueue.as_mut()).is_pending());
             }
 
