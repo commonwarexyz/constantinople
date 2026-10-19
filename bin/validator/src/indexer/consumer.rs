@@ -431,12 +431,6 @@ fn spawn_upload(
         .admission_wait
         .observe_between(admission_started, context.current());
     let height = record.height();
-    assert_eq!(
-        height,
-        position
-            .checked_add(1)
-            .expect("finalized queue position must not overflow")
-    );
     let payloads = payloads.clone();
     let metrics = metrics.clone();
     let (admitted_tx, admitted_rx) = oneshot::channel();
@@ -465,7 +459,7 @@ fn spawn_upload(
                 record.receipt,
                 "finalized index payload at height {height} does not match its record"
             );
-            let block = Arc::new(upload.block().clone());
+            let block = upload.block().clone();
             let finalization = upload.finalization().cloned();
 
             wait_for_upload_turn(&context, turn, &metrics)
@@ -863,7 +857,7 @@ mod tests {
 
     #[test]
     fn reservation_is_released_once_both_uploads_are_durable() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
             let budget = UploadBudget::new(
                 &context.child("upload_budget"),
                 FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,

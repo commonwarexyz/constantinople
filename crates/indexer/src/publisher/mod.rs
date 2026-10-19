@@ -159,7 +159,7 @@ impl StoreCommitMetrics {
     }
 }
 
-// Observe cancelled attempts too so the retry deadline cannot hide stalled requests.
+// Observe cancelled attempts too so request timeouts remain visible.
 struct PutAttemptTimer {
     histogram: raw::Histogram,
     start: Instant,
@@ -371,9 +371,6 @@ fn store_error_label(error: &ClientError) -> &'static str {
     }
 
     match error {
-        ClientError::Http(error) if error.is_connect() => "http_connect",
-        ClientError::Http(error) if error.is_timeout() => "http_timeout",
-        ClientError::Http(error) if error.is_request() => "http_request",
         ClientError::Http(_) => "http",
         ClientError::Rpc(error) => error.code.as_str(),
         ClientError::Prefix(_) => "prefix",
@@ -388,7 +385,6 @@ fn is_retryable_store_error(error: &ClientError) -> bool {
     }
 
     match error {
-        ClientError::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
         ClientError::Rpc(_) => matches!(
             error.rpc_code(),
             Some(
@@ -400,7 +396,8 @@ fn is_retryable_store_error(error: &ClientError) -> bool {
                     | ErrorCode::Unknown
             )
         ),
-        ClientError::Prefix(_)
+        ClientError::Http(_)
+        | ClientError::Prefix(_)
         | ClientError::InvalidKeyLength { .. }
         | ClientError::WireFormat(_) => false,
     }

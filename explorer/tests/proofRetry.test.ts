@@ -1,10 +1,12 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { Code, ConnectError } from '@connectrpc/connect';
-import { HttpError } from '@exowarexyz/sdk';
+import { Client, HttpError, StoreKeyPrefix } from '@exowarexyz/sdk';
+import { SqlClient } from '@exowarexyz/sql';
 
 import {
     accountRetryReason,
+    errorMessage,
     isConsistencyNotReadyError,
     isMissingAccountProofError,
     isRetryableAccountProofError,
@@ -14,6 +16,16 @@ import {
 import { transactionProofTip } from '../src/proofMath.ts';
 
 const CONSISTENCY_NOT_READY = '[aborted] minimum consistency token is not yet visible';
+const NETWORK_FAILURES = [
+    'Failed to fetch',
+    'fetch failed',
+    'Load failed',
+    'network error',
+    'terminated',
+    'Error in body stream',
+    'Error in input stream',
+    'NetworkError when attempting to fetch resource.',
+];
 
 test('SQL tx metadata misses are retried while the indexer catches up', () => {
     assert.equal(
@@ -49,7 +61,7 @@ test('structured consistency lag is retried without accepting unrelated aborted 
     );
 });
 
-test('Wasm asset rejections are terminal while network fetch failures are retried', () => {
+test('Wasm load failures are terminal because the SDK caches failed initialization', () => {
     for (const status of ['403 Forbidden', '404 Not Found']) {
         const error = new Error(`failed to fetch Wasm: ${status} fetching 'http://localhost:5173/verifier.wasm'`);
 
@@ -57,11 +69,69 @@ test('Wasm asset rejections are terminal while network fetch failures are retrie
         assert.equal(isRetryableAccountProofError(error), false);
     }
 
-    for (const detail of ['Failed to fetch', 'fetch failed', 'Load failed', 'NetworkError when attempting to fetch resource.']) {
-        const error = new TypeError(detail);
+    for (const detail of NETWORK_FAILURES) {
+        for (const error of [new TypeError(detail), `TypeError: ${detail}`]) {
+            assert.equal(isRetryableProofError(error), false, detail);
+            assert.equal(isRetryableAccountProofError(error), false, detail);
+        }
+    }
+});
 
-        assert.equal(isRetryableProofError(error), true);
-        assert.equal(isRetryableAccountProofError(error), true);
+test('SDK transport failures remain retryable after client error wrapping', async (t) => {
+    for (const detail of NETWORK_FAILURES) {
+        // The SDK captures fetch when a client is built, so clients follow the mock.
+        t.mock.method(globalThis, 'fetch', async () => {
+            throw new TypeError(detail);
+        });
+        const sql = new SqlClient('https://example.invalid');
+        const store = new Client('https://example.invalid').store(new StoreKeyPrefix(new Uint8Array([2])));
+
+        for (const read of [
+            () => sql.query('SELECT 1', 1n),
+            () => store.get(new Uint8Array([1]), 1n),
+        ]) {
+            await assert.rejects(read(), (error: unknown) => {
+                const rethrown = new Error(`${errorMessage(error)} · height 1`, { cause: error });
+                for (const candidate of [error, rethrown]) {
+                    assert.equal(isRetryableProofError(candidate), true, detail);
+                    assert.equal(accountRetryReason(candidate), 'retrying after service error', detail);
+                }
+                return true;
+            });
+        }
+        t.mock.restoreAll();
+    }
+});
+
+test('Unknown errors without a network fetch cause remain terminal', async (t) => {
+    t.mock.method(globalThis, 'fetch', async () => new Response('upstream failure', { status: 500 }));
+    const sql = new SqlClient('https://example.invalid');
+    const store = new Client('https://example.invalid').store(new StoreKeyPrefix(new Uint8Array([2])));
+
+    for (const read of [
+        () => sql.query('SELECT 1', 1n),
+        () => store.get(new Uint8Array([1]), 1n),
+    ]) {
+        await assert.rejects(read(), (error: unknown) => {
+            assert.equal(isRetryableProofError(error), false);
+            assert.equal(accountRetryReason(error), undefined);
+            return true;
+        });
+    }
+
+    for (const error of [
+        new ConnectError('Failed to fetch', Code.Unknown),
+        new ConnectError('Error in body stream', Code.Unknown),
+        new ConnectError('Error in input stream', Code.Unknown),
+        new ConnectError('missing EndStreamResponse', Code.Unknown),
+        new Error('missing EndStreamResponse'),
+        new ConnectError('Invalid URL', Code.Unknown, undefined, undefined, new TypeError('Invalid URL')),
+        new ConnectError('Invalid header value', Code.Unknown, undefined, undefined, new TypeError('Invalid header value')),
+        new ConnectError('Failed to fetch', Code.Internal, undefined, undefined, new TypeError('Failed to fetch')),
+        new Error('[unknown] Failed to fetch · height 1'),
+    ]) {
+        assert.equal(isRetryableProofError(error), false, error.message);
+        assert.equal(accountRetryReason(error), undefined, error.message);
     }
 });
 
@@ -188,7 +258,7 @@ test('account proof index catch-up errors are retried', () => {
     );
     assert.equal(isRetryableAccountProofError('finalization missing at height 42'), true);
     assert.equal(isRetryableAccountProofError('[unavailable] transport disconnected'), true);
-    assert.equal(isRetryableAccountProofError('TypeError: Failed to fetch'), true);
+    assert.equal(isRetryableAccountProofError(ConnectError.from(new TypeError('Failed to fetch'))), true);
 });
 
 test('missing account proof rows are not retried as index catch-up', () => {
@@ -206,8 +276,11 @@ test('account retries distinguish indexer lag from service errors', () => {
     ]) {
         assert.equal(accountRetryReason(new Error(detail)), 'waiting for indexer', detail);
     }
-    for (const detail of ['[unavailable] transport disconnected', 'TypeError: Failed to fetch']) {
-        assert.equal(accountRetryReason(new Error(detail)), 'retrying after service error', detail);
+    for (const error of [
+        new Error('[unavailable] transport disconnected'),
+        ConnectError.from(new TypeError('Failed to fetch')),
+    ]) {
+        assert.equal(accountRetryReason(error), 'retrying after service error', error.message);
     }
     for (const detail of ['SQL transaction body does not match transaction digest']) {
         assert.equal(accountRetryReason(new Error(detail)), undefined, detail);

@@ -1693,7 +1693,7 @@ mod tests {
                 queued_range(&state, 1, 2),
                 queued_range(&transactions, 1, 2),
             );
-            let block = Arc::new(upload.block().clone());
+            let block = upload.block().clone();
             let finalization = upload.finalization().cloned();
             publisher
                 .enqueue_queued_finalized(upload)

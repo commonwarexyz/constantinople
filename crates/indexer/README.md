@@ -147,17 +147,14 @@ capacity. The byte ceiling across those requests is 240 MiB per block. This
 excludes request overhead and other copies. Simplex full-block uploads use a
 separate request path.
 
-Each Store Put uses client streaming with a target of 1 MiB of uncompressed
-protobuf per message. A row larger than that target occupies its own message.
-Rows are never fragmented. All messages in a request form one atomic write and
-receive one Store sequence number. Request splitting above creates separate
-writes. The Store endpoint must support the client-streaming Put
-protocol. A server that only accepts unary Put requests is incompatible.
+Each Store Put sends one unary protobuf request. All rows in that request form
+one atomic write and receive one Store sequence number. Request splitting above
+creates separate writes.
 
-Preparation still materializes the block's SQL and QMDB rows before starting
-uploads. The SDK accepts a complete `StoreWriteBatch` and then encodes its
-messages on demand. This bounds ordinary message encoding buffers, but does not
-overlap row preparation with transmission or bound total preparation memory.
+Preparation materializes the block's SQL and QMDB rows before uploads start.
+The SDK accepts a complete `StoreWriteBatch` and encodes and compresses the full
+request on each attempt. Preparation and transmission do not overlap, and the
+request path does not bound total preparation memory.
 
 Remote Store commits retry the fully staged `StoreWriteBatch` with capped
 exponential backoff. Retries resend the complete logical request. Retryable

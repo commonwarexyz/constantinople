@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import test from 'node:test';
-import type { CallOptions } from '@connectrpc/connect';
+import { Code, ConnectError, type CallOptions } from '@connectrpc/connect';
 
 import {
     QmdbOperationLogClient,
@@ -17,7 +17,7 @@ import {
 } from '@exowarexyz/sql';
 import { SimplexClient, type VerifiedSimplexCertificate } from '@exowarexyz/simplex';
 import { ensureSimplexWasm } from '@exowarexyz/simplex/wasm';
-import { StoreClient, TraversalMode, type GetManyResultItem, type QueryResult } from '@exowarexyz/sdk';
+import { StoreClient, TraversalMode, type QueryResult } from '@exowarexyz/sdk';
 import { toArrayBuffer, toHex } from '../src/codec.ts';
 import { normalizeSubmittedTransaction } from '../src/submissionHistory.ts';
 import {
@@ -325,61 +325,63 @@ test('transaction proof discovers its height despite an ahead-of-target report r
     assert.equal(proofRequest.mock.callCount(), 1);
 });
 
-for (const hintState of ['missing', 'error', 'pending'] as const) {
-    test(`transaction proof ignores a ${hintState} certificate for a different hinted height`, { timeout: 5_000 }, async (t) => {
-        const body = new Uint8Array(82).fill(0x33);
-        const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
-        const certificate = await finalizedCertificate(HEIGHT);
-        mockParentHeader(t, certificate);
-        const hintStarted = deferred<void>();
-        let hintSignal: AbortSignal | undefined;
-        const heights: string[] = [];
-        t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
-            height: string, floor: bigint, options: { signal?: AbortSignal },
-        ) => {
-            assert.equal(floor, FLOOR);
-            heights.push(height);
-            if (height === HEIGHT.toString()) return certificate;
-            assert.equal(height, (HEIGHT - 1n).toString());
-            hintSignal = options.signal;
-            hintStarted.resolve();
-            if (hintState === 'missing') return null;
-            if (hintState === 'error') throw new Error('hint certificate unavailable');
-            return new Promise<VerifiedSimplexCertificate>((_resolve, reject) => {
-                hintSignal!.addEventListener('abort', () => reject(hintSignal!.reason), { once: true });
+for (const finalizedHeight of [undefined, HEIGHT - 1n]) {
+    for (const hintState of ['missing', 'error', 'pending'] as const) {
+        test(`transaction proof ignores a ${hintState} unrelated certificate with hint ${finalizedHeight}`, { timeout: 5_000 }, async (t) => {
+            const body = new Uint8Array(82).fill(0x33);
+            const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+            const certificate = await finalizedCertificate(HEIGHT);
+            mockParentHeader(t, certificate);
+            const hintStarted = deferred<void>();
+            let hintSignal: AbortSignal | undefined;
+            const heights: string[] = [];
+            t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
+                height: string, floor: bigint, options: { signal?: AbortSignal },
+            ) => {
+                assert.equal(floor, FLOOR);
+                heights.push(height);
+                if (height === HEIGHT.toString()) return certificate;
+                assert.equal(height, (finalizedHeight ?? HEIGHT + 1n).toString());
+                hintSignal = options.signal;
+                hintStarted.resolve();
+                if (hintState === 'missing') return null;
+                if (hintState === 'error') throw new Error('hint certificate unavailable');
+                return new Promise<VerifiedSimplexCertificate>((_resolve, reject) => {
+                    hintSignal!.addEventListener('abort', () => reject(hintSignal!.reason), { once: true });
+                });
             });
-        });
-        mockNoDescendant(t);
-        t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
-            assert.equal(floor, FLOOR);
-            await hintStarted.promise;
-            return txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT });
-        });
-        const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
-            request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
-        ) => {
-            assert.equal(request.minSequenceNumber, FLOOR);
-            assert.equal(request.tip, 7n);
-            assert.equal(location, LOCATION);
-            assert.equal(toHex(value), digest);
-            assert.deepEqual(root, latestTarget().transactionsRoot);
-            return keylessProof(request, root, location, value);
-        });
-        const finalizations: bigint[] = [];
+            mockNoDescendant(t);
+            t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
+                assert.equal(floor, FLOOR);
+                await hintStarted.promise;
+                return txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT });
+            });
+            const proofRequest = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
+                request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
+            ) => {
+                assert.equal(request.minSequenceNumber, FLOOR);
+                assert.equal(request.tip, 7n);
+                assert.equal(location, LOCATION);
+                assert.equal(toHex(value), digest);
+                assert.deepEqual(root, latestTarget().transactionsRoot);
+                return keylessProof(request, root, location, value);
+            });
+            const finalizations: bigint[] = [];
 
-        const proof = await fetchAndVerifyTransactionProof({
-            ...transactionProofOptions(digest),
-            finalizedHeight: HEIGHT - 1n,
-            signal: t.signal,
-            onFinalizationVerified: (target) => { finalizations.push(target.height); },
-        });
+            const proof = await fetchAndVerifyTransactionProof({
+                ...transactionProofOptions(digest),
+                finalizedHeight,
+                signal: t.signal,
+                onFinalizationVerified: (target) => { finalizations.push(target.height); },
+            });
 
-        assert.equal(proof.height, HEIGHT);
-        assert.deepEqual(heights, [(HEIGHT - 1n).toString(), HEIGHT.toString()]);
-        assert.deepEqual(finalizations, [HEIGHT]);
-        assert.equal(proofRequest.mock.callCount(), 1);
-        if (hintState === 'pending') assert.equal(hintSignal?.aborted, true);
-    });
+            assert.equal(proof.height, HEIGHT);
+            assert.deepEqual(heights, [(finalizedHeight ?? HEIGHT + 1n).toString(), HEIGHT.toString()]);
+            assert.deepEqual(finalizations, [HEIGHT]);
+            assert.equal(proofRequest.mock.callCount(), 1);
+            if (hintState === 'pending') assert.equal(hintSignal?.aborted, true);
+        });
+    }
 }
 
 test('a certificate failure still rejects when SQL confirms the hinted height', async (t) => {
@@ -501,13 +503,15 @@ for (const { name, location, accepted } of [
     { name: 'the current trailing commit', location: latestTarget().transactionsTip - 1n, accepted: false },
     { name: 'a location below the active range', location: latestTarget().transactionsStart - 1n, accepted: false },
 ]) {
-    test(`exact inclusion height checks ${name} before notifying or fetching a proof`, async (t) => {
+    test(`exact inclusion height checks ${name} before notifying or fetching a proof`, { timeout: 5_000 }, async (t) => {
         const body = new Uint8Array(82).fill(0x33);
         const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
         const certificate = await finalizedCertificate(HEIGHT);
         const events: string[] = [];
+        const parentRead = deferred<void>();
         const parent = mockParentHeader(t, certificate, () => {
             events.push('parent');
+            parentRead.resolve();
             return certificate.parentHeader;
         });
         const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
@@ -541,6 +545,9 @@ for (const { name, location, accepted } of [
             assert.deepEqual(events, ['parent', 'verified', 'proof']);
         } else {
             await assert.rejects(pending, NOT_IN_BLOCK);
+
+            // Local bound failures can reject before the prefetched parent read reaches the transport.
+            await parentRead.promise;
             assert.deepEqual(events, ['parent']);
         }
         assert.equal(parent.mock.callCount(), 1);
@@ -824,6 +831,30 @@ test('reported-height proofs retain the request floor without response sequence 
     assert.equal(result.location, LOCATION);
 });
 
+test('proof diagnostics preserve retryable transport causes', async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const certificate = await finalizedCertificate(HEIGHT);
+    mockParentHeader(t, certificate);
+    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
+        txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
+    );
+    const failure = new ConnectError('Failed to fetch', Code.Unknown, undefined, undefined, new TypeError('Failed to fetch'));
+    t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => { throw failure; });
+
+    await assert.rejects(fetchAndVerifyTransactionProof({
+        ...transactionProofOptions(digest),
+        finalizedHeight: HEIGHT,
+    }), (error: unknown) => {
+        assert.ok(error instanceof Error);
+        assert.match(error.message, /height 7/);
+        assert.equal(error.cause, failure);
+        assert.equal(isRetryableProofError(error), true);
+        return true;
+    });
+});
+
 test('a failed metadata read cancels its concurrent certificate request', async (t) => {
     let certificateStarted!: () => void;
     const ready = new Promise<void>((resolve) => { certificateStarted = resolve; });
@@ -1052,11 +1083,14 @@ function fixtureHeader(
 }
 
 function mockParentHeaders(t: test.TestContext, certificates: FixtureCertificate[]) {
-    return t.mock.method(StoreClient.prototype, 'getMany', async (keys: Uint8Array[]): Promise<GetManyResultItem[]> => {
+    return t.mock.method(globalThis, 'fetch', async (input: unknown, init: RequestInit): Promise<Response> => {
+        assert.match(String(input), /\/store\.query\.v1\.Service\/GetMany$/);
+        const request = readConnectJsonRequest(init);
+        const key = new Uint8Array(Buffer.from(request.keys[0]!, 'base64'));
         const certificate = certificates.find(({ parentDigest }) =>
-            toHex(keys[0]!) === toHex(concat(new Uint8Array([1]), parentDigest)));
+            toHex(key) === toHex(concat(new Uint8Array([2, 1]), parentDigest)));
         assert.ok(certificate, 'unexpected header read');
-        return [{ key: keys[0]!, value: certificate.parentHeader }];
+        return connectJsonStream(headerFrames([{ key, value: certificate.parentHeader }], 1));
     });
 }
 
@@ -1065,16 +1099,14 @@ function mockParentHeader(
     certificate: FixtureCertificate,
     read: () => Uint8Array | undefined | Promise<Uint8Array | undefined> = () => certificate.parentHeader,
 ) {
-    return t.mock.method(StoreClient.prototype, 'getMany', async (
-        keys: Uint8Array[],
-        batchSize?: number,
-        _onChunk?: unknown,
-        floor?: bigint,
-    ): Promise<GetManyResultItem[]> => {
-        assert.deepEqual(keys, [concat(new Uint8Array([1]), certificate.parentDigest)]);
-        assert.equal(batchSize, 1);
-        assert.equal(floor, FLOOR);
-        return [{ key: keys[0]!, value: await read() }];
+    return t.mock.method(globalThis, 'fetch', async (input: unknown, init: RequestInit): Promise<Response> => {
+        assert.match(String(input), /\/store\.query\.v1\.Service\/GetMany$/);
+        const request = readConnectJsonRequest(init);
+        const keys = request.keys.map((key) => new Uint8Array(Buffer.from(key, 'base64')));
+        assert.deepEqual(keys, [concat(new Uint8Array([2, 1]), certificate.parentDigest)]);
+        assert.equal(request.batchSize, 1);
+        assert.equal(request.minSequenceNumber, FLOOR.toString());
+        return connectJsonStream(headerFrames([{ key: keys[0]!, value: await read() }], 1));
     });
 }
 
@@ -1416,6 +1448,10 @@ interface DescendantStoreOptions {
     readonly descendantKeyHeight?: (height: bigint) => bigint;
     readonly sql?: (sql: string) => DecodedQueryResult;
     readonly sqlSignal?: (signal: AbortSignal | undefined) => Promise<void>;
+    readonly headerFrameSize?: number;
+    readonly reverseHeaders?: boolean;
+    readonly extraHeaderKeys?: readonly Uint8Array[];
+    readonly headerTransport?: (init: RequestInit) => Promise<Response>;
 }
 
 test('a missing exact certificate is authenticated through a certified descendant', async (t) => {
@@ -1673,14 +1709,79 @@ test('transaction proofs use the requested ancestor root authenticated by the pu
     assert.equal(proof.height, 7n);
     assert.equal(proof.view, blocks.get(7n)!.view);
     assert.deepEqual(finalizations, [{ height: 7n, view: blocks.get(7n)!.view }]);
-    assert.deepEqual(store.certificateReads.map(({ height }) => height), [8n, 7n]);
-    // The tip's parent is prefetched before SQL resolves the lower height.
+    assert.deepEqual(store.certificateReads.map(({ height }) => height), [8n, 7n, 8n]);
     assert.deepEqual(store.headerReads, [
-        { count: 1, floor: FLOOR },
         { count: 1, floor: STORE_SEQUENCE },
         { count: 1, floor: FLOOR },
     ]);
     assert.equal(store.hintQueries.length, 0);
+});
+
+test('the last header waiter cancels the shared transport', { timeout: 5_000 }, async (t) => {
+    const blocks = await blockChain(1n, 8n);
+    const started = deferred<void>();
+    let transportSignal: AbortSignal | undefined;
+    const store = mockDescendantStore(t, {
+        blocks,
+        certified: [8n],
+        headerTransport: (init) => {
+            transportSignal = init.signal!;
+            started.resolve();
+            return new Promise<Response>((_resolve, reject) => {
+                transportSignal!.addEventListener('abort', () => reject(transportSignal!.reason), { once: true });
+            });
+        },
+    });
+    const first = new AbortController();
+    const second = new AbortController();
+    const options = { ...transactionProofOptions(''), height: 7n };
+    const pendingFirst = prefetchFinalizedCertificate({ ...options, signal: first.signal });
+    const pendingSecond = prefetchFinalizedCertificate({ ...options, signal: second.signal });
+    await started.promise;
+
+    first.abort(new Error('first left'));
+    await assert.rejects(pendingFirst, /first left/);
+    assert.equal(transportSignal?.aborted, false);
+    assert.equal(store.headerReads.length, 1);
+
+    second.abort(new Error('last left'));
+    await assert.rejects(pendingSecond, /last left/);
+    assert.equal(transportSignal?.aborted, true);
+
+    const replacement = mockDescendantStore(t, { blocks, certified: [8n] });
+    await prefetchFinalizedCertificate(options);
+    assert.equal(replacement.headerReads.length, 1);
+});
+
+test('header batches are matched by key across reordered multi-frame responses', async (t) => {
+    const blocks = await blockChain(1n, 301n);
+    const store = mockDescendantStore(t, {
+        blocks,
+        certified: [301n],
+        headerFrameSize: 7,
+        reverseHeaders: true,
+        extraHeaderKeys: [concat(new Uint8Array([2, 1]), new Uint8Array(32).fill(0xee))],
+    });
+
+    const target = await fetchLatestProofTarget({
+        ...transactionProofOptions(''),
+        publishedTarget: { height: 1n, blockDigest: blocks.get(1n)!.digest, sequenceNumber: FLOOR },
+    });
+
+    assert.equal(target.height, 1n);
+    assert.deepEqual(store.headerReads.map(({ count }) => count), [HINT_BATCH, HINT_BATCH, 44]);
+    assert.deepEqual(store.headerReads.map(({ floor }) => floor), [STORE_SEQUENCE, STORE_SEQUENCE, STORE_SEQUENCE]);
+});
+
+test('a header row outside the Simplex store prefix fails the lookup closed', async (t) => {
+    const blocks = await blockChain(1n, 8n);
+    mockDescendantStore(t, {
+        blocks,
+        certified: [8n],
+        extraHeaderKeys: [concat(new Uint8Array([3, 1]), new Uint8Array(32))],
+    });
+
+    await assert.rejects(prefetchFinalizedCertificate({ ...transactionProofOptions(''), height: 7n }), /store prefix/);
 });
 
 test('cancelling descendant fallback aborts its pending SQL read', async (t) => {
@@ -1825,19 +1926,26 @@ function mockDescendantStore(t: test.TestContext, options: DescendantStoreOption
                 : [{ key: concat(new Uint8Array([5]), u64(keyHeight)), value: new Uint8Array([1]) }],
         };
     });
-    t.mock.method(StoreClient.prototype, 'getMany', async (
-        keys: Uint8Array[],
-        _batchSize?: number,
-        _onChunk?: unknown,
-        floor?: bigint,
-    ): Promise<GetManyResultItem[]> => {
-        recorded.headerReads.push({ count: keys.length, floor });
-        return keys.map((key) => {
-            assert.equal(key[0], 1);
-            const digest = key.slice(1);
-            return { key, value: options.header ? options.header(digest) : headers.get(toHex(digest)) };
+    t.mock.method(globalThis, 'fetch', async (input: unknown, init: RequestInit): Promise<Response> => {
+        assert.match(String(input), /\/store\.query\.v1\.Service\/GetMany$/);
+        const request = readConnectJsonRequest(init);
+        assert.equal(request.batchSize, request.keys.length);
+        const keys = request.keys.map((key: string) => new Uint8Array(Buffer.from(key, 'base64')));
+        recorded.headerReads.push({
+            count: keys.length,
+            floor: request.minSequenceNumber === undefined ? undefined : BigInt(request.minSequenceNumber),
         });
+        if (options.headerTransport) return options.headerTransport(init);
+        const entries = keys.map((key: Uint8Array) => {
+            assert.deepEqual([...key.subarray(0, 2)], [2, 1]);
+            const digest = key.slice(2);
+            const value = options.header ? options.header(digest) : headers.get(toHex(digest));
+            return { key, value };
+        });
+        entries.push(...(options.extraHeaderKeys ?? []).map((key) => ({ key, value: new Uint8Array([9]) })));
+        return connectJsonStream(headerFrames(entries, options.headerFrameSize ?? entries.length, options.reverseHeaders));
     });
+
     t.mock.method(SqlClient.prototype, 'query', async (
         sql: string,
         floor?: bigint,
@@ -1914,4 +2022,47 @@ function chainCertificate(block: ChainBlock): VerifiedSimplexCertificate {
 
 function bytesEqualTest(left: Uint8Array, right: Uint8Array): boolean {
     return left.length === right.length && left.every((byte, index) => byte === right[index]);
+}
+
+function readConnectJsonRequest(init: RequestInit): { keys: string[]; batchSize?: number; minSequenceNumber?: string } {
+    const body = init.body as Uint8Array;
+    const length = new DataView(body.buffer, body.byteOffset).getUint32(1);
+    return JSON.parse(new TextDecoder().decode(body.subarray(5, 5 + length)));
+}
+
+function headerFrames(
+    entries: ReadonlyArray<{ key: Uint8Array; value: Uint8Array | undefined }>,
+    frameSize: number,
+    reverse = false,
+) {
+    const ordered = reverse ? [...entries].reverse() : entries;
+    const frames = [];
+    for (let index = 0; index < ordered.length; index += frameSize) {
+        frames.push({
+            results: ordered.slice(index, index + frameSize).map(({ key, value }) => ({
+                key: Buffer.from(key).toString('base64'),
+                ...(value === undefined ? {} : { value: Buffer.from(value).toString('base64') }),
+            })),
+        });
+    }
+    return frames;
+}
+
+function connectJsonStream(frames: readonly unknown[]): Response {
+    const encoder = new TextEncoder();
+    const envelope = (flags: number, message: unknown) => {
+        const body = encoder.encode(JSON.stringify(message));
+        const out = new Uint8Array(5 + body.length);
+        out[0] = flags;
+        new DataView(out.buffer).setUint32(1, body.length);
+        out.set(body, 5);
+        return out;
+    };
+    return new Response(new ReadableStream<Uint8Array>({
+        start(controller) {
+            for (const frame of frames) controller.enqueue(envelope(0, frame));
+            controller.enqueue(envelope(2, {}));
+            controller.close();
+        },
+    }), { status: 200, headers: { 'content-type': 'application/connect+json' } });
 }

@@ -59,7 +59,6 @@ import {
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
-    isConsistencyNotReadyError,
     retryAccountWork,
 } from './proofRetry';
 import {
@@ -523,7 +522,7 @@ export default function App() {
                 signal: controller.signal,
             }),
             controller.signal,
-            isConsistencyNotReadyError,
+            isRetryableAccountProofError,
         )
             .then((page) => {
                 if (controller.signal.aborted) return;

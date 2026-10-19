@@ -1,6 +1,5 @@
 import { BinaryReader, WireType } from '@bufbuild/protobuf/wire';
 import { Code, ConnectError } from '@connectrpc/connect';
-import { HttpError } from '@exowarexyz/sdk';
 
 const ERROR_INFO_TYPE = 'google.rpc.ErrorInfo';
 const CONSISTENCY_NOT_READY = 'CONSISTENCY_NOT_READY';
@@ -8,13 +7,14 @@ const SERIALIZED_CONSISTENCY_NOT_READY =
     /^(?:HTTP error: 409 )?\[aborted\] minimum consistency token is not yet visible\b/i;
 const RETRYABLE_PROOF_ERROR =
     /tx_meta missing|tx digest .* (missing at height|is not finalized yet)|finalization missing|QMDB transaction proof response missing|not yet covered by a provable finalization|out_of_range|unavailable/i;
-const RETRYABLE_FETCH_ERROR =
-    /(?:^|:\s)(?:failed to fetch|fetch failed|load failed|networkerror when attempting to fetch resource\.?)$/i;
+const ACCOUNT_SERVICE_ERROR = /\[unavailable\]/i;
 
-const ACCOUNT_SERVICE_ERRORS = [
-    /\[unavailable\]/i,
-    RETRYABLE_FETCH_ERROR,
-];
+// Fetch and response-body failures have different messages across runtimes.
+const NETWORK_FAILURE_MESSAGE =
+    /^(?:failed to fetch|fetch failed|load failed|network error|terminated|error in (?:body|input) stream|networkerror when attempting to fetch resource\.?)$/i;
+
+// Bounds the walk so a cyclic cause chain cannot hang classification.
+const MAX_CAUSE_DEPTH = 8;
 
 const ACCOUNT_INDEXER_LAG_ERRORS = [
     /^finalization missing at height \d+$/,
@@ -48,8 +48,8 @@ export function isRetryableProofError(error: unknown): boolean {
     const detail = errorMessage(error);
     return (
         isConsistencyNotReadyError(error) ||
-        RETRYABLE_PROOF_ERROR.test(detail) ||
-        RETRYABLE_FETCH_ERROR.test(detail)
+        isTransportFailure(error) ||
+        RETRYABLE_PROOF_ERROR.test(detail)
     );
 }
 
@@ -71,7 +71,7 @@ export function accountRetryReason(error: unknown): AccountRetryReason | undefin
     ) {
         return 'waiting for indexer';
     }
-    if (ACCOUNT_SERVICE_ERRORS.some((pattern) => pattern.test(detail))) {
+    if (isTransportFailure(error) || ACCOUNT_SERVICE_ERROR.test(detail)) {
         return 'retrying after service error';
     }
     return undefined;
@@ -86,11 +86,40 @@ export function isConsistencyNotReadyError(error: unknown): boolean {
     );
 }
 
-export function errorInfos(error: unknown, code: Code): ErrorInfo[] {
-    const cause = error instanceof HttpError ? error.cause : error;
-    if (!(cause instanceof ConnectError) || cause.code !== code) return [];
+// Local transport failures retain their cause, unlike server-sent Unknown
+// errors. Bare SDK Wasm initialization failures stay terminal because the SDK
+// caches the rejected promise until reload.
+export function isTransportFailure(error: unknown): boolean {
+    const connect = connectError(error);
+    return (
+        connect?.code === Code.Unknown &&
+        (connect.cause === 'missing EndStreamResponse' ||
+            (connect.cause instanceof TypeError && NETWORK_FAILURE_MESSAGE.test(connect.cause.message)))
+    );
+}
 
-    return cause.details.flatMap((detail) => {
+export function isRetryableServiceError(error: unknown): boolean {
+    const code = connectError(error)?.code;
+    return (
+        isTransportFailure(error) ||
+        code === Code.Unavailable ||
+        code === Code.DeadlineExceeded ||
+        isConsistencyNotReadyError(error) ||
+        isBatchEvicted(error)
+    );
+}
+
+export function isBatchEvicted(error: unknown): boolean {
+    return errorInfos(error, Code.OutOfRange).some(
+        ({ reason, domain }) => reason === 'BATCH_EVICTED' && domain === 'log.stream',
+    );
+}
+
+export function errorInfos(error: unknown, code: Code): ErrorInfo[] {
+    const connect = connectError(error);
+    if (connect?.code !== code) return [];
+
+    return connect.details.flatMap((detail) => {
         if (!('type' in detail) || detail.type !== ERROR_INFO_TYPE) return [];
         try {
             return [decodeErrorInfo(detail.value)];
@@ -140,6 +169,17 @@ export function waitForRetry(ms: number, signal?: AbortSignal): Promise<boolean>
 
 export function errorMessage(error: unknown): string {
     return error instanceof Error ? error.message : String(error);
+}
+
+// Store errors arrive as HttpError and proof errors can be rethrown with added
+// context, so the RPC failure is found by following the cause chain.
+function connectError(error: unknown): ConnectError | undefined {
+    let current = error;
+    for (let depth = 0; depth < MAX_CAUSE_DEPTH && current instanceof Error; depth += 1) {
+        if (current instanceof ConnectError) return current;
+        current = current.cause;
+    }
+    return undefined;
 }
 
 function decodeErrorInfo(value: Uint8Array): ErrorInfo {
