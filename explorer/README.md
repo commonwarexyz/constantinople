@@ -39,10 +39,11 @@ The explorer distinguishes validator-reported finalization from verified
 certificates and proofs. Once the reported height is published, its certificate
 and `tx_meta` row are read concurrently. The reported height is a lookup hint;
 the `tx_meta` row records the transaction's containing height and QMDB
-location. Reconciliation checks the certificate at that height, the
-transaction body digest, and the location within the certified block range
-before fetching and verifying the QMDB operation-log proof under
-`/transactions`.
+location. Reconciliation checks the certificate at that height and the
+transaction body digest. It authenticates the parent header through the
+certified header's parent digest and checks the location within the block's
+own transaction appends before verifying the QMDB operation-log proof under
+`/transactions`. Together these checks authenticate the exact inclusion height.
 The UI records finalization observation and successful proof verification
 separately.
 

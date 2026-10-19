@@ -164,7 +164,7 @@ test('QMDB transaction root mismatches are terminal', () => {
 });
 
 test('non-indexer proof errors are not retried forever', () => {
-    assert.equal(isRetryableProofError('transaction location 3 is outside finalized block range'), false);
+    assert.equal(isRetryableProofError('Could not verify the transaction\'s inclusion in the reported block.'), false);
 });
 
 test('QMDB transaction proof tip uses inclusive operation location', () => {

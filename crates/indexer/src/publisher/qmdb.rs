@@ -1778,7 +1778,7 @@ mod tests {
             first.persisted().await.unwrap();
             let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
             {
-                let mut enqueue = Box::pin(publisher.enqueue_queued_finalized(upload(3)));
+                let mut enqueue = std::pin::pin!(publisher.enqueue_queued_finalized(upload(3)));
                 assert!(futures::poll!(enqueue.as_mut()).is_pending());
             }
 

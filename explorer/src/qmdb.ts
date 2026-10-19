@@ -204,23 +204,18 @@ export async function fetchAndVerifyTransactionProof({
         const targetHeight = coveredHeightHint ?? publishedTarget.height;
         const targetController = new AbortController();
         const targetSignal = AbortSignal.any([signal, targetController.signal]);
-        const targetResult = (targetHeight === publishedTarget.height
-            ? fetchLatestProofTarget({
-                storeUrl,
-                sqlUrl,
-                simplexVerificationMaterial,
-                publishedTarget,
-                signal: targetSignal,
-            })
-            : finalizedTransactionTarget(
-                source,
-                targetHeight,
-                publishedTarget.sequenceNumber,
-                targetSignal,
-            )).then(
-                (target) => ({ target }),
-                (error: unknown) => ({ error }),
-            );
+        const targetResult = finalizedTransactionTarget(
+            source,
+            targetHeight,
+            publishedTarget.sequenceNumber,
+            targetSignal,
+        ).then((target) => {
+            assertPublishedTargetDigest(target, publishedTarget);
+            return target;
+        }).then(
+            (target) => ({ target }),
+            (error: unknown) => ({ error }),
+        );
         const metadata = await fetchTransactionProofMetadata(
             sqlUrl,
             digest,
@@ -232,7 +227,7 @@ export async function fetchAndVerifyTransactionProof({
             throw uncoveredError(`transaction height ${metadata.height}`);
         }
 
-        let proofTarget: FinalizedTransactionTarget | undefined;
+        let proofTarget: AuthenticatedTarget | undefined;
         if (coveredHeightHint !== undefined && metadata.height !== targetHeight) {
             targetController.abort();
         } else {
@@ -254,10 +249,14 @@ export async function fetchAndVerifyTransactionProof({
             );
         signal.throwIfAborted();
         assertPublishedTargetDigest(target, publishedTarget);
-        if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
-            throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
-        }
-        onFinalizationVerified?.(target);
+        await verifyTransactionBlockLocation(
+            storeUrl,
+            target,
+            metadata.location,
+            publishedTarget.sequenceNumber,
+            signal,
+        );
+        onFinalizationVerified?.({ height: target.height, view: target.view });
 
         const tip = transactionProofTip(target.transactionsTip);
         let verification: VerifiedFixedKeylessAppendProof;
@@ -287,6 +286,33 @@ export async function fetchAndVerifyTransactionProof({
     }
 }
 
+async function verifyTransactionBlockLocation(
+    storeUrl: string,
+    target: AuthenticatedTarget,
+    location: bigint,
+    minSequenceNumber: bigint,
+    signal: AbortSignal,
+): Promise<void> {
+    // Genesis has no transactions, and the final operation is the block commit.
+    if (target.height === 0n || location < target.transactionsStart || location >= transactionProofTip(target.transactionsTip)) {
+        throw new Error('Could not verify the transaction\'s inclusion in the reported block.');
+    }
+
+    // Authenticate the parent's log end to exclude its retained transactions.
+    const [bytes] = await headersByDigest(
+        simplexStore(storeUrl),
+        [target.parentDigest],
+        minSequenceNumber,
+        signal,
+    );
+    if (!bytes) throw missingFinalization(target.height - 1n);
+    const parent = await authenticatedHeader(bytes, target.parentDigest, target.height - 1n);
+    signal.throwIfAborted();
+    if (location < parent.transactionsTip) {
+        throw new Error('Could not verify the transaction\'s inclusion in the reported block.');
+    }
+}
+
 // The published target is committed atomically with the state and transaction
 // QMDB publication boundary. Finalization of the target height, either directly
 // or through a certified descendant, authenticates its digest and supplies the
@@ -311,7 +337,7 @@ export async function fetchLatestProofTarget({
         signal,
     );
     assertPublishedTargetDigest(target, publishedTarget);
-    return { ...target, sequenceNumber: publishedTarget.sequenceNumber };
+    return { ...publicFinalizedTarget(target), sequenceNumber: publishedTarget.sequenceNumber };
 }
 
 function assertPublishedTargetDigest(
@@ -589,7 +615,7 @@ interface FinalizationSource {
     readonly simplexVerificationMaterial: string;
 }
 
-// The parent digest lets a cached descendant anchor later ancestor checks.
+// The parent digest authenticates ancestor headers and exact transaction bounds.
 interface AuthenticatedTarget extends FinalizedTransactionTarget {
     readonly parentDigest: Uint8Array;
 }
@@ -607,13 +633,13 @@ async function finalizedTransactionTarget(
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<FinalizedTransactionTarget> {
+): Promise<AuthenticatedTarget> {
     signal?.throwIfAborted();
     if (height < 0n) throw new Error('finalized height must be non-negative');
 
     const cacheKey = finalizedTargetKey(source, height);
     const cached = cachedFinalizedTarget(cacheKey);
-    if (cached) return publicFinalizedTarget(cached);
+    if (cached) return cached;
 
     // A verified target does not depend on SQL hints, but a failed attempt can.
     // Callers join an attempt only when it uses their SQL service and covers
@@ -669,10 +695,10 @@ async function finalizedTransactionTarget(
         signal?.addEventListener('abort', abort, { once: true });
         shared.promise.then((value) => finish(undefined, value), (error) => finish(error));
     });
-    return publicFinalizedTarget(copyFinalizedTarget(target));
+    return copyFinalizedTarget(target);
 }
 
-// The parent digest only anchors ancestor checks, so callers get the public shape.
+// Public proof targets omit the digest used for internal parent-header checks.
 function publicFinalizedTarget(target: AuthenticatedTarget): FinalizedTransactionTarget {
     const { parentDigest: _parentDigest, ...finalized } = target;
     return finalized;

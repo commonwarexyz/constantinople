@@ -91,6 +91,7 @@ test('reported height starts certificate and metadata reads together and retains
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
+    mockParentHeader(t, certificate);
     let metadataStarted!: () => void;
     const metadataReady = new Promise<void>((resolve) => { metadataStarted = resolve; });
     const reads: string[] = [];
@@ -145,6 +146,7 @@ for (const containingHeight of [1n, HEIGHT]) {
         const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
         const latest = await finalizedCertificate(HEIGHT + 1n);
         const containing = await finalizedCertificate(containingHeight);
+        mockParentHeader(t, containing);
         const heights: string[] = [];
         t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
             heights.push(height);
@@ -194,6 +196,7 @@ for (const finalizedHeight of [undefined, HEIGHT + 1n]) {
         const body = new Uint8Array(82).fill(0x33);
         const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
         const containing = await finalizedCertificate(HEIGHT);
+        mockParentHeader(t, containing);
         const later = await finalizedCertificate(HEIGHT + 1n, 4n, 12n);
         const options = transactionProofOptions(digest);
         options.publishedTarget.blockDigest = later.payload.slice(0, 32);
@@ -246,6 +249,7 @@ test('transaction proof discovers its height despite an ahead-of-target report r
 
     const latest = await finalizedCertificate(HEIGHT + 1n);
     const containing = await finalizedCertificate(HEIGHT);
+    mockParentHeader(t, containing);
     const options = transactionProofOptions(digest);
     options.publishedTarget.blockDigest = latest.payload.slice(0, 32);
     const heights: string[] = [];
@@ -288,6 +292,7 @@ for (const hintState of ['missing', 'error', 'pending'] as const) {
         const body = new Uint8Array(82).fill(0x33);
         const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
         const certificate = await finalizedCertificate(HEIGHT);
+        mockParentHeader(t, certificate);
         const hintStarted = deferred<void>();
         let hintSignal: AbortSignal | undefined;
         const heights: string[] = [];
@@ -443,9 +448,213 @@ test('a reported height cannot place a transaction outside its certified range',
         ...transactionProofOptions(digest),
         finalizedHeight: HEIGHT,
         onFinalizationVerified: () => { verified = true; },
-    }), /outside finalized block range/);
+    }), /Could not verify the transaction's inclusion in the reported block\./);
 
     assert.equal(verified, false);
+    assert.equal(proof.mock.callCount(), 0);
+});
+
+for (const { name, location, accepted, parentReads } of [
+    { name: 'a parent transaction falsely labeled with the child height', location: LOCATION - 2n, accepted: false, parentReads: 1 },
+    { name: 'the first transaction at the parent range end', location: LOCATION, accepted: true, parentReads: 1 },
+    { name: 'the current trailing commit', location: latestTarget().transactionsTip - 1n, accepted: false, parentReads: 0 },
+    { name: 'a location below the active range', location: latestTarget().transactionsStart - 1n, accepted: false, parentReads: 0 },
+]) {
+    test(`exact inclusion height checks ${name} before notifying or fetching a proof`, async (t) => {
+        const body = new Uint8Array(82).fill(0x33);
+        const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+        const certificate = await finalizedCertificate(HEIGHT);
+        const events: string[] = [];
+        const parent = mockParentHeader(t, certificate, () => {
+            events.push('parent');
+            return certificate.parentHeader;
+        });
+        const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
+            assert.equal(height, HEIGHT.toString());
+            assert.equal(floor, FLOOR);
+            return certificate;
+        });
+        const metadata = t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
+            assert.equal(floor, FLOOR);
+            return txMetaResult(sql, { qmdb_location: location, body, height: HEIGHT });
+        });
+        const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
+            request: OperationRangeRequest, root: Uint8Array, proofLocation: bigint, value: Uint8Array,
+        ) => {
+            events.push('proof');
+            assert.equal(request.minSequenceNumber, FLOOR);
+            assert.equal(request.tip, latestTarget().transactionsTip - 1n);
+            assert.equal(proofLocation, location);
+            return keylessProof(request, root, proofLocation, value);
+        });
+        const pending = fetchAndVerifyTransactionProof({
+            ...transactionProofOptions(digest),
+            finalizedHeight: HEIGHT,
+            onFinalizationVerified: () => { events.push('verified'); },
+        });
+
+        if (accepted) {
+            const result = await pending;
+            assert.equal(result.height, HEIGHT);
+            assert.equal(result.location, location);
+            assert.deepEqual(events, ['parent', 'verified', 'proof']);
+        } else {
+            await assert.rejects(pending, /Could not verify the transaction's inclusion in the reported block\./);
+            assert.deepEqual(events, parentReads ? ['parent'] : []);
+        }
+        assert.equal(parent.mock.callCount(), parentReads);
+        assert.equal(proof.mock.callCount(), accepted ? 1 : 0);
+        assert.equal(certificates.mock.callCount(), 1);
+        assert.equal(metadata.mock.callCount(), 1);
+    });
+}
+
+test('transaction inclusion height cannot be genesis', async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const certificate = await finalizedCertificate(0n);
+    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
+        txMetaResult(sql, { qmdb_location: LOCATION, body, height: 0n }),
+    );
+    const parent = mockParentHeader(t, certificate);
+    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+        throw new Error('unexpected proof');
+    });
+    const finalizations: bigint[] = [];
+
+    const failure = await fetchAndVerifyTransactionProof({
+        ...transactionProofOptions(digest),
+        publishedTarget: { height: 0n, blockDigest: certificate.payload.slice(0, 32), sequenceNumber: FLOOR },
+        finalizedHeight: 0n,
+        onFinalizationVerified: ({ height }) => { finalizations.push(height); },
+    }).then(() => assert.fail('expected genesis inclusion to fail'), (reason: unknown) => reason);
+
+    assert.match(String(failure), /Could not verify the transaction's inclusion in the reported block\./);
+    assert.equal(isRetryableProofError(failure), false);
+    assert.deepEqual(finalizations, []);
+    assert.equal(parent.mock.callCount(), 0);
+    assert.equal(proof.mock.callCount(), 0);
+});
+
+test('a missing parent header retries at its height and succeeds after publication', async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const certificate = await finalizedCertificate(HEIGHT);
+    let available = false;
+    const parent = mockParentHeader(t, certificate, () => available ? certificate.parentHeader : undefined);
+    const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
+        assert.equal(height, HEIGHT.toString());
+        assert.equal(floor, FLOOR);
+        return certificate;
+    });
+    const metadata = t.mock.method(SqlClient.prototype, 'query', async (sql: string, floor?: bigint) => {
+        assert.equal(floor, FLOOR);
+        return txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT });
+    });
+    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async (
+        request: OperationRangeRequest, root: Uint8Array, location: bigint, value: Uint8Array,
+    ) => keylessProof(request, root, location, value));
+    const finalizations: bigint[] = [];
+    const options = {
+        ...transactionProofOptions(digest),
+        finalizedHeight: HEIGHT,
+        onFinalizationVerified: ({ height }: { height: bigint }) => { finalizations.push(height); },
+    };
+
+    const failure = await fetchAndVerifyTransactionProof(options).then(
+        () => assert.fail('expected the parent header to be unavailable'),
+        (reason: unknown) => reason,
+    );
+    assert.equal(String(failure), `Error: finalization missing at height ${HEIGHT - 1n}`);
+    assert.equal(isRetryableProofError(failure), true);
+    assert.deepEqual(finalizations, []);
+    assert.equal(proof.mock.callCount(), 0);
+
+    available = true;
+    const result = await fetchAndVerifyTransactionProof(options);
+    assert.equal(result.height, HEIGHT);
+    assert.deepEqual(finalizations, [HEIGHT]);
+    assert.equal(parent.mock.callCount(), 2);
+    assert.equal(certificates.mock.callCount(), 1);
+    assert.equal(metadata.mock.callCount(), 2);
+    assert.equal(proof.mock.callCount(), 1);
+});
+
+for (const invalidParent of ['tampered', 'wrong height'] as const) {
+    test(`transaction inclusion rejects a ${invalidParent} parent header before callbacks or proofs`, async (t) => {
+        const body = new Uint8Array(82).fill(0x33);
+        const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+        const certificate = invalidParent === 'wrong height'
+            ? await finalizedCertificate(HEIGHT, 2n, 8n, fixtureHeader(HEIGHT - 2n, new Uint8Array(32), 2n, LOCATION))
+            : await finalizedCertificate(HEIGHT);
+        const returnedHeader = certificate.parentHeader.slice();
+        if (invalidParent === 'tampered') returnedHeader[returnedHeader.length - 1] ^= 1;
+        const parent = mockParentHeader(t, certificate, () => returnedHeader);
+        const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string) => {
+            assert.equal(height, HEIGHT.toString());
+            return certificate;
+        });
+        t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
+            txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
+        );
+        const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+            throw new Error('unexpected proof');
+        });
+        const finalizations: bigint[] = [];
+
+        const failure = await fetchAndVerifyTransactionProof({
+            ...transactionProofOptions(digest),
+            finalizedHeight: HEIGHT,
+            onFinalizationVerified: ({ height }) => { finalizations.push(height); },
+        }).then(() => assert.fail('expected parent authentication to fail'), (reason: unknown) => reason);
+
+        assert.match(String(failure), invalidParent === 'tampered'
+            ? /block header at height 6 does not match its certified digest/
+            : /block header height 5 does not match chain height 6/);
+        assert.equal(isRetryableProofError(failure), false);
+        assert.deepEqual(finalizations, []);
+        assert.equal(parent.mock.callCount(), 1);
+        assert.equal(certificates.mock.callCount(), 1);
+        assert.equal(proof.mock.callCount(), 0);
+    });
+}
+
+test('cancellation during a parent header read stops before callbacks or proofs', { timeout: 5_000 }, async (t) => {
+    const body = new Uint8Array(82).fill(0x33);
+    const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
+    const certificate = await finalizedCertificate(HEIGHT);
+    const started = deferred<void>();
+    const response = deferred<Uint8Array>();
+    const parent = mockParentHeader(t, certificate, () => {
+        started.resolve();
+        return response.promise;
+    });
+    t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
+    t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
+        txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
+    );
+    const proof = t.mock.method(QmdbOperationLogClient.prototype, 'getFixedKeylessAppend', async () => {
+        throw new Error('unexpected proof');
+    });
+    const finalizations: bigint[] = [];
+    const controller = new AbortController();
+    const cancellation = new Error('transaction page left');
+    const pending = fetchAndVerifyTransactionProof({
+        ...transactionProofOptions(digest),
+        finalizedHeight: HEIGHT,
+        signal: AbortSignal.any([controller.signal, t.signal]),
+        onFinalizationVerified: ({ height }) => { finalizations.push(height); },
+    });
+    const rejected = assert.rejects(pending, (error) => error === cancellation);
+
+    await started.promise;
+    controller.abort(cancellation);
+    response.resolve(certificate.parentHeader);
+    await rejected;
+
+    assert.deepEqual(finalizations, []);
+    assert.equal(parent.mock.callCount(), 1);
     assert.equal(proof.mock.callCount(), 0);
 });
 
@@ -507,6 +716,7 @@ test('reported-height proofs retain the request floor without response sequence 
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
+    mockParentHeader(t, certificate);
     t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async () => certificate);
     t.mock.method(SqlClient.prototype, 'query', async (sql: string) =>
         txMetaResult(sql, { qmdb_location: LOCATION, body, height: HEIGHT }),
@@ -554,6 +764,7 @@ test('prefetched certificates share verification and retain each proof publicati
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const certificate = await finalizedCertificate(HEIGHT);
+    mockParentHeader(t, certificate);
     const options = transactionProofOptions(digest);
     const read = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (
         _height: string, floor: bigint,
@@ -709,18 +920,19 @@ function transactionProofOptions(digest: string) {
     };
 }
 
+interface FixtureCertificate extends VerifiedSimplexCertificate {
+    readonly parentHeader: Uint8Array;
+    readonly parentDigest: Uint8Array;
+}
+
 async function finalizedCertificate(
     height: bigint,
     transactionsStart = latestTarget().transactionsStart,
     transactionsTip = latestTarget().transactionsTip,
-): Promise<VerifiedSimplexCertificate> {
-    const target = latestTarget();
-    const header = concat(
-        new Uint8Array([0, 9]), new Uint8Array(32), new Uint8Array([8]),
-        new Uint8Array(100), new Uint8Array(32), u64(height), u64(0n),
-        target.stateRoot, u64(target.stateStart), u64(target.stateTip),
-        target.transactionsRoot, u64(transactionsStart), u64(transactionsTip),
-    );
+    parentHeader = fixtureHeader(height === 0n ? 0n : height - 1n, new Uint8Array(32), 2n, LOCATION),
+): Promise<FixtureCertificate> {
+    const parentDigest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(parentHeader)));
+    const header = fixtureHeader(height, parentDigest, transactionsStart, transactionsTip);
     const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(header)));
     const payload = concat(digest, new Uint8Array(68));
     return {
@@ -731,7 +943,42 @@ async function finalizedCertificate(
         payload,
         certificate: new Uint8Array(),
         header: concat(payload, header),
+        parentHeader,
+        parentDigest,
     };
+}
+
+function fixtureHeader(
+    height: bigint,
+    parentDigest: Uint8Array,
+    transactionsStart: bigint,
+    transactionsTip: bigint,
+): Uint8Array {
+    const target = latestTarget();
+    return concat(
+        new Uint8Array([0, 9]), new Uint8Array(32), new Uint8Array([8]),
+        new Uint8Array(100), parentDigest, u64(height), u64(0n),
+        target.stateRoot, u64(target.stateStart), u64(target.stateTip),
+        target.transactionsRoot, u64(transactionsStart), u64(transactionsTip),
+    );
+}
+
+function mockParentHeader(
+    t: test.TestContext,
+    certificate: FixtureCertificate,
+    read: () => Uint8Array | undefined | Promise<Uint8Array | undefined> = () => certificate.parentHeader,
+) {
+    return t.mock.method(StoreClient.prototype, 'getMany', async (
+        keys: Uint8Array[],
+        batchSize?: number,
+        _onChunk?: unknown,
+        floor?: bigint,
+    ): Promise<GetManyResultItem[]> => {
+        assert.deepEqual(keys, [concat(new Uint8Array([1]), certificate.parentDigest)]);
+        assert.equal(batchSize, 1);
+        assert.equal(floor, FLOOR);
+        return [{ key: keys[0]!, value: await read() }];
+    });
 }
 
 test('account proof retains request floors without response sequence metadata', async (t) => {
@@ -1301,6 +1548,9 @@ test('transaction proofs use the requested ancestor root authenticated by the pu
     const body = new Uint8Array(82).fill(0x33);
     const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
     const blocks = await blockChain(1n, 8n);
+    await replaceBlock(blocks, 6n, chainHeader(6n, blocks.get(5n)!.digest, LOCATION));
+    await replaceBlock(blocks, 7n, chainHeader(7n, blocks.get(6n)!.digest));
+    await replaceBlock(blocks, 8n, chainHeader(8n, blocks.get(7n)!.digest, 10n));
     const store = mockDescendantStore(t, {
         blocks,
         certified: [8n],
@@ -1327,7 +1577,11 @@ test('transaction proofs use the requested ancestor root authenticated by the pu
     assert.equal(proof.view, blocks.get(7n)!.view);
     assert.deepEqual(finalizations, [{ height: 7n, view: blocks.get(7n)!.view }]);
     assert.deepEqual(store.certificateReads.map(({ height }) => height), [8n, 7n]);
-    assert.deepEqual(store.headerReads, [{ count: 1, floor: STORE_SEQUENCE }]);
+    assert.deepEqual(store.headerReads, [
+        { count: 1, floor: STORE_SEQUENCE },
+        { count: 1, floor: FLOOR },
+    ]);
+    assert.equal(store.hintQueries.length, 0);
 });
 
 test('cancelling descendant fallback aborts its pending SQL read', async (t) => {
@@ -1525,12 +1779,12 @@ async function chainBlock(height: bigint, header: Uint8Array): Promise<ChainBloc
 }
 
 // Each height gets distinct roots and a view below the one-byte varint limit.
-function chainHeader(height: bigint, parent: Uint8Array): Uint8Array {
+function chainHeader(height: bigint, parent: Uint8Array, transactionsTip = 8n): Uint8Array {
     return concat(
         new Uint8Array([0, Number(chainView(height))]), new Uint8Array(32), new Uint8Array([8]),
         new Uint8Array(100), parent, u64(height), u64(0n),
         chainStateRoot(height), u64(1n), u64(10n),
-        chainTransactionsRoot(height), u64(2n), u64(8n),
+        chainTransactionsRoot(height), u64(2n), u64(transactionsTip),
     );
 }
 
