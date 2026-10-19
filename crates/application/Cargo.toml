@@ -32,7 +32,6 @@ rand.workspace = true
 bytes.workspace = true
 futures = { workspace = true, features = ["executor"] }
 tracing.workspace = true
-prometheus-client.workspace = true
 ahash.workspace = true
 
 [dev-dependencies]

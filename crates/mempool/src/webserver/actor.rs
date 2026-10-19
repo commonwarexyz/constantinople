@@ -112,9 +112,13 @@ impl<D: Display> StoredBatchStatus<D> {
         }
     }
 
-    /// Whether the wire form carries digest lists (nontrivial to encode).
-    pub(super) const fn has_digest_lists(&self) -> bool {
-        matches!(self, Self::PartiallyFinalized { .. })
+    pub(super) const fn digest_list_len(&self) -> Option<usize> {
+        match self {
+            Self::PartiallyFinalized {
+                included, filtered, ..
+            } => Some(included.len().saturating_add(filtered.len())),
+            _ => None,
+        }
     }
 }
 
@@ -844,22 +848,24 @@ where
                 Message::Report(Update::Block(block, acknowledgement)) => {
                     // Only this node's outstanding proposals consume the
                     // finalized-digest set (~1 in `participants` views), so
-                    // the full-body decode is skipped otherwise; the block is
-                    // still released on the strategy's pool off this loop.
+                    // the full-body decode is skipped otherwise. Adaptive
+                    // scheduling may release a small block inline.
                     if proposed.is_empty() {
-                        drop(strategy.spawn(move |_: St| drop(block)));
+                        let work_size = block.body.len();
+                        drop(strategy.spawn(work_size, move |_: St| drop(block)));
                         acknowledgement.acknowledge();
                         continue;
                     }
 
                     let height = block.header.height;
+                    let work_size = block.body.len();
 
                     // Deriving the finalized set decodes any transaction the
-                    // application has not already materialized, so it runs on
-                    // the strategy's pool (which also releases the block
-                    // there).
+                    // application has not already materialized. The strategy
+                    // schedules that work and block release together, but may
+                    // run small jobs inline.
                     let finalized: AHashSet<H::Digest> = strategy
-                        .spawn(move |_: St| {
+                        .spawn(work_size, move |_: St| {
                             block
                                 .body
                                 .iter()

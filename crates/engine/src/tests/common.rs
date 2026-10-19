@@ -1,7 +1,4 @@
-use crate::{
-    ThresholdScheme,
-    types::{EngineBlock, EngineMarshalMailbox},
-};
+use crate::{ThresholdScheme, block::ApplicationBlock, types::EngineMarshalMailbox};
 use commonware_actor::Feedback;
 use commonware_consensus::{
     Heightable, Reporter,
@@ -34,13 +31,14 @@ pub(crate) type TestHasher = Sha256;
 pub(crate) type TestPrivateKey = ed25519::PrivateKey;
 pub(crate) type TestPublicKey = ed25519::PublicKey;
 pub(crate) type TestScheme = ThresholdScheme<TestPublicKey, MinSig>;
-pub(crate) type TestBlock = EngineBlock<TestHasher, TestPublicKey>;
+pub(crate) type TestBlock = ApplicationBlock<TestHasher, TestPublicKey>;
 pub(crate) type TestMarshalMailbox = EngineMarshalMailbox<TestHasher, TestPublicKey, MinSig>;
 pub(crate) const TRANSACTION_NAMESPACE: &[u8] = b"constantinople-engine-test-transactions";
 pub(crate) const TEST_QUOTA: Quota = Quota::per_second(std::num::NonZeroU32::MAX);
 
 #[derive(Clone, Default)]
 pub(crate) struct RestartBarrier {
+    processed_height: u64,
     held: Arc<Mutex<Vec<Exact>>>,
     released: Arc<AtomicBool>,
     starts: Arc<AtomicUsize>,
@@ -50,6 +48,17 @@ pub(crate) struct RestartBarrier {
 }
 
 impl RestartBarrier {
+    pub(crate) fn new(processed_height: u64) -> Self {
+        Self {
+            processed_height,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) const fn processed_height(&self) -> u64 {
+        self.processed_height
+    }
+
     pub(crate) fn begin_start(&self) -> bool {
         let restarting = self.starts.fetch_add(1, Ordering::SeqCst) > 0;
         if !restarting {
@@ -69,7 +78,7 @@ impl RestartBarrier {
     }
 
     fn acknowledge(&self, block_height: u64, acknowledgement: Exact) {
-        if block_height == 0 || self.released.load(Ordering::SeqCst) {
+        if block_height <= self.processed_height || self.released.load(Ordering::SeqCst) {
             acknowledgement.acknowledge();
             return;
         }
@@ -134,14 +143,14 @@ impl Reporter for TestReporter {
 #[derive(Clone)]
 pub(crate) struct HeightMonitorReporter<R> {
     inner: R,
-    monitor: mpsc::Sender<FinalizationUpdate<TestPublicKey>>,
+    monitor: mpsc::UnboundedSender<FinalizationUpdate<TestPublicKey>>,
     public_key: TestPublicKey,
 }
 
 impl<R> HeightMonitorReporter<R> {
     pub(crate) const fn new(
         public_key: TestPublicKey,
-        monitor: mpsc::Sender<FinalizationUpdate<TestPublicKey>>,
+        monitor: mpsc::UnboundedSender<FinalizationUpdate<TestPublicKey>>,
         inner: R,
     ) -> Self {
         Self {
@@ -165,14 +174,14 @@ where
     type Activity = marshal::Update<TestBlock>;
 
     fn report(&mut self, activity: Self::Activity) -> Feedback {
-        if let marshal::Update::Tip(round, _, digest) = &activity {
-            let monitor = self.monitor.clone();
+        if let marshal::Update::Tip(round, height, digest) = &activity {
             let update = FinalizationUpdate {
                 pk: self.public_key.clone(),
                 round: *round,
+                height: *height,
                 block_digest: digest.as_ref().to_vec(),
             };
-            let _ = monitor.try_send(update);
+            let _ = self.monitor.send(update);
         }
 
         self.inner.report(activity)
@@ -203,9 +212,9 @@ impl ValidatorState {
 
     pub(crate) async fn processed_height(&self) -> u64 {
         self.marshal
-            .get_processed_height()
+            .get_processed()
             .await
-            .map_or(0, |height| height.get())
+            .map_or(0, |processed| processed.height().get())
     }
 }
 

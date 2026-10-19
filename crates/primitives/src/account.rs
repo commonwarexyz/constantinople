@@ -4,8 +4,8 @@ use crate::{
     TransactionPublicKey,
     auth::{ED25519_SCHEME, SECP256R1_SCHEME},
 };
-use bytes::{Buf, BufMut};
-use commonware_codec::{Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
+use bytes::BufMut;
+use commonware_codec::{Buf, Error as CodecError, FixedArray, FixedSize, Read, ReadExt, Write};
 use commonware_cryptography::{Hasher, ed25519, sha256};
 use commonware_formatting::hex;
 use commonware_utils::{Array, Span};
@@ -269,7 +269,7 @@ fn consume_current_nonce(base: u64, bitmap: u64) -> Option<Nonce> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use commonware_codec::{DecodeExt, FixedSize};
+    use commonware_codec::{Copying, DecodeExt, FixedSize};
     use commonware_cryptography::{
         Hasher, Signer, ed25519, secp256r1::standard as secp256r1, sha256,
     };
@@ -279,7 +279,7 @@ mod tests {
         let mut raw = vec![0u8; AccountKey::SIZE];
         raw[0] = 1;
 
-        let key = AccountKey::decode(&mut &raw[..]).expect("account keys are raw bytes");
+        let key = AccountKey::decode(Copying(&raw)).expect("account keys are raw bytes");
 
         assert_eq!(key.as_ref(), raw.as_slice());
     }
@@ -318,7 +318,7 @@ mod tests {
         account.write(&mut buf);
         assert_eq!(buf.len(), Account::SIZE);
 
-        let decoded = Account::decode(&mut &buf[..]).expect("decoding should succeed");
+        let decoded = Account::decode(buf).expect("decoding should succeed");
         assert_eq!(decoded, account);
     }
 
