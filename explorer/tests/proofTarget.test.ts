@@ -20,7 +20,7 @@ function heightKey(height: bigint): Uint8Array {
 }
 
 test('target subscriptions recover when a response body disconnects', async (context) => {
-    for (const detail of ['network error', 'terminated', 'Error in body stream', 'Error in input stream', 'missing end frame']) {
+    for (const detail of ['network error', 'terminated', 'Error in body stream', 'Error in input stream', 'missing end frame', 'truncated frame']) {
         await context.test(detail, { timeout: 5_000 }, async (t) => {
             const controller = new AbortController();
             const bodies: ReadableStreamDefaultController<Uint8Array>[] = [];
@@ -54,7 +54,12 @@ test('target subscriptions recover when a response body disconnects', async (con
             try {
                 assert.equal((await stream.next()).value?.height, 7n);
                 if (detail === 'missing end frame') bodies[0]!.close();
-                else bodies[0]!.error(new TypeError(detail));
+                else if (detail === 'truncated frame') {
+                    const partial = new Uint8Array(9);
+                    new DataView(partial.buffer).setUint32(1, 100);
+                    bodies[0]!.enqueue(partial);
+                    bodies[0]!.close();
+                } else bodies[0]!.error(new TypeError(detail));
                 assert.equal((await stream.next()).value?.height, 8n);
                 assert.deepEqual(cursors, ['7', '8']);
             } finally {
@@ -256,6 +261,47 @@ test('provable target subscription preserves its cursor after a generic error', 
 
     controller.abort();
     await stream.return();
+});
+
+test('provable target subscription reconnects after server and proxy failures', async (context) => {
+    for (const failure of [
+        new ConnectError('failed to read response body: connection reset', Code.Internal),
+        new HttpError(500, '[unknown] HTTP 520', Code.Unknown, new ConnectError('HTTP 520', Code.Unknown)),
+    ]) {
+        await context.test(failure.message, async () => {
+            const subscriptions: bigint[] = [];
+            const controller = new AbortController();
+            const store = {
+                async query() {
+                    return queryResult(4n, 11n);
+                },
+                subscribe(filters: Parameters<PublishedProofTargetStore['subscribe']>[0]) {
+                    subscriptions.push(filters.sinceSequenceNumber ?? 0n);
+                    return subscriptions.length === 1
+                        ? failedBatchStream(failure)
+                        : batches([
+                            {
+                                sequenceNumber: 15n,
+                                entries: [{ key: heightKey(5n), value: digest(5) }],
+                            },
+                        ]);
+                },
+            } as PublishedProofTargetStore;
+            const stream = subscribePublishedProofTargetsFromStore(store, {
+                signal: controller.signal,
+                reconnectDelayMs: 0,
+            });
+
+            try {
+                assert.equal((await stream.next()).value?.height, 4n);
+                assert.equal((await stream.next()).value?.height, 5n);
+                assert.deepEqual(subscriptions, [12n, 12n]);
+            } finally {
+                controller.abort();
+                await stream.return();
+            }
+        });
+    }
 });
 
 test('provable target subscription fails closed on a malformed batch entry', async () => {
@@ -650,42 +696,48 @@ function untilAborted(signal?: AbortSignal): Promise<never> {
 }
 
 test('permanent target bootstrap and subscription failures are terminal', async (context) => {
-    for (const bootstrap of [true, false]) {
-        await context.test(bootstrap ? 'bootstrap' : 'subscription', async () => {
-            const controller = new AbortController();
-            const cause = new ConnectError('invalid target request', Code.InvalidArgument);
-            const failure = new HttpError(400, cause.message, cause.code, cause);
-            let attempts = 0;
-            let errors = 0;
-            const store = {
-                async query() {
-                    if (bootstrap) {
+    const invalidRequest = new ConnectError('invalid target request', Code.InvalidArgument);
+    const invalidUrl = ConnectError.from(new TypeError('Invalid URL'));
+    const failures = [
+        new HttpError(400, invalidRequest.message, invalidRequest.code, invalidRequest),
+        new HttpError(500, invalidUrl.message, invalidUrl.code, invalidUrl),
+    ];
+    for (const failure of failures) {
+        for (const bootstrap of [true, false]) {
+            await context.test(`${failure.message} during ${bootstrap ? 'bootstrap' : 'subscription'}`, async () => {
+                const controller = new AbortController();
+                let attempts = 0;
+                let errors = 0;
+                const store = {
+                    async query() {
+                        if (bootstrap) {
+                            attempts++;
+                            throw failure;
+                        }
+                        return { sequenceNumber: 1n, results: [] };
+                    },
+                    async *subscribe() {
                         attempts++;
                         throw failure;
-                    }
-                    return { sequenceNumber: 1n, results: [] };
-                },
-                async *subscribe() {
-                    attempts++;
-                    throw failure;
-                },
-            } as PublishedProofTargetStore;
-            const stream = subscribePublishedProofTargetsFromStore(store, {
-                signal: controller.signal,
-                reconnectDelayMs: 0,
-                onError() {
-                    if (++errors === 2) controller.abort();
-                },
-            });
+                    },
+                } as PublishedProofTargetStore;
+                const stream = subscribePublishedProofTargetsFromStore(store, {
+                    signal: controller.signal,
+                    reconnectDelayMs: 0,
+                    onError() {
+                        if (++errors === 2) controller.abort();
+                    },
+                });
 
-            try {
-                await assert.rejects(stream.next(), { message: failure.message });
-                assert.equal(attempts, 1);
-                assert.equal(errors, 1);
-            } finally {
-                controller.abort();
-                await stream.return();
-            }
-        });
+                try {
+                    await assert.rejects(stream.next(), { message: failure.message });
+                    assert.equal(attempts, 1);
+                    assert.equal(errors, 1);
+                } finally {
+                    controller.abort();
+                    await stream.return();
+                }
+            });
+        }
     }
 });

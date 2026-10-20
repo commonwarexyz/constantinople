@@ -131,6 +131,30 @@ test('block metadata retries backend errors until cancelled', async () => {
     assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
 });
 
+test('block point reads retry server and proxy failures', async (context) => {
+    for (const failure of [
+        new ConnectError('failed to read response body: connection reset', Code.Internal),
+        new ConnectError('HTTP 520', Code.Unknown),
+    ]) {
+        await context.test(failure.message, async () => {
+            const target = proofTarget(7n, 23n, 7);
+            let queries = 0;
+            const sql = sqlClient(async () => {
+                if (++queries === 1) throw failure;
+                return queryResult(23n, 7n, target.blockDigest, 1n);
+            });
+            const stream = subscribeBlocksFromTargets(sql, targets(target), { reconnectDelayMs: 0 });
+
+            try {
+                assert.equal((await stream.next()).value?.height, 7n);
+                assert.equal(queries, 2);
+            } finally {
+                await stream.return();
+            }
+        });
+    }
+});
+
 test('a consistency lag on the block point read is retried as catch-up', async () => {
     const target = proofTarget(7n, 23n, 0xa5);
     const controller = new AbortController();

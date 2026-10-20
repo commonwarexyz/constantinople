@@ -46,7 +46,8 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-// Keep operation-log pages in probation until floor advancement reuses them.
+// Sized so operation-log pages stay cached, or at least in Clock2Q+ ghost
+// history, until floor advancement reuses them.
 pub(crate) const fn default_state_page_cache_bytes() -> usize {
     6 * 1024 * 1024 * 1024
 }

@@ -98,15 +98,29 @@ export function isTransportFailure(error: unknown): boolean {
     );
 }
 
+// Long-lived subscriptions reconnect on failures that can clear without a
+// client change. Servers forward upstream stream resets as Internal, and
+// proxies answer with non-Connect 5xx bodies that decode as Unknown without a
+// local cause. Unknown errors that carry a local cause, such as an invalid
+// URL, stay terminal.
 export function isRetryableServiceError(error: unknown): boolean {
-    const code = connectError(error)?.code;
+    const connect = connectError(error);
     return (
         isTransportFailure(error) ||
-        code === Code.Unavailable ||
-        code === Code.DeadlineExceeded ||
+        (connect?.code === Code.Unknown && connect.cause === undefined) ||
+        connect?.code === Code.Internal ||
+        connect?.code === Code.Unavailable ||
+        connect?.code === Code.DeadlineExceeded ||
+        isIncompleteEnvelope(connect) ||
         isConsistencyNotReadyError(error) ||
         isBatchEvicted(error)
     );
+}
+
+// Connect reports a body that ends cleanly inside a frame as a local
+// InvalidArgument. The response was truncated, so the request itself is valid.
+function isIncompleteEnvelope(connect: ConnectError | undefined): boolean {
+    return connect?.code === Code.InvalidArgument && connect.rawMessage === 'protocol error: incomplete envelope';
 }
 
 export function isBatchEvicted(error: unknown): boolean {

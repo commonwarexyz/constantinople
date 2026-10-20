@@ -159,7 +159,8 @@ impl StoreCommitMetrics {
     }
 }
 
-// Observe cancelled attempts too so request timeouts remain visible.
+// Observe attempts dropped mid-flight, such as on task abort or shutdown, so
+// their elapsed time still reaches the histogram.
 struct PutAttemptTimer {
     histogram: raw::Histogram,
     start: Instant,

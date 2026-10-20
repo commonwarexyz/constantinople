@@ -29,8 +29,8 @@ use std::{
 type InnerApplication<E, H, P, V, I, B, St> =
     Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, B, St>;
 
-// An engine block delegates its digest to the sealed block it wraps, so the
-// marshal's digest is reused instead of hashing the block again.
+// An engine block and its inner block share one digest. Pairing the inner block
+// with the marshal's digest keeps this conversion synchronous.
 fn application_block<H, P>(block: &Digested<EngineBlock<H, P>>) -> Digested<ApplicationBlock<H, P>>
 where
     H: Hasher,
