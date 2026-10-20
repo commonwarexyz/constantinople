@@ -23,15 +23,6 @@ import {
     type VerifiedFixedUnorderedUpdateProof,
 } from '@exowarexyz/qmdb';
 import { columnValue, firstTableRow, tableRows, type SqlRow } from './sqlTable.ts';
-import {
-    BLOCK_META_DIGEST,
-    BLOCK_META_HEIGHT,
-    BLOCK_META_TABLE,
-    BLOCK_META_TRANSACTIONS_TIP,
-    BLOCK_META_TX_COUNT,
-    containingTransactionHeight,
-    transactionHeightPredecessorQuery,
-} from './transactionHeight.ts';
 
 const CONSENSUS_NAMESPACE = new TextEncoder().encode('constantinople_CONSENSUS');
 const SIMPLEX_SCHEME = 'bls12381-threshold-standard-min-sig';
@@ -49,10 +40,15 @@ const TRANSACTION_BODY_BYTES =
 const ACCOUNT_VALUE_BYTES = 24;
 const ACCOUNT_CURSOR_BYTES = 24;
 
+const BLOCK_META_TABLE = 'block_meta';
+const BLOCK_META_HEIGHT = 'height';
+const BLOCK_META_DIGEST = 'digest';
+
 const TX_META_TABLE = 'tx_meta';
 const TX_META_DIGEST = 'tx_digest';
 const TX_META_QMDB_LOCATION = 'qmdb_location';
 const TX_META_BODY = 'body';
+const TX_META_HEIGHT = 'height';
 
 const TX_ACTIVITY_TABLE = 'tx_activity';
 const TX_ACTIVITY_ACCOUNT = 'account';
@@ -63,6 +59,7 @@ const TX_ACTIVITY_DIGEST = 'tx_digest';
 const TX_ACTIVITY_COUNTERPARTY = 'counterparty';
 const TX_ACTIVITY_VALUE = 'value';
 const TX_ACTIVITY_NONCE = 'nonce';
+const TX_ACTIVITY_QMDB_LOCATION = 'qmdb_location';
 const TX_ACTIVITY_ROLE_SENDER = 0n;
 const TX_ACTIVITY_ROLE_RECEIVER = 1n;
 
@@ -117,6 +114,7 @@ export interface AccountTransactionRow {
     readonly nonce: bigint;
     readonly height: bigint;
     readonly blockIndex: number;
+    readonly location: bigint;
 }
 
 export interface AccountTransactionPage {
@@ -132,17 +130,6 @@ export interface VerifiedAccountProof {
     readonly tip: bigint;
     readonly proofSizeBytes: number;
 }
-
-export interface TransactionRowMetadata {
-    readonly location: bigint;
-    readonly sequenceNumber: bigint;
-}
-
-// Missing rows may still be indexing, while invalid rows can never verify.
-export type TransactionRowMetadataResult =
-    | { readonly status: 'indexed'; readonly metadata: TransactionRowMetadata }
-    | { readonly status: 'missing'; readonly error: Error }
-    | { readonly status: 'invalid'; readonly error: Error };
 
 export interface AccountProofMetadata extends AccountProofRow {
     readonly sequenceNumber: bigint;
@@ -183,67 +170,6 @@ export function fetchAccountProofMetadata({
     return fetchAccountProofRow(sqlUrl, parseAccountBytes(account), undefined, minSequenceNumber, signal);
 }
 
-// Each digest's body is validated on its own, so one bad or lagging row cannot
-// withhold metadata from the rest of the page. Failures that cannot be
-// attributed to a requested digest still reject the whole batch.
-export async function fetchTransactionRowMetadata({
-    sqlUrl,
-    rows,
-    minSequenceNumber,
-    signal,
-}: {
-    sqlUrl: string;
-    rows: readonly AccountTransactionRow[];
-    minSequenceNumber: bigint;
-    signal?: AbortSignal;
-}): Promise<ReadonlyMap<string, TransactionRowMetadataResult>> {
-    const digests = new Map(rows.map(({ digest }) => {
-        const bytes = fromHex(digest);
-        assertByteLength(bytes, DIGEST_BYTES, 'transaction digest');
-        return [toHex(bytes), bytes];
-    }));
-    if (digests.size === 0) return new Map();
-
-    const result = await sqlQuery(
-        sqlUrl,
-        `SELECT ${TX_META_DIGEST}, ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
-         FROM ${TX_META_TABLE}
-         WHERE ${TX_META_DIGEST} IN (${[...digests.values()].map(fixedBinaryLiteral).join(', ')})`,
-        minSequenceNumber,
-        signal,
-    );
-
-    const matches = new Map<string, SqlRow[]>();
-    for (const row of tableRows(result.table)) {
-        const hex = toHex(expectVariableBytes(columnValue(row, TX_META_DIGEST), TX_META_DIGEST));
-        if (!digests.has(hex)) throw new Error('SQL transaction metadata contains an unexpected digest');
-        matches.set(hex, [...matches.get(hex) ?? [], row]);
-    }
-
-    return new Map(await Promise.all([...digests].map(async ([hex, digest]) => [
-        hex,
-        await transactionRowMetadataResult(matches.get(hex) ?? [], digest, result.sequenceNumber),
-    ] as const)));
-}
-
-async function transactionRowMetadataResult(
-    rows: readonly SqlRow[],
-    digest: Uint8Array,
-    sequenceNumber: bigint,
-): Promise<TransactionRowMetadataResult> {
-    const [row, duplicate] = rows;
-    if (!row) return { status: 'missing', error: missingTransactionMetadataError(digest) };
-    if (duplicate) {
-        return { status: 'invalid', error: new Error('SQL transaction metadata contains a duplicate digest') };
-    }
-    try {
-        const location = await verifiedTransactionLocation(row, digest);
-        return { status: 'indexed', metadata: { location, sequenceNumber } };
-    } catch (error) {
-        return { status: 'invalid', error: error instanceof Error ? error : new Error(String(error)) };
-    }
-}
-
 export async function fetchAndVerifyTransactionProof({
     qmdbUrl,
     storeUrl,
@@ -278,23 +204,25 @@ export async function fetchAndVerifyTransactionProof({
         const targetHeight = coveredHeightHint ?? publishedTarget.height;
         const targetController = new AbortController();
         const targetSignal = AbortSignal.any([signal, targetController.signal]);
-        const targetResult = (targetHeight === publishedTarget.height
-            ? fetchLatestProofTarget({
-                storeUrl,
-                sqlUrl,
-                simplexVerificationMaterial,
-                publishedTarget,
-                signal: targetSignal,
-            })
-            : finalizedTransactionTarget(
+        const publishedBlockTarget = async (height: bigint, readSignal: AbortSignal): Promise<BlockTarget> => {
+            const target = await finalizedTransactionTarget(
                 source,
-                targetHeight,
+                height,
                 publishedTarget.sequenceNumber,
-                targetSignal,
-            )).then(
-                (target) => ({ target }),
-                (error: unknown) => ({ error }),
+                readSignal,
             );
+            assertPublishedTargetDigest(target, publishedTarget);
+            // The parent read needs only the authenticated target, so it overlaps SQL.
+            const appendsStart = settle(blockAppendsStart(
+                storeUrl,
+                target,
+                publishedTarget.sequenceNumber,
+                readSignal,
+            ));
+            return { target, appendsStart };
+        };
+        const targetResult = publishedBlockTarget(targetHeight, targetSignal)
+            .catch((error: unknown) => ({ error }));
         const metadata = await fetchTransactionProofMetadata(
             sqlUrl,
             digest,
@@ -306,32 +234,35 @@ export async function fetchAndVerifyTransactionProof({
             throw uncoveredError(`transaction height ${metadata.height}`);
         }
 
-        let proofTarget: FinalizedTransactionTarget | undefined;
+        let hinted: BlockTarget | undefined;
         if (coveredHeightHint !== undefined && metadata.height !== targetHeight) {
             targetController.abort();
         } else {
             const result = await targetResult;
             signal.throwIfAborted();
             if ('error' in result) throw result.error;
-            proofTarget = result.target;
+            hinted = result;
         }
-        if (coveredHeightHint === undefined && proofTarget && metadata.location >= proofTarget.transactionsTip) {
+        if (coveredHeightHint === undefined && hinted && metadata.location >= hinted.target.transactionsTip) {
             throw uncoveredError(`transaction location ${metadata.location}`);
         }
-        const target = metadata.height === proofTarget?.height
-            ? proofTarget
-            : await finalizedTransactionTarget(
-                source,
-                metadata.height,
-                publishedTarget.sequenceNumber,
-                signal,
-            );
+        const { target, appendsStart } = metadata.height === hinted?.target.height
+            ? hinted
+            : await publishedBlockTarget(metadata.height, signal);
         signal.throwIfAborted();
-        assertPublishedTargetDigest(target, publishedTarget);
-        if (metadata.location < target.transactionsStart || metadata.location >= target.transactionsTip) {
-            throw new Error(`transaction location ${metadata.location} is outside finalized block range`);
+        // Genesis has no transactions, and the final operation is the block commit.
+        // Check before awaiting the parent so a bad location fails terminally.
+        const appendsEnd = transactionProofTip(target.transactionsTip);
+        if (target.height === 0n || metadata.location < target.transactionsStart || metadata.location >= appendsEnd) {
+            throw blockInclusionError(target, metadata.location, target.transactionsStart, appendsEnd);
         }
-        onFinalizationVerified?.(target);
+        const start = await appendsStart;
+        signal.throwIfAborted();
+        if ('error' in start) throw start.error;
+        if (metadata.location < start.value) {
+            throw blockInclusionError(target, metadata.location, start.value, appendsEnd);
+        }
+        onFinalizationVerified?.({ height: target.height, view: target.view });
 
         const tip = transactionProofTip(target.transactionsTip);
         let verification: VerifiedFixedKeylessAppendProof;
@@ -361,6 +292,53 @@ export async function fetchAndVerifyTransactionProof({
     }
 }
 
+interface BlockTarget {
+    readonly target: AuthenticatedTarget;
+    readonly appendsStart: Promise<Settled<bigint>>;
+}
+
+type Settled<T> = { readonly value: T } | { readonly error: unknown };
+
+// Settled results let an abandoned read fail without an unhandled rejection.
+function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
+    return promise.then((value) => ({ value }), (error: unknown) => ({ error }));
+}
+
+// A block's own transactions are appended after its parent's log end.
+async function blockAppendsStart(
+    storeUrl: string,
+    target: AuthenticatedTarget,
+    minSequenceNumber: bigint,
+    signal: AbortSignal,
+): Promise<bigint> {
+    // Genesis is never uploaded, but its empty body starts block 1's range at
+    // the genesis commit, so block 1's appends begin right after it.
+    if (target.height <= 1n) return target.transactionsStart + 1n;
+
+    const [bytes] = await headersByDigest(
+        simplexStore(storeUrl),
+        [target.parentDigest],
+        minSequenceNumber,
+        signal,
+    );
+    if (!bytes) throw missingFinalization(target.height - 1n);
+    const parent = await authenticatedHeader(bytes, target.parentDigest, target.height - 1n);
+    signal.throwIfAborted();
+    return parent.transactionsTip;
+}
+
+function blockInclusionError(
+    target: FinalizedTransactionTarget,
+    location: bigint,
+    appendsStart: bigint,
+    appendsEnd: bigint,
+): Error {
+    return new Error([
+        `transaction location ${location} is not a transaction append of block ${target.height}`,
+        `appends ${appendsStart}..${appendsEnd}`,
+    ].join(' · '));
+}
+
 // The published target is committed atomically with the state and transaction
 // QMDB publication boundary. Finalization of the target height, either directly
 // or through a certified descendant, authenticates its digest and supplies the
@@ -385,7 +363,7 @@ export async function fetchLatestProofTarget({
         signal,
     );
     assertPublishedTargetDigest(target, publishedTarget);
-    return { ...target, sequenceNumber: publishedTarget.sequenceNumber };
+    return { ...publicFinalizedTarget(target), sequenceNumber: publishedTarget.sequenceNumber };
 }
 
 function assertPublishedTargetDigest(
@@ -502,30 +480,18 @@ export async function fetchAndVerifyAccountProof({
 
 export async function fetchAndVerifyTransactionRowProof({
     qmdbUrl,
-    sqlUrl,
     row,
     target,
-    metadata,
     signal,
 }: {
     qmdbUrl: string;
-    sqlUrl: string;
     row: AccountTransactionRow;
     target: LatestProofTarget;
-    metadata?: TransactionRowMetadata;
     signal?: AbortSignal;
 }): Promise<VerifiedTransactionProof> {
     const digestBytes = fromHex(row.digest);
     assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    const location = metadata && metadata.sequenceNumber >= target.sequenceNumber
-        ? metadata.location
-        : await fetchVerifiedSqlTransactionMetadata(
-            sqlUrl,
-            digestBytes,
-            target.sequenceNumber,
-            signal,
-        );
-
+    const { location } = row;
     if (location >= target.transactionsTip) {
         throw uncoveredError(`transaction location ${location}`);
     }
@@ -550,18 +516,20 @@ export async function fetchAndVerifyTransactionRowProof({
     };
 }
 
-async function fetchVerifiedSqlTransactionMetadata(
+async function fetchTransactionProofMetadata(
     sqlUrl: string,
-    digest: Uint8Array,
+    digest: string,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<bigint> {
+): Promise<TransactionProofMetadata> {
+    const digestBytes = fromHex(digest);
+    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
     const result = await sqlQuery(
         sqlUrl,
         `
-            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}
+            SELECT ${TX_META_QMDB_LOCATION}, ${TX_META_BODY}, ${TX_META_HEIGHT}
             FROM ${TX_META_TABLE}
-            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digest)}
+            WHERE ${TX_META_DIGEST} = ${fixedBinaryLiteral(digestBytes)}
             LIMIT 1
         `,
         minSequenceNumber,
@@ -569,14 +537,12 @@ async function fetchVerifiedSqlTransactionMetadata(
     );
     const row = firstTableRow(result.table);
     if (!row) {
-        throw missingTransactionMetadataError(digest);
+        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
     }
-
-    return verifiedTransactionLocation(row, digest);
-}
-
-function missingTransactionMetadataError(digest: Uint8Array): Error {
-    return new Error(`tx digest ${shortHex(toHex(digest))} missing from raw transaction index`);
+    return {
+        height: expectBigint(columnValue(row, TX_META_HEIGHT), TX_META_HEIGHT),
+        location: await verifiedTransactionLocation(row, digestBytes),
+    };
 }
 
 async function verifiedTransactionLocation(row: SqlRow, digest: Uint8Array): Promise<bigint> {
@@ -591,67 +557,6 @@ async function verifiedTransactionLocation(row: SqlRow, digest: Uint8Array): Pro
         throw new Error('SQL transaction body does not match transaction digest');
     }
     return location;
-}
-
-async function fetchTransactionProofMetadata(
-    sqlUrl: string,
-    digest: string,
-    minSequenceNumber: bigint,
-    signal?: AbortSignal,
-): Promise<TransactionProofMetadata> {
-    const digestBytes = fromHex(digest);
-    assertByteLength(digestBytes, DIGEST_BYTES, 'transaction digest');
-    let location: bigint;
-    try {
-        location = await fetchVerifiedSqlTransactionMetadata(
-            sqlUrl,
-            digestBytes,
-            minSequenceNumber,
-            signal,
-        );
-    } catch (error) {
-        if (errorMessage(error).includes('missing from raw transaction index')) {
-            throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
-        }
-        throw error;
-    }
-
-    // A bounded seek on the covered tip index finds the last block boundary
-    // at or before the location. Ranges are contiguous, so the next height owns it.
-    const predecessors = await sqlQuery(
-        sqlUrl,
-        transactionHeightPredecessorQuery(location),
-        minSequenceNumber,
-        signal,
-    );
-    const predecessor = firstTableRow(predecessors.table);
-    const height = containingTransactionHeight(
-        predecessor ? expectBigint(columnValue(predecessor, BLOCK_META_HEIGHT), BLOCK_META_HEIGHT) : null,
-    );
-    const result = await sqlQuery(
-        sqlUrl,
-        `
-            SELECT ${BLOCK_META_TRANSACTIONS_TIP}, ${BLOCK_META_TX_COUNT}
-            FROM ${BLOCK_META_TABLE}
-            WHERE ${BLOCK_META_HEIGHT} = ${height.toString()}
-            LIMIT 1
-        `,
-        minSequenceNumber,
-        signal,
-    );
-    const row = firstTableRow(result.table);
-    if (!row) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet`);
-    }
-
-    // The tip is the trailing commit location. A later certified range can
-    // retain this transaction without identifying its original block.
-    const tip = expectBigint(columnValue(row, BLOCK_META_TRANSACTIONS_TIP), BLOCK_META_TRANSACTIONS_TIP);
-    const count = expectBigint(columnValue(row, BLOCK_META_TX_COUNT), BLOCK_META_TX_COUNT);
-    if (location < tip - count || location >= tip) {
-        throw new Error(`tx digest ${shortHex(digest)} is not finalized yet in the selected block range`);
-    }
-    return { height, location };
 }
 
 function uncoveredError(subject: string): Error {
@@ -736,7 +641,7 @@ interface FinalizationSource {
     readonly simplexVerificationMaterial: string;
 }
 
-// The parent digest lets a cached descendant anchor later ancestor checks.
+// The parent digest authenticates ancestor headers and exact transaction bounds.
 interface AuthenticatedTarget extends FinalizedTransactionTarget {
     readonly parentDigest: Uint8Array;
 }
@@ -754,13 +659,13 @@ async function finalizedTransactionTarget(
     height: bigint,
     minSequenceNumber: bigint,
     signal?: AbortSignal,
-): Promise<FinalizedTransactionTarget> {
+): Promise<AuthenticatedTarget> {
     signal?.throwIfAborted();
     if (height < 0n) throw new Error('finalized height must be non-negative');
 
     const cacheKey = finalizedTargetKey(source, height);
     const cached = cachedFinalizedTarget(cacheKey);
-    if (cached) return publicFinalizedTarget(cached);
+    if (cached) return cached;
 
     // A verified target does not depend on SQL hints, but a failed attempt can.
     // Callers join an attempt only when it uses their SQL service and covers
@@ -816,10 +721,10 @@ async function finalizedTransactionTarget(
         signal?.addEventListener('abort', abort, { once: true });
         shared.promise.then((value) => finish(undefined, value), (error) => finish(error));
     });
-    return publicFinalizedTarget(copyFinalizedTarget(target));
+    return copyFinalizedTarget(target);
 }
 
-// The parent digest only anchors ancestor checks, so callers get the public shape.
+// Public proof targets omit the digest used for internal parent-header checks.
 function publicFinalizedTarget(target: AuthenticatedTarget): FinalizedTransactionTarget {
     const { parentDigest: _parentDigest, ...finalized } = target;
     return finalized;
@@ -1303,7 +1208,8 @@ async function fetchAccountActivityRows(
                 ${TX_ACTIVITY_DIGEST},
                 ${TX_ACTIVITY_COUNTERPARTY},
                 ${TX_ACTIVITY_VALUE},
-                ${TX_ACTIVITY_NONCE}
+                ${TX_ACTIVITY_NONCE},
+                ${TX_ACTIVITY_QMDB_LOCATION}
             FROM ${TX_ACTIVITY_TABLE}
             WHERE ${predicates.join(' AND ')}
             ORDER BY ${TX_ACTIVITY_HEIGHT} DESC,
@@ -1333,6 +1239,7 @@ function decodeAccountActivityRow(row: SqlRow): AccountTransactionRow {
         nonce: expectBigint(columnValue(row, TX_ACTIVITY_NONCE), TX_ACTIVITY_NONCE),
         height: expectBigint(columnValue(row, TX_ACTIVITY_HEIGHT), TX_ACTIVITY_HEIGHT),
         blockIndex: expectSafeNumber(columnValue(row, TX_ACTIVITY_INDEX), TX_ACTIVITY_INDEX),
+        location: expectBigint(columnValue(row, TX_ACTIVITY_QMDB_LOCATION), TX_ACTIVITY_QMDB_LOCATION),
     };
 }
 

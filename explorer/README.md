@@ -37,20 +37,25 @@ backend or verifier repairs.
 
 The explorer distinguishes validator-reported finalization from verified
 certificates and proofs. Once the reported height is published, its certificate
-and `tx_meta` row are read concurrently. The reported height is a lookup hint.
-Reconciliation uses `block_meta` tips and transaction counts to identify the
-original containing block even when rows arrive out of order. It checks the
-certificate, transaction body digest, and location within the certified block
-range before fetching and verifying the QMDB operation-log proof under
-`/transactions`.
+and `tx_meta` row are read concurrently. The reported height is a lookup hint;
+the `tx_meta` row records the transaction's containing height and QMDB
+location. Reconciliation checks the certificate at that height and the
+transaction body digest. It authenticates the parent header through the
+certified header's parent digest and checks the location within the block's
+own transaction appends before verifying the QMDB operation-log proof under
+`/transactions`. The parent header read starts once the certificate verifies,
+overlapping the `tx_meta` read. Block 1 needs no parent read: genesis is never
+uploaded, but its empty body places block 1's appends right after the start
+of its certified range. Together these checks authenticate the exact inclusion height.
 The UI records finalization observation and successful proof verification
 separately.
 
 Account pages show the certificate as soon as it is verified and load state
-and transaction proofs concurrently. Row proofs retain a certificate that
-covers the newest transaction on the selected page. A newer page shares one
-certificate refresh across its rows. Account-state retries do not restart
-transaction proofs already in progress.
+and transaction proofs concurrently. Each `tx_activity` row carries its
+transaction's QMDB location, so row proofs need no further SQL reads. Row
+proofs retain a certificate that covers the newest transaction on the selected
+page. A newer page shares one certificate refresh across its rows.
+Account-state retries do not restart transaction proofs already in progress.
 
 The publication target's Store sequence becomes the minimum sequence for
 related SQL, Simplex, and QMDB reads. A lagging query node must catch up instead
