@@ -43,7 +43,10 @@ location. Reconciliation checks the certificate at that height and the
 transaction body digest. It authenticates the parent header through the
 certified header's parent digest and checks the location within the block's
 own transaction appends before verifying the QMDB operation-log proof under
-`/transactions`. Together these checks authenticate the exact inclusion height.
+`/transactions`. The parent header read starts once the certificate verifies,
+overlapping the `tx_meta` read. Block 1 needs no parent read: genesis is never
+uploaded, but its empty body places block 1's appends right after the start
+of its certified range. Together these checks authenticate the exact inclusion height.
 The UI records finalization observation and successful proof verification
 separately.
 

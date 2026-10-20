@@ -204,18 +204,25 @@ export async function fetchAndVerifyTransactionProof({
         const targetHeight = coveredHeightHint ?? publishedTarget.height;
         const targetController = new AbortController();
         const targetSignal = AbortSignal.any([signal, targetController.signal]);
-        const targetResult = finalizedTransactionTarget(
-            source,
-            targetHeight,
-            publishedTarget.sequenceNumber,
-            targetSignal,
-        ).then((target) => {
+        const publishedBlockTarget = async (height: bigint, readSignal: AbortSignal): Promise<BlockTarget> => {
+            const target = await finalizedTransactionTarget(
+                source,
+                height,
+                publishedTarget.sequenceNumber,
+                readSignal,
+            );
             assertPublishedTargetDigest(target, publishedTarget);
-            return target;
-        }).then(
-            (target) => ({ target }),
-            (error: unknown) => ({ error }),
-        );
+            // The parent read needs only the authenticated target, so it overlaps SQL.
+            const appendsStart = settle(blockAppendsStart(
+                storeUrl,
+                target,
+                publishedTarget.sequenceNumber,
+                readSignal,
+            ));
+            return { target, appendsStart };
+        };
+        const targetResult = publishedBlockTarget(targetHeight, targetSignal)
+            .catch((error: unknown) => ({ error }));
         const metadata = await fetchTransactionProofMetadata(
             sqlUrl,
             digest,
@@ -227,35 +234,34 @@ export async function fetchAndVerifyTransactionProof({
             throw uncoveredError(`transaction height ${metadata.height}`);
         }
 
-        let proofTarget: AuthenticatedTarget | undefined;
+        let hinted: BlockTarget | undefined;
         if (coveredHeightHint !== undefined && metadata.height !== targetHeight) {
             targetController.abort();
         } else {
             const result = await targetResult;
             signal.throwIfAborted();
             if ('error' in result) throw result.error;
-            proofTarget = result.target;
+            hinted = result;
         }
-        if (coveredHeightHint === undefined && proofTarget && metadata.location >= proofTarget.transactionsTip) {
+        if (coveredHeightHint === undefined && hinted && metadata.location >= hinted.target.transactionsTip) {
             throw uncoveredError(`transaction location ${metadata.location}`);
         }
-        const target = metadata.height === proofTarget?.height
-            ? proofTarget
-            : await finalizedTransactionTarget(
-                source,
-                metadata.height,
-                publishedTarget.sequenceNumber,
-                signal,
-            );
+        const { target, appendsStart } = metadata.height === hinted?.target.height
+            ? hinted
+            : await publishedBlockTarget(metadata.height, signal);
         signal.throwIfAborted();
-        assertPublishedTargetDigest(target, publishedTarget);
-        await verifyTransactionBlockLocation(
-            storeUrl,
-            target,
-            metadata.location,
-            publishedTarget.sequenceNumber,
-            signal,
-        );
+        // Genesis has no transactions, and the final operation is the block commit.
+        // Check before awaiting the parent so a bad location fails terminally.
+        const appendsEnd = transactionProofTip(target.transactionsTip);
+        if (target.height === 0n || metadata.location < target.transactionsStart || metadata.location >= appendsEnd) {
+            throw blockInclusionError(target, metadata.location, target.transactionsStart, appendsEnd);
+        }
+        const start = await appendsStart;
+        signal.throwIfAborted();
+        if ('error' in start) throw start.error;
+        if (metadata.location < start.value) {
+            throw blockInclusionError(target, metadata.location, start.value, appendsEnd);
+        }
         onFinalizationVerified?.({ height: target.height, view: target.view });
 
         const tip = transactionProofTip(target.transactionsTip);
@@ -286,19 +292,29 @@ export async function fetchAndVerifyTransactionProof({
     }
 }
 
-async function verifyTransactionBlockLocation(
+interface BlockTarget {
+    readonly target: AuthenticatedTarget;
+    readonly appendsStart: Promise<Settled<bigint>>;
+}
+
+type Settled<T> = { readonly value: T } | { readonly error: unknown };
+
+// Settled results let an abandoned read fail without an unhandled rejection.
+function settle<T>(promise: Promise<T>): Promise<Settled<T>> {
+    return promise.then((value) => ({ value }), (error: unknown) => ({ error }));
+}
+
+// A block's own transactions are appended after its parent's log end.
+async function blockAppendsStart(
     storeUrl: string,
     target: AuthenticatedTarget,
-    location: bigint,
     minSequenceNumber: bigint,
     signal: AbortSignal,
-): Promise<void> {
-    // Genesis has no transactions, and the final operation is the block commit.
-    if (target.height === 0n || location < target.transactionsStart || location >= transactionProofTip(target.transactionsTip)) {
-        throw new Error('Could not verify the transaction\'s inclusion in the reported block.');
-    }
+): Promise<bigint> {
+    // Genesis is never uploaded, but its empty body starts block 1's range at
+    // the genesis commit, so block 1's appends begin right after it.
+    if (target.height <= 1n) return target.transactionsStart + 1n;
 
-    // Authenticate the parent's log end to exclude its retained transactions.
     const [bytes] = await headersByDigest(
         simplexStore(storeUrl),
         [target.parentDigest],
@@ -308,9 +324,19 @@ async function verifyTransactionBlockLocation(
     if (!bytes) throw missingFinalization(target.height - 1n);
     const parent = await authenticatedHeader(bytes, target.parentDigest, target.height - 1n);
     signal.throwIfAborted();
-    if (location < parent.transactionsTip) {
-        throw new Error('Could not verify the transaction\'s inclusion in the reported block.');
-    }
+    return parent.transactionsTip;
+}
+
+function blockInclusionError(
+    target: FinalizedTransactionTarget,
+    location: bigint,
+    appendsStart: bigint,
+    appendsEnd: bigint,
+): Error {
+    return new Error([
+        `transaction location ${location} is not a transaction append of block ${target.height}`,
+        `appends ${appendsStart}..${appendsEnd}`,
+    ].join(' · '));
 }
 
 // The published target is committed atomically with the state and transaction
