@@ -1,6 +1,6 @@
 pub use exoware_sdk::{ClientBuildError as StoreClientBuildError, StoreClient};
 use exoware_sdk::{
-    ClientError, ConnectRequestCompression, RetryConfig, StoreClientBuilder,
+    ConnectRequestCompression, ProbeError, RetryConfig, StoreClientBuilder,
     transport::BalancedHttp2Config,
 };
 use std::time::Duration;
@@ -13,7 +13,7 @@ pub enum StoreReadinessError {
     NotReady,
     /// The Store could not answer the probe.
     #[error("Store readiness probe failed")]
-    Probe(#[source] ClientError),
+    Probe(#[source] ProbeError),
 }
 
 /// Builds a Store client whose explicit key takes precedence over the SDK environment fallback.

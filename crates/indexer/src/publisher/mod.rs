@@ -26,7 +26,7 @@ use commonware_runtime::{
         Counter, EncodeLabelSet, Gauge, Histogram, MetricsExt as _, Registered, raw,
     },
 };
-use exoware_sdk::{ClientError, ErrorCode, StoreClient, StoreWriteBatch};
+use exoware_sdk::{ClientError, StoreClient, StoreWriteBatch};
 pub use qmdb::Publisher;
 pub use sql::SqlRow;
 use std::{
@@ -338,7 +338,7 @@ where
         match commit(attempt).await {
             Ok(seq) => return Ok(seq),
             Err(error) => {
-                if !is_retryable_store_error(&error) {
+                if !error.is_transient() {
                     warn!(
                         ?error,
                         put_too_large = ?error.put_too_large(),
@@ -372,35 +372,10 @@ fn store_error_label(error: &ClientError) -> &'static str {
     }
 
     match error {
-        ClientError::Http(_) => "http",
         ClientError::Rpc(error) => error.code.as_str(),
         ClientError::Prefix(_) => "prefix",
         ClientError::InvalidKeyLength { .. } => "invalid_key_length",
         ClientError::WireFormat(_) => "wire_format",
-    }
-}
-
-fn is_retryable_store_error(error: &ClientError) -> bool {
-    if error.put_too_large().is_some() {
-        return false;
-    }
-
-    match error {
-        ClientError::Rpc(_) => matches!(
-            error.rpc_code(),
-            Some(
-                ErrorCode::Aborted
-                    | ErrorCode::DeadlineExceeded
-                    | ErrorCode::Internal
-                    | ErrorCode::ResourceExhausted
-                    | ErrorCode::Unavailable
-                    | ErrorCode::Unknown
-            )
-        ),
-        ClientError::Http(_)
-        | ClientError::Prefix(_)
-        | ClientError::InvalidKeyLength { .. }
-        | ClientError::WireFormat(_) => false,
     }
 }
 
@@ -415,7 +390,7 @@ fn retry_backoff(attempt: u32) -> Duration {
 mod tests {
     use super::*;
     use commonware_runtime::{Runner as _, telemetry::metrics::has_metric_value};
-    use exoware_sdk::{ConnectError, Key};
+    use exoware_sdk::{ConnectError, ErrorCode, Key};
     use tokio::time::timeout;
 
     fn put_error_response(error: ConnectError) -> axum::response::Response {
