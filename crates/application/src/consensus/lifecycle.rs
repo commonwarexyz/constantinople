@@ -30,13 +30,12 @@ use rand::{CryptoRng, Rng};
 use std::{future::Future, sync::Arc};
 use tracing::{Instrument as _, error, info, info_span, warn};
 
-impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
+impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
 where
     E: BufferPooler + Storage + Metrics + Clock,
     C: Digest,
     H: Hasher,
     P: PublicKey,
-    B: Send + Sync + 'static,
     St: Strategy,
 {
     /// Proposes a child block from an already fetched parent.

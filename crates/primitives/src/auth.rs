@@ -357,19 +357,19 @@ impl From<ed25519::Signature> for TransactionSignature {
 
 /// Verifies mixed transaction signatures with separate scheme groups.
 ///
-/// Ed25519 entries borrow their inputs until [`Self::verify`] so batching does
-/// not copy messages or keys.
+/// Entries borrow their inputs until [`Self::verify`] so batching does not
+/// copy messages, keys, or WebAuthn assertion data.
 pub struct TransactionBatchVerifier<'a> {
     ed25519: Vec<BatchEntry<'a, ed25519::PublicKey>>,
-    secp256r1: Vec<Secp256r1Item>,
+    secp256r1: Vec<Secp256r1Item<'a>>,
 }
 
-struct Secp256r1Item {
-    message: Vec<u8>,
+struct Secp256r1Item<'a> {
+    message: &'a [u8],
     verifying_key: VerifyingKey,
-    signature: secp256r1::Signature,
-    authenticator_data: Vec<u8>,
-    client_data_json: Vec<u8>,
+    signature: &'a secp256r1::Signature,
+    authenticator_data: &'a [u8],
+    client_data_json: &'a [u8],
 }
 
 impl<'a> TransactionBatchVerifier<'a> {
@@ -418,11 +418,11 @@ impl<'a> TransactionBatchVerifier<'a> {
                 },
             ) => {
                 self.secp256r1.push(Secp256r1Item {
-                    message: message.to_vec(),
+                    message,
                     verifying_key: *verifying_key,
-                    signature: signature.clone(),
-                    authenticator_data: authenticator_data.clone(),
-                    client_data_json: client_data_json.clone(),
+                    signature,
+                    authenticator_data,
+                    client_data_json,
                 });
                 true
             }
@@ -454,7 +454,7 @@ impl Default for TransactionBatchVerifier<'_> {
     }
 }
 
-fn verify_secp256r1(strategy: &impl Strategy, items: Vec<Secp256r1Item>) -> bool {
+fn verify_secp256r1(strategy: &impl Strategy, items: Vec<Secp256r1Item<'_>>) -> bool {
     if items.is_empty() {
         return true;
     }
@@ -466,10 +466,10 @@ fn verify_secp256r1(strategy: &impl Strategy, items: Vec<Secp256r1Item>) -> bool
             valid
                 && verify_webauthn_assertion(
                     &item.verifying_key,
-                    &item.message,
-                    &item.signature,
-                    &item.authenticator_data,
-                    &item.client_data_json,
+                    item.message,
+                    item.signature,
+                    item.authenticator_data,
+                    item.client_data_json,
                 )
         },
         |left, right| left && right,
@@ -609,6 +609,29 @@ mod tests {
         });
     }
 
+    // The upstream Ed25519 batch rejects empty input, so a batch holding only
+    // secp256r1 signatures must skip it rather than fail.
+    #[test]
+    fn batch_verifier_accepts_secp256r1_only() {
+        deterministic::Runner::default().start(|context| async move {
+            let cache = PublicKeyCache::new(context, NZUsize!(16));
+            let first_message = sha256::Sha256::hash(&[b"first"]).to_vec();
+            let second_message = sha256::Sha256::hash(&[b"second"]).to_vec();
+            let (first_key, first_signature) = webauthn_signature(&first_message);
+            let (second_key, second_signature) = webauthn_signature(&second_message);
+            let keys = cache
+                .decompress(&[&first_key, &second_key], &Sequential)
+                .expect("valid keys");
+
+            let mut verifier = TransactionBatchVerifier::new(2);
+            assert!(verifier.add(NAMESPACE, &first_message, &keys[0], &first_signature));
+            assert!(verifier.add(NAMESPACE, &second_message, &keys[1], &second_signature));
+            assert!(verifier.verify(&mut test_rng(), &Sequential));
+
+            assert!(TransactionBatchVerifier::default().verify(&mut test_rng(), &Sequential));
+        });
+    }
+
     #[test]
     fn mixed_batch_verifier_rejects_scheme_mismatch() {
         deterministic::Runner::default().start(|context| async move {
@@ -625,11 +648,6 @@ mod tests {
             let mut verifier = TransactionBatchVerifier::new(1);
             assert!(!verifier.add(NAMESPACE, &message, key, &signature));
         });
-    }
-
-    #[test]
-    fn empty_batch_verifier_accepts() {
-        assert!(TransactionBatchVerifier::default().verify(&mut test_rng(), &Sequential));
     }
 
     #[test]

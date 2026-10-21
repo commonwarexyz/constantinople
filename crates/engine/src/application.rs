@@ -26,8 +26,8 @@ use std::{
     task::{Context, Poll},
 };
 
-type InnerApplication<E, H, P, V, I, B, St> =
-    Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, B, St>;
+type InnerApplication<E, H, P, V, I, St> =
+    Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, St>;
 
 // An engine block and its inner block share one digest. Pairing the inner block
 // with the marshal's digest keeps this conversion synchronous.
@@ -39,7 +39,7 @@ where
     Digested::precomputed(block.inner().inner_shared(), block.digest())
 }
 
-pub(crate) struct EngineApplication<E, H, P, V, I, B, St>
+pub(crate) struct EngineApplication<E, H, P, V, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
@@ -47,7 +47,7 @@ where
     V: Variant,
     St: Strategy,
 {
-    inner: InnerApplication<E, H, P, V, I, B, St>,
+    inner: InnerApplication<E, H, P, V, I, St>,
     finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
 }
 
@@ -90,7 +90,7 @@ where
     }
 }
 
-impl<E, H, P, V, I, B, St> EngineApplication<E, H, P, V, I, B, St>
+impl<E, H, P, V, I, St> EngineApplication<E, H, P, V, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
@@ -99,7 +99,7 @@ where
     St: Strategy,
 {
     pub(crate) const fn new(
-        inner: InnerApplication<E, H, P, V, I, B, St>,
+        inner: InnerApplication<E, H, P, V, I, St>,
         finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
     ) -> Self {
         Self {
@@ -109,7 +109,7 @@ where
     }
 }
 
-impl<E, H, P, V, I, B, St> Clone for EngineApplication<E, H, P, V, I, B, St>
+impl<E, H, P, V, I, St> Clone for EngineApplication<E, H, P, V, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
@@ -200,7 +200,7 @@ where
     }
 }
 
-impl<E, H, P, V, I, B, St> StatefulApplication<E> for EngineApplication<E, H, P, V, I, B, St>
+impl<E, H, P, V, I, St> StatefulApplication<E> for EngineApplication<E, H, P, V, I, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
@@ -208,19 +208,18 @@ where
     V: Variant,
     ThresholdScheme<P, V>: Scheme<PublicKey = P>,
     I: TransactionSource<EngineCommitment<H, P>, P, H> + Clone + Sync,
-    B: Send + Sync + 'static,
     St: Strategy,
 {
     type SigningScheme = ThresholdScheme<P, V>;
     type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, P>, P>;
     type Block = EngineBlock<H, P>;
-    type Databases = <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::Databases;
+    type Databases = <InnerApplication<E, H, P, V, I, St> as StatefulApplication<E>>::Databases;
     type Captured = Option<FinalizedArtifacts<H>>;
     type Provider = I;
     type Input = ();
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
-        InnerApplication::<E, H, P, V, I, B, St>::sync_targets(block)
+        InnerApplication::<E, H, P, V, I, St>::sync_targets(block)
     }
 
     async fn genesis(&mut self) -> Self::Block {

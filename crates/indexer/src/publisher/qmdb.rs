@@ -1372,6 +1372,7 @@ fn complete_publication<D: Digest>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespaces::STATE_PROOF_CHUNK_SIZE;
     use bytes::Bytes;
     use commonware_codec::Decode as _;
     use commonware_consensus::{
@@ -2555,11 +2556,14 @@ mod tests {
             second.published().await.unwrap();
             third.published().await.unwrap();
 
-            let state =
-                Unordered::<QmdbFamily, Sha256, AccountKey, AccountValue, 32, StateEncoding>::new(
-                    state_qmdb_client(&physical).unwrap(),
-                    (),
-                );
+            let state = Unordered::<
+                QmdbFamily,
+                Sha256,
+                AccountKey,
+                AccountValue,
+                STATE_PROOF_CHUNK_SIZE,
+                StateEncoding,
+            >::new(state_qmdb_client(&physical).unwrap(), ());
             let transactions =
                 Keyless::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
                     transactions_qmdb_client(&physical).unwrap(),
@@ -3098,11 +3102,14 @@ mod tests {
 
             assert_eq!(target(&target_client, 1).await, Some(first_digest));
             assert_eq!(target(&target_client, 2).await, Some(second_digest));
-            let state =
-                Unordered::<QmdbFamily, Sha256, AccountKey, AccountValue, 32, StateEncoding>::new(
-                    state_client,
-                    (),
-                );
+            let state = Unordered::<
+                QmdbFamily,
+                Sha256,
+                AccountKey,
+                AccountValue,
+                STATE_PROOF_CHUNK_SIZE,
+                StateEncoding,
+            >::new(state_client, ());
             let transactions =
                 Keyless::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
                     transaction_client,

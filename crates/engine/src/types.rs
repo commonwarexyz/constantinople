@@ -149,19 +149,19 @@ pub(crate) type TransactionResolverMailbox<E, H, T> = commonware_glue::stateful:
 pub(crate) type TransactionResolverActor<E, P, M, B, H, T> =
     commonware_glue::stateful::db::p2p::Actor<E, P, M, B, mmr::Family, TransactionDb<E, H, T>>;
 
-pub(crate) type App<E, H, P, V, I, B, St> = EngineApplication<E, H, P, V, I, B, St>;
+pub(crate) type App<E, H, P, V, I, St> = EngineApplication<E, H, P, V, I, St>;
 
-pub(crate) type AppMailbox<E, H, P, V, I, B, St> =
-    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, B, St>>;
+pub(crate) type AppMailbox<E, H, P, V, I, St> =
+    commonware_glue::stateful::Mailbox<E, App<E, H, P, V, I, St>>;
 
-pub(crate) type EngineMarshalReporters<E, H, P, V, I, B, St, R> =
-    Reporters<AppMailbox<E, H, P, V, I, B, St>, EngineReporter<R, H, P>>;
+pub(crate) type EngineMarshalReporters<E, H, P, V, I, St, R> =
+    Reporters<AppMailbox<E, H, P, V, I, St>, EngineReporter<R, H, P>>;
 
 pub(crate) type SchemeProvider<P, V> = ConstantProvider<ThresholdScheme<P, V>, Epoch>;
 
-pub(crate) type StatefulApp<E, H, P, V, I, B, St> = Stateful<
+pub(crate) type StatefulApp<E, H, P, V, I, St> = Stateful<
     E,
-    App<E, H, P, V, I, B, St>,
+    App<E, H, P, V, I, St>,
     ThresholdScheme<P, V>,
     EngineVariant<H, P>,
     (
@@ -171,9 +171,9 @@ pub(crate) type StatefulApp<E, H, P, V, I, B, St> = Stateful<
     St,
 >;
 
-pub(crate) type MarshaledApp<E, H, P, V, I, B, St> = Marshaled<
+pub(crate) type MarshaledApp<E, H, P, V, I, St> = Marshaled<
     E,
-    AppMailbox<E, H, P, V, I, B, St>,
+    AppMailbox<E, H, P, V, I, St>,
     EngineBlock<H, P>,
     ReedSolomon<H>,
     H,
@@ -189,17 +189,17 @@ pub(crate) type ShardsMailbox<H, P> = shards::Mailbox<EngineBlock<H, P>, ReedSol
 
 /// Reporter combinator that fans simplex activity to the marshaled
 /// application and an optional external observer.
-pub(crate) type SimplexReporter<E, H, P, V, I, BV, St, O> =
-    Reporters<MarshaledApp<E, H, P, V, I, BV, St>, O>;
+pub(crate) type SimplexReporter<E, H, P, V, I, St, O> =
+    Reporters<MarshaledApp<E, H, P, V, I, St>, O>;
 
-pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, BV, O> = simplex::Engine<
+pub(crate) type SimplexEngine<E, B, H, P, V, L, St, I, O> = simplex::Engine<
     E,
     ThresholdScheme<P, V>,
     L,
     B,
     EngineCommitment<H, P>,
-    MarshaledApp<E, H, P, V, I, BV, St>,
-    MarshaledApp<E, H, P, V, I, BV, St>,
-    SimplexReporter<E, H, P, V, I, BV, St, O>,
+    MarshaledApp<E, H, P, V, I, St>,
+    MarshaledApp<E, H, P, V, I, St>,
+    SimplexReporter<E, H, P, V, I, St, O>,
     St,
 >;

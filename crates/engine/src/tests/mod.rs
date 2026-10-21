@@ -378,7 +378,7 @@ impl EngineDefinition for TestEngineDefinition {
                     // Small: simulation state is tiny and large caches slow
                     // deterministic runs.
                     state_page_cache_bytes: 32 * 1024 * 1024,
-                    other_page_cache_bytes: 32 * 1024 * 1024,
+                    history_page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
                     input,

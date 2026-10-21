@@ -19,7 +19,7 @@ use futures::{FutureExt, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::sync::Arc;
 
-impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
+impl<E, H, C, S, P, I, St> CApplication<E> for Application<E, H, C, S, P, I, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
@@ -27,7 +27,6 @@ where
     S: Scheme<PublicKey = P>,
     P: PublicKey,
     I: TransactionSource<C, P, H> + Clone + Sync,
-    B: Send + Sync + 'static,
     St: Strategy,
 {
     type SigningScheme = S;

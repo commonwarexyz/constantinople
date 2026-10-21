@@ -165,8 +165,8 @@ mod tests {
 
     /// `build_meta_schema` must register all metadata tables onto a fresh
     /// `SqlContext` without error.
-    #[tokio::test]
-    async fn schema_registers_into_sql_context() {
+    #[test]
+    fn schema_registers_into_sql_context() {
         let client = crate::namespaces::sql_meta_client(&exoware_sdk::StoreClient::new(
             "http://127.0.0.1:0",
         ))
