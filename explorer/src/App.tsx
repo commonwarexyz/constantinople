@@ -523,9 +523,11 @@ export default function App() {
             }),
             controller.signal,
             isRetryableAccountProofError,
+            { onRetry: (error) => setAccountActivityError(accountRetryReason(error) ?? errorMessage(error)) },
         )
             .then((page) => {
                 if (controller.signal.aborted) return;
+                setAccountActivityError('');
                 setAccountNextCursor(page.nextCursor);
                 setAccountTransactions(page.rows.map((row) => ({
                     row,

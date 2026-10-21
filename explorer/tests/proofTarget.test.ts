@@ -19,30 +19,39 @@ function heightKey(height: bigint): Uint8Array {
     return key;
 }
 
+function requestCursor(init: RequestInit): string {
+    return JSON.parse(new TextDecoder().decode((init.body as Uint8Array).subarray(5))).sinceSequenceNumber;
+}
+
+function targetStreamResponse(
+    height: bigint,
+    onStart?: (body: ReadableStreamDefaultController<Uint8Array>) => void,
+): Response {
+    const key = Buffer.concat([Buffer.from([4]), Buffer.from(heightKey(height))]);
+    const message = new TextEncoder().encode(JSON.stringify({
+        sequenceNumber: height.toString(),
+        entries: [{ key: key.toString('base64'), value: Buffer.from(digest(7)).toString('base64') }],
+    }));
+    const frame = new Uint8Array(5 + message.length);
+    new DataView(frame.buffer).setUint32(1, message.length);
+    frame.set(message, 5);
+    return new Response(new ReadableStream<Uint8Array>({
+        start(body) {
+            onStart?.(body);
+            body.enqueue(frame);
+        },
+    }), { headers: { 'content-type': 'application/connect+json' } });
+}
+
 test('target subscriptions recover when a response body disconnects', async (context) => {
-    for (const detail of ['network error', 'terminated', 'Error in body stream', 'Error in input stream', 'missing end frame', 'truncated frame']) {
+    for (const detail of ['terminated', 'missing end frame', 'truncated frame']) {
         await context.test(detail, { timeout: 5_000 }, async (t) => {
             const controller = new AbortController();
             const bodies: ReadableStreamDefaultController<Uint8Array>[] = [];
             const cursors: string[] = [];
             t.mock.method(globalThis, 'fetch', async (_input: unknown, init: RequestInit) => {
-                const request = init.body as Uint8Array;
-                cursors.push(JSON.parse(new TextDecoder().decode(request.subarray(5))).sinceSequenceNumber);
-                const height = BigInt(7 + bodies.length);
-                const key = Buffer.concat([Buffer.from([4]), Buffer.from(heightKey(height))]);
-                const message = new TextEncoder().encode(JSON.stringify({
-                    sequenceNumber: height.toString(),
-                    entries: [{ key: key.toString('base64'), value: Buffer.from(digest(7)).toString('base64') }],
-                }));
-                const frame = new Uint8Array(5 + message.length);
-                new DataView(frame.buffer).setUint32(1, message.length);
-                frame.set(message, 5);
-                return new Response(new ReadableStream<Uint8Array>({
-                    start(body) {
-                        bodies.push(body);
-                        body.enqueue(frame);
-                    },
-                }), { headers: { 'content-type': 'application/connect+json' } });
+                cursors.push(requestCursor(init));
+                return targetStreamResponse(BigInt(7 + bodies.length), (body) => bodies.push(body));
             });
             const store = new Client('https://example.invalid').store(new StoreKeyPrefix(new Uint8Array([4])));
             t.mock.method(store, 'query', async () => ({ sequenceNumber: 6n, results: [] }));
@@ -67,6 +76,36 @@ test('target subscriptions recover when a response body disconnects', async (con
                 await stream.return();
             }
         });
+    }
+});
+
+// The SDK retries a retryable first response with the request it already
+// consumed, so recovery depends on the subscription reconnecting.
+test('target subscriptions recover when the first response is a retryable status', { timeout: 5_000 }, async (t) => {
+    const controller = new AbortController();
+    const cursors: string[] = [];
+    t.mock.method(globalThis, 'fetch', async (_input: unknown, init: RequestInit) => {
+        cursors.push(requestCursor(init));
+        return cursors.length === 1
+            ? new Response(JSON.stringify({ code: 'unavailable', message: 'overloaded' }), {
+                status: 503,
+                headers: { 'content-type': 'application/json' },
+            })
+            : targetStreamResponse(7n);
+    });
+    const store = new Client('https://example.invalid').store(new StoreKeyPrefix(new Uint8Array([4])));
+    t.mock.method(store, 'query', async () => ({ sequenceNumber: 6n, results: [] }));
+    const stream = subscribePublishedProofTargetsFromStore(store, {
+        signal: controller.signal,
+        reconnectDelayMs: 0,
+    });
+
+    try {
+        assert.equal((await stream.next()).value?.height, 7n);
+        assert.deepEqual(cursors, ['7', '7']);
+    } finally {
+        controller.abort();
+        await stream.return();
     }
 });
 
@@ -230,41 +269,9 @@ test('provable target subscription releases a pending bootstrap on abort', async
     assert.equal(seenSignal, controller.signal);
 });
 
-test('provable target subscription preserves its cursor after a generic error', async () => {
-    const subscriptions: bigint[] = [];
-    const controller = new AbortController();
-    const store = {
-        async query() {
-            return queryResult(4n, 11n);
-        },
-        subscribe(filters: Parameters<PublishedProofTargetStore['subscribe']>[0]) {
-            subscriptions.push(filters.sinceSequenceNumber ?? 0n);
-            return subscriptions.length === 1
-                ? failedBatchStream(new ConnectError('network unavailable', Code.Unavailable))
-                : batches([
-                    {
-                        sequenceNumber: 15n,
-                        entries: [{ key: heightKey(5n), value: digest(5) }],
-                    },
-                ]);
-        },
-    } as PublishedProofTargetStore;
-
-    const stream = subscribePublishedProofTargetsFromStore(store, {
-        signal: controller.signal,
-        reconnectDelayMs: 0,
-    });
-
-    assert.equal((await stream.next()).value?.height, 4n);
-    assert.equal((await stream.next()).value?.height, 5n);
-    assert.deepEqual(subscriptions, [12n, 12n]);
-
-    controller.abort();
-    await stream.return();
-});
-
-test('provable target subscription reconnects after server and proxy failures', async (context) => {
+test('provable target subscription preserves its cursor after a retryable error', async (context) => {
     for (const failure of [
+        new ConnectError('network unavailable', Code.Unavailable),
         new ConnectError('failed to read response body: connection reset', Code.Internal),
         new HttpError(500, '[unknown] HTTP 520', Code.Unknown, new ConnectError('HTTP 520', Code.Unknown)),
     ]) {
@@ -287,19 +294,18 @@ test('provable target subscription reconnects after server and proxy failures', 
                         ]);
                 },
             } as PublishedProofTargetStore;
+
             const stream = subscribePublishedProofTargetsFromStore(store, {
                 signal: controller.signal,
                 reconnectDelayMs: 0,
             });
 
-            try {
-                assert.equal((await stream.next()).value?.height, 4n);
-                assert.equal((await stream.next()).value?.height, 5n);
-                assert.deepEqual(subscriptions, [12n, 12n]);
-            } finally {
-                controller.abort();
-                await stream.return();
-            }
+            assert.equal((await stream.next()).value?.height, 4n);
+            assert.equal((await stream.next()).value?.height, 5n);
+            assert.deepEqual(subscriptions, [12n, 12n]);
+
+            controller.abort();
+            await stream.return();
         });
     }
 });

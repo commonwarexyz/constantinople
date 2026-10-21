@@ -20,6 +20,8 @@ const NETWORK_FAILURES = [
     'Failed to fetch',
     'fetch failed',
     'Load failed',
+    'The Internet connection appears to be offline.',
+    'The network connection was lost.',
     'network error',
     'terminated',
     'Error in body stream',

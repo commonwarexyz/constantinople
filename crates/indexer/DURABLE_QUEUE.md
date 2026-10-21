@@ -110,8 +110,8 @@ Transient and ambiguous failures repeat the same deterministic writes with
 capped exponential backoff and no attempt cap or overall deadline. Each writer
 request retains its 30-second timeout. Permanent errors fail the indexer task.
 QMDB preparation and Simplex block encoding and staging use blocking tasks.
-Store requests and retry backoff run on the async executor. The transport also
-encodes and compresses request messages there as it polls the outgoing body.
+Store requests and retry backoff run on the async executor. The SDK also
+encodes and compresses each full request there before every attempt.
 The ignored `large_block_data_uploads_with_bounded_requests` test uploads a 32 MiB proposal's
 SQL and QMDB rows through the real simulator transport.
 

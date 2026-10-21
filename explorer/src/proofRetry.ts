@@ -10,8 +10,9 @@ const RETRYABLE_PROOF_ERROR =
 const ACCOUNT_SERVICE_ERROR = /\[unavailable\]/i;
 
 // Fetch and response-body failures have different messages across runtimes.
+// Older Safari reports the underlying system error description.
 const NETWORK_FAILURE_MESSAGE =
-    /^(?:failed to fetch|fetch failed|load failed|network error|terminated|error in (?:body|input) stream|networkerror when attempting to fetch resource\.?)$/i;
+    /^(?:failed to fetch|fetch failed|load failed|network error|terminated|error in (?:body|input) stream|networkerror when attempting to fetch resource\.?|the internet connection appears to be offline\.|the network connection was lost\.)$/i;
 
 // Bounds the walk so a cyclic cause chain cannot hang classification.
 const MAX_CAUSE_DEPTH = 8;
@@ -48,8 +49,8 @@ export function isRetryableProofError(error: unknown): boolean {
     const detail = errorMessage(error);
     return (
         isConsistencyNotReadyError(error) ||
-        isTransportFailure(error) ||
-        RETRYABLE_PROOF_ERROR.test(detail)
+        RETRYABLE_PROOF_ERROR.test(detail) ||
+        isTransportFailure(error)
     );
 }
 
@@ -87,22 +88,27 @@ export function isConsistencyNotReadyError(error: unknown): boolean {
 }
 
 // Local transport failures retain their cause, unlike server-sent Unknown
-// errors. Bare SDK Wasm initialization failures stay terminal because the SDK
-// caches the rejected promise until reload.
-export function isTransportFailure(error: unknown): boolean {
+// errors. Connect gives a string cause when a stream ends early or when an SDK
+// retry reuses the request a failed first response already consumed. A body
+// that ends inside a frame is a local InvalidArgument, though the request
+// itself is valid. Bare SDK Wasm initialization failures stay terminal because
+// the SDK caches the rejected promise until reload.
+function isTransportFailure(error: unknown): boolean {
     const connect = connectError(error);
     return (
-        connect?.code === Code.Unknown &&
-        (connect.cause === 'missing EndStreamResponse' ||
-            (connect.cause instanceof TypeError && NETWORK_FAILURE_MESSAGE.test(connect.cause.message)))
+        (connect?.code === Code.InvalidArgument && connect.rawMessage === 'protocol error: incomplete envelope') ||
+        (connect?.code === Code.Unknown &&
+            (connect.cause === 'missing EndStreamResponse' ||
+                connect.cause === 'missing request message' ||
+                (connect.cause instanceof TypeError && NETWORK_FAILURE_MESSAGE.test(connect.cause.message))))
     );
 }
 
 // Long-lived subscriptions reconnect on failures that can clear without a
-// client change. Servers forward upstream stream resets as Internal, and
-// proxies answer with non-Connect 5xx bodies that decode as Unknown without a
-// local cause. Unknown errors that carry a local cause, such as an invalid
-// URL, stay terminal.
+// client change. Internal covers forwarded upstream resets and HTTP 400.
+// Unknown without a cause covers proxy pages and HTTP statuses Connect does not
+// map, so a misconfigured endpoint also keeps reconnecting. Unknown errors that
+// carry a local cause, such as an invalid URL, stay terminal.
 export function isRetryableServiceError(error: unknown): boolean {
     const connect = connectError(error);
     return (
@@ -110,17 +116,9 @@ export function isRetryableServiceError(error: unknown): boolean {
         (connect?.code === Code.Unknown && connect.cause === undefined) ||
         connect?.code === Code.Internal ||
         connect?.code === Code.Unavailable ||
-        connect?.code === Code.DeadlineExceeded ||
-        isIncompleteEnvelope(connect) ||
         isConsistencyNotReadyError(error) ||
         isBatchEvicted(error)
     );
-}
-
-// Connect reports a body that ends cleanly inside a frame as a local
-// InvalidArgument. The response was truncated, so the request itself is valid.
-function isIncompleteEnvelope(connect: ConnectError | undefined): boolean {
-    return connect?.code === Code.InvalidArgument && connect.rawMessage === 'protocol error: incomplete envelope';
 }
 
 export function isBatchEvicted(error: unknown): boolean {

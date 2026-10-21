@@ -262,14 +262,11 @@ export async function* subscribePublishedProofTargetsFromStore(
             options.onError?.('provable target subscription ended');
         } catch (error) {
             if (signal?.aborted) return;
-            if (!isRetryableServiceError(error)) {
-                options.onError?.(errorMessage(error));
-                throw error;
-            }
+            options.onError?.(errorMessage(error));
+            if (!isRetryableServiceError(error)) throw error;
             if (isBatchEvicted(error)) {
                 nextSequence = undefined;
             }
-            options.onError?.(errorMessage(error));
         }
 
         if (!(await waitForRetry(reconnectDelayMs, signal))) return;

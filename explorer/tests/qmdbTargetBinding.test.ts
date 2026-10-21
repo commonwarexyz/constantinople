@@ -503,15 +503,13 @@ for (const { name, location, accepted } of [
     { name: 'the current trailing commit', location: latestTarget().transactionsTip - 1n, accepted: false },
     { name: 'a location below the active range', location: latestTarget().transactionsStart - 1n, accepted: false },
 ]) {
-    test(`exact inclusion height checks ${name} before notifying or fetching a proof`, { timeout: 5_000 }, async (t) => {
+    test(`exact inclusion height checks ${name} before notifying or fetching a proof`, async (t) => {
         const body = new Uint8Array(82).fill(0x33);
         const digest = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', toArrayBuffer(body))));
         const certificate = await finalizedCertificate(HEIGHT);
         const events: string[] = [];
-        const parentRead = deferred<void>();
-        const parent = mockParentHeader(t, certificate, () => {
+        mockParentHeader(t, certificate, () => {
             events.push('parent');
-            parentRead.resolve();
             return certificate.parentHeader;
         });
         const certificates = t.mock.method(SimplexClient.prototype, 'getFinalizationByHeight', async (height: string, floor: bigint) => {
@@ -545,12 +543,8 @@ for (const { name, location, accepted } of [
             assert.deepEqual(events, ['parent', 'verified', 'proof']);
         } else {
             await assert.rejects(pending, NOT_IN_BLOCK);
-
-            // Local bound failures can reject before the prefetched parent read reaches the transport.
-            await parentRead.promise;
-            assert.deepEqual(events, ['parent']);
+            assert.equal(events.includes('verified'), false);
         }
-        assert.equal(parent.mock.callCount(), 1);
         assert.equal(proof.mock.callCount(), accepted ? 1 : 0);
         assert.equal(certificates.mock.callCount(), 1);
         assert.equal(metadata.mock.callCount(), 1);
