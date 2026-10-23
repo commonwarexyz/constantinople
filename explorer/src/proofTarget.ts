@@ -1,5 +1,4 @@
 import { create } from '@bufbuild/protobuf';
-import { Code } from '@connectrpc/connect';
 import {
     Client,
     SelectorSchema,
@@ -8,7 +7,7 @@ import {
     type StoreBatch,
     type StoreClient,
 } from '@exowarexyz/sdk';
-import { errorInfos, errorMessage, NETWORK_RECONNECT_DELAY_MS, waitForRetry } from './proofRetry.ts';
+import { errorMessage, isBatchEvicted, isRetryableServiceError, NETWORK_RECONNECT_DELAY_MS, waitForRetry } from './proofRetry.ts';
 
 const PROVABLE_TARGET_STORE_PREFIX = new Uint8Array([0x04]);
 const PROVABLE_TARGET_HEIGHT_BYTES = 8;
@@ -17,8 +16,6 @@ const MAX_HEIGHT = 0xffff_ffff_ffff_ffffn;
 const BOOTSTRAP_HEIGHT_SLACK = 8n;
 const MAX_QUEUED_TARGETS = 4096;
 const TARGET_KEY_REGEX = `(?s-u)^.{${PROVABLE_TARGET_HEIGHT_BYTES}}$`;
-const STORE_STREAM_ERROR_DOMAIN = 'log.stream';
-const BATCH_EVICTED_REASON = 'BATCH_EVICTED';
 
 export interface PublishedProofTarget {
     readonly height: bigint;
@@ -265,14 +262,11 @@ export async function* subscribePublishedProofTargetsFromStore(
             options.onError?.('provable target subscription ended');
         } catch (error) {
             if (signal?.aborted) return;
-            if (error instanceof MalformedProofTargetError) {
-                options.onError?.(errorMessage(error));
-                throw error;
-            }
+            options.onError?.(errorMessage(error));
+            if (!isRetryableServiceError(error)) throw error;
             if (isBatchEvicted(error)) {
                 nextSequence = undefined;
             }
-            options.onError?.(errorMessage(error));
         }
 
         if (!(await waitForRetry(reconnectDelayMs, signal))) return;
@@ -325,11 +319,4 @@ function targetsInBatch(batch: StoreBatch): PublishedProofTarget[] {
 
 function isNewer(target: PublishedProofTarget, latestHeight: bigint | undefined): boolean {
     return latestHeight === undefined || target.height > latestHeight;
-}
-
-function isBatchEvicted(error: unknown): boolean {
-    return errorInfos(error, Code.OutOfRange).some(
-        ({ reason, domain }) =>
-            reason === BATCH_EVICTED_REASON && domain === STORE_STREAM_ERROR_DOMAIN,
-    );
 }

@@ -851,14 +851,14 @@ where
                     // the full-body decode is skipped otherwise. Adaptive
                     // scheduling may release a small block inline.
                     if proposed.is_empty() {
-                        let work_size = block.body.len();
+                        let work_size = block.inner().body.len();
                         drop(strategy.spawn(work_size, move |_: St| drop(block)));
                         acknowledgement.acknowledge();
                         continue;
                     }
 
-                    let height = block.header.height;
-                    let work_size = block.body.len();
+                    let height = block.inner().header.height;
+                    let work_size = block.inner().body.len();
 
                     // Deriving the finalized set decodes any transaction the
                     // application has not already materialized. The strategy
@@ -867,6 +867,7 @@ where
                     let finalized: AHashSet<H::Digest> = strategy
                         .spawn(work_size, move |_: St| {
                             block
+                                .inner()
                                 .body
                                 .iter()
                                 .filter_map(|tx| tx.get().map(|tx| *tx.message_digest()))

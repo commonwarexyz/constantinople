@@ -8,7 +8,8 @@ use commonware_consensus::{
     marshal::{Update, ancestry::Ancestry},
 };
 use commonware_cryptography::{
-    Hasher, PublicKey, bls12381::primitives::variant::Variant, certificate::Scheme,
+    Digested, Digestible, Hasher, PublicKey, bls12381::primitives::variant::Variant,
+    certificate::Scheme,
 };
 use commonware_glue::stateful::{
     Application as StatefulApplication, Input, Proposed, db::DatabaseSet,
@@ -22,14 +23,23 @@ use rand::{CryptoRng, Rng};
 use std::{
     marker::PhantomData,
     pin::Pin,
-    sync::Arc,
     task::{Context, Poll},
 };
 
-type InnerApplication<E, H, P, V, I, B, St> =
-    Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, B, St>;
+type InnerApplication<E, H, P, V, I, St> =
+    Application<E, H, EngineCommitment<H, P>, ThresholdScheme<P, V>, P, I, St>;
 
-pub(crate) struct EngineApplication<E, H, P, V, I, B, St>
+// An engine block and its inner block share one digest. Pairing the inner block
+// with the marshal's digest keeps this conversion synchronous.
+fn application_block<H, P>(block: &Digested<EngineBlock<H, P>>) -> Digested<ApplicationBlock<H, P>>
+where
+    H: Hasher,
+    P: PublicKey,
+{
+    Digested::precomputed(block.inner().inner_shared(), block.digest())
+}
+
+pub(crate) struct EngineApplication<E, H, P, V, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
@@ -37,7 +47,7 @@ where
     V: Variant,
     St: Strategy,
 {
-    inner: InnerApplication<E, H, P, V, I, B, St>,
+    inner: InnerApplication<E, H, P, V, I, St>,
     finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
 }
 
@@ -73,14 +83,14 @@ where
         let activity = match activity {
             Update::Tip(round, height, digest) => Update::Tip(round, height, digest),
             Update::Block(block, acknowledgement) => {
-                Update::Block(block.inner_shared(), acknowledgement)
+                Update::Block(application_block(&block), acknowledgement)
             }
         };
         self.inner.report(activity)
     }
 }
 
-impl<E, H, P, V, I, B, St> EngineApplication<E, H, P, V, I, B, St>
+impl<E, H, P, V, I, St> EngineApplication<E, H, P, V, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
@@ -89,7 +99,7 @@ where
     St: Strategy,
 {
     pub(crate) const fn new(
-        inner: InnerApplication<E, H, P, V, I, B, St>,
+        inner: InnerApplication<E, H, P, V, I, St>,
         finalized_hook: Option<FinalizedHookFn<EngineCommitment<H, P>, H, P>>,
     ) -> Self {
         Self {
@@ -99,7 +109,7 @@ where
     }
 }
 
-impl<E, H, P, V, I, B, St> Clone for EngineApplication<E, H, P, V, I, B, St>
+impl<E, H, P, V, I, St> Clone for EngineApplication<E, H, P, V, I, St>
 where
     E: BufferPooler + Storage + Clock + Metrics,
     H: Hasher,
@@ -115,24 +125,52 @@ where
     }
 }
 
-struct InnerAncestry<A, H, P> {
+struct InnerAncestry<A, H, P>
+where
+    H: Hasher,
+    P: PublicKey,
+{
     ancestry: A,
-    _marker: PhantomData<fn() -> (H, P)>,
+
+    // `peek` returns a borrow, so the converted head is refreshed whenever
+    // polling can change the wrapped stream's head.
+    head: Option<Digested<ApplicationBlock<H, P>>>,
 }
 
-impl<A, H, P> InnerAncestry<A, H, P> {
-    const fn new(ancestry: A) -> Self {
+impl<A, H, P> InnerAncestry<A, H, P>
+where
+    A: Ancestry<EngineBlock<H, P>>,
+    H: Hasher,
+    P: PublicKey,
+{
+    fn new(ancestry: A) -> Self {
+        let head = ancestry.peek().map(application_block);
+        Self { ancestry, head }
+    }
+}
+
+impl<A, H, P> Clone for InnerAncestry<A, H, P>
+where
+    A: Clone,
+    H: Hasher,
+    P: PublicKey,
+{
+    fn clone(&self) -> Self {
         Self {
-            ancestry,
-            _marker: PhantomData,
+            ancestry: self.ancestry.clone(),
+            head: self.head.clone(),
         }
     }
 }
 
-impl<A: Clone, H, P> Clone for InnerAncestry<A, H, P> {
-    fn clone(&self) -> Self {
-        Self::new(self.ancestry.clone())
-    }
+// Fields are never pinned structurally, so the cached head can move freely
+// even when the digest type itself is not `Unpin`.
+impl<A, H, P> Unpin for InnerAncestry<A, H, P>
+where
+    A: Unpin,
+    H: Hasher,
+    P: PublicKey,
+{
 }
 
 impl<A, H, P> Stream for InnerAncestry<A, H, P>
@@ -141,12 +179,13 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    type Item = Arc<ApplicationBlock<H, P>>;
+    type Item = Digested<ApplicationBlock<H, P>>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Pin::new(&mut self.get_mut().ancestry)
-            .poll_next(cx)
-            .map(|block| block.map(|block| block.inner_shared()))
+        let this = self.get_mut();
+        let next = Pin::new(&mut this.ancestry).poll_next(cx);
+        this.head = this.ancestry.peek().map(application_block);
+        next.map(|block| block.as_ref().map(application_block))
     }
 }
 
@@ -156,12 +195,12 @@ where
     H: Hasher,
     P: PublicKey,
 {
-    fn peek(&self) -> Option<&ApplicationBlock<H, P>> {
-        self.ancestry.peek().map(|block| &**block)
+    fn peek(&self) -> Option<&Digested<ApplicationBlock<H, P>>> {
+        self.head.as_ref()
     }
 }
 
-impl<E, H, P, V, I, B, St> StatefulApplication<E> for EngineApplication<E, H, P, V, I, B, St>
+impl<E, H, P, V, I, St> StatefulApplication<E> for EngineApplication<E, H, P, V, I, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
@@ -169,19 +208,18 @@ where
     V: Variant,
     ThresholdScheme<P, V>: Scheme<PublicKey = P>,
     I: TransactionSource<EngineCommitment<H, P>, P, H> + Clone + Sync,
-    B: Send + Sync + 'static,
     St: Strategy,
 {
     type SigningScheme = ThresholdScheme<P, V>;
     type Context = commonware_consensus::simplex::types::Context<EngineCommitment<H, P>, P>;
     type Block = EngineBlock<H, P>;
-    type Databases = <InnerApplication<E, H, P, V, I, B, St> as StatefulApplication<E>>::Databases;
+    type Databases = <InnerApplication<E, H, P, V, I, St> as StatefulApplication<E>>::Databases;
     type Captured = Option<FinalizedArtifacts<H>>;
     type Provider = I;
     type Input = ();
 
     fn sync_targets(block: &Self::Block) -> <Self::Databases as DatabaseSet<E>>::SyncTargets {
-        InnerApplication::<E, H, P, V, I, B, St>::sync_targets(block)
+        InnerApplication::<E, H, P, V, I, St>::sync_targets(block)
     }
 
     async fn genesis(&mut self) -> Self::Block {

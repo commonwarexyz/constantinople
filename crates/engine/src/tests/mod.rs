@@ -29,7 +29,6 @@ use commonware_cryptography::{
         primitives::{group::Share, variant::MinSig},
     },
     certificate::ConstantProvider,
-    ed25519::Batch as Ed25519Batch,
     sha256,
 };
 use commonware_glue::{
@@ -368,7 +367,6 @@ impl EngineDefinition for TestEngineDefinition {
                 RoundRobin<TestHasher>,
                 _,
                 _,
-                Ed25519Batch,
                 crate::types::NoopActivityReporter<TestPublicKey, MinSig>,
             >::new(
                 context.child("engine"),
@@ -380,7 +378,7 @@ impl EngineDefinition for TestEngineDefinition {
                     // Small: simulation state is tiny and large caches slow
                     // deterministic runs.
                     state_page_cache_bytes: 32 * 1024 * 1024,
-                    other_page_cache_bytes: 32 * 1024 * 1024,
+                    history_page_cache_bytes: 32 * 1024 * 1024,
                     output,
                     share,
                     input,
@@ -395,9 +393,8 @@ impl EngineDefinition for TestEngineDefinition {
                     sync_config: SyncEngineConfig {
                         fetch_batch_size: NZU64!(16),
                         apply_batch_size: NZU64!(64),
-                        max_outstanding_requests: 8,
+                        max_outstanding_requests: NZUsize!(8),
                         update_channel_size: NZUsize!(256),
-                        max_retained_roots: 32,
                     },
                     prune_config: Some(PruneConfig {
                         maintenance_interval: NZUsize!(16),

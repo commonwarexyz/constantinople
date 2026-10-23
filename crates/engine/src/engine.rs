@@ -34,7 +34,7 @@ use commonware_consensus::{
     types::{Epoch, FixedEpocher, ViewDelta},
 };
 use commonware_cryptography::{
-    BatchVerifier, Committable, Digest, Hasher, PublicKey, Signer,
+    Committable, Digest, Digested, Hasher, PublicKey, Signer,
     bls12381::{
         dkg::feldman_desmedt::Output,
         primitives::{group, variant::Variant},
@@ -192,11 +192,11 @@ where
     /// live account set passed ~2M (build/verify doubled on ~200k journal
     /// cache misses/s/node).
     pub state_page_cache_bytes: usize,
-    /// Capacity in bytes of the page cache for everything else (block and
-    /// certificate archives, transaction history, simplex journal). Separate
-    /// from the state cache so backfill and replay scans cannot evict its
-    /// working set.
-    pub other_page_cache_bytes: usize,
+    /// Capacity in bytes of the page cache shared by everything outside state:
+    /// the finalized block, finalization, and marshal archives, the transaction
+    /// history witness journal, and the simplex vote journal. Separate from the
+    /// state cache so backfill and replay scans cannot evict its working set.
+    pub history_page_cache_bytes: usize,
     pub probe: Option<EngineProbeMailbox<H, C::PublicKey, V>>,
     /// Optional external observer of the simplex activity stream. The marshal
     /// reporter is always wired up, and this slot fans out alongside it via
@@ -209,7 +209,7 @@ where
 }
 
 /// Fully assembled validator engine.
-pub struct Engine<E, C, M, B, H, V, L, St, I, BV, O>
+pub struct Engine<E, C, M, B, H, V, L, St, I, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
@@ -220,7 +220,6 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
-    BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     context: ContextCell<E>,
@@ -229,8 +228,8 @@ where
     blocker: B,
     state_resolver: StateResolverActor<E, C::PublicKey, M, B, H, St>,
     transaction_resolver: TransactionResolverActor<E, C::PublicKey, M, B, H, St>,
-    stateful: StatefulApp<E, H, C::PublicKey, V, I, BV, St>,
-    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, BV, St>,
+    stateful: StatefulApp<E, H, C::PublicKey, V, I, St>,
+    stateful_mailbox: AppMailbox<E, H, C::PublicKey, V, I, St>,
     shards: ShardsEngine<E, B, M, H, C::PublicKey, V, St>,
     shard_mailbox: ShardsMailbox<H, C::PublicKey>,
     coding_config: CodingConfig,
@@ -253,10 +252,10 @@ where
     startup_sync_floor: Option<EngineFinalization<C::PublicKey, V, H>>,
     #[cfg(all(test, feature = "test-utils"))]
     genesis_commitment: EngineCommitment<H, C::PublicKey>,
-    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, BV, O>,
+    simplex: SimplexEngine<E, B, H, C::PublicKey, V, L, St, I, O>,
 }
 
-impl<E, C, M, B, H, V, L, St, I, BV, O> Engine<E, C, M, B, H, V, L, St, I, BV, O>
+impl<E, C, M, B, H, V, L, St, I, O> Engine<E, C, M, B, H, V, L, St, I, O>
 where
     E: BufferPooler + Spawner + Metrics + CryptoRng + Clock + Storage + Network,
     C: Signer,
@@ -267,7 +266,6 @@ where
     L: Elector<ThresholdScheme<C::PublicKey, V>> + Default,
     St: Strategy,
     I: TransactionSource<EngineCommitment<H, C::PublicKey>, C::PublicKey, H> + Clone + Sync,
-    BV: BatchVerifier<PublicKey = C::PublicKey> + Send + Sync + 'static,
     O: Reporter<Activity = EngineActivity<C::PublicKey, V, H>>,
 {
     /// Returns the durable processed height recovered before the engine starts.
@@ -318,18 +316,8 @@ where
     /// Initializes the full engine stack.
     #[boxed]
     pub async fn new(context: E, config: Config<C, M, B, V, St, I, H, O>) -> Self {
-        let page_cache = CacheRef::from_pooler(
-            &context.child("other"),
-            PAGE_CACHE_PAGE_SIZE,
-            NonZero::new(config.other_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
-                .expect("page cache must hold at least one page"),
-        );
-        let storage_page_cache = CacheRef::from_pooler(
-            &context.child("state"),
-            PAGE_CACHE_PAGE_SIZE,
-            NonZero::new(config.state_page_cache_bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
-                .expect("state page cache must hold at least one page"),
-        );
+        let state_page_cache = page_cache(&context, "state", config.state_page_cache_bytes);
+        let history_page_cache = page_cache(&context, "history", config.history_page_cache_bytes);
         let consensus_namespace = union(&config.namespace, b"_CONSENSUS");
         let epocher = FixedEpocher::new(FIXED_EPOCH_LENGTH);
         let scheme =
@@ -383,13 +371,13 @@ where
         let (finalizations_by_height, finalized_blocks) = futures::join!(
             init_finalizations_archive::<E, H, C::PublicKey, V>(
                 &context,
-                &page_cache,
+                &history_page_cache,
                 &config.partition_prefix,
                 prunable_items_per_section,
             ),
             init_finalized_blocks_archive::<E, H, C::PublicKey>(
                 &context,
-                &page_cache,
+                &history_page_cache,
                 &config.partition_prefix,
                 &config.block_codec,
                 prunable_items_per_section,
@@ -397,7 +385,7 @@ where
         );
         let transaction_db_config = transaction_db_config(
             &config.partition_prefix,
-            &page_cache,
+            &history_page_cache,
             config.strategy.clone(),
         );
         let stateful_partition_prefix = format!("{}_stateful", config.partition_prefix);
@@ -438,11 +426,11 @@ where
             <StateDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
             <TransactionDb<E, H, St> as ManagedDb<E>>::initial_sync_target(),
         );
-        let coded_genesis = Arc::new(EngineCodedBlock::new(
-            genesis_block.into(),
-            coding_config,
-            &config.strategy,
-        ));
+        let genesis_block =
+            Digested::compute(EngineBlock::from(genesis_block), &config.strategy).await;
+        let coded_genesis = Arc::new(
+            EngineCodedBlock::encode(genesis_block, coding_config, &config.strategy).await,
+        );
         let (application_state_target, application_transactions_target) =
             block_targets(coded_genesis.inner());
 
@@ -469,7 +457,7 @@ where
                 mailbox_size: MAILBOX_SIZE,
                 view_retention: ACTIVITY_TIMEOUT,
                 prunable_items_per_section,
-                page_cache: page_cache.clone(),
+                page_cache: history_page_cache.clone(),
                 replay_buffer: REPLAY_BUFFER,
                 key_write_buffer: WRITE_BUFFER,
                 value_write_buffer: WRITE_BUFFER,
@@ -538,7 +526,7 @@ where
                 db_config: (
                     state_db_config(
                         &config.partition_prefix,
-                        &storage_page_cache,
+                        &state_page_cache,
                         config.strategy.clone(),
                     ),
                     transaction_db_config,
@@ -550,6 +538,7 @@ where
                 resolvers: (state_sync_resolver, transaction_sync_resolver),
                 sync_config: config.sync_config,
                 prune_config: config.prune_config,
+                strategy: config.strategy.clone(),
             },
         );
 
@@ -564,9 +553,11 @@ where
                 epocher,
             },
         );
-        // Fan Simplex activity to the marshal mailbox and any external observer.
-        let simplex_reporter: SimplexReporter<H, C::PublicKey, V, O> =
-            Reporters::from((marshal_mailbox.clone(), config.simplex_observer));
+        // Simplex activity reaches marshal through the marshaled application,
+        // which retires its proposal gates on finalization before forwarding.
+        // Reporting to the marshal mailbox directly would leak those gates.
+        let simplex_reporter: SimplexReporter<E, H, C::PublicKey, V, I, St, O> =
+            Reporters::from((application.clone(), config.simplex_observer));
 
         // Retain votes for late equivocation reports. The upstream wall-clock skip policy
         // avoids waiting on silent leaders while a quorum remains active.
@@ -587,7 +578,7 @@ where
                 floor: simplex_floor,
                 replay_buffer: NZUsize!(1024 * 1024),
                 write_buffer: NZUsize!(1024 * 1024),
-                page_cache,
+                page_cache: history_page_cache,
                 leader_timeout: Duration::from_secs(4),
                 certification_timeout: Duration::from_secs(8),
                 timeout_retry: Duration::from_secs(10),
@@ -671,7 +662,7 @@ where
         let stateful_handle = self.stateful.start();
 
         let reporter = reporter.map(EngineReporter::new);
-        let reporters: EngineMarshalReporters<E, H, C::PublicKey, V, I, BV, St, Rep> =
+        let reporters: EngineMarshalReporters<E, H, C::PublicKey, V, I, St, Rep> =
             EngineMarshalReporters::from((self.stateful_mailbox, reporter));
         let marshal_handle = self
             .marshal
@@ -714,6 +705,21 @@ where
         }
         None => ThresholdScheme::verifier(namespace, participants, output.public().clone()),
     }
+}
+
+// Each cache allocates its full capacity up front, so the budgets partition
+// memory rather than cap it lazily.
+fn page_cache<E: BufferPooler + Metrics>(
+    context: &E,
+    name: &'static str,
+    bytes: usize,
+) -> CacheRef {
+    CacheRef::from_pooler(
+        &context.child(name),
+        PAGE_CACHE_PAGE_SIZE,
+        NonZero::new(bytes / usize::from(PAGE_CACHE_PAGE_SIZE.get()))
+            .unwrap_or_else(|| panic!("{name} page cache must hold at least one page")),
+    )
 }
 
 fn block_targets<H, P>(
@@ -876,7 +882,7 @@ mod unit_tests {
         simplex::types::Context,
         types::{Epoch, Round, View},
     };
-    use commonware_cryptography::{Digest, Signer, ed25519, sha256};
+    use commonware_cryptography::{Digest, Digestible, Signer, ed25519, sha256};
     use commonware_math::algebra::Random;
     use commonware_parallel::Sequential;
     use commonware_utils::{NZU16, non_empty_range};
@@ -884,6 +890,7 @@ mod unit_tests {
         Block, Header, Sealable, Transaction, TransactionPublicKey,
         proposal::{MAXIMUM_BLOCK_SIZE, MAXIMUM_MESSAGE_SIZE, max_transaction_bytes},
     };
+    use futures::FutureExt;
     use rand::{SeedableRng, rngs::StdRng};
     use std::num::NonZeroU64;
 
@@ -979,7 +986,12 @@ mod unit_tests {
         for validators in [4, 7, 50] {
             let coding_config = coding_config_for_participants(validators);
             let shards = usize::from(coding_config.minimum_shards.get());
-            let coded = EngineCodedBlock::new(block.clone(), coding_config, &Sequential);
+
+            // Sequential runs the coding job inline, so the future is already ready.
+            let digested = Digested::precomputed(block.clone(), block.digest());
+            let coded = EngineCodedBlock::encode(digested, coding_config, &Sequential)
+                .now_or_never()
+                .expect("sequential encoding completes inline");
             let encoded = coded.shard(0).expect("shard zero should exist").encode();
             assert!(encoded.len() <= MAXIMUM_MESSAGE_SIZE as usize);
 

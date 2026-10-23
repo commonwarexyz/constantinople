@@ -10,6 +10,12 @@ use exoware_sdk::{Key, PrefixedStoreClient, StoreClient, StoreKeyPrefix, StoreKe
 
 /// Store namespace byte for QMDB account-state rows.
 pub const STATE_QMDB_PREFIX_VALUE: u8 = 0x00;
+
+/// Bitmap chunk size in bytes for account-state current-value proofs.
+///
+/// The QMDB service and every client that verifies its proofs must agree on
+/// this value, so it is part of the published index format.
+pub const STATE_PROOF_CHUNK_SIZE: usize = 32;
 /// Store namespace byte for QMDB transaction-hash rows.
 pub const TRANSACTIONS_QMDB_PREFIX_VALUE: u8 = 0x01;
 /// Store namespace byte for Simplex block and certificate rows.

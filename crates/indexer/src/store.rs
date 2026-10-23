@@ -204,15 +204,14 @@ mod tests {
         headers: HeaderMap,
         body: Bytes,
     ) -> StatusCode {
-        assert_eq!(headers[CONTENT_TYPE], "application/connect+proto");
-        assert!(!headers.contains_key(CONTENT_ENCODING));
-        assert_eq!(body[0], 1);
-        assert_eq!(&body[5..9], b"\x28\xb5\x2f\xfd");
+        assert_eq!(headers[CONTENT_TYPE], "application/proto");
+        assert!(!headers.contains_key("connect-content-encoding"));
+        assert!(body.starts_with(b"\x28\xb5\x2f\xfd"));
 
-        let content_encoding = headers.get("connect-content-encoding").map(|value| {
+        let content_encoding = headers.get(CONTENT_ENCODING).map(|value| {
             value
                 .to_str()
-                .expect("connect-content-encoding should be ASCII")
+                .expect("content-encoding should be ASCII")
                 .to_string()
         });
         sender

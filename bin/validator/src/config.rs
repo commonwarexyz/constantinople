@@ -46,7 +46,13 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-pub(crate) const fn default_page_cache_bytes() -> usize {
+// Sized so operation-log pages stay cached, or at least in Clock2Q+ ghost
+// history, until floor advancement reuses them.
+pub(crate) const fn default_state_page_cache_bytes() -> usize {
+    6 * 1024 * 1024 * 1024
+}
+
+pub(crate) const fn default_history_page_cache_bytes() -> usize {
     2 * 1024 * 1024 * 1024
 }
 
@@ -143,12 +149,13 @@ pub struct ValidatorConfig {
     #[serde(default = "default_max_pool_bytes")]
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
-    #[serde(default = "default_page_cache_bytes")]
+    #[serde(default = "default_state_page_cache_bytes")]
     pub state_page_cache_bytes: usize,
-    /// Capacity in bytes of the engine's non-state page cache (archives,
-    /// transaction history, journal).
-    #[serde(default = "default_page_cache_bytes")]
-    pub other_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's history page cache, shared by the
+    /// block, finalization, and marshal archives, transaction history, and
+    /// the simplex vote journal.
+    #[serde(default = "default_history_page_cache_bytes")]
+    pub history_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     pub public_key_cache_size: usize,
@@ -255,9 +262,10 @@ pub struct LoadedConfig {
     pub max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
     pub state_page_cache_bytes: usize,
-    /// Capacity in bytes of the engine's non-state page cache (archives,
-    /// transaction history, journal).
-    pub other_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's history page cache, shared by the
+    /// block, finalization, and marshal archives, transaction history, and
+    /// the simplex vote journal.
+    pub history_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     pub public_key_cache_size: usize,
     /// OTLP traces endpoint and sampling rate, when trace uploads are enabled.
@@ -404,7 +412,7 @@ fn decode_with_network(
         metrics_listen,
         max_propose_bytes: config.max_propose_bytes,
         state_page_cache_bytes: config.state_page_cache_bytes,
-        other_page_cache_bytes: config.other_page_cache_bytes,
+        history_page_cache_bytes: config.history_page_cache_bytes,
         max_pool_bytes: config.max_pool_bytes,
         public_key_cache_size: config.public_key_cache_size,
         otel,
@@ -563,9 +571,9 @@ pub fn load_deployer_config(hosts_path: &Path, config_path: &Path) -> LoadedConf
 mod tests {
     use super::{
         IndexerConfig, NamedBootstrapperEntry, StartupModeConfig, ValidatorConfig,
-        default_max_pool_bytes, default_max_propose_bytes, default_page_cache_bytes,
-        default_public_key_cache_size, default_upload_budget_bytes, default_upload_max_in_flight,
-        load_deployer_config, load_local_config,
+        default_history_page_cache_bytes, default_max_pool_bytes, default_max_propose_bytes,
+        default_public_key_cache_size, default_state_page_cache_bytes, default_upload_budget_bytes,
+        default_upload_max_in_flight, load_deployer_config, load_local_config,
     };
     use commonware_codec::Encode;
     use commonware_cryptography::{
@@ -716,8 +724,8 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
-                state_page_cache_bytes: default_page_cache_bytes(),
-                other_page_cache_bytes: default_page_cache_bytes(),
+                state_page_cache_bytes: default_state_page_cache_bytes(),
+                history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
@@ -752,8 +760,8 @@ mod tests {
                 http_port: 8080,
                 metrics_port: 9090,
                 max_propose_bytes: default_max_propose_bytes(),
-                state_page_cache_bytes: default_page_cache_bytes(),
-                other_page_cache_bytes: default_page_cache_bytes(),
+                state_page_cache_bytes: default_state_page_cache_bytes(),
+                history_page_cache_bytes: default_history_page_cache_bytes(),
                 max_pool_bytes: default_max_pool_bytes(),
                 public_key_cache_size: default_public_key_cache_size(),
                 traces: 0.0,
@@ -849,6 +857,20 @@ mod tests {
     }
 
     #[test]
+    fn omitted_cache_budgets_use_independent_defaults() {
+        let cluster = Cluster::new(2, 0);
+        let config = cluster.primary_config(0, StartupModeConfig::MarshalSync, Vec::new());
+        let mut value = serde_yaml::to_value(config).unwrap();
+        let mapping = value.as_mapping_mut().unwrap();
+        mapping.remove("state_page_cache_bytes");
+        mapping.remove("history_page_cache_bytes");
+
+        let config: ValidatorConfig = serde_yaml::from_value(value).unwrap();
+        assert_eq!(config.state_page_cache_bytes, 6 * 1024 * 1024 * 1024);
+        assert_eq!(config.history_page_cache_bytes, 2 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
     fn local_config_resolves_bootstrapper_peers() {
         let cluster = Cluster::new(2, 0);
         let self_key = &cluster.primary_keys[0];
@@ -863,6 +885,8 @@ mod tests {
         );
         config.max_propose_bytes = 1_234_567;
         config.max_pool_bytes = 9_876_543;
+        config.state_page_cache_bytes = 64 * 1024 * 1024;
+        config.history_page_cache_bytes = 32 * 1024 * 1024;
         fs::write(
             &config_path,
             serde_yaml::to_string(&config).expect("config should serialize"),
@@ -894,6 +918,8 @@ mod tests {
         assert_eq!(loaded.metrics_listen, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(loaded.max_propose_bytes, 1_234_567);
         assert_eq!(loaded.max_pool_bytes, 9_876_543);
+        assert_eq!(loaded.state_page_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(loaded.history_page_cache_bytes, 32 * 1024 * 1024);
         assert_eq!(loaded.decoded.listen_bind, "0.0.0.0:9000".parse().unwrap());
         assert_eq!(
             loaded.decoded.listen_advertise,

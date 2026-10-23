@@ -27,16 +27,13 @@ use commonware_consensus::{
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
 use constantinople_primitives::{BlockCfg, SignedTransaction, Transaction};
-use datafusion::{
-    arrow::{
-        array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array},
-        record_batch::RecordBatch,
-    },
-    prelude::SessionContext,
+use datafusion::arrow::{
+    array::{Array, BinaryArray, FixedSizeBinaryArray, UInt64Array},
+    record_batch::RecordBatch,
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient};
 use exoware_simplex::{Finalized, SimplexError, SimplexReader};
-use exoware_sql::with_read_session;
+use exoware_sql::SqlContext;
 
 type CertifiedFinalization<H, P, S> = Finalized<CertifiedHeader<H, P>, S, EngineCommitment<H, P>>;
 type FinalizationCfg<H, P, S> = <CertifiedFinalization<H, P, S> as Read>::Cfg;
@@ -109,7 +106,7 @@ pub struct IndexerClient {
     blocks: SimplexReader,
     targets: PrefixedStoreClient,
     sql_store: PrefixedStoreClient,
-    sql: SessionContext,
+    sql: SqlContext,
 }
 
 impl std::fmt::Debug for IndexerClient {
@@ -118,7 +115,7 @@ impl std::fmt::Debug for IndexerClient {
             .field("blocks", &self.blocks)
             .field("targets", &self.targets)
             .field("sql_store", &self.sql_store)
-            .field("sql", &"SessionContext")
+            .field("sql", &"SqlContext")
             .finish()
     }
 }
@@ -131,8 +128,8 @@ impl IndexerClient {
 
     /// Wrap existing [`StoreClient`]s for block and finalized index families.
     pub fn try_new(blocks: StoreClient, metadata: StoreClient) -> Result<Self, ReadError> {
-        let sql = SessionContext::new();
         let sql_store = sql_meta_client(&metadata).map_err(ClientError::from)?;
+        let sql = SqlContext::new(sql_store.clone());
         build_meta_schema(sql_store.clone())
             .map_err(ReadError::SqlSchema)?
             .register_all(&sql)?;
@@ -150,7 +147,7 @@ impl IndexerClient {
     }
 
     /// Borrow the SQL metadata context used for transaction lookups.
-    pub const fn sql(&self) -> &SessionContext {
+    pub const fn sql(&self) -> &SqlContext {
         &self.sql
     }
 
@@ -404,8 +401,7 @@ impl IndexerClient {
         let Some(target) = self.publication_target::<H>(height).await? else {
             return Ok(None);
         };
-        let sql = with_read_session(
-            &self.sql,
+        let sql = self.sql.with_read_session(
             self.sql_store
                 .create_session_with_sequence(target.store_sequence_number),
         );
@@ -495,7 +491,7 @@ fn column<'a, A: Array + 'static>(
 }
 
 async fn validate_target_block_digest(
-    sql: &SessionContext,
+    sql: &SqlContext,
     height: u64,
     target_digest: &[u8],
 ) -> Result<(), ReadError> {

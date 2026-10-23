@@ -41,8 +41,11 @@ use constantinople_engine::types::{EngineBlock, EngineFinalization};
 use constantinople_primitives::{Account, AccountKey, BlockCfg};
 use cpu_time::ThreadTime;
 use exoware_qmdb::{
-    AuthenticatedOperationRange, QmdbError, prepare_authenticated_range, stage_authenticated_range,
-    stage_watermark,
+    QmdbError,
+    adapter::upload::{
+        AuthenticatedOperationRange, prepare_authenticated_range, stage_authenticated_range,
+        stage_watermark,
+    },
 };
 use exoware_sdk::{ClientError, PrefixedStoreClient, StoreClient, StoreWriteBatch, keys::Key};
 use exoware_sql::{BatchWriter, KvSchema};
@@ -1369,6 +1372,7 @@ fn complete_publication<D: Digest>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespaces::STATE_PROOF_CHUNK_SIZE;
     use bytes::Bytes;
     use commonware_codec::Decode as _;
     use commonware_consensus::{
@@ -1393,9 +1397,9 @@ mod tests {
     use commonware_utils::{NZU16, non_empty_range};
     use constantinople_engine::{ThresholdScheme, types::EngineCommitment};
     use constantinople_primitives::{Block, Header, Sealable, SignedTransaction};
-    use exoware_qmdb::{KeylessClient, UnorderedClient};
+    use exoware_qmdb::adapter::{Keyless, Unordered};
     use rand::{SeedableRng, rngs::StdRng};
-    use std::sync::Mutex as StdMutex;
+    use std::{pin::pin, sync::Mutex as StdMutex};
     use tracing::{
         Id, Subscriber,
         field::{Field, Visit},
@@ -1690,7 +1694,7 @@ mod tests {
                 queued_range(&state, 1, 2),
                 queued_range(&transactions, 1, 2),
             );
-            let block = Arc::new(upload.block().clone());
+            let block = upload.block().clone();
             let finalization = upload.finalization().cloned();
             publisher
                 .enqueue_queued_finalized(upload)
@@ -1778,7 +1782,7 @@ mod tests {
             first.persisted().await.unwrap();
             let second = publisher.enqueue_queued_finalized(upload(2)).await.unwrap();
             {
-                let mut enqueue = std::pin::pin!(publisher.enqueue_queued_finalized(upload(3)));
+                let mut enqueue = pin!(publisher.enqueue_queued_finalized(upload(3)));
                 assert!(futures::poll!(enqueue.as_mut()).is_pending());
             }
 
@@ -2552,34 +2556,42 @@ mod tests {
             second.published().await.unwrap();
             third.published().await.unwrap();
 
-            let state = UnorderedClient::<
+            let state = Unordered::<
                 QmdbFamily,
                 Sha256,
                 AccountKey,
                 AccountValue,
+                STATE_PROOF_CHUNK_SIZE,
                 StateEncoding,
             >::new(state_qmdb_client(&physical).unwrap(), ());
-            let transactions = KeylessClient::<
-                QmdbFamily,
-                Sha256,
-                Sha256Digest,
-                TransactionEncoding<Sha256>,
-            >::new(transactions_qmdb_client(&physical).unwrap(), ());
+            let transactions =
+                Keyless::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
+                    transactions_qmdb_client(&physical).unwrap(),
+                    (),
+                );
             let expected = upload(3);
-            let state_proof =
-                Box::pin(state.operation_range_checkpoint(Location::new(9), Location::new(9), 1))
-                    .await
-                    .unwrap();
+            let state_proof = Box::pin(state.operation_range_checkpoint(
+                Location::new(9),
+                Location::new(9),
+                1,
+                None,
+            ))
+            .await
+            .unwrap();
             let transaction_proof = Box::pin(transactions.operation_range_checkpoint(
                 Location::new(9),
                 Location::new(9),
                 1,
+                None,
             ))
             .await
             .unwrap();
-            assert_eq!(state_proof.root, expected.block.header.state_root);
             assert_eq!(
-                transaction_proof.root,
+                state_proof.canonical_root::<Sha256>(),
+                expected.block.header.state_root
+            );
+            assert_eq!(
+                transaction_proof.canonical_root::<Sha256>(),
                 expected.block.header.transactions_root
             );
             assert!(state_proof.verify::<Sha256>());
@@ -2610,6 +2622,7 @@ mod tests {
                 Location::new(10),
                 Location::new(10),
                 1,
+                None,
             ))
             .await
             .unwrap();
@@ -3089,19 +3102,19 @@ mod tests {
 
             assert_eq!(target(&target_client, 1).await, Some(first_digest));
             assert_eq!(target(&target_client, 2).await, Some(second_digest));
-            let state = UnorderedClient::<
+            let state = Unordered::<
                 QmdbFamily,
                 Sha256,
                 AccountKey,
                 AccountValue,
+                STATE_PROOF_CHUNK_SIZE,
                 StateEncoding,
             >::new(state_client, ());
-            let transactions = KeylessClient::<
-                QmdbFamily,
-                Sha256,
-                Sha256Digest,
-                TransactionEncoding<Sha256>,
-            >::new(transaction_client, ());
+            let transactions =
+                Keyless::<QmdbFamily, Sha256, Sha256Digest, TransactionEncoding<Sha256>>::new(
+                    transaction_client,
+                    (),
+                );
             assert_eq!(
                 state
                     .latest_published_watermark()
@@ -3132,10 +3145,11 @@ mod tests {
                     block.header.transactions_root,
                 );
                 for location in start..block.header.state_range.end() {
-                    let proof = Box::pin(state.operation_range_proof(
+                    let proof = Box::pin(state.operation_range(
                         state_tip,
                         Location::new(location),
                         1,
+                        None,
                     ))
                     .await
                     .expect("state operation proof");
@@ -3148,10 +3162,11 @@ mod tests {
                     );
                 }
                 for location in start..block.header.transactions_range.end() {
-                    let proof = Box::pin(transactions.operation_range_proof(
+                    let proof = Box::pin(transactions.operation_range(
                         transaction_tip,
                         Location::new(location),
                         1,
+                        None,
                     ))
                     .await
                     .expect("transaction operation proof");
@@ -3172,10 +3187,11 @@ mod tests {
                         .expect("test transaction decodes")
                         .message_digest();
                     let offset = u64::try_from(offset).expect("transaction index fits u64");
-                    let proof = Box::pin(transactions.operation_range_proof(
+                    let proof = Box::pin(transactions.operation_range(
                         transaction_tip,
                         Location::new(append_start + offset),
                         1,
+                        None,
                     ))
                     .await
                     .expect("transaction append proof");

@@ -11,7 +11,7 @@ use commonware_cryptography::{
     ChaCha20Poly1305,
     bls12381::primitives::variant::MinSig,
     certificate::ConstantProvider,
-    ed25519::{self, Batch, PublicKey},
+    ed25519::{self, PublicKey},
     sha256::Sha256,
 };
 use commonware_formatting::hex;
@@ -177,7 +177,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
         max_propose_bytes,
         max_pool_bytes,
         state_page_cache_bytes,
-        other_page_cache_bytes,
+        history_page_cache_bytes,
         public_key_cache_size,
         otel,
         json_logs,
@@ -402,7 +402,6 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
             RoundRobin<Sha256>,
             Rayon,
             _,
-            Batch,
             crate::relayer::Observer,
         >::new(
             context.child("engine"),
@@ -426,7 +425,7 @@ fn run_with_config(config: LoadedConfig, config_path: PathBuf) {
                 block_codec: Default::default(),
                 prunable_items_per_section: PRUNABLE_ITEMS_PER_SECTION,
                 state_page_cache_bytes,
-                other_page_cache_bytes,
+                history_page_cache_bytes,
                 probe: Some(probe_mailbox.clone()),
                 simplex_observer: relayer_observer,
                 finalized_hook,
@@ -506,9 +505,8 @@ const fn production_sync_config() -> SyncEngineConfig {
     SyncEngineConfig {
         fetch_batch_size: NZU64!(1024),
         apply_batch_size: STATE_SYNC_APPLY_BATCH_SIZE,
-        max_outstanding_requests: 8,
+        max_outstanding_requests: NZUsize!(8),
         update_channel_size: NZUsize!(256),
-        max_retained_roots: 32,
     }
 }
 

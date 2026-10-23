@@ -3,6 +3,7 @@ import { bytesEqual } from './codec.ts';
 import {
     errorMessage,
     isConsistencyNotReadyError,
+    isRetryableServiceError,
     NETWORK_RECONNECT_DELAY_MS,
     waitForRetry,
 } from './proofRetry.ts';
@@ -99,6 +100,7 @@ export async function* subscribeBlocksFromTargets(
                             continue;
                         }
                         options.onError?.(errorMessage(error));
+                        if (!isRetryableServiceError(error)) throw error;
                         if (!(await waitForRetry(reconnectDelayMs, signal))) return;
                         options.onReconnect?.();
                         continue;
@@ -146,6 +148,7 @@ async function readBlockMetadata(
         } catch (error) {
             if (signal.aborted) return;
             onError?.(errorMessage(error));
+            if (!isRetryableServiceError(error)) return;
 
             // The cache is optional. Resume live after a lost cursor and let
             // sequence-gated point reads fill any missed rows.

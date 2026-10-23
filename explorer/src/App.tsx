@@ -59,7 +59,6 @@ import {
     isMissingAccountProofError,
     isRetryableAccountProofError,
     isRetryableProofError,
-    isConsistencyNotReadyError,
     retryAccountWork,
 } from './proofRetry';
 import {
@@ -523,10 +522,12 @@ export default function App() {
                 signal: controller.signal,
             }),
             controller.signal,
-            isConsistencyNotReadyError,
+            isRetryableAccountProofError,
+            { onRetry: (error) => setAccountActivityError(accountRetryReason(error) ?? errorMessage(error)) },
         )
             .then((page) => {
                 if (controller.signal.aborted) return;
+                setAccountActivityError('');
                 setAccountNextCursor(page.nextCursor);
                 setAccountTransactions(page.rows.map((row) => ({
                     row,

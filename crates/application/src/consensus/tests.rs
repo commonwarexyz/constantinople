@@ -45,7 +45,6 @@ type TestApp = Application<
     threshold::Scheme<ed25519::PublicKey, MinSig>,
     ed25519::PublicKey,
     StaticTransactionSource<sha256::Digest, ed25519::PublicKey, sha256::Sha256>,
-    (),
     Sequential,
 >;
 type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;
@@ -854,7 +853,6 @@ fn build_timeout_bounds_refill_rounds() {
             threshold::Scheme<ed25519::PublicKey, MinSig>,
             ed25519::PublicKey,
             DelayedSource,
-            (),
             Sequential,
         > = Application::new(
             context.child("deadline_app"),

@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { getEventListeners } from 'node:events';
 import test from 'node:test';
+import { BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
+import { Code, ConnectError } from '@connectrpc/connect';
 import type { DecodedQueryResult, Table } from '@exowarexyz/sql';
 
 import {
@@ -109,7 +111,7 @@ test('block metadata retries backend errors until cancelled', async () => {
     const errors: string[] = [];
     let reconnects = 0;
     const sql = sqlClient(async () => {
-        throw new Error('backend unavailable');
+        throw new ConnectError('backend unavailable', Code.Unavailable);
     });
     const stream = subscribeBlocksFromTargets(sql, targets(target), {
         signal: controller.signal,
@@ -124,9 +126,33 @@ test('block metadata retries backend errors until cancelled', async () => {
     });
 
     assert.deepEqual(await stream.next(), { done: true, value: undefined });
-    assert.deepEqual(errors, ['backend unavailable', 'backend unavailable']);
+    assert.deepEqual(errors, ['[unavailable] backend unavailable', '[unavailable] backend unavailable']);
     assert.equal(reconnects, 2);
     assert.equal(getEventListeners(controller.signal, 'abort').length, 0);
+});
+
+test('block point reads retry server and proxy failures', async (context) => {
+    for (const failure of [
+        new ConnectError('failed to read response body: connection reset', Code.Internal),
+        new ConnectError('HTTP 520', Code.Unknown),
+    ]) {
+        await context.test(failure.message, async () => {
+            const target = proofTarget(7n, 23n, 7);
+            let queries = 0;
+            const sql = sqlClient(async () => {
+                if (++queries === 1) throw failure;
+                return queryResult(23n, 7n, target.blockDigest, 1n);
+            });
+            const stream = subscribeBlocksFromTargets(sql, targets(target), { reconnectDelayMs: 0 });
+
+            try {
+                assert.equal((await stream.next()).value?.height, 7n);
+                assert.equal(queries, 2);
+            } finally {
+                await stream.return();
+            }
+        });
+    }
 });
 
 test('a consistency lag on the block point read is retried as catch-up', async () => {
@@ -269,7 +295,19 @@ test('metadata subscription resumes live after a lost cursor while point reads c
     const cursors: Array<bigint | undefined> = [];
     source.client.subscribe = async function* (request, options) {
         cursors.push(request.sinceSequenceNumber);
-        if (cursors.length === 1) throw new Error('cursor evicted');
+        if (cursors.length === 1) {
+            const error = new ConnectError('cursor evicted', Code.OutOfRange);
+            error.details.push({
+                type: 'google.rpc.ErrorInfo',
+                value: new BinaryWriter()
+                    .tag(1, WireType.LengthDelimited)
+                    .string('BATCH_EVICTED')
+                    .tag(2, WireType.LengthDelimited)
+                    .string('log.stream')
+                    .finish(),
+            });
+            throw error;
+        }
         yield* subscribe(request, options);
     };
     const errors: string[] = [];
@@ -281,7 +319,7 @@ test('metadata subscription resumes live after a lost cursor while point reads c
     assert.equal((await stream.next()).value?.height, 7n);
     assert.equal((await stream.next()).value?.height, 8n);
     assert.deepEqual(cursors, [23n, undefined]);
-    assert.deepEqual(errors, ['cursor evicted']);
+    assert.deepEqual(errors, ['[out_of_range] cursor evicted']);
     await stream.return();
     assert.equal(source.stopped(), true);
 });
@@ -410,7 +448,7 @@ test('a SQL outage across a long target backlog resumes at the latest target', a
     const proof = shared.subscribe();
     let recovered = false;
     const blocks = subscribeBlocksFromTargets(sqlClient(async (query, floor) => {
-        if (!recovered) throw new Error('SQL unavailable');
+        if (!recovered) throw new ConnectError('SQL unavailable', Code.Unavailable);
         const height = BigInt(/height = (\d+)/.exec(query)![1]!);
         return queryResult(floor!, height, digest(1), 0n);
     }), shared.subscribe(), { signal: controller.signal, reconnectDelayMs: 0 });
@@ -445,3 +483,85 @@ function untilAborted(signal?: AbortSignal): Promise<never> {
         else signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
 }
+
+test('permanent block query failures are terminal', async (context) => {
+    for (const failure of [
+        new ConnectError('no field named tx_count', Code.InvalidArgument),
+        new Error('SQL response is missing its Arrow schema'),
+    ]) {
+        await context.test(failure.message, async () => {
+            const controller = new AbortController();
+            let attempts = 0;
+            let errors = 0;
+            const sql = sqlClient(async () => {
+                attempts++;
+                throw failure;
+            });
+            const stream = subscribeBlocksFromTargets(sql, targets(proofTarget(7n, 23n, 7)), {
+                signal: controller.signal,
+                reconnectDelayMs: 0,
+                onError() {
+                    if (++errors === 2) controller.abort();
+                },
+            });
+
+            try {
+                await assert.rejects(stream.next(), { message: failure.message });
+                assert.equal(attempts, 1);
+                assert.equal(errors, 1);
+            } finally {
+                controller.abort();
+                await stream.return();
+            }
+        });
+    }
+});
+
+test('a permanently failed metadata stream stops while point reads keep delivering', async (context) => {
+    context.mock.timers.enable({ apis: ['setTimeout'] });
+    const controller = new AbortController();
+    const first = proofTarget(7n, 23n, 7);
+    const second = proofTarget(8n, 24n, 8);
+    let failed!: () => void;
+    const failure = new Promise<void>((resolve) => { failed = resolve; });
+    let subscriptions = 0;
+    let queries = 0;
+    const errors: string[] = [];
+    const sql: BlockMetadataSqlClient = {
+        async query() {
+            queries++;
+            const target = queries === 1 ? first : second;
+            return queryResult(target.sequenceNumber, target.height, target.blockDigest, 1n);
+        },
+        async *subscribe() {
+            subscriptions++;
+            throw new ConnectError('table subscription is unsupported', Code.Unimplemented);
+        },
+    };
+    const stream = subscribeBlocksFromTargets(sql, (async function* () {
+        yield first;
+        yield second;
+    })(), {
+        signal: controller.signal,
+        reconnectDelayMs: 0,
+        onError(message) {
+            errors.push(message);
+            failed();
+        },
+    });
+
+    try {
+        const next = stream.next();
+        await failure;
+        context.mock.timers.tick(0);
+        await Promise.resolve();
+        assert.equal((await next).value?.height, 7n);
+        assert.equal((await stream.next()).value?.height, 8n);
+        assert.equal(subscriptions, 1);
+        assert.equal(queries, 2);
+        assert.deepEqual(errors, ['[unimplemented] table subscription is unsupported']);
+    } finally {
+        controller.abort();
+        await stream.return();
+    }
+});

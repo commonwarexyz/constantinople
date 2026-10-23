@@ -35,7 +35,6 @@ type TestApp = EngineApplication<
     ed25519::PublicKey,
     MinSig,
     StaticTransactionSource<TestCommitment, ed25519::PublicKey, sha256::Sha256>,
-    (),
     Sequential,
 >;
 type TestDbs = Databases<deterministic::Context, sha256::Sha256, EightCap, Sequential>;

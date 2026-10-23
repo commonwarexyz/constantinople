@@ -4,6 +4,7 @@ use super::{
     Application, FinalizedArtifacts, FinalizedRange, db::Databases, genesis_block_with_parent,
     history::header_range_to_target,
 };
+use commonware_consensus::marshal::ancestry::Ancestry;
 use commonware_cryptography::{Digest, Hasher, PublicKey, certificate::Scheme};
 use commonware_glue::stateful::{
     Application as CApplication, Input as CInput, Proposed, db::DatabaseSet,
@@ -14,11 +15,11 @@ use commonware_storage::{mmr, qmdb::sync::Target as AnyTarget, translator::Eight
 use commonware_utils::non_empty_range;
 use constantinople_mempool::TransactionSource;
 use constantinople_primitives::SealedBlock;
-use futures::{Stream, StreamExt};
+use futures::{FutureExt, StreamExt};
 use rand::{CryptoRng, Rng};
 use std::sync::Arc;
 
-impl<E, H, C, S, P, I, B, St> CApplication<E> for Application<E, H, C, S, P, I, B, St>
+impl<E, H, C, S, P, I, St> CApplication<E> for Application<E, H, C, S, P, I, St>
 where
     E: Rng + Spawner + BufferPooler + Storage + Metrics + Clock + CryptoRng,
     H: Hasher,
@@ -26,7 +27,6 @@ where
     S: Scheme<PublicKey = P>,
     P: PublicKey,
     I: TransactionSource<C, P, H> + Clone + Sync,
-    B: Send + Sync + 'static,
     St: Strategy,
 {
     type SigningScheme = S;
@@ -70,13 +70,13 @@ where
     async fn propose(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
+        ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
         input: CInput<Self::Input, Self::Provider>,
     ) -> Option<Proposed<Self, E>> {
         let mut input = input.provider;
         let mut ancestry = Box::pin(ancestry);
-        let parent = ancestry.next().await?;
+        let parent = Arc::from(ancestry.next().await?);
         let result = self
             .propose_child(context, parent, batches, &mut input)
             .await;
@@ -94,17 +94,22 @@ where
     async fn verify(
         &mut self,
         context: (E, Self::Context),
-        ancestry: impl Stream<Item = Arc<Self::Block>> + Send,
+        ancestry: impl Ancestry<Self::Block>,
         batches: <Self::Databases as DatabaseSet<E>>::Unmerkleized,
     ) -> Option<<Self::Databases as DatabaseSet<E>>::Merkleized> {
         let mut ancestry = Box::pin(ancestry);
-        let block = ancestry.next().await?;
+        let block = Arc::from(ancestry.next().await?);
 
         // The parent fetch is passed as a future so verify_child can start
         // signature verification (which needs only the block body) while the
         // parent is still in flight.
         let result = self
-            .verify_child(context, block, ancestry.next(), batches)
+            .verify_child(
+                context,
+                block,
+                ancestry.next().map(|parent| parent.map(Arc::from)),
+                batches,
+            )
             .await;
 
         // verify_child's offloaded tasks release the body and parent (early

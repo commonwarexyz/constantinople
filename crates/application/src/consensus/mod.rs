@@ -96,7 +96,7 @@ const MALFORMED_TRANSACTION: &str = "malformed transaction";
 const STATIC_INVALID_TRANSACTION: &str = "statically invalid transaction";
 
 /// Core Constantinople application.
-pub struct Application<E, H, C, S, P, I, B, St>
+pub struct Application<E, H, C, S, P, I, St>
 where
     H: Hasher,
     E: BufferPooler + Storage + Clock + Metrics,
@@ -112,10 +112,10 @@ where
     genesis_state_target: StateSyncTarget<H::Digest>,
     genesis_transactions_target: TransactionHistoryTarget<H::Digest>,
     proposed_transactions: Counter,
-    _marker: PhantomData<(E, C, S, I, B)>,
+    _marker: PhantomData<(E, C, S, I)>,
 }
 
-impl<E, H, C, S, P, I, B, St> Clone for Application<E, H, C, S, P, I, B, St>
+impl<E, H, C, S, P, I, St> Clone for Application<E, H, C, S, P, I, St>
 where
     H: Hasher,
     E: BufferPooler + Storage + Clock + Metrics,
@@ -139,7 +139,7 @@ where
     }
 }
 
-impl<E, H, C, S, P, I, B, St> Application<E, H, C, S, P, I, B, St>
+impl<E, H, C, S, P, I, St> Application<E, H, C, S, P, I, St>
 where
     H: Hasher,
     E: BufferPooler + Storage + Clock + Metrics,

@@ -18,7 +18,7 @@ use constantinople_engine::types::{EngineBlock, EngineCommitment, EngineHeader};
 use exoware_sdk::{StoreBatchUpload, StoreWriteBatch};
 use exoware_simplex::{Finalized, PreparedUpload, SimplexWriter};
 use futures::{StreamExt, stream::FuturesUnordered};
-use std::{sync::Arc, time::Instant};
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tracing::{Instrument as _, Span, debug, info_span, instrument::WithSubscriber as _};
 
@@ -166,7 +166,7 @@ where
     /// Queue a block, and its finalization when present, for one durable Store commit.
     pub async fn publish_finalized_block(
         &self,
-        block: Arc<EngineBlock<H, P>>,
+        block: EngineBlock<H, P>,
         finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
     ) -> Result<FinalizedBlockUploadCompletion, CertificateUploaderStopped>
     where
@@ -224,7 +224,7 @@ where
     P: PublicKey,
     S: Scheme,
 {
-    block: Arc<EngineBlock<H, P>>,
+    block: EngineBlock<H, P>,
     finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
     completion: oneshot::Sender<()>,
     queued_at: Instant,
@@ -239,7 +239,7 @@ where
     S: Scheme,
 {
     fn new(
-        block: Arc<EngineBlock<H, P>>,
+        block: EngineBlock<H, P>,
         finalization: Option<simplex::types::Finalization<S, EngineCommitment<H, P>>>,
         completion: oneshot::Sender<()>,
     ) -> Self {
@@ -926,7 +926,7 @@ mod tests {
         });
     }
 
-    fn test_block(height: u64) -> Arc<EngineBlock<Sha256, ed25519::PublicKey>> {
+    fn test_block(height: u64) -> EngineBlock<Sha256, ed25519::PublicKey> {
         let leader = ed25519::PrivateKey::from_seed(1).public_key();
         let signer = ed25519::PrivateKey::from_seed(2);
         let sender = TransactionPublicKey::ed25519(signer.public_key());
@@ -952,7 +952,7 @@ mod tests {
             transactions_range: non_empty_range!(0, 2),
         };
         let block = Block::new(header, vec![transaction]).seal(&mut Sha256::default());
-        Arc::new(EngineBlock::from(block))
+        EngineBlock::from(block)
     }
 
     fn test_finalization(

@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn upload_budget_blocks_until_reservations_drop() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
             let budget = UploadBudget::new(
                 &context.child("upload_budget"),
                 2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES,
@@ -190,7 +190,7 @@ mod tests {
 
     #[test]
     fn oversized_upload_reserves_the_entire_budget() {
-        commonware_runtime::tokio::Runner::default().start(|context| async move {
+        commonware_runtime::deterministic::Runner::default().start(|context| async move {
             let configured_bytes = 2 * FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES;
             let budget = UploadBudget::new(&context.child("upload_budget"), configured_bytes);
             let regular_charge = budget.charge(FINALIZED_UPLOAD_BUDGET_QUANTUM_BYTES / 8);

@@ -143,15 +143,14 @@ pub(crate) struct GenerateArgs {
     /// Maximum mempool size in bytes.
     #[arg(long = "max-pool-bytes", default_value_t = default_max_pool_bytes())]
     max_pool_bytes: usize,
-    /// Capacity in bytes of each validator's state QMDB page cache. Must
-    /// hold the state journal's working set: 512 MiB thrashed once the live
-    /// account set passed ~2M and build/verify doubled on cache misses.
-    #[arg(long = "state-page-cache-bytes", default_value_t = default_page_cache_bytes())]
+    /// Capacity in bytes of each validator's state QMDB page cache.
+    #[arg(long = "state-page-cache-bytes", default_value_t = default_state_page_cache_bytes())]
     state_page_cache_bytes: usize,
-    /// Capacity in bytes of each validator's non-state page cache
-    /// (archives, transaction history, journal).
-    #[arg(long = "other-page-cache-bytes", default_value_t = default_page_cache_bytes())]
-    other_page_cache_bytes: usize,
+    /// Capacity in bytes of each validator's history page cache, shared by
+    /// the block, finalization, and marshal archives, transaction history,
+    /// and the simplex vote journal.
+    #[arg(long = "history-page-cache-bytes", default_value_t = default_history_page_cache_bytes())]
+    history_page_cache_bytes: usize,
     /// Startup sync mode for the generated validators.
     #[arg(long, value_enum, default_value_t = StartupModeConfig::MarshalSync)]
     startup: StartupModeConfig,
@@ -489,9 +488,10 @@ pub(crate) struct ValidatorConfig {
     max_pool_bytes: usize,
     /// Capacity in bytes of the engine's state QMDB page cache.
     state_page_cache_bytes: usize,
-    /// Capacity in bytes of the engine's non-state page cache (archives,
-    /// transaction history, journal).
-    other_page_cache_bytes: usize,
+    /// Capacity in bytes of the engine's history page cache, shared by the
+    /// block, finalization, and marshal archives, transaction history, and
+    /// the simplex vote journal.
+    history_page_cache_bytes: usize,
     /// Capacity of the decompressed public key cache.
     #[serde(default = "default_public_key_cache_size")]
     public_key_cache_size: usize,
@@ -876,7 +876,13 @@ pub(crate) const fn default_max_pool_bytes() -> usize {
     64 * 1024 * 1024
 }
 
-pub(crate) const fn default_page_cache_bytes() -> usize {
+// Sized so operation-log pages stay cached, or at least in Clock2Q+ ghost
+// history, until floor advancement reuses them.
+pub(crate) const fn default_state_page_cache_bytes() -> usize {
+    6 * 1024 * 1024 * 1024
+}
+
+pub(crate) const fn default_history_page_cache_bytes() -> usize {
     2 * 1024 * 1024 * 1024
 }
 
@@ -950,6 +956,33 @@ mod tests {
             "--dashboard",
             "dashboard.json",
         ]
+    }
+
+    #[test]
+    fn cache_budgets_default_independently_and_allow_overrides() {
+        let cli = parse_cli(remote_cli_args()).unwrap();
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.state_page_cache_bytes, 6 * 1024 * 1024 * 1024);
+        assert_eq!(generate.history_page_cache_bytes, 2 * 1024 * 1024 * 1024);
+
+        let mut args = remote_cli_args();
+        args.splice(
+            2..2,
+            [
+                "--state-page-cache-bytes",
+                "67108864",
+                "--history-page-cache-bytes",
+                "33554432",
+            ],
+        );
+        let cli = parse_cli(args).unwrap();
+        let Command::Generate(generate) = cli.command else {
+            panic!("expected generate command");
+        };
+        assert_eq!(generate.state_page_cache_bytes, 64 * 1024 * 1024);
+        assert_eq!(generate.history_page_cache_bytes, 32 * 1024 * 1024);
     }
 
     #[test]

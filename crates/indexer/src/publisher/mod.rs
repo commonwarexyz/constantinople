@@ -159,7 +159,8 @@ impl StoreCommitMetrics {
     }
 }
 
-// Observe cancelled attempts too so the retry deadline cannot hide stalled requests.
+// Observe attempts dropped mid-flight, such as on task abort or shutdown, so
+// their elapsed time still reaches the histogram.
 struct PutAttemptTimer {
     histogram: raw::Histogram,
     start: Instant,
@@ -371,9 +372,6 @@ fn store_error_label(error: &ClientError) -> &'static str {
     }
 
     match error {
-        ClientError::Http(error) if error.is_connect() => "http_connect",
-        ClientError::Http(error) if error.is_timeout() => "http_timeout",
-        ClientError::Http(error) if error.is_request() => "http_request",
         ClientError::Http(_) => "http",
         ClientError::Rpc(error) => error.code.as_str(),
         ClientError::Prefix(_) => "prefix",
@@ -388,7 +386,6 @@ fn is_retryable_store_error(error: &ClientError) -> bool {
     }
 
     match error {
-        ClientError::Http(error) => error.is_connect() || error.is_timeout() || error.is_request(),
         ClientError::Rpc(_) => matches!(
             error.rpc_code(),
             Some(
@@ -400,7 +397,8 @@ fn is_retryable_store_error(error: &ClientError) -> bool {
                     | ErrorCode::Unknown
             )
         ),
-        ClientError::Prefix(_)
+        ClientError::Http(_)
+        | ClientError::Prefix(_)
         | ClientError::InvalidKeyLength { .. }
         | ClientError::WireFormat(_) => false,
     }
@@ -420,19 +418,19 @@ mod tests {
     use exoware_sdk::{ConnectError, Key};
     use tokio::time::timeout;
 
-    fn put_error_response(code: &str, message: &str) -> axum::response::Response {
+    fn put_error_response(error: ConnectError) -> axum::response::Response {
         use axum::{http::header::CONTENT_TYPE, response::IntoResponse as _};
 
-        let error =
-            format!(r#"{{"error":{{"code":"{code}","message":"{message}"}}}}"#).into_bytes();
-        let mut body = vec![2];
-        body.extend_from_slice(&(error.len() as u32).to_be_bytes());
-        body.extend_from_slice(&error);
-        ([(CONTENT_TYPE, "application/connect+proto")], body).into_response()
+        (
+            error.http_status(),
+            [(CONTENT_TYPE, "application/json")],
+            error.to_json(),
+        )
+            .into_response()
     }
 
     #[test]
-    fn store_commit_replays_compressed_frames_as_one_sequence() {
+    fn store_commit_replays_compressed_put_as_one_sequence() {
         use axum::{
             Router,
             body::{Body, to_bytes},
@@ -441,9 +439,11 @@ mod tests {
             middleware::{Next, from_fn},
         };
         use bytes::Bytes;
-        use exoware_sdk::{PrefixedStoreClient, limits::PUT_CHUNK_TARGET_BYTES};
+        use exoware_sdk::PrefixedStoreClient;
         use exoware_simulator::{AppState, Log as _, RocksStore, Sequence as _, connect_stack};
         use std::sync::{Arc, Mutex};
+
+        const VALUE_LEN: usize = 64 * 1024;
 
         commonware_runtime::tokio::Runner::default().start(|context| async move {
             let metrics = StoreCommitMetrics::new(&context);
@@ -460,13 +460,10 @@ mod tests {
                         let engine = observed_engine.clone();
                         async move {
                             assert_eq!(request.uri().path(), "/log.ingest.v1.Service/Put");
-                            assert_eq!(
-                                request.headers()[CONTENT_TYPE],
-                                "application/connect+proto"
-                            );
+                            assert_eq!(request.headers()[CONTENT_TYPE], "application/proto");
                             assert_eq!(request.headers()[AUTHORIZATION], "Bearer write-key");
-                            assert_eq!(request.headers()["connect-content-encoding"], "zstd");
-                            assert!(!request.headers().contains_key(CONTENT_ENCODING));
+                            assert_eq!(request.headers()[CONTENT_ENCODING], "zstd");
+                            assert!(!request.headers().contains_key("connect-content-encoding"));
 
                             let (parts, body) = request.into_parts();
                             let body = to_bytes(body, 8 * 1024 * 1024).await.unwrap();
@@ -477,7 +474,7 @@ mod tests {
                             };
                             if attempt <= failures {
                                 assert_eq!(engine.current_sequence(), 0);
-                                return put_error_response("unavailable", "retry");
+                                return put_error_response(ConnectError::unavailable("retry"));
                             }
                             next.run(Request::from_parts(parts, Body::from(body))).await
                         }
@@ -489,13 +486,13 @@ mod tests {
                 let target = PrefixedStoreClient::empty(client.clone());
                 let mut batch = StoreWriteBatch::new();
 
-                // Each row nearly fills the SDK message target, requiring three frames.
+                // Repetitive values exceed the client's compression threshold and compress well.
                 for marker in 1..=3 {
                     batch
                         .push(
                             &target,
                             &Key::from(vec![marker; 8]),
-                            vec![marker; PUT_CHUNK_TARGET_BYTES - 32],
+                            vec![marker; VALUE_LEN],
                         )
                         .unwrap();
                 }
@@ -519,23 +516,13 @@ mod tests {
                 assert_eq!(entries, batch.entries());
                 assert!(engine.get_batch(sequence + 1).await.unwrap().is_none());
 
+                // Every attempt resends one identical zstd-compressed PutRequest.
                 let requests = requests.lock().unwrap();
                 assert_eq!(requests.len(), failures + 1);
                 for request in requests.iter() {
                     assert_eq!(request, &requests[0]);
-                    let mut remaining = request.as_ref();
-                    let mut frames = 0;
-                    while !remaining.is_empty() {
-                        assert!(remaining.len() >= 5);
-                        assert_eq!(remaining[0], 1);
-                        let length =
-                            u32::from_be_bytes(remaining[1..5].try_into().unwrap()) as usize;
-                        assert!(length >= 4 && remaining.len() >= 5 + length);
-                        assert_eq!(&remaining[5..9], b"\x28\xb5\x2f\xfd");
-                        remaining = &remaining[5 + length..];
-                        frames += 1;
-                    }
-                    assert_eq!(frames, 3);
+                    assert!(request.starts_with(b"\x28\xb5\x2f\xfd"));
+                    assert!(request.len() < batch.encoded_len());
                 }
                 server.abort();
             }
@@ -630,9 +617,9 @@ mod tests {
                 async move {
                     sleep(Duration::from_millis(10)).await;
                     if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-                        put_error_response("unavailable", "retry")
+                        put_error_response(ConnectError::unavailable("retry"))
                     } else {
-                        put_error_response("invalid_argument", "reject")
+                        put_error_response(ConnectError::invalid_argument("reject"))
                     }
                 }
             });

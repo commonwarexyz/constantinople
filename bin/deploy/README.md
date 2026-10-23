@@ -18,6 +18,20 @@ receiving valid peer blocks. Network messages remain capped at 32 MiB.
 `--spammer-accounts`, `--spammer-submitters`, and `--max-pool-bytes`.
 Run `./deploy.sh --help` for defaults.
 
+Each node runs two page caches. The state cache defaults to 6 GiB and holds the
+account-state journals. The history cache defaults to 2 GiB and is shared by the
+finalized block, finalization, and marshal archives, the transaction history
+witness journal, and the simplex vote journal. This applies to validators and to
+the indexer and relayer secondaries, which run the validator binary. Both caches
+are allocated and zeroed at startup, so each node commits the full 8 GiB before
+serving traffic. Size local clusters with that in mind. The larger state cache
+gives operation-log pages more room to remain cached until floor advancement
+reuses them with the standard Clock2Q+ policy. Keeping history apart from state
+keeps backfill and replay scans from evicting the state working set.
+Use the generator's `--state-page-cache-bytes` and `--history-page-cache-bytes`
+options to override these budgets, including for local clusters. Existing YAML
+configs with explicit cache budgets retain those values.
+
 `--worker-threads` and `--rayon-threads` set each node's async workers and engine
 Rayon pool. Use `--indexer-worker-threads` and `--indexer-rayon-threads` to override
 those counts for the indexer secondary in either deployment mode.

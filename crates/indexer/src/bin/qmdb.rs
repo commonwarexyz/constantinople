@@ -11,10 +11,10 @@ use commonware_storage::{merkle::mmr, qmdb::any::value::FixedEncoding};
 use commonware_utils::sequence::FixedBytes;
 use constantinople_indexer::{
     adapter::{self, BoxError, Profile},
-    namespaces::{state_qmdb_client, transactions_qmdb_client},
+    namespaces::{STATE_PROOF_CHUNK_SIZE, state_qmdb_client, transactions_qmdb_client},
 };
 use constantinople_primitives::{Account, AccountKey};
-use exoware_qmdb::{keyless_operation_log_connect_stack, unordered_operation_log_connect_stack};
+use exoware_qmdb::service::server::{keyless_operation_log_stack, unordered_operation_log_stack};
 use exoware_sdk::StoreClient;
 
 #[global_allocator]
@@ -33,17 +33,18 @@ fn build_routes(client: &StoreClient) -> Result<Router, BoxError> {
     Ok(Router::new()
         .nest_service(
             "/state",
-            unordered_operation_log_connect_stack::<
+            unordered_operation_log_stack::<
                 mmr::Family,
                 Sha256,
                 AccountKey,
                 AccountValue,
+                STATE_PROOF_CHUNK_SIZE,
                 FixedEncoding<AccountValue>,
             >(state_qmdb_client(client)?, ()),
         )
         .nest_service(
             "/transactions",
-            keyless_operation_log_connect_stack::<
+            keyless_operation_log_stack::<
                 mmr::Family,
                 Sha256,
                 TransactionValue,

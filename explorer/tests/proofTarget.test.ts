@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test, { type TestContext } from 'node:test';
 import { BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import { Code, ConnectError } from '@connectrpc/connect';
-import { Client, HttpError, TraversalMode } from '@exowarexyz/sdk';
+import { Client, HttpError, StoreKeyPrefix, TraversalMode } from '@exowarexyz/sdk';
 import { getEventListeners } from 'node:events';
 
 import {
@@ -18,6 +18,96 @@ function heightKey(height: bigint): Uint8Array {
     new DataView(key.buffer).setBigUint64(0, height);
     return key;
 }
+
+function requestCursor(init: RequestInit): string {
+    return JSON.parse(new TextDecoder().decode((init.body as Uint8Array).subarray(5))).sinceSequenceNumber;
+}
+
+function targetStreamResponse(
+    height: bigint,
+    onStart?: (body: ReadableStreamDefaultController<Uint8Array>) => void,
+): Response {
+    const key = Buffer.concat([Buffer.from([4]), Buffer.from(heightKey(height))]);
+    const message = new TextEncoder().encode(JSON.stringify({
+        sequenceNumber: height.toString(),
+        entries: [{ key: key.toString('base64'), value: Buffer.from(digest(7)).toString('base64') }],
+    }));
+    const frame = new Uint8Array(5 + message.length);
+    new DataView(frame.buffer).setUint32(1, message.length);
+    frame.set(message, 5);
+    return new Response(new ReadableStream<Uint8Array>({
+        start(body) {
+            onStart?.(body);
+            body.enqueue(frame);
+        },
+    }), { headers: { 'content-type': 'application/connect+json' } });
+}
+
+test('target subscriptions recover when a response body disconnects', async (context) => {
+    for (const detail of ['terminated', 'missing end frame', 'truncated frame']) {
+        await context.test(detail, { timeout: 5_000 }, async (t) => {
+            const controller = new AbortController();
+            const bodies: ReadableStreamDefaultController<Uint8Array>[] = [];
+            const cursors: string[] = [];
+            t.mock.method(globalThis, 'fetch', async (_input: unknown, init: RequestInit) => {
+                cursors.push(requestCursor(init));
+                return targetStreamResponse(BigInt(7 + bodies.length), (body) => bodies.push(body));
+            });
+            const store = new Client('https://example.invalid').store(new StoreKeyPrefix(new Uint8Array([4])));
+            t.mock.method(store, 'query', async () => ({ sequenceNumber: 6n, results: [] }));
+            const stream = subscribePublishedProofTargetsFromStore(store, {
+                signal: controller.signal,
+                reconnectDelayMs: 0,
+            });
+
+            try {
+                assert.equal((await stream.next()).value?.height, 7n);
+                if (detail === 'missing end frame') bodies[0]!.close();
+                else if (detail === 'truncated frame') {
+                    const partial = new Uint8Array(9);
+                    new DataView(partial.buffer).setUint32(1, 100);
+                    bodies[0]!.enqueue(partial);
+                    bodies[0]!.close();
+                } else bodies[0]!.error(new TypeError(detail));
+                assert.equal((await stream.next()).value?.height, 8n);
+                assert.deepEqual(cursors, ['7', '8']);
+            } finally {
+                controller.abort();
+                await stream.return();
+            }
+        });
+    }
+});
+
+// The SDK retries a retryable first response with the request it already
+// consumed, so recovery depends on the subscription reconnecting.
+test('target subscriptions recover when the first response is a retryable status', { timeout: 5_000 }, async (t) => {
+    const controller = new AbortController();
+    const cursors: string[] = [];
+    t.mock.method(globalThis, 'fetch', async (_input: unknown, init: RequestInit) => {
+        cursors.push(requestCursor(init));
+        return cursors.length === 1
+            ? new Response(JSON.stringify({ code: 'unavailable', message: 'overloaded' }), {
+                status: 503,
+                headers: { 'content-type': 'application/json' },
+            })
+            : targetStreamResponse(7n);
+    });
+    const store = new Client('https://example.invalid').store(new StoreKeyPrefix(new Uint8Array([4])));
+    t.mock.method(store, 'query', async () => ({ sequenceNumber: 6n, results: [] }));
+    const stream = subscribePublishedProofTargetsFromStore(store, {
+        signal: controller.signal,
+        reconnectDelayMs: 0,
+    });
+
+    try {
+        assert.equal((await stream.next()).value?.height, 7n);
+        assert.deepEqual(cursors, ['7', '7']);
+    } finally {
+        controller.abort();
+        await stream.return();
+    }
+});
 
 test('provable target decodes its big-endian height and block digest', () => {
     const digest = new Uint8Array(32).fill(0xa5);
@@ -179,37 +269,45 @@ test('provable target subscription releases a pending bootstrap on abort', async
     assert.equal(seenSignal, controller.signal);
 });
 
-test('provable target subscription preserves its cursor after a generic error', async () => {
-    const subscriptions: bigint[] = [];
-    const controller = new AbortController();
-    const store = {
-        async query() {
-            return queryResult(4n, 11n);
-        },
-        subscribe(filters: Parameters<PublishedProofTargetStore['subscribe']>[0]) {
-            subscriptions.push(filters.sinceSequenceNumber ?? 0n);
-            return subscriptions.length === 1
-                ? failedBatchStream('network unavailable')
-                : batches([
-                    {
-                        sequenceNumber: 15n,
-                        entries: [{ key: heightKey(5n), value: digest(5) }],
-                    },
-                ]);
-        },
-    } as PublishedProofTargetStore;
+test('provable target subscription preserves its cursor after a retryable error', async (context) => {
+    for (const failure of [
+        new ConnectError('network unavailable', Code.Unavailable),
+        new ConnectError('failed to read response body: connection reset', Code.Internal),
+        new HttpError(500, '[unknown] HTTP 520', Code.Unknown, new ConnectError('HTTP 520', Code.Unknown)),
+    ]) {
+        await context.test(failure.message, async () => {
+            const subscriptions: bigint[] = [];
+            const controller = new AbortController();
+            const store = {
+                async query() {
+                    return queryResult(4n, 11n);
+                },
+                subscribe(filters: Parameters<PublishedProofTargetStore['subscribe']>[0]) {
+                    subscriptions.push(filters.sinceSequenceNumber ?? 0n);
+                    return subscriptions.length === 1
+                        ? failedBatchStream(failure)
+                        : batches([
+                            {
+                                sequenceNumber: 15n,
+                                entries: [{ key: heightKey(5n), value: digest(5) }],
+                            },
+                        ]);
+                },
+            } as PublishedProofTargetStore;
 
-    const stream = subscribePublishedProofTargetsFromStore(store, {
-        signal: controller.signal,
-        reconnectDelayMs: 0,
-    });
+            const stream = subscribePublishedProofTargetsFromStore(store, {
+                signal: controller.signal,
+                reconnectDelayMs: 0,
+            });
 
-    assert.equal((await stream.next()).value?.height, 4n);
-    assert.equal((await stream.next()).value?.height, 5n);
-    assert.deepEqual(subscriptions, [12n, 12n]);
+            assert.equal((await stream.next()).value?.height, 4n);
+            assert.equal((await stream.next()).value?.height, 5n);
+            assert.deepEqual(subscriptions, [12n, 12n]);
 
-    controller.abort();
-    await stream.return();
+            controller.abort();
+            await stream.return();
+        });
+    }
 });
 
 test('provable target subscription fails closed on a malformed batch entry', async () => {
@@ -602,3 +700,50 @@ function untilAborted(signal?: AbortSignal): Promise<never> {
         signal?.addEventListener('abort', () => reject(signal.reason), { once: true });
     });
 }
+
+test('permanent target bootstrap and subscription failures are terminal', async (context) => {
+    const invalidRequest = new ConnectError('invalid target request', Code.InvalidArgument);
+    const invalidUrl = ConnectError.from(new TypeError('Invalid URL'));
+    const failures = [
+        new HttpError(400, invalidRequest.message, invalidRequest.code, invalidRequest),
+        new HttpError(500, invalidUrl.message, invalidUrl.code, invalidUrl),
+    ];
+    for (const failure of failures) {
+        for (const bootstrap of [true, false]) {
+            await context.test(`${failure.message} during ${bootstrap ? 'bootstrap' : 'subscription'}`, async () => {
+                const controller = new AbortController();
+                let attempts = 0;
+                let errors = 0;
+                const store = {
+                    async query() {
+                        if (bootstrap) {
+                            attempts++;
+                            throw failure;
+                        }
+                        return { sequenceNumber: 1n, results: [] };
+                    },
+                    async *subscribe() {
+                        attempts++;
+                        throw failure;
+                    },
+                } as PublishedProofTargetStore;
+                const stream = subscribePublishedProofTargetsFromStore(store, {
+                    signal: controller.signal,
+                    reconnectDelayMs: 0,
+                    onError() {
+                        if (++errors === 2) controller.abort();
+                    },
+                });
+
+                try {
+                    await assert.rejects(stream.next(), { message: failure.message });
+                    assert.equal(attempts, 1);
+                    assert.equal(errors, 1);
+                } finally {
+                    controller.abort();
+                    await stream.return();
+                }
+            });
+        }
+    }
+});

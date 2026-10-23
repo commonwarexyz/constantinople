@@ -235,16 +235,13 @@ export async function fetchAndVerifyTransactionProof({
         }
 
         let hinted: BlockTarget | undefined;
-        if (coveredHeightHint !== undefined && metadata.height !== targetHeight) {
+        if (metadata.height !== targetHeight) {
             targetController.abort();
         } else {
             const result = await targetResult;
             signal.throwIfAborted();
             if ('error' in result) throw result.error;
             hinted = result;
-        }
-        if (coveredHeightHint === undefined && hinted && metadata.location >= hinted.target.transactionsTip) {
-            throw uncoveredError(`transaction location ${metadata.location}`);
         }
         const { target, appendsStart } = metadata.height === hinted?.target.height
             ? hinted
@@ -277,7 +274,7 @@ export async function fetchAndVerifyTransactionProof({
                 signal,
             );
         } catch (error) {
-            throw new Error(transactionProofErrorDetail(error, target, metadata));
+            throw new Error(transactionProofErrorDetail(error, target, metadata), { cause: error });
         }
 
         return {
@@ -316,7 +313,7 @@ async function blockAppendsStart(
     if (target.height <= 1n) return target.transactionsStart + 1n;
 
     const [bytes] = await headersByDigest(
-        simplexStore(storeUrl),
+        storeUrl,
         [target.parentDigest],
         minSequenceNumber,
         signal,
@@ -837,7 +834,7 @@ async function descendantFinalizedTarget(
     if (!descendant) throw missingFinalization(height);
     return ancestorTarget(
         source.sqlUrl,
-        store,
+        source.storeUrl,
         descendant,
         height,
         minSequenceNumber,
@@ -873,7 +870,7 @@ async function descendantTarget(
 // heights would evict live targets from the small cache.
 async function ancestorTarget(
     sqlUrl: string,
-    store: StoreClient,
+    storeUrl: string,
     descendant: AuthenticatedTarget,
     height: bigint,
     sqlFloor: bigint,
@@ -890,7 +887,7 @@ async function ancestorTarget(
             ? await blockDigestHints(sqlUrl, bottom, top, height, sqlFloor, signal)
             : [];
         const digests = [...hints, expected];
-        const headers = await headersByDigest(store, digests, headerFloor, signal);
+        const headers = await headersByDigest(storeUrl, digests, headerFloor, signal);
 
         for (let index = digests.length - 1; index >= 0; index--) {
             const blockHeight = bottom + BigInt(index);
@@ -967,19 +964,27 @@ async function blockDigestHints(
 // Header values are unauthenticated. Results are matched by key, so a missing
 // or extra row cannot shift a value onto another digest.
 async function headersByDigest(
-    store: StoreClient,
+    storeUrl: string,
     digests: readonly Uint8Array[],
     minSequenceNumber: bigint,
     signal?: AbortSignal,
 ): Promise<Array<Uint8Array | undefined>> {
-    const keys = digests.map((digest) => headerByDigestKey(digest));
-
-    // The SDK cannot cancel getMany, so an abandoned walk stops after this batch.
-    const entries = await store.getMany(keys, keys.length, undefined, minSequenceNumber);
     signal?.throwIfAborted();
+    const client = new Client(trimTrailingSlash(storeUrl));
+    const store = client.store(new StoreKeyPrefix(SIMPLEX_STORE_PREFIX));
+    const keys = digests.map((digest) => headerByDigestKey(digest));
     const values = new Map<string, Uint8Array>();
-    for (const { key, value } of entries) {
-        if (value !== undefined) values.set(toHex(key), value);
+
+    // StoreClient.getMany does not forward cancellation to the transport.
+    for await (const frame of client.query.getMany({
+        keys: keys.map((key) => store.encodeStoreKey(key)),
+        batchSize: keys.length,
+        minSequenceNumber,
+    }, { signal })) {
+        signal?.throwIfAborted();
+        for (const { key, value } of frame.results) {
+            if (value !== undefined) values.set(toHex(store.decodeStoreKey(key)), value);
+        }
     }
     return keys.map((key) => values.get(toHex(key)));
 }
