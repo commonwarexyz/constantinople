@@ -33,7 +33,8 @@ jobs:
       with:
         rust-cache-save: ${{ matrix.partition == 1 }}
     - name: Install cargo-llvm-cov & nextest
-      uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+      # Pinned to a valid immutable SHA
+      uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
       with:
         tool: cargo-llvm-cov,cargo-nextest
     - name: Generate coverage report
