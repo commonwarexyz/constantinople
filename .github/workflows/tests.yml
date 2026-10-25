@@ -35,8 +35,16 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-cache-save: ${{ matrix.partition == 1 }}
-      - uses: taiki-e/install-action@40895b01b2f2cea6a044171e57070a91013b8dd3 # just
-      - uses: taiki-e/install-action@19c7190d8e0bc0aa6ec705040b2021eaf1c28bbd # nextest
+      - name: Install just
+        # Pinned to a valid immutable SHA instead of unresolved hash
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        with:
+          tool: just
+      - name: Install nextest
+        # Pinned to a valid immutable SHA instead of unresolved hash
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        with:
+          tool: cargo-nextest
       - name: Test deployment script
         if: matrix.partition == 1
         run: just deploy-script-test
@@ -71,7 +79,10 @@ jobs:
         uses: ./.github/actions/disk
       - name: Run setup
         uses: ./.github/actions/setup
-      - uses: taiki-e/install-action@40895b01b2f2cea6a044171e57070a91013b8dd3 # just
+      - name: Install just
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        with:
+          tool: just
       - name: build
         run: just build --locked
 
@@ -89,7 +100,10 @@ jobs:
         with:
           additional-toolchain: nightly
           additional-components: rustfmt,clippy
-      - uses: taiki-e/install-action@40895b01b2f2cea6a044171e57070a91013b8dd3 # just
+      - name: Install just
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        with:
+          tool: just
       - name: fmt + lint
         run: just lint
 
@@ -106,8 +120,14 @@ jobs:
         uses: ./.github/actions/disk
       - name: Run setup
         uses: ./.github/actions/setup
-      - uses: taiki-e/install-action@40895b01b2f2cea6a044171e57070a91013b8dd3 # just
-      - uses: taiki-e/install-action@19c7190d8e0bc0aa6ec705040b2021eaf1c28bbd # nextest
+      - name: Install just
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        with:
+          tool: just
+      - name: Install nextest
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        with:
+          tool: cargo-nextest
       - name: check docs
         run: just docs-check
       - name: test docs
@@ -126,7 +146,8 @@ jobs:
         with:
           additional-toolchain: nightly
       - name: Install just & cargo-udeps
-        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177 # v2
+        # Pinned to a valid immutable SHA
+        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
         with:
           tool: just@1.43.0,cargo-udeps@${{ env.UDEPS_VERSION }}
       - name: Check for unused dependencies
