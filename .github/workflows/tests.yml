@@ -36,13 +36,13 @@ jobs:
         with:
           rust-cache-save: ${{ matrix.partition == 1 }}
       - name: Install just
-        # Pinned to a valid immutable SHA instead of unresolved hash
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        # Restored to the valid immutable SHA for official action
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: just
       - name: Install nextest
-        # Pinned to a valid immutable SHA instead of unresolved hash
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        # Restored to the valid immutable SHA for official action
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: cargo-nextest
       - name: Test deployment script
@@ -80,7 +80,7 @@ jobs:
       - name: Run setup
         uses: ./.github/actions/setup
       - name: Install just
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: just
       - name: build
@@ -101,7 +101,7 @@ jobs:
           additional-toolchain: nightly
           additional-components: rustfmt,clippy
       - name: Install just
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: just
       - name: fmt + lint
@@ -121,11 +121,11 @@ jobs:
       - name: Run setup
         uses: ./.github/actions/setup
       - name: Install just
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: just
       - name: Install nextest
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: cargo-nextest
       - name: check docs
@@ -146,28 +146,8 @@ jobs:
         with:
           additional-toolchain: nightly
       - name: Install just & cargo-udeps
-        # Pinned to a valid immutable SHA
-        uses: taiki-e/install-action@94a99045a72830168b8eae8bf767ba08abeca856
+        uses: taiki-e/install-action@a4d3f3f761dcd95cce1b72cb61cb6d1963438177
         with:
           tool: just@1.43.0,cargo-udeps@${{ env.UDEPS_VERSION }}
       - name: Check for unused dependencies
         run: just udeps
-
-  # wasm:
-  #   name: Build WASM
-  #   runs-on: ubuntu-latest
-  #   steps:
-  #     - name: Checkout repository
-  #       uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-  #     - uses: dtolnay/rust-toolchain@stable
-  #       with:
-  #         targets: wasm32-unknown-unknown
-  #     - uses: Swatinem/rust-cache@v2
-  #       with:
-  #         save-if: ${{ github.ref == 'refs/heads/main' }}
-  #     - name: Build types
-  #       run: cargo build --target wasm32-unknown-unknown --release --manifest-path types/Cargo.toml && du -h target/wasm32-unknown-unknown/release/alto_types.wasm
-  #     - name: Install wasm-pack
-  #       uses: taiki-e/install-action@wasm-pack
-  #     - name: Pack types
-  #       run: wasm-pack build types --release --target web
